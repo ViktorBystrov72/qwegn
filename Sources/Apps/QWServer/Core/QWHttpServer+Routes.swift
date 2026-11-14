@@ -175,10 +175,13 @@ extension QWHttpServer {
         }
     }
 
-    func sendRawData(_ connection: NWConnection, status: Int, contentType: String, data: Data) {
+    func sendRawData(_ connection: NWConnection, status: Int, contentType: String, data: Data, extraHeaders: [String] = []) {
         var header = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Error")\r\n"
         header += "Content-Type: \(contentType)\r\n"
         header += "Content-Length: \(data.count)\r\n"
+        for line in extraHeaders {
+            header += "\(line)\r\n"
+        }
         header += corsHeaderLines(for: connection)
         header += "Connection: close\r\n\r\n"
 

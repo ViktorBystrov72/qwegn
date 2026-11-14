@@ -205,18 +205,30 @@ extension QWHttpServer {
         }
 
         let fm = FileManager.default
-        let stem = (relative as NSString).deletingPathExtension
-        let ext = (relative as NSString).pathExtension
-        if let localPath = Self.resolveStaticUIResourcePath(stem: stem, ext: ext, relative: relative, fm: fm),
-           fm.fileExists(atPath: localPath),
+        if let localPath = Self.resolveStaticUIResourcePath(relative: relative, fm: fm),
            let data = try? Data(contentsOf: URL(fileURLWithPath: localPath)) {
-            let contentType = relative.hasSuffix(".svg") ? "image/svg+xml" : (relative.hasSuffix(".js") ? "application/javascript" : "text/html; charset=utf-8")
-            sendRawData(connection, status: 200, contentType: contentType, data: data)
+            let contentType = Self.staticUIMimeType(for: relative)
+            sendRawData(
+                connection,
+                status: 200,
+                contentType: contentType,
+                data: data,
+                extraHeaders: ["Cache-Control: no-cache"]
+            )
         } else {
             let escapedPath = QWHttpSecurity.escapeHTML(relative)
             let body = "<html><body style='background:#111318;color:#e2e2e9;font-family:sans-serif;padding:24px;'><h2>QWEGN Controlbar</h2><p>The control bar UI resource <code>\(escapedPath)</code> is not installed.</p><p>Build it: <code>make build</code></p></body></html>"
             sendRawData(connection, status: 503, contentType: "text/html; charset=utf-8", data: Data(body.utf8))
         }
+    }
+
+    private static func staticUIMimeType(for relative: String) -> String {
+        let lower = relative.lowercased()
+        if lower.hasSuffix(".css") { return "text/css; charset=utf-8" }
+        if lower.hasSuffix(".js") { return "application/javascript; charset=utf-8" }
+        if lower.hasSuffix(".svg") { return "image/svg+xml" }
+        if lower.hasSuffix(".json") { return "application/json; charset=utf-8" }
+        return "text/html; charset=utf-8"
     }
 
     private func isSafeStaticRelativePath(_ relative: String) -> Bool {
@@ -230,38 +242,84 @@ extension QWHttpServer {
         return !components.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." })
     }
 
-    private static func resolveStaticUIResourcePath(stem: String, ext: String, relative: String, fm: FileManager) -> String? {
+    private static func resolveStaticUIResourcePath(relative: String, fm: FileManager) -> String? {
         let execDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
-        let bundleCandidates = [
-            Bundle.main.resourceURL?.appendingPathComponent("qwegine_QWServer.bundle"),
-            execDir.appendingPathComponent("qwegine_QWServer.bundle"),
-            execDir.deletingLastPathComponent().appendingPathComponent("share/qwegn/qwegine_QWServer.bundle"),
-            URL(fileURLWithPath: "/usr/local/share/qwegn/qwegine_QWServer.bundle"),
-            URL(fileURLWithPath: "/Applications/Qwegn.app/Contents/Resources/qwegine_QWServer.bundle"),
-        ].compactMap { $0 }
-        for bURL in bundleCandidates {
-            if let b = Bundle(url: bURL), let hit = containedResourcePath(bundle: b, stem: stem, ext: ext) {
-                return hit
-            }
-        }
-        if let hit = containedResourcePath(bundle: Bundle.module, stem: stem, ext: ext) {
-            return hit
+        if let bundle = activeStaticUIBundle(execDir: execDir, fm: fm) {
+            return containedResourcePath(bundle: bundle, relative: relative, fm: fm)
         }
         let devStaticRoot = URL(fileURLWithPath: fm.currentDirectoryPath)
             .appendingPathComponent("Sources/Apps/QWServer/Resources", isDirectory: true)
             .resolvingSymlinksInPath()
             .standardizedFileURL
-        let candidate = devStaticRoot.appendingPathComponent(relative).resolvingSymlinksInPath().standardizedFileURL
-        let rootPrefix = devStaticRoot.path.hasSuffix("/") ? devStaticRoot.path : devStaticRoot.path + "/"
-        return candidate.path.hasPrefix(rootPrefix) && fm.fileExists(atPath: candidate.path) ? candidate.path : nil
+        var rootIsDir: ObjCBool = false
+        if fm.fileExists(atPath: devStaticRoot.path, isDirectory: &rootIsDir), rootIsDir.boolValue {
+            let candidate = devStaticRoot.appendingPathComponent(relative).resolvingSymlinksInPath().standardizedFileURL
+            let rootPrefix = devStaticRoot.path.hasSuffix("/") ? devStaticRoot.path : devStaticRoot.path + "/"
+            var isDir: ObjCBool = false
+            return candidate.path.hasPrefix(rootPrefix)
+                && fm.fileExists(atPath: candidate.path, isDirectory: &isDir)
+                && !isDir.boolValue
+                ? candidate.path
+                : nil
+        }
+        let fallbackCandidates = [
+            URL(fileURLWithPath: "/usr/local/share/qwegn/qwegine_QWServer.bundle"),
+            URL(fileURLWithPath: "/Applications/Qwegn.app/Contents/Resources/qwegine_QWServer.bundle"),
+        ]
+        if let fallback = firstExistingBundle(in: fallbackCandidates, fm: fm) {
+            return containedResourcePath(bundle: fallback, relative: relative, fm: fm)
+        }
+        return nil
     }
 
-    private static func containedResourcePath(bundle: Bundle, stem: String, ext: String) -> String? {
-        guard let root = bundle.resourceURL?.resolvingSymlinksInPath().standardizedFileURL,
-              let hit = bundle.url(forResource: stem, withExtension: ext)?.resolvingSymlinksInPath().standardizedFileURL else {
+    private static func activeStaticUIBundle(execDir: URL, fm: FileManager) -> Bundle? {
+        var candidates: [URL] = []
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["PACKAGE_RESOURCE_BUNDLE_PATH"] ?? env["PACKAGE_RESOURCE_BUNDLE_URL"], !raw.isEmpty {
+            let url = URL(fileURLWithPath: raw)
+            candidates.append(url.pathExtension == "bundle" ? url : url.appendingPathComponent("qwegine_QWServer.bundle"))
+        }
+        let serverBundle = Bundle(for: QWHttpServer.self)
+        if let mainRes = Bundle.main.resourceURL {
+            candidates.append(mainRes.appendingPathComponent("qwegine_QWServer.bundle"))
+        }
+        if let srvRes = serverBundle.resourceURL {
+            candidates.append(srvRes.appendingPathComponent("qwegine_QWServer.bundle"))
+        }
+        candidates.append(serverBundle.bundleURL.deletingLastPathComponent().appendingPathComponent("qwegine_QWServer.bundle"))
+        candidates.append(execDir.appendingPathComponent("qwegine_QWServer.bundle"))
+        candidates.append(execDir.deletingLastPathComponent().appendingPathComponent("Resources/qwegine_QWServer.bundle"))
+        candidates.append(execDir.deletingLastPathComponent().appendingPathComponent("share/qwegn/qwegine_QWServer.bundle"))
+        return firstExistingBundle(in: candidates, fm: fm)
+    }
+
+    private static func firstExistingBundle(in candidates: [URL], fm: FileManager) -> Bundle? {
+        for url in candidates {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue,
+               let bundle = Bundle(url: url) {
+                return bundle
+            }
+        }
+        return nil
+    }
+
+    private static func containedResourcePath(bundle: Bundle, relative: String, fm: FileManager) -> String? {
+        guard let root = bundle.resourceURL?.resolvingSymlinksInPath().standardizedFileURL else {
             return nil
         }
+        let nsRelative = relative as NSString
+        let ext = nsRelative.pathExtension
+        let withoutExt = nsRelative.deletingPathExtension
+        let subdir = (withoutExt as NSString).deletingLastPathComponent
+        let stem = (withoutExt as NSString).lastPathComponent
+        let subOpt: String? = subdir.isEmpty ? nil : subdir
+        let candidate = bundle.url(forResource: stem, withExtension: ext, subdirectory: subOpt)?
+            .resolvingSymlinksInPath().standardizedFileURL
+            ?? root.appendingPathComponent(relative).resolvingSymlinksInPath().standardizedFileURL
         let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
-        return hit.path.hasPrefix(rootPrefix) ? hit.path : nil
+        guard candidate.path.hasPrefix(rootPrefix) else { return nil }
+        var isDir: ObjCBool = false
+        return fm.fileExists(atPath: candidate.path, isDirectory: &isDir) && !isDir.boolValue ? candidate.path : nil
     }
 }

@@ -88,13 +88,13 @@ public enum QWSparklineGeometry {
 
         return QWSparklinePlot(
             prefill: buildSeries(
-                data: prefill, peak: peakP, ceiling: ceilP,
-                totalSlots: totalSlots, width: width, height: height,
+                data: prefill, companion: decode, peak: peakP, companionPeak: peakD,
+                ceiling: ceilP, totalSlots: totalSlots, width: width, height: height,
                 insetX: insetX, insetY: insetY, usableW: usableW, usableH: usableH
             ),
             decode: buildSeries(
-                data: decode, peak: peakD, ceiling: ceilD,
-                totalSlots: totalSlots, width: width, height: height,
+                data: decode, companion: prefill, peak: peakD, companionPeak: peakP,
+                ceiling: ceilD, totalSlots: totalSlots, width: width, height: height,
                 insetX: insetX, insetY: insetY, usableW: usableW, usableH: usableH
             ),
             totalSlots: totalSlots
@@ -103,7 +103,9 @@ public enum QWSparklineGeometry {
 
     private static func buildSeries(
         data: [Double?],
+        companion: [Double?],
         peak: Double,
+        companionPeak: Double,
         ceiling: Double,
         totalSlots: Int,
         width: Double,
@@ -130,6 +132,11 @@ public enum QWSparklineGeometry {
         let maxRef = max(1.0, peak > 0 ? peak / ceiling : 1.0)
         for (index, raw) in data.enumerated() {
             guard let raw else {
+                // Skip nil slots while the companion phase is actively running so 1Hz decode
+                // windows do not fragment prefill measurements into isolated dots.
+                if index < companion.count, let comp = companion[index], comp > 0 {
+                    continue
+                }
                 flushCurrent()
                 continue
             }
@@ -145,7 +152,8 @@ public enum QWSparklineGeometry {
         }
         flushCurrent()
 
-        let guideY = (totalSlots == 1 && isolated.count == 1) ? isolated[0].y : nil
+        let showGuide = runs.isEmpty && isolated.count == 1 && (totalSlots == 1 || companionPeak > 0)
+        let guideY = showGuide ? isolated[0].y : nil
         return QWSparklineSeriesGeometry(
             runs: runs, isolatedPoints: isolated,
             latestPoint: latest, singleSlotGuideY: guideY

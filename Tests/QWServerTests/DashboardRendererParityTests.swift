@@ -6,30 +6,56 @@
 // These are source-text assertions: they read the page the browser
 // will run. Each one was proved against the broken code it forbids.
 
+import Darwin
+import Foundation
+import JavaScriptCore
 import XCTest
 @testable import QWServer
-import Foundation
+
+private extension QWHttpServer {
+    var boundPort: UInt16? {
+        listener?.port?.rawValue
+    }
+}
 
 final class DashboardRendererParityTests: XCTestCase {
+    private static let stylesheetPaths = [
+        "Sources/Apps/QWServer/Resources/css/base.css",
+        "Sources/Apps/QWServer/Resources/css/panels.css",
+    ]
+    private static let scriptPaths = [
+        "Sources/Apps/QWServer/Resources/js/state.js",
+        "Sources/Apps/QWServer/Resources/js/dashboard.js",
+        "Sources/Apps/QWServer/Resources/js/markdown.js",
+        "Sources/Apps/QWServer/Resources/js/actions.js",
+    ]
+
     private func html() throws -> String {
         try Self.read("Sources/Apps/QWServer/Resources/controlbar.html")
     }
 
+    private func styles() throws -> String {
+        try Self.stylesheetPaths.map { try Self.read($0) }.joined(separator: "\n")
+    }
+
     private func script() throws -> String {
-        let html = try html()
-        return try XCTUnwrap(Self.script(of: html), "the dashboard has no script")
+        try Self.scriptPaths.map { try Self.read($0) }.joined(separator: "\n")
+    }
+
+    private func allWebUISource() throws -> String {
+        try [html(), styles(), script()].joined(separator: "\n")
     }
 
     func testDashboardFetchesTheViewModel() throws {
-        let html = try html()
-        XCTAssertTrue(html.contains("/v1/dashboard"),
+        let ui = try allWebUISource()
+        XCTAssertTrue(ui.contains("/v1/dashboard"),
                       "the dashboard must consume the published view model")
     }
 
     func testDashboardDoesNotComputeItsOwnRates() throws {
-        let html = try html()
+        let ui = try allWebUISource()
         for forbidden in ["tokensOut / decodeSec", "emittedTokens /", "1000 / p50"] {
-            XCTAssertFalse(html.contains(forbidden),
+            XCTAssertFalse(ui.contains(forbidden),
                            "the dashboard must not recompute \(forbidden)")
         }
     }
@@ -56,10 +82,10 @@ final class DashboardRendererParityTests: XCTestCase {
     /// The renderer is driven by the card list: it reads the cards, and
     /// it does not know what a card is called.
     func testTheRendererIsDrivenByTheCards() throws {
-        let html = try html()
-        XCTAssertTrue(html.contains("model.cards"),
+        let ui = try allWebUISource()
+        XCTAssertTrue(ui.contains("model.cards"),
                       "the renderer walks the published cards")
-        XCTAssertTrue(html.contains("data-card"),
+        XCTAssertTrue(ui.contains("data-card"),
                       "the rows declare which card they show")
     }
 
@@ -95,8 +121,8 @@ final class DashboardRendererParityTests: XCTestCase {
 
     /// The view-model stream replaced the metrics stream.
     func testTheDashboardStreamsTheViewModel() throws {
-        let html = try html()
-        XCTAssertTrue(html.contains("/v1/dashboard/stream"),
+        let ui = try allWebUISource()
+        XCTAssertTrue(ui.contains("/v1/dashboard/stream"),
                       "the dashboard subscribes to the published model")
     }
 
@@ -104,7 +130,7 @@ final class DashboardRendererParityTests: XCTestCase {
     /// below was a fabrication: a bandwidth nobody measured, a legend
     /// the server never published, a miss rate nobody measures.
     func testThePageInventsNoValue() throws {
-        let html = try html()
+        let ui = try allWebUISource()
         for forbidden in ["585 GB/s",
                           "Q4g • Metal 4 (Tensor)",
                           "Sampling: 500ms",
@@ -121,7 +147,7 @@ final class DashboardRendererParityTests: XCTestCase {
                           "last 60 seconds",
                           "-60 sec",
                           "Real-Time HTTP / IPC"] {
-            XCTAssertFalse(html.contains(forbidden),
+            XCTAssertFalse(ui.contains(forbidden),
                            "the page must not claim '\(forbidden)'")
         }
     }
@@ -238,8 +264,8 @@ final class DashboardRendererParityTests: XCTestCase {
     /// cache purge. A button that claims an action the server cannot
     /// perform is a lie with a click.
     func testNoActionIsOfferedThatTheServerCannotPerform() throws {
-        let html = try html()
-        XCTAssertFalse(html.contains("purgeCache"),
+        let ui = try allWebUISource()
+        XCTAssertFalse(ui.contains("purgeCache"),
                        "the server has no cache purge: the page must not offer one")
     }
 
@@ -255,13 +281,17 @@ final class DashboardRendererParityTests: XCTestCase {
 
     /// The workbench UI must load zero external CDN scripts, stylesheets, or URLs.
     func testDashboardHasNoExternalCDNDependencies() throws {
-        let markup = try html()
-        XCTAssertFalse(markup.contains("https://"),
-                       "controlbar.html must remain strictly offline with zero https URLs")
-        XCTAssertFalse(markup.contains("cdn.tailwindcss.com"),
-                       "controlbar.html must not reference Tailwind CDN")
-        XCTAssertFalse(markup.contains("fonts.googleapis.com"),
-                       "controlbar.html must not reference Google Fonts CDN")
+        let paths = ["Sources/Apps/QWServer/Resources/controlbar.html"]
+            + Self.stylesheetPaths + Self.scriptPaths
+        for path in paths {
+            let source = try Self.read(path)
+            XCTAssertFalse(source.contains("https://"),
+                           "\(path) must remain strictly offline with zero https URLs")
+            XCTAssertFalse(source.contains("cdn.tailwindcss.com"),
+                           "\(path) must not reference Tailwind CDN")
+            XCTAssertFalse(source.contains("fonts.googleapis.com"),
+                           "\(path) must not reference Google Fonts CDN")
+        }
     }
 
     /// All four QWG processor vector marks must stay free of the left-pin 340 bug.
@@ -306,9 +336,223 @@ final class DashboardRendererParityTests: XCTestCase {
         XCTAssertTrue(disconnectFn.contains("prefill-pct"))
     }
 
-    /// The script body of the document: the last script block, which
-    /// is the dashboard's. Taking the first would make every assertion
-    /// below vacuous the day another script is added above it.
+    /// Smoke probe output parses Markdown safely into styled elements while neutralizing raw HTML and unsafe URLs.
+    func testSmokeProbeRendersMarkdownAndEscapesUntrustedHtml() throws {
+        let html = try html()
+        let script = try script()
+        XCTAssertTrue(html.contains("id=\"probe-output\""))
+        XCTAssertTrue(html.contains("id=\"probe-mode-btn\""))
+        XCTAssertTrue(html.contains("toggleSmokeProbeMode()"))
+        XCTAssertTrue(script.contains("renderSmokeProbeMarkdown("))
+
+        let ctx = try XCTUnwrap(JSContext())
+        var jsError: String?
+        ctx.exceptionHandler = { _, exc in
+            jsError = exc?.toString() ?? "unknown JS error"
+        }
+        for name in [
+            "escapeHtml",
+            "sanitizeMarkdownUrl",
+            "splitMarkdownTableCells",
+            "isMarkdownTableDelimiter",
+            "applyInlineMarkdownEmphasis",
+            "renderInlineMarkdown",
+            "renderSmokeProbeMarkdown",
+        ] {
+            let fnBody = try XCTUnwrap(Self.function(name, in: script), "missing \(name)")
+            ctx.evaluateScript("function \(name)\(fnBody)")
+            XCTAssertNil(jsError, "JS error evaluating \(name): \(jsError ?? "")")
+        }
+
+        let fixture = """
+        # LSA Kernel Implementation in Qwegn
+
+        ---
+
+        ## Core LSA Attention Kernels
+
+        | File | Role |
+        |------|------|
+        | **`QWLSAOperator.swift`** | Uses `ShvqTgLut<1|2|3>` |
+
+        ### 1. Coarse Selection
+        - **32 KiB-TG** via `qwg_shvq_read_elem_t<bool SUB2>`
+          - Nested item for vision_encode_ms
+
+        ```
+        QWEngine
+        └─ QWLSAOperator.select()
+        ```
+
+        <img src=x onerror=alert(1)> <script>evil()</script> [bad](javascript:alert(1)) [top](/ui#top)
+        """
+        let fn = try XCTUnwrap(ctx.objectForKeyedSubscript("renderSmokeProbeMarkdown"))
+        let result = try XCTUnwrap(fn.call(withArguments: [fixture]))
+        XCTAssertNil(jsError, "JS execution failed: \(jsError ?? "")")
+        let rendered = try XCTUnwrap(result.toString())
+
+        XCTAssertTrue(rendered.contains("<h1 class=\"md-h1\">LSA Kernel Implementation in Qwegn</h1>"))
+        XCTAssertTrue(rendered.contains("<hr class=\"md-hr\" />"))
+        XCTAssertTrue(rendered.contains("<h2 class=\"md-h2\">Core LSA Attention Kernels</h2>"))
+        XCTAssertTrue(rendered.contains("<table class=\"ledger md-table\">"))
+        XCTAssertTrue(rendered.contains("<strong><code class=\"md-inline-code\">QWLSAOperator.swift</code></strong>"))
+        XCTAssertTrue(rendered.contains("<code class=\"md-inline-code\">ShvqTgLut&lt;1|2|3&gt;</code>"))
+        XCTAssertTrue(rendered.contains("<h3 class=\"md-h3\">1. Coarse Selection</h3>"))
+        XCTAssertTrue(rendered.contains("<ul><li><strong>32 KiB-TG</strong>"))
+        XCTAssertTrue(rendered.contains("&lt;bool SUB2&gt;"))
+        XCTAssertTrue(rendered.contains("vision_encode_ms"))
+        XCTAssertFalse(rendered.contains("<em>encode</em>"))
+        XCTAssertTrue(rendered.contains("<pre class=\"mono\"><code>QWEngine\n└─ QWLSAOperator.select()</code></pre>"))
+        XCTAssertTrue(rendered.contains("href=\"/ui#top\""))
+
+        XCTAssertTrue(rendered.contains("&lt;img src=x onerror=alert(1)&gt;"))
+        XCTAssertTrue(rendered.contains("&lt;script&gt;evil()&lt;/script&gt;"))
+        XCTAssertFalse(rendered.contains("<img"))
+        XCTAssertFalse(rendered.contains("<script"))
+        XCTAssertNil(rendered.range(of: #"<[^>]*\bonerror\s*="#, options: [.regularExpression, .caseInsensitive]))
+        XCTAssertFalse(rendered.lowercased().contains("javascript:"))
+
+        let extractFnBody = try XCTUnwrap(Self.function("extractSmokeProbeParts", in: script))
+        ctx.evaluateScript("function extractSmokeProbeParts\(extractFnBody)")
+        let extractFn = try XCTUnwrap(ctx.objectForKeyedSubscript("extractSmokeProbeParts"))
+        let extracted = try XCTUnwrap(extractFn.call(withArguments: [
+            ["content": "<think>Step 1</think>Answer body"],
+            ["choices": []],
+        ])?.toDictionary())
+        XCTAssertEqual(extracted["reasoning"] as? String, "Step 1")
+        XCTAssertEqual(extracted["content"] as? String, "Answer body")
+    }
+
+    func testWebUIAssetsAreModularAndServedWithProperMimeTypes() async throws {
+        let markup = try html()
+        XCTAssertFalse(markup.lowercased().contains("<style"))
+        XCTAssertNil(markup.range(of: "<script>", options: .caseInsensitive))
+        let assetSpecs: [(route: String, mime: String, sourcePath: String)] = [
+            ("/ui", "text/html", "Sources/Apps/QWServer/Resources/controlbar.html"),
+            ("/ui/logo.svg", "image/svg+xml", "Sources/Apps/QWServer/Resources/logo.svg"),
+            ("/ui/css/base.css", "text/css", "Sources/Apps/QWServer/Resources/css/base.css"),
+            ("/ui/css/panels.css", "text/css", "Sources/Apps/QWServer/Resources/css/panels.css"),
+            ("/ui/js/state.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/state.js"),
+            ("/ui/js/dashboard.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/dashboard.js"),
+            ("/ui/js/markdown.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/markdown.js"),
+            ("/ui/js/actions.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/actions.js"),
+        ]
+        for spec in assetSpecs {
+            let lineCount = try Self.read(spec.sourcePath).components(separatedBy: "\n").count
+            XCTAssertLessThanOrEqual(lineCount, 800, "\(spec.sourcePath) must stay <= 800 lines")
+            if spec.route != "/ui" && spec.route != "/ui/logo.svg" {
+                XCTAssertTrue(markup.contains(spec.route), "controlbar.html must reference \(spec.route)")
+            }
+        }
+
+        let cfg = QWEngineLifecycleActor.Config(packPath: "/dummy/model.qwp", modelName: "test-model")
+        let logger = QWServerLogger(level: .none)
+        let actor = QWEngineLifecycleActor(config: cfg, logger: logger)
+        let server = QWHttpServer(actor: actor, host: "127.0.0.1", port: 0, logger: logger)
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let port = try XCTUnwrap(server.boundPort)
+        let session = URLSession.shared
+        for spec in assetSpecs {
+            let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)\(spec.route)"))
+            let (data, resp) = try await session.data(from: url)
+            let http = try XCTUnwrap(resp as? HTTPURLResponse)
+            XCTAssertEqual(http.statusCode, 200, "Expected 200 for \(spec.route)")
+            let ct = try XCTUnwrap(http.value(forHTTPHeaderField: "Content-Type"))
+            XCTAssertTrue(ct.hasPrefix(spec.mime), "Unexpected Content-Type '\(ct)' for \(spec.route)")
+            XCTAssertEqual(http.value(forHTTPHeaderField: "Cache-Control"), "no-cache")
+            XCTAssertEqual(String(data: data, encoding: .utf8), try Self.read(spec.sourcePath))
+        }
+
+        let dirURL = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/ui/css"))
+        let (_, dirResp) = try await session.data(from: dirURL)
+        XCTAssertEqual((dirResp as? HTTPURLResponse)?.statusCode, 503)
+
+        let traversalResp = Self.rawLoopbackHTTP(port: port, requestLine: "GET /ui/../Package.swift HTTP/1.1")
+        XCTAssertTrue(traversalResp.hasPrefix("HTTP/1.1 403 "), "Expected 403 traversal guard, got: \(traversalResp)")
+    }
+
+    func testSparklineConnectsPrefillAcrossActiveDecodeAndSplitsTrueGaps() throws {
+        let script = try script()
+        let updateFnBody = try XCTUnwrap(Self.function("updateSparkline", in: script), "missing updateSparkline")
+
+        let ctx = try XCTUnwrap(JSContext())
+        var jsError: String?
+        ctx.exceptionHandler = { _, exc in
+            jsError = exc?.toString() ?? "unknown JS error"
+        }
+        ctx.evaluateScript("""
+        var _attrs = {};
+        var _classes = {};
+        var document = {
+          getElementById: function(id) {
+            if (!_attrs[id]) _attrs[id] = {};
+            if (!_classes[id]) _classes[id] = {};
+            return {
+              setAttribute: function(k, v) { _attrs[id][k] = String(v); },
+              classList: {
+                add: function(c) { _classes[id][c] = true; },
+                remove: function(c) { delete _classes[id][c]; }
+              }
+            };
+          }
+        };
+        function updateSparkline\(updateFnBody)
+        """)
+        XCTAssertNil(jsError, "JS error setting up updateSparkline: \(jsError ?? "")")
+
+        ctx.evaluateScript("updateSparkline([1420, null, null, 1580, null, 1510], [80, 81, 82, null, 83, 81]);")
+        XCTAssertNil(jsError, "JS error invoking updateSparkline: \(jsError ?? "")")
+        let attrs = try XCTUnwrap(ctx.objectForKeyedSubscript("_attrs")?.toDictionary())
+        let aAttrs = try XCTUnwrap(attrs["sparkline-series-a-path"] as? [String: Any])
+        let aArea = try XCTUnwrap(attrs["sparkline-series-a-area"] as? [String: Any])
+        let aGuide = try XCTUnwrap(attrs["sparkline-series-a-guide"] as? [String: Any])
+        let aMarkers = try XCTUnwrap(attrs["sparkline-series-a-markers"] as? [String: Any])
+        let bAttrs = try XCTUnwrap(attrs["sparkline-series-b-path"] as? [String: Any])
+
+        let pathA = try XCTUnwrap(aAttrs["d"] as? String)
+        XCTAssertTrue(pathA.hasPrefix("M "), "Expected continuous prefill line path, got: \(pathA)")
+        XCTAssertTrue(pathA.contains(" C "), "Expected cubic Bezier segments in prefill line: \(pathA)")
+        XCTAssertFalse((aArea["d"] as? String ?? "").isEmpty)
+        XCTAssertEqual(aGuide["d"] as? String, "")
+        let markersA = try XCTUnwrap(aMarkers["d"] as? String)
+        XCTAssertEqual(markersA.components(separatedBy: "M ").count - 1, 1,
+                       "Expected only endpoint marker, not isolated per-turn dots: \(markersA)")
+        XCTAssertTrue((bAttrs["d"] as? String ?? "").hasPrefix("M "))
+
+        ctx.evaluateScript("updateSparkline([1420, null, 1580], [80, null, 82]);")
+        XCTAssertNil(jsError, "JS error testing dual gap: \(jsError ?? "")")
+        let gapAttrs = try XCTUnwrap(ctx.objectForKeyedSubscript("_attrs")?.toDictionary())
+        XCTAssertEqual((gapAttrs["sparkline-series-a-path"] as? [String: Any])?["d"] as? String, "")
+        XCTAssertEqual((gapAttrs["sparkline-series-b-path"] as? [String: Any])?["d"] as? String, "")
+    }
+
+    private static func rawLoopbackHTTP(port: UInt16, requestLine: String) -> String {
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return "" }
+        defer { Darwin.close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let connectOK = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        guard connectOK else { return "" }
+        let req = "\(requestLine)\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        _ = req.withCString { Darwin.send(fd, $0, strlen($0), 0) }
+        var buf = [UInt8](repeating: 0, count: 512)
+        let n = Darwin.recv(fd, &buf, buf.count, 0)
+        return n > 0 ? String(decoding: buf.prefix(n), as: UTF8.self) : ""
+    }
+
+    /// The script body of the document: the last inline script block,
+    /// falling back to the modular external JS files when split.
     static func script(of html: String) -> String? {
         var blocks: [String] = []
         var rest = html[html.startIndex...]
@@ -318,29 +562,29 @@ final class DashboardRendererParityTests: XCTestCase {
             blocks.append(String(after[..<close.lowerBound]))
             rest = after[close.upperBound...]
         }
-        return blocks.last { $0.contains("API_BASE") } ?? blocks.last
+        if let inline = blocks.last(where: { $0.contains("API_BASE") }) ?? blocks.last {
+            return inline
+        }
+        return try? scriptPaths.map { try read($0) }.joined(separator: "\n")
     }
 
     /// The body of one function in the script: from its name to the
-    /// next function. An async function ends at the next async one
-    /// too, or a guard would be satisfied by its neighbour's code.
+    /// next top-level function definition.
     static func function(_ name: String, in script: String) -> String? {
         guard let start = script.range(of: "function \(name)") else { return nil }
         let rest = script[start.upperBound...]
-        guard let end = rest.range(of: #"\n    (async )?function "#,
+        guard let end = rest.range(of: #"\n(?:    )?(?:async )?function "#,
                                    options: .regularExpression) else {
             return String(rest)
         }
         return String(rest[..<end.lowerBound])
     }
 
-    /// Reads a file relative to the package root, which is two
-    /// directories above this file.
     static func read(_ relativePath: String) throws -> String {
         let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // QWServerTests
-            .deletingLastPathComponent()   // Tests
-            .deletingLastPathComponent()   // package root
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
         let url = root.appendingPathComponent(relativePath)
         return try String(contentsOf: url, encoding: .utf8)
     }

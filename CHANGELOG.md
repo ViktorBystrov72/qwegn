@@ -10,6 +10,18 @@ The single source of the version is `QWVersion.current` in
 
 ## [Unreleased]
 
+## [0.21.3] - 2026-11-14
+
+### Changed
+- **Modular WebUI Asset Layout (`Package.swift`, `QWServer/Resources`, `QWHttpServer+Streams`, `QWHttpServer+Routes`)**: Split the monolithic `controlbar.html` (`3,303` lines) into semantic static files — `controlbar.html` (`407` lines, zero inline `<style>`/`<script>`), `css/base.css` (`618` lines), `css/panels.css` (`476` lines), `js/state.js` (`241` lines), `js/dashboard.js` (`700` lines), `js/markdown.js` (`429` lines), and `js/actions.js` (`476` lines) — copied with directory structure via `Package.swift` `.copy(...)` and served by `QWHttpServer` with `Cache-Control: no-cache`, explicit CSS/JS/SVG/JSON MIME types, directory exclusion (`!isDir`), and crash-free active-bundle discovery.
+
+### Added
+- **Offline XSS-Safe Smoke Probe Markdown Renderer (`js/markdown.js`, `css/panels.css`, `controlbar.html`)**: Rendered Quick Inference Smoke Probe responses (including `<think>` / `reasoning_content` collapsible sections, `#`–`######` headings, horizontal rules, GFM tables preserving backtick pipes, nested/task lists, blockquotes, language-labeled code blocks + monospace ASCII trees, inline code angle brackets, snake_case-safe underscores, `Raw`/`Rendered` toggle, `Copy`, and unrestricted `#probe-max-tokens`) with zero external dependencies and strict HTML/URL sanitization, backed by `JavaScriptCore` XSS and live `QWHttpServer` MIME/traversal unit tests (`DashboardRendererParityTests`, `QWTelemetryHonestyTests`).
+
+### Fixed
+- **Cross-Phase Sparkline Line Continuity (`QWSparklineGeometry`, `js/state.js`, `MenuBarRendererParityTests`, `DashboardRendererParityTests`)**: Prevented active `1 Hz` decode windows from splitting sub-second prefill measurements into isolated dots (and vice versa) across both WebUI `/ui` and `Qwegn.app` `DualSparklineView` by ignoring `nil` slots while the companion phase is actively running, using monotone horizontal-tangent cubic Bézier segments in `/ui`, keeping single-turn horizontal reference guides visible while decode runs, and still breaking runs cleanly on true unmeasured dual-nil gaps while preserving raw `nil` values in `QWEngineTelemetryRegistry` and hover tooltips.
+- **macOS `qwegine_QWServer.bundle` Code-Signing Normalization (`Scripts/build_app.sh`, `Scripts/build_pkg.sh`, `.github/workflows/release.yml`)**: Normalized flat SwiftPM resource bundles emitted by Xcode 26 `swift build` into canonical macOS `Contents/Info.plist` + `Contents/Resources/` `CFBundle` structure before running `codesign`, preventing `bundle format unrecognized, invalid, or unsuitable` errors when signing nested `css/` and `js/` WebUI subdirectories in the GitHub Actions `release` workflow.
+
 ## [0.21.2] - 2026-11-14
 
 ### Changed

@@ -10,9 +10,10 @@
 - `QWMenuBarApp` updates `NSStatusItem` through `withObservationTracking` (`observeStatusItem()`), re-evaluating only when properties read by `menuBarStatusState` or `menuBarStatusTitle` mutate.
 
 ## 2. Single-Source Telemetry & Honesty Invariants
-Both `Qwegn.app` and `QWServer` (`/ui` + `controlbar.html`) render from `QWDashboardViewModel` (`QWDashboardBuilder`):
+Both `Qwegn.app` and `QWServer` (`/ui` backed by `Sources/Apps/QWServer/Resources/{controlbar.html,logo.svg,css/{base,panels}.css},js/{state,dashboard,markdown,actions}.js}`) render from `QWDashboardViewModel` (`QWDashboardBuilder`):
 - **Catalogue lockstep:** Every card ID read in `QWMenuBar` (`TelemetryCards.swift`) belongs to `MenuBarCardCatalogue.ids`; `/ui` cards belong to `QWDashboardBuilder.cardSpecs`.
-- **Zero fabricated state:** Missing metrics render `—` with `card.reason` tooltips; UI code must never read `engineInfo` / `settings.modelName` for active model titles or synthesize `"Idle"` / `"Stopped"` fallbacks when disconnected (`MenuBarRendererParityTests` & `QWTelemetryHonestyTests`).
+- **Zero fabricated state & offline modular assets:** Missing metrics render `—` with `card.reason` tooltips; UI code must never read `engineInfo` / `settings.modelName` for active model titles or synthesize `"Idle"` / `"Stopped"` fallbacks when disconnected (`MenuBarRendererParityTests`, `DashboardRendererParityTests`, `QWTelemetryHonestyTests`). All `/ui` CSS/JS assets are copied via `Package.swift` `.copy(...)` and served strictly offline (`Cache-Control: no-cache`, zero `https://` CDN links), and Smoke Probe Markdown output (`js/markdown.js`) renders offline with strict HTML escaping, URL scheme filtering, and `Raw` / `Rendered` toggle.
+- **Cross-phase sparkline continuity without synthetic values:** `QWEngineTelemetryRegistry` preserves `nil` on unmeasured slots (`1 Hz` decode-only slots stay `nil` in `prefillRateSeries`), while `QWSparklineGeometry` and `/ui` `updateSparkline` bridge `nil` slots only when the companion phase holds a positive sample on the same timestamp, keeping `Prefill`/`Decode` lines continuous across turns and still breaking on true dual-nil gaps.
 - **Lifecycle boundary & restart coherence:** `QWSettingsCoherence` classifies every setting into `.live` vs `.serverRestart`. Server header actions use `restartServerProcess()` / `toggleDaemon()`; model actions stay inside `RESIDENT MODEL`.
 
 ## 3. Co-Bundled Binary & Packaging

@@ -116,7 +116,12 @@ var targets: [Target] = [
                            "QWEngine", "QWCli", "QWHead",
                            .product(name: "Jinja", package: "swift-jinja")],
             path: targetPaths["QWServer"],
-            resources: [.process("Resources")],
+            resources: [
+                .copy("Resources/controlbar.html"),
+                .copy("Resources/logo.svg"),
+                .copy("Resources/css"),
+                .copy("Resources/js"),
+            ],
             swiftSettings: swiftWarningsAsErrors),
     // Layer 8 — CLI.
     .executableTarget(name: "qwg",

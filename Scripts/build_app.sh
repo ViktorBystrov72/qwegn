@@ -99,7 +99,31 @@ chmod 755 "$APP/Contents/MacOS/qwg"
 cp "Sources/QWMetal/kernel.metallib" "Sources/QWMetal/kernel_std.metallib" "$APP/Contents/Resources/"
 
 if [[ -d "$BIN_DIR/qwegine_QWServer.bundle" ]]; then
-  /usr/bin/ditto "$BIN_DIR/qwegine_QWServer.bundle" "$APP/Contents/Resources/qwegine_QWServer.bundle"
+  DEST_BUNDLE="$APP/Contents/Resources/qwegine_QWServer.bundle"
+  if [[ -f "$BIN_DIR/qwegine_QWServer.bundle/Contents/Info.plist" ]]; then
+    /usr/bin/ditto "$BIN_DIR/qwegine_QWServer.bundle" "$DEST_BUNDLE"
+  else
+    mkdir -p "$DEST_BUNDLE/Contents/Resources"
+    /usr/bin/ditto "$BIN_DIR/qwegine_QWServer.bundle" "$DEST_BUNDLE/Contents/Resources"
+    rm -rf "$DEST_BUNDLE/Contents/Resources/Info.plist" "$DEST_BUNDLE/Contents/Resources/_CodeSignature"
+    cat > "$DEST_BUNDLE/Contents/Info.plist" <<BPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
+    <key>CFBundleIdentifier</key><string>qwegine.QWServer.resources</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>qwegine_QWServer</string>
+    <key>CFBundlePackageType</key><string>BNDL</string>
+    <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+    <key>CFBundleVersion</key><string>${VERSION}</string>
+    <key>LSMinimumSystemVersion</key><string>26.0</string>
+</dict>
+</plist>
+BPLIST
+    /usr/bin/plutil -lint "$DEST_BUNDLE/Contents/Info.plist" >/dev/null
+  fi
 fi
 
 SIGN_FLAGS=(--force --sign "$IDENTITY")

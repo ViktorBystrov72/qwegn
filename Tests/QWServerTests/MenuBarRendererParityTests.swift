@@ -393,6 +393,36 @@ final class MenuBarRendererParityTests: XCTestCase {
         XCTAssertNil(empty.decode.singleSlotGuideY)
     }
 
+    func testDualSparklineBridgesActiveCompanionPhaseSlotsWhileSplittingTrueGaps() throws {
+        // Multi-turn 1Hz trace: sub-second prefills appear as single non-nil slots
+        // separated by active 1Hz decode samples. Neither phase fragments into dots.
+        let multiTurn = QWSparklineGeometry.layout(
+            prefill: [1420.0, nil, nil, nil, 1580.0, nil, nil, 1510.0, nil],
+            decode: [80.0, 81.2, 82.0, 80.5, nil, 83.1, 81.8, 80.9, 82.4],
+            width: 388,
+            height: 50
+        )
+        XCTAssertEqual(multiTurn.prefill.runs.count, 1)
+        XCTAssertEqual(multiTurn.prefill.runs[0].map(\.index), [0, 4, 7])
+        XCTAssertTrue(multiTurn.prefill.isolatedPoints.isEmpty)
+        XCTAssertNil(multiTurn.prefill.singleSlotGuideY)
+        XCTAssertEqual(multiTurn.decode.runs.count, 1)
+        XCTAssertEqual(multiTurn.decode.runs[0].map(\.index), [0, 1, 2, 3, 5, 6, 7, 8])
+        XCTAssertTrue(multiTurn.decode.isolatedPoints.isEmpty)
+
+        // True unmeasured gap across both series still splits into isolated points.
+        let dualGap = QWSparklineGeometry.layout(
+            prefill: [1420.0, nil, 1580.0],
+            decode: [80.0, nil, 82.0],
+            width: 388,
+            height: 50
+        )
+        XCTAssertTrue(dualGap.prefill.runs.isEmpty)
+        XCTAssertEqual(dualGap.prefill.isolatedPoints.map(\.index), [0, 2])
+        XCTAssertTrue(dualGap.decode.runs.isEmpty)
+        XCTAssertEqual(dualGap.decode.isolatedPoints.map(\.index), [0, 2])
+    }
+
     /// The card ids a source asks for, by the only way it asks for one.
     static func cardIds(in source: String) -> Set<String> {
         let marker = "card(\""

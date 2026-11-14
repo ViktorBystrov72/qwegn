@@ -73,8 +73,8 @@ jobs:
           cp "$BIN_DIR/qwg" "$STAGE/"
           ./Scripts/build_app.sh --skip-build --version "$VERSION" --output "$STAGE"
           cp Sources/QWMetal/kernel.metallib Sources/QWMetal/kernel_std.metallib "$STAGE/"
-          if [ -d "$BIN_DIR/qwegine_QWServer.bundle" ]; then
-            ditto "$BIN_DIR/qwegine_QWServer.bundle" "$STAGE/qwegine_QWServer.bundle"
+          if [ -d "$STAGE/Qwegn.app/Contents/Resources/qwegine_QWServer.bundle" ]; then
+            ditto "$STAGE/Qwegn.app/Contents/Resources/qwegine_QWServer.bundle" "$STAGE/qwegine_QWServer.bundle"
           fi
           cp LICENSE README.md "$STAGE/"
           cat > "$STAGE/INSTALL.txt" <<'TXT'

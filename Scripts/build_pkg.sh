@@ -117,8 +117,10 @@ for py in "$ROOT"/Scripts/quantize/*.py; do
   [[ "$base" == test_* ]] && continue
   cp "$py" "$PKGROOT/usr/local/share/qwegn/Scripts/quantize/$base"
 done
-if [[ -d "$BIN_DIR/qwegine_QWServer.bundle" ]]; then
-  /usr/bin/ditto "$BIN_DIR/qwegine_QWServer.bundle" "$PKGROOT/usr/local/share/qwegn/qwegine_QWServer.bundle"
+if [[ -d "$PKGROOT/Applications/Qwegn.app/Contents/Resources/qwegine_QWServer.bundle" ]]; then
+  /usr/bin/ditto \
+    "$PKGROOT/Applications/Qwegn.app/Contents/Resources/qwegine_QWServer.bundle" \
+    "$PKGROOT/usr/local/share/qwegn/qwegine_QWServer.bundle"
   /usr/bin/codesign "${CLI_SIGN_FLAGS[@]}" "$PKGROOT/usr/local/share/qwegn/qwegine_QWServer.bundle"
 fi
 

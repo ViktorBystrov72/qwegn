@@ -291,7 +291,15 @@ final class QWTelemetryHonestyTests: XCTestCase {
     /// The dashboard and the menu bar must not turn a missing reading into a
     /// zero: the law says a gap is a gap, in every surface.
     func testTheSurfacesDoNotCoerceMissingReadingsToZero() throws {
-        let dashboard = try source("Sources/Apps/QWServer/Resources/controlbar.html")
+        let dashboard = try [
+            "Sources/Apps/QWServer/Resources/controlbar.html",
+            "Sources/Apps/QWServer/Resources/css/base.css",
+            "Sources/Apps/QWServer/Resources/css/panels.css",
+            "Sources/Apps/QWServer/Resources/js/state.js",
+            "Sources/Apps/QWServer/Resources/js/dashboard.js",
+            "Sources/Apps/QWServer/Resources/js/markdown.js",
+            "Sources/Apps/QWServer/Resources/js/actions.js",
+        ].map { try source($0) }.joined(separator: "\n")
         XCTAssertFalse(dashboard.contains("util.gpuUsagePercent || 0"),
                        "the dashboard must not turn a missing GPU reading into a zero")
         XCTAssertFalse(dashboard.contains("util.memoryUsedGB || 0"),
