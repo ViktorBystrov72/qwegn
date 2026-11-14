@@ -22,7 +22,6 @@ extension QWEngineDriver: QWSessionInferenceEngine {
     public var arenaBytes: Int { arena.committedBytes }
     public var weightReservedBytes: Int { arena.regionSizes.weights }
     public var weightUsedBytes: Int { arena.weightsSub.usedBytes }
-    public var captureTarget: any MTLCommandQueue { hal.queue }
     public var freeKVPages: Int { kvCache.freePageCount }
     /// The dense family offers every capability its module offers, and expert streaming when the model is MoE.
     public var capabilities: Set<QWKnobCapability> {
@@ -155,7 +154,13 @@ extension QWEngineDriver: QWSessionInferenceEngine {
         activeCollectLogprobs = request.collectLogprobs
         activeConstraint = request.constraint.map { ($0, QWSampler(config: request.sampling)) }
         activeVisualSpans = request.visualSpans
+        activePrefillProgress = request.onPrefillProgress
+        activePrefillTotalTokens = nil
+        activePrefillBasePosition = 0
         defer {
+            activePrefillProgress = nil
+            activePrefillTotalTokens = nil
+            activePrefillBasePosition = 0
             activeVisualSpans = []
             activeConstraint = nil
             activeCollectLogprobs = false

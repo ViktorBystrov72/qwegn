@@ -252,10 +252,10 @@ extension QWEngineLifecycleActor {
 
         var geometryDigest: String? = nil
         if case .loaded(let loaded) = state {
-            geometryDigest = loaded.descriptor.geometryDigestV2Hex
+            geometryDigest = loaded.descriptor.geometryDigestV3Hex
         } else if !config.packPath.isEmpty,
                   let assets = try? QWModelRuntimeAssets.load(packPath: config.packPath) {
-            geometryDigest = assets.descriptor.geometryDigestV2Hex
+            geometryDigest = assets.descriptor.geometryDigestV3Hex
         }
 
         guard let artifact = manifest.matchingCache(
@@ -383,13 +383,6 @@ extension QWEngineLifecycleActor {
         if let oldName {
             logger.log(.info, "[MemoryPack] Unmounted '\(oldName)' and unlocked kvMode")
         }
-    }
-
-    /// Auto-discovers a repository memory pack from `request.model` (`model@repo`) or
-    /// `system`/`developer` messages and returns the `0 ..< N_mem` (+ live delta) token prefix.
-    func autoMountAndPrepareMemoryPrefix(for request: ChatCompletionRequest) async -> [Int] {
-        let state = await autoMountAndPrepareMemoryState(for: request)
-        return state.mountedTokens + state.deltaTokens
     }
 
     /// Auto-discovers a repository memory pack and returns its mounted Cortex tokens, live delta tokens, and manifest.

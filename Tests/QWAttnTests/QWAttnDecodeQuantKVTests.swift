@@ -28,13 +28,13 @@ final class QWAttnDecodeQuantKVTests: XCTestCase {
         return d
     }
     static func u16s(_ d: Data) -> [UInt16] {
-        d.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: UInt16.self)) }
     }
     static func f16(_ bits: UInt16) -> Float { QWQuant.f16tof32Bits(bits) }
     static func readF(_ b: [UInt16]) -> [Float] { b.map { f16($0) } }
     static func buf(_ d: Data) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
-        d.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
     static func tv(_ b: MTLBuffer, _ n: Int) -> QWTensorValue {
@@ -45,14 +45,14 @@ final class QWAttnDecodeQuantKVTests: XCTestCase {
     /// Stride identities: Swift layout authority ≡ kernel #defines (the
     /// numbers in qwattn_decode.metal / qwgemm_batched.metal headers).
     func testLayoutIdentities() throws {
-        XCTAssertEqual(QWKVCache.pageBytes(mode: .q8), 264192, "≡ QW_Q8_PGE")
-        XCTAssertEqual(QWKVCompressedLayout(mode: .q8).dataBytesPerPage, 262144, "≡ QW_Q8_HDR")
-        XCTAssertEqual(QWKVCache.pageBytes(mode: .q4), 139264, "≡ QW_Q4_PGE")
-        XCTAssertEqual(QWKVCompressedLayout(mode: .q4).dataBytesPerPage, 131072, "≡ QW_Q4_HDR")
+        XCTAssertEqual(QWKVCache.pageBytes(mode: .q8, geometry: .qwen38_27b), 264192, "≡ QW_Q8_PGE")
+        XCTAssertEqual(QWKVCompressedLayout(mode: .q8, geometry: .qwen38_27b).dataBytesPerPage, 262144, "≡ QW_Q8_HDR")
+        XCTAssertEqual(QWKVCache.pageBytes(mode: .q4, geometry: .qwen38_27b), 139264, "≡ QW_Q4_PGE")
+        XCTAssertEqual(QWKVCompressedLayout(mode: .q4, geometry: .qwen38_27b).dataBytesPerPage, 131072, "≡ QW_Q4_HDR")
     }
 
     static func makeEnv(mode: QWKVMode, tokensCeiling: Int) throws -> (QWKVCache, QWArena, QWMRegion) {
-        let pageBytes = QWKVCache.pageBytes(mode: mode)
+        let pageBytes = QWKVCache.pageBytes(mode: mode, geometry: .qwen38_27b)
         let needPages = (tokensCeiling + 255) / 256
         let poolBytes = pageBytes * needPages * 2
         let tables = QWKVCache.tableSlotBytes * 2 * layers.count * QWKVCache.maxSeqs
@@ -109,7 +109,7 @@ final class QWAttnDecodeQuantKVTests: XCTestCase {
         _ = try Self.runDecode(cache: cache, handle: h, layer: Self.layers[0], qgate: qgate,
                                knew: knew, vnew: vnew, partials: part, C: C, splits: splits, mode: .q8)
         // Reference bytes for row C (K and V) from the f16 staging rows.
-        let layout = QWKVCompressedLayout(mode: .q8)
+        let layout = QWKVCompressedLayout(mode: .q8, geometry: .qwen38_27b)
         var mismatches = 0
         let pairs: [(row: [UInt16], kind: QWKVKind)] = [(Self.u16s(knew), .k), (Self.u16s(vnew), .v)]
         for (row, kind) in pairs {
@@ -122,7 +122,7 @@ final class QWAttnDecodeQuantKVTests: XCTestCase {
                 .advanced(by: view.table.region.base + view.table.offset + page * 4)
                 .assumingMemoryBound(to: Int32.self)[0]
             let pageBase = view.pool.buffer.contents()
-                .advanced(by: view.pool.base + Int(pageID) * QWKVCache.pageBytes(mode: .q8))
+                .advanced(by: view.pool.base + Int(pageID) * QWKVCache.pageBytes(mode: .q8, geometry: .qwen38_27b))
             // Expected payload + header.
             var f = [Float](repeating: 0, count: 1024)
             var q = [Int8](repeating: 0, count: 1024)
@@ -156,7 +156,7 @@ final class QWAttnDecodeQuantKVTests: XCTestCase {
         let splits = QWAttnDecode.splits(forKeys: C + 1)
         _ = try Self.runDecode(cache: cache, handle: h, layer: Self.layers[0], qgate: qgate,
                                knew: knew, vnew: vnew, partials: part, C: C, splits: splits, mode: .q4)
-        let layout = QWKVCompressedLayout(mode: .q4)
+        let layout = QWKVCompressedLayout(mode: .q4, geometry: .qwen38_27b)
         var mismatches = 0
         let pairs: [(row: [UInt16], kind: QWKVKind)] = [(Self.u16s(knew), .k), (Self.u16s(vnew), .v)]
         for (row, kind) in pairs {
@@ -167,7 +167,7 @@ final class QWAttnDecodeQuantKVTests: XCTestCase {
                 .advanced(by: view.table.region.base + view.table.offset + page * 4)
                 .assumingMemoryBound(to: Int32.self)[0]
             let pageBase = view.pool.buffer.contents()
-                .advanced(by: view.pool.base + Int(pageID) * QWKVCache.pageBytes(mode: .q4))
+                .advanced(by: view.pool.base + Int(pageID) * QWKVCache.pageBytes(mode: .q4, geometry: .qwen38_27b))
             var f = [Float](repeating: 0, count: 1024)
             var q = [UInt8](repeating: 0, count: 512)
             var sc = [Float16](repeating: 0, count: 8)
@@ -252,7 +252,7 @@ final class QWAttnDecodeQuantKVTests: XCTestCase {
         let g = QWModelGeometry.qwen38_27b
         let B = 3, C = 16
         for mode in [QWKVMode.q8, QWKVMode.q4] {
-            let pageBytes = QWKVCache.pageBytes(mode: mode)
+            let pageBytes = QWKVCache.pageBytes(mode: mode, geometry: g)
             let poolBytes = pageBytes * 4
             let tables = QWKVCache.tableSlotBytes * 2 * Self.layers.count * QWKVCache.maxSeqs
             let pBytes = QWAttnDecode.decodePartialsBytesBatched(T: B, geometry: g)

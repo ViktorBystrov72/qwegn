@@ -80,9 +80,9 @@ final class FNMetalMultiBitUnpackTests: XCTestCase {
             let offset = (row * groups + g) * bytesPerGroup
             let slice = bank.subdata(in: offset..<(offset + bytesPerGroup))
             let xs = (0..<group).map { f32Activations ? x[g * group + $0] : Float(Float16(x[g * group + $0])) }
-            acc += slice.withUnsafeBytes { QWAQBlock.dot(group: $0, bits: bits, group: group, x: xs) }
+            acc += slice.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.dot(group: raw, bits: bits, group: group, x: xs) }
             var weights: [Float] = []
-            slice.withUnsafeBytes { QWAQBlock.unpack(group: $0, bits: bits, group: group, into: &weights) }
+            slice.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.unpack(group: raw, bits: bits, group: group, into: &weights) }
             for i in 0..<group { magnitude += abs(weights[i] * xs[i]) }
         }
         return (acc, magnitude)

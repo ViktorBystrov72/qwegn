@@ -7,8 +7,6 @@ import Metal
 import QWAlloc
 import QWHAL
 
-public typealias QWAttentionSelectionMode = QWCoarsePoolIndex.SelectionMode
-
 public enum QWCoarsePoolIndex {
     public static let macroChunkTokens = 4096
     public static let macroChunkPools = 1024

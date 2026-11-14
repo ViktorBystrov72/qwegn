@@ -18,7 +18,6 @@ public enum QWGDNConvError: Error, CustomStringConvertible {
 
 /// Encoder for `qwg_gdn_conv`. Stateless after init.
 public final class QWGDNConv {
-    public static let channels = QWModelGeometry.qwen38_27b.gdnQKVChannels      // 10240
     public static let stateRows = 3
     static let chPerBand = 256           // 32 lanes x 8 channels, 40 bands (all GPU cores busy at small T)
     static let tokBand = 32
@@ -53,8 +52,12 @@ public final class QWGDNConv {
     }
 
     /// Bytes per tensor role (f16 units): x/y = T·channels, state = 3·channels.
-    public static func sizes(T: Int, channels: Int = QWGDNConv.channels) -> (xy: Int, state: Int, w: Int, bias: Int) {
+    public static func sizes(T: Int, channels: Int) -> (xy: Int, state: Int, w: Int, bias: Int) {
         (T * channels, stateRows * channels, channels * 4, channels)
+    }
+
+    public func sizes(T: Int) -> (xy: Int, state: Int, w: Int, bias: Int) {
+        Self.sizes(T: T, channels: instChannels)
     }
 
     private var instChannels: Int { max(1, geometry.gdnQKVChannels) }

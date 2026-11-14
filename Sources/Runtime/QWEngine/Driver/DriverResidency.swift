@@ -2,17 +2,16 @@
 // The planner sizes the resident bank to the memory budget the tuning's
 // memory policy names; the rest of each layer's experts stream from SSD.
 import Foundation
+import os
 import QWCore
 import QWHAL
 import QWHead
 import QWGDN
-import QWState
 import QWKV
 import QWQuant
 
 extension QWEngineDriver {
-    private static let formatCacheLock = NSLock()
-    nonisolated(unsafe) private static var cachedPackFormats: [String: QWWeightFormat] = [:]
+    private static let cachedPackFormats = OSAllocatedUnfairLock<[String: QWWeightFormat]>(initialState: [:])
 
     /// Default OS RAM reserve (GiB) per memory policy when `osReserveGiB` is not explicitly set:
     /// 16 GiB under `.maxResident` and 24 GiB under `.safe` (matching `docs/benchmarks.md`).
@@ -120,51 +119,41 @@ extension QWEngineDriver {
         tuning: QWEngineTuning = .default,
         physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes()
     ) -> QWContextMemoryEstimate {
+        QWModuleRegistry.estimateContextMemory(
+            descriptor: descriptor, packPath: packPath, contextTokens: contextTokens,
+            kvMode: kvMode, mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
+            prefillChunkSize: prefillChunkSize, tuning: tuning,
+            physicalMemoryBytes: physicalMemoryBytes
+        )
+    }
+
+    static func estimateDriverContextMemory(
+        descriptor: QWModelDescriptor,
+        packPath: String? = nil,
+        contextTokens: Int,
+        kvMode: QWKVMode = .f16,
+        mtpDrafts: Int = 0,
+        mtpBackend: String = "variational",
+        prefillChunkSize: Int = QWPrefillLimits.chunkRows,
+        tuning: QWEngineTuning = .default,
+        physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes()
+    ) -> QWContextMemoryEstimate {
         let clampedContext = max(64, min(1_048_576, contextTokens))
-        if descriptor.family == .qwen38FlashNext {
-            let perTokBytes: Int = switch kvMode {
-            case .f16: 31_296
-            case .q8:  18_096
-            case .q4:  11_752
-            }
-            let hiBit = (descriptor.quantization?.bits ?? 4) > 4
-            let minWeights = (hiBit ? 3_408 : 2_384) << 20
-            let onDisk = QWResidencyAdmission.flashNextOnDiskFootprint(packPath: packPath, minWeightsBytes: minWeights)
-            let weightsBytes = onDisk.weightsBytes + onDisk.pleBytes
-            let scratchBytes = (1408 << 20) + (836 << 20)
-            let fixedBytes = weightsBytes + scratchBytes
-            let alignedCap = QWCapacityPlan.steppedCapacity(clampedContext)
-            let kvCap = alignedCap >= 32_768 ? (alignedCap + 1024) : alignedCap
-            let kvBytes = kvCap * perTokBytes
-            let requiredBytes = fixedBytes + kvBytes
-            let reserveGiB = tuning.osReserveGiB ?? Double(QWCapacityBudget.osReserveBytes >> 30)
-            let reserveBytes = max(0, Int((reserveGiB * Double(1 << 30)).rounded()))
-            let availBytes = max(0, (physicalMemoryBytes ?? 0) - reserveBytes)
-            let maxFitting = availBytes > fixedBytes ? min(1_048_576, (availBytes - fixedBytes) / perTokBytes) : 0
-            return QWContextMemoryEstimate(
-                contextTokens: clampedContext, weightsBytes: weightsBytes, kvBytes: kvBytes,
-                scratchAndStateBytes: scratchBytes, requiredBytes: requiredBytes,
-                availableBytes: availBytes, maxFittingContext: maxFitting,
-                fits: availBytes == 0 || requiredBytes <= availBytes)
-        }
         let rawGeometry = QWModelGeometry(descriptor: descriptor).withResidentExperts(tuning.residentExpertsPerLayer)
         let effDrafts = max(0, mtpDrafts)
         let maxMTP = ["dflash2", "dflash", "dspine"].contains(mtpBackend.lowercased()) ? 15 : 5
         let mtpWeightDrafts = descriptor.mtpLayers > 0 ? min(effDrafts, maxMTP) : 0
         let format: QWWeightFormat = {
             if let path = packPath, !path.isEmpty {
-                formatCacheLock.lock()
-                let hit = cachedPackFormats[path]
-                formatCacheLock.unlock()
-                if let hit { return hit }
+                if let hit = cachedPackFormats.withLock({ $0[path] }) { return hit }
                 let root = QWModelRoot(url: URL(fileURLWithPath: path))
-                let pk = (root.kind == .qwp1 || root.kind == nil) ? (try? QWQuant.Pack(url: URL(fileURLWithPath: path))) : nil
+                let pk = (root.kind == .qwp1 || root.kind == nil)
+                    ? (try? QWQuant.Pack(url: URL(fileURLWithPath: path), descriptor: descriptor))
+                    : nil
                 if let choice = try? Self.weightFormatChoice(
                     for: root, quantization: descriptor.quantization, geometry: rawGeometry,
                     mtpDrafts: effDrafts, pack: pk) {
-                    formatCacheLock.lock()
-                    cachedPackFormats[path] = choice.format
-                    formatCacheLock.unlock()
+                    cachedPackFormats.withLock { $0[path] = choice.format }
                     return choice.format
                 }
             }

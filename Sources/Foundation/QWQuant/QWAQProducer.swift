@@ -43,8 +43,8 @@ public enum QWAQProducer {
             body[word * 4 + 3] = UInt8((current >> 24) & 0xFF)
         }
         var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: Float16(scale).bitPattern.littleEndian) { Array($0) })
-        out.append(contentsOf: withUnsafeBytes(of: Float16(bias).bitPattern.littleEndian) { Array($0) })
+        out.append(contentsOf: withUnsafeBytes(of: Float16(scale).bitPattern.littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
+        out.append(contentsOf: withUnsafeBytes(of: Float16(bias).bitPattern.littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         out.append(contentsOf: body)
         return out
     }
@@ -69,8 +69,8 @@ public enum QWAQProducer {
             body[word * 4 + 3] = UInt8((current >> 24) & 0xFF)
         }
         var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: storedScale.bitPattern.littleEndian) { Array($0) })
-        out.append(contentsOf: withUnsafeBytes(of: folded.bitPattern.littleEndian) { Array($0) })
+        out.append(contentsOf: withUnsafeBytes(of: storedScale.bitPattern.littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
+        out.append(contentsOf: withUnsafeBytes(of: folded.bitPattern.littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         out.append(contentsOf: body)
         return out
     }
@@ -80,23 +80,6 @@ public enum QWAQProducer {
     /// weight. f16 SUBNORMALS are exact and are accepted.
     public static func headerHolds(scale: Float, bias: Float) -> Bool {
         Float(Float16(scale)) == scale && Float(Float16(bias)) == bias
-    }
-
-    /// One group of an MLX affine tensor, repacked into our one plane. The
-    /// payload is copied verbatim; the header holds the group's own scale and
-    /// bias. A header f16 cannot hold exactly is REFUSED BY NAME, not rounded.
-    public static func repackMLXGroup(bits: Int, group: Int, packed: [UInt8],
-                                       scale: Float, bias: Float) throws -> Data {
-        let payload = group * bits / 8
-        precondition(packed.count == payload, "a group holds \(payload) payload bytes")
-        guard headerHolds(scale: scale, bias: bias) else {
-            throw QWAQProducerError.headerNotRepresentable(scale: scale, bias: bias)
-        }
-        var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: Float16(scale).bitPattern.littleEndian) { Array($0) })
-        out.append(contentsOf: withUnsafeBytes(of: Float16(bias).bitPattern.littleEndian) { Array($0) })
-        out.append(contentsOf: packed)
-        return out
     }
 
     /// The incumbent's `Block_HQ4_G32` nibble layout: element `8w + j` sits

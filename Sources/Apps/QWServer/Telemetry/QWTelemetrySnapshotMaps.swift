@@ -54,16 +54,18 @@ extension QWEngineTelemetryRegistry {
     }
 
     /// When each metric in the snapshot was taken.
-    static func sampledAtMap(liveDecode: Double?, lastPrefill: Double?, lastDecode: Double?,
-                                     emaPrefill: Double?, emaDecode: Double?,
-                                     avgPrefill: Double?, avgDecode: Double?,
-                                     displayPrefill: Double?, displayDecode: Double?,
-                                     ttft: Bool, hw: QWSystemHardwareUtilization,
-                                     busy: QWTelemetryValue?,
-                                     lastPrefillAt: Date?, lastDecodeAt: Date?,
-                                     lastTurnAt: Date?, lastTtftAt: Date?,
-                                     prefillFromCache: Bool) -> [String: Date] {
+    static func sampledAtMap(livePrefill: Double?, liveDecode: Double?,
+                             lastPrefill: Double?, lastDecode: Double?,
+                             emaPrefill: Double?, emaDecode: Double?,
+                             avgPrefill: Double?, avgDecode: Double?,
+                             displayPrefill: Double?, displayDecode: Double?,
+                             ttft: Bool, hw: QWSystemHardwareUtilization,
+                             busy: QWTelemetryValue?,
+                             livePrefillAt: Date?, lastPrefillAt: Date?, lastDecodeAt: Date?,
+                             lastTurnAt: Date?, lastTtftAt: Date?,
+                             prefillFromCache: Bool) -> [String: Date] {
         var map: [String: Date] = [:]
+        if livePrefill != nil { map[QWTelemetryMetric.livePrefillTokensPerSec.rawValue] = livePrefillAt }
         if liveDecode != nil { map[QWTelemetryMetric.liveDecodeTokensPerSec.rawValue] = lastDecodeAt }
         if lastPrefill != nil { map[QWTelemetryMetric.lastPrefillTokensPerSec.rawValue] = lastPrefillAt }
         if lastDecode != nil { map[QWTelemetryMetric.lastDecodeTokensPerSec.rawValue] = lastDecodeAt }
@@ -71,7 +73,9 @@ extension QWEngineTelemetryRegistry {
         if emaDecode != nil { map[QWTelemetryMetric.ema1mDecodeTokensPerSec.rawValue] = lastTurnAt }
         if avgPrefill != nil { map[QWTelemetryMetric.avgPrefillTokensPerSec.rawValue] = lastTurnAt }
         if avgDecode != nil { map[QWTelemetryMetric.avgDecodeTokensPerSec.rawValue] = lastTurnAt }
-        if displayPrefill != nil { map[QWTelemetryMetric.displayPrefillTokensPerSec.rawValue] = lastPrefillAt }
+        if displayPrefill != nil {
+            map[QWTelemetryMetric.displayPrefillTokensPerSec.rawValue] = livePrefill != nil ? livePrefillAt : lastPrefillAt
+        }
         if displayDecode != nil { map[QWTelemetryMetric.displayDecodeTokensPerSec.rawValue] = lastDecodeAt }
         if ttft { map[QWTelemetryMetric.ttftMs.rawValue] = lastTtftAt }
         map[QWTelemetryMetric.cpuPercent.rawValue] = hw.sampledAt

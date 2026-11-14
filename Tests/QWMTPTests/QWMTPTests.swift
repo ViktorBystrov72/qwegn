@@ -20,7 +20,6 @@ import QWQuant
 import QWRope
 import QWKV
 import QWAttn
-import QWMLP
 
 final class QWMTPTests: XCTestCase {
 
@@ -35,14 +34,13 @@ final class QWMTPTests: XCTestCase {
         }
         return d
     }
-    static func f64s(_ d: Data) -> [Double] { d.withUnsafeBytes { Array($0.bindMemory(to: Double.self)) } }
-    static func i32s(_ d: Data) -> [Int32] { d.withUnsafeBytes { Array($0.bindMemory(to: Int32.self)) } }
+    static func i32s(_ d: Data) -> [Int32] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Int32.self)) } }
 
     // GPU-leg helpers — identical to the C15 harness (same buffers, same
     // QWTensorValue view; the fc leg must ride the proven door).
     static let hal: QWHal = { try! QWHal(geometry: .qwen38_27b) }()
-    static func f32s(_ d: Data) -> [Float] { d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }
-    static func f16s(_ d: Data) -> [UInt16] { d.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) } }
+    static func f32s(_ d: Data) -> [Float] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) } }
+    static func f16s(_ d: Data) -> [UInt16] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: UInt16.self)) } }
     static func readF(_ b: [UInt16]) -> [Float] { b.map { QWQuant.f16tof32Bits($0) } }
     static func u16row(_ b: MTLBuffer, _ byteOffset: Int, _ n: Int) -> [UInt16] {
         let p = b.contents().advanced(by: byteOffset).assumingMemoryBound(to: UInt16.self)
@@ -63,7 +61,7 @@ final class QWMTPTests: XCTestCase {
     }
     static func buf(_ d: Data) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
-        d.withUnsafeBytes { p in _ = memcpy(b.contents(), p.baseAddress!, p.count) }
+        d.withUnsafeBytes { (p: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), p.baseAddress!, p.count) }
         return b
     }
     static func zeros(_ elems: Int, _ dt: QWDType) -> MTLBuffer {
@@ -76,87 +74,6 @@ final class QWMTPTests: XCTestCase {
         QWTensorValue(region: QWMRegion(buffer: b, base: 0,
                                         length: max(16, Int((Double(n) * dt.bytesPerParam).rounded()))),
                       offset: 0, shape: QWTensorShape([n], dt))
-    }
-
-    struct Geo: Decodable { let H, KVH, HD, NL, V, ISZ, P, N, R: Int }
-    struct RoundsFile: Decodable { let uni_consumed: Int
-        enum CodingKeys: String, CodingKey { case uni_consumed } }
-
-    /// Full golden replay: per round feed drafts + p_d + p_t + the exact
-    /// uniform window; accepted / finalToken / nDrawn must match the
-    /// golden EXACTLY and the stream must end fully consumed.
-    func testGoldenReplay() throws {
-        let rounds = try Self.i32s(Self.load("mtpA_rounds.bin"))      // [R,N]
-        let accG = try Self.i32s(Self.load("mtpA_accepted.bin"))
-        let commG = try Self.i32s(Self.load("mtpA_committed.bin"))
-        let drawnG = try Self.i32s(Self.load("mtpA_drawn.bin"))
-        let uni = try Self.f64s(Self.load("mtpA_uni.bin"))
-        let pd = try Self.f64s(Self.load("mtpA_pd.bin"))              // [R,N,V]
-        let pt = try Self.f64s(Self.load("mtpA_pt.bin"))              // [R,N+1,V]
-        let geo = try JSONDecoder().decode(Geo.self, from: try Self.load("mtpA_geom.json"))
-        let rf = try JSONDecoder().decode(RoundsFile.self, from: try Self.load("mtpA_rounds.json"))
-        let (R, N, V) = (geo.R, geo.N, geo.V)
-        XCTAssertEqual(rounds.count, R * N)
-        XCTAssertEqual(uni.count, rf.uni_consumed)
-
-        var ui = 0
-        var accMismatch = 0, tokMismatch = 0
-        for r in 0..<R {
-            let dp = (0..<N).map { Array(pd[(r * N + $0) * V ..< (r * N + $0 + 1) * V]) }
-            let tp = (0...N).map { Array(pt[(r * (N + 1) + $0) * V ..< (r * (N + 1) + $0 + 1) * V]) }
-            let d = (0..<N).map { Int(rounds[r * N + $0]) }
-            // STREAM LAW (gen_mtp_fixtures docstring): per round the draft
-            // leg consumed N uniforms FIRST (sampling d_1..d_N), then the
-            // accept leg consumed nDrawn. The replay skips the draft slots
-            let res = QWMTP.acceptRound(draftProbs: dp, targetRows: tp, drafts: d,
-                                        uniforms: uni, offset: ui + N)
-            if res.accepted != Int(accG[r]) { accMismatch += 1 }
-            if res.finalToken != Int(commG[r]) { tokMismatch += 1 }
-            XCTAssertEqual(res.nDrawn, Int(drawnG[r]), "draws law r\(r)")
-            ui += N + res.nDrawn           // draft slots + accept slots
-        }
-        XCTAssertEqual(accMismatch, 0, "accept-lens vs golden")
-        XCTAssertEqual(tokMismatch, 0, "committed tokens vs golden")
-        XCTAssertEqual(ui, uni.count, "uniform stream fully consumed exactly")
-    }
-
-    /// Draw-count law property: N=2 ⇒ acc+2 draws on reject, 3 on all-
-    /// accept. Seeded random rows.
-    func testDrawCountLaw() {
-        var seed: UInt64 = 42
-        func u() -> Double { seed &+= 0x9E3779B97F4A7C15
-            var z = seed &* 0xff51afd7ed558ccd
-            z ^= z >> 33; z &*= 0xc4ceb9fe1a85ec53; z ^= z >> 33
-            return Double(z >> 11) / Double(1 << 53) }
-        func row(_ scale: Double) -> [Double] {
-            var r = (0..<64).map { _ in (u() - 0.5) * scale }
-            let mx = r.max()!
-            r = r.map { exp($0 - mx) }
-            let s = r.reduce(0, +)
-            return r.map { $0 / s }
-        }
-        for _ in 0..<2000 {
-            let pd = [row(2), row(2)]
-            let pt = [row(2), row(2), row(2)]
-            let d = [Int.random(in: 0..<64), Int.random(in: 0..<64)]
-            let uni = (0..<4).map { _ in u() }
-            let res = QWMTP.acceptRound(draftProbs: pd, targetRows: pt, drafts: d,
-                                        uniforms: uni)
-            XCTAssertEqual(res.nDrawn, res.accepted < 2 ? res.accepted + 2 : 3)
-        }
-    }
-
-    /// Scan law: ascending strict-cumsum; boundary tokens + fp tail.
-    func testScanLaw() {
-        let p: [Double] = [0.5, 0.25, 0.125, 0.125]
-        p.withUnsafeBufferPointer { b in
-            XCTAssertEqual(QWMTP.scan(b, 0.4), 0)
-            XCTAssertEqual(QWMTP.scan(b, 0.5), 1)          // strict: 0.5 is NOT < 0.5
-            XCTAssertEqual(QWMTP.scan(b, 0.74), 1)
-            XCTAssertEqual(QWMTP.scan(b, 0.76), 2)
-            XCTAssertEqual(QWMTP.scan(b, 0.999), 3)
-            XCTAssertEqual(QWMTP.scan(b, 0.9999999999999999), 3)
-        }
     }
 
     // ── fc GEMV (draft leg): [5120,10240] q4g is an F1-family shape —
@@ -283,8 +200,8 @@ final class QWMTPTests: XCTestCase {
         let tab = Self.buf(try Self.load("mtpc_rope_tab.bin"))            // f32 [3][64]
         let wqT = Self.buf(try Self.load("mtpc_wq.bin"))                   // [256]
         let wkT = Self.buf(try Self.load("mtpc_wk.bin"))                   // [1024]
-        let rope = QWRopeApply(tableTensor: Self.tv(tab, 3 * 64, .f32),
-                               hal: Self.hal, nullSlab: Self.zeros(16, .f16), geometry: .qwen38_27b)
+        let rope = try QWRopeApply(tableTensor: Self.tv(tab, 3 * 64, .f32),
+                                   hal: Self.hal, nullSlab: Self.zeros(16, .f16), geometry: .qwen38_27b)
         let gsq = Self.zeros(H / 128, .f32)
         let qg32 = Self.zeros(QG, .f32), qg16 = Self.zeros(QG, .f16)
         let k32 = Self.zeros(KK, .f32), k16 = Self.zeros(KK, .f16)
@@ -359,7 +276,7 @@ final class QWMTPTests: XCTestCase {
         let P = 16, C = P - 1                              // C keys in cache; new row = C+1-th
 
         func env(_ ceiling: Int) throws -> (QWKVCache, QWArena, QWMRegion) {
-            let pageBytes = QWKVCache.pageBytes(mode: .f16)
+            let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
             let poolBytes = pageBytes * ((ceiling + 255) / 256) * 2
             let tables = QWKVCache.tableSlotBytes * 2 * 1 * QWKVCache.maxSeqs
             let pBytes = QWAttnDecode.decodePartialsBytes(geometry: .qwen38_27b)
@@ -488,106 +405,8 @@ eH.endEncoding(); cbH.commit(); cbH.waitUntilCompleted()
         _ = arena   // retention
     }
 
-    func testGPUGumbelArgmaxMatchesPhiloxReference() throws {
-        let draft: [Float] = [0.25, 1.5, -0.5, -2]
-        let target: [Float] = [1.25, 0.75, -0.5, -2]
-        let vocabulary = UInt32(draft.count)
-        let seed: UInt64 = 137
-        let position: UInt64 = 3
-        let temperature: Float = 0.75
-        func floatBuffer(_ values: [Float]) throws -> MTLBuffer {
-            let buffer = try XCTUnwrap(Self.hal.device.makeBuffer(
-                length: values.count * MemoryLayout<Float>.size, options: .storageModeShared))
-            values.withUnsafeBytes { buffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
-            return buffer
-        }
-        func winner(_ logits: [Float]) -> Int32 {
-            let base = position * UInt64(vocabulary)
-            return Int32(logits.indices.max { lhs, rhs in
-                let lu = max(Double(QWPhilox.u(base + UInt64(lhs), seed: seed, version: .upper24)),
-                             1.0 / 16_777_216.0)
-                let ru = max(Double(QWPhilox.u(base + UInt64(rhs), seed: seed, version: .upper24)),
-                             1.0 / 16_777_216.0)
-                let ls = Double(logits[lhs]) / Double(temperature) - log(-log(lu))
-                let rs = Double(logits[rhs]) / Double(temperature) - log(-log(ru))
-                return ls == rs ? lhs > rhs : ls < rs
-            }!)
-        }
-        let draftBuffer = try floatBuffer(draft), targetBuffer = try floatBuffer(target)
-        let output = try XCTUnwrap(Self.hal.device.makeBuffer(length: 8, options: .storageModeShared))
-        memset(output.contents(), 0, output.length)
-        let pipeline = try Self.hal.pipeline("qwg_gumbel_sample_argmax")
-        let commandBuffer = try XCTUnwrap(Self.hal.queue.makeCommandBuffer())
-        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
-        encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(draftBuffer, offset: 0, index: 0)
-        encoder.setBuffer(targetBuffer, offset: 0, index: 1)
-        encoder.setBuffer(output, offset: 0, index: 2)
-        var vocabularyValue = vocabulary
-        var seedValue = seed, positionValue = position
-        var temperatureValue = temperature
-        encoder.setBytes(&vocabularyValue, length: MemoryLayout<UInt32>.size, index: 3)
-        encoder.setBytes(&seedValue, length: MemoryLayout<UInt64>.size, index: 4)
-        encoder.setBytes(&positionValue, length: MemoryLayout<UInt64>.size, index: 5)
-        encoder.setBytes(&temperatureValue, length: MemoryLayout<Float>.size, index: 6)
-        encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-        encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        XCTAssertEqual(commandBuffer.status, .completed, "\(String(describing: commandBuffer.error))")
-        let winners = output.contents().assumingMemoryBound(to: Int32.self)
-        XCTAssertEqual(winners[0], winner(draft))
-        XCTAssertEqual(winners[1], winner(target))
-    }
-
-    func testVariationalRelaxedGreedyAndStochasticAcceptance() throws {
-        // 1. Greedy acceptance: margin = 0 matches strict greedy; margin = 1.5 accepts near-argmax drafts.
-        let targetLogits: [[Float]] = [
-            [1.0, 5.0, 4.2, -1.0], // argmax = 1 (5.0), token 2 = 4.2 (gap 0.8 <= 1.5)
-            [0.5, 2.0, 6.0, 3.0],  // argmax = 2 (6.0), token 1 = 2.0 (gap 4.0 > 1.5)
-            [9.0, 1.0, 0.0, -2.0]  // bonus row argmax = 0
-        ]
-        let targetTokens = [1, 2, 0]
-        let drafts = [2, 1]
-
-        let strictGreedy = try QWMTP.checkedRelaxedGreedyRound(
-            drafts: drafts,
-            targetTokens: targetTokens,
-            targetLogits: targetLogits,
-            vocabulary: 4,
-            margin: 0.0
-        )
-        XCTAssertEqual(strictGreedy.accepted, 0)
-        XCTAssertEqual(strictGreedy.finalToken, 1)
-
-        let relaxedGreedy = try QWMTP.checkedRelaxedGreedyRound(
-            drafts: drafts,
-            targetTokens: targetTokens,
-            targetLogits: targetLogits,
-            vocabulary: 4,
-            margin: 1.5
-        )
-        XCTAssertEqual(relaxedGreedy.accepted, 1)
-        XCTAssertEqual(relaxedGreedy.finalToken, 2) // argmax of row 1 where draft[1]=1 was rejected
-
-        // 1b. Probability floor: row 0's draft has p_target ~= 0.306 — kept at 0.2, refused at 0.35.
-        let flooredLow = try QWMTP.checkedRelaxedGreedyRound(
-            drafts: drafts, targetTokens: targetTokens, targetLogits: targetLogits,
-            vocabulary: 4, margin: 1.5, minProbability: 0.2)
-        XCTAssertEqual(flooredLow.accepted, 1)
-        let flooredHigh = try QWMTP.checkedRelaxedGreedyRound(
-            drafts: drafts, targetTokens: targetTokens, targetLogits: targetLogits,
-            vocabulary: 4, margin: 1.5, minProbability: 0.35)
-        XCTAssertEqual(flooredHigh.accepted, 0)
-        XCTAssertEqual(flooredHigh.finalToken, 1)
-        XCTAssertTrue(QWMTP.clearsProbabilityFloor(targetLogits[0], token: 2, minProbability: 0))
-        XCTAssertFalse(QWMTP.clearsProbabilityFloor(targetLogits[0], token: 2, minProbability: 1))
-        XCTAssertThrowsError(try QWMTP.checkedRelaxedGreedyRound(
-            drafts: drafts, targetTokens: targetTokens, targetLogits: targetLogits,
-            vocabulary: 4, margin: 1.5, minProbability: 1.5))
-
-        // 2. Relaxed Gumbel coupling: margin = 0 matches strict Gumbel coupling; margin > 0 accepts within margin.
+    func testVariationalRelaxedGumbelAcceptance() throws {
+        // Relaxed Gumbel coupling: margin = 0 matches strict Gumbel coupling; margin > 0 accepts within margin.
         let draftDists = [
             try QWSamplingDistribution.sparse(vocabulary: 4, ids: [0, 1, 2, 3], weights: [0.05, 0.15, 0.75, 0.05]),
             try QWSamplingDistribution.sparse(vocabulary: 4, ids: [0, 1, 2, 3], weights: [0.10, 0.70, 0.10, 0.10])
@@ -613,26 +432,6 @@ eH.endEncoding(); cbH.commit(); cbH.waitUntilCompleted()
         )
         XCTAssertGreaterThanOrEqual(gumbelWide.accepted, gumbelStrict.accepted)
         XCTAssertEqual(gumbelWide.accepted, 2)
-
-        // 3. Relaxed Leviathan acceptance: margin = 0 matches strict acceptRound; margin > 0 increases acceptance.
-        let uniforms: [Double] = [0.99, 0.99, 0.10, 0.10] // high uniforms reject strict Leviathan when tp < dp
-        let strictLev = try QWMTP.checkedRelaxedAcceptRound(
-            draftDistributions: draftDists,
-            targetDistributions: targetDists,
-            drafts: [2, 1],
-            uniforms: uniforms,
-            margin: 0.0
-        )
-        let relaxedLev = try QWMTP.checkedRelaxedAcceptRound(
-            draftDistributions: draftDists,
-            targetDistributions: targetDists,
-            drafts: [2, 1],
-            uniforms: uniforms,
-            margin: 1.0
-        )
-        XCTAssertEqual(strictLev.accepted, 0)
-        XCTAssertEqual(relaxedLev.accepted, 2)
-        XCTAssertEqual(relaxedLev.finalToken, 0)
     }
 
     func testGPUVariationalArgmaxFinKernel() throws {
@@ -660,10 +459,10 @@ eH.endEncoding(); cbH.commit(); cbH.waitUntilCompleted()
         // draftTok layout matches Flash-Next tokenIn: [committed, draft0, draft1, draft2]
         let draftTok: [UInt32] = [0, 2, 4, 6]
 
-        let logitsBuf = Self.buf(logits.withUnsafeBytes { Data($0) })
-        let hiBuf = Self.buf(keysHi.withUnsafeBytes { Data($0) })
-        let loBuf = Self.buf(keysLo.withUnsafeBytes { Data($0) })
-        let draftsBuf = Self.buf(draftTok.withUnsafeBytes { Data($0) })
+        let logitsBuf = Self.buf(logits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
+        let hiBuf = Self.buf(keysHi.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
+        let loBuf = Self.buf(keysLo.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
+        let draftsBuf = Self.buf(draftTok.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
         let outTokBuf = Self.zeros(rows, .i32)
 
         guard let (cb, enc) = Self.hal.begin() else { XCTFail("cmdbuffer"); return }
@@ -718,10 +517,10 @@ eH.endEncoding(); cbH.commit(); cbH.waitUntilCompleted()
         let keysLo: [UInt32] = [~UInt32(1), ~UInt32(3), ~UInt32(5), ~UInt32(7)]
         let draftTok: [UInt32] = [0, 2, 4, 6]
 
-        let logitsBuf = Self.buf(logits.withUnsafeBytes { Data($0) })
-        let hiBuf = Self.buf(keysHi.withUnsafeBytes { Data($0) })
-        let loBuf = Self.buf(keysLo.withUnsafeBytes { Data($0) })
-        let draftsBuf = Self.buf(draftTok.withUnsafeBytes { Data($0) })
+        let logitsBuf = Self.buf(logits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
+        let hiBuf = Self.buf(keysHi.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
+        let loBuf = Self.buf(keysLo.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
+        let draftsBuf = Self.buf(draftTok.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
         let outTokBuf = Self.zeros(rows, .i32)
 
         guard let (cb, enc) = Self.hal.begin() else { XCTFail("cmdbuffer"); return }

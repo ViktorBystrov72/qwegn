@@ -15,7 +15,6 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
-import QWState
 
 /// The container a model is held in, and why the size-preserving family was
 /// declined when it was. Each reason is a different fact about the model, so
@@ -460,13 +459,6 @@ extension QWEngineDriver {
         case "incumbent", "hq4g32": return .hq4G32
         default: return nil
         }
-    }
-
-    /// Whether every weight kernel this model dispatches has a twin in the
-    /// size-preserving family. A model with experts, with GDN layers, or with
-    /// MTP drafts reads weights through paths the family has no twin for.
-    static func familyServes(geometry: QWModelGeometry, mtpDrafts: Int) -> Bool {
-        familyDeclineReason(geometry: geometry, mtpDrafts: mtpDrafts) == nil
     }
 
     /// Why the family cannot serve this model, when it cannot. Each reason

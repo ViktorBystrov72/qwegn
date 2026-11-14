@@ -72,9 +72,10 @@ metallib: ## Compile Sources/QWMetal/*.metal into kernel.metallib
 test: ## Run the XCTest suite (serial: parallel GPU bundles are unsafe)
 	@swift test --no-parallel
 
-lint: ## Style, geometry, and kernel-reachability gates
+lint: ## Style, geometry, DAG, and kernel-reachability gates
 	@python3 Scripts/lint_style.py Sources Tests Scripts
 	@python3 Scripts/lint_geometry_defaults.py Sources
+	@python3 Scripts/lint_package_dag.py
 	@python3 Scripts/test_kernel_inventory.py
 	@./Scripts/build_metallib.sh >/dev/null
 	@python3 Scripts/lint_kernels.py
@@ -86,12 +87,12 @@ perf: ## Performance gates (needs the model packs in ~/.qwg/models; prints why i
 	@python3 Scripts/perf_gate.py
 
 m1: ## Soak gate: writes the measured soak artifact bench-m1 verifies (CPU reference soak without a pack)
-	@set -o pipefail; swift build -c release --target m1 2>&1 | tail -1
+	@swift build -c release --target m1
 	@./.build/release/m1 --harness --steps $${STEPS:-10000} --window $${WINDOW:-1000} --export .build/m1_export.jsonl
 	@python3 Scripts/gen_soak_sample.py .build/m1_export.jsonl --out-dir $${SOAK_DIR:-.}
 
 bench-m1: ## Merge gate: re-verify the newest soak artifact and the ratchet (no GPU)
-	@set -o pipefail; swift build 2>&1 | tail -1
+	@swift build
 	@./.build/$(BUILD)/qwg bench m1 --check --soak-dir $${SOAK_DIR:-.}
 
 # -------------------------------------------------------------- release --

@@ -73,7 +73,7 @@ final class QWAQEmbedGatherTests: XCTestCase {
         let g = column / group, j = column % group
         let offset = (row * groups + g) * bytesPerGroup
         let slice = table.subdata(in: offset..<(offset + bytesPerGroup))
-        return slice.withUnsafeBytes { raw -> (Double, Double) in
+        return slice.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> (Double, Double) in
             let (scale, bias) = QWAQBlock.header(raw)
             let payload = UnsafeRawBufferPointer(rebasing: raw.dropFirst(4))
             let code = Double(QWAQBlock.readBits(payload, bits: bits, index: j))

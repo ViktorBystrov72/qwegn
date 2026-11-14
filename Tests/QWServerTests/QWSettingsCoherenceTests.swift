@@ -7,6 +7,14 @@ import XCTest
 import QWCore
 import Foundation
 
+private extension QWSettingsCoherence {
+    static let liveKeys: Set<String> = [
+        "modelAlias", "modelAliases", "loadVision",
+        "logDir", "logFileName",
+        "telemetryPollIntervalMs", "runAtStartup", "autoStartServer",
+    ]
+}
+
 final class QWSettingsCoherenceTests: XCTestCase {
     private let menuBarDirectory = "Sources/Apps/QWMenuBar"
     private let serverDirectory = "Sources/Apps/QWServer"
@@ -47,29 +55,24 @@ final class QWSettingsCoherenceTests: XCTestCase {
 
     // MARK: - 2. Restart means one thing
 
-    func testRestartIsTheInProcessEngineRestart() throws {
-        let source = try MenuBarRendererParityTests.read("\(menuBarDirectory)/TelemetryObservable.swift")
-        let body = try XCTUnwrap(MenuBarRendererParityTests.body(of: "restartEngine", in: source))
-        XCTAssertTrue(body.contains("/v1/engine/restart"),
-                      "restart must be the engine restart inside the running server")
-        XCTAssertFalse(body.contains("stopEngineAsync"),
-                       "restart must not stop the server process")
-    }
-
     func testTheProcessRestartHasItsOwnName() throws {
         let source = try MenuBarRendererParityTests.read("\(menuBarDirectory)/TelemetryObservable.swift")
         let body = try XCTUnwrap(MenuBarRendererParityTests.body(of: "restartServerProcess", in: source))
         XCTAssertTrue(body.contains("stopEngineAsync"))
         XCTAssertTrue(body.contains("startEngine"))
+        XCTAssertFalse(source.contains("func restartEngine("),
+                       "unused in-place engine restart helper must not remain in TelemetryObservable")
     }
 
     func testTheSurfacesUseTheOneRestart() throws {
         let cards = try MenuBarRendererParityTests.read("\(menuBarDirectory)/TelemetryCards.swift")
-        XCTAssertTrue(cards.contains("telemetry.restartEngine()"))
-        XCTAssertFalse(cards.contains("telemetry.restartServerProcess()"),
-                       "the card button must not restart the process")
+        XCTAssertTrue(cards.contains("telemetry.restartServerProcess()"),
+                      "the header control must restart the qwg server process")
+        XCTAssertFalse(cards.contains("telemetry.restartEngine()"),
+                       "the popover must not surface an in-place model restart")
         let app = try MenuBarRendererParityTests.read("\(menuBarDirectory)/QWMenuBarApp.swift")
-        XCTAssertTrue(app.contains("telemetry.restartEngine()"))
+        XCTAssertTrue(app.contains("telemetry.restartServerProcess()"),
+                      "Cmd+R must restart the qwg server process")
     }
 
     func testTheServerRouteIsTheEngineRestart() throws {
@@ -89,7 +92,9 @@ final class QWSettingsCoherenceTests: XCTestCase {
     }
 
     func testTheSettingsTheServerReadsAtStartupNeedARestart() {
-        let atStartup = ["host", "port", "modelPackPath", "modelName", "maxContext", "kvMode",
+        let atStartup = ["host", "port", "apiKey", "corsAllowedOrigins",
+                         "allowLocalImagePaths", "allowRemoteImageURLs",
+                         "modelPackPath", "modelName", "maxContext", "kvMode",
                          "ropeScalingType", "ropeScalingFactor", "temperature", "topP", "topK",
                          "maxTokens", "repetitionPenalty", "seed", "enableThinking",
                          "reasoningEffort", "systemPrompt", "lazyLoad",

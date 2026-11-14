@@ -279,7 +279,7 @@ enum BenchRunner {
                                    rows: Int, cols: Int, xs: [Float]) throws -> BenchWork {
         let bank = AQBanks.make(bits: bits, group: group, rows: rows, cols: cols)
         let weights = try makeBuffer(device: device, bytes: bank.count)
-        bank.withUnsafeBytes { src in
+        bank.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             weights.contents().copyMemory(from: src.baseAddress!, byteCount: bank.count)
         }
         let x = try makeBuffer(device: device, bytes: cols * 2)
@@ -303,7 +303,7 @@ enum BenchRunner {
                                           xs: [Float]) throws -> BenchWork {
         let bank = AQBanks.makeIncumbent4G32(rows: rows, cols: cols)
         let weights = try makeBuffer(device: device, bytes: bank.count)
-        bank.withUnsafeBytes { src in
+        bank.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             weights.contents().copyMemory(from: src.baseAddress!, byteCount: bank.count)
         }
         let x = try makeBuffer(device: device, bytes: cols * 2)
@@ -325,7 +325,7 @@ enum BenchRunner {
         let (w, scales, biases) = MLXBanks.make(bits: bits, group: group,
                                                 rows: rows, cols: cols)
         let weights = try makeBuffer(device: device, bytes: w.count)
-        w.withUnsafeBytes { src in
+        w.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             weights.contents().copyMemory(from: src.baseAddress!, byteCount: w.count)
         }
         let scaleBuf = try makeBuffer(device: device, bytes: scales.count * 2)

@@ -8,3 +8,27 @@ inline int qw_moe_tile_block(int c, int forced) {
     if (forced > 0) return forced;
     return c <= 16 ? 16 : (c <= 32 ? 32 : 64);
 }
+
+// Bit-packs (tid_y, bm) into tileR[t]: bits 24..25 encode bm (1=16, 2=32, 3=64).
+inline int qw_moe_pack_tile_r(int tid_y, int bm) {
+    const int code = (bm == 16) ? 1 : ((bm == 32) ? 2 : 3);
+    return (code << 24) | (tid_y & 0xFFFFFF);
+}
+
+// Decodes (bm, tid.y) from tileR[t], honoring forced tileBlock or legacy unencoded tileR.
+inline void qw_moe_decode_tile(int packed, int rowCount, int forced,
+                               thread int& bm, thread uint& tidY) {
+    const uint code = uint(packed) >> 24u;
+    if (forced > 0) {
+        bm = forced;
+        const uint raw = uint(packed) & 0xFFFFFFu;
+        const uint tileBm = (code == 1u) ? 16u : ((code == 2u) ? 32u : 64u);
+        tidY = (code == 0u) ? uint(packed) : ((raw * tileBm) / uint(forced));
+        return;
+    }
+    if (code == 1u) { bm = 16; tidY = uint(packed) & 0xFFFFFFu; return; }
+    if (code == 2u) { bm = 32; tidY = uint(packed) & 0xFFFFFFu; return; }
+    if (code == 3u) { bm = 64; tidY = uint(packed) & 0xFFFFFFu; return; }
+    bm = qw_moe_tile_block(rowCount, 0);
+    tidY = uint(packed);
+}

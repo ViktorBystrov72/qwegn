@@ -58,11 +58,4 @@ enum QWStatFormat {
             + " · p50 \(number(percentile(sorted, 0.50), "%.0f")) ms"
             + " · p95 \(number(percentile(sorted, 0.95), "%.0f")) ms"
     }
-
-    /// The percentiles of a sorted sample of round times.
-    static func percentiles(_ sorted: [Double]) -> String {
-        guard !sorted.isEmpty else { return "unavailable" }
-        return "p50 \(number(percentile(sorted, 0.50), "%.0f")) ms"
-            + " · p95 \(number(percentile(sorted, 0.95), "%.0f")) ms"
-    }
 }

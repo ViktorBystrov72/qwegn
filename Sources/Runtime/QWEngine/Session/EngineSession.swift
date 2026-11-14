@@ -16,7 +16,6 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
-import QWState
 
 /// THE PER-LAYER STATE LAW (C23 fix — the single-slot version conflated
 public final class QWEngineSession: @unchecked Sendable {
@@ -46,8 +45,6 @@ public final class QWEngineSession: @unchecked Sendable {
     var stochastic: QWStochasticSession?
     var attnKVViews: [(k: QWKVLayerView, v: QWKVLayerView)] = []
     var mtpKVViews: [(k: QWKVLayerView, v: QWKVLayerView)] = []
-    public var recStates: [QWTensorValue] { rec }
-    public var ringStates: [QWTensorValue] { ring }
     public var mtpPhysicalRows: Int { roundRecord.mtpPhysicalRows }
 
     init(kv: QWKVHandle, mtpKV: QWKVHandle? = nil, rec: [QWTensorValue],

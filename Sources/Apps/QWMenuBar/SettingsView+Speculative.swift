@@ -10,18 +10,24 @@ extension SettingsView {
     var speculativeSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsGroup(title: "Speculative Multi-Token Prediction (MTP)", icon: "bolt.badge.clock") {
-                HStack(spacing: 6) {
-                    Toggle("Enable Speculative Decoding", isOn: $draftSettings.speculativeDecodingEnabled)
-                        .toggleStyle(.switch)
-                    SettingsRestartBadge(key: "speculativeDecodingEnabled")
+                HStack(spacing: 8) {
+                    Text("Stored per model profile")
+                        .font(TelemetryTheme.ui(11))
+                        .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                     Spacer()
-                    Button("Reset to Defaults") {
-                        resetToTopPerformanceDefaults()
+                    Button("Reset Speculative Defaults") {
+                        resetSpeculativeDefaults()
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .help("Reinstate top-performance defaults (all tabs) for the selected model")
+                    .help("Stage default speculative parameters for the selected model")
                 }
+
+                settingsToggleRow(
+                    "Enable Speculative Decoding",
+                    key: "speculativeDecodingEnabled",
+                    isOn: $draftSettings.speculativeDecodingEnabled
+                )
 
                 formRow(label: "MTP Backend:", key: "mtpBackend") {
                     Picker("", selection: $draftSettings.mtpBackend) {
@@ -35,7 +41,8 @@ extension SettingsView {
                             Text("DSpine (Dense)").tag("dspine")
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .pickerStyle(.menu)
                     .onChange(of: draftSettings.mtpBackend) { _, newBackend in
                         handleMTPBackendSelectionChange(newBackend)
                     }
@@ -53,12 +60,13 @@ extension SettingsView {
                             Text("MTP Only").tag("mtp")
                             Text("N-Gram Only").tag("ngram")
                         }
-                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .pickerStyle(.menu)
                     }
                 }
 
                 if draftSettings.mtpBackend == "variational" {
-                    Divider().background(Color.white.opacity(0.08))
+                    Divider()
 
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
@@ -67,31 +75,31 @@ extension SettingsView {
                             Text(draftSettings.mtpRelaxedMargin == 0
                                  ? "0.00 (Strict Argmax)"
                                  : String(format: "%.2f nats", draftSettings.mtpRelaxedMargin))
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(draftSettings.mtpRelaxedMargin == 0 ? TelemetryTheme.warning : TelemetryTheme.accent)
+                                .font(TelemetryTheme.numeric(11, .semibold))
+                                .foregroundStyle(draftSettings.mtpRelaxedMargin == 0 ? TelemetryTheme.warning : TelemetryTheme.accent)
                         }
-                        Slider(value: $draftSettings.mtpRelaxedMargin, in: 0.0...5.0, step: 0.1)
+                        steppedSlider(value: $draftSettings.mtpRelaxedMargin, in: 0.0...5.0, step: 0.1)
                         Text("Accepts drafted tokens whose verifier logit is within ε of the target argmax (arXiv:2610.26693)")
-                            .font(.system(size: 9))
-                            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                            .font(TelemetryTheme.ui(11))
+                            .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                     }
 
                     VariationalFloorRow(value: $draftSettings.mtpRelaxedMinProb, contrast: contrast)
 
-                    HStack(spacing: 6) {
-                        Toggle("Quadratic Prefix Seeding (Batch Verify Seed)", isOn: $draftSettings.mtpQuadraticSeeding)
-                            .toggleStyle(.switch)
-                        SettingsRestartBadge(key: "mtpQuadraticSeeding")
-                    }
+                    settingsToggleRow(
+                        "Quadratic Prefix Seeding (Batch Verify Seed)",
+                        key: "mtpQuadraticSeeding",
+                        isOn: $draftSettings.mtpQuadraticSeeding
+                    )
                 }
 
-                Divider().background(Color.white.opacity(0.08))
+                Divider()
 
-                HStack(spacing: 6) {
-                    Toggle("Adaptive Draft Depth (Entropy Stop)", isOn: $draftSettings.mtpAdaptiveDepth)
-                        .toggleStyle(.switch)
-                    SettingsRestartBadge(key: "mtpAdaptiveDepth")
-                }
+                settingsToggleRow(
+                    "Adaptive Draft Depth (Entropy Stop)",
+                    key: "mtpAdaptiveDepth",
+                    isOn: $draftSettings.mtpAdaptiveDepth
+                )
 
                 if draftSettings.mtpAdaptiveDepth {
                     VStack(alignment: .leading, spacing: 6) {
@@ -99,15 +107,15 @@ extension SettingsView {
                             SettingsRowLabel(text: "Entropy Threshold:", key: "mtpEntropyThreshold")
                             Spacer()
                             Text(String(format: "%.2f", draftSettings.mtpEntropyThreshold))
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(TelemetryTheme.accent)
+                                .font(TelemetryTheme.numeric(11, .semibold))
+                                .foregroundStyle(TelemetryTheme.accent)
                         }
-                        Slider(value: $draftSettings.mtpEntropyThreshold, in: 0.05...1.0, step: 0.05)
+                        steppedSlider(value: $draftSettings.mtpEntropyThreshold, in: 0.05...1.0, step: 0.05)
                     }
                 }
 
                 if isExternalDrafterSelected {
-                    Divider().background(Color.white.opacity(0.08))
+                    Divider()
 
                     formRow(label: "Drafter Model:", key: "dflashDraftPackPath") {
                         HStack(spacing: 8) {
@@ -116,6 +124,7 @@ extension SettingsView {
                                     Text(m.name).tag(m.packPath)
                                 }
                             }
+                            .labelsHidden()
                             .pickerStyle(.menu)
                             .onChange(of: draftSettings.dflashDraftPackPath) { _, newPath in
                                 syncDrafterBackendFromPack(newPath)
@@ -126,7 +135,8 @@ extension SettingsView {
                                 Image(systemName: "arrow.clockwise")
                                     .font(.system(size: 11))
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                             .help("Refresh DFlash 2 / DSpine drafter models in ~/.qwg/models")
                         }
                     }
@@ -149,7 +159,8 @@ extension SettingsView {
                             Text("8").tag(8)
                             Text("16 (Default)").tag(16)
                         }
-                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .pickerStyle(.menu)
                     }
                 }
             }

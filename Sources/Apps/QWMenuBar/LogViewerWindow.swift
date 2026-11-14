@@ -1,252 +1,325 @@
-import SwiftUI
+// LogViewerWindow.swift — Structured engine & HTTP request log console
+
 import AppKit
 import QWServer
+import SwiftUI
 
-/// Dedicated streaming Log Viewer Window with JetBrains Mono typography,
-/// real-time log ingestion, search filtering, and an explicit "Reveal in Finder" button.
+/// Streaming engine & HTTP request log window with chip filters, wrap toggle, and copy feedback.
 public struct LogViewerWindow: View {
-    @ObservedObject public var telemetry: TelemetryObservable
+    public var telemetry: TelemetryObservable
     /// Increased Contrast asks for stronger text. L-M7: it is honoured.
     @Environment(\.colorSchemeContrast) internal var contrast: ColorSchemeContrast
-    @State private var filterLevel: String = "ALL"
+    @State private var filterLevel: QWLogFilterLevel = .all
     @State private var searchText: String = ""
     @State private var autoScroll: Bool = true
-    public var onClose: () -> Void
+    @State private var wrapLines: Bool = true
+    @State private var showCopiedFeedback: Bool = false
 
-    public init(telemetry: TelemetryObservable, onClose: @escaping () -> Void = {}) {
+    public init(
+        telemetry: TelemetryObservable,
+        initialFilterLevel: QWLogFilterLevel = .all,
+        initialSearchText: String = "",
+        initialWrapLines: Bool = true,
+        onClose: @escaping () -> Void = {}
+    ) {
         self.telemetry = telemetry
-        self.onClose = onClose
+        self._filterLevel = State(initialValue: initialFilterLevel)
+        self._searchText = State(initialValue: initialSearchText)
+        self._wrapLines = State(initialValue: initialWrapLines)
+        let _ = onClose
     }
 
-    private var filteredLogs: [String] {
-        telemetry.recentLogs.filter { line in
-            let matchesLevel: Bool
-            if filterLevel == "ALL" {
-                matchesLevel = true
-            } else {
-                matchesLevel = line.contains(" \(filterLevel) ")
-            }
+    private var increasedContrast: Bool {
+        contrast == .increased
+    }
 
-            let matchesSearch: Bool
-            if searchText.isEmpty {
-                matchesSearch = true
-            } else {
-                matchesSearch = line.localizedCaseInsensitiveContains(searchText)
-            }
-
-            return matchesLevel && matchesSearch
-        }
+    private var filteredEntries: [QWLogEntry] {
+        telemetry.logEntries.filter { $0.matches(filter: filterLevel, query: searchText) }
     }
 
     public var body: some View {
         ZStack {
-            // The glass lives inside a container: the system blends a
-            // group of glass together, and glass outside one is alone.
-            GlassEffectContainer(spacing: 8) {
-                SystemVibrancyView()
-                    .edgesIgnoringSafeArea(.all)
-            }
+            SystemVibrancyView()
+                .edgesIgnoringSafeArea(.all)
 
             VStack(spacing: 0) {
-                // Subtle Unified Toolbar
-                HStack(spacing: 8) {
-                    // Left: App / Log Identifier
-                    HStack(spacing: 6) {
-                        Image(systemName: "terminal")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(TelemetryTheme.accent)
-                        Text("Engine Logs")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(TelemetryTheme.primary(increasedContrast: contrast == .increased))
-                        Text("\(filteredLogs.count)")
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .foregroundColor(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Color.white.opacity(0.08))
-                            .cornerRadius(4)
-                    }
+                toolbarHeader
+                Divider()
+                filterBar
+                Divider()
+                logScrollBody
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
-                    Spacer(minLength: 8)
+    private var toolbarHeader: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(TelemetryTheme.accent)
+                Text("Engine Logs")
+                    .font(TelemetryTheme.ui(13, .semibold))
+                    .foregroundStyle(TelemetryTheme.primary(increasedContrast: increasedContrast))
+                Text("\(filteredEntries.count)")
+                    .font(TelemetryTheme.numeric(11, .medium))
+                    .foregroundStyle(TelemetryTheme.secondary(increasedContrast: increasedContrast))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(TelemetryTheme.substrate)
+                    .clipShape(Capsule())
+                sourceBadge
+            }
 
-                    // Center: Subtle Search Field
-                    HStack(spacing: 5) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 10))
-                            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                        TextField("Filter logs...", text: $searchText)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 11))
-                        if !searchText.isEmpty {
-                            Button(action: { searchText = "" }) {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .frame(minWidth: 140, maxWidth: 200)
-                    .background(Color.black.opacity(0.35))
-                    .cornerRadius(6)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.10), lineWidth: 0.5))
+            Spacer(minLength: 8)
 
-                    // Filter Level Picker (Compact Menu Style - no overlap)
-                    Picker("", selection: $filterLevel) {
-                        Text("All Levels").tag("ALL")
-                        Text("Info").tag("INFO")
-                        Text("Warn").tag("WARN")
-                        Text("Error").tag("ERROR")
-                        Text("Debug").tag("DEBUG")
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 105)
-                    .font(.system(size: 11))
+            toolbarActions
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(TelemetryTheme.rowSubstrate)
+    }
 
-                    // Auto-Scroll Toggle Button
-                    Button(action: { autoScroll.toggle() }) {
-                        HStack(spacing: 3) {
-                            Image(systemName: autoScroll ? "arrow.down.to.line" : "pause")
-                                .font(.system(size: 10))
-                            Text("Scroll")
-                                .font(.system(size: 10))
-                        }
-                        .foregroundColor(autoScroll ? TelemetryTheme.active : .white.opacity(0.40))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 4)
-                        .background(Color.white.opacity(autoScroll ? 0.10 : 0.04))
-                        .cornerRadius(5)
-                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
-                    }
-                    .buttonStyle(.plain)
-                    .help(autoScroll ? "Auto-scroll enabled (click to pause)" : "Auto-scroll paused (click to follow)")
+    private var sourceBadge: some View {
+        let isSSE = telemetry.isLogStreamConnected
+        let label = isSSE ? "SSE Stream" : (telemetry.isConnected ? "Local Process" : "Offline")
+        let tint: Color = isSSE ? TelemetryTheme.active : (telemetry.isConnected ? TelemetryTheme.cool : TelemetryTheme.unknown)
+        return HStack(spacing: 4) {
+            Circle()
+                .fill(tint)
+                .frame(width: 6, height: 6)
+            Text(label)
+                .font(TelemetryTheme.ui(10, .medium))
+                .foregroundStyle(TelemetryTheme.secondary(increasedContrast: increasedContrast))
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(TelemetryTheme.substrate)
+        .clipShape(Capsule())
+    }
 
-                    Divider()
-                        .frame(height: 14)
-                        .background(Color.white.opacity(0.12))
-
-                    // Action Icons: Finder, Copy, Trash, Close
-                    HStack(spacing: 4) {
-                        Button(action: revealInFinder) {
-                            HStack(spacing: 3) {
-                                Image(systemName: "folder")
-                                    .font(.system(size: 10))
-                                Text("Finder")
-                                    .font(.system(size: 10))
-                            }
-                            .foregroundColor(.white.opacity(0.75))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 4)
-                            .background(Color.white.opacity(0.06))
-                            .cornerRadius(5)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Reveal log folder in macOS Finder")
-
-                        Button(action: copyLogs) {
-                            Image(systemName: "doc.on.doc")
-                                .font(.system(size: 11))
-                                .foregroundColor(.white.opacity(0.60))
-                                .frame(width: 22, height: 22)
-                                .background(Color.white.opacity(0.04))
-                                .cornerRadius(5)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Copy visible logs to clipboard")
-
-                        Button(action: { telemetry.recentLogs.removeAll() }) {
-                            Image(systemName: "trash")
-                                .font(.system(size: 11))
-                                .foregroundColor(.white.opacity(0.60))
-                                .frame(width: 22, height: 22)
-                                .background(Color.white.opacity(0.04))
-                                .cornerRadius(5)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Clear log viewer buffer")
-
-                        Button(action: onClose) {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                                .frame(width: 22, height: 22)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Close window")
-                    }
+    private var searchField: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 10))
+                .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
+            TextField("Filter logs…", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(TelemetryTheme.ui(11))
+            if !searchText.isEmpty {
+                Button(action: { searchText = "" }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Color.black.opacity(0.25))
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .frame(minWidth: 150, maxWidth: 220)
+        .background(TelemetryTheme.substrate)
+        .clipShape(RoundedRectangle(cornerRadius: TelemetryTheme.Radius.small))
+        .overlay(
+            RoundedRectangle(cornerRadius: TelemetryTheme.Radius.small)
+                .strokeBorder(TelemetryTheme.hairline(increasedContrast: increasedContrast), lineWidth: 1)
+        )
+    }
 
-                Divider().background(Color.white.opacity(0.08))
+    private var toolbarActions: some View {
+        HStack(spacing: 5) {
+            Toggle("Wrap", isOn: $wrapLines)
+                .toggleStyle(.button)
+                .controlSize(.small)
+                .help("Toggle soft line wrapping")
 
-                // Terminal Scroll Area
-                ScrollViewReader { proxy in
-                    ScrollView(.vertical, showsIndicators: true) {
-                        LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array(filteredLogs.enumerated()), id: \.offset) { idx, line in
-                                logLineView(line)
-                                    .id(idx)
+            Toggle("Follow", isOn: $autoScroll)
+                .toggleStyle(.button)
+                .controlSize(.small)
+                .help(autoScroll ? "Auto-scroll enabled (click to pause)" : "Auto-scroll paused")
+
+            Button(action: revealInFinder) {
+                Label("Finder", systemImage: "folder")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Reveal log file in Finder")
+
+            Button(action: copyLogs) {
+                Label(showCopiedFeedback ? "Copied" : "Copy", systemImage: showCopiedFeedback ? "checkmark" : "doc.on.doc")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Copy visible log lines to clipboard")
+
+            Button(action: { telemetry.clearLogs() }) {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel("Clear log buffer")
+            .help("Clear log viewer buffer")
+        }
+    }
+
+    private var filterBar: some View {
+        HStack(spacing: 6) {
+            ForEach(QWLogFilterLevel.allCases) { chip in
+                let isSelected = filterLevel == chip
+                Button(action: { filterLevel = chip }) {
+                    Text(chip.rawValue)
+                        .font(TelemetryTheme.ui(10, isSelected ? .semibold : .medium))
+                        .foregroundStyle(isSelected
+                            ? TelemetryTheme.accent
+                            : TelemetryTheme.secondary(increasedContrast: increasedContrast))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(isSelected ? TelemetryTheme.accent.opacity(0.14) : TelemetryTheme.substrate)
+                        .clipShape(Capsule())
+                        .overlay(
+                            Capsule()
+                                .strokeBorder(
+                                    isSelected
+                                        ? TelemetryTheme.accent.opacity(0.45)
+                                        : TelemetryTheme.hairline(increasedContrast: increasedContrast),
+                                    lineWidth: 1
+                                )
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer(minLength: 8)
+            searchField
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(TelemetryTheme.rowSubstrate)
+    }
+
+    private var logScrollBody: some View {
+        ScrollViewReader { proxy in
+            Group {
+                if filteredEntries.isEmpty {
+                    emptyLogView
+                } else {
+                    ScrollView(wrapLines ? .vertical : [.vertical, .horizontal], showsIndicators: true) {
+                        LazyVStack(alignment: .leading, spacing: 3) {
+                            ForEach(filteredEntries) { entry in
+                                logRowView(entry)
+                                    .id(entry.id)
                             }
                         }
                         .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .background(Color(red: 12/255, green: 14/255, blue: 18/255).opacity(0.85))
-                    .onChange(of: filteredLogs.count) { _, newCount in
-                        if autoScroll && newCount > 0 {
-                            withAnimation(.easeOut(duration: 0.1)) {
-                                proxy.scrollTo(newCount - 1, anchor: .bottom)
-                            }
+                    .onChange(of: filteredEntries.last?.id) { _, lastId in
+                        guard autoScroll, let lastId else { return }
+                        withAnimation(.easeOut(duration: 0.1)) {
+                            proxy.scrollTo(lastId, anchor: .bottom)
                         }
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(TelemetryTheme.surface.opacity(0.65))
         }
-        .frame(width: 680, height: 460)
     }
 
-    private func logLineView(_ line: String) -> some View {
-        let trimmed = line.trimmingCharacters(in: .newlines)
-        let color: Color
-        if trimmed.contains(" ERROR ") {
-            color = TelemetryTheme.failure
-        } else if trimmed.contains(" WARN ") {
-            color = TelemetryTheme.warning
-        } else if trimmed.contains(" DEBUG ") {
-            color = TelemetryTheme.unknown
-        } else if trimmed.contains(" -> 200 OK ") {
-            color = TelemetryTheme.active
-        } else {
-            color = TelemetryTheme.highlight
+    private var emptyLogView: some View {
+        let hasActiveFilter = filterLevel != .all || !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return VStack(spacing: 8) {
+            Image(systemName: hasActiveFilter ? "line.3.horizontal.decrease.circle" : "terminal")
+                .font(.system(size: 22, weight: .light))
+                .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
+            Text(hasActiveFilter ? "No log entries match the active filter" : "Waiting for server log output…")
+                .font(TelemetryTheme.ui(12, .medium))
+                .foregroundStyle(TelemetryTheme.secondary(increasedContrast: increasedContrast))
+            if hasActiveFilter {
+                Button("Clear Filter") {
+                    filterLevel = .all
+                    searchText = ""
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
-        return Text(trimmed)
-            .font(.system(size: 11, design: .monospaced))
-            .foregroundColor(color)
-            .textSelection(.enabled)
+    private func logRowView(_ entry: QWLogEntry) -> some View {
+        let color = entryTint(entry)
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if let ts = entry.timestamp {
+                Text(ts)
+                    .font(TelemetryTheme.numeric(11))
+                    .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            Text(entry.kind == .http ? "HTTP" : levelLabel(entry.level))
+                .font(TelemetryTheme.numeric(10.5, .semibold))
+                .foregroundStyle(color)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .frame(minWidth: 48, alignment: .center)
+                .background(color.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .lineLimit(1)
+                .fixedSize()
+            Text(entry.body.isEmpty ? entry.line : entry.body)
+                .font(TelemetryTheme.numeric(11))
+                .foregroundStyle(entry.kind == .http ? color : TelemetryTheme.primary(increasedContrast: increasedContrast))
+                .lineLimit(wrapLines ? nil : 1)
+                .fixedSize(horizontal: !wrapLines, vertical: wrapLines)
+                .textSelection(.enabled)
+        }
+        .fixedSize(horizontal: !wrapLines, vertical: false)
+    }
+
+    private func levelLabel(_ level: QWLogLevel) -> String {
+        switch level {
+        case .debug: return "DEBUG"
+        case .info: return "INFO"
+        case .warn: return "WARN"
+        case .error: return "ERROR"
+        case .none: return "LOG"
+        }
+    }
+
+    private func entryTint(_ entry: QWLogEntry) -> Color {
+        if entry.kind == .http {
+            return entry.level == .error ? TelemetryTheme.failure : TelemetryTheme.active
+        }
+        switch entry.level {
+        case .error: return TelemetryTheme.failure
+        case .warn: return TelemetryTheme.warning
+        case .debug: return TelemetryTheme.unknown
+        case .info, .none: return TelemetryTheme.accent
+        }
     }
 
     private func revealInFinder() {
         let path = telemetry.settings.expandedLogFilePath
         let url = URL(fileURLWithPath: path)
         let dir = url.deletingLastPathComponent()
-
-        // Ensure file exists so Finder can select it
         if !FileManager.default.fileExists(atPath: url.path) {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             FileManager.default.createFile(atPath: url.path, contents: Data())
         }
-
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     private func copyLogs() {
-        let allText = filteredLogs.joined()
+        let text = filteredEntries.map(\.line).joined(separator: "\n")
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(allText, forType: .string)
+        pb.setString(text, forType: .string)
+        showCopiedFeedback = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            showCopiedFeedback = false
+        }
     }
 }

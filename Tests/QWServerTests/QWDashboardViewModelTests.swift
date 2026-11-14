@@ -5,7 +5,7 @@
 import XCTest
 @testable import QWServer
 import QWCore
-import QWEngine
+@testable import QWEngine
 import Foundation
 
 final class QWDashboardViewModelTests: XCTestCase {
@@ -22,8 +22,9 @@ final class QWDashboardViewModelTests: XCTestCase {
     }
 
     func testUnavailableMetricBecomesUnavailableCardNotZero() throws {
-        QWTelemetryRegistry.shared.recordUnavailable("gpu.device",
-                                                     reason: "IOAccelerator unavailable on this host")
+        QWTelemetryRegistry.shared.lock.withLock {
+            QWTelemetryRegistry.shared.values["gpu.device"] = .unavailable("IOAccelerator unavailable on this host")
+        }
         let model = QWDashboardViewModel.build(lifecycle: lifecycle(), modelId: "m")
         let card = try XCTUnwrap(model.cards.first { $0.id == "gpu.device" })
         XCTAssertNil(card.value, "an unavailable metric has no value, not a zero")
@@ -113,7 +114,7 @@ final class QWDashboardViewModelTests: XCTestCase {
 
     func testTheRateCardsSayWhichRateTheyShow() throws {
         // The server measured a rate: the card must say which kind it is.
-        QWEngineTelemetryRegistry.shared.recordGeneration(
+        QWEngineTelemetryRegistry.shared.endRequest(
             tokensIn: 100, tokensOut: 50, prefillSec: 0.5, decodeSec: 1.0, ttftSec: nil)
         let model = QWDashboardViewModel.build(lifecycle: lifecycle(), modelId: "m")
         let card = try XCTUnwrap(model.cards.first { $0.id == "throughput.display_decode_tokens_per_sec" })
@@ -209,8 +210,8 @@ final class QWDashboardViewModelTests: XCTestCase {
     func testTheRateCardCarriesThePublishedTrace() throws {
     let registry = QWEngineTelemetryRegistry.shared
     registry.resetToIdle()
-    registry.recordGeneration(tokensIn: 100, tokensOut: 50,
-                              prefillSec: 0.5, decodeSec: 1.0, ttftSec: nil)
+    registry.endRequest(tokensIn: 100, tokensOut: 50,
+                        prefillSec: 0.5, decodeSec: 1.0, ttftSec: nil)
     // The engine's own registry reads that rate too. Its number wins;
     // the trace behind it stays.
     QWTelemetryRegistry.shared.record("throughput.display_decode_tokens_per_sec", 49.0)
@@ -293,5 +294,126 @@ final class QWDashboardViewModelTests: XCTestCase {
         let model = QWDashboardViewModel.build(lifecycle: lifecycle(), modelId: "dense",
                                                capabilities: [.prefixCache, .speculative])
         XCTAssertEqual(model.capabilities, ["prefixCache", "speculative"])
+    }
+
+    func testExtendedDashboardFactsRoundTripThroughCodable() throws {
+        let facts = QWDashboardFacts(
+            quantization: "hq4g32",
+            hostLogicalCores: 16,
+            gdnPrefillMode: "fused",
+            gpuName: "Apple M4 Max",
+            metalFamily: "Apple9",
+            physicalMemoryGB: 128.0,
+            lsaMode: "active",
+            mountedMemoryPack: "mempack-q4"
+        )
+        let encoded = try JSONEncoder().encode(facts)
+        let decoded = try JSONDecoder().decode(QWDashboardFacts.self, from: encoded)
+        XCTAssertEqual(decoded.physicalMemoryGB, 128.0)
+        XCTAssertEqual(decoded.lsaMode, "active")
+        XCTAssertEqual(decoded.mountedMemoryPack, "mempack-q4")
+    }
+
+    func testSessionMemoryDecodeAndThroughputCardLayout() throws {
+        let model = QWDashboardViewModel.build(lifecycle: lifecycle(), modelId: "m")
+        let ids = Set(model.cards.map(\.id))
+        let requiredIds = [
+            "session.ema_decode_tps",
+            "session.ema_prefill_tps",
+            "session.avg_decode_tps",
+            "session.avg_prefill_tps",
+            "session.tokens_in_total",
+            "session.tokens_out_total",
+            "memory.resident_bytes",
+            "memory.arena_reserved_bytes",
+            "decode.cb_per_step",
+            "decode.cold_stage_host_us",
+        ]
+        for id in requiredIds {
+            XCTAssertTrue(ids.contains(id), "missing expected card \(id)")
+            let card = try XCTUnwrap(model.cards.first { $0.id == id })
+            if card.value == nil {
+                XCTAssertNotNil(card.reason, "unmeasured card \(id) must provide a reason")
+            }
+        }
+        let throughputCards = model.cards.filter { $0.id.hasPrefix("throughput.") }
+        XCTAssertEqual(throughputCards.count, 2, "throughput group must remain 2 dual-sparkline cards")
+    }
+
+    func testExtendedCacheCardsFollowPrefixCacheCapability() {
+        let extendedCacheIds = [
+            "cache.warm_limit_bytes",
+            "cache.ssd_limit_bytes",
+            "cache.lookups_total",
+            "cache.hits_warm_total",
+            "cache.hits_ssd_total",
+            "cache.evictions_total",
+        ]
+        let withoutCache = QWDashboardViewModel.build(lifecycle: lifecycle(), modelId: "dense", capabilities: [])
+        let withoutIds = Set(withoutCache.cards.map(\.id))
+        for id in extendedCacheIds {
+            XCTAssertFalse(withoutIds.contains(id), "\(id) must be omitted without .prefixCache")
+        }
+
+        let withCache = QWDashboardViewModel.build(lifecycle: lifecycle(), modelId: "dense", capabilities: [.prefixCache])
+        let withIds = Set(withCache.cards.map(\.id))
+        for id in extendedCacheIds {
+            XCTAssertTrue(withIds.contains(id), "\(id) must be present when .prefixCache is supported")
+        }
+    }
+
+    func testTokenCountFormatterAppliesCommasAndMillionThreshold() {
+        XCTAssertEqual(QWTokenCountFormatter.format(0), "0")
+        XCTAssertEqual(QWTokenCountFormatter.format(999), "999")
+        XCTAssertEqual(QWTokenCountFormatter.format(1_000), "1,000")
+        XCTAssertEqual(QWTokenCountFormatter.format(62_707), "62,707")
+        XCTAssertEqual(QWTokenCountFormatter.format(174_108), "174,108")
+        XCTAssertEqual(QWTokenCountFormatter.format(999_999), "999,999")
+        XCTAssertEqual(QWTokenCountFormatter.format(1_000_000), "1.00M")
+        XCTAssertEqual(QWTokenCountFormatter.format(2_572_570), "2.57M")
+        XCTAssertEqual(QWTokenCountFormatter.format(11_164_092), "11.16M")
+        XCTAssertEqual(QWTokenCountFormatter.format(125_400_000), "125.4M")
+        XCTAssertEqual(QWTokenCountFormatter.format(Double.nan), "—")
+    }
+
+    func testTokenCardsFormatStringsWhilePreservingRawNumericValues() throws {
+        let registry = QWEngineTelemetryRegistry()
+        registry.endRequest(tokensIn: 11_164_092, tokensOut: 174_108,
+                            prefillSec: 10.0, decodeSec: 5.0, ttftSec: 1.0)
+        registry.updateCacheUsage(warmBytes: 1_073_741_824, warmLimit: 8_589_934_592, ssdBytes: 0, ssdLimit: 0)
+        registry.recordCacheLookup(hitTier: "warm_ram", matchedTokens: 2_572_570)
+        registry.beginPrefill(promptTokens: 62_707)
+        registry.updatePrefillProgress(completedTokens: 26_337, totalTokens: 62_707)
+
+        let model = QWDashboardViewModel.build(
+            lifecycle: lifecycle(),
+            modelId: "m",
+            capabilities: [.prefixCache],
+            telemetry: registry
+        )
+        XCTAssertEqual(model.generation, .prefill)
+
+        let tokensIn = try XCTUnwrap(model.cards.first { $0.id == "session.tokens_in_total" })
+        XCTAssertEqual(tokensIn.value, "11.16M")
+        XCTAssertEqual(tokensIn.unit, "tok")
+        XCTAssertEqual(tokensIn.number, 11_164_092)
+
+        let tokensOut = try XCTUnwrap(model.cards.first { $0.id == "session.tokens_out_total" })
+        XCTAssertEqual(tokensOut.value, "174,108")
+        XCTAssertEqual(tokensOut.unit, "tok")
+        XCTAssertEqual(tokensOut.number, 174_108)
+
+        let reused = try XCTUnwrap(model.cards.first { $0.id == "cache.tokens_reused_total" })
+        XCTAssertEqual(reused.value, "2.57M")
+        XCTAssertEqual(reused.unit, "tok")
+        XCTAssertEqual(reused.number, 2_572_570)
+
+        let prog = try XCTUnwrap(model.cards.first { $0.id == "prefill.progress_tokens" })
+        XCTAssertEqual(prog.value, "26,337")
+        XCTAssertEqual(prog.number, 26_337)
+
+        let target = try XCTUnwrap(model.cards.first { $0.id == "prefill.total_tokens" })
+        XCTAssertEqual(target.value, "62,707")
+        XCTAssertEqual(target.number, 62_707)
     }
 }

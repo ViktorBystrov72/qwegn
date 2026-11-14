@@ -79,10 +79,10 @@ extension QWEngineDriver.WeightLoader {
         for i in 0..<combined.count {
             bits[i] = QWQuant.f32tof16Bits(combined[i])
         }
-        bits.withUnsafeBytes {
+        bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             wGateWeights.region.buffer.contents()
                 .advanced(by: wGateWeights.region.base + wGateWeights.offset)
-                .copyMemory(from: $0.baseAddress!, byteCount: combined.count * 2)
+                .copyMemory(from: raw.baseAddress!, byteCount: combined.count * 2)
         }
 
         let ape = try f16w(blk + "self_attn.indexer.index_kpool_compress_ape", 4 * idxD)
@@ -159,10 +159,10 @@ extension QWEngineDriver.WeightLoader {
             for i in 0..<allConv.count {
                 bits[i] = QWQuant.f32tof16Bits(allConv[i])
             }
-            bits.withUnsafeBytes {
+            bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 t.region.buffer.contents()
                     .advanced(by: t.region.base + t.offset)
-                    .copyMemory(from: $0.baseAddress!, byteCount: allConv.count * 2)
+                    .copyMemory(from: raw.baseAddress!, byteCount: allConv.count * 2)
             }
             conv = t
         } else {
@@ -272,10 +272,10 @@ extension QWEngineDriver.WeightLoader {
         for i in 0..<combined.count {
             bits[i] = QWQuant.f32tof16Bits(combined[i])
         }
-        bits.withUnsafeBytes {
+        bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             wGateWeights.region.buffer.contents()
                 .advanced(by: wGateWeights.region.base + wGateWeights.offset)
-                .copyMemory(from: $0.baseAddress!, byteCount: combined.count * 2)
+                .copyMemory(from: raw.baseAddress!, byteCount: combined.count * 2)
         }
 
         let ape = try f16w(blk + "self_attn.indexer.index_kpool_compress_ape", 4 * idxD)
@@ -366,10 +366,10 @@ extension QWEngineDriver.WeightLoader {
             }
         }
         let wTensor = try allocateWeight(QWTensorShape([wElems], .f32))
-        fnFloats.withUnsafeBytes {
+        fnFloats.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             wTensor.region.buffer.contents()
                 .advanced(by: wTensor.region.base + wTensor.offset)
-                .copyMemory(from: $0.baseAddress!, byteCount: wElems * 4)
+                .copyMemory(from: raw.baseAddress!, byteCount: wElems * 4)
         }
         let bTensor = try f32wOrDequant(blk + hcPrefix + "_base", routerRows)
         return (wTensor, bTensor)

@@ -135,11 +135,11 @@ final class QWStandardMoEKernelTests: XCTestCase {
         var xPlain = xRot
         unrotate(&xPlain)
         let router = routerPlane(experts: experts, hidden: hidden, xPlain: Array(xPlain[0..<hidden]))
-        let guStd = guBank.withUnsafeBytes {
-            QWQuant.Pack.dequantHQ4Slab(base: $0.baseAddress!, nRows: experts * 2 * inter, kCols: hidden)
+        let guStd = guBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            QWQuant.Pack.dequantHQ4Slab(base: raw.baseAddress!, nRows: experts * 2 * inter, kCols: hidden)
         }
-        let downStd = downBank.withUnsafeBytes {
-            QWQuant.Pack.dequantHQ4Slab(base: $0.baseAddress!, nRows: experts * hidden, kCols: inter)
+        let downStd = downBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            QWQuant.Pack.dequantHQ4Slab(base: raw.baseAddress!, nRows: experts * hidden, kCols: inter)
         }
         return Model(geometry: g, xRot: xRot, router: router, guBank: guBank, downBank: downBank,
                      guStd: guStd, downStd: downStd)
@@ -540,13 +540,13 @@ final class QWStandardMoEKernelTests: XCTestCase {
     func testTheSparseDoorsAreThePerPairChain() {
         let sparse = Set(Qwen3MoEModule.requiredDoors)
         let dense = Set(StandardModule.requiredDoors)
-        XCTAssertEqual(Set(Qwen3MoEModule.moeDoors),
+        XCTAssertEqual(Set(QWKernelInventory.moe_only),
                        ["qwg_router_gemm", "qwg_moe_bridge_f16_to_f32", "qwg_moe_route",
                         "qwg_moe_route_decode", "qwg_moe_gateup_q4g_f32_r1",
                         "qwg_moe_down_shared_combine_q4g_f32",
                         "qwg_moe_group_pairs_f32", "qwg_moe_nax_gemm",
                         "qwg_moe_nax_split_f32", "qwg_moe_down_reduce_combine_f32"])
-        for door in Qwen3MoEModule.moeDoors {
+        for door in QWKernelInventory.moe_only {
             XCTAssertTrue(sparse.contains(door), door)
             XCTAssertFalse(dense.contains(door), door)
         }

@@ -21,14 +21,6 @@ public enum QWLSAMode: String, Sendable, Codable, CaseIterable, Equatable, Hasha
     }
 }
 
-/// Concrete LSA backend selected for a loaded model.
-public enum QWLSAResolvedBackend: String, Sendable, Codable, Equatable, Hashable {
-    case disabled = "off"
-    case sidecar = "sidecar"
-    case svd = "svd"
-    case qsaCluster = "qsa-cluster"
-}
-
 /// Summary metadata of a discovered `.qlsa` sidecar file (`QLSA0001`).
 public struct QWLSASidecarInfo: Sendable, Codable, Equatable, Hashable {
     public let path: String
@@ -88,8 +80,6 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
     public static let maxBucketKeys: Int = 16
     /// Default low-rank latent index dimension ($d_{\mathrm{idx}} = 64$).
     public static let defaultIndexDim: Int = 64
-    /// Latent index dimension when clustering QSA pooled keys directly ($d_{\mathrm{idx}} = 128$).
-    public static let qsaClusterIndexDim: Int = 128
     /// Default sparse token budget ($k = 2048$ tokens = 512 four-token blocks).
     public static let defaultBudget: Int = 2048
 
@@ -131,16 +121,6 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
         return 512
     }
 
-    /// Number of 4-token pool blocks per cluster block ($n_{\mathrm{cluster}} / 4$, default `128`).
-    public var poolBlocksPerCluster: Int {
-        alignedClusterBlock / Self.poolSize
-    }
-
-    /// Number of candidate buckets selected before best-first expansion ($p = 2 \cdot (k / \bar{n}_b) = k / 4$).
-    public var candidateBucketsToSelect: Int {
-        max(16, alignedBudget / 4)
-    }
-
     /// Maximum 4-token blocks emitted in `lsaBlockList` for one query token:
     /// 1 sink block + $k / 4$ selected middle blocks + $(n_w / 4 + 1)$ local window blocks.
     public var maxTotalSelectedBlocks: Int {
@@ -153,39 +133,8 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
         Self.sinkTokens + alignedBudget + Self.windowTokens
     }
 
-    /// True when a sequence of `position + 1` tokens should bypass LSA and execute dense attention.
-    @inline(__always)
-    public func shouldBypassToDense(position: Int) -> Bool {
-        position < denseBypassThreshold
-    }
-
     /// Context threshold above which QSA models automatically engage `e-means-4096` coarse clustering in `auto` mode.
     public static let qsaAutoClusterThresholdTokens: Int = 262_144
-
-    /// Resolves the concrete backend for `descriptor`.
-    public func resolveBackend(descriptor: QWModelDescriptor, hasValidSidecar: Bool, maxContext: Int = 0) -> QWLSAResolvedBackend {
-        switch mode {
-        case .off:
-            return .disabled
-        case .sidecar:
-            return hasValidSidecar ? .sidecar : .disabled
-        case .svd:
-            return hasValidSidecar ? .sidecar : .svd
-        case .qsaCluster:
-            if descriptor.capabilities.contains(.qsaIndexer) {
-                return .qsaCluster
-            }
-            return hasValidSidecar ? .sidecar : .svd
-        case .auto:
-            if descriptor.capabilities.contains(.qsaIndexer) {
-                return maxContext > Self.qsaAutoClusterThresholdTokens ? .qsaCluster : .disabled
-            }
-            if hasValidSidecar {
-                return .sidecar
-            }
-            return .svd
-        }
-    }
 
     /// Resolves the `.qlsa` sidecar file URL for a model pack, checking `explicitSidecarPath` first,
     /// then `<modelRoot>/model.qlsa` and `<modelRoot>/assets/model.qlsa`.
@@ -213,29 +162,5 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
             return candidate
         }
         return nil
-    }
-
-    /// Computes the preallocated GPU byte footprint per full-attention layer for `QWLSACacheState`
-    /// (`bucketCentroids`: 8 KB/512t, `bucketMembers`: 256 B/512t, `tailPoolKeys`: 16 KB fixed ring).
-    public static func cacheBytesPerLayer(
-        maxTokens: Int,
-        indexDim: Int = defaultIndexDim,
-        clusterBlock: Int = defaultClusterBlock,
-        bucketsPerBlock: Int = bucketsPerBlock
-    ) -> (tailPoolBytes: Int, centroidBytes: Int, memberBytes: Int, totalBytes: Int) {
-        func align256(_ n: Int) -> Int { (max(256, n) + 255) & ~255 }
-        if clusterBlock >= emeansClusterBlock {
-            let macros = max(1, (maxTokens + emeansClusterBlock - 1) / emeansClusterBlock)
-            let tailBytes = align256(1024 * indexDim * 2)
-            let centBytes = align256(macros * 64 * indexDim * 2)
-            let membBytes = align256(macros * (1024 * 2 + 64 * 4))
-            return (tailBytes, centBytes, membBytes, tailBytes + centBytes + membBytes)
-        }
-        let maxBlocks = max(1, (maxTokens + clusterBlock - 1) / clusterBlock)
-        let poolBlocks = max(128, clusterBlock / poolSize)
-        let tailBytes = align256(poolBlocks * indexDim * 2)
-        let centBytes = align256(maxBlocks * bucketsPerBlock * indexDim * 2)
-        let membBytes = align256(maxBlocks * bucketsPerBlock * 4)
-        return (tailBytes, centBytes, membBytes, tailBytes + centBytes + membBytes)
     }
 }

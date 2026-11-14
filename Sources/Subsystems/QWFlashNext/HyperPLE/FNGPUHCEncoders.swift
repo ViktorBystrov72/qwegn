@@ -93,6 +93,21 @@ extension QWGemm {
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
+    /// Fused residual injection (xOut = base + src * inj) + HC stream norm (xn) without rotation.
+    public static func encodeFnHCInjectNorm(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
+                                            base: QWTensorValue, src: QWTensorValue, inj: QWTensorValue,
+                                            xOut: QWTensorValue, weight: QWTensorValue, xn: QWTensorValue,
+                                            rows: Int, width: Int, hidden: Int, eps: Float) throws {
+        precondition(width % hidden == 0, "fused HC inject+norm requires width % hidden == 0")
+        enc.setComputePipelineState(try hal.pipeline("qwg_hc_inject_norm"))
+        enc.bindTensors(base, src, inj, xOut, weight, xn, startIndex: 0)
+        enc.setUInt32s(hidden, startIndex: 6)
+        enc.setPod(eps, index: 7)
+        enc.setUInt32s(width, startIndex: 8)
+        enc.dispatchThreadgroups(MTLSize(width: rows * (width / hidden), height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
     /// Fused residual injection (xOut = base + src * inj) + HC stream norm + 32-point rotation in one dispatch.
     public static func encodeFnHCInjectNormRot(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
                                                base: QWTensorValue, src: QWTensorValue, inj: QWTensorValue,

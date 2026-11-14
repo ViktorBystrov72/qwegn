@@ -18,14 +18,6 @@ public enum QWKVError: Error, CustomStringConvertible {
 
 public enum QWKVMode: Sendable, CaseIterable {
     case f16, q8, q4
-
-    public var bytesPerElement: Double {
-        switch self {
-        case .f16: return 2.0
-        case .q8: return 1.0
-        case .q4: return 0.5
-        }
-    }
 }
 public enum QWKVKind: String, Sendable, CaseIterable { case k = "K", v = "V" }
 

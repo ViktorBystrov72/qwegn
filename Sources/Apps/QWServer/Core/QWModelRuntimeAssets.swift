@@ -33,6 +33,7 @@ public struct QWModelRuntimeAssets: Sendable {
         case templateMissing(String)
         case ambiguousTemplate(String)
         case tokenizerMissing(String)
+        case configMissing(String)
 
         public var description: String {
             switch self {
@@ -45,6 +46,7 @@ public struct QWModelRuntimeAssets: Sendable {
             case .ambiguousTemplate(let path):
                 return "model assets: multiple named chat templates in '\(path)' have no 'default' template"
             case .tokenizerMissing(let path): return "model assets: tokenizer.json missing at '\(path)'"
+            case .configMissing(let path): return "model assets: config.json missing at '\(path)'"
             }
         }
     }
@@ -82,7 +84,7 @@ public struct QWModelRuntimeAssets: Sendable {
 
     private static func validateModelConfig(at url: URL) throws -> QWModelDescriptor {
         guard FileManager.default.fileExists(atPath: url.path) else {
-            return .qwen38_27b
+            throw Error.configMissing(url.path)
         }
         let descriptor = try QWModelDescriptor.decode(configJSON: Data(contentsOf: url))
         // Model-type admission only. Geometry identity stays bound by the

@@ -6,7 +6,6 @@ import XCTest
 import Metal
 import QWCore
 import QWAlloc
-import QWState
 import QWMM
 import QWQuant
 import QWGEMM
@@ -39,24 +38,6 @@ final class QWEngineTests: XCTestCase {
         ledger.reset()
         ledger.setEnabled(false)
         XCTAssertTrue(ledger.values().isEmpty)
-    }
-
-    // MARK: - config contract (spec-22: every flag 1:1, no hidden defaults)
-
-    func testConfigDefaultsAreTheAdrs() {
-        let c = QWEngineConfig()
-        XCTAssertEqual(c.prefillChunk, 64)      // C13 ADR
-        XCTAssertEqual(c.gdnPrefillMode, .chunked) // C13 default
-        XCTAssertEqual(c.mtpDrafts, 0)          // speculation opt-in
-        XCTAssertEqual(c.temperature, 0)        // greedy default
-    }
-
-    func testConfigPrefillModes() {
-        var c = QWEngineConfig()
-        c.gdnPrefillMode = .naive
-        XCTAssertEqual(c.gdnPrefillMode, .naive)
-        c.gdnPrefillMode = .chunked
-        XCTAssertEqual(c.gdnPrefillMode, .chunked)
     }
 
     func testPrefillScratchEvictionAutoTriggersOnHighWiredArenaRatio() {

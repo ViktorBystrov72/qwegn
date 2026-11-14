@@ -38,7 +38,7 @@ final class QWMultiBitUnpackTests: XCTestCase {
         for (bits, group) in [(2, 64), (3, 64), (4, 64), (6, 64), (8, 64)] {
             var out: [Float] = []
             makeBlock(bits: bits, group: group, values: values, scale: 1, bias: -1032)
-                .withUnsafeBytes { QWAQBlock.unpack(group: $0, bits: bits, group: group, into: &out) }
+                .withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.unpack(group: raw, bits: bits, group: group, into: &out) }
             for i in 0..<group {
                 let code = Double(values[i] & UInt32((1 << bits) - 1))
                 XCTAssertEqual(Double(out[i]), code - 1032.0, accuracy: 1e-3,
@@ -76,7 +76,7 @@ final class QWMultiBitUnpackTests: XCTestCase {
             let values = (0..<group).map { UInt32($0 % (maxValue + 1)) }
             let block = makeBlock(bits: bits, group: group, values: values)
             var out: [Float] = []
-            block.withUnsafeBytes { QWAQBlock.unpack(group: $0, bits: bits, group: group, into: &out) }
+            block.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.unpack(group: raw, bits: bits, group: group, into: &out) }
             XCTAssertEqual(out.count, group, "\(bits)-bit group")
             for i in 0..<group {
                 XCTAssertEqual(Double(out[i]), Double(values[i]), accuracy: 1e-3, "\(bits)-bit element \(i)")
@@ -98,7 +98,7 @@ final class QWMultiBitUnpackTests: XCTestCase {
         let values = (0..<64).map { UInt32($0) }
         let block = makeBlock(bits: 8, group: 64, values: values, scale: 2, bias: 3)
         var out: [Float] = []
-        block.withUnsafeBytes { QWAQBlock.unpack(group: $0, bits: 8, group: 64, into: &out) }
+        block.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.unpack(group: raw, bits: 8, group: 64, into: &out) }
         XCTAssertEqual(Double(out[0]), 3.0, accuracy: 1e-3)
         XCTAssertEqual(Double(out[1]), 5.0, accuracy: 1e-3)
     }
@@ -111,7 +111,7 @@ final class QWMultiBitUnpackTests: XCTestCase {
             let block = makeBlock(bits: bits, group: group, values: values, scale: 2, bias: 3)
             var x = [Float](repeating: 0, count: group)
             for i in 0..<group { x[i] = Float(i % 7) - 3.0 }
-            let got = block.withUnsafeBytes { QWAQBlock.dot(group: $0, bits: bits, group: group, x: x) }
+            let got = block.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.dot(group: raw, bits: bits, group: group, x: x) }
             var expected = 0.0
             for i in 0..<group {
                 expected += (Double(values[i]) * 2.0 + 3.0) * Double(x[i])
@@ -130,7 +130,7 @@ final class QWMultiBitUnpackTests: XCTestCase {
         let bytes = [UInt8](block)
         XCTAssertEqual(Array(bytes[4...]), payload)
         var out: [Float] = []
-        block.withUnsafeBytes { QWAQBlock.unpack(group: $0, bits: 3, group: 64, into: &out) }
+        block.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.unpack(group: raw, bits: 3, group: 64, into: &out) }
         XCTAssertEqual(Double(out[0]), 0.0 * 0.03125 - 0.125, accuracy: 1e-6)
     }
 

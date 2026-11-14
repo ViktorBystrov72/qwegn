@@ -38,7 +38,7 @@ final class QWEmbedTableTests: XCTestCase {
         }
         let headerJSON = try JSONSerialization.data(withJSONObject: header)
         var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { Array($0) })
+        out.append(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         out.append(headerJSON)
         out.append(payload)
         try out.write(to: dir.appendingPathComponent(name))

@@ -10,7 +10,6 @@ import Metal
 import QWCore
 import QWHAL
 import QWAlloc
-import QWState
 import QWMM
 
 // MARK: - Config (the whole contract — the CLI maps flags 1:1, spec-22) ─────
@@ -24,20 +23,6 @@ public enum GDNPrefillMode: String, Sendable, CaseIterable, Equatable {
     /// EXP-9); parity-gated against `.chunked`/`.naive`, SMALL-T measured
     /// win only (component bench, T<=1024) — not certified for T>1024.
     case regres
-}
-
-/// Production speculative configuration (Phase 4, section 5A.1).
-/// Supports N=0 (speculation off) and N=1...5 drafts (up to six verify rows).
-public struct QWMTPConfig: Sendable, Equatable {
-    public let drafts: Int
-
-    public init(drafts: Int = 0, backend: QWMTPBackend = .standard) throws {
-        let maxDrafts = backend == .dflash2 ? 15 : 5
-        guard drafts >= 0 && drafts <= maxDrafts else {
-            throw QWEngineError.badConfig("MTP drafts must be 0...\(maxDrafts) (got \(drafts))")
-        }
-        self.drafts = drafts
-    }
 }
 
 /// Typed per-session round record (Phase 4, section 5A.3).
@@ -70,40 +55,6 @@ public struct QWRoundRecord: Sendable, Equatable, Codable {
         self.samplerDrawIndex = samplerDrawIndex
     }
 }
-
-public struct QWEngineConfig: Sendable, Equatable {
-    public var slotCap: Int = 1              // C20 slots (P0 single-seq build)
-    public var lruN: Int = 4                 // prefix-cache LRU depth
-    public var prefillChunk: Int = 64        // C13 ADR (guard: L ≤ 64 kernel law)
-    public var gdnPrefillMode: GDNPrefillMode = .chunked // C13 chunked scan (C12 naive fallback)
-    public var mtpDrafts: Int = 0 {          // 0 = speculation off; 1...5 (or 1...15 for dflash2/dspine) drafts
-        didSet {
-            precondition(mtpDrafts >= 0 && mtpDrafts <= 15, "mtpDrafts must be 0...15 (got \(mtpDrafts))")
-        }
-    }
-    /// The MTP execution backend (LighteningMTP L1 / DFlash 2). The config carries the
-    /// SAME identity the driver resolved; an explicit backend with zero
-    /// drafts is invalid — use QWEngineConfig.validate() (the throwing
-    public var mtpBackend: QWMTPBackend = .standard
-    public var mtpRelaxedMargin: Double = 1.5
-    public var mtpDraftStrategy: String = "hybrid"
-    public var mtpQuadraticSeeding: Bool = true
-    public var dflashDraftPackPath: String? = nil
-    public var dflashSelectorTopK: Int = 16
-    public var maxNewTokens: Int = 256
-    public var temperature: Float = 0        // 0 = greedy (argmax door)
-    public init() {}
-
-    /// The config-level backend/drafts contract (LighteningMTP L1). An
-    /// explicit backend at zero drafts is rejected by the driver init (it
-    /// keeps the explicit-ness); this method guards the positive-drafts
-    public func validate() throws {
-        if mtpDrafts > 0 {
-            _ = try QWMTPBackend.resolveSelection(mtpBackend, drafts: mtpDrafts)
-        }
-    }
-}
-
 
 // MARK: - L5: CPU-tail ledger (encode time = the ≤300 µs/step gate feed) ───
 

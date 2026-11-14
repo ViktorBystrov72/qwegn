@@ -113,11 +113,6 @@ public struct QWResidentKVWatermarkTracker<Token: Equatable & Sendable>: Sendabl
             currentHasMTP = hasMTP
         }
     }
-
-    public mutating func invalidateAll() {
-        historyBySlot.removeAll(keepingCapacity: true)
-        hasMTPBySlot.removeAll(keepingCapacity: true)
-    }
 }
 
 /// Shared cold SSD directory helpers for `.qwcache` files.
@@ -257,10 +252,6 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
 
     public var sharedBaseBytes: Int {
         sharedBaseKeys.reduce(0) { $0 + (entries[$1]?.charge ?? 0) }
-    }
-
-    public var sharedBaseMaxTokens: Int {
-        sharedBaseKeys.reduce(0) { max($0, entries[$1]?.tokenCount ?? 0) }
     }
 
     /// Returns the longest common prefix length (`>= rootPrefixTokenCount` and `< history.count`)
@@ -415,20 +406,6 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
         }) ?? order.first(where: { !isSharedBaseKey($0) }) else { return false }
         evictKey(victim)
         return true
-    }
-
-    public func evictMatchingPrefixes(
-        maxTokenCount: Int,
-        matchesPrefix: (Key, Int) -> Bool
-    ) {
-        guard isEnabled else { return }
-        for key in Array(order) {
-            if isSharedBaseKey(key) || isProtectedLastKey(key) { continue }
-            guard let entry = entries[key], entry.tokenCount > 0, entry.tokenCount < maxTokenCount else { continue }
-            if matchesPrefix(key, entry.tokenCount) {
-                evictKey(key)
-            }
-        }
     }
 
     @discardableResult

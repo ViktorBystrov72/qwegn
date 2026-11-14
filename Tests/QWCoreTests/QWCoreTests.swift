@@ -65,7 +65,6 @@ final class QWCoreTests: XCTestCase {
 
     func testDTypeSizes() {
         XCTAssertEqual(QWDType.q4g.bytesPerParam, 0.625, accuracy: 1e-9)
-        XCTAssertEqual(QWDType.hq4_g32.bytesPerParam, 0.625, accuracy: 1e-9)
         XCTAssertEqual(QWDType.q4g.groupSize, 32)
         XCTAssertEqual(QWDType.q8_0.bytesPerParam, 1.0625, accuracy: 1e-9)
         // HQ4_G32_M5 model-size sanity: 26.89e9 text params ≈ 16.81 GB

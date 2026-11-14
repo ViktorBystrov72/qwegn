@@ -21,7 +21,7 @@ final class QWKV1MAndCompressedLayoutTests: XCTestCase {
 
     func testAllocateCeilingGuardAt1MContext() throws {
         // Sizing a minimal cache to verify ceiling guard arithmetic
-        let pageBytes = QWKVCache.pageBytes(mode: .f16)
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
         let tables = QWKVCache.tableSlotBytes * 2 * Self.testLayers.count * QWKVCache.maxSeqs
         let arena = try QWArena(hal: Self.hal, weights: 0, activations: 0,
                                 kv: pageBytes * 4 * Self.testLayers.count + tables, gdnStates: 0)
@@ -34,7 +34,7 @@ final class QWKV1MAndCompressedLayoutTests: XCTestCase {
     }
 
     func testFinishZeroesExpandedDeviceSlot() throws {
-        let pageBytes = QWKVCache.pageBytes(mode: .f16)
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
         let needPages = 4
         let poolBytes = pageBytes * needPages * 2
         let tables = QWKVCache.tableSlotBytes * 2 * Self.testLayers.count * QWKVCache.maxSeqs
@@ -73,34 +73,34 @@ final class QWKV1MAndCompressedLayoutTests: XCTestCase {
         // stride the q8/q4 decode kernels multiply page ids by (pinned by
         // QWAttnDecodeQuantKVTests.testLayoutIdentities vs the kernel
         // #defines). Payload-only math for budgeting stays in kvBytes below.
-        XCTAssertEqual(QWKVCache.pageBytes(mode: .f16), 256 * 1024 * 2)
-        XCTAssertEqual(QWKVCache.pageBytes(mode: .q8), 256 * 1024 * 1 + 256 * 4 * 2)      // +2048 B f16 scales
-        XCTAssertEqual(QWKVCache.pageBytes(mode: .q4), 256 * 1024 / 2 + 2048 * 2 * 2)     // +8192 B {scale,min}
+        XCTAssertEqual(QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b), 256 * 1024 * 2)
+        XCTAssertEqual(QWKVCache.pageBytes(mode: .q8, geometry: .qwen38_27b), 256 * 1024 * 1 + 256 * 4 * 2)      // +2048 B f16 scales
+        XCTAssertEqual(QWKVCache.pageBytes(mode: .q4, geometry: .qwen38_27b), 256 * 1024 / 2 + 2048 * 2 * 2)     // +8192 B {scale,min}
 
         // 1M tokens (1,048,576) across 16 layers:
         // FP16: 2 * 16 * 1,048,576 * 1024 * 2 = 64 GiB (68,719,476,736 bytes)
         // Q8:   2 * 16 * 1,048,576 * 1024 * 1 = 32 GiB (34,359,738,368 bytes)
         let oneMillion = 1_048_576
-        XCTAssertEqual(QWKVCache.kvBytes(tokens: oneMillion, layers: 16, mode: .f16), 68_719_476_736)
-        XCTAssertEqual(QWKVCache.kvBytes(tokens: oneMillion, layers: 16, mode: .q8), 34_359_738_368)
-        XCTAssertEqual(QWKVCache.kvBytes(tokens: oneMillion, layers: 16, mode: .q4), 17_179_869_184)
+        XCTAssertEqual(QWKVCache.kvBytes(tokens: oneMillion, layers: 16, mode: .f16, geometry: .qwen38_27b), 68_719_476_736)
+        XCTAssertEqual(QWKVCache.kvBytes(tokens: oneMillion, layers: 16, mode: .q8, geometry: .qwen38_27b), 34_359_738_368)
+        XCTAssertEqual(QWKVCache.kvBytes(tokens: oneMillion, layers: 16, mode: .q4, geometry: .qwen38_27b), 17_179_869_184)
     }
 
     func testCompressedKVPageLayoutMetadata() {
         // Layout metadata for a page of 256 tokens:
-        let layoutF16 = QWKVCompressedLayout(mode: .f16)
+        let layoutF16 = QWKVCompressedLayout(mode: .f16, geometry: .qwen38_27b)
         XCTAssertEqual(layoutF16.dataBytesPerPage, 524_288)
         XCTAssertEqual(layoutF16.scaleBytesPerPage, 0)
         XCTAssertEqual(layoutF16.totalBytesPerPage, 524_288)
 
-        let layoutQ8 = QWKVCompressedLayout(mode: .q8)
+        let layoutQ8 = QWKVCompressedLayout(mode: .q8, geometry: .qwen38_27b)
         // 256 tokens * 4 heads * 256 bytes = 262,144 bytes data
         XCTAssertEqual(layoutQ8.dataBytesPerPage, 262_144)
         // Per head per row scale (fp16 = 2 bytes): 256 tokens * 4 heads * 2 bytes = 2048 bytes
         XCTAssertEqual(layoutQ8.scaleBytesPerPage, 2048)
         XCTAssertEqual(layoutQ8.totalBytesPerPage, 262_144 + 2048)
 
-        let layoutQ4 = QWKVCompressedLayout(mode: .q4)
+        let layoutQ4 = QWKVCompressedLayout(mode: .q4, geometry: .qwen38_27b)
         // 256 tokens * 4 heads * 128 bytes = 131,072 bytes data (packed nibbles)
         XCTAssertEqual(layoutQ4.dataBytesPerPage, 131_072)
         // Group-128 scale and min (fp16 each = 4 bytes per group):
@@ -218,7 +218,7 @@ final class QWKV1MAndCompressedLayoutTests: XCTestCase {
     }
 
     func testSplitKVSubAllocatorsPlaceKAndVInDisjointBuffers() throws {
-        let pageBytes = QWKVCache.pageBytes(mode: .f16)
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
         let needPages = 4
         let kTotal = pageBytes * needPages * Self.testLayers.count
         let vTotal = pageBytes * needPages * Self.testLayers.count
@@ -236,6 +236,16 @@ final class QWKV1MAndCompressedLayoutTests: XCTestCase {
             XCTAssertTrue(views.k.pool.buffer === kBuf)
             XCTAssertTrue(views.v.pool.buffer === vBuf)
             XCTAssertFalse(views.k.pool.buffer === views.v.pool.buffer)
+        }
+    }
+}
+
+private extension QWKVMode {
+    var bytesPerElement: Double {
+        switch self {
+        case .f16: return 2.0
+        case .q8: return 1.0
+        case .q4: return 0.5
         }
     }
 }

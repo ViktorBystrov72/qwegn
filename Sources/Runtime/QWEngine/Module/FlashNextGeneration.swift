@@ -86,8 +86,9 @@ extension FlashNextModule {
             ))
             return try core.generate(prompt: request.prompt, maxNew: request.maxNew,
                                      stopIDs: request.stopIDs, sampling: request.sampling,
-                                     speculative: request.speculative, onToken: onToken,
-                                     onStopToken: onStopToken)
+                                     speculative: request.speculative,
+                                     onToken: onToken, onStopToken: onStopToken,
+                                     onPrefillProgress: request.onPrefillProgress)
         }
         for token in request.prompt where token < 0 || token >= plan.vocab {
             throw QWModuleError.invalidToken(token)
@@ -124,6 +125,7 @@ extension FlashNextModule {
             quadraticSeeding: request.speculative.mtpQuadraticSeeding,
             collectLogprobs: request.collectLogprobs,
             topLogprobsCount: request.topLogprobsCount,
+            onPrefillProgress: request.onPrefillProgress,
             onToken: onToken,
             onStopToken: onStopToken,
             onTokenLogprob: request.onTokenLogprob,

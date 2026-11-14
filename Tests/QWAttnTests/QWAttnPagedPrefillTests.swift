@@ -102,7 +102,7 @@ final class QWAttnPagedPrefillTests: XCTestCase {
         let T = 32
         let sp = (T + 31) / 32 * 32
         let ceiling = pos + T + 256
-        let pageBytes = QWKVCache.pageBytes(mode: .f16)
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
         let needPages = (ceiling + 255) / 256
         let poolBytes = pageBytes * needPages * 2
         let tables = QWKVCache.tableSlotBytes * 2 * 1 * QWKVCache.maxSeqs
@@ -184,7 +184,7 @@ final class QWAttnPagedPrefillTests: XCTestCase {
         let T = 65
         let sp = (T + 31) / 32 * 32
         let ceiling = pos + T + 256
-        let pageBytes = QWKVCache.pageBytes(mode: .f16)
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
         let needPages = (ceiling + 255) / 256
         let poolBytes = pageBytes * needPages * 2
         let tables = QWKVCache.tableSlotBytes * 2 * 1 * QWKVCache.maxSeqs
@@ -229,7 +229,7 @@ final class QWAttnPagedPrefillTests: XCTestCase {
         let T = 32
         let sp = (T + 31) / 32 * 32
         let ceiling = pos + T + 256
-        let pageBytes = QWKVCache.pageBytes(mode: .q8)
+        let pageBytes = QWKVCache.pageBytes(mode: .q8, geometry: .qwen38_27b)
         let needPages = (ceiling + 255) / 256
         let poolBytes = pageBytes * needPages * 2
         let tables = QWKVCache.tableSlotBytes * 2 * 1 * QWKVCache.maxSeqs
@@ -305,7 +305,7 @@ final class QWAttnPagedPrefillTests: XCTestCase {
         let T = 32
         let sp = (T + 31) / 32 * 32
         let ceiling = pos + T + 256
-        let pageBytes = QWKVCache.pageBytes(mode: .q4)
+        let pageBytes = QWKVCache.pageBytes(mode: .q4, geometry: .qwen38_27b)
         let needPages = (ceiling + 255) / 256
         let poolBytes = pageBytes * needPages * 2
         let tables = QWKVCache.tableSlotBytes * 2 * 1 * QWKVCache.maxSeqs

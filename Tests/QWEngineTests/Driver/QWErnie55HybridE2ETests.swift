@@ -352,7 +352,7 @@ final class QWErnie55HybridE2ETests: XCTestCase {
                     let bits = val.bitPattern
                     let roundBias = UInt32(0x7FFF) &+ ((bits >> 16) & 1)
                     let bf = UInt16(truncatingIfNeeded: (bits &+ roundBias) >> 16).littleEndian
-                    withUnsafeBytes(of: bf) { raw.append(contentsOf: $0) }
+                    withUnsafeBytes(of: bf) { (rawBuf: UnsafeRawBufferPointer) in raw.append(contentsOf: rawBuf) }
                 }
                 file.append(raw)
                 padTo(256)
@@ -402,7 +402,7 @@ final class QWErnie55HybridE2ETests: XCTestCase {
         ]
         let hdrData = try JSONSerialization.data(withJSONObject: headerObj, options: [.sortedKeys])
         let hdrLen = UInt64(hdrData.count).littleEndian
-        withUnsafeBytes(of: hdrLen) { raw in
+        withUnsafeBytes(of: hdrLen) { (raw: UnsafeRawBufferPointer) in
             file.replaceSubrange(4..<12, with: raw)
         }
         file.append(hdrData)
@@ -421,6 +421,8 @@ final class QWErnie55HybridE2ETests: XCTestCase {
     }
 
     func testGreedyVsEchoSpeculativeBitExactTokenStreamParity() throws {
+        try XCTSkipUnless(QWDeviceCaps.current?.isMetal4TensorCapable == true,
+                          "ERNIE-5.5 hybrid driver E2E requires bare-metal Apple Silicon GPU")
         let rootDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qw-ernie55-e2e-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: rootDir) }
@@ -461,9 +463,19 @@ final class QWErnie55HybridE2ETests: XCTestCase {
             driver: hybrid3Driver, prompt: prompt, maxNew: maxNew, speculative: true)
         XCTAssertEqual(hybrid3Tokens, baselineTokens,
                        "3-draft hybrid PLD + ECHO speculative stream must be bit-exact with greedy baseline")
+
+        let repPrompt = [1, 12, 24, 36, 48, 60, 72, 12, 24, 36, 48]
+        let repBaseline = try runGreedyTokens(
+            driver: baseDriver, prompt: repPrompt, maxNew: 8, speculative: false)
+        let repHybrid = try runGreedyTokens(
+            driver: hybrid3Driver, prompt: repPrompt, maxNew: 8, speculative: true)
+        XCTAssertEqual(repHybrid, repBaseline,
+                       "Repetitive prompt ECHO PLD + commit pair seeding must be bit-exact with greedy baseline")
     }
 
     func testPrivatePrefixRollbackAndStandaloneQWCacheBitExactParity() throws {
+        try XCTSkipUnless(QWDeviceCaps.current?.isMetal4TensorCapable == true,
+                          "ERNIE-5.5 hybrid driver E2E requires bare-metal Apple Silicon GPU")
         let rootDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qw-ernie55-cache-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: rootDir) }

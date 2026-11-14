@@ -45,10 +45,12 @@ fi
 
 if [[ $SKIP_BUILD -eq 0 ]]; then
   ./Scripts/build_metallib.sh >/dev/null
+  swift build -c release --product qwg
   swift build -c release --product qwg-menu
 fi
 
 BIN_DIR="$(swift build -c release --show-bin-path)"
+[[ -x "$BIN_DIR/qwg" ]] || { echo "build_app.sh: missing $BIN_DIR/qwg" >&2; exit 1; }
 [[ -x "$BIN_DIR/qwg-menu" ]] || { echo "build_app.sh: missing $BIN_DIR/qwg-menu" >&2; exit 1; }
 [[ -f "Sources/QWMetal/kernel.metallib" && -f "Sources/QWMetal/kernel_std.metallib" ]] || {
   echo "build_app.sh: missing Sources/QWMetal/kernel*.metallib" >&2
@@ -92,6 +94,8 @@ swift "$ROOT/Scripts/gen_app_icon.swift" "$ICON_WORK/AppIcon.iconset"
 
 cp "$BIN_DIR/qwg-menu" "$APP/Contents/MacOS/qwg-menu"
 chmod 755 "$APP/Contents/MacOS/qwg-menu"
+cp "$BIN_DIR/qwg" "$APP/Contents/MacOS/qwg"
+chmod 755 "$APP/Contents/MacOS/qwg"
 cp "Sources/QWMetal/kernel.metallib" "Sources/QWMetal/kernel_std.metallib" "$APP/Contents/Resources/"
 
 if [[ -d "$BIN_DIR/qwegine_QWServer.bundle" ]]; then
@@ -104,6 +108,7 @@ if [[ "$IDENTITY" == "-" ]]; then
 else
   SIGN_FLAGS+=(--options runtime --timestamp)
 fi
+/usr/bin/codesign "${SIGN_FLAGS[@]}" "$APP/Contents/MacOS/qwg"
 if [[ -d "$APP/Contents/Resources/qwegine_QWServer.bundle" ]]; then
   /usr/bin/codesign "${SIGN_FLAGS[@]}" "$APP/Contents/Resources/qwegine_QWServer.bundle"
 fi

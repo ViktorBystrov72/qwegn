@@ -99,7 +99,7 @@ kernel void qwg_mla_indexer_score_mma(
 // Per-row top-K over scores from qwg_mla_indexer_score_mma, plus trailing window append.
 // Grid: (T, 1, 1), Threadgroup: (256, 1, 1).
 kernel void qwg_mla_indexer_select(
-    device const float*       scoreScratch [[buffer(3)]],
+    device atomic_uint*       scoreScratch [[buffer(3)]],
     device int*               blockList    [[buffer(4)]],
     device int*               blockCount   [[buffer(5)]],
     constant MLAIndexerParams& p           [[buffer(6)]],
@@ -123,6 +123,7 @@ kernel void qwg_mla_indexer_select(
     qwg_mla_select_pools(scoreScratch + (size_t)t * p.scoreStride, midPools, p.topKPools,
                          dstList, blockCount + t, tid, hist, tgState);
     if (winBlocks > 0u) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
         threadgroup_barrier(mem_flags::mem_device);
         for (uint w = tid; w < winBlocks; w += 256u) dstList[p.topKPools + w] = int(midPools + w);
         if (tid == 0u) blockCount[t] = int(p.topKPools + winBlocks);

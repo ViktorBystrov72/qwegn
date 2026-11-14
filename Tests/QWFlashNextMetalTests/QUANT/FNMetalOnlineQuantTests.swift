@@ -353,10 +353,10 @@ final class FNMetalOnlineQuantTests: XCTestCase {
             let at = b * groupBytes
             let block = Data(got[at..<(at + groupBytes)])
             var values: [Float] = []
-            block.withUnsafeBytes { QWAQBlock.unpack(group: $0, bits: bits, group: group, into: &values) }
+            block.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.unpack(group: raw, bits: bits, group: group, into: &values) }
             decoded.append(contentsOf: values)
         }
-        let mlx = wantValues.withUnsafeBytes { [Float]($0.bindMemory(to: Float.self)) }
+        let mlx = wantValues.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in [Float](raw.bindMemory(to: Float.self)) }
         for i in 0..<min(decoded.count, mlx.count) {
             let at = (i / group) * 4
             let bits32 = UInt32(scales[at]) | (UInt32(scales[at + 1]) << 8)
@@ -366,5 +366,26 @@ final class FNMetalOnlineQuantTests: XCTestCase {
             let scale = abs(Float(bitPattern: bits32))
             XCTAssertLessThan(abs(decoded[i] - mlx[i]), 0.6 * scale + 1e-6, "element \(i)")
         }
+    }
+}
+
+private extension QWAQProducer {
+    static func repackMLXGroup(
+        bits: Int, group: Int, packed: [UInt8], scale: Float, bias: Float
+    ) throws -> Data {
+        let payload = group * bits / 8
+        precondition(packed.count == payload, "a group holds \(payload) payload bytes")
+        guard headerHolds(scale: scale, bias: bias) else {
+            throw QWAQProducerError.headerNotRepresentable(scale: scale, bias: bias)
+        }
+        var out = Data()
+        out.append(contentsOf: withUnsafeBytes(of: Float16(scale).bitPattern.littleEndian) {
+            (raw: UnsafeRawBufferPointer) in Array(raw)
+        })
+        out.append(contentsOf: withUnsafeBytes(of: Float16(bias).bitPattern.littleEndian) {
+            (raw: UnsafeRawBufferPointer) in Array(raw)
+        })
+        out.append(contentsOf: packed)
+        return out
     }
 }

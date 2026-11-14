@@ -87,18 +87,6 @@ final class QWMTPBackendTests: XCTestCase {
         }
     }
 
-    func testEngineConfigCarriesBackendAndValidates() throws {
-        var c = QWEngineConfig()
-        XCTAssertEqual(c.mtpBackend, .standard)      // default unchanged
-        XCTAssertEqual(c.mtpDrafts, 0)
-        try c.validate()                              // N0: no backend contract
-        c.mtpDrafts = 2
-        c.mtpBackend = .dflash2
-        try c.validate()
-        c.mtpDrafts = 0
-        try c.validate()                              // explicit-at-N0 caught by driver, not config
-    }
-
     func testBackendCodableRoundTrip() throws {
         let data = try JSONEncoder().encode(QWMTPBackend.dflash2)
         XCTAssertEqual(String(decoding: data, as: UTF8.self), "\"dflash2\"")

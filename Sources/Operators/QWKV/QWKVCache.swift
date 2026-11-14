@@ -12,35 +12,20 @@ import QWHAL
 import QWAlloc
 
 
-/// The cache. One instance per engine; `layers` = the 16 attn layer indices.
+/// The cache. One instance per engine; `layers` = attn layer indices.
 public final class QWKVCache: @unchecked Sendable {
     public static let pageTokens = 256
-    public static let kvHeads = QWModelGeometry.qwen38_27b.kvHeads            // 4
-    public static let headDim = QWModelGeometry.qwen38_27b.headDim            // 256
-    /// Pool row = one token of one pool = kvHeads×headDim f16 = 2 KiB; the
-    /// per-head row (head_dim×dtype = 512 B) is inherently 128 B-aligned —
-    /// bench_kv races the natural 1024 vs a padded 1152 stride for the
-    public static let rowBytes = kvHeads * headDim * 2         // 2048 B (f16)
-    public static func rowBytes(mode: QWKVMode) -> Int {
-        switch mode {
-        case .f16: return kvHeads * headDim * 2
-        case .q8:  return kvHeads * headDim * 1 + kvHeads * MemoryLayout<Float16>.stride
-        case .q4:  return kvHeads * headDim / 2 + 8 * (MemoryLayout<Float16>.stride * 2)
-        }
-    }
-    public static func pageBytes(mode: QWKVMode) -> Int {
-        pageBytes(mode: mode, geometry: .qwen38_27b)
-    }
+    public var f16RowBytes: Int { geometry.kvChannels * 2 }
+
     public static func pageBytes(mode: QWKVMode, geometry: QWModelGeometry) -> Int {
         // Layout authority = QWKVCompressedLayout: compressed pages carry
         // their C04 scale header INSIDE the page (the kernel addresses it at
         // a fixed payload offset), so the cache page size is data+header.
         return QWKVCompressedLayout(mode: mode, geometry: geometry).totalBytesPerPage
     }
-    /// One KV buffer (K+V, all layers) for `tokens` (q8 halves it, q4 quarters it; C04 header
-    /// adds the per-row f16 scale ≈ +1.6%, budgeted at ROOFLINE, not here).
-    public static func kvBytes(tokens: Int, layers: Int = 16, mode: QWKVMode = .f16) -> Int {
-        let elements = 2 * layers * tokens * kvHeads * headDim
+    /// One KV buffer (K+V, all layers) for `tokens` at raw payload density.
+    public static func kvBytes(tokens: Int, layers: Int, mode: QWKVMode, geometry: QWModelGeometry) -> Int {
+        let elements = 2 * layers * tokens * geometry.kvChannels
         switch mode {
         case .f16: return elements * 2
         case .q8: return elements * 1
@@ -305,54 +290,6 @@ public final class QWKVCache: @unchecked Sendable {
         return QWKVHandle(seq: id, capacity: pagesNeeded * Self.pageTokens, cache: self)
     }
 
-    /// Adopt into an already admitted empty sequence. Prefer
-    /// `allocate(adopting:promptTokens:)` when admission pressure matters.
-    public func adoptSharedPrefix(_ prefix: QWKVSharedPrefix, into h: QWKVHandle) throws {
-        lock.lock(); defer { lock.unlock() }
-        try validateSharedPrefixLocked(prefix)
-        guard h.cache === self, !h.finished, let st = seqs[h.seq],
-              st.writtenTokens == 0, prefix.tokenCount <= h.tokenCapacity else {
-            throw QWKVError.badArgument("shared prefix destination identity, state or capacity invalid")
-        }
-        let required = (prefix.tokenCount + Self.pageTokens - 1) / Self.pageTokens
-        for li in layers.indices {
-            guard st.tablesK[li].count >= required, st.tablesV[li].count >= required else {
-                throw QWKVError.badArgument("shared prefix destination page table is short")
-            }
-            for (ki, kind) in QWKVKind.allCases.enumerated() {
-                let ids = prefix.pages[li * 2 + ki].prefix(required)
-                let limit = pool(layers[li], kind).pages.pageCount
-                guard ids.allSatisfy({ $0 >= 0 && Int($0) < limit }) else {
-                    throw QWKVError.badArgument("shared prefix page ID is invalid")
-                }
-            }
-        }
-
-        for (li, layer) in layers.enumerated() {
-            for (ki, kind) in QWKVKind.allCases.enumerated() {
-                let newIDs = Array(prefix.pages[li * 2 + ki].prefix(required))
-                let oldIDs = kind == .k ? st.tablesK[li] : st.tablesV[li]
-                let oldShared = kind == .k ? st.sharedK[li] : st.sharedV[li]
-                for page in newIDs { retainSharedPage(poolIndex(li, kind), page) }
-                if kind == .k {
-                    st.tablesK[li].replaceSubrange(0..<required, with: newIDs)
-                    st.sharedK[li].replaceSubrange(0..<required, with: repeatElement(true, count: required))
-                } else {
-                    st.tablesV[li].replaceSubrange(0..<required, with: newIDs)
-                    st.sharedV[li].replaceSubrange(0..<required, with: repeatElement(true, count: required))
-                }
-                for index in 0..<required {
-                    if oldShared[index] { releaseSharedPage(poolIndex(li, kind), oldIDs[index]) }
-                    else if !isPagePinned(poolIndex(li, kind), oldIDs[index]) {
-                        pool(layer, kind).pages.freePage(Int(oldIDs[index]))
-                    }
-                }
-                uploadSlot(h.seq, li, kind, kind == .k ? st.tablesK[li] : st.tablesV[li])
-            }
-        }
-        st.writtenTokens = prefix.tokenCount
-    }
-
     /// Grow to ≥ `tokens` (page granularity, every layer+kind). Hot decode
     /// path (once per 256 tokens); zero host allocs when steady (the table
     /// arrays are capacity-reserved at allocate()). All-or-nothing per call.
@@ -407,19 +344,10 @@ public final class QWKVCache: @unchecked Sendable {
         guard h.cache === self, !h.finished, let st = seqs[h.seq], let li = layerIndex(layer) else {
             throw QWKVError.badArgument("unknown seq/layer")
         }
-        let rowElems = geometry.kvChannels   // 1024 f16 at the 27B
+        let rowElems = geometry.kvChannels
         guard positions.lowerBound >= 0, positions.upperBound >= positions.lowerBound,
               positions.count * rowElems == src.count else {
             throw QWKVError.badArgument("src/token mismatch")
-        }
-        if mode != .f16 {
-            // The host-side q8/q4 quantisers are the 27B's layout (four heads
-            // of 256, eight q4 groups per row). Another geometry's
-            // compressed layout has a different group map, so it is refused
-            // rather than silently mis-quantised (C103).
-            guard geometry.is27BKVShape else {
-                throw QWKVError.badArgument("compressed KV fill is the 27B's layout only")
-            }
         }
         let cap = st.tablesK[li].count * Self.pageTokens
         guard positions.upperBound <= cap else { throw QWKVError.badArgument("grow first (cap \(cap))") }
@@ -443,11 +371,13 @@ public final class QWKVCache: @unchecked Sendable {
         } else if mode == .q8 {
             // 4c: CPU quantiser for host-side fills (tests, prefix restore).
             // Byte-identical to the GPU quantisers (qwg_kv_paged_write /
-            // qwattn_decode epilogue) — all three are the QWKVCompressedLayout
-            let layout = QWKVCompressedLayout(mode: .q8)
+            // qwattn_decode epilogue) — all three use QWKVCompressedLayout.
+            let layout = QWKVCompressedLayout(mode: .q8, geometry: geometry)
+            let effHeads = geometry.usesAnyMLA ? 1 : geometry.kvHeads
+            let effHeadDim = geometry.usesAnyMLA ? geometry.kvChannels : geometry.headDim
             var frow = [Float](repeating: 0, count: rowElems)
             var qrow = [Int8](repeating: 0, count: rowElems)
-            var srow = [Float16](repeating: 0, count: geometry.kvHeads)
+            var srow = [Float16](repeating: 0, count: effHeads)
             try src.withUnsafeBufferPointer { s in
                 for tok in positions {
                     let pg = tok / Self.pageTokens, off = tok % Self.pageTokens
@@ -458,20 +388,26 @@ public final class QWKVCache: @unchecked Sendable {
                     for i in 0..<rowElems {
                         frow[i] = Float(Float16(bitPattern: srcRow[i]))
                     }
-                    try QWKVCompressedLayout.quantizeQ8(input: frow, qOut: &qrow, scalesOut: &srow)
-                    _ = qrow.withUnsafeBytes { memcpy(pageBase.advanced(by: off * rowElems), $0.baseAddress!, rowElems) }
-                    let scaleBase = pageBase.advanced(by: layout.dataBytesPerPage + off * (geometry.kvHeads * 2))
-                    _ = srow.withUnsafeBytes { memcpy(scaleBase, $0.baseAddress!, geometry.kvHeads * 2) }
+                    try QWKVCompressedLayout.quantizeQ8(
+                        input: frow, qOut: &qrow, scalesOut: &srow,
+                        kvHeads: effHeads, headDim: effHeadDim)
+                    _ = qrow.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in memcpy(pageBase.advanced(by: off * rowElems), raw.baseAddress!, rowElems) }
+                    let scaleBase = pageBase.advanced(by: layout.dataBytesPerPage + off * (effHeads * 2))
+                    _ = srow.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in memcpy(scaleBase, raw.baseAddress!, effHeads * 2) }
                 }
             }
         } else {
             // q4 host fill: byte-identical to GPU writers + quantizeQ4
             // (group-128 asymmetric; low nibble = even element).
-            let layout = QWKVCompressedLayout(mode: .q4)
+            let layout = QWKVCompressedLayout(mode: .q4, geometry: geometry)
+            let effHeads = geometry.usesAnyMLA ? 1 : geometry.kvHeads
+            let effHeadDim = geometry.usesAnyMLA ? geometry.kvChannels : geometry.headDim
+            let groupsPerHead = max(1, (effHeadDim + 127) / 128)
+            let totalGroups = effHeads * groupsPerHead
             var frow = [Float](repeating: 0, count: rowElems)
             var qrow = [UInt8](repeating: 0, count: rowElems / 2)
-            var sc = [Float16](repeating: 0, count: 8)
-            var mn = [Float16](repeating: 0, count: 8)
+            var sc = [Float16](repeating: 0, count: totalGroups)
+            var mn = [Float16](repeating: 0, count: totalGroups)
             try src.withUnsafeBufferPointer { s in
                 for tok in positions {
                     let pg = tok / Self.pageTokens, off = tok % Self.pageTokens
@@ -482,12 +418,13 @@ public final class QWKVCache: @unchecked Sendable {
                     for i in 0..<rowElems {
                         frow[i] = Float(Float16(bitPattern: srcRow[i]))
                     }
-                    try QWKVCompressedLayout.quantizeQ4(input: frow, qOut: &qrow,
-                                                        scalesOut: &sc, minsOut: &mn)
-                    _ = qrow.withUnsafeBytes { memcpy(pageBase.advanced(by: off * (rowElems / 2)), $0.baseAddress!, rowElems / 2) }
-                    // header: 8 groups × {scale f16, min f16} interleaved
-                    let hBase = pageBase.advanced(by: layout.dataBytesPerPage + off * 32)
-                    for g in 0..<8 {
+                    try QWKVCompressedLayout.quantizeQ4(
+                        input: frow, qOut: &qrow, scalesOut: &sc, minsOut: &mn,
+                        kvHeads: effHeads, headDim: effHeadDim)
+                    _ = qrow.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in memcpy(pageBase.advanced(by: off * (rowElems / 2)), raw.baseAddress!, rowElems / 2) }
+                    // header: totalGroups × {scale f16, min f16} interleaved
+                    let hBase = pageBase.advanced(by: layout.dataBytesPerPage + off * (totalGroups * 4))
+                    for g in 0..<totalGroups {
                         hBase.assumingMemoryBound(to: Float16.self)[2 * g] = sc[g]
                         hBase.assumingMemoryBound(to: Float16.self)[2 * g + 1] = mn[g]
                     }
@@ -634,7 +571,7 @@ public final class QWKVCache: @unchecked Sendable {
             // Empty-array law: withUnsafeBytes on [] hands back a nil
             // baseAddress — the memcpy would trap. The memset below already
             // zeroes the whole slot in that case, so skip the copy.
-            ids.withUnsafeBytes { raw in
+            ids.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 _ = memcpy(tableBuffer.contents().advanced(by: base), raw.baseAddress!, byteCount)
             }
         }

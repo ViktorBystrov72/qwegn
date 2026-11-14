@@ -13,7 +13,7 @@ extension SettingsView {
             settingsGroup(title: "Memory & Residency", icon: "memorychip") {
                 HStack(spacing: 6) {
                     Text("Stored per model · QW_* environment variables override")
-                        .font(.system(size: 9))
+                        .font(TelemetryTheme.ui(11))
                         .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                     Spacer()
                     Button("Reset Performance Defaults") { resetPerformanceDefaults() }
@@ -27,12 +27,13 @@ extension SettingsView {
                         Text("Max Resident (Fastest)").tag(QWMemoryPolicy.maxResident.rawValue)
                         Text("Safe (No Swap)").tag(QWMemoryPolicy.safe.rawValue)
                     }
-                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .pickerStyle(.menu)
                 }
                 Text(tuningString("memoryPolicy").wrappedValue == QWMemoryPolicy.maxResident.rawValue
                      ? "Sizes resident weights to physical RAM less the OS reserve. Fastest; other apps' memory may be swapped out."
                      : "Sizes resident weights to memory that is free or reclaimable at load, less 6 GiB headroom. Never swaps.")
-                    .font(.system(size: 9))
+                    .font(TelemetryTheme.ui(11))
                     .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
 
                 doubleSliderRow(label: "OS Reserve:", id: "osReserveGiB", range: 2...32, step: 1,
@@ -44,15 +45,16 @@ extension SettingsView {
                         Text("Always").tag("always")
                         Text("Never").tag("never")
                     }
+                    .labelsHidden()
                     .pickerStyle(.segmented)
                 }
 
                 if selectedModelSupportsPLE {
-                    Divider().background(Color.white.opacity(0.08))
+                    Divider()
                     tuningToggle("Stream PLE N-gram Table from SSD (Saves ~27.3 GiB GPU RAM)", id: "streamNgrams")
                     Text("Streams external ngram.bin via a 64 MiB L1 cache instead of wiring into Metal RAM. Auto-engages when context exceeds UMA headroom.")
-                        .font(.system(size: 9))
-                        .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                        .font(TelemetryTheme.ui(11))
+                        .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                 }
             }
 
@@ -72,25 +74,17 @@ extension SettingsView {
                         .disabled(!tuningBool("coldEvents").wrappedValue)
                     tuningToggle("Mapped Expert Spans per Prefill Chunk", id: "prefillSpanMap")
                     Text("Experts that do not fit in memory stream from SSD. These keep the GPU busy while they load.")
-                        .font(.system(size: 9))
-                        .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                        .font(TelemetryTheme.ui(11))
+                        .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                 }
             }
 
-            settingsGroup(title: "Prefill & Concurrency", icon: "cpu") {
+            settingsGroup(title: "Prefill Shaping", icon: "cpu") {
                 // Bounds are the resolver's clamp bounds (QWPrefillLimits).
                 intSliderRow(label: "Prefill Chunk Rows:", key: "prefillChunkSize",
                              range: Double(QWPrefillLimits.minRows)...Double(QWPrefillLimits.maxRows),
                              step: Double(QWPrefillLimits.rowStep), readout: { "\($0) rows" },
                              value: $draftSettings.prefillChunkSize)
-
-                intSliderRow(label: "Concurrent Sessions:", key: "maxConcurrentSessions",
-                             range: 1...16, step: 1,
-                             readout: { $0 == 1 ? "1 session (Single-stream)" : "\($0) sessions" },
-                             value: $draftSettings.maxConcurrentSessions)
-                Text("Protects up to \(draftSettings.maxConcurrentSessions) concurrent agent/subagent KV cache slots in Warm RAM without mutual eviction, and enables parallel GPU batching when requests fit within per-slot context.")
-                    .font(.system(size: 9))
-                    .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
             }
 
             settingsGroup(title: "Latent Sparse Attention (LSA — arXiv:2610.42147)", icon: "point.3.connected.trianglepath.dotted") {
@@ -102,7 +96,8 @@ extension SettingsView {
                         Text("Weight-SVD").tag("svd")
                         Text("QSA-Cluster").tag("qsa-cluster")
                     }
-                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .pickerStyle(.menu)
                     .onChange(of: draftSettings.lsaMode) { _, _ in
                         validateModelAndDrafterOnSelection()
                     }
@@ -110,22 +105,34 @@ extension SettingsView {
 
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(selectedModelHasLSASidecar ? TelemetryTheme.active : Color.white.opacity(0.30))
+                        .fill(selectedModelHasLSASidecar ? TelemetryTheme.active : TelemetryTheme.unknown)
                         .frame(width: 7, height: 7)
-                    Text(selectedModelLSASidecarStatusText)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(selectedModelHasLSASidecar ? TelemetryTheme.active : TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                    Text(isGeneratingLSASidecar ? "Synthesizing model.qlsa via Weight-SVD…" : selectedModelLSASidecarStatusText)
+                        .font(TelemetryTheme.numeric(11))
+                        .foregroundStyle(selectedModelHasLSASidecar
+                            ? TelemetryTheme.active
+                            : TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                     Spacer()
-                    Button("Build .qlsa (SVD)") {
-                        generateLSASidecarForSelectedModel()
+                    if isGeneratingLSASidecar {
+                        ProgressView()
+                            .controlSize(.small)
+                        Button("Cancel") {
+                            cancelLSASidecarGeneration()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    } else {
+                        Button("Build .qlsa (SVD)") {
+                            generateLSASidecarForSelectedModel()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("Synthesize a model.qlsa projection sidecar for the selected model using Weight-SVD")
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                    .help("Synthesize a model.qlsa projection sidecar for the selected model using Weight-SVD")
                 }
 
                 if draftSettings.lsaMode != "off" {
-                    Divider().background(Color.white.opacity(0.08))
+                    Divider()
 
                     formRow(label: "Key Budget (k):", key: "lsaBudget") {
                         Picker("", selection: $draftSettings.lsaBudget) {
@@ -135,6 +142,7 @@ extension SettingsView {
                             Text("4,096 tokens").tag(4096)
                             Text("8,192 tokens").tag(8192)
                         }
+                        .labelsHidden()
                         .pickerStyle(.menu)
                     }
 
@@ -145,7 +153,8 @@ extension SettingsView {
                             Text("1,024 tokens").tag(1024)
                             Text("4,096 (e-means)").tag(4096)
                         }
-                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .pickerStyle(.menu)
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
@@ -160,7 +169,7 @@ extension SettingsView {
                     }
 
                     Text("Auto selects .qlsa / Weight-SVD on GQA (<= k+516 runs exact dense), native flat QSA <= 262K + e-means-4096 > 262K on QSA, and < 41K flat bypass + >= 41K e-means coarse pruning on MLA.")
-                        .font(.system(size: 9))
+                        .font(TelemetryTheme.ui(11))
                         .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                 }
             }
@@ -182,10 +191,13 @@ extension SettingsView {
     /// The selected model has routed experts the engine can stream (MoE outside FlashNext's own engine).
     var selectedModelStreamsExperts: Bool {
         if let desc = try? draftSettings.validatePrimaryModel() {
-            return (desc.numExperts ?? 0) > 0 && desc.family != .qwen38FlashNext
+            return desc.supportsExpertStreaming
         }
-        if let disc = discoveredModels.first(where: { $0.name == draftSettings.modelName }) {
-            return disc.capabilities.contains("moe") && disc.family != QWModelDescriptor.Family.qwen38FlashNext.rawValue
+        if let disc = discoveredModels.first(where: { $0.name == draftSettings.modelName }),
+           let familyRaw = disc.family,
+           let family = QWModelDescriptor.Family(rawValue: familyRaw),
+           let spec = QWModelFamilyRegistry.shared.spec(for: family) {
+            return disc.capabilities.contains("moe") && spec.supportsExpertStreaming
         }
         return false
     }
@@ -226,10 +238,7 @@ extension SettingsView {
     }
 
     private func tuningToggle(_ title: String, id: String) -> some View {
-        HStack(spacing: 6) {
-            Toggle(title, isOn: tuningBool(id)).toggleStyle(.switch)
-            SettingsRestartBadge(key: "engineTuning")
-        }
+        settingsToggleRow(title, key: "engineTuning", isOn: tuningBool(id))
     }
 
     private func doubleSliderRow(label: String, id: String, range: ClosedRange<Double>, step: Double,
@@ -244,7 +253,7 @@ extension SettingsView {
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundColor(TelemetryTheme.accent)
             }
-            Slider(value: value, in: range, step: step)
+            steppedSlider(value: value, in: range, step: step)
         }
     }
 }

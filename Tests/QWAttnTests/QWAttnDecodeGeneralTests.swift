@@ -32,7 +32,7 @@ final class QWAttnDecodeGeneralTests: XCTestCase {
 
     static func buf(_ hal: QWHal, _ halves: [UInt16]) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, halves.count * 2), options: .storageModeShared)!
-        halves.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        halves.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
 
@@ -340,7 +340,7 @@ final class QWAttnDecodeGeneralTests: XCTestCase {
         func load(_ name: String) throws -> [UInt16] {
             let p = dir.appendingPathComponent(name)
             let d = try Data(contentsOf: p)
-            return d.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) }
+            return d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: UInt16.self)) }
         }
         let qgate = try load("attn_qgate_dec_t257.bin")
         let knew = try load("attn_knew_t257.bin")

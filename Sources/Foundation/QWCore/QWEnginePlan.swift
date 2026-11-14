@@ -11,10 +11,14 @@ public struct QWEnginePlan: Sendable, Equatable, Codable {
     public enum LayerAttentionKind: String, Sendable, Codable, CaseIterable {
         /// Linear attention (GDN).
         case gdn
+        /// Linear attention with vector decay / separate conv (KDA).
+        case kda
         /// Full attention without a sparse indexer.
         case fullAttention
         /// Full attention driven by a QSA sparse indexer.
         case qsaSparse
+        /// Multi-head Latent Attention (NoPE MLA or decoupled-RoPE MLA-DSA).
+        case mlaCompressed
         /// Hybrid Compressed Attention (`128:1` compressed KV + SWA ring + Weight-SVD LSA).
         case hcaCompressed
     }
@@ -112,6 +116,10 @@ public struct QWEnginePlan: Sendable, Equatable, Codable {
     /// The KV storage mode the model runs in: `f16`, `q8` or `q4`.
     /// It selects the attention kernels, so it is part of the digest.
     public let kvStorageMode: String
+    /// True when full-attention layers run MLA (NoPE MLA or decoupled-RoPE MLA-DSA).
+    public let usesAnyMLA: Bool
+    /// True when linear-attention layers use vector-decay KDA rather than scalar-decay GDN.
+    public let gdnVectorDecay: Bool
     /// The capabilities the model itself advertises, from its config.
     /// A module must implement every one of them or refuse the model.
     public let modelCapabilities: Set<QWModelDescriptor.Capability>
@@ -186,6 +194,8 @@ public struct QWEnginePlan: Sendable, Equatable, Codable {
         self.kvStepTokens = QWCapacityPlan.kvStepTokens
         self.prefillChunkRows = prefillChunkRows
         self.kvStorageMode = kvStorageMode
+        self.usesAnyMLA = geometry.usesAnyMLA
+        self.gdnVectorDecay = geometry.gdnVectorDecay
         self.modelCapabilities = descriptor.capabilities
         self.kernelDispatch = kernelDispatch
 
@@ -198,9 +208,9 @@ public struct QWEnginePlan: Sendable, Equatable, Codable {
             if geometry.isCompressedAttention(index) {
                 attention = .hcaCompressed
             } else if geometry.isFullAttention(index) {
-                attention = isQSA ? .qsaSparse : .fullAttention
+                attention = geometry.usesAnyMLA ? .mlaCompressed : (isQSA ? .qsaSparse : .fullAttention)
             } else {
-                attention = .gdn
+                attention = geometry.gdnVectorDecay ? .kda : .gdn
             }
             built.append(LayerPlan(index: index, attention: attention,
                                    mlp: geometry.isMoELayer(index) ? .moe : .dense,
@@ -209,7 +219,7 @@ public struct QWEnginePlan: Sendable, Equatable, Codable {
         self.layers = built
 
         var canonical = "\(modelId.count):\(modelId)|\(geometryDigest.count):\(geometryDigest)"
-        canonical += "|\(descriptor.geometryDigestV2Hex)"
+        canonical += "|\(descriptor.geometryDigestV3Hex)"
         canonical += "|\(hidden)|\(intermediate)|\(moeIntermediate)|\(sharedExpertIntermediate)"
         canonical += "|\(numExperts)|\(expertsPerToken)|\(qHeads)|\(kvHeads)|\(headDim)"
         canonical += "|\(gdnVHeads)|\(gdnHeadDim)|\(gdnQKVChannels)|\(qProjOut)|\(kvWidth)"

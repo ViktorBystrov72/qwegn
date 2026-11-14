@@ -109,7 +109,12 @@ public struct QWDFlashConfig: Sendable, Equatable {
                 "DFlash2 drafter targetLayerIds \(cfg.targetLayerIds) out of range for \(targetDescriptor.numLayers)-layer target"
             )
         }
-        let pack = try QWQuant.Pack(url: resolvedURL, descriptor: .qwen38_27b, skipIdentityCheck: true)
+        guard let cfgURL = QWModelRoot(url: resolvedURL).configURL,
+              let cfgData = try? Data(contentsOf: cfgURL),
+              let drafterDesc = try? QWModelDescriptor.decodeDrafter(configJSON: cfgData) else {
+            throw QWEngineDriverError.state("DFlash2 drafter missing valid config.json at \(resolvedURL.path)")
+        }
+        let pack = try QWQuant.Pack(url: resolvedURL, descriptor: drafterDesc, skipIdentityCheck: true)
         var required = ["fc.weight", "hidden_norm.weight", "norm.weight", "layers.0.self_attn.q_proj.weight"]
         if cfg.isDSpine {
             required += ["selected_prefix_bridge.codebook", "selected_prefix_bridge.read_weight",

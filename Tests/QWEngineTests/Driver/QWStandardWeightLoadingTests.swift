@@ -68,7 +68,7 @@ final class QWStandardWeightLoadingTests: XCTestCase {
                 var bytes = Data(capacity: values.count * 2)
                 for v in values {
                     let bf = UInt16(truncatingIfNeeded: v.bitPattern >> 16)
-                    withUnsafeBytes(of: bf.littleEndian) { bytes.append(contentsOf: $0) }
+                    withUnsafeBytes(of: bf.littleEndian) { (raw: UnsafeRawBufferPointer) in bytes.append(contentsOf: raw) }
                 }
                 entries[name] = ["shape": [values.count], "raw_off": offset, "kind": "bf16"]
                 payload.append(bytes)
@@ -87,7 +87,7 @@ final class QWStandardWeightLoadingTests: XCTestCase {
         ])
         var file = Data()
         file.append(Data("QWP1".utf8))
-        withUnsafeBytes(of: UInt64(header.count).littleEndian) { file.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt64(header.count).littleEndian) { (raw: UnsafeRawBufferPointer) in file.append(contentsOf: raw) }
         file.append(payload)
         file.append(header)
         try file.write(to: URL(fileURLWithPath: path))

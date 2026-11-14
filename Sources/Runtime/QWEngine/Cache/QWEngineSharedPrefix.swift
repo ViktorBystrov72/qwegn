@@ -77,29 +77,29 @@ struct QWEnginePrefixState: Sendable {
 
     /// All geometry and cache operations must succeed before publication.
     func publish(into session: QWEngineSession, stochastic owner: QWStochasticSession? = nil) {
-        recData.withUnsafeBytes {
+        recData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             session.recSlab.region.pointer.advanced(by: session.recSlab.offset)
-                .copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+                .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
         }
-        ringData.withUnsafeBytes {
+        ringData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             session.ringSlab.region.pointer.advanced(by: session.ringSlab.offset)
-                .copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+                .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
         }
         if let hidden = session.trunkHidden, let data = trunkHiddenData {
-            data.withUnsafeBytes {
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 hidden.region.pointer.advanced(by: hidden.offset)
-                    .copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+                    .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
             }
         }
         if let dSlot = session.dflashSlot, let kData = dflashKData, let vData = dflashVData,
            kData.count == dSlot.kSlab.bytes, vData.count == dSlot.vSlab.bytes {
-            kData.withUnsafeBytes {
+            kData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset)
-                    .copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+                    .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
             }
-            vData.withUnsafeBytes {
+            vData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset)
-                    .copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+                    .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
             }
         }
         session.position = position

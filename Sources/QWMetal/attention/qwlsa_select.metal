@@ -44,7 +44,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
                                           device const half*   centroids,
                                           device const uchar4* bucketMembers,
                                           device const uchar*  bucketSizes,
-                                          device uint*         scoreScratch,
+                                          device atomic_uint*  scoreScratch,
                                           device int*          blockList,
                                           device uint*         blockCount,
                                           uint pos0, uint indexDim, uint budgetBlocks,
@@ -80,7 +80,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
     const uint middleEnd = totalBlocks - windowBlocks;
     const uint numMiddle = middleEnd - 1u;
     const uint kEff = min(budgetBlocks, numMiddle);
-    device uint* rowScores = scoreScratch + uint64_t(t) * scoreStride;
+    device atomic_uint* rowScores = scoreScratch + uint64_t(t) * scoreStride;
 
     const uint numClusters = middleEnd >> 7u;
     const uint numBuckets = numClusters * 64u;
@@ -88,7 +88,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
     float centroidThresh = -1e30f;
     if (numBuckets > max(256u, kEff * 2u)) {
         hist[tid] = 0u;
-        if (tid == 0u) greaterAccum = 0u;
+        if (tid == 0u) { greaterAccum = 0u; chosenBin = 0u; sgTotal = 0u; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint b = tid; b < numBuckets; b += 256u) {
@@ -124,8 +124,9 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
     }
 
     if (centroidThresh > -1e20f) {
-        for (uint m = 1u + tid; m < numClusters * 128u; m += 256u) rowScores[m - 1u] = 0u;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint m = 1u + tid; m < numClusters * 128u; m += 256u) atomic_store_explicit(&rowScores[m - 1u], 0u, memory_order_relaxed);
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        threadgroup_barrier(mem_flags::mem_device);
 
         for (uint b = tid; b < numBuckets; b += 256u) {
             device const half* cPtr = centroids + uint64_t(b) * indexDim;
@@ -142,7 +143,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
                         device const half* kPtr = pooledKeys + uint64_t(m) * indexDim;
                         float kDot = 0.0f;
                         for (uint d = 0u; d < dLim; d++) kDot = fma(qShared[d], float(kPtr[d]), kDot);
-                        rowScores[m - 1u] = lsa_float_to_sortable_u32(kDot);
+                        atomic_store_explicit(&rowScores[m - 1u], lsa_float_to_sortable_u32(kDot), memory_order_relaxed);
                     }
                 }
             }
@@ -151,19 +152,20 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
             device const half* kPtr = pooledKeys + uint64_t(m) * indexDim;
             float kDot = 0.0f;
             for (uint d = 0u; d < dLim; d++) kDot = fma(qShared[d], float(kPtr[d]), kDot);
-            rowScores[m - 1u] = lsa_float_to_sortable_u32(kDot);
+            atomic_store_explicit(&rowScores[m - 1u], lsa_float_to_sortable_u32(kDot), memory_order_relaxed);
         }
     } else {
         for (uint m = 1u + tid; m < middleEnd; m += 256u) {
             device const half* kPtr = pooledKeys + uint64_t(m) * indexDim;
             float kDot = 0.0f;
             for (uint d = 0u; d < dLim; d++) kDot = fma(qShared[d], float(kPtr[d]), kDot);
-            rowScores[m - 1u] = lsa_float_to_sortable_u32(kDot);
+            atomic_store_explicit(&rowScores[m - 1u], lsa_float_to_sortable_u32(kDot), memory_order_relaxed);
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    threadgroup_barrier(mem_flags::mem_device);
 
-    if (tid == 0u) greaterAccum = 0u;
+    if (tid == 0u) { greaterAccum = 0u; chosenBin = 0u; sgTotal = 0u; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint threshU = 0u;
@@ -174,7 +176,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint i = tid; i < numMiddle; i += 256u) {
-            const uint u = rowScores[i];
+            const uint u = atomic_load_explicit(&rowScores[i], memory_order_relaxed);
             if ((u & mask) == threshU) {
                 atomic_fetch_add_explicit((threadgroup atomic_uint*)&hist[(u >> shift) & 0xFFu], 1u, memory_order_relaxed);
             }
@@ -197,7 +199,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
     const uint numChunks = (numMiddle + 255u) >> 8u;
     for (uint c = 0u; c < numChunks; c++) {
         const uint idx = (c << 8u) + tid;
-        const uint u = (idx < numMiddle) ? rowScores[idx] : 0u;
+        const uint u = (idx < numMiddle) ? atomic_load_explicit(&rowScores[idx], memory_order_relaxed) : 0u;
         const bool isGt = (idx < numMiddle) && (u > threshU);
         const bool isTie = (idx < numMiddle) && (u == threshU);
 
@@ -250,7 +252,7 @@ kernel void qwg_lsa_select_blocks(device const half*   qIdx          [[buffer(0)
                                   device const half*   centroids     [[buffer(2)]],
                                   device const uchar4* bucketMembers [[buffer(3)]],
                                   device const uchar*  bucketSizes   [[buffer(4)]],
-                                  device uint*         scoreScratch  [[buffer(5)]],
+                                  device atomic_uint*  scoreScratch  [[buffer(5)]],
                                   device int*          blockList     [[buffer(6)]],
                                   device uint*         blockCount    [[buffer(7)]],
                                   constant uint&       T             [[buffer(8)]],
@@ -335,18 +337,18 @@ static inline void lsa_load_q(device const half* qIdx, uint qRow, uint indexDim,
 }
 
 // Replays the two-byte centroid threshold from device histograms.
-static inline uint lsa_pick_centroid_bins(device const uint* uHist, bool second, uint target,
+static inline uint lsa_pick_centroid_bins(device atomic_uint* uHist, bool second, uint target,
                                           uint tid, uint sg, uint lane,
                                           threadgroup uint* hist, threadgroup uint* scanSum,
                                           threadgroup uint& greaterAccum, threadgroup uint& chosenBin,
                                           threadgroup uint& sgTotal) {
-    hist[tid] = uHist[tid];
-    if (tid == 0u) greaterAccum = 0u;
+    hist[tid] = atomic_load_explicit(&uHist[tid], memory_order_relaxed);
+    if (tid == 0u) { greaterAccum = 0u; chosenBin = 0u; sgTotal = 0u; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     lsa_pick_radix_bin(hist, scanSum, greaterAccum, chosenBin, sgTotal, target, true, tid, sg, lane);
     const uint topByte = chosenBin << 24u;
     if (!second) return topByte;
-    hist[tid] = uHist[256u + tid];
+    hist[tid] = atomic_load_explicit(&uHist[256u + tid], memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     lsa_pick_radix_bin(hist, scanSum, greaterAccum, chosenBin, sgTotal, target, true, tid, sg, lane);
     return topByte | (chosenBin << 16u);
@@ -397,7 +399,7 @@ kernel void qwg_lsa_select_hist2(device const uint*  cScore [[buffer(0)]],
     threadgroup uint scanSum[8];
     threadgroup uint sgTotal, chosenBin, greaterAccum;
     const uint sg = tid >> 5u, lane = tid & 31u;
-    device const uint* uh = (device const uint*)(uHist) + unit * 512u;
+    device atomic_uint* uh = uHist + unit * 512u;
     const uint topByte = lsa_pick_centroid_bins(uh, false, g.targetBuckets, tid, sg, lane,
                                                 hist, scanSum, greaterAccum, chosenBin, sgTotal);
     hist[tid] = 0u;
@@ -435,7 +437,7 @@ kernel void qwg_lsa_select_expand(device const half*   qIdx          [[buffer(0)
                                   device const uchar4* bucketMembers [[buffer(2)]],
                                   device const uchar*  bucketSizes   [[buffer(3)]],
                                   device const uint*   cScore        [[buffer(4)]],
-                                  device const uint*   uHist         [[buffer(5)]],
+                                  device atomic_uint*  uHist         [[buffer(5)]],
                                   device atomic_uint*  marks         [[buffer(6)]],
                                   device atomic_uint*  candCount     [[buffer(7)]],
                                   device uint*         candM         [[buffer(8)]],
@@ -494,12 +496,12 @@ kernel void qwg_lsa_select_finalize(device const half*   qIdx          [[buffer(
                                     device const half*   centroids     [[buffer(2)]],
                                     device const uchar4* bucketMembers [[buffer(3)]],
                                     device const uchar*  bucketSizes   [[buffer(4)]],
-                                    device uint*         scoreScratch  [[buffer(5)]],
+                                    device atomic_uint*  scoreScratch  [[buffer(5)]],
                                     device int*          blockList     [[buffer(6)]],
                                     device uint*         blockCount    [[buffer(7)]],
-                                    device uint*         uHist         [[buffer(8)]],
-                                    device uint*         marks         [[buffer(9)]],
-                                    device uint*         candCount     [[buffer(10)]],
+                                    device atomic_uint*  uHist         [[buffer(8)]],
+                                    device atomic_uint*  marks         [[buffer(9)]],
+                                    device atomic_uint*  candCount     [[buffer(10)]],
                                     device const uint*   candM         [[buffer(11)]],
                                     device const uint*   candU         [[buffer(12)]],
                                     constant LSASelParams& p           [[buffer(13)]],
@@ -518,7 +520,7 @@ kernel void qwg_lsa_select_finalize(device const half*   qIdx          [[buffer(
 
     const uint sg = tid >> 5u, lane = tid & 31u;
     const LSASelGeom g = lsa_sel_geom(p, unit);
-    const uint rawCount = g.filter ? candCount[unit] : 0u;
+    const uint rawCount = g.filter ? atomic_load_explicit(&candCount[unit], memory_order_relaxed) : 0u;
     const uint nCand = min(rawCount, p.candCap);
     device const uint* cm = candM + uint64_t(unit) * p.candCap;
     device const uint* cu = candU + uint64_t(unit) * p.candCap;
@@ -526,7 +528,7 @@ kernel void qwg_lsa_select_finalize(device const half*   qIdx          [[buffer(
     bool fast = g.filter && rawCount <= p.candCap && nCand >= g.kEff;
     uint threshU = 0u;
     if (fast) {
-        if (tid == 0u) greaterAccum = 0u;
+        if (tid == 0u) { greaterAccum = 0u; chosenBin = 0u; sgTotal = 0u; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint mask = 0u;
         for (uint pass = 0u; pass < 4u; pass++) {
@@ -613,14 +615,18 @@ kernel void qwg_lsa_select_finalize(device const half*   qIdx          [[buffer(
     }
 
     if (g.filter) {
-        device uint* mk = marks + uint64_t(unit) * p.markStride;
+        device atomic_uint* mk = marks + uint64_t(unit) * p.markStride;
         if (rawCount > p.candCap) {
-            for (uint w = tid; w < ((g.middleEnd + 31u) >> 5u); w += 256u) mk[w] = 0u;
+            for (uint w = tid; w < ((g.middleEnd + 31u) >> 5u); w += 256u) {
+                atomic_store_explicit(&mk[w], 0u, memory_order_relaxed);
+            }
         } else {
-            for (uint i = tid; i < nCand; i += 256u) mk[cm[i] >> 5u] = 0u;
+            for (uint i = tid; i < nCand; i += 256u) {
+                atomic_store_explicit(&mk[cm[i] >> 5u], 0u, memory_order_relaxed);
+            }
         }
-        uHist[unit * 512u + tid] = 0u;
-        uHist[unit * 512u + 256u + tid] = 0u;
-        if (tid == 0u) candCount[unit] = 0u;
+        atomic_store_explicit(&uHist[unit * 512u + tid], 0u, memory_order_relaxed);
+        atomic_store_explicit(&uHist[unit * 512u + 256u + tid], 0u, memory_order_relaxed);
+        if (tid == 0u) atomic_store_explicit(&candCount[unit], 0u, memory_order_relaxed);
     }
 }

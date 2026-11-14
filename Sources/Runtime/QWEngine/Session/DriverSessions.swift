@@ -15,7 +15,6 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
-import QWState
 
 extension QWEngineDriver {
     public func makeSession(promptTokens: Int) throws -> QWEngineSession {
@@ -124,7 +123,7 @@ extension QWEngineDriver {
             pendingMTPProfile = nil
             pendingMTPAdaptiveEntropy = nil
             lastRoundUsedPLD = false
-            lastEchoDraftedPairs = 0
+            lastDraftedPairs = 0
             session.verificationPending = false
         }
         if let mtpCache, let mtpH = session.mtpKV {
@@ -225,7 +224,7 @@ extension QWEngineDriver {
     private static func unpackCompositeSparseState(_ data: Data) -> (sub: Data, hca: Data)? {
         guard data.count >= qhmsHeaderBytes else { return nil }
         var hdr = [UInt32](repeating: 0, count: 4)
-        _ = hdr.withUnsafeMutableBytes { dst in
+        _ = hdr.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
             data.copyBytes(to: dst, from: 0..<qhmsHeaderBytes)
         }
         guard hdr[0] == qhmsMagic, hdr[1] == 1 else { return nil }

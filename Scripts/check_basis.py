@@ -37,6 +37,8 @@ Run:  python3 Scripts/check_basis.py
 """
 from __future__ import annotations
 
+import concurrent.futures
+import os
 import re
 import subprocess
 import sys
@@ -89,20 +91,33 @@ def compile_ir(tree: Path, out: Path, extra: list[str]) -> dict[str, list[str]]:
     if not files:
         sys.exit(f"no .metal files under {tree}")
     cc = metal_cc()
-    for mtl in files:
-        air = out / (mtl.stem + ".ll")
+    workers = min(len(files), max(1, int(os.environ.get("QW_METAL_JOBS", os.cpu_count() or 8))))
+
+    def compile_one(idx_mtl: tuple[int, Path]) -> tuple[Path, list[tuple[str, list[str]]]]:
+        idx, mtl = idx_mtl
+        air = out / f"{idx:04d}_{mtl.stem}.ll"
         cmd = [*cc, "-std=metal4.0", "-O2", *extra,
                *INCLUDES, "-S", "-emit-llvm", str(mtl), "-o", str(air)]
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:
-            sys.exit(f"metal compile failed for {mtl}:\n{r.stderr[:2000]}")
+            raise RuntimeError(f"metal compile failed for {mtl}:\n{r.stderr[:2000]}")
         src = air.read_text()
+        found: list[tuple[str, list[str]]] = []
         for m in DEFINE.finditer(src):
             name = m.group(1)
             end = src.find("\n}\n", m.start())
             if end < 0:
                 continue
-            funcs[name] = src[m.start():end].splitlines()
+            found.append((name, src[m.start():end].splitlines()))
+        return mtl, found
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        try:
+            for _, items in pool.map(compile_one, enumerate(files)):
+                for name, lines in items:
+                    funcs[name] = lines
+        except RuntimeError as exc:
+            sys.exit(str(exc))
     return funcs
 
 

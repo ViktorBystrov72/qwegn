@@ -27,7 +27,7 @@ final class QWAttnPrefillTests: XCTestCase {
     }
     static func buf(_ d: Data) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
-        d.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
     /// Collective fragment loads cannot clamp per-row → inputs carry +32 zero
@@ -35,7 +35,7 @@ final class QWAttnPrefillTests: XCTestCase {
     /// causality, tail O masked at store). makeBuffer is zero-filled.
     static func padded(_ d: Data, rowBytes: Int, padRows: Int = 32) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count + padRows * rowBytes), options: .storageModeShared)!
-        d.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
     /// v5 kernel requires ZEROED pad rows (staged P̂ reads pbuf beyond kEnd;
@@ -45,7 +45,7 @@ final class QWAttnPrefillTests: XCTestCase {
         let extra = padRows * rowBytes
         let b = hal.device.makeBuffer(length: max(16, d.count + extra), options: .storageModeShared)!
         memset(b.contents(), 0, d.count + extra)
-        d.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
     static func u16(_ b: MTLBuffer, _ n: Int) -> [UInt16] {
@@ -187,6 +187,6 @@ final class QWAttnPrefillTests: XCTestCase {
 
 private extension Array where Element == UInt16 {
     init(unsafeBytes data: Data) {
-        self = Array(data.withUnsafeBytes { $0.bindMemory(to: UInt16.self) })
+        self = Array(data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in raw.bindMemory(to: UInt16.self) })
     }
 }

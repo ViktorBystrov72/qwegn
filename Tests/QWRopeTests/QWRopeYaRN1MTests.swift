@@ -7,7 +7,7 @@ final class QWRopeYaRN1MTests: XCTestCase {
 
     func testYaRN1MConfigurationAndScaleFactor() {
         // Scaling from 256K (262,144) to 1M (1,048,576) requires factor = 4.0
-        let yarn = QWYaRNConfig.config1M()
+        let yarn = QWYaRNConfig.config1M(originalMaxPosition: QWModelGeometry.qwen38_27b.maxPositionEmbeddings)
         XCTAssertEqual(yarn.factor, 4.0, accuracy: 1e-5)
         XCTAssertEqual(yarn.originalMaxPosition, 262_144)
 
@@ -20,14 +20,14 @@ final class QWRopeYaRN1MTests: XCTestCase {
         // Verify frequency bands:
         // Lower dimensions (higher frequency) should remain close to default invFreq
         // Higher dimensions (lower frequency) should be scaled down by approx 1/factor
-        let defFreqs = QWRopeTables.invFreqDefault()
+        let defFreqs = QWRopeTables.invFreqDefault(rotaryDims: QWModelGeometry.qwen38_27b.rotaryDims)
         XCTAssertEqual(invFreqs[0], defFreqs[0], accuracy: 1e-6, "High frequency pairs should be unmodified")
         XCTAssertLessThan(invFreqs[31], defFreqs[31], "Low frequency pairs must be scaled down")
         XCTAssertEqual(invFreqs[31], defFreqs[31] / yarn.factor, accuracy: 1e-4, "Highest pair must be fully interpolated")
     }
 
     func testYaRN1MTableGenerationAndBoundaryPositions() {
-        let yarn = QWYaRNConfig.config1M()
+        let yarn = QWYaRNConfig.config1M(originalMaxPosition: QWModelGeometry.qwen38_27b.maxPositionEmbeddings)
         // Generate a compact test table of 1024 rows with 1M YaRN config
         let tables = QWRopeTables(rows: 1024, yarn: yarn, geometry: .qwen38_27b)
         XCTAssertEqual(tables.rows, 1024)

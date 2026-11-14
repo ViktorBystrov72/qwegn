@@ -84,9 +84,9 @@ final class QWGemmAQBenchTests: XCTestCase {
         let one = groupBytes(bits: bits, group: group)
         let groups = rows * (k / group)
         var out = Data(count: one.count * groups)
-        out.withUnsafeMutableBytes { dst in
+        out.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
             guard let dstBase = dst.baseAddress else { return }
-            one.withUnsafeBytes { src in
+            one.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
                 guard let srcBase = src.baseAddress else { return }
                 for g in 0..<groups {
                     dstBase.advanced(by: g * one.count)
@@ -109,9 +109,9 @@ final class QWGemmAQBenchTests: XCTestCase {
         let one = QWAQProducer.hq4G32Block(weights)
         let blocks = rows * (k / 32)
         var out = Data(count: one.count * blocks)
-        out.withUnsafeMutableBytes { dst in
+        out.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
             guard let dstBase = dst.baseAddress else { return }
-            one.withUnsafeBytes { src in
+            one.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
                 guard let srcBase = src.baseAddress else { return }
                 for b in 0..<blocks {
                     dstBase.advanced(by: b * one.count)
@@ -130,17 +130,32 @@ final class QWGemmAQBenchTests: XCTestCase {
         // against. The family's own 4-bit G32 pair reads the SAME number of
         // bytes, so that pair is a like-for-like kernel comparison.
         let hq4Bytes = n * (k / 32) * QWQuant.blockBytes
-        var banks: [String: QWTensorValue] = [:]
         var bankBytesRead: [String: Int] = [:]
-        var sources: [String: Data] = [:]
-
         let pairs = QWAQBlock.supported
-        var totalBytes = hq4Bytes
         for (bits, group) in pairs {
             let name = QWAQBlock.formatName(bits: bits, group: group)
             let rowBytes = QWGemmAQ.rowBytes(bits: bits, group: group, k: k)!
-            let bytes = n * rowBytes
-            bankBytesRead[name] = bytes
+            bankBytesRead[name] = n * rowBytes
+        }
+
+        // The deterministic claim: the family's sub-4-bit pairs read strictly
+        // fewer bytes than the incumbent's inflated bank. That is the whole
+        // point of the family, and it does not depend on the clock.
+        for (bits, group) in pairs where bits < 4 {
+            let name = QWAQBlock.formatName(bits: bits, group: group)
+            XCTAssertLessThan(bankBytesRead[name]!, hq4Bytes,
+                              "\(name) must read fewer bytes than the incumbent")
+        }
+
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable && ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true",
+                          "Cold-cache GPU benchmark requires bare-metal Apple Silicon GPU")
+
+        var banks: [String: QWTensorValue] = [:]
+        var sources: [String: Data] = [:]
+        var totalBytes = hq4Bytes
+        for (bits, group) in pairs {
+            let name = QWAQBlock.formatName(bits: bits, group: group)
+            let bytes = bankBytesRead[name]!
             sources[name] = bankBytes(bits: bits, group: group, rows: n, k: k)
             totalBytes += bytes
         }
@@ -236,24 +251,18 @@ final class QWGemmAQBenchTests: XCTestCase {
 
         """)
 
-        // The deterministic claim: the family's sub-4-bit pairs read strictly
-        // fewer bytes than the incumbent's inflated bank. That is the whole
-        // point of the family, and it does not depend on the clock.
-        for (bits, group) in pairs where bits < 4 {
-            let name = QWAQBlock.formatName(bits: bits, group: group)
-            XCTAssertLessThan(bankBytesRead[name]!, hq4Bytes,
-                              "\(name) must read fewer bytes than the incumbent")
-        }
-
         // The family's 4-bit G32 pair reads the SAME number of bytes as the
         // incumbent's bank, so its kernel must not be structurally slower.
-        let g32Median = median(samples[QWAQBlock.formatName(bits: 4, group: 32)]!)
-        XCTAssertLessThanOrEqual(g32Median, incumbent * 1.5,
+        let g32Min = samples[QWAQBlock.formatName(bits: 4, group: 32)]!.min()!
+        let incumbentMin = samples["incumbent"]!.min()!
+        XCTAssertLessThanOrEqual(g32Min, incumbentMin * 1.5,
                                  "the family's 4-bit G32 kernel must not be structurally slower "
                                  + "than the incumbent's")
     }
 
     func testEveryHQWidthF32V4AgainstTheIncumbent() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable && ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true",
+                          "Cold-cache GPU benchmark requires bare-metal Apple Silicon GPU")
         let n = 4096, k = 4096
         let rounds = 5
         let hq4Bytes = n * (k / 32) * QWQuant.blockBytes

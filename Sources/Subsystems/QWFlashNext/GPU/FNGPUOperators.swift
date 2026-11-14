@@ -19,11 +19,6 @@ public enum QWFourSlotRollbackRing {
     }
 
     @inline(__always)
-    public static func advance(_ parity: Int, by rows: Int) -> Int {
-        (parity + rows) & ringMask
-    }
-
-    @inline(__always)
     public static func rollback(_ parity: Int, by rejectedCount: Int) -> Int {
         (parity - rejectedCount) & ringMask
     }
@@ -70,9 +65,10 @@ public enum QWPLEOperator {
         s: FNGPUScratch,
         stream: QWTensorValue,
         out: QWTensorValue,
-        embed: QWTensorValue? = nil
+        embed: QWTensorValue? = nil,
+        inInject: (base: QWTensorValue, src: QWTensorValue, scale: QWTensorValue)? = nil
     ) throws {
-        try FNGPULayerPasses.ple(enc, hal: hal, p: p, s: s, stream: stream, out: out, embed: embed)
+        try FNGPULayerPasses.ple(enc, hal: hal, p: p, s: s, stream: stream, out: out, embed: embed, inInject: inInject)
     }
 
     public static func stageTargets(

@@ -1,20 +1,27 @@
-import SwiftUI
+// SettingsView.swift — Sidebar-based native macOS settings window
+
 import AppKit
-import ServiceManagement
 import QWCore
 import QWServer
+import ServiceManagement
+import SwiftUI
 
-/// Comprehensive, perfectly aligned settings window for all server, kernel, memory, and logging parameters.
+/// Sidebar-navigated Settings window covering general lifecycle, models, sampling, speculative, performance, memory, and logging.
 public struct SettingsView: View {
-    @ObservedObject public var telemetry: TelemetryObservable
+    public var telemetry: TelemetryObservable
     /// Increased Contrast asks for stronger text. L-M7: it is honoured.
     @Environment(\.colorSchemeContrast) internal var contrast: ColorSchemeContrast
     @State var draftSettings: QWServerSettings
+    @State var baselineSettings: QWServerSettings
     @State var activeTab: SettingsTab = .general
     @State var saveConfirmationMessage: String?
     @State var validationErrorMessage: String?
     @State var discoveredModels: [DiscoveredModel] = []
     @State var discoveredDrafterModels: [DiscoveredModel] = []
+    @State var pendingProfileReset: Bool = false
+    @State var isGeneratingLSASidecar: Bool = false
+    @State var lsaSidecarTask: Task<Void, Never>?
+    @State var isSaving: Bool = false
     public var onClose: () -> Void
 
     public enum SettingsTab: String, CaseIterable, Identifiable {
@@ -23,7 +30,7 @@ public struct SettingsView: View {
         case sampling = "Sampling"
         case speculative = "Speculative"
         case performance = "Performance"
-        case cache = "KV Cache"
+        case cache = "Memory & Cache"
         case logging = "Logging"
 
         public var id: String { rawValue }
@@ -31,7 +38,7 @@ public struct SettingsView: View {
         public var icon: String {
             switch self {
             case .general: return "gearshape"
-            case .model: return "brain"
+            case .model: return "cpu"
             case .sampling: return "slider.horizontal.below.rectangle"
             case .speculative: return "bolt.badge.clock"
             case .performance: return "gauge.with.dots.needle.67percent"
@@ -41,166 +48,209 @@ public struct SettingsView: View {
         }
     }
 
-    public init(telemetry: TelemetryObservable, onClose: @escaping () -> Void = {}) {
+    public init(
+        telemetry: TelemetryObservable,
+        initialTab: SettingsTab = .general,
+        onClose: @escaping () -> Void = {}
+    ) {
         self.telemetry = telemetry
         self._draftSettings = State(initialValue: telemetry.settings)
+        self._baselineSettings = State(initialValue: telemetry.settings)
+        self._activeTab = State(initialValue: initialTab)
         self.onClose = onClose
+    }
+
+    var isDirty: Bool {
+        draftSettings != baselineSettings || pendingProfileReset
+    }
+
+    var increasedContrast: Bool {
+        contrast == .increased
     }
 
     public var body: some View {
         ZStack {
-            // The glass lives inside a container: the system blends a
-            // group of glass together, and glass outside one is alone.
-            GlassEffectContainer(spacing: 8) {
-                SystemVibrancyView()
-                    .edgesIgnoringSafeArea(.all)
-            }
+            SystemVibrancyView()
+                .edgesIgnoringSafeArea(.all)
 
-            VStack(spacing: 0) {
-                // Header Bar
-                HStack(spacing: 8) {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 13))
-                        .foregroundColor(TelemetryTheme.accent)
-                    Text("QWEGN Engine Settings")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.white)
-                    Spacer()
-                    Text("~/.qwg/settings.json")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                    Button(action: onClose) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 14))
-                            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(Color.white.opacity(0.04))
-
-                Divider().background(Color.white.opacity(0.08))
-
-                // Tab Switcher
-                HStack(spacing: 4) {
-                    ForEach(SettingsTab.allCases) { tab in
-                        Button(action: { activeTab = tab }) {
-                            HStack(spacing: 5) {
-                                Image(systemName: tab.icon)
-                                    .font(.system(size: 11))
-                                Text(tab.rawValue)
-                                    .font(.system(size: 11, weight: activeTab == tab ? .semibold : .regular))
-                            }
-                            .foregroundColor(activeTab == tab ? .white : .white.opacity(0.60))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(activeTab == tab ? TelemetryTheme.accent.opacity(0.35) : TelemetryTheme.rowSubstrate)
-                            .cornerRadius(6)
-                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(activeTab == tab ? TelemetryTheme.accent.opacity(0.60) : Color.white.opacity(0.06), lineWidth: 0.5))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(Color.black.opacity(0.20))
-
-                Divider().background(Color.white.opacity(0.08))
-
-                // Main Tab Content
-                ScrollView(.vertical, showsIndicators: true) {
-                    VStack(alignment: .leading, spacing: 14) {
-                        pendingRestartPanel
-                        switch activeTab {
-                        case .general:
-                            generalSection
-                        case .model:
-                            modelSection
-                        case .sampling:
-                            samplingSection
-                        case .speculative:
-                            speculativeSection
-                        case .performance:
-                            performanceSection
-                        case .cache:
-                            cacheSection
-                        case .logging:
-                            loggingSection
-                        }
-                    }
-                    .padding(16)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                Divider().background(Color.white.opacity(0.08))
-
-                // Bottom Action Bar
-                HStack(spacing: 10) {
-                    Button("Reset to Defaults") {
-                        resetToTopPerformanceDefaults()
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.60))
-                    .help("Reinstate the engine's top-performance default parameters for the selected model")
-
-                    Text("•")
-                        .font(.system(size: 10))
-                        .foregroundColor(TelemetryTheme.separator(increasedContrast: contrast == .increased))
-
-                    Button(action: revealSettingsInFinder) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "folder")
-                                .font(.system(size: 10))
-                            Text("Reveal in Finder")
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.60))
-
-                    Spacer()
-
-                    if let err = validationErrorMessage {
-                        Text(err)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(TelemetryTheme.failure)
-                            .lineLimit(2)
-                    } else if let msg = saveConfirmationMessage {
-                        Text(msg)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(TelemetryTheme.active)
-                    }
-
-                    Button("Cancel") {
-                        draftSettings = telemetry.settings
-                        onClose()
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.70))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(Color.white.opacity(0.08))
-                    .cornerRadius(6)
-
-                    Button("Save & Apply") {
-                        applyAndSave()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.regular)
-                    .disabled(draftSettings == telemetry.settings || validationErrorMessage != nil)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(Color.black.opacity(0.30))
+            HStack(spacing: 0) {
+                sidebarPane
+                Divider()
+                detailPane
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
-            refreshDiscoveredModels()
+            openOrRefreshIfClean()
+        }
+        .onDisappear {
+            lsaSidecarTask?.cancel()
+            lsaSidecarTask = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .qwgSettingsWindowDidOpen)) { _ in
+            openOrRefreshIfClean()
+        }
+    }
+
+    private var sidebarPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            List(SettingsTab.allCases, selection: $activeTab) { tab in
+                Label(tab.rawValue, systemImage: tab.icon)
+                    .font(TelemetryTheme.ui(12, activeTab == tab ? .semibold : .regular))
+                    .tag(tab)
+            }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("~/.qwg/settings.json")
+                    .font(TelemetryTheme.numeric(10))
+                    .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Button(action: revealSettingsInFinder) {
+                    Label("Reveal in Finder", systemImage: "folder")
+                        .font(TelemetryTheme.ui(11))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(TelemetryTheme.secondary(increasedContrast: increasedContrast))
+            }
+            .padding(12)
+        }
+        .frame(width: 185)
+        .frame(maxHeight: .infinity)
+        .background(TelemetryTheme.rowSubstrate)
+    }
+
+    private var detailPane: some View {
+        VStack(spacing: 0) {
+            detailHeader
+            Divider()
+
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 14) {
+                    pendingRestartPanel
+                    switch activeTab {
+                    case .general:
+                        generalSection
+                    case .model:
+                        modelSection
+                    case .sampling:
+                        samplingSection
+                    case .speculative:
+                        speculativeSection
+                    case .performance:
+                        performanceSection
+                    case .cache:
+                        cacheSection
+                    case .logging:
+                        loggingSection
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+            bottomActionBar
+        }
+        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var detailHeader: some View {
+        HStack(spacing: 8) {
+            Image(systemName: activeTab.icon)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(TelemetryTheme.accent)
+            Text(activeTab.rawValue)
+                .font(TelemetryTheme.ui(13, .semibold))
+                .foregroundStyle(TelemetryTheme.primary(increasedContrast: increasedContrast))
+            Spacer()
+            if isDirty {
+                Text("Unsaved Changes")
+                    .font(TelemetryTheme.ui(10, .semibold))
+                    .foregroundStyle(TelemetryTheme.warning)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(TelemetryTheme.warning.opacity(0.14))
+                    .clipShape(Capsule())
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private var bottomActionBar: some View {
+        let needsRestart = !telemetry.pendingServerRestartKeys(for: draftSettings).isEmpty
+        return HStack(spacing: 10) {
+            Button("Reset to Defaults") {
+                resetToTopPerformanceDefaults()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Stage top-performance default parameters for the selected model")
+
+            if let err = validationErrorMessage {
+                Text(err)
+                    .font(TelemetryTheme.ui(11, .medium))
+                    .foregroundStyle(TelemetryTheme.failure)
+                    .lineLimit(2)
+                    .help(err)
+            } else if let msg = saveConfirmationMessage {
+                Text(msg)
+                    .font(TelemetryTheme.ui(11, .medium))
+                    .foregroundStyle(TelemetryTheme.active)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            Button("Discard Changes") {
+                discardChanges()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+            .disabled(!isDirty || isSaving)
+
+            if isDirty && needsRestart && telemetry.isConnected {
+                Button(isSaving ? "Saving…" : "Save") {
+                    applyAndSave()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .disabled(validationErrorMessage != nil || isSaving)
+
+                Button("Save & Restart Server") {
+                    saveAndRestartServer()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .disabled(validationErrorMessage != nil || isSaving)
+            } else {
+                Button(isSaving ? "Saving…" : "Save & Apply") {
+                    applyAndSave()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .disabled(!isDirty || validationErrorMessage != nil || isSaving)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(TelemetryTheme.rowSubstrate)
+    }
+
+    private func openOrRefreshIfClean() {
+        let wasClean = !isDirty
+        if wasClean {
+            draftSettings = telemetry.settings
+        }
+        refreshDiscoveredModels()
+        if wasClean {
+            baselineSettings = draftSettings
         }
     }
 
@@ -208,25 +258,21 @@ public struct SettingsView: View {
     private var generalSection: some View {
         VStack(alignment: .leading, spacing: 14) {
             settingsGroup(title: "System Integration", icon: "macwindow") {
-                Toggle("Run at startup", isOn: $draftSettings.runAtStartup)
-                    .toggleStyle(.switch)
-                    .onChange(of: draftSettings.runAtStartup) { _, newValue in
-                        updateRunAtStartup(newValue)
-                    }
-
-                Toggle("Auto-start inference server on launch", isOn: $draftSettings.autoStartServer)
-                    .toggleStyle(.switch)
+                settingsToggleRow("Run at startup", isOn: $draftSettings.runAtStartup)
+                settingsToggleRow("Auto-start inference server on launch", isOn: $draftSettings.autoStartServer)
             }
 
+            SettingsMenuBarAppearanceView(telemetry: telemetry)
+
             settingsGroup(title: "Server & App Lifecycle", icon: "server.rack") {
-                HStack(spacing: 6) {
-                    Toggle("Keep the server running after the app quits", isOn: $draftSettings.keepServerRunningAfterQuit)
-                        .toggleStyle(.switch)
-                    SettingsRestartBadge(key: "keepServerRunningAfterQuit")
-                }
+                settingsToggleRow(
+                    "Keep the server running after the app quits",
+                    key: "keepServerRunningAfterQuit",
+                    isOn: $draftSettings.keepServerRunningAfterQuit
+                )
                 Text(QWSettingsCoherence.effectNote(for: "keepServerRunningAfterQuit") ?? "")
-                    .font(.system(size: 9))
-                    .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                    .font(TelemetryTheme.ui(11))
+                    .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
             }
 
             settingsGroup(title: "Network & Endpoints", icon: "network") {
@@ -249,7 +295,7 @@ public struct SettingsView: View {
     // MARK: - 2. Model & Weights Section
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            settingsGroup(title: "Model Selection (~/.qwg/models)", icon: "brain") {
+            settingsGroup(title: "Model Selection (~/.qwg/models)", icon: "cpu") {
                 formRow(label: "Installed Model:", key: "modelName") {
                     HStack(spacing: 8) {
                         Picker("", selection: $draftSettings.modelName) {
@@ -257,6 +303,7 @@ public struct SettingsView: View {
                                 Text(m.name).tag(m.name)
                             }
                         }
+                        .labelsHidden()
                         .pickerStyle(.menu)
                         .onChange(of: draftSettings.modelName) { _, newName in
                             if let match = discoveredModels.first(where: { $0.name == newName }), !match.packPath.isEmpty {
@@ -273,30 +320,32 @@ public struct SettingsView: View {
 
                         Button(action: refreshDiscoveredModels) {
                             Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 11))
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityLabel("Refresh installed models")
                         .help("Refresh models in ~/.qwg/models")
 
                         Button(action: revealModelsFolderInFinder) {
                             Image(systemName: "folder")
-                                .font(.system(size: 11))
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityLabel("Open models folder in Finder")
                         .help("Open ~/.qwg/models in Finder")
                     }
                 }
 
                 formRow(label: "Model Alias:", key: "modelAlias") {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 3) {
                         TextField("e.g. qwen-27b (optional)", text: Binding(
                             get: { draftSettings.modelAlias },
                             set: { draftSettings.setAlias($0, for: draftSettings.modelName) }
                         ))
-                            .textFieldStyle(.roundedBorder)
-                        Text("Alias is persisted per model in ~/.qwg/settings.json, returned in /v1/models, and used for API responses & inference")
-                            .font(.system(size: 9))
-                            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                        .textFieldStyle(.roundedBorder)
+                        Text("Persisted per model in ~/.qwg/settings.json and returned by /v1/models.")
+                            .font(TelemetryTheme.ui(11))
+                            .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
                     }
                 }
 
@@ -311,21 +360,25 @@ public struct SettingsView: View {
                     }
                 }
 
-                HStack(spacing: 6) {
-                    Toggle("Lazy Load Model Weights on First Request", isOn: $draftSettings.lazyLoad)
-                        .toggleStyle(.switch)
-                    SettingsRestartBadge(key: "lazyLoad")
-                }
+                settingsToggleRow(
+                    "Lazy Load Model Weights on First Request",
+                    key: "lazyLoad",
+                    isOn: $draftSettings.lazyLoad
+                )
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Toggle("Load Vision Tower (Multimodal Image Input)", isOn: $draftSettings.loadVision)
-                        .toggleStyle(.switch)
-                        .disabled(!selectedModelSupportsVision)
+                VStack(alignment: .leading, spacing: 4) {
+                    settingsToggleRow(
+                        "Load Vision Tower (Multimodal Image Input)",
+                        key: "loadVision",
+                        isOn: $draftSettings.loadVision
+                    )
+                    .disabled(!selectedModelSupportsVision)
                     Text(selectedModelSupportsVision
-                        ? (QWSettingsCoherence.effectNote(for: "loadVision") ?? "Loads or unloads the vision tower in place without restarting the engine or resetting the KV cache.")
+                        ? (QWSettingsCoherence.effectNote(for: "loadVision")
+                            ?? "Loads or unloads the vision tower in place without restarting the engine.")
                         : "Selected model does not include a vision tower.")
-                        .font(.system(size: 9))
-                        .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                        .font(TelemetryTheme.ui(11))
+                        .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
                 }
             }
 
@@ -352,17 +405,18 @@ public struct SettingsView: View {
                             Text("Q8_0 (8-bit)").tag("q8")
                             Text("Q4_0 (4-bit)").tag("q4")
                         }
+                        .labelsHidden()
                         .pickerStyle(.segmented)
                         .disabled(isKVModeLockedByMemoryPack)
 
                         if let mounted = mountedMemoryPack, mounted.enforcesKVMode {
                             HStack(spacing: 6) {
                                 Image(systemName: "lock.fill")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(TelemetryTheme.warning)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(TelemetryTheme.warning)
                                 Text("Locked by Memory Pack (\(mounted.packName) · \(mounted.enforcedKVMode.uppercased()))")
-                                    .font(.system(size: 9, weight: .medium))
-                                    .foregroundColor(TelemetryTheme.warning)
+                                    .font(TelemetryTheme.ui(10, .medium))
+                                    .foregroundStyle(TelemetryTheme.warning)
                                 Spacer()
                                 Button("Unmount") {
                                     unmountActiveMemoryPack()
@@ -376,215 +430,4 @@ public struct SettingsView: View {
             }
         }
     }
-
-    // MARK: - 3. Sampling & Reasoning Section
-    private var samplingSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            settingsGroup(title: "Sampling & Generation Hyperparameters", icon: "slider.horizontal.3") {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        SettingsRowLabel(text: "Temperature:", key: "temperature")
-                        Spacer()
-                        Text(draftSettings.temperature == 0 ? "0.00 (Greedy / Argmax)" : String(format: "%.2f", draftSettings.temperature))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundColor(draftSettings.temperature == 0 ? TelemetryTheme.warning : TelemetryTheme.accent)
-                    }
-                    Slider(value: $draftSettings.temperature, in: 0.0...2.0, step: 0.05)
-                }
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        SettingsRowLabel(text: "Top-P (Nucleus):", key: "topP")
-                        Spacer()
-                        Text(String(format: "%.2f", draftSettings.topP))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundColor(TelemetryTheme.accent)
-                    }
-                    Slider(value: $draftSettings.topP, in: 0.05...1.0, step: 0.05)
-                }
-
-                intSliderRow(label: "Top-K Filtering:", key: "topK", range: 0...100, step: 1,
-                             readout: { $0 <= 0 ? "0 (Disabled)" : ($0 == 1 ? "1 (Greedy / Argmax)" : "\($0)") },
-                             tint: { $0 <= 0 ? .white.opacity(0.40) : ($0 == 1 ? TelemetryTheme.warning : TelemetryTheme.accent) },
-                             value: $draftSettings.topK)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        SettingsRowLabel(text: "Repetition Penalty:", key: "repetitionPenalty")
-                        Spacer()
-                        Text(String(format: "%.2f", draftSettings.repetitionPenalty))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundColor(TelemetryTheme.accent)
-                    }
-                    Slider(value: $draftSettings.repetitionPenalty, in: 1.0...1.5, step: 0.01)
-                }
-
-                formRow(label: "Max Tokens:", key: "maxTokens") {
-                    Picker("", selection: $draftSettings.maxTokens) {
-                        Text("256 tokens").tag(256)
-                        Text("512 tokens (Default)").tag(512)
-                        Text("1,024 tokens").tag(1024)
-                        Text("2,048 tokens").tag(2048)
-                        Text("4,096 tokens").tag(4096)
-                        Text("8,192 tokens").tag(8192)
-                        Text("16,384 tokens").tag(16384)
-                    }
-                    .pickerStyle(.menu)
-                }
-
-                formRow(label: "Random Seed:", key: "seed") {
-                    VStack(alignment: .leading, spacing: 2) {
-                        TextField("-1 (Random)", value: $draftSettings.seed, formatter: plainNumberFormatter)
-                            .textFieldStyle(.roundedBorder)
-                        Text("Set -1 for non-deterministic pseudorandom sampling")
-                            .font(.system(size: 9))
-                            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                    }
-                }
-            }
-
-            settingsGroup(title: "Reasoning & Template Conditioning", icon: "sparkles") {
-                HStack(spacing: 6) {
-                    Toggle("Enable Thinking Mode (<think>...</think>)", isOn: $draftSettings.enableThinking)
-                        .toggleStyle(.switch)
-                    SettingsRestartBadge(key: "enableThinking")
-                }
-
-                formRow(label: "Reasoning Effort:", key: "reasoningEffort") {
-                    Picker("", selection: $draftSettings.reasoningEffort) {
-                        Text("Low").tag("low")
-                        Text("Medium").tag("medium")
-                        Text("Extra High (Default)").tag("xhigh")
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    SettingsRowLabel(text: "Default System Prompt:", key: "systemPrompt")
-                    TextField("e.g. You are a helpful AI assistant...", text: $draftSettings.systemPrompt)
-                        .textFieldStyle(.roundedBorder)
-                    Text("Prepended if incoming request does not provide a system role message")
-                        .font(.system(size: 9))
-                        .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                }
-            }
-        }
-    }
-
-    // MARK: - 6. KV Cache & Storage Section
-    private var cacheSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            settingsGroup(title: "Codebase & Knowledge Memory Pack (.qwg)", icon: "memorychip") {
-                if let mounted = mountedMemoryPack {
-                    HStack(spacing: 8) {
-                        Image(systemName: "lock.shield.fill")
-                            .font(.system(size: 12))
-                            .foregroundColor(TelemetryTheme.active)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(mounted.packName) — \(mounted.fileCount) files · \(mounted.tokenCount) tokens · KV \(mounted.enforcedKVMode.uppercased()) (enforced)")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(.white)
-                            Text("\(mounted.rootPath) · LSA \(mounted.lsaMode) · Live delta: \(mounted.modifiedFileCount) file(s)")
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                        }
-                        Spacer()
-                        Button("Mount...") {
-                            selectAndMountMemoryPackDirectory()
-                        }
-                        .controlSize(.small)
-                        Button("Unmount") {
-                            unmountActiveMemoryPack()
-                        }
-                        .controlSize(.small)
-                    }
-                } else {
-                    HStack(spacing: 8) {
-                        Text("Auto-discovers <repo>/.qwg/manifest.json from coding agent system prompts, or mount manually:")
-                            .font(.system(size: 10))
-                            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                        Spacer()
-                        Button("Mount Repository...") {
-                            selectAndMountMemoryPackDirectory()
-                        }
-                        .controlSize(.small)
-                    }
-                }
-            }
-
-            settingsGroup(title: "Two-Tier Hierarchical Prefix Cache", icon: "internaldrive") {
-                formRow(label: "Warm RAM Limit (GB):", key: "warmRAMLimitGB") {
-                    TextField("4.0", value: $draftSettings.warmRAMLimitGB, formatter: plainNumberFormatter)
-                        .textFieldStyle(.roundedBorder)
-                }
-
-                intSliderRow(label: "Concurrent Session Slots:", key: "maxConcurrentSessions",
-                             range: 1...16, step: 1,
-                             readout: { "\($0) slots" },
-                             value: $draftSettings.maxConcurrentSessions)
-                Text("Independent session slots preserved simultaneously in Warm RAM (e.g. main agent + subagents sharing a system prompt).")
-                    .font(.system(size: 9))
-                    .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-
-                formRow(label: "Persist Cache to SSD:", key: "ssdCacheEnabled") {
-                    Toggle("Enable Cold SSD Persistence", isOn: $draftSettings.ssdCacheEnabled)
-                        .toggleStyle(.switch)
-                }
-
-                formRow(label: "Cold SSD Limit (GB):", key: "ssdCacheLimitGB") {
-                    TextField("10.0", value: $draftSettings.ssdCacheLimitGB, formatter: plainNumberFormatter)
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(!draftSettings.ssdCacheEnabled)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    SettingsRowLabel(text: "Cache Directory:", key: "cacheDir")
-                    HStack(spacing: 8) {
-                        TextField("~/.qwg/cache", text: $draftSettings.cacheDir)
-                            .textFieldStyle(.roundedBorder)
-                            .disabled(!draftSettings.ssdCacheEnabled)
-                        Button("Browse...") {
-                            selectCacheDirectory()
-                        }
-                        .disabled(!draftSettings.ssdCacheEnabled)
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: - 7. Logging & Diagnostics Section
-    private var loggingSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            settingsGroup(title: "Logging Configuration", icon: "doc.text") {
-                formRow(label: "Log Level:", key: "logLevel") {
-                    Picker("", selection: $draftSettings.logLevel) {
-                        Text("Debug").tag("debug")
-                        Text("Info").tag("info")
-                        Text("Warn").tag("warn")
-                        Text("Error").tag("error")
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                formRow(label: "Log File Name:", key: "logFileName") {
-                    TextField("qwg.log", text: $draftSettings.logFileName)
-                        .textFieldStyle(.roundedBorder)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    SettingsRowLabel(text: "Log Directory:", key: "logDir")
-                    HStack(spacing: 8) {
-                        TextField("~/.qwg/logs", text: $draftSettings.logDir)
-                            .textFieldStyle(.roundedBorder)
-                        Button("Reveal in Finder") {
-                            revealLogFolderInFinder()
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // UI Building Blocks and Actions live in SettingsView+Actions.swift.
 }

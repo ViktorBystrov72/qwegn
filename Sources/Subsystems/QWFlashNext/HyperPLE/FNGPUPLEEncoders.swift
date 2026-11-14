@@ -21,17 +21,34 @@ extension QWGemm {
                                  threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
     }
 
-    /// out f32 [T, W] = gv + SiLU(causal dilated depthwise conv over gvNorm).
+    /// Fused key norm + PLE gate + conv norm over packed `kv` [T, kvStride], emitting `gv` and `gvNorm` [T, W].
+    public static func encodeFnPLEFusedGateNorm(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
+                                                kv: QWTensorValue, queryNorm: QWTensorValue,
+                                                normKey: QWTensorValue, normConv: QWTensorValue,
+                                                gv: QWTensorValue, gvNorm: QWTensorValue,
+                                                rows: Int, hidden: Int, hc: Int, kvStride: Int, eps: Float) throws {
+        precondition(kvStride >= hc * hidden)
+        enc.setComputePipelineState(try hal.pipeline("qwg_ple_fused_gate_norm"))
+        enc.bindTensors(kv, queryNorm, normKey, normConv, gv, gvNorm, startIndex: 0)
+        enc.setUInt32s(hidden, hc, kvStride, startIndex: 6)
+        enc.setPod(eps, index: 9)
+        enc.dispatchThreadgroups(MTLSize(width: hc, height: rows, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    /// out f32 [T, W] = (residual ? residual + : 0) gv + SiLU(causal dilated depthwise conv over gvNorm).
     public static func encodeFnPLEConv(_ enc: any MTLComputeCommandEncoder, hal: QWHal, gv: QWTensorValue,
                                        gvNorm: QWTensorValue, convWeight: QWTensorValue, out: QWTensorValue,
                                        rows: Int, width: Int, kernel: Int, dilation: Int,
-                                       hist: QWTensorValue? = nil) throws {
+                                       hist: QWTensorValue? = nil, residual: QWTensorValue? = nil) throws {
         enc.setComputePipelineState(try hal.pipeline("qwg_ple_conv"))
         enc.bindTensors(gv, gvNorm, convWeight, out, startIndex: 0)
         enc.setUInt32s(width, kernel, dilation, rows, startIndex: 4)
         // No history: bind any buffer; HL = 0 means the kernel never reads it.
         (hist ?? gv).bind(enc, index: 8)
         enc.setUInt32s(hist == nil ? 0 : (kernel - 1) * dilation, startIndex: 9)
+        (residual ?? gv).bind(enc, index: 10)
+        enc.setUInt32s(residual == nil ? 0 : 1, startIndex: 11)
         enc.dispatchThreads(MTLSize(width: width, height: rows, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
     }

@@ -165,8 +165,8 @@ final class FNMetalMoESpanMapTests: XCTestCase {
         func stage(_ stagingExperts: [Int], gu: QWTensorValue, dn: QWTensorValue) {
             let guPtr = arena.cpuPointer(of: gu), dnPtr = arena.cpuPointer(of: dn)
             for (slot, e) in stagingExperts.enumerated() {
-                guPhys[e].withUnsafeBytes { guPtr.advanced(by: slot * guSlabBytes).copyMemory(from: $0.baseAddress!, byteCount: guSlabBytes) }
-                dnPhys[e].withUnsafeBytes { dnPtr.advanced(by: slot * dnSlabBytes).copyMemory(from: $0.baseAddress!, byteCount: dnSlabBytes) }
+                guPhys[e].withUnsafeBytes { (raw: UnsafeRawBufferPointer) in guPtr.advanced(by: slot * guSlabBytes).copyMemory(from: raw.baseAddress!, byteCount: guSlabBytes) }
+                dnPhys[e].withUnsafeBytes { (raw: UnsafeRawBufferPointer) in dnPtr.advanced(by: slot * dnSlabBytes).copyMemory(from: raw.baseAddress!, byteCount: dnSlabBytes) }
             }
         }
         func group(_ enc: any MTLComputeCommandEncoder, _ idsT: QWTensorValue) throws {

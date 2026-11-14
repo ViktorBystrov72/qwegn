@@ -241,7 +241,7 @@ public enum QWWeightFormat: Sendable, Hashable {
             return denseBpw
         }
         let nMoe = max(1, (0..<g.numLayers).filter { g.isMoELayer($0) }.count)
-        let routedDim = (g.moeLatentSize ?? 0) > 0 ? g.moeLatentSize! : g.hidden
+        let routedDim = (g.moeLatentSize.flatMap { $0 > 0 ? $0 : nil }) ?? g.hidden
         let guWeights = Double(nMoe) * Double(g.numExperts) * 2.0 * Double(g.moeIntermediate) * Double(routedDim)
         let dnWeights = Double(nMoe) * Double(g.numExperts) * Double(routedDim) * Double(g.moeIntermediate)
         let densePerLayer = Double(4 * g.hidden * g.hidden + 3 * g.hidden * max(g.intermediate, g.sharedExpertIntermediate))

@@ -15,7 +15,6 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
-import QWState
 
 extension QWEngineDriver {
     /// Whether full-attention layers run O(T·B) subquadratic prefill at long context (`>= 131K`).
@@ -231,15 +230,29 @@ extension QWEngineDriver {
         }
     }
 
+    private func emitPrefillProgress(_ session: QWEngineSession, done currentDone: Int, promptCount: Int) {
+        let total = activePrefillTotalTokens ?? promptCount
+        let done = activePrefillTotalTokens != nil
+            ? min(total, max(0, session.position - activePrefillBasePosition))
+            : min(total, max(0, currentDone))
+        activePrefillProgress?(done, total)
+    }
+
     func prefill(_ session: QWEngineSession, tokens: [Int],
                          mode: GDNPrefillMode?, permit: QWGenerationPermit) throws -> Int {
         guard !tokens.isEmpty else { return 0 }
         session.tokenHistory = tokens
+        emitPrefillProgress(session, done: 0, promptCount: tokens.count)
         let effectiveMode = mode ?? gdnPrefillMode
         switch effectiveMode {
         case .naive:
             var lastToken = 0
-            for t in tokens { lastToken = try decodeStep(session, token: t, permit: permit) }
+            for (idx, t) in tokens.enumerated() {
+                lastToken = try decodeStep(session, token: t, permit: permit)
+                if (idx + 1) % 32 == 0 || idx + 1 == tokens.count {
+                    emitPrefillProgress(session, done: idx + 1, promptCount: tokens.count)
+                }
+            }
             return lastToken
         case .chunked, .regres:
             // .regres only swaps the GDN-layer recurrence kernel (inner
@@ -249,6 +262,10 @@ extension QWEngineDriver {
             // C5 (prefill entry): validate the WHOLE token list before any
             // chunk opens an encoder — a bad id must fail loud, not mid-stream.
             for t in tokens where t < 0 || t >= geometry.vocab { throw QWEngineDriverError.badToken(t) }
+            if geometry.sharedExpertIntermediate > 0 && !geometry.sharedExpertHasGate, let s = psc.moe {
+                let gPtr = s.gate.region.pointer.advanced(by: s.gate.offset).assumingMemoryBound(to: Float.self)
+                for i in 0..<min(tokens.count, psc.maxChunk) { gPtr[i] = 1.0 }
+            }
             var offset = 0
             var lastToken = 0
             let maxChunk = psc.maxChunk
@@ -263,6 +280,7 @@ extension QWEngineDriver {
                                              start: offset, count: count,
                                              runsHead: isLast, mode: effectiveMode, permit: permit)
                 offset += count
+                emitPrefillProgress(session, done: offset, promptCount: tokens.count)
             }
             if prefillScratchEviction.shouldEvict(wiredEngineBytes: arena.committedBytes) {
                 evictPrefillScratch()

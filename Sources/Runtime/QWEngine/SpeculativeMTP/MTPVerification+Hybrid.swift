@@ -38,10 +38,51 @@ extension QWEngineDriver {
         return 0
     }
 
-    struct EchoRoundProposal {
+    struct MTPRoundProposal {
         let drafts: [Int]
         let proposals: [QWMTPGumbelProposal]
         let draftedPairs: Int
+    }
+
+    private func draftFullHistory(session: QWEngineSession, pending: Int) -> [Int] {
+        if session.tokenHistory.count > session.position, session.tokenHistory.last == pending {
+            return session.tokenHistory
+        }
+        return session.tokenHistory + [pending]
+    }
+
+    private func adaptiveDraftCount(count: Int, defaultTrunkBits: Int) -> Int {
+        guard mtpAdaptiveDepth && geometry.numExperts > 0 && mtpDraftProposals >= 8 && count > 1 else {
+            return count
+        }
+        let trunkBits = layersW.first?.gu.view.bits ?? defaultTrunkBits
+        let expertBits = layersW.compactMap({ $0.moe?.gateUp.bits }).first ?? trunkBits
+        let acceptRate = Double(mtpDraftAccepted) / Double(max(1, mtpDraftProposals))
+        return QWMTPAdaptiveDepth.optimalDraftCount(
+            geometry: geometry, trunkBits: trunkBits, expertBits: expertBits,
+            acceptRate: acceptRate, maxDrafts: count)
+    }
+
+    private func tryZeroCostContextDrafts(
+        fullHistory: [Int],
+        count: Int,
+        strategy: QWDraftStrategy
+    ) -> [Int]? {
+        if let pd = QWContextCopyDrafter.periodicDrafts(
+            history: fullHistory, maxCount: count, minRepeats: 3),
+           !pd.isEmpty {
+            return pd
+        }
+        let minMatch = (strategy == .ngram) ? 3 : 5
+        if let match = QWContextCopyDrafter.drafts(
+            history: fullHistory, maxCount: count, minMatchLen: minMatch),
+           !match.tokens.isEmpty {
+            let take = match.matchLen >= 6
+                ? count
+                : min(strategy == .ngram ? count : 2, match.tokens.count)
+            return Array(match.tokens.prefix(max(1, take)))
+        }
+        return nil
     }
 
     func proposeEchoOrPLDRound(
@@ -54,52 +95,77 @@ extension QWEngineDriver {
         basePairs: Int,
         owner: QWStochasticSession?,
         draftCompleted: ((any MTLCommandBuffer) throws -> Void)?
-    ) throws -> EchoRoundProposal {
-        let effectiveCount: Int
-        if mtpAdaptiveDepth && geometry.numExperts > 0 && mtpDraftProposals >= 8 && count > 1 {
-            let trunkBits = layersW.first?.gu.view.bits ?? 8
-            let expertBits = layersW.compactMap({ $0.moe?.gateUp.bits }).first ?? trunkBits
-            let acceptRate = Double(mtpDraftAccepted) / Double(max(1, mtpDraftProposals))
-            effectiveCount = QWMTPAdaptiveDepth.optimalDraftCount(
-                geometry: geometry, trunkBits: trunkBits, expertBits: expertBits,
-                acceptRate: acceptRate, maxDrafts: count)
-        } else {
-            effectiveCount = count
-        }
+    ) throws -> MTPRoundProposal {
+        try proposeHybridRound(
+            session: session, pending: pending, count: count,
+            defaultTrunkBits: 8, owner: owner, traceTag: "[echo-draft]",
+            useFullNeuralDepth: { $0 == .mtp || mtpStageProfiling || owner != nil },
+            proposeNeural: { neuralCount, sampledToken, stopAfterDraft in
+                try echoDrafter.propose(
+                    driver: self, initialStream: hidden, kv: views,
+                    pendingToken: pending, cacheRows: basePairs, drafts: neuralCount,
+                    sampledToken: sampledToken, shouldStopAfterDraft: stopAfterDraft,
+                    writeLogitsOnFinalDraft: mtpStageProfiling, completed: draftCompleted)
+            })
+    }
 
+    func proposeNextNOrPLDRound(
+        session: QWEngineSession,
+        draftEncoder: QWMTPDraftEncoder,
+        hidden: QWTensorValue,
+        views: (k: QWKVLayerView, v: QWKVLayerView),
+        pending: Int,
+        count: Int,
+        basePairs: Int,
+        owner: QWStochasticSession?,
+        draftCompleted: ((any MTLCommandBuffer) throws -> Void)?
+    ) throws -> MTPRoundProposal {
+        try proposeHybridRound(
+            session: session, pending: pending, count: count,
+            defaultTrunkBits: 4, owner: owner, traceTag: "[draft]",
+            useFullNeuralDepth: { !($0 == .ngram && owner == nil && !mtpStageProfiling) },
+            proposeNeural: { neuralCount, sampledToken, stopAfterDraft in
+                try QWMTPDraftChain.run(
+                    hal: hal, draft: draftEncoder, headStorage: headStorage,
+                    draftHead: mtpDraftHead, hidden: hidden, kv: views,
+                    pendingToken: pending, drafts: neuralCount, position: session.position, cacheRows: basePairs,
+                    selection: .gpuChecked,
+                    deviceEmbedding: owner != nil ? nil : mtpDeviceEmbedding,
+                    embedding: { try self.copyEmbedRow($0, to: $1) },
+                    sampledToken: sampledToken,
+                    shouldStopAfterDraft: stopAfterDraft,
+                    writeLogitsOnFinalDraft: mtpStageProfiling,
+                    completed: draftCompleted,
+                    gpuFailure: { self.commandBufferErrors += 1 })
+            })
+    }
+
+    private func proposeHybridRound(
+        session: QWEngineSession,
+        pending: Int,
+        count: Int,
+        defaultTrunkBits: Int,
+        owner: QWStochasticSession?,
+        traceTag: String,
+        useFullNeuralDepth: (QWDraftStrategy) -> Bool,
+        proposeNeural: (
+            _ neuralCount: Int,
+            _ sampledToken: ((QWTensorValue) throws -> Int)?,
+            _ stopAfterDraft: ((QWTensorValue, Int) throws -> Bool)?
+        ) throws -> [Int]
+    ) throws -> MTPRoundProposal {
+        let effectiveCount = adaptiveDraftCount(count: count, defaultTrunkBits: defaultTrunkBits)
         let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
-        let fullHistory: [Int]
-        if session.tokenHistory.count > session.position, session.tokenHistory.last == pending {
-            fullHistory = session.tokenHistory
-        } else {
-            fullHistory = session.tokenHistory + [pending]
-        }
-        if owner == nil && !mtpStageProfiling && resolvedStrategy != .mtp {
-            if let pd = QWContextCopyDrafter.periodicDrafts(
-                history: fullHistory, maxCount: effectiveCount, minRepeats: 3),
-               !pd.isEmpty {
-                lastRoundUsedPLD = true
-                lastEchoDraftedPairs = 0
-                mtpDraftProposals += pd.count
-                return EchoRoundProposal(drafts: pd, proposals: [], draftedPairs: 0)
-            }
-            let minMatch = (resolvedStrategy == .ngram) ? 3 : 5
-            if let match = QWContextCopyDrafter.drafts(
-                history: fullHistory, maxCount: effectiveCount, minMatchLen: minMatch),
-               !match.tokens.isEmpty {
-                let take = match.matchLen >= 6
-                    ? effectiveCount
-                    : min(resolvedStrategy == .ngram ? effectiveCount : 2, match.tokens.count)
-                let chosen = Array(match.tokens.prefix(max(1, take)))
-                lastRoundUsedPLD = true
-                lastEchoDraftedPairs = 0
-                mtpDraftProposals += chosen.count
-                return EchoRoundProposal(drafts: chosen, proposals: [], draftedPairs: 0)
-            }
+        let fullHistory = draftFullHistory(session: session, pending: pending)
+        if owner == nil && !mtpStageProfiling && resolvedStrategy != .mtp,
+           let chosen = tryZeroCostContextDrafts(fullHistory: fullHistory, count: count, strategy: resolvedStrategy) {
+            lastRoundUsedPLD = true
+            lastDraftedPairs = 0
+            mtpDraftProposals += chosen.count
+            return MTPRoundProposal(drafts: chosen, proposals: [], draftedPairs: 0)
         }
 
-        let neuralCount = (resolvedStrategy == .mtp || mtpStageProfiling || owner != nil)
-            ? effectiveCount : 1
+        let neuralCount = useFullNeuralDepth(resolvedStrategy) ? effectiveCount : 1
         var proposals: [QWMTPGumbelProposal] = []
         if let owner {
             try owner.stream.beginGumbelRound(drafts: neuralCount, vocabulary: geometry.vocab)
@@ -129,29 +195,25 @@ extension QWEngineDriver {
         } : nil
 
         let tDraft0 = Self.decodeTraceEnabled ? Date() : nil
-        var drafts = try echoDrafter.propose(
-            driver: self, initialStream: hidden, kv: views,
-            pendingToken: pending, cacheRows: basePairs, drafts: neuralCount,
-            sampledToken: sampledToken, shouldStopAfterDraft: stopAfterDraft,
-            writeLogitsOnFinalDraft: mtpStageProfiling, completed: draftCompleted)
+        var drafts = try proposeNeural(neuralCount, sampledToken, stopAfterDraft)
         let draftedPairs = drafts.count
         if owner == nil, !mtpStageProfiling, resolvedStrategy != .mtp,
-           effectiveCount > drafts.count, let d0 = drafts.first,
+           count > drafts.count, let lastDraft = drafts.last,
            let cont = QWContextCopyDrafter.drafts(
-               history: fullHistory, appendedToken: d0,
-               maxCount: effectiveCount - drafts.count, minMatchLen: 4),
+               history: fullHistory + drafts.dropLast(), appendedToken: lastDraft,
+               maxCount: count - drafts.count, minMatchLen: 4),
            !cont.tokens.isEmpty {
-            let extra = cont.matchLen >= 6 ? (effectiveCount - drafts.count) : 1
+            let extra = cont.matchLen >= 6 ? (count - drafts.count) : 1
             drafts.append(contentsOf: cont.tokens.prefix(max(1, extra)))
         }
         if let tDraft0 {
             FileHandle.standardError.write(Data(String(
-                format: "[echo-draft] pos=%d count=%d wall=%.2fms\n",
-                session.position, drafts.count, Date().timeIntervalSince(tDraft0) * 1000).utf8))
+                format: "%@ pos=%d count=%d wall=%.2fms\n",
+                traceTag, session.position, drafts.count, Date().timeIntervalSince(tDraft0) * 1000).utf8))
         }
-        lastEchoDraftedPairs = draftedPairs
+        lastDraftedPairs = draftedPairs
         mtpDraftProposals += drafts.count
-        return EchoRoundProposal(drafts: drafts, proposals: proposals, draftedPairs: draftedPairs)
+        return MTPRoundProposal(drafts: drafts, proposals: proposals, draftedPairs: draftedPairs)
     }
 
     func encodeEchoCommitResolution(
@@ -230,7 +292,72 @@ extension QWEngineDriver {
         enc.endEncoding()
     }
 
-    func finalizeEchoPairCursor(
+    func encodeNextNCommitResolution(
+        _ cb: any MTLCommandBuffer,
+        session: QWEngineSession,
+        draft: QWMTPDraftEncoder,
+        window: QWVerifyWindow,
+        trunkHidden: QWTensorValue,
+        basePairs: Int,
+        retained: Int,
+        usedPLD: Bool
+    ) throws {
+        guard let views = session.mtpKVViews.first else {
+            throw QWEngineDriverError.state("NextN commit resolution requires MTP KV views")
+        }
+        let h = geometry.hidden
+        let seedable = min(retained, max(0, draft.positionCapacity - session.position))
+        if usedPLD {
+            guard seedable > 0 else { return }
+            for r in 0..<seedable {
+                try copyEmbedRow(verifiedInputs[r], to: try window.embeddingRow(r))
+            }
+            let embSlice = QWTensorValue(region: window.embeddings.region, offset: window.embeddings.offset,
+                                         shape: QWTensorShape([seedable * h], .f16))
+            let trunkSlice = QWTensorValue(region: window.hidden.region, offset: window.hidden.offset,
+                                           shape: QWTensorShape([seedable * h], .f16))
+            guard let enc = cb.makeComputeCommandEncoder() else {
+                throw QWEngineDriverError.state("NextN PLD commit seed compute encoder")
+            }
+            do {
+                bindResidentResources(enc)
+                try QWMTPPromptSeeder.encode(enc, draft: draft, embeddings: embSlice, trunkHidden: trunkSlice,
+                                             previousHidden: trunkHidden, position: session.position,
+                                             count: seedable, cacheRows: basePairs, kv: views)
+            } catch {
+                enc.endEncoding()
+                throw error
+            }
+            enc.endEncoding()
+            return
+        }
+
+        guard seedable >= 2 else { return }
+        let extra = seedable - 1
+        for r in 1..<seedable {
+            try copyEmbedRow(verifiedInputs[r], to: try window.embeddingRow(r))
+        }
+        let embSlice = QWTensorValue(region: window.embeddings.region, offset: window.embeddings.offset + h * 2,
+                                     shape: QWTensorShape([extra * h], .f16))
+        let prevHidden = try window.hiddenRow(0)
+        let trunkSlice = QWTensorValue(region: window.hidden.region, offset: window.hidden.offset + h * 2,
+                                       shape: QWTensorShape([extra * h], .f16))
+        guard let enc = cb.makeComputeCommandEncoder() else {
+            throw QWEngineDriverError.state("NextN verify refresh compute encoder")
+        }
+        do {
+            bindResidentResources(enc)
+            try QWMTPPromptSeeder.encode(enc, draft: draft, embeddings: embSlice, trunkHidden: trunkSlice,
+                                         previousHidden: prevHidden, position: session.position + 1,
+                                         count: extra, cacheRows: basePairs + 1, kv: views)
+        } catch {
+            enc.endEncoding()
+            throw error
+        }
+        enc.endEncoding()
+    }
+
+    func finalizeMTPPairCursor(
         session: QWEngineSession,
         mtpCache: QWKVCache,
         mtpHandle: QWKVHandle,

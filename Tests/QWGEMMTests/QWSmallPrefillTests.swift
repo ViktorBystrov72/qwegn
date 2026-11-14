@@ -74,7 +74,7 @@ final class QWSmallPrefillTests: XCTestCase {
             let gBytes = QWSHVQBlock.bytes(bits: 4, group: group)
             for (n, k) in [(19, 64), (64, 2560), (320, 320), (32, 6144), (64, 128), (320, 64)] {
                 var data = Data(count: n * (k / group) * gBytes)
-                data.withUnsafeMutableBytes { raw in
+                data.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
                     guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
                     var s: UInt32 = 0x9E37_79B9 ^ UInt32(group)
                     for r in 0..<n {

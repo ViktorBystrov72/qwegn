@@ -160,11 +160,6 @@ extension QWModelDescriptor {
     public enum ActivationKind: Sendable, Hashable, Codable, Equatable {
         case silu
         case situ(beta: Float, linearBeta: Float)
-
-        public var isSitu: Bool {
-            if case .situ = self { return true }
-            return false
-        }
     }
 
     /// Weight-SVD LSA key-projection descriptor for a physical decoder layer.
@@ -216,15 +211,6 @@ extension QWModelDescriptor {
     /// True when the model executes MLA (either NoPE MLA or hybrid decoupled-RoPE MLA-DSA) on its full-attention layers.
     public var hasMLAAttention: Bool {
         (mlaUseNoPE && (kvLoraRank ?? 0) > 0) || hybridMLAConfig != nil
-    }
-
-    /// True when NextN / MTP layer `mtpOffset` (`0..<mtpLayers`) runs MLA-DSA rather than HCA.
-    public func isNextNLayerDSA(_ mtpOffset: Int = 0) -> Bool {
-        let idx = numLayers + max(0, mtpOffset)
-        if let ratios = hcaConfig?.compressRatios, idx < ratios.count {
-            return ratios[idx] <= 0
-        }
-        return hasMLAAttention
     }
 
     /// Resolves the RoPE-free key projection tensor slice for training-free Weight-SVD LSA synthesis.

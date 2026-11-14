@@ -1,126 +1,112 @@
-// TelemetryTheme.swift — The design tokens the MenuBar draws with.
-// One place for the palette, the type and the metrics, so a card in the
-// popover and a card in the web dashboard read as the same instrument.
+// TelemetryTheme.swift — Adaptive Light/Dark design tokens for QWMenuBar
 
-import SwiftUI
 import AppKit
+import SwiftUI
 
-/// The popover's design tokens.
+/// Adaptive semantic colors, typography, spacing, and radii for Light and Dark Mode.
 public enum TelemetryTheme {
-    // MARK: - Colour
+    private static func adaptive(light: NSColor, dark: NSColor) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            switch appearance.bestMatch(from: [.darkAqua, .aqua, .vibrantDark, .vibrantLight]) {
+            case .darkAqua, .vibrantDark:
+                return dark
+            default:
+                return light
+            }
+        })
+    }
 
-    /// The canvas behind the popover, when the glass is turned off.
-    public static let surface = Color(hex: "#111318")
-    /// The accent: controls, focus, the decode trace.
-    public static let accent = Color(hex: "#0A84FF")
-    /// The prefill trace.
-    public static let prefill = Color(hex: "#FFD60A")
-    /// A cool accent: the cache, the CPU.
-    public static let cool = Color(hex: "#64D2FF")
-    /// The quiet grey: memory.
-    public static let neutral = Color(hex: "#98989D")
-    /// A lighter blue: the selected row.
-    public static let highlight = Color(hex: "#AAC7FF")
-    /// The ink of the emblem.
-    public static let logoInk = Color(hex: "#F3F4F6")
-    /// An engine that is running.
-    public static let active = Color(hex: "#30D158")
-    /// A warning: memory pressure, a warm-up.
-    public static let warning = Color(hex: "#FF9F0A")
-    /// A failure.
-    public static let failure = Color(hex: "#FF453A")
-    /// A state nobody has observed.
-    public static let unknown = Color(hex: "#8B91A0")
+    public static let surface = adaptive(
+        light: NSColor.windowBackgroundColor,
+        dark: NSColor(srgbRed: 0.067, green: 0.075, blue: 0.094, alpha: 1.0)
+    )
+    public static let accent = adaptive(
+        light: NSColor(srgbRed: 0.0, green: 0.439, blue: 0.902, alpha: 1.0),
+        dark: NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1.0)
+    )
+    public static let prefill = adaptive(
+        light: NSColor(srgbRed: 0.722, green: 0.420, blue: 0.0, alpha: 1.0),
+        dark: NSColor(srgbRed: 1.0, green: 0.839, blue: 0.039, alpha: 1.0)
+    )
+    public static let cool = adaptive(
+        light: NSColor(srgbRed: 0.0, green: 0.455, blue: 0.678, alpha: 1.0),
+        dark: NSColor(srgbRed: 0.392, green: 0.824, blue: 1.0, alpha: 1.0)
+    )
+    public static let neutral = Color.secondary
+    public static let highlight = adaptive(
+        light: NSColor(srgbRed: 0.04, green: 0.38, blue: 0.82, alpha: 1.0),
+        dark: NSColor(srgbRed: 0.667, green: 0.780, blue: 1.0, alpha: 1.0)
+    )
+    public static let logoInk = Color.primary
+    public static let active = adaptive(
+        light: NSColor(srgbRed: 0.086, green: 0.545, blue: 0.227, alpha: 1.0),
+        dark: NSColor(srgbRed: 0.188, green: 0.820, blue: 0.345, alpha: 1.0)
+    )
+    public static let warning = adaptive(
+        light: NSColor(srgbRed: 0.780, green: 0.400, blue: 0.0, alpha: 1.0),
+        dark: NSColor(srgbRed: 1.0, green: 0.624, blue: 0.039, alpha: 1.0)
+    )
+    public static let failure = adaptive(
+        light: NSColor(srgbRed: 0.800, green: 0.125, blue: 0.145, alpha: 1.0),
+        dark: NSColor(srgbRed: 1.0, green: 0.271, blue: 0.227, alpha: 1.0)
+    )
+    public static let unknown = Color.secondary.opacity(0.75)
 
-    // MARK: - Type
+    public static let label = Font.system(size: 11, weight: .medium)
+    public static let body = Font.system(size: 12, weight: .regular)
+    public static let metric = Font.system(size: 12, weight: .medium, design: .monospaced)
 
-    /// The type for the interface's own words.
-    public static let label = Font.system(size: 10, weight: .medium)
-    public static let body = Font.system(size: 11, weight: .regular)
-    public static let headline = Font.system(size: 13, weight: .semibold)
-    /// The type for numbers: monospaced, so a digit does not move.
-    public static let metric = Font.system(size: 11, weight: .medium, design: .monospaced)
-
-    /// The interface face. DESIGN.md names Inter; a machine without it
-    /// uses the system face, so the popover is readable everywhere.
     public static func ui(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
-        guard let face = Face.inter else {
-            return .system(size: size, weight: weight)
-        }
-        return .custom(face, size: size).weight(weight)
+        Font.system(size: size, weight: weight)
     }
 
-    /// The numeric face. DESIGN.md names JetBrains Mono; a machine
-    /// without it uses the system's own monospace. Either way the digits
-    /// are tabular, so a value that streams does not make the row jump.
     public static func numeric(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
-        guard let face = Face.jetbrainsMono else {
-            return .system(size: size, weight: weight, design: .monospaced).monospacedDigit()
-        }
-        return .custom(face, size: size).weight(weight).monospacedDigit()
+        Font.system(size: size, weight: weight, design: .monospaced).monospacedDigit()
     }
-
-    /// The faces DESIGN.md names, and whether this machine has them.
-    /// A missing face is a fact the theme knows, not a silent
-    /// substitution the reader cannot see.
-    enum Face {
-        static let inter = firstAvailable(["Inter", "Inter-Regular", "Inter Display"])
-        static let jetbrainsMono = firstAvailable(["JetBrains Mono", "JetBrainsMono Nerd Font",
-                                                    "JetBrainsMonoNL Nerd Font"])
-
-        private static func firstAvailable(_ names: [String]) -> String? {
-            names.first { NSFont(name: $0, size: 1) != nil }
-        }
-    }
-
-    // MARK: - Metrics
 
     public enum Radius {
-        public static let small: CGFloat = 4
-        public static let medium: CGFloat = 6
-        public static let large: CGFloat = 8
-    }
-
-    public enum Space {
-        public static let xSmall: CGFloat = 2
-        public static let small: CGFloat = 4
+        public static let small: CGFloat = 5
         public static let medium: CGFloat = 8
-        public static let large: CGFloat = 12
+        public static let large: CGFloat = 10
     }
 
-    /// The hairline the cards are drawn with.
-    public static let hairline = Color.white.opacity(0.08)
-    /// A card's substrate on the glass.
-    public static let substrate = Color.white.opacity(0.05)
-    /// A row's substrate inside a card.
-    public static let rowSubstrate = Color.white.opacity(0.03)
+    public static let hairline = adaptive(
+        light: NSColor.black.withAlphaComponent(0.10),
+        dark: NSColor.white.withAlphaComponent(0.11)
+    )
+    public static let substrate = adaptive(
+        light: NSColor.black.withAlphaComponent(0.045),
+        dark: NSColor.white.withAlphaComponent(0.06)
+    )
+    public static let rowSubstrate = adaptive(
+        light: NSColor.black.withAlphaComponent(0.03),
+        dark: NSColor.white.withAlphaComponent(0.035)
+    )
 
-    // MARK: - Accessibility
-
-    /// The hairline, honouring Increased Contrast. A stronger edge is
-    /// what the user asked for when they ask for more contrast.
     public static func hairline(increasedContrast: Bool) -> Color {
-        increasedContrast ? Color.white.opacity(0.28) : hairline
+        adaptive(
+            light: NSColor.black.withAlphaComponent(increasedContrast ? 0.26 : 0.10),
+            dark: NSColor.white.withAlphaComponent(increasedContrast ? 0.28 : 0.11)
+        )
     }
 
-    /// The quieter text, honouring Increased Contrast.
     public static func secondary(increasedContrast: Bool) -> Color {
-        increasedContrast ? Color.white.opacity(0.88) : Color.white.opacity(0.45)
+        increasedContrast ? Color.primary.opacity(0.88) : Color.secondary
     }
 
-    /// The quietest text — the ages and the reasons, honouring Increased
-    /// Contrast.
     public static func quiet(increasedContrast: Bool) -> Color {
-        increasedContrast ? Color.white.opacity(0.75) : Color.white.opacity(0.35)
+        increasedContrast ? Color.primary.opacity(0.72) : Color.secondary.opacity(0.80)
     }
 
-    /// A separator between two values, honouring Increased Contrast.
     public static func separator(increasedContrast: Bool) -> Color {
-        increasedContrast ? Color.white.opacity(0.45) : Color.white.opacity(0.20)
+        adaptive(
+            light: NSColor.black.withAlphaComponent(increasedContrast ? 0.28 : 0.12),
+            dark: NSColor.white.withAlphaComponent(increasedContrast ? 0.30 : 0.12)
+        )
     }
 
-    /// The text on the canvas, honouring Increased Contrast.
     public static func primary(increasedContrast: Bool) -> Color {
-        increasedContrast ? Color.white : Color.white.opacity(0.95)
+        let _ = increasedContrast
+        return Color.primary
     }
 }

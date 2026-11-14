@@ -31,10 +31,6 @@ public final class QWGDNPrefill {
     public static let vHeads = 48
     public static let headDim = 128
     public static let maxChunk = 64
-    /// f32 elements of ONE of U/W/A/B scratch tensors.
-    public static func uwabElems(T: Int) -> Int { T * 6144 }
-    /// f32 elements of o_scratch.
-    public static func oScratchElems(T: Int) -> Int { T * 6144 }
     /// Active scan kernel name (used by parity gates to assert backend routing).
     public let kernelNameScan: String
     public let kernelNameSolve: String
@@ -46,8 +42,15 @@ public final class QWGDNPrefill {
     private let psoScan: any MTLComputePipelineState
     private let psoNorm: any MTLComputePipelineState
     /// EXP-9 sub-item 1 (opt-in, NOT shipping default): register-resident
-    /// recurrence, lazily built so callers that never opt in pay nothing.
-    private lazy var psoRegRes: any MTLComputePipelineState = { try! hal.pipeline("qwg_gdn_prefill_regres") }()
+    /// recurrence, lazily resolved so callers that never opt in pay nothing.
+    private var cachedRegRes: (any MTLComputePipelineState)?
+
+    private func regResPipeline() throws -> any MTLComputePipelineState {
+        if let p = cachedRegRes { return p }
+        let p = try hal.pipeline("qwg_gdn_prefill_regres")
+        cachedRegRes = p
+        return p
+    }
 
     public init(hal: QWHal, scanBackend: ScanBackend = .hybrid, solveBackend: SolveBackend = .scalar) throws {
         self.hal = hal
@@ -161,7 +164,7 @@ public final class QWGDNPrefill {
         else { throw QWGDNPrefillError.badShape("regres T=\(T) y=\(y.shape.elementCount)") }
 
         var tU = UInt32(T)
-        enc.setComputePipelineState(psoRegRes)
+        enc.setComputePipelineState(try regResPipeline())
         y.bind(enc, index: 0); betas.bind(enc, index: 1); glog.bind(enc, index: 2)
         state.bind(enc, index: 3)        // IN PLACE
         oScratch.bind(enc, index: 4)

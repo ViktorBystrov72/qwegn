@@ -138,7 +138,8 @@ public final class QWEngineCore: @unchecked Sendable {
                          sampling: QWSamplerConfig? = nil,
                          speculative: QWSpeculativeParameters? = nil,
                          onToken: ((Int) -> Bool)? = nil,
-                         onStopToken: ((Int) -> Void)? = nil) throws -> QWGenerationResult {
+                         onStopToken: ((Int) -> Void)? = nil,
+                         onPrefillProgress: ((Int, Int) -> Void)? = nil) throws -> QWGenerationResult {
         let sampling = sampling ?? configuration.sampling
         let drafts = speculative ?? configuration.speculative
         // C5 (prefill entry): validate the WHOLE token list before any
@@ -164,6 +165,9 @@ public final class QWEngineCore: @unchecked Sendable {
             // The module gets the request before the clock starts: what a
             // request needs up front must not land inside the measured prefill.
             try configuration.module.prepare(state, prompt: prompt, maxNew: maxNew)
+            if !prompt.isEmpty {
+                onPrefillProgress?(0, prompt.count)
+            }
             let prefillStart = Date()
             while chunkStart < prompt.count {
                 let end = min(chunkStart + configuration.plan.prefillChunkRows, prompt.count)
@@ -171,6 +175,7 @@ public final class QWEngineCore: @unchecked Sendable {
                                                                chunk: chunkStart..<end,
                                                                runsHead: end == prompt.count)
                 chunkStart = end
+                onPrefillProgress?(end, prompt.count)
             }
             prefillSeconds = Date().timeIntervalSince(prefillStart)
         } catch let error as QWEngineError {

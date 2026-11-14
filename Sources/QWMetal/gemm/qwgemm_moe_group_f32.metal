@@ -93,23 +93,37 @@ kernel void qwg_moe_group_pairs_f32(device const int* selected [[buffer(0)]],
         const uint chunk = (experts + 31u) / 32u;
         const uint e0 = min(lane * chunk, experts);
         const uint e1 = min(e0 + chunk, experts);
+        const bool compactTail = (writeInv & 4u) == 0u;
         int myTiles = 0;
         for (uint e = e0; e < e1; ++e) {
             const int c = tgOff[e + 1] - tgOff[e];
-            if (c > 0) {
-                const int bm = qw_moe_tile_block(c, 0);
-                myTiles += (c + bm - 1) / bm;
-            }
+            if (c > 0) myTiles += (c + 63) / 64;
         }
         int t = simd_prefix_exclusive_sum(myTiles);
         for (uint e = e0; e < e1; ++e) {
             const int c = tgOff[e + 1] - tgOff[e];
             if (c > 0) {
-                const int bm = qw_moe_tile_block(c, 0);
-                for (int r = 0; r * bm < c; ++r) {
-                    tileE[t] = int(e);
-                    tileR[t] = r;
-                    ++t;
+                if (compactTail) {
+                    const int q = c >> 6;
+                    const int rem = c & 63;
+                    for (int r = 0; r < q; ++r) {
+                        tileE[t] = int(e);
+                        tileR[t] = qw_moe_pack_tile_r(r, 64);
+                        ++t;
+                    }
+                    if (rem > 0) {
+                        const int tailBm = qw_moe_tile_block(rem, 0);
+                        tileE[t] = int(e);
+                        tileR[t] = qw_moe_pack_tile_r((q * 64) / tailBm, tailBm);
+                        ++t;
+                    }
+                } else {
+                    const int bm = qw_moe_tile_block(c, 0);
+                    for (int r = 0; r * bm < c; ++r) {
+                        tileE[t] = int(e);
+                        tileR[t] = qw_moe_pack_tile_r(r, bm);
+                        ++t;
+                    }
                 }
             }
         }

@@ -13,6 +13,8 @@ final class QWSafeTensorsZeroCopyTests: XCTestCase {
     }
 
     func testReadingATensorDoesNotCopyTheFile() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == "true",
+                      "Uncontaminated process ru_maxrss check skipped on virtualized CI runner")
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("zc-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -31,7 +33,7 @@ final class QWSafeTensorsZeroCopyTests: XCTestCase {
         let headerJSON = try JSONSerialization.data(withJSONObject: header)
         FileManager.default.createFile(atPath: url.path, contents: nil)
         let handle = try FileHandle(forWritingTo: url)
-        try handle.write(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { Data($0) })
+        try handle.write(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { (raw: UnsafeRawBufferPointer) in Data(raw) })
         try handle.write(contentsOf: headerJSON)
         let chunk = Data(repeating: 0xAB, count: 1024 * 1024)
         var written = 0

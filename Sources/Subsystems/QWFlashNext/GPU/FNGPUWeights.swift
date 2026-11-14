@@ -18,21 +18,23 @@ public final class FNGPUGDNMixer: @unchecked Sendable {
     public let inProjBA: QWWeightView
     public let conv: QWTensorValue, normWeight: QWTensorValue, aLog: QWTensorValue, dtBias: QWTensorValue
     public let inProjB: QWTensorValue, inProjA: QWTensorValue
+    public let inProjBA32: QWTensorValue?
     public var states: [QWTensorValue]             // eight f32 [vHeads, kDim, vDim] ring buffers for O(1) verify rollback
     public var stateParity = 0                     // index of the active recurrent state buffer
     public var state: QWTensorValue { states[stateParity & QWFourSlotRollbackRing.ringMask] }
-    public var altState: QWTensorValue { states[(stateParity + 1) & QWFourSlotRollbackRing.ringMask] }
     public var convState: [QWTensorValue]          // eight f32 [3, convDim] ring buffers, stepped each call
     public var convParity = 0                      // index of the conv state read by the next call
     public let vHeads: Int, kHeads: Int, kDim: Int, vDim: Int, convDim: Int
 
     init(qkv: QWWeightView, z: QWWeightView, qkvZ: QWWeightView?, out: QWWeightView, inProjBA: QWWeightView,
          conv: QWTensorValue, normWeight: QWTensorValue, aLog: QWTensorValue, dtBias: QWTensorValue,
-         inProjB: QWTensorValue, inProjA: QWTensorValue, states: [QWTensorValue], convState: [QWTensorValue],
+         inProjB: QWTensorValue, inProjA: QWTensorValue, inProjBA32: QWTensorValue? = nil,
+         states: [QWTensorValue], convState: [QWTensorValue],
          vHeads: Int, kHeads: Int, kDim: Int, vDim: Int, convDim: Int) {
         self.qkv = qkv; self.z = z; self.qkvZ = qkvZ; self.out = out; self.inProjBA = inProjBA
         self.conv = conv; self.normWeight = normWeight; self.aLog = aLog; self.dtBias = dtBias
-        self.inProjB = inProjB; self.inProjA = inProjA; self.states = states; self.convState = convState
+        self.inProjB = inProjB; self.inProjA = inProjA; self.inProjBA32 = inProjBA32
+        self.states = states; self.convState = convState
         self.vHeads = vHeads; self.kHeads = kHeads; self.kDim = kDim; self.vDim = vDim; self.convDim = convDim
     }
 }
@@ -229,11 +231,6 @@ public enum FNGPULoader {
         arena.write(t, from: a); return t
     }
 
-    static func zerosF32(_ arena: QWArena, count: Int) throws -> QWTensorValue {
-        let t = try arena.weightsRegion().allocate(QWTensorShape([count], .f32))
-        memset(arena.cpuPointer(of: t), 0, t.bytes); return t
-    }
-
     static func bf16FromF32(_ arena: QWArena, _ a: [Float]) throws -> QWTensorValue {
         let t = try arena.weightsRegion().allocate(QWTensorShape([a.count], .f16))
         arena.write(t, from: a.map(QWBF16.fromFloatRNE)); return t
@@ -299,14 +296,20 @@ public enum FNGPULoader {
             let stateRing = try arena.activationsRegion().allocate(QWTensorShape([8 * stateCount], .f32))
             memset(arena.cpuPointer(of: stateRing), 0, stateCount * 4)
             let states = (0..<8).map { s in stateRing.slice(byteOffset: s * stateCount * 4, count: stateCount, dtype: .f32) }
+            let bArr = try loader.tensor(gp + "in_proj_b.weight")
+            let aArr = try loader.tensor(gp + "in_proj_a.weight")
+            let ba32 = try f32(arena, bArr + aArr)
+            let inProjB32 = ba32.slice(byteOffset: 0, count: bArr.count, dtype: .f32)
+            let inProjA32 = ba32.slice(byteOffset: bArr.count * 4, count: aArr.count, dtype: .f32)
             mixer = .gdn(FNGPUGDNMixer(
                 qkv: qkvView, z: zView, qkvZ: qkvZ, out: outView, inProjBA: inProjBA,
                 conv: try f32(arena, try loader.tensor(gp + "conv1d.weight")),
                 normWeight: try f32(arena, try loader.tensor(gp + "norm.weight")),
                 aLog: try f32(arena, try loader.tensor(gp + "A_log")),
                 dtBias: try f32(arena, try loader.tensor(gp + "dt_bias")),
-                inProjB: try f32(arena, try loader.tensor(gp + "in_proj_b.weight")),
-                inProjA: try f32(arena, try loader.tensor(gp + "in_proj_a.weight")),
+                inProjB: inProjB32,
+                inProjA: inProjA32,
+                inProjBA32: ba32,
                 states: states, convState: convState, vHeads: vHeads, kHeads: kHeads, kDim: kDim, vDim: vDim, convDim: convDim))
         } else {
             let ap = p + "self_attn.", ixp = ap + "indexer."

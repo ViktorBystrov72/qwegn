@@ -58,38 +58,12 @@ public struct QWTensorValue: Sendable {
     }
 }
 
-/// Ping-pong buffer pair for recurrent / causal history state that alternates read and write slots each pass.
-public struct QWPingPongBuffer: Sendable {
-    public let pair: [QWTensorValue]
-    public var parity: Int = 0
-
-    public init(_ a: QWTensorValue, _ b: QWTensorValue) {
-        self.pair = [a, b]
-    }
-
-    public init(pair: [QWTensorValue]) {
-        precondition(pair.count == 2, "QWPingPongBuffer requires 2 tensors")
-        self.pair = pair
-    }
-
-    @inline(__always)
-    public var current: QWTensorValue { pair[parity] }
-
-    @inline(__always)
-    public var next: QWTensorValue { pair[1 - parity] }
-
-    @inline(__always)
-    public mutating func advance() { parity = 1 - parity }
-
-    public subscript(index: Int) -> QWTensorValue { pair[index] }
-}
-
 extension MTLComputeCommandEncoder {
     /// Binds a POD value into `index` using its stride.
     @inline(__always)
     public func setPod<T>(_ value: T, index: Int) {
         var copy = value
-        withUnsafeBytes(of: &copy) { raw in
+        withUnsafeBytes(of: &copy) { (raw: UnsafeRawBufferPointer) in
             setBytes(raw.baseAddress!, length: raw.count, index: index)
         }
     }
@@ -203,7 +177,6 @@ public final class QWSubAllocator: @unchecked Sendable {
         cursor = 0
         usedBytes = 0
     }
-    public func resetSteadyCounters() { lock.lock(); steadyStateAllocs = 0; lock.unlock() }
 }
 
 /// Ring of fixed-size slabs (decode activation pipeline): O(1) rotate, no
@@ -251,9 +224,6 @@ public final class QWPageArena: @unchecked Sendable {
     public func allocPage() -> Int? { freeStack.popLast().map { $0 } }
     public func freePage(_ i: Int) { freeStack.append(i) }
     public var freePages: Int { freeStack.count }
-    public func pageView(_ i: Int, _ shape: QWTensorShape) -> QWTensorValue {
-        QWTensorValue(region: region, offset: i * pageSize, shape: shape)
-    }
 }
 
 /// The arena. One per process: one giant shared buffer (or per-region shared
@@ -439,7 +409,7 @@ public final class QWArena: @unchecked Sendable {
         let byteCount = array.count * MemoryLayout<Element>.stride
         precondition(byteCount <= t.bytes, "write \(byteCount) > tensor \(t.bytes)")
         guard byteCount > 0 else { return }
-        _ = array.withUnsafeBytes { raw in
+        _ = array.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             memcpy(cpuPointer(of: t), raw.baseAddress!, byteCount)
         }
     }

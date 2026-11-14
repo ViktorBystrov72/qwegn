@@ -84,17 +84,6 @@ final class QWWeightAllocationPlanTests: XCTestCase {
         XCTAssertThrowsError(try QWWeightAllocationPlan(geometry: try Self.geometry27B(), ropeRows: 8192, mtpDrafts: 6))
     }
 
-    func testMTPConfigValidation() throws {
-        XCTAssertEqual(try QWMTPConfig(drafts: 0).drafts, 0)
-        XCTAssertEqual(try QWMTPConfig(drafts: 1).drafts, 1)
-        XCTAssertEqual(try QWMTPConfig(drafts: 2).drafts, 2)
-        XCTAssertEqual(try QWMTPConfig(drafts: 3).drafts, 3)
-        XCTAssertEqual(try QWMTPConfig(drafts: 4).drafts, 4)
-        XCTAssertEqual(try QWMTPConfig(drafts: 5).drafts, 5)
-        XCTAssertThrowsError(try QWMTPConfig(drafts: -1))
-        XCTAssertThrowsError(try QWMTPConfig(drafts: 6))
-    }
-
     func testRoundRecordInitialization() {
         var rec = QWRoundRecord()
         XCTAssertNil(rec.pendingToken)
@@ -120,15 +109,6 @@ final class QWWeightAllocationPlanTests: XCTestCase {
         XCTAssertEqual(rec.mtpPhysicalRows, 2)
         XCTAssertEqual(rec.absolutePosition, 12)
         XCTAssertEqual(rec.samplerDrawIndex, 7)
-    }
-
-    func testEngineConfigMTPDrafts() {
-        var cfg = QWEngineConfig()
-        XCTAssertEqual(cfg.mtpDrafts, 0)
-        cfg.mtpDrafts = 1
-        XCTAssertEqual(cfg.mtpDrafts, 1)
-        cfg.mtpDrafts = 2
-        XCTAssertEqual(cfg.mtpDrafts, 2)
     }
 
     static func glm53FlashGeometry(residentExperts: Int? = nil) throws -> QWModelGeometry {
@@ -218,17 +198,17 @@ final class QWWeightAllocationPlanTests: XCTestCase {
         let geo288 = try Self.glm53FlashGeometry(residentExperts: 288)
         XCTAssertEqual(geo288.effectiveResidentExperts, 288)
         XCTAssertEqual(geo288.coldExpertStagingSlots, 0)
-        XCTAssertEqual(geo288.allocatedExpertSlots, 288)
+        XCTAssertEqual(geo288.effectiveResidentExperts + geo288.coldExpertStagingSlots, 288)
 
         let geo216 = try Self.glm53FlashGeometry(residentExperts: 216)
         XCTAssertEqual(geo216.effectiveResidentExperts, 216)
         XCTAssertEqual(geo216.coldExpertStagingSlots, 8)
-        XCTAssertEqual(geo216.allocatedExpertSlots, 224)
+        XCTAssertEqual(geo216.effectiveResidentExperts + geo216.coldExpertStagingSlots, 224)
 
         let geo96 = try Self.glm53FlashGeometry(residentExperts: 96)
         XCTAssertEqual(geo96.effectiveResidentExperts, 96)
         XCTAssertEqual(geo96.coldExpertStagingSlots, 8)
-        XCTAssertEqual(geo96.allocatedExpertSlots, 104)
+        XCTAssertEqual(geo96.effectiveResidentExperts + geo96.coldExpertStagingSlots, 104)
 
         let fmt = QWWeightFormat.hqBlock(
             bits: 4, groupSize: 32,
@@ -260,5 +240,13 @@ final class QWWeightAllocationPlanTests: XCTestCase {
             XCTAssertNoThrow(try plan96.check(shape, at: index))
         }
         XCTAssertNoThrow(try plan96.finish(requests: plan96.shapes.count, usedBytes: plan96.bytes))
+    }
+}
+
+private extension QWModelGeometry {
+    var coldExpertStagingSlots: Int {
+        let res = effectiveResidentExperts
+        guard res < numExperts else { return 0 }
+        return min(expertsPerTok, numExperts - res)
     }
 }

@@ -27,29 +27,6 @@ public enum QWProfileStoreError: Error, Equatable, CustomStringConvertible {
     }
 }
 
-/// What the seed did for one model.
-public struct QWSeedReport: Sendable, Equatable {
-    /// The knobs the model's profile now carries.
-    public let carried: Int
-    /// The knobs the legacy settings named that the profile does not hold,
-    /// and why. A caller that logs the seed must be able to say what was
-    /// left out, not only how many.
-    public let dropped: [String: String]
-    /// The knobs the profile holds whose value this model cannot honour,
-    /// and why. The resolution will not use them.
-    public let unavailable: [String: String]
-    /// Why the seed did not write, when it did not write.
-    public let skipped: String?
-
-    public init(carried: Int, dropped: [String: String] = [:],
-                unavailable: [String: String] = [:], skipped: String? = nil) {
-        self.carried = carried
-        self.dropped = dropped
-        self.unavailable = unavailable
-        self.skipped = skipped
-    }
-}
-
 /// One model's knob values, read from and written to disk. A profile bound
 /// to another geometry is stale: its values are refused, not applied.
 public final class QWProfileStore {
@@ -155,7 +132,7 @@ public final class QWProfileStore {
             }
             try descriptor.validate(value)
         }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try QWPaths.ensurePrivateDirectory(root)
         var stamped = profile
         stamped.schemaVersion = QWKnobProfile.currentSchemaVersion
         // The store owns the timestamp: the moment the file reached the disk
@@ -164,150 +141,14 @@ public final class QWProfileStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(stamped)
+        let profileURL = profileURL(for: profile.modelId)
         do {
-            try data.write(to: profileURL(for: profile.modelId), options: .atomic)
+            try data.write(to: profileURL, options: .atomic)
+            QWPaths.setPrivateFilePermissions(atPath: profileURL.path)
         } catch {
             throw QWProfileStoreError.unwritableProfile(model: profile.modelId,
                                                         reason: error.localizedDescription)
         }
-    }
-
-    /// Carries the legacy global settings into one profile per model,
-    /// keeping only the knobs that model can honour. Returns how many
-    /// knobs each profile carries, so the caller can say what was carried.
-    public func seedFromLegacySettings(legacy: [String: QWKnobValue],
-                                       models: [(modelId: String,
-                                                 capabilities: Set<QWKnobCapability>)]) throws -> [String: Int] {
-        // The legacy settings belong to no model, so the profiles this
-        // writes are bound to no geometry and are never checked for
-        // staleness. Use the digest overload when the geometry is known.
-        let reports = try seedFromLegacySettingsReporting(
-            legacy: legacy,
-            models: models.map { ($0.modelId, $0.capabilities, "") })
-        return reports.mapValues { $0.carried }
-    }
-
-    /// The same seed, with every profile bound to the geometry it was
-    /// written against. A profile whose geometry later changes is stale.
-    public func seedFromLegacySettings(legacy: [String: QWKnobValue],
-                                       models: [(modelId: String,
-                                                 capabilities: Set<QWKnobCapability>,
-                                                 geometryDigest: String)]) throws -> [String: Int] {
-        let reports = try seedFromLegacySettingsReporting(legacy: legacy, models: models)
-        return reports.mapValues { $0.carried }
-    }
-
-    /// The seed, with the full account of what it carried, what it left
-    /// out, and why.
-    public func seedFromLegacySettingsReporting(
-        legacy: [String: QWKnobValue],
-        models: [(modelId: String,
-                  capabilities: Set<QWKnobCapability>,
-                  geometryDigest: String)]) throws -> [String: QWSeedReport] {
-        // The seed fills a profile; it never overwrites one. A value the
-        // user has already chosen is theirs, and the legacy settings are
-        // only the fallback for what they have not.
-        var reports: [String: QWSeedReport] = [:]
-        for model in models {
-            var fill: [String: QWKnobValue] = [:]
-            // Why the legacy value for a knob was not carried over.
-            var reasons: [String: String] = [:]
-            for (id, value) in legacy {
-                guard let descriptor = QWKnobRegistry.descriptor(id) else {
-                    // A name the registry does not know is a mistake in the
-                    // mapping, not a reason to abandon the whole migration.
-                    reasons[id] = "the registry does not declare this knob"
-                    continue
-                }
-                // A knob the model cannot honour is not carried over: it is
-                // absent from its profile, not set to something it ignores.
-                if let capability = descriptor.requiredCapability,
-                   !model.capabilities.contains(capability) {
-                    reasons[id] = "the model does not have the '\(capability.rawValue)' capability"
-                    continue
-                }
-                if let text = value.stringValue,
-                   let required = descriptor.valueCapabilities[text],
-                   !model.capabilities.contains(required) {
-                    reasons[id] = "the value '\(text)' needs the '\(required.rawValue)' capability"
-                    continue
-                }
-                do {
-                    try descriptor.validate(value)
-                } catch {
-                    reasons[id] = "the registry refuses it: \(error)"
-                    continue
-                }
-                fill[id] = value
-            }
-
-            var values = fill
-            var digest = model.geometryDigest
-            if let existing = try load(modelId: model.modelId) {
-                if !existing.geometryDigest.isEmpty, !model.geometryDigest.isEmpty,
-                   existing.geometryDigest != model.geometryDigest {
-                    // The profile was written against another geometry. Its
-                    // values are stale, and the seed must not make stale
-                    // values look fresh by binding them to this geometry.
-                    reports[model.modelId] = QWSeedReport(
-                        carried: 0,
-                        unavailable: try unavailableInProfile(modelId: model.modelId,
-                                                             capabilities: model.capabilities),
-                        skipped: "the profile was written against another geometry "
-                            + "('\(existing.geometryDigest)')")
-                    continue
-                }
-                // The user's own values win. The seed fills what the profile
-                // lacks and never overwrites what it holds.
-                for (id, value) in existing.values {
-                    values[id] = value
-                }
-                // A profile that knows no geometry may learn one; a profile
-                // that knows one does not forget it.
-                if !existing.geometryDigest.isEmpty {
-                    digest = existing.geometryDigest
-                }
-                if existing.values == values, existing.geometryDigest == digest {
-                    // Nothing changed: the profile keeps its timestamp.
-                    reports[model.modelId] = QWSeedReport(
-                        carried: values.count,
-                        dropped: Self.dropped(reasons: reasons, values: values),
-                        unavailable: try unavailableInProfile(modelId: model.modelId,
-                                                             capabilities: model.capabilities))
-                    continue
-                }
-            } else if values.isEmpty {
-                // There is nothing to carry and no profile to fill. Writing
-                // an empty file would only clutter the directory.
-                reports[model.modelId] = QWSeedReport(carried: 0,
-                                                      dropped: Self.dropped(reasons: reasons,
-                                                                            values: values))
-                continue
-            }
-            try save(QWKnobProfile(schemaVersion: QWKnobProfile.currentSchemaVersion,
-                                   modelId: model.modelId,
-                                   geometryDigest: digest,
-                                   updatedAt: Date(),
-                                   values: values))
-            reports[model.modelId] = QWSeedReport(
-                carried: values.count,
-                dropped: Self.dropped(reasons: reasons, values: values),
-                unavailable: try unavailableInProfile(modelId: model.modelId,
-                                                     capabilities: model.capabilities))
-        }
-        return reports
-    }
-
-    /// The knobs the legacy settings named that the profile does not hold.
-    /// A knob the profile holds is not dropped, whatever happened to the
-    /// legacy value: the report must not contradict the file.
-    private static func dropped(reasons: [String: String],
-                                values: [String: QWKnobValue]) -> [String: String] {
-        var out: [String: String] = [:]
-        for (id, reason) in reasons where values[id] == nil {
-            out[id] = reason
-        }
-        return out
     }
 
     /// The knob values for a model: the explicit value, else the profile's,
@@ -359,31 +200,6 @@ public final class QWProfileStore {
                 continue
             }
             out[descriptor.id] = value
-        }
-        return out
-    }
-
-    /// The values in a model's profile that the model cannot honour, and
-    /// why. A caller that resolved the knobs can ask this and say what it
-    /// left out, instead of leaving it to be noticed.
-    public func unavailableInProfile(modelId: String,
-                                     capabilities: Set<QWKnobCapability>) throws -> [String: String] {
-        guard let profile = try load(modelId: modelId) else { return [:] }
-        var out: [String: String] = [:]
-        for (id, value) in profile.values {
-            guard let descriptor = QWKnobRegistry.descriptor(id) else {
-                out[id] = "the registry does not declare this knob"
-                continue
-            }
-            if let capability = descriptor.requiredCapability, !capabilities.contains(capability) {
-                out[id] = "the model does not have the '\(capability.rawValue)' capability"
-                continue
-            }
-            if let text = value.stringValue,
-               let required = descriptor.valueCapabilities[text],
-               !capabilities.contains(required) {
-                out[id] = "the value '\(text)' needs the '\(required.rawValue)' capability"
-            }
         }
         return out
     }

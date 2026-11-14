@@ -71,7 +71,7 @@ public final class QWHead {
         self.psoArgmaxFin = try hal.pipeline("qwg_head_argmax_fin")
         self.psoMultiMax = try hal.pipeline("qwg_multimax_f32")
         self.f2plan = QWGemm.plan(QWGemmShape(m: 1, n: geometry.vocab, k: geometry.hidden),
-                                  dtype: .q4g, epi: .none)
+                                  dtype: .q4g, epi: .none, vocab: geometry.vocab)
     }
 
     public static func yElems(_ N: Int) -> Int { N }                       // f32
@@ -221,7 +221,7 @@ public final class QWHead {
             return
         }
         let plan = QWGemm.plan(QWGemmShape(m: 1, n: view.n, k: view.k),
-                               dtype: .q4g, epi: .none)
+                               dtype: .q4g, epi: .none, vocab: view.n)
         try QWGemm.encode(enc, hal: hal, plan: plan, x: x,
                           xGroupSum: gs, wQ4: view, y: y)
     }

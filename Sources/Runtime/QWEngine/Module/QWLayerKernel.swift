@@ -27,15 +27,19 @@ public enum QWLayerKernelRegistry {
     /// implements is a load-time error, never a silent fallback.
     public static func kernel(for key: QWEnginePlan.LayerKernelKey) -> (any QWLayerKernel.Type)? {
         switch key {
-        case QWEnginePlan.LayerKernelKey(attention: .gdn, mlp: .dense, ple: false):
+        case QWEnginePlan.LayerKernelKey(attention: .gdn, mlp: .dense, ple: false),
+             QWEnginePlan.LayerKernelKey(attention: .kda, mlp: .dense, ple: false):
             return GDNLayerKernel.self
-        case QWEnginePlan.LayerKernelKey(attention: .gdn, mlp: .moe, ple: false):
+        case QWEnginePlan.LayerKernelKey(attention: .gdn, mlp: .moe, ple: false),
+             QWEnginePlan.LayerKernelKey(attention: .kda, mlp: .moe, ple: false):
             return GDNMoELayerKernel.self
         case QWEnginePlan.LayerKernelKey(attention: .fullAttention, mlp: .dense, ple: false),
-             QWEnginePlan.LayerKernelKey(attention: .qsaSparse, mlp: .dense, ple: false):
+             QWEnginePlan.LayerKernelKey(attention: .qsaSparse, mlp: .dense, ple: false),
+             QWEnginePlan.LayerKernelKey(attention: .mlaCompressed, mlp: .dense, ple: false):
             return FullAttentionLayerKernel.self
         case QWEnginePlan.LayerKernelKey(attention: .fullAttention, mlp: .moe, ple: false),
-             QWEnginePlan.LayerKernelKey(attention: .qsaSparse, mlp: .moe, ple: false):
+             QWEnginePlan.LayerKernelKey(attention: .qsaSparse, mlp: .moe, ple: false),
+             QWEnginePlan.LayerKernelKey(attention: .mlaCompressed, mlp: .moe, ple: false):
             return MoELayerKernel.self
         case QWEnginePlan.LayerKernelKey(attention: .hcaCompressed, mlp: .dense, ple: false):
             return HCALayerKernel.self
@@ -70,15 +74,18 @@ public enum QWLayerKernelRegistry {
                 "the plan names \(plan.layers.count) layers, the weights carry \(layers.count)")
         }
         let kernels = try resolve(plan: plan)
-        let fullAttnKey = plan.modelCapabilities.contains(.qsaIndexer) ? "qsaSparse" : "fullAttention"
+        let linearAttnKey = plan.gdnVectorDecay ? "kda" : "gdn"
+        let fullAttnKey = plan.usesAnyMLA
+            ? "mlaCompressed"
+            : (plan.modelCapabilities.contains(.qsaIndexer) ? "qsaSparse" : "fullAttention")
         for (index, weights) in layers.enumerated() {
             let key = plan.layers[index].kernelKey
             // The plan and the weights must agree about the kind — the
             // attention mixer AND the MLP family: a plan that says `.moe`
             // against dense weights is a different model.
             let runtime: (attention: String, mlp: String) = switch weights.kind {
-            case .gdn: ("gdn", "dense")
-            case .gdnMoe: ("gdn", "moe")
+            case .gdn: (linearAttnKey, "dense")
+            case .gdnMoe: (linearAttnKey, "moe")
             case .fullAttention: (fullAttnKey, "dense")
             case .moe: (fullAttnKey, "moe")
             case .hca: ("hcaCompressed", "dense")

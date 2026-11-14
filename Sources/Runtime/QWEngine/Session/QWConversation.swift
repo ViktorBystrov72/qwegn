@@ -9,7 +9,6 @@ public final class QWConversation {
     private var consumed: [Int] = []
     private var generationWasSpeculative: Bool?
     public private(set) var reusedTokens: Int = 0
-    public var consumedTokenCount: Int { consumed.count }
 
     public init(engine: any QWSessionInferenceEngine) { self.engine = engine }
     deinit { reset() }

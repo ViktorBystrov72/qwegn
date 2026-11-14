@@ -16,7 +16,6 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
-import QWState
 
 /// The driver's error is the engine's error: one vocabulary for every
 /// family, so a consumer never names a concrete engine's error type.

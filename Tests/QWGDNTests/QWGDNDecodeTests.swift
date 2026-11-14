@@ -7,7 +7,7 @@ import QWHAL
 import QWAlloc
 import QWQuant
 
-/// C12 recurrent-step gate: `qwg_gdn_recurrent` + `qwg_gdn_norm_sigmoid` vs torch
+/// C12 recurrent-step gate: `qwg_gdn_recurrent` (with fused gated norm) vs torch
 /// fixtures (gen_gdn_decode_fixtures.py — golden = qw38_oracle GatedDeltaNet,
 /// HF torch_recurrent_gated_delta_rule semantics).
 final class QWGDNDecodeTests: XCTestCase {
@@ -28,13 +28,13 @@ final class QWGDNDecodeTests: XCTestCase {
         }
         return d
     }
-    static func u16s(_ d: Data) -> [UInt16] { d.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) } }
-    static func f32s(_ d: Data) -> [Float] { d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }
+    static func u16s(_ d: Data) -> [UInt16] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: UInt16.self)) } }
+    static func f32s(_ d: Data) -> [Float] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) } }
     static func f16(_ bits: UInt16) -> Float { QWQuant.f16tof32Bits(bits) }
 
     static func buf(_ d: Data) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
-        d.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
     static func tv(_ b: MTLBuffer, _ n: Int, _ dt: QWDType) -> QWTensorValue {

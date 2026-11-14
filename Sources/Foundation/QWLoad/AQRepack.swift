@@ -99,33 +99,6 @@ public enum QWAQRepacker {
         return Layout(bits: bits, group: groupSize, groups: groups, scaleDType: scaleDType)
     }
 
-    /// Infers `(rows, cols, layout)` directly from an MLX affine tensor's `.weight` and `.scales` shapes.
-    public static func inferShapeAndLayout(container: QWSafeTensorsContainer, name: String) throws -> (rows: Int, cols: Int, layout: Layout) {
-        guard let info = container.tensor(name), info.dtype == .u32, name.hasSuffix(".weight"), info.shape.count >= 2 else {
-            throw RepackError.notAffine(name: name, dtype: container.tensor(name)?.dtype.rawValue ?? "missing")
-        }
-        let stem = String(name.dropLast(".weight".count))
-        guard let sInfo = container.tensor(stem + ".scales"), sInfo.shape.count == info.shape.count else {
-            throw RepackError.missingHeader(name: stem + ".scales", kind: "scales")
-        }
-        let rows = info.shape.dropLast().reduce(1, *)
-        let groups = sInfo.shape.last ?? 0
-        let packedCols = info.shape.last ?? 0
-        // Determine groupSize and bits: in MLX affine, groupSize is in {32, 64, 128} and bits in {2, 3, 4, 6, 8},
-        // and cols = groups * groupSize, packedCols * 32 = cols * bits -> packedCols * 32 / groups = groupSize * bits.
-        let groupBitsProd = groups > 0 ? (packedCols * 32) / groups : 0
-        let candidates: [(bits: Int, group: Int)] = [
-            (4, 64), (8, 64), (4, 32), (8, 32), (4, 128), (8, 128),
-            (6, 64), (3, 64), (2, 64), (6, 32), (3, 32), (2, 32), (6, 128), (3, 128), (2, 128)
-        ]
-        guard let match = candidates.first(where: { $0.bits * $0.group == groupBitsProd }) else {
-            throw RepackError.badLayout(name: name, reason: "cannot infer (bits, group) from packedCols=\(packedCols) groups=\(groups)")
-        }
-        let cols = groups * match.group
-        let lay = try layout(container: container, name: name, rows: rows, cols: cols)
-        return (rows, cols, lay)
-    }
-
     /// Repacks one MLX affine tensor into the family's container, on the GPU.
     /// The payload is the checkpoint's own bytes, COPIED VERBATIM; a header
     /// that does not survive the f16 conversion is refused.

@@ -188,7 +188,7 @@ public final class QWSystemMetricsSampler: @unchecked Sendable {
                     if let c = p["gpu-core-count"] as? Int {
                         gpuCores = c
                     } else if let d = p["gpu-core-count"] as? Data {
-                        gpuCores = d.withUnsafeBytes { $0.load(as: Int.self) }
+                        gpuCores = d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in raw.load(as: Int.self) }
                     }
                 }
                 IOObjectRelease(entry)

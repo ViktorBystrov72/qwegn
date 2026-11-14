@@ -49,6 +49,8 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
     public let defaultExpertGateType: String?
     public let usesPlusOneRMSNorm: Bool
     public let usesQwenChatTemplateIds: Bool
+    public let maxSpeculativeDrafts: Int
+    public let supportsExpertStreaming: Bool
     public let isOfficialSupported: Bool
 
     public init(
@@ -58,15 +60,19 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
         defaultExpertGateType: String? = nil,
         usesPlusOneRMSNorm: Bool? = nil,
         usesQwenChatTemplateIds: Bool? = nil,
+        maxSpeculativeDrafts: Int? = nil,
+        supportsExpertStreaming: Bool? = nil,
         isOfficialSupported: Bool = true
     ) {
         self.modelType = modelType
         self.family = family
         self.defaultAttnOutputGate = defaultAttnOutputGate
         self.defaultExpertGateType = defaultExpertGateType
-        self.usesPlusOneRMSNorm = usesPlusOneRMSNorm ?? (family == .qwen38Dense)
+        self.usesPlusOneRMSNorm = usesPlusOneRMSNorm ?? [.qwen38Dense, .qwen38MoE, .senseNovaLoop].contains(family)
         self.usesQwenChatTemplateIds = usesQwenChatTemplateIds
-            ?? (family == .qwen38Dense || family == .qwen38FlashNext)
+            ?? [.qwen38Dense, .qwen38MoE, .qwen38FlashNext, .senseNovaLoop].contains(family)
+        self.maxSpeculativeDrafts = maxSpeculativeDrafts ?? (family == .qwen38FlashNext ? 3 : 5)
+        self.supportsExpertStreaming = supportsExpertStreaming ?? (family != .qwen38FlashNext)
         self.isOfficialSupported = isOfficialSupported
     }
 }
@@ -89,13 +95,13 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
     public static let builtinSpecs: [QWModelFamilySpec] = [
         QWModelFamilySpec(modelType: "qwen3_5", family: .qwen38Dense, defaultAttnOutputGate: true),
         QWModelFamilySpec(modelType: "qwen3_5_text", family: .qwen38Dense, defaultAttnOutputGate: true),
-        QWModelFamilySpec(modelType: "qwen3_5_moe", family: .qwen38Dense, defaultAttnOutputGate: true),
-        QWModelFamilySpec(modelType: "qwen3_5_moe_text", family: .qwen38Dense, defaultAttnOutputGate: true),
-        QWModelFamilySpec(modelType: "sensenova_loop", family: .qwen38Dense, defaultAttnOutputGate: true),
-        QWModelFamilySpec(modelType: "sensenova_loop_text", family: .qwen38Dense, defaultAttnOutputGate: true),
+        QWModelFamilySpec(modelType: "qwen3_5_moe", family: .qwen38MoE, defaultAttnOutputGate: true),
+        QWModelFamilySpec(modelType: "qwen3_5_moe_text", family: .qwen38MoE, defaultAttnOutputGate: true),
+        QWModelFamilySpec(modelType: "sensenova_loop", family: .senseNovaLoop, defaultAttnOutputGate: true),
+        QWModelFamilySpec(modelType: "sensenova_loop_text", family: .senseNovaLoop, defaultAttnOutputGate: true),
         QWModelFamilySpec(
             modelType: "glm5_next",
-            family: .qwen38Dense,
+            family: .glm5Next,
             defaultAttnOutputGate: false,
             defaultExpertGateType: "sigmoid",
             usesPlusOneRMSNorm: false,
@@ -103,7 +109,7 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
         ),
         QWModelFamilySpec(
             modelType: "glm5_next_text",
-            family: .qwen38Dense,
+            family: .glm5Next,
             defaultAttnOutputGate: false,
             defaultExpertGateType: "sigmoid",
             usesPlusOneRMSNorm: false,
@@ -111,7 +117,7 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
         ),
         QWModelFamilySpec(
             modelType: "ernie5_5_moe",
-            family: .qwen38Dense,
+            family: .ernie55MoE,
             defaultAttnOutputGate: false,
             defaultExpertGateType: "sigmoid",
             usesPlusOneRMSNorm: false,
@@ -119,7 +125,7 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
         ),
         QWModelFamilySpec(
             modelType: "ernie5_5_moe_text",
-            family: .qwen38Dense,
+            family: .ernie55MoE,
             defaultAttnOutputGate: false,
             defaultExpertGateType: "sigmoid",
             usesPlusOneRMSNorm: false,
@@ -129,13 +135,15 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
             modelType: "qwen4_exp",
             family: .qwen38FlashNext,
             defaultAttnOutputGate: true,
-            defaultExpertGateType: "sigmoid"
+            defaultExpertGateType: "sigmoid",
+            maxSpeculativeDrafts: 3
         ),
         QWModelFamilySpec(
             modelType: "qwen4_exp_text",
             family: .qwen38FlashNext,
             defaultAttnOutputGate: true,
-            defaultExpertGateType: "sigmoid"
+            defaultExpertGateType: "sigmoid",
+            maxSpeculativeDrafts: 3
         ),
         // The standard HF/MLX families. None packs an attention output gate.
         // `qwen2`, `llama` and the `qwen3` families are officially supported;
@@ -165,14 +173,14 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
         return specs[modelType]
     }
 
-    public func isSupported(modelType: String) -> Bool {
-        spec(forModelType: modelType)?.isOfficialSupported == true
-    }
-
-    public var registeredModelTypes: [String] {
+    public func spec(for family: QWModelDescriptor.Family) -> QWModelFamilySpec? {
         lock.lock()
         defer { lock.unlock() }
-        return specs.keys.sorted()
+        return specs.values.first { $0.family == family }
+    }
+
+    public func isSupported(modelType: String) -> Bool {
+        spec(forModelType: modelType)?.isOfficialSupported == true
     }
 }
 

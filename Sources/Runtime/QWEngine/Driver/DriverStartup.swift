@@ -16,7 +16,6 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
-import QWState
 
 extension QWEngineDriver {
     struct StartupConfig {
@@ -70,11 +69,19 @@ extension QWEngineDriver {
                 throw QWEngineDriverError.unsupportedModel(desc.family.rawValue)
             }
         } else {
-            let identity = try QWQuant.Pack.peekProvenance(url: URL(fileURLWithPath: packPath))
-            let family = identity.modelId.flatMap { QWModuleRegistry.family(forPackModelId: $0) }
-            let served = family.flatMap { QWModuleRegistry.moduleType(for: $0) }
-            if let mid = identity.modelId, !(served is DenseModule.Type) {
-                throw QWEngineDriverError.unsupportedModel(mid)
+            if let cfgURL = root.configURL {
+                let desc = try QWModelDescriptor.decode(configJSON: Data(contentsOf: cfgURL))
+                let served = QWModuleRegistry.moduleType(for: desc.family)
+                guard served is DenseModule.Type else {
+                    throw QWEngineDriverError.unsupportedModel(desc.family.rawValue)
+                }
+            } else {
+                let identity = try QWQuant.Pack.peekProvenance(url: URL(fileURLWithPath: packPath))
+                let family = identity.modelId.flatMap { QWModuleRegistry.family(forPackModelId: $0) }
+                let served = family.flatMap { QWModuleRegistry.moduleType(for: $0) }
+                if let mid = identity.modelId, !(served is DenseModule.Type) {
+                    throw QWEngineDriverError.unsupportedModel(mid)
+                }
             }
         }
         // Validate KV mode before any arena work (f16, q8, and q4 are all

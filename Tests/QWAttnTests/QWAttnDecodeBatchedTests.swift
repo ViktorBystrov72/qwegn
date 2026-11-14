@@ -115,7 +115,7 @@ final class QWAttnDecodeBatchedTests: XCTestCase {
                         streamPrefix: Bool = false) throws
         -> (QWKVCache, QWKVHandle, QWMRegion) {
         let ceiling = pos + T + 256
-        let pageBytes = QWKVCache.pageBytes(mode: .f16)
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
         let needPages = (ceiling + 255) / 256
         let poolBytes = pageBytes * needPages * 2
         let tables = QWKVCache.tableSlotBytes * 2 * 1 * QWKVCache.maxSeqs

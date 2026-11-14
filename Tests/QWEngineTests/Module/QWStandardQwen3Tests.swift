@@ -144,7 +144,7 @@ final class QWStandardQwen3Tests: XCTestCase {
         var bytes = Data(capacity: v.count * 2)
         for x in v {
             let bits = QWQuant.f32tof16Bits(x)
-            withUnsafeBytes(of: bits.littleEndian) { bytes.append(contentsOf: $0) }
+            withUnsafeBytes(of: bits.littleEndian) { (raw: UnsafeRawBufferPointer) in bytes.append(contentsOf: raw) }
         }
         return bytes
     }

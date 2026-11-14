@@ -64,11 +64,6 @@ public enum QWAQBlock {
         "AQ\(bits)_G\(group)"
     }
 
-    /// Bits per weight, including the scale and bias overhead.
-    public static func bitsPerWeight(bits: Int, group: Int) -> Double {
-        Double(bytes(bits: bits, group: group) * 8) / Double(group)
-    }
-
     /// Is this a pair the family supports?
     public static func isSupported(bits: Int, group: Int) -> Bool {
         supported.contains { $0.bits == bits && $0.group == group }
@@ -148,8 +143,8 @@ public enum QWAQBlock {
         precondition(values.count == group, "a group holds \(group) values")
         let payload = payloadBytes(bits: bits, group: group)
         var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: Float16(scale).bitPattern.littleEndian) { Array($0) })
-        out.append(contentsOf: withUnsafeBytes(of: Float16(bias).bitPattern.littleEndian) { Array($0) })
+        out.append(contentsOf: withUnsafeBytes(of: Float16(scale).bitPattern.littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
+        out.append(contentsOf: withUnsafeBytes(of: Float16(bias).bitPattern.littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         var body = [UInt8](repeating: 0, count: payload)
         for (i, v) in values.enumerated() {
             var bit = i * bits

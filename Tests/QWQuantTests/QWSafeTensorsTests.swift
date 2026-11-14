@@ -26,7 +26,7 @@ final class QWSafeTensorsTests: XCTestCase {
         }
         let headerJSON = try JSONSerialization.data(withJSONObject: header)
         var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { Array($0) })
+        out.append(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         out.append(headerJSON)
         out.append(payload)
         try out.write(to: dir.appendingPathComponent(name))
@@ -36,7 +36,7 @@ final class QWSafeTensorsTests: XCTestCase {
     private func writeRaw(_ name: String, headerJSON: String, payload: [UInt8]) throws {
         let header = Data(headerJSON.utf8)
         var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: UInt64(header.count).littleEndian) { Array($0) })
+        out.append(contentsOf: withUnsafeBytes(of: UInt64(header.count).littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         out.append(header)
         out.append(contentsOf: payload)
         try out.write(to: dir.appendingPathComponent(name))
@@ -169,7 +169,7 @@ final class QWSafeTensorsTests: XCTestCase {
         ]
         let headerJSON = try JSONSerialization.data(withJSONObject: header)
         var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { Array($0) })
+        out.append(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         out.append(headerJSON)
         out.append(Data(repeating: 0, count: 16))
         try out.write(to: dir.appendingPathComponent("model.safetensors"))
@@ -196,7 +196,7 @@ final class QWSafeTensorsTests: XCTestCase {
         // UInt64.max as the header length. `Int(headerLength)` would trap.
         let url = dir.appendingPathComponent("model.safetensors")
         var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: UInt64.max) { Array($0) })
+        out.append(contentsOf: withUnsafeBytes(of: UInt64.max) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         out.append(Data("{".utf8))
         try out.write(to: url)
         XCTAssertThrowsError(try QWSafeTensorsContainer(url: url))

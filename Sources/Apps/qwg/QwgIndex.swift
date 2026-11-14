@@ -68,9 +68,8 @@ struct Index: ParsableCommand {
             FileHandle.standardError.write("qwg index: error: directory not found at '\(rootURL.path)'\n".data(using: .utf8)!)
             throw ExitCode(2)
         }
-        let resolvedPackName = packName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            ? packName!.trimmingCharacters(in: .whitespacesAndNewlines)
-            : rootURL.lastPathComponent
+        let trimmedPackName = packName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let resolvedPackName = trimmedPackName.isEmpty ? rootURL.lastPathComponent : trimmedPackName
 
         let settings = QWSettingsManager.shared.loadSettings()
         let rawModelRef = modelOption ?? settings.modelPackPath
@@ -264,7 +263,7 @@ struct Index: ParsableCommand {
 
         let artifact = QWMemoryManifest.CacheArtifact(
             modelName: resolvedModelName,
-            geometryDigest: runtimeAssets.descriptor.geometryDigestV2Hex,
+            geometryDigest: runtimeAssets.descriptor.geometryDigestV3Hex,
             kvMode: kvModeName,
             lsaMode: resolvedLSAMode.rawValue,
             lsaSidecarDigest: sidecarURL?.lastPathComponent,

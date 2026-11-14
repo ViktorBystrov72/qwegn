@@ -10,6 +10,95 @@ The single source of the version is `QWVersion.current` in
 
 ## [Unreleased]
 
+## [0.21.2] - 2026-11-14
+
+### Changed
+- **README Live Telemetry Previews (`README.md`, `assets/qwegn_dashboard.png`, `assets/qwegn_menubar.png`)**: Replaced the static top banner with a live `2880×1800` `/ui` web dashboard screenshot and added a `932×1014` `Qwegn.app` menu bar control panel preview (`Edge0-145B-hq8g32-hq4g64`).
+- **Engineering Laws & Git Hygiene (`AGENTS.md`, `.gitignore`)**: Recorded Swift Testing `#expect(Bool(true))` / `#require` variable-shadowing rules (Law 25), bare-metal vs GitHub Actions `Apple Paravirtual device` CI gating (`GITHUB_ACTIONS=true`, Law 26), and ignored root `bench_kernels_report.*` CLI outputs.
+
+## [0.21.1] - 2026-11-14
+
+### Fixed
+- **Live Prefill Progress Streaming (`QWEngineCore`, `DriverPrefill`, `FNGPUEngine`, `QWServerMetrics`, `QWHttpServer+Streams`, `controlbar.html`)**: Wired `onPrefillProgress` across all model runners (standard drivers and `FlashNextModule` / `FNGPUSession`) into `QWEngineTelemetryRegistry.updatePrefillProgress(completedTokens:totalTokens:)`, accelerated `/v1/metrics/stream` and `/v1/dashboard/stream` SSE cadence to `150 ms` while actively generating, and updated `/ui` `#prefill-banner` to track incremental progress (`0%`→`100%`) and hold a brief `100%` `"Prefill Complete"` banner before hiding on transition into decode.
+- **1-Second Scrolling Throughput Trace (`QWServerMetrics`, `QWTelemetrySnapshotMaps`, `QWDashboardReadings`, `QWDashboardBuilder`, `TelemetryObservable`, `TelemetryObservable+Streams`)**: Emitted 1-second (`1 Hz`) aligned `prefillRateSeries` and `decodeRateSeries` samples (up to `60` slots, frozen when `.idle`) from `QWEngineTelemetryRegistry` during active `.prefill` and `.decode` without client-side synthetic history, preserved `QWDashboardCard.series` across `nil`-value transitions so Turn 1's prefill trace stays visible during Turn 1 decode, clamped active `Qwegn.app` polling to `<= 1.0 s` on `RunLoop.main` `.common` mode, and guarded against out-of-order HTTP `/v1/dashboard` snapshots overwriting newer SSE frames.
+
+### Added
+- **Menu Bar Prefill Progress & Readable Token Formatting (`TelemetryCards`, `TelemetryCardPrimitives`, `QWTokenCountFormatter`, `QWDashboardBuilder`, `controlbar.html`)**: Added a compact `PREFILL PROGRESS` bar inside `Qwegn.app`'s `inferenceTelemetryCard` during `.prefill`, and formatted `tok`-unit counters consistently across WebUI and `QWMenuBar` with ASCII comma separators below `1,000,000` (e.g., `62,707`) and compact decimal `M` notation at `>= 1,000,000` (`1.00M`–`99.99M`, `125.4M` at `>= 99,995,000`) while keeping numeric `QWDashboardCard.number` raw.
+
+## [0.21.0] - 2026-11-14
+
+### Added
+- **Zero-Overload 11-Family Model Registry & Config-Sourced Geometry**: Config-sourced 11-family model registry and `geometryDigestV3` replacing overloaded model-type handling, backed by normative `specs/` architecture, family, quant, HAL, security, and UI parity specifications (`specs/06-menubar-and-webui-parity.md`).
+- **GitHub Actions Virtualized GPU CI Parity**: Gated bare-metal Apple Silicon GPU execution (`qwg-bench-kernels`) when `GITHUB_ACTIONS=true` while preserving full `make lint`, Swift/Python tests, and build verification.
+
+### Changed
+- **Layered DAG, File Decomposition & `@Observable` Menu Bar**: Enforced the 28-target layered `Package.swift` DAG with `-Xswiftc -warnings-as-errors`, decomposed oversized `Sources/` files below 650 LOC, removed dead/`Tests/`-only production symbols, and migrated `TelemetryObservable` and menu bar views to Swift `Observation` (`@Observable`).
+
+### Fixed
+- **Security, Runtime Lifetimes & Metal Coherency**: Hardened HTTP framing, loopback/auth defaults, image decoding, path/PID safety, `pread`, zero-copy buffer lifetimes, lock-free PSO snapshots, stream cancellation, `QWAttn` intra-threadgroup `device` coherency (`qwlsa.metal`, `qwlsa_select.metal`, `qwemeans_coarse.metal`, `qwattn_mla_indexer.metal`, `qwattn_mla_indexer_split.metal`, `qw_mla_indexer.metalh`), ungated shared-expert `psc.moe.gate` `1.0` reset in `DriverPrefill.swift`, and `--no-stream-ngrams` / `--stream-ngrams` residency toggle compliance.
+
+## [0.20.5] - 2026-11-14
+
+### Changed
+- **Release Infographics & Model Card Sync (`assets/qwegn_*.svg`, `README.md`, `docs/benchmarks.md`, `docs/tuning.md`)**: Updated all 19 repository and Hugging Face `qwegnai/*` infographics for `v0.20.5` with latest `Apple M5 Max (Mac17,6)` measurements (`6,419 tok/s` `Qwen3.6-35B-A3B`, `3,035 tok/s` `@8K` `Qwen3.8-Flash-Next`, `2,572 tok/s` `Edge0-145B`, `1,035 tok/s` `Qwen3.8-27B`, `1,014 tok/s` `GLM-5.3-Flash`, `989 tok/s` `ERNIE-5.5-Flash-Base`), added standalone `qwegn_model_ernie55_flash.svg` and `qwegn_lsa_scaling_ernie55_flash.svg` cards, and documented `qwg pull qwegnai/<pack>` pre-quantized packs.
+
+## [0.20.4] - 2026-11-14
+
+### Fixed
+- **Throughput Trace Rendering & Live Projection (`QWSparklineGeometry`, `DualSparklineView`, `QWServerMetrics`, `controlbar.html`)**: Replaced `GeometryReader`-based sparkline paths with an immediate-mode `Canvas` backed by shared `QWSparklineGeometry` dual-band normalization so single-turn traces (`len == 1`), `nil`-gapped runs, and high-prefill / moderate-decode ratios render clearly in `Qwegn.app` and `/ui`; projected the active in-flight decode rate onto `snapshot()` series without mutating turn history, and added `enableAutoLifecycle` on `TelemetryObservable.init`.
+
+## [0.20.3] - 2026-11-14
+
+### Fixed
+- **Menu Bar Popover Header (`TelemetryCards`, `TelemetryObservable+MenuBar`)**: Removed the duplicate inline prefill/decode `tok/s` label next to `Loaded` in the `Qwegn.app` control panel header (keeping speeds exclusively on the dedicated `Decode` and `Prefill` tiles and optional macOS menu bar item) and retired the unused `liveMenuBarRateText` helper.
+
+## [0.20.2] - 2026-11-14
+
+### Added
+- **Customizable Menu Bar Metrics (`QWMenuBarStatusFormatter`, `SettingsMenuBarAppearanceView`)**: Added a live menu bar preview pill, 4 selectable metrics (`Decode speed`, `Prefill speed`, `Engine memory`, `Context size`), and `"Only show speeds during active generation"` in **Settings → General**, migrating legacy `qwg.ui.showMenuBarThroughput`.
+
+### Changed
+- **Menu Bar Control Panel Composition (`CupertinoTelemetryView`, `TelemetryCards`)**: Simplified `RESIDENT MODEL` to show only model-relevant traits (`quantization`, `KV`, `ctx`, `Spec`, optional `MemPack`) with a native `NSMenu` `[Switch ⌄]` picker and `[⏏ Unload]` / `[↓ Load]`; moved server `[↻ Restart]` (`⌘R`) and `[⏻ Stop]` / `[▶ Start]` into the popover header; unified the 2-column `Decode` / `Prefill` card, 3-column `TTFT` / `Context` / `Eng GPU` strip, auto-collapsing `THROUGHPUT TRACE` sparkline, `Engine RAM` (`arena_reserved_bytes` / `resident_bytes`) + capability-gated cache row, and symmetric 4-button footer (`Web UI ⌘D`, `Logs ⌘L`, `Settings ⌘,`, `Quit ⌘Q`).
+- **Daemon Restart Shortcut (`QWMenuBarApp`)**: Bound `⌘R` and the header `Restart` control to `restartServerProcess()`, removing the redundant `"Restart model"` button from the resident model tile.
+
+## [0.20.1] - 2026-11-14
+
+### Added
+- **App Bundle Co-Packaging**: `Scripts/build_app.sh` now embeds and codesigns the release `qwg` engine binary inside `Qwegn.app/Contents/MacOS/qwg`, and `TelemetryObservable.findQWGBinary()` prefers the sibling executable in `Bundle.main` before falling back to `PATH` or `/usr/local/bin`.
+- **Layered `QWG` Microprocessor Emblem**: Updated `QGProcessorLogoView`, `gen_app_icon.swift`, `logo.svg`, and the inline WebUI SVG marks with a layered `Q` / `W` / `G` glyph design.
+- **WebUI Console Enhancements**: Added a collapsible **Runtime Parameters** drawer, live **Smoke Probe** panel, server log viewer, model selector/detail cards, and settings controls in the offline `/ui` control bar (`controlbar.html`).
+
+### Changed
+- **Menu Bar Popover & Settings**: Refined the `440pt` menu bar popover geometry (`CupertinoTelemetryView`, `TelemetryCards`), standardized numeric spacing, added `steppedSlider` controls across Settings tabs (`SettingsView*`), moved lazy vs eager loading into `Model`, and organized shortcuts (`⌘D` Web UI, `⌘,` Settings, `⌘L` Logs, `⌘R` Restart, `⌘Q` Quit).
+- **Log Console (`LogViewerWindow` / `QWLogLineParser`)**: Added structured log-line parsing with severity/category badges, level filtering, search, and line-wrap toggle.
+
+### Fixed
+- **SVG Bus Pin Geometry**: Fixed the 4th left bus pin coordinate (`x2="340"` -> `x2="108"`) across all four SVG/Swift/HTML vector sources so the pin no longer cuts across the die wall and glyph strokes.
+
+## [0.20.0] - 2026-11-14
+
+### Added
+- **FlashNext / `Edge0-145B` `3K` Prefill Kernel Wave 1+2 (`QWMetal`, `QWFlashNext`, `QWAttn`):**
+  - **MoE tail tile compaction & coalesced Q4G NAX (`5ddd33e6`, `9ecbf93b`):** Added `qw_moe_tile.metalh` and compacted `tileR[t]` scheduling in `qwg_moe_group_pairs_f32` across `HQ4`, `AQ`, and `SHVQ` batched NAX kernels (`full 64`-row + compact `16/32`-row tail blocks) plus `qwg_moe_nax_gemm_q4g_t` inner-loop coalescing.
+  - **`0`-ULP PLE & HC fusions (`f39d2655`, `9ecbf93b`):** Merged `keyValueBank` `W+H` projection, added bit-exact `qwg_ple_fused_gate_norm`, specialized `qwg_hc_inject_norm_core<false>` (skipping unneeded WHT32 on plain HC), and enabled in-place `qwg_ple_conv` residual accumulation.
+  - **Fused GDN `inProjBA32` & strided conv prep (`509cf13c`, `9ecbf93b`):** Concatenated `in_proj_b` + `in_proj_a` into `ba32` for one `[T, 2*VH, H]` GEMV and fast `h / 3u` head indexing when `VHEADS == kh * 3u`.
+  - **QSA `simdgroup_half8x8` scorers, full-`T` `chunkMax[516]`, & `gqa8` Sparse NAX (`7bb0567b`, `9ecbf93b`):** Added `BM64/256` `simdgroup_half8x8` flat and `e-means` coarse QSA scorers (`qwqsa.metal`, `qwemeans_coarse_scorers.metal`), full-`T` `trackChunkMax` radix top-k beyond 16 chunks, and `qwg_attn_sparse_gated_nax_gqa8` (`gqa <= 8` halving `xchg` barriers and exponent passes on `24Q/2KV`).
+  - **Sliver-free outer prefill chunking (`9ecbf93b`):** Locked `FNGPUSession.prefillStepChunk` once per prompt and deferred partial outer-slice remainders (`FNGPUPrefillStack.deferredSubchunkRows`) with `0` steady-state allocations.
+- **Refuted & Rolled-Back Hypotheses (`apple10-roofline-findings.md`):**
+  - Rolled back `GDN L=64` UT/WY chunked `f32` prefill (`0.629x–0.858x` vs SRAM-resident `qwg_gdn_recurrent_seq_tg_impl`), 4-TG partial-buffer `qwg_hc_mix_h32` + `qwg_hc_inj_finalize`, and cross-token `reuseExpertsAcrossTokens` (`0.55x–0.69x`).
+
+### Fixed
+- **64-bit `>16 GiB` PLE gather offsets (`93893f4a`, `qwple.metal`, `FNGPUDecodeStack.swift`, `FNGPUPrefillStack.swift`):**
+  - Widened `targetFloatOffsets` in `qwg_ple_vq2_gather` and `qwg_ple_vq4_gather` to `device const ulong*` and introduced `FNGPUDecodeStack.pleTargetWordOffset(regionBase:actBase:tensorOffset:) -> UInt64`, fixing `UInt32` float-index `SIGTRAP` overflow above `16 GiB` inside `activationsSub` (verified on `Edge0-145B` `1M` `--kv-mode q8 --no-stream-ngrams` at `102.99 GiB` planned).
+
+### Verified
+- **Paired `512–256K` Prefill Sweep & Chunk Scaling (`v0.19.1` → `v0.20.0`, `chunk=4096`):**
+  - `Qwen3.8-Flash-Next`: `2,072.9 tok/s` (`@512`), `2,941.3` (`@2K`), **`3,034.8`** (`@8K`), `2,724.7` (`@32K`), `2,385.1` (`@65K`, `1.2917x`), `1,909.0` (`@131K`, `1.0271x`), `1,839.7` (`@256K`, `1.0447x`), `0` allocs; chunk scaling `512 -> 2048 -> 4096`: `2,046.6 -> 2,888.3 -> 3,027.6` (`@8K`), `1,851.8 -> 2,640.4 -> 2,763.4` (`@32K`).
+  - `Edge0-145B`: `1,945.8 tok/s` (`@512`), `2,543.4` (`@2K`), **`2,568.4`** (`@8K`), `2,291.8` (`@32K`, `1.0496x`), `2,132.3` (`@65K`), `2,051.7` (`@131K`, `1.0427x`), `1,899.3` (`@256K`, `1.0265x`), `0` allocs; chunk scaling `512 -> 2048 -> 4096`: `1,952.5 -> 2,467.9 -> 2,474.4` (`@8K`), `1,710.3 -> 2,297.7 -> 2,351.7` (`@32K`).
+- **`Edge0-145B` Beyond-`256K` (`300K`–`1M`) Qualification & Law 9 6-Flagship Gate:**
+  - `320K`/`512K`/`1M` (`q4 --stream-ngrams`: `61.84` / `63.99` / `69.73 GiB`) and `1M` `q8 --no-stream-ngrams` (`102.99 / 107.52 GiB`, `0` allocs), Law 12 refusal guards (`1M f16`, `1M q4 --os-reserve 65`, `2M` cap: `rc=1`, `0` SIGTRAPs), and **`3/3` needle recall** at `16K` (`2,507.8 tok/s`), `128K` (`1,918.7 tok/s`), and `300K` (`1,885.5 tok/s` `1.25×` YaRN & `1,882.6 tok/s` raw RoPE).
+  - 6-Flagship Law 9 gate: `Edge0-145B` (`2,572.0` prefill `1.0131x`, **`67.59 tok/s` MTP-3 `1.1024x`**), `Qwen3.8-Flash-Next` (`2,947.3` prefill `1.0108x`, **`79.91 tok/s` MTP-3 `1.0210x`**), `ERNIE-5.5-Flash-Base` (`0.997x–1.011x`), `GLM-5.3-Flash` (`1.020x–1.062x`), `Qwen3.6-35B-A3B` (`1.003x–1.030x`), `Qwen3.8-27B+DSpine` (`1.001x–1.008x`); `9/10` `llmprobe` `code-10` on all 5 instruct flagships (`3/10` on `ERNIE-5.5-Flash-Base`), `3/3` `16K` needles & `0` steady allocs across all 6.
+
 ## [0.19.1] - 2026-11-13
 
 ### Added

@@ -54,7 +54,7 @@ final class FNNgramMLXRowsTests: XCTestCase {
         var headerLength = UInt64(headerJSON.count).littleEndian
 
         var data = Data()
-        withUnsafeBytes(of: &headerLength) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &headerLength) { (raw: UnsafeRawBufferPointer) in data.append(contentsOf: raw) }
         data.append(headerJSON)
 
         // Write weights: row r, element c has nibble (c % 16).
@@ -72,21 +72,21 @@ final class FNNgramMLXRowsTests: XCTestCase {
         }
         for w in wWords {
             var val = w
-            withUnsafeBytes(of: &val) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: &val) { (raw: UnsafeRawBufferPointer) in data.append(contentsOf: raw) }
         }
 
         // Write scales (BF16 = 2.0 -> 0x4000)
         let scaleBF16 = UInt16(0x4000).littleEndian
         for _ in 0..<(rows * gCols) {
             var val = scaleBF16
-            withUnsafeBytes(of: &val) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: &val) { (raw: UnsafeRawBufferPointer) in data.append(contentsOf: raw) }
         }
 
         // Write biases (BF16 = 1.0 -> 0x3F80)
         let biasBF16 = UInt16(0x3F80).littleEndian
         for _ in 0..<(rows * gCols) {
             var val = biasBF16
-            withUnsafeBytes(of: &val) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: &val) { (raw: UnsafeRawBufferPointer) in data.append(contentsOf: raw) }
         }
 
         try data.write(to: url)

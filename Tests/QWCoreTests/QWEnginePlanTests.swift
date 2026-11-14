@@ -292,7 +292,8 @@ final class QWEnginePlanTests: XCTestCase {
                                     prefillChunkRows: 512, kvStorageMode: "q4")
         XCTAssertEqual(plan.layers.count, 43)
         XCTAssertEqual(plan.layers.filter { $0.attention == .hcaCompressed }.count, 37)
-        XCTAssertEqual(plan.layers.filter { $0.attention == .qsaSparse }.count, 6)
+        XCTAssertEqual(plan.layers.filter { $0.attention == .mlaCompressed }.count, 6)
+        XCTAssertEqual(plan.layers.filter { $0.attention == .qsaSparse }.count, 0)
         XCTAssertEqual(plan.layers.filter { $0.attention == .fullAttention }.count, 0)
         XCTAssertEqual(plan.layers.filter { $0.attention == .gdn }.count, 0)
         XCTAssertEqual(plan.layers[0].mlp, .dense)
@@ -311,5 +312,52 @@ final class QWEnginePlanTests: XCTestCase {
         } else {
             XCTFail("expected ERNIE-5.5 SHVQ15+SHVQ3 admission to succeed on 128 GiB UMA")
         }
+    }
+
+    func testGlm5NextPlanUsesKDAAndMLACompressedLayers() throws {
+        let glmJSON = """
+        {
+          "architectures": ["Glm5NextForConditionalGeneration"],
+          "model_type": "glm5_next",
+          "vision_config": {"depth": 4, "hidden_size": 1152, "num_heads": 16, "out_hidden_size": 4096, "num_position_embeddings": 1024},
+          "text_config": {
+            "model_type": "glm5_next_text",
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "vocab_size": 154880,
+            "num_hidden_layers": 4,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention"],
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 131072,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 64,
+            "qk_head_dim": 256,
+            "qk_nope_head_dim": 192,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 256,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 1536,
+            "mla_use_nope": true,
+            "linear_attn_config": {
+              "Linear_type": "kda",
+              "head_dim": 128,
+              "num_heads": 64,
+              "short_conv_kernel_size": 4
+            },
+            "n_routed_experts": 32,
+            "num_experts_per_tok": 4,
+            "moe_intermediate_size": 1024,
+            "first_k_dense_replace": 1,
+            "eos_token_id": 154820
+          }
+        }
+        """.data(using: .utf8)!
+        let desc = try QWModelDescriptor.decode(configJSON: glmJSON)
+        XCTAssertEqual(desc.family, .glm5Next)
+        XCTAssertEqual(desc.role, .multimodalConditionalLM)
+        let plan = try QWEnginePlan(geometry: QWModelGeometry(descriptor: desc), modelId: "glm5_next",
+                                    geometryDigest: desc.geometryDigestV3Hex, prefillChunkRows: 512, kvStorageMode: "q4")
+        XCTAssertEqual(plan.layers.filter { $0.attention == .kda }.count, 3)
+        XCTAssertEqual(plan.layers.filter { $0.attention == .mlaCompressed }.count, 1)
     }
 }

@@ -106,13 +106,14 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
     const uint kvh = tg.y;
     if (tq >= T || kvh >= nkv) return;
     const uint gqa = nh / nkv;
+    const bool gqa8 = (gqa <= 8u);
     const short qid = short(lane >> 2u);
     const short fm = (qid & 4) | (short(lane >> 1u) & 3);
     const short fn = ((qid & 2) | short(lane & 1u)) * 4;
     const uint fcol = uint(2 * fn);
     const uint dBase = uint(dh) * 128u + fcol;
     const bool r0_ok = uint(fm) < gqa;
-    const bool r1_ok = uint(fm + 8) < gqa;
+    const bool r1_ok = !gqa8 && (uint(fm + 8) < gqa);
     const uint h0 = kvh * gqa + (r0_ok ? uint(fm) : 0u);
     const uint h1 = kvh * gqa + (r1_ok ? uint(fm + 8) : 0u);
 
@@ -130,7 +131,7 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
         } else {
             q0_reg[jj] = vec<half, 8>(0.0h);
         }
-        if (r1_ok) {
+        if (!gqa8 && r1_ok) {
             const float4 lo = *(device const float4*)(qp1 + 32 * jj);
             const float4 hi = *(device const float4*)(qp1 + 32 * jj + 4);
             q1_reg[jj] = vec<half, 8>(half(lo.x), half(lo.y), half(lo.z), half(lo.w),
@@ -258,81 +259,151 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
             s[0][i] = s_ct[i];
             s[1][i] = s_ct[8 + i];
         }
-        #pragma unroll
-        for (short f = 0; f < 2; ++f) {
+        if (gqa8) {
             threadgroup float* mine = xchg[dh];
             const threadgroup float* peer = xchg[1u - dh];
             #pragma unroll
-            for (short i = 0; i < 8; ++i) {
-                mine[lane * 8u + ushort(i)] = s[f][i];
+            for (short j = 0; j < 4; ++j) {
+                mine[lane * 8u + ushort(j)]     = s[0][j];
+                mine[lane * 8u + ushort(4 + j)] = s[1][j];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            #pragma unroll
-            for (short i = 0; i < 8; ++i) {
-                s[f][i] += peer[lane * 8u + ushort(i)];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        #pragma unroll
-        for (short f = 0; f < 2; ++f) {
             #pragma unroll
             for (short j = 0; j < 4; ++j) {
-                const bool ok = j < nvis[f];
-                s[f][j]     = ok ? (s[f][j] * scale2) : -INFINITY;
-                s[f][4 + j] = ok ? (s[f][4 + j] * scale2) : -INFINITY;
+                s[0][j] += peer[lane * 8u + ushort(j)];
+                s[1][j] += peer[lane * 8u + ushort(4 + j)];
             }
-        }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float factor[2];
-        #pragma unroll
-        for (short i = 0; i < 2; ++i) {
+            #pragma unroll
+            for (short f = 0; f < 2; ++f) {
+                #pragma unroll
+                for (short j = 0; j < 4; ++j) {
+                    s[f][j] = (j < nvis[f]) ? (s[f][j] * scale2) : -INFINITY;
+                }
+            }
+
             float m = -INFINITY;
             #pragma unroll
             for (short f = 0; f < 2; ++f) {
-                m = max(m, max(max(s[f][4 * i], s[f][4 * i + 1]), max(s[f][4 * i + 2], s[f][4 * i + 3])));
+                m = max(m, max(max(s[f][0], s[f][1]), max(s[f][2], s[f][3])));
             }
             m = max(m, simd_shuffle_xor(m, ushort(1)));
             m = max(m, simd_shuffle_xor(m, ushort(8)));
-            const float new_max = max(max_s[i], m);
+            const float new_max = max(max_s[0], m);
             float rs = 0.0f;
             #pragma unroll
             for (short f = 0; f < 2; ++f) {
                 #pragma unroll
                 for (short j = 0; j < 4; ++j) {
-                    s[f][4 * i + j] = fast::exp2(s[f][4 * i + j] - new_max);
-                    rs += s[f][4 * i + j];
+                    s[f][j] = fast::exp2(s[f][j] - new_max);
+                    rs += s[f][j];
                 }
             }
             rs += simd_shuffle_xor(rs, ushort(1));
             rs += simd_shuffle_xor(rs, ushort(8));
-            factor[i] = fast::exp2(max_s[i] - new_max);
-            max_s[i] = new_max;
-            sum_s[i] = sum_s[i] * factor[i] + rs;
-        }
+            const float factor0 = fast::exp2(max_s[0] - new_max);
+            max_s[0] = new_max;
+            sum_s[0] = sum_s[0] * factor0 + rs;
 
-        if (simd_any(factor[0] != 1.0f || factor[1] != 1.0f)) {
-            #pragma unroll
-            for (short h = 0; h < 2; ++h) {
+            if (simd_any(factor0 != 1.0f)) {
                 #pragma unroll
-                for (short j = 0; j < 4; ++j) {
-                    of0[8 * h + j]     *= factor[0];
-                    of0[8 * h + 4 + j] *= factor[1];
-                    of1[8 * h + j]     *= factor[0];
-                    of1[8 * h + 4 + j] *= factor[1];
-                    of2[8 * h + j]     *= factor[0];
-                    of2[8 * h + 4 + j] *= factor[1];
-                    of3[8 * h + j]     *= factor[0];
-                    of3[8 * h + 4 + j] *= factor[1];
+                for (short h = 0; h < 2; ++h) {
+                    #pragma unroll
+                    for (short j = 0; j < 4; ++j) {
+                        of0[8 * h + j] *= factor0;
+                        of1[8 * h + j] *= factor0;
+                        of2[8 * h + j] *= factor0;
+                        of3[8 * h + j] *= factor0;
+                    }
                 }
             }
-        }
 
-        // P·V: one K=32 MMA per 32-key step; f=0 keys fill the first K half, f=1 keys the second.
-        #pragma unroll
-        for (short i = 0; i < 8; ++i) {
-            pa_ct[i]     = half(s[0][i]);
-            pa_ct[8 + i] = half(s[1][i]);
+            // P·V: one K=32 MMA per 32-key step; only i = 0 (rows 0..7) is live for gqa <= 8.
+            #pragma unroll
+            for (short j = 0; j < 4; ++j) {
+                pa_ct[j]      = half(s[0][j]);
+                pa_ct[4 + j]  = 0.0h;
+                pa_ct[8 + j]  = half(s[1][j]);
+                pa_ct[12 + j] = 0.0h;
+            }
+        } else {
+            #pragma unroll
+            for (short f = 0; f < 2; ++f) {
+                threadgroup float* mine = xchg[dh];
+                const threadgroup float* peer = xchg[1u - dh];
+                #pragma unroll
+                for (short i = 0; i < 8; ++i) {
+                    mine[lane * 8u + ushort(i)] = s[f][i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                #pragma unroll
+                for (short i = 0; i < 8; ++i) {
+                    s[f][i] += peer[lane * 8u + ushort(i)];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            #pragma unroll
+            for (short f = 0; f < 2; ++f) {
+                #pragma unroll
+                for (short j = 0; j < 4; ++j) {
+                    const bool ok = j < nvis[f];
+                    s[f][j]     = ok ? (s[f][j] * scale2) : -INFINITY;
+                    s[f][4 + j] = ok ? (s[f][4 + j] * scale2) : -INFINITY;
+                }
+            }
+
+            float factor[2];
+            #pragma unroll
+            for (short i = 0; i < 2; ++i) {
+                float m = -INFINITY;
+                #pragma unroll
+                for (short f = 0; f < 2; ++f) {
+                    m = max(m, max(max(s[f][4 * i], s[f][4 * i + 1]), max(s[f][4 * i + 2], s[f][4 * i + 3])));
+                }
+                m = max(m, simd_shuffle_xor(m, ushort(1)));
+                m = max(m, simd_shuffle_xor(m, ushort(8)));
+                const float new_max = max(max_s[i], m);
+                float rs = 0.0f;
+                #pragma unroll
+                for (short f = 0; f < 2; ++f) {
+                    #pragma unroll
+                    for (short j = 0; j < 4; ++j) {
+                        s[f][4 * i + j] = fast::exp2(s[f][4 * i + j] - new_max);
+                        rs += s[f][4 * i + j];
+                    }
+                }
+                rs += simd_shuffle_xor(rs, ushort(1));
+                rs += simd_shuffle_xor(rs, ushort(8));
+                factor[i] = fast::exp2(max_s[i] - new_max);
+                max_s[i] = new_max;
+                sum_s[i] = sum_s[i] * factor[i] + rs;
+            }
+
+            if (simd_any(factor[0] != 1.0f || factor[1] != 1.0f)) {
+                #pragma unroll
+                for (short h = 0; h < 2; ++h) {
+                    #pragma unroll
+                    for (short j = 0; j < 4; ++j) {
+                        of0[8 * h + j]     *= factor[0];
+                        of0[8 * h + 4 + j] *= factor[1];
+                        of1[8 * h + j]     *= factor[0];
+                        of1[8 * h + 4 + j] *= factor[1];
+                        of2[8 * h + j]     *= factor[0];
+                        of2[8 * h + 4 + j] *= factor[1];
+                        of3[8 * h + j]     *= factor[0];
+                        of3[8 * h + 4 + j] *= factor[1];
+                    }
+                }
+            }
+
+            // P·V: one K=32 MMA per 32-key step; f=0 keys fill the first K half, f=1 keys the second.
+            #pragma unroll
+            for (short i = 0; i < 8; ++i) {
+                pa_ct[i]     = half(s[0][i]);
+                pa_ct[8 + i] = half(s[1][i]);
+            }
         }
         const half2 vm0 = qwg_fn_kv_meta_half<KV_MODE>(vMeta, kseg[0], dh);
         const half2 vm1 = qwg_fn_kv_meta_half<KV_MODE>(vMeta, kseg[1], dh);
@@ -368,8 +439,7 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
         }
     }
 
-    #pragma unroll
-    for (short i = 0; i < 2; ++i) {
+    for (short i = 0; i < (gqa8 ? 1 : 2); ++i) {
         const bool row_ok = (i == 0) ? r0_ok : r1_ok;
         const uint h = (i == 0) ? h0 : h1;
         const float rr = (sum_s[i] > 0.0f) ? (1.0f / sum_s[i]) : 0.0f;

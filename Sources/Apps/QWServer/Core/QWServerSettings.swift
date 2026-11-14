@@ -14,6 +14,10 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
     // MARK: - Network & Server
     public var host: String
     public var port: Int
+    public var apiKey: String = ""
+    public var corsAllowedOrigins: [String] = []
+    public var allowLocalImagePaths: Bool = false
+    public var allowRemoteImageURLs: Bool = false
     public var telemetryPollIntervalMs: Int
 
     // MARK: - Model & Architecture
@@ -111,6 +115,10 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         keepServerRunningAfterQuit: Bool = false,
         host: String = "127.0.0.1",
         port: Int = 8080,
+        apiKey: String = "",
+        corsAllowedOrigins: [String] = [],
+        allowLocalImagePaths: Bool = false,
+        allowRemoteImageURLs: Bool = false,
         telemetryPollIntervalMs: Int = 500,
         modelPackPath: String = "",
         modelName: String = "Qwen3.8-27B",
@@ -163,6 +171,10 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.keepServerRunningAfterQuit = keepServerRunningAfterQuit
         self.host = host
         self.port = port
+        self.apiKey = apiKey
+        self.corsAllowedOrigins = corsAllowedOrigins
+        self.allowLocalImagePaths = allowLocalImagePaths
+        self.allowRemoteImageURLs = allowRemoteImageURLs
         self.telemetryPollIntervalMs = telemetryPollIntervalMs
         self.modelPackPath = modelPackPath
         self.modelName = modelName
@@ -223,6 +235,10 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.keepServerRunningAfterQuit = try c.decodeIfPresent(Bool.self, forKey: .keepServerRunningAfterQuit) ?? false
         self.host = try c.decodeIfPresent(String.self, forKey: .host) ?? "127.0.0.1"
         self.port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 8080
+        self.apiKey = try c.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
+        self.corsAllowedOrigins = try c.decodeIfPresent([String].self, forKey: .corsAllowedOrigins) ?? []
+        self.allowLocalImagePaths = try c.decodeIfPresent(Bool.self, forKey: .allowLocalImagePaths) ?? false
+        self.allowRemoteImageURLs = try c.decodeIfPresent(Bool.self, forKey: .allowRemoteImageURLs) ?? false
         self.telemetryPollIntervalMs = try c.decodeIfPresent(Int.self, forKey: .telemetryPollIntervalMs) ?? 500
         self.modelPackPath = try c.decodeIfPresent(String.self, forKey: .modelPackPath) ?? ""
         self.modelName = try c.decodeIfPresent(String.self, forKey: .modelName) ?? "Qwen3.8-27B"
@@ -288,11 +304,6 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
     public var expandedLogFilePath: String {
         let expandedDir = logDir.expandingTildePath
         return (expandedDir as NSString).appendingPathComponent(logFileName)
-    }
-
-    /// Full expanded path to the cache directory
-    public var expandedCacheDirPath: String {
-        cacheDir.expandingTildePath
     }
 
     /// Cohesive sampling parameters view of these settings.
@@ -399,399 +410,4 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         warmRAMLimitGB = 4.0
     }
 
-    /// Returns the persisted alias for `modelName` (or empty string if none).
-    public func alias(for modelName: String) -> String {
-        if let mapped = modelAliases[modelName], !mapped.isEmpty {
-            return mapped
-        }
-        if modelName == self.modelName {
-            return modelAlias.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return ""
-    }
-
-    /// Updates or removes the persisted alias for `modelName`.
-    public mutating func setAlias(_ alias: String, for modelName: String) {
-        let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !modelName.isEmpty {
-            if trimmed.isEmpty {
-                modelAliases.removeValue(forKey: modelName)
-            } else {
-                modelAliases[modelName] = trimmed
-            }
-        }
-        if modelName == self.modelName {
-            self.modelAlias = trimmed
-        }
-    }
-
-    /// Synchronizes `modelAlias` and `modelAliases` for the currently active `modelName`.
-    public mutating func syncActiveModelAlias() {
-        let trimmed = modelAlias.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !modelName.isEmpty {
-            if !trimmed.isEmpty {
-                modelAliases[modelName] = trimmed
-            } else if let mapped = modelAliases[modelName], !mapped.isEmpty {
-                self.modelAlias = mapped
-                return
-            } else {
-                modelAliases.removeValue(forKey: modelName)
-            }
-        }
-        self.modelAlias = trimmed
-    }
-
-    /// Removes aliases of models that are no longer present in `~/.qwg/models`.
-    /// Returns true when at least one orphaned alias was removed.
-    @discardableResult
-    public mutating func pruneRemovedModels(discovered: [DiscoveredModel] = Self.scanModelsDirectory()) -> Bool {
-        let installed = Set(discovered.filter { !$0.packPath.isEmpty }.map(\.name))
-        guard !installed.isEmpty else { return false }
-        // The active model may be served under a name of the user's
-        // choosing; the pack that backs it says whether it is still
-        // there. An alias whose model is installed is not an orphan.
-        let installedPacks = Set(discovered.filter { !$0.packPath.isEmpty }
-            .map { $0.packPath.expandingTildePath })
-        let activePack = modelPackPath.expandingTildePath
-        let activeInstalled = installedPacks.contains(activePack)
-        var changed = false
-        for key in Array(modelAliases.keys)
-        where !installed.contains(key) && !(key == modelName && activeInstalled) {
-            modelAliases.removeValue(forKey: key)
-            changed = true
-        }
-        if !installed.contains(modelName) {
-            let modelsRoot = QWPaths.modelsDirectoryPath
-            if !activeInstalled && (activePack.isEmpty || activePack.hasPrefix(modelsRoot)) {
-                if !modelAlias.isEmpty {
-                    modelAlias = ""
-                    changed = true
-                }
-            }
-        } else if let mapped = modelAliases[modelName], modelAlias != mapped {
-            modelAlias = mapped
-            changed = true
-        }
-        return changed
-    }
-
-    /// Resolves a model reference (CLI `--model` argument, model name in `~/.qwg/models`, alias, or pack path)
-    /// to `(packPath, modelName, alias)`.
-    public func resolveModelReference(
-        _ ref: String,
-        discovered: [DiscoveredModel] = Self.scanModelsDirectory()
-    ) -> (packPath: String, modelName: String, alias: String) {
-        let trimmed = ref.trimmingCharacters(in: .whitespacesAndNewlines)
-        let activeAlias = alias(for: modelName)
-        guard !trimmed.isEmpty else { return (modelPackPath.expandingTildePath, modelName, activeAlias) }
-        // 0. Prefer the active model when `ref` matches its name or alias case-insensitively.
-        if !modelPackPath.isEmpty && (trimmed.caseInsensitiveCompare(modelName) == .orderedSame
-            || (!activeAlias.isEmpty && trimmed.caseInsensitiveCompare(activeAlias) == .orderedSame)) {
-            return (modelPackPath.expandingTildePath, modelName, activeAlias)
-        }
-        // 1. Match by persisted alias in modelAliases
-        if let (targetModel, targetAlias) = modelAliases.first(where: { $0.value == trimmed })
-            ?? modelAliases.first(where: { $0.value.caseInsensitiveCompare(trimmed) == .orderedSame }) {
-            if let disc = discovered.first(where: { $0.name == targetModel }), !disc.packPath.isEmpty {
-                return (disc.packPath, disc.name, targetAlias)
-            }
-            let candidate = (QWPaths.modelsDirectoryPath as NSString).appendingPathComponent(targetModel)
-            if FileManager.default.fileExists(atPath: candidate) { return (candidate, targetModel, targetAlias) }
-            if targetModel == modelName && !modelPackPath.isEmpty {
-                return (modelPackPath.expandingTildePath, modelName, targetAlias)
-            }
-        }
-        if !modelAlias.isEmpty && modelAlias.caseInsensitiveCompare(trimmed) == .orderedSame {
-            return (modelPackPath.expandingTildePath, modelName, modelAlias)
-        }
-        // 2. Match by discovered model name in ~/.qwg/models
-        if let disc = discovered.first(where: { $0.name == trimmed })
-            ?? discovered.first(where: { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }),
-           !disc.packPath.isEmpty {
-            return (disc.packPath, disc.name, alias(for: disc.name))
-        }
-        // 3. Direct path or relative to ~/.qwg/models or HuggingFace / MLX cache
-        let fm = FileManager.default
-        func resolvedTuple(_ path: String) -> (String, String, String) {
-            let resolvedURL = QWModelRoot.resolveSnapshotDirectory(URL(fileURLWithPath: path), fileManager: fm)
-            let name = QWModelRoot.canonicalModelName(for: resolvedURL)
-            return (resolvedURL.path, name, alias(for: name))
-        }
-        let inModelsDir = (QWPaths.modelsDirectoryPath as NSString).appendingPathComponent(trimmed)
-        if !trimmed.contains("/") && !trimmed.hasPrefix("~") && fm.fileExists(atPath: inModelsDir) {
-            return resolvedTuple(inModelsDir)
-        }
-        let expanded = trimmed.expandingTildePath
-        if !fm.fileExists(atPath: expanded) {
-            let repoLeaf = trimmed.split(separator: "/").last.map(String.init) ?? trimmed
-            for rootDir in ["./models", QWPaths.modelsDirectoryPath] {
-                for sub in [trimmed, repoLeaf] {
-                    let cand = (rootDir as NSString).appendingPathComponent(sub)
-                    if fm.fileExists(atPath: cand) { return resolvedTuple(cand) }
-                }
-            }
-            // Check HuggingFace hub cache (~/.cache/huggingface/hub/models--<org>--<repo>) or ~/.mlx-serve/models/<org>/<repo>
-            let hfHub = QWPaths.hfHubCacheDirectoryURL.path
-            let sanitized = trimmed.replacingOccurrences(of: "/", with: "--")
-            let hfRepoCandidate = (hfHub as NSString).appendingPathComponent(
-                sanitized.hasPrefix("models--") ? sanitized : "models--\(sanitized)"
-            )
-            if fm.fileExists(atPath: hfRepoCandidate) { return resolvedTuple(hfRepoCandidate) }
-            let mlxRoot = ("~/.mlx-serve/models" as NSString).expandingTildeInPath
-            let mlxCandidate = (mlxRoot as NSString).appendingPathComponent(trimmed)
-            if fm.fileExists(atPath: mlxCandidate) { return resolvedTuple(mlxCandidate) }
-        }
-        let resolvedURL = QWModelRoot.resolveSnapshotDirectory(URL(fileURLWithPath: expanded), fileManager: fm)
-        let resolvedPath = resolvedURL.path
-        let canonical = QWModelRoot.canonicalModelName(for: resolvedURL)
-        let derivedName = canonical.isEmpty ? modelName : canonical
-        if let disc = discovered.first(where: { $0.packPath == resolvedPath || $0.packPath == expanded }) {
-            return (disc.packPath, disc.name, alias(for: disc.name))
-        }
-        return (resolvedPath, derivedName, alias(for: derivedName))
-    }
-
-    /// Scans ~/.qwg/models and the Hugging Face hub cache for installed primary model packs.
-    public static func scanModelsDirectory() -> [DiscoveredModel] {
-        let dir = QWPaths.modelsDirectoryPath
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: dir) { try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true) }
-        let local = QWModelCatalog.scan(directory: dir)
-        let hub = QWModelCatalog.scanHuggingFaceHub(directory: QWPaths.hfHubCacheDirectoryURL.path)
-        let localNames = Set(local.map(\.name))
-        return (local + hub.filter { !localNames.contains($0.name) }).map { e in
-            DiscoveredModel(name: e.name, packPath: e.path, family: e.family?.rawValue,
-                            nativeWindow: e.nativeWindow, supported: e.supported, reason: e.reason,
-                            capabilities: e.capabilities.map(\.rawValue).sorted(),
-                            maxSpeculativeDrafts: e.maxSpeculativeDrafts,
-                            hasLSASidecar: e.hasLSASidecar, lsaSidecarPath: e.lsaSidecarPath)
-        }
-    }
-
-    /// Scans ~/.qwg/models for installed DFlash 2 and DSpine drafter model packs via `config.json`.
-    public static func scanDrafterModelsDirectory() -> [DiscoveredModel] {
-        let dir = QWPaths.modelsDirectoryPath
-        var models: [DiscoveredModel] = []
-        if let items = try? FileManager.default.contentsOfDirectory(atPath: dir) {
-            for item in items.sorted() where !item.hasPrefix(".") {
-                let itemPath = (dir as NSString).appendingPathComponent(item)
-                let url = URL(fileURLWithPath: itemPath)
-                guard QWDFlashConfig.isDrafterPack(at: url) else { continue }
-                models.append(DiscoveredModel(name: QWModelRoot.canonicalModelName(for: url), packPath: itemPath))
-            }
-        }
-        return models
-    }
-
-    /// Infers `"dspine"` vs `"dflash2"` and maximum draft count (`blockSize - 1`) from the drafter pack's `config.json`.
-    public static func inferDrafterBackendAndMaxDrafts(packPath: String?) -> (backend: String, maxDrafts: Int) {
-        QWDFlashConfig.inferBackendAndMaxDrafts(packPath: packPath)
-    }
-
-    /// Validates the currently selected primary model pack (fail-fast check before server launch or upon UI selection).
-    public func validatePrimaryModel() throws -> QWModelDescriptor {
-        let rawPath = modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ref = resolveModelReference(rawPath.isEmpty ? modelName : rawPath)
-        let candidatePath = ref.packPath.isEmpty ? modelName : ref.packPath
-        let assets = try QWModelRuntimeAssets.load(packPath: candidatePath)
-        return assets.descriptor
-    }
-
-    /// Validates the DFlash 2 / DSpine drafter model configuration against the selected primary model.
-    public func validateDFlashConfiguration() throws {
-        let descriptor = try validatePrimaryModel()
-        let maxD = QWDFlashConfig.inferBackendAndMaxDrafts(packPath: dflashDraftPackPath).maxDrafts
-        let drafts = max(1, min(maxD, mtpDrafts))
-        try QWDFlashConfig.validateDrafter(
-            targetDescriptor: descriptor,
-            packPath: dflashDraftPackPath,
-            drafts: drafts,
-            selectorTopK: dflashSelectorTopK
-        )
-    }
-
-    /// Validates both the primary model and, when DFlash 2 / DSpine speculative decoding is enabled, the drafter pack.
-    public func validateBeforeLaunch() throws {
-        guard !modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-              !modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return
-        }
-        let descriptor = try validatePrimaryModel()
-        let isExternalDrafter = ["dflash2", "dflash", "dspine"].contains(mtpBackend.lowercased())
-        if speculativeDecodingEnabled && isExternalDrafter && mtpDrafts > 0 {
-            try QWDFlashConfig.validateDrafter(targetDescriptor: descriptor, packPath: dflashDraftPackPath,
-                                               drafts: mtpDrafts, selectorTopK: dflashSelectorTopK)
-        }
-        guard QWLSAMode.resolve(lsaMode) != nil else {
-            throw QWEngineError.state("Unknown LSA mode '\(lsaMode)' (expected off, auto, sidecar, svd, or qsa-cluster)")
-        }
-        if lsaMode.lowercased() == "sidecar" {
-            let rawPath = modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            let ref = resolveModelReference(rawPath.isEmpty ? modelName : rawPath)
-            guard QWLSAConfig.resolveSidecarURL(packPath: ref.packPath,
-                                                explicitSidecarPath: lsaSidecarPath.isEmpty ? nil : lsaSidecarPath) != nil else {
-                throw QWEngineError.state("LSA mode 'sidecar' requires a .qlsa sidecar file in '\(ref.packPath)' or via lsaSidecarPath")
-            }
-        }
-    }
-}
-
-/// Manager for loading and saving settings to ~/.qwg/settings.json
-public final class QWSettingsManager: @unchecked Sendable {
-    public static let shared = QWSettingsManager()
-    private let lock = NSLock()
-    private var cachedSettings: QWServerSettings?
-    private var cachedBytes: Data?
-    private var cachedURL: URL?
-
-    public static var defaultSettingsDirectory: URL { QWPaths.rootDirectoryURL }
-    public static var defaultSettingsFileURL: URL { QWPaths.settingsFileURL }
-    public init() {}
-
-    /// Returns the per-model `QWProfileStore` associated with a settings file URL.
-    public func profileStore(forSettingsURL url: URL = defaultSettingsFileURL) -> QWProfileStore {
-        QWProfileStore(root: url.deletingLastPathComponent().appendingPathComponent("profiles", isDirectory: true))
-    }
-
-    /// Loads the dedicated per-model knob profile for `modelName`, if one exists on disk.
-    public func loadProfile(forModel modelName: String, from url: URL = defaultSettingsFileURL) -> QWKnobProfile? {
-        let trimmed = modelName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : (try? profileStore(forSettingsURL: url).load(modelId: trimmed))
-    }
-
-    /// Removes the dedicated per-model knob profile for `modelName`, if present.
-    public func removeProfile(forModel modelName: String, from url: URL = defaultSettingsFileURL) {
-        let trimmed = modelName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        try? FileManager.default.removeItem(at: profileStore(forSettingsURL: url).profileURL(for: trimmed))
-    }
-
-    /// Resolves effective settings for `modelName` / `packPath`: starts from the model's config files + engine defaults,
-    /// and overlays the dedicated per-model profile from `profiles/` if one exists.
-    public func effectiveSettings(
-        forModel modelName: String, packPath: String, base: QWServerSettings,
-        from url: URL = defaultSettingsFileURL, ignoreProfile: Bool = false
-    ) -> (settings: QWServerSettings, profile: QWKnobProfile?) {
-        var resolved = base
-        resolved.modelName = modelName
-        if !packPath.isEmpty { resolved.modelPackPath = packPath }
-        resolved.modelAlias = resolved.alias(for: modelName)
-        resolved.applyModelConfigDefaults(packPath: packPath)
-        if !ignoreProfile, let profile = loadProfile(forModel: modelName, from: url) {
-            resolved.apply(knobProfile: profile)
-            return (resolved, profile)
-        }
-        return (resolved, nil)
-    }
-
-    /// Persists customized per-model knob values for `settings.modelName` into `profiles/`.
-    private func saveModelProfile(for settings: QWServerSettings, to url: URL) throws {
-        let modelId = settings.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !modelId.isEmpty else { return }
-        let rawPath = settings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ref = settings.resolveModelReference(rawPath.isEmpty ? modelId : rawPath)
-        var baseline = settings
-        baseline.applyModelConfigDefaults(packPath: ref.packPath)
-        let baseKnobs = baseline.validatedKnobValues
-        let currentKnobs = settings.validatedKnobValues
-        let store = profileStore(forSettingsURL: url)
-        let existing = try? store.load(modelId: modelId)
-        var diff: [String: QWKnobValue] = [:]
-        for (id, value) in currentKnobs {
-            if baseKnobs[id] != value || existing?.values[id] != nil {
-                diff[id] = value
-            }
-        }
-        let profile = QWKnobProfile(modelId: modelId, values: diff)
-        try store.save(profile)
-    }
-
-    /// Loads settings from ~/.qwg/settings.json, falling back to defaults.
-    /// The file is the truth: the decoded copy is reused only while the
-    /// bytes on disk are the ones it came from.
-    public func loadSettings(from url: URL = defaultSettingsFileURL) -> QWServerSettings {
-        do {
-            return try loadSettingsSnapshot(from: url).settings
-        } catch {
-            QWServerLogger.shared.log(.warn, "Failed to load settings from \(url.path): \(error)")
-            return QWServerSettings()
-        }
-    }
-
-    func loadSettingsSnapshot(from url: URL) throws -> (settings: QWServerSettings, keys: Set<String>) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let data: Data
-        do {
-            data = try Data(contentsOf: url)
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            cachedSettings = nil
-            cachedBytes = nil
-            cachedURL = nil
-            return (QWServerSettings(), [])
-        }
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw QWServerConfigurationResolver.Error.invalidSettingsFile(url.path)
-        }
-        let keys = Set(object.keys)
-        if let cached = cachedSettings, cachedBytes == data, cachedURL == url.standardizedFileURL {
-            return (cached, keys)
-        }
-
-        var settings = try JSONDecoder().decode(QWServerSettings.self, from: data)
-        var persistedBytes = data
-        if url.standardizedFileURL == Self.defaultSettingsFileURL.standardizedFileURL && settings.pruneRemovedModels() {
-            do {
-                let encoder = JSONEncoder()
-                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-                let prunedData = try encoder.encode(settings)
-                try prunedData.write(to: url, options: .atomic)
-                persistedBytes = prunedData
-            } catch {
-                QWServerLogger.shared.log(.warn, "Failed to prune settings at \(url.path): \(error)")
-            }
-        }
-        cachedSettings = settings
-        cachedBytes = persistedBytes
-        cachedURL = url.standardizedFileURL
-        return (settings, keys)
-    }
-
-    /// Saves settings atomically to ~/.qwg/settings.json, creating directories as needed.
-    public func saveSettings(_ settings: QWServerSettings, to url: URL = defaultSettingsFileURL) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
-        var normalized = settings
-        normalized.syncActiveModelAlias()
-        if url == Self.defaultSettingsFileURL {
-            normalized.pruneRemovedModels()
-        }
-
-        let fm = FileManager.default
-        let dir = url.deletingLastPathComponent()
-        if !fm.fileExists(atPath: dir.path) {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        }
-        let logDirURL = normalized.logDir.canonicalFileURL
-        if !fm.fileExists(atPath: logDirURL.path) {
-            try? fm.createDirectory(at: logDirURL, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        }
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(normalized)
-        try data.write(to: url, options: .atomic)
-        try? saveModelProfile(for: normalized, to: url)
-        cachedSettings = normalized
-        cachedBytes = data
-        cachedURL = url.standardizedFileURL
-    }
-
-    /// Forces a reload of settings from disk on next read.
-    public func invalidateCache() {
-        lock.lock(); defer { lock.unlock() }
-        cachedSettings = nil; cachedBytes = nil; cachedURL = nil
-    }
 }

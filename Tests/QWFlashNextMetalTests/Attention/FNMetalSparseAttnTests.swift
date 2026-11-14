@@ -22,11 +22,15 @@ final class FNMetalSparseAttnTests: XCTestCase {
         try checkKVMode(.f16, rows: 16, maxRelErr: 2e-3)
         try checkKVMode(.q8, rows: 16, maxRelErr: 1.5e-2)
         try checkKVMode(.q4, rows: 16, maxRelErr: 8e-2)
+        try checkKVMode(.f16, rows: 16, kvHeads: 2, maxRelErr: 2e-3)
+        try checkKVMode(.q8, rows: 16, kvHeads: 2, maxRelErr: 1.5e-2)
+        try checkKVMode(.q4, rows: 16, kvHeads: 2, maxRelErr: 8e-2)
         try check(16, 300, maxRelErr: 1.5e-3)
+        try check(16, 300, nkv: 2, maxRelErr: 1.5e-3)
     }
 
-    private func checkKVMode(_ mode: FNKVStorageMode, rows T: Int = 8, maxRelErr: Double) throws {
-        let nh = 16, nkv = 4, D = 256, ROT = 64
+    private func checkKVMode(_ mode: FNKVStorageMode, rows T: Int = 8, kvHeads nkv: Int = 4, maxRelErr: Double) throws {
+        let nh = 16, D = 256, ROT = 64
         let rowStride = nh * 2 * D + 2 * nkv * D
         let arena = try QWArena(hal: Self.hal, weights: 1 << 20, activations: 32 << 20, kv: 0, gdnStates: 0)
         let act = arena.activationsRegion()
@@ -84,12 +88,16 @@ final class FNMetalSparseAttnTests: XCTestCase {
         XCTAssertLessThan(rel, maxRelErr, "KV mode \(mode) rel err \(rel) exceeded \(maxRelErr)")
     }
     func testQSASelectLongContextParity() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG / multi-TG atomic QSA/LSA selector requires Metal 4 hardware")
         // ~470 positive scores against a 512 budget: the threshold lands on the zero-score ties.
         try checkQSASelect(rows: 2, pos0: 4000)
         try checkQSASelect(rows: 16, pos0: 8000)
         try checkQSASelect(rows: 2, pos0: 8192)
         try checkQSASelect(rows: 2, pos0: 131072)
         try checkQSASelect(rows: 2, pos0: 262144)
+        try checkQSASelect(rows: 16, pos0: 32768)
+        try checkQSASelect(rows: 16, pos0: 131072)
     }
 
     private func checkQSASelect(rows T: Int, pos0: Int) throws {
@@ -146,8 +154,8 @@ final class FNMetalSparseAttnTests: XCTestCase {
         }
     }
 
-    private func check(_ T: Int, _ pos0: Int, maxRelErr: Double = 1e-4) throws {
-        let nh = 16, nkv = 4, D = 256
+    private func check(_ T: Int, _ pos0: Int, nkv: Int = 4, maxRelErr: Double = 1e-4) throws {
+        let nh = 16, D = 256
         let cache = pos0 + T
         let arena = try QWArena(hal: Self.hal, weights: 8 << 20, activations: (64 << 20), kv: 0, gdnStates: 0)
         let act = arena.activationsRegion()
@@ -279,6 +287,8 @@ final class FNMetalSparseAttnTests: XCTestCase {
     }
 
     func testQSAEmeansClusterThreeNeedleRecallAndFootprint() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG / multi-TG atomic QSA/LSA selector requires Metal 4 hardware")
         let totalTokens = 81_920
         let numPools = totalTokens / 4
         let needles = [1900, 9600, 17400]
@@ -386,6 +396,8 @@ final class FNMetalSparseAttnTests: XCTestCase {
     }
 
     func testQSAPairedPerfAB() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG / multi-TG atomic QSA/LSA selector requires Metal 4 hardware")
         guard ProcessInfo.processInfo.environment["QW_PERF_GATE"] == "1" else {
             throw XCTSkip("Set QW_PERF_GATE=1 to run paired QSA flat vs Ward vs e-means A/B")
         }
@@ -476,5 +488,105 @@ final class FNMetalSparseAttnTests: XCTestCase {
                          T, wardD.min()!, med(wardD), flatD.min()!, med(flatD), emD.min()!, med(emD),
                          wardD.min()! / emD.min()!, flatD.min()! / emD.min()!))
         }
+    }
+
+    func testQSAScoresMatAndCoarseTiledParity() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG / multi-TG atomic QSA/LSA selector requires Metal 4 hardware")
+        // 1. End-to-end flat QSA selection with T=65 (multi-tile + remainder) at 8K context.
+        try checkQSASelect(rows: 65, pos0: 8000)
+
+        // 2. Direct coarse scorer parity: qwg_emeans_qsa_score_coarse_tiled vs qwg_emeans_qsa_score_coarse.
+        let T = 65, NI = 4, DI = 128, pos0 = 32_768
+        let maxBg = QWCoarsePoolIndex.batchGeometry(
+            pos0: pos0, units: T, budgetBlocks: 512, windowBlocks: 0,
+            hasSink: false, writeCount: false, probeClusters: 544)
+        let nClusters = maxBg.numClusters
+        let cStride = max(64, nClusters)
+        let arena = try QWArena(hal: Self.hal, weights: 1 << 20, activations: 64 << 20, kv: 0, gdnStates: 0)
+        let act = arena.activationsRegion()
+        var seed: UInt32 = 918273
+        func rnd() -> Float {
+            seed = seed &* 1664525 &+ 1013904223
+            return Float(Int32(truncatingIfNeeded: seed)) * 1e-9
+        }
+        let qV = (0..<(T * NI * DI)).map { _ in rnd() }
+        let cV = (0..<(nClusters * DI)).map { _ in Float16(rnd()).bitPattern }
+        let spanV = (0..<nClusters).map { c -> UInt32 in
+            c % 17 == 0 ? 0 : (UInt32(c & 1023) | (UInt32(16) << 16))
+        }
+        let qBuf = try act.allocate(QWTensorShape([T * NI * DI], .f32))
+        let cBuf = try act.allocate(QWTensorShape([nClusters * DI], .f16))
+        let spBuf = try act.allocate(QWTensorShape([nClusters], .i32))
+        let csA = try act.allocate(QWTensorShape([T * cStride], .i32))
+        let csB = try act.allocate(QWTensorShape([T * cStride], .i32))
+        let uHistA = try act.allocate(QWTensorShape([T * 512], .i32))
+        let uHistB = try act.allocate(QWTensorShape([T * 512], .i32))
+        arena.write(qBuf, from: qV)
+        arena.write(cBuf, from: cV)
+        arena.write(spBuf, from: spanV)
+        arena.write(uHistA, from: [UInt32](repeating: 0, count: T * 512))
+        arena.write(uHistB, from: [UInt32](repeating: 0, count: T * 512))
+
+        var prm = QWCoarsePoolIndex.SelectParams(
+            T: T, pos0: pos0, indexDim: DI, budgetBlocks: 512, windowBlocks: 0,
+            hasSink: false, writeCount: false, listStride: 512, rowStep: 1, maxRow: T,
+            clusterStride: cStride, probeClusters: 544, candCap: 8192)
+        let plen = MemoryLayout<QWCoarsePoolIndex.SelectParams>.stride
+        let psoRef = try Self.hal.pipeline("qwg_emeans_qsa_score_coarse")
+        let psoTiled = try Self.hal.pipeline("qwg_emeans_qsa_score_coarse_tiled")
+        let tpg = MTLSize(width: 256, height: 1, depth: 1)
+
+        guard let (cb, enc) = Self.hal.begin() else { throw XCTSkip("no command buffer") }
+        enc.setComputePipelineState(psoRef)
+        qBuf.bind(enc, index: 0); cBuf.bind(enc, index: 1); spBuf.bind(enc, index: 2)
+        csA.bind(enc, index: 3); uHistA.bind(enc, index: 4)
+        enc.setBytes(&prm, length: plen, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: (nClusters + 255) / 256, height: T, depth: 1),
+                                 threadsPerThreadgroup: tpg)
+        enc.setComputePipelineState(psoTiled)
+        qBuf.bind(enc, index: 0); cBuf.bind(enc, index: 1); spBuf.bind(enc, index: 2)
+        csB.bind(enc, index: 3); uHistB.bind(enc, index: 4)
+        enc.setBytes(&prm, length: plen, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: (nClusters + 31) / 32, height: (T + 7) / 8, depth: 1),
+                                 threadsPerThreadgroup: tpg)
+        Self.hal.end(cb, enc)
+        cb.waitUntilCompleted()
+        XCTAssertNil(cb.error)
+
+        let scoresA = arena.read(csA, as: UInt32.self, count: T * cStride)
+        let scoresB = arena.read(csB, as: UInt32.self, count: T * cStride)
+        let histA = arena.read(uHistA, as: UInt32.self, count: T * 512)
+        let histB = arena.read(uHistB, as: UInt32.self, count: T * 512)
+        func decodeOrdFloat(_ u: UInt32) -> Float {
+            Float(bitPattern: (u & 0x8000_0000) != 0 ? (u & 0x7FFF_FFFF) : ~u)
+        }
+        var maxRelErr: Double = 0
+        var maxAbsErr: Double = 0
+        for r in 0..<T {
+            let rowBg = QWCoarsePoolIndex.batchGeometry(
+                pos0: pos0 + r, units: 1, budgetBlocks: 512, windowBlocks: 0,
+                hasSink: false, writeCount: false, probeClusters: 544)
+            let cntA = (0..<256).reduce(0) { $0 + Int(histA[r * 512 + $1]) }
+            let cntB = (0..<256).reduce(0) { $0 + Int(histB[r * 512 + $1]) }
+            XCTAssertEqual(cntA, rowBg.numClusters, "ref hist count mismatch at row \(r)")
+            XCTAssertEqual(cntB, rowBg.numClusters, "tiled hist count mismatch at row \(r)")
+            for c in 0..<rowBg.numClusters {
+                let ua = scoresA[r * cStride + c], ub = scoresB[r * cStride + c]
+                if c % 17 == 0 {
+                    XCTAssertEqual(ua, 0); XCTAssertEqual(ub, 0)
+                } else {
+                    XCTAssertGreaterThan(ub, 0)
+                    let fa = decodeOrdFloat(ua), fb = decodeOrdFloat(ub)
+                    let absE = abs(Double(fa) - Double(fb))
+                    let rel = absE / max(1e-2, abs(Double(fa)))
+                    maxAbsErr = max(maxAbsErr, absE)
+                    maxRelErr = max(maxRelErr, rel)
+                }
+            }
+        }
+        print(String(format: "QSA-COARSE-TILED T=%d maxAbsErr=%.3e maxRelErr=%.3e", T, maxAbsErr, maxRelErr))
+        XCTAssertLessThan(maxAbsErr, 1e-4, "coarse tiled QSA max abs err \(maxAbsErr)")
+        XCTAssertLessThan(maxRelErr, 5e-4, "coarse tiled QSA max rel err \(maxRelErr)")
     }
 }

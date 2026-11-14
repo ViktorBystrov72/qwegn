@@ -20,7 +20,7 @@ public enum QWEngineBootstrap {
         try QWEnginePlan(
             geometry: geometry,
             modelId: QWEnginePlan.packIdentity(packPath: packPath),
-            geometryDigest: geometry.descriptor.geometryDigestV2Hex,
+            geometryDigest: geometry.descriptor.geometryDigestV3Hex,
             prefillChunkRows: prefillChunkRows,
             kvStorageMode: kvStorageMode,
             kernelDispatch: kernelDispatch

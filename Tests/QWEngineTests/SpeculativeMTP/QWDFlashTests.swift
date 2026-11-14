@@ -38,6 +38,8 @@ final class QWDFlashTests: XCTestCase {
     }
 
     func testDFlashDrafterLoadsPackedCheckpoint() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != nil,
+                      "Local ~/.qwg/models pack check skipped on GitHub Actions")
         let packPath = QWDFlashDrafter.defaultPackPath
         try XCTSkipUnless(FileManager.default.fileExists(atPath: packPath),
                           "DFlash 2 pack not installed at \(packPath)")
@@ -108,7 +110,8 @@ final class QWDFlashTests: XCTestCase {
         }
 
         // 3. Invalid draft count (> maxDrafts) must fail fast with .state
-        if FileManager.default.fileExists(atPath: QWDFlashDrafter.defaultPackPath) {
+        if ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == nil,
+           FileManager.default.fileExists(atPath: QWDFlashDrafter.defaultPackPath) {
             let cfg = QWDFlashConfig.load(from: URL(fileURLWithPath: QWDFlashDrafter.defaultPackPath))
             let expectedMax = max(7, cfg.blockSize - 1)
             XCTAssertThrowsError(

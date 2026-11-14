@@ -63,7 +63,7 @@ final class QWKVCacheTests: XCTestCase {
         return 0x3800 | (x & 0x7FF)          // ±[1,2) f16
     }
     static func kvSlice(from tok0: Int, count: Int) -> [UInt16] {
-        let re = QWKVCache.kvHeads * QWKVCache.headDim
+        let re = QWModelGeometry.qwen38_27b.kvChannels
         var out = [UInt16](repeating: 0, count: count * re)
         for t in 0..<count { for e in 0..<re { out[t * re + e] = row(tok0 + t, e) } }
         return out
@@ -71,7 +71,7 @@ final class QWKVCacheTests: XCTestCase {
 
     func makeCache(tokensCeiling: Int = 4096, mode: QWKVMode = .f16) throws -> (QWKVCache, QWArena) {
         // kv region sized for: pools + tables. 4 layers × 2 kinds.
-        let pageBytes = QWKVCache.pageBytes(mode: mode)
+        let pageBytes = QWKVCache.pageBytes(mode: mode, geometry: .qwen38_27b)
         let needPages = (tokensCeiling + 255) / 256
         let poolBytes = pageBytes * needPages * 2                // headroom ×2
         let tables = QWKVCache.tableSlotBytes * 2 * Self.layers.count * QWKVCache.maxSeqs
@@ -92,7 +92,7 @@ final class QWKVCacheTests: XCTestCase {
                     try cache.append(donor, positions: 0..<count, layer: layer, kind: kind, src: original)
                 }
             }
-            let cost = count * QWKVCache.rowBytes * Self.layers.count * 2
+            let cost = count * cache.f16RowBytes * Self.layers.count * 2
             if cost > 0 {
                 XCTAssertThrowsError(try cache.capturePrivatePrefix(donor, maxBytes: cost - 1))
             }
@@ -190,7 +190,7 @@ final class QWKVCacheTests: XCTestCase {
                         try cache.append(first, positions: count..<(count + 1), layer: layer, kind: kind,
                                          src: replacement)
                         XCTAssertEqual(Array(readKV(cache: cache, h: first, layer: layer, kind: kind,
-                                                   tokens: count + 1).suffix(QWKVCache.kvHeads * QWKVCache.headDim)),
+                                                   tokens: count + 1).suffix(QWModelGeometry.qwen38_27b.kvChannels)),
                                        replacement, "append after COW did not write the requested bytes")
                         XCTAssertEqual(readKV(cache: cache, h: first, layer: layer, kind: kind, tokens: count),
                                        original, "COW changed bytes in the retained prefix")
@@ -508,8 +508,8 @@ final class QWKVCacheTests: XCTestCase {
 
     func readKV(cache: QWKVCache, h: QWKVHandle, layer: Int,
                 kind: QWKVKind, tokens: Int) -> [UInt16] {
-        let re = QWKVCache.kvHeads * QWKVCache.headDim
-        let pageBytes = QWKVCache.pageBytes(mode: .f16)
+        let re = QWModelGeometry.qwen38_27b.kvChannels
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
         let ids = cache.pageIDs(h, layer: layer, kind: kind)
         let views = (try? cache.layerViews(h, layer: layer))!
         let pool = kind == .k ? views.k.pool : views.v.pool
@@ -590,11 +590,11 @@ final class QWKVCacheTests: XCTestCase {
 
     func testModeBytesMath() {
         // f16: 64 KB/token/layer (spec ROOFLINE); q8 halves it.
-        XCTAssertEqual(QWKVCache.kvBytes(tokens: 1, layers: 1, mode: .f16), 4 * 256 * 2 * 2)
-        XCTAssertEqual(QWKVCache.kvBytes(tokens: 1, layers: 1, mode: .q8) * 2,
-                       QWKVCache.kvBytes(tokens: 1, layers: 1, mode: .f16),
+        XCTAssertEqual(QWKVCache.kvBytes(tokens: 1, layers: 1, mode: .f16, geometry: .qwen38_27b), 4 * 256 * 2 * 2)
+        XCTAssertEqual(QWKVCache.kvBytes(tokens: 1, layers: 1, mode: .q8, geometry: .qwen38_27b) * 2,
+                       QWKVCache.kvBytes(tokens: 1, layers: 1, mode: .f16, geometry: .qwen38_27b),
                        "q8 halves KV")
-        XCTAssertEqual(QWKVCache.kvBytes(tokens: 262144, layers: 16, mode: .f16) / 1024 / 1024 / 1024, 16,
+        XCTAssertEqual(QWKVCache.kvBytes(tokens: 262144, layers: 16, mode: .f16, geometry: .qwen38_27b) / 1024 / 1024 / 1024, 16,
                        "262K fp16 KV ≈ 16.8 GB budget anchor")
     }
 

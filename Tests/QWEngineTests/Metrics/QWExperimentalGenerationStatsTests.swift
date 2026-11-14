@@ -28,3 +28,15 @@ final class QWExperimentalGenerationStatsTests: XCTestCase {
         XCTAssertEqual(stats.decodeTokensPerSecond, 0)
     }
 }
+
+private extension QWExperimentalGenerationStats {
+    var prefillTokensPerSecond: Double {
+        guard prefillSec > 0, prefillSec.isFinite else { return 0 }
+        return Double(promptTokens) / prefillSec
+    }
+
+    var decodeTokensPerSecond: Double {
+        guard decodeSec > 0, decodeSec.isFinite else { return 0 }
+        return Double(roundTokenCounts.reduce(0, +)) / decodeSec
+    }
+}

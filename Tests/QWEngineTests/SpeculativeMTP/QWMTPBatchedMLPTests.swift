@@ -29,7 +29,7 @@ final class QWMTPBatchedMLPTests: XCTestCase {
             .appendingPathComponent("Scripts/spike/out")
         func tensor(_ data: Data, dtype: QWDType = .f16) throws -> QWTensorValue {
             let buffer = try XCTUnwrap(hal.device.makeBuffer(length: data.count, options: .storageModeShared))
-            data.withUnsafeBytes { buffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in buffer.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count) }
             return QWTensorValue(region: QWMRegion(buffer: buffer, base: 0, length: data.count),
                                  offset: 0, shape: QWTensorShape([data.count / (dtype == .f16 ? 2 : 4)], dtype))
         }
@@ -74,7 +74,7 @@ final class QWMTPBatchedMLPTests: XCTestCase {
                 let values = (0..<(rows * QWModelGeometry.qwen38_27b.hidden)).map {
                     Float16(Float(($0 * 17 + 11) % 61 - 30) / 32)
                 }
-                input = try tensor(values.withUnsafeBytes { Data($0) })
+                input = try tensor(values.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
             }
             let h = try allocator.allocate(QWTensorShape([rows * QWModelGeometry.qwen38_27b.intermediate], .f16))
             if ProcessInfo.processInfo.environment["QW_MTP_MLP_BENCH"] == "1" {
@@ -247,7 +247,7 @@ final class QWMTPBatchedMLPTests: XCTestCase {
             .appendingPathComponent("Scripts/spike/out")
         func tensor(_ data: Data, dtype: QWDType = .f16) throws -> QWTensorValue {
             let buffer = try XCTUnwrap(hal.device.makeBuffer(length: data.count, options: .storageModeShared))
-            data.withUnsafeBytes { buffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in buffer.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count) }
             return QWTensorValue(region: QWMRegion(buffer: buffer, base: 0, length: data.count),
                                  offset: 0, shape: QWTensorShape([data.count / (dtype == .f16 ? 2 : 4)], dtype))
         }
@@ -269,7 +269,7 @@ final class QWMTPBatchedMLPTests: XCTestCase {
             let alloc = arena.activationsRegion()
             let batch = try QWMTPBatchedMLP(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 5)
             let vals = (0..<(5 * geom.hidden)).map { Float16(Float(($0 * 17 + 11) % 61 - 30) / 32) }
-            let input5 = try tensor(vals.withUnsafeBytes { Data($0) })
+            let input5 = try tensor(vals.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
             let input2 = QWTensorValue(region: input5.region, offset: 0, shape: QWTensorShape([2 * geom.hidden], .f16))
             let h5 = try alloc.allocate(QWTensorShape([5 * geom.intermediate], .f16))
             let h2 = try alloc.allocate(QWTensorShape([2 * geom.intermediate], .f16))
@@ -322,7 +322,7 @@ final class QWMTPBatchedMLPTests: XCTestCase {
         let geom = QWModelGeometry.qwen38_27b
         func tensor(_ data: Data, dtype: QWDType = .f16) throws -> QWTensorValue {
             let buffer = try XCTUnwrap(hal.device.makeBuffer(length: data.count, options: .storageModeShared))
-            data.withUnsafeBytes { buffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in buffer.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count) }
             return QWTensorValue(region: QWMRegion(buffer: buffer, base: 0, length: data.count),
                                  offset: 0, shape: QWTensorShape([data.count / (dtype == .f16 ? 2 : 4)], dtype))
         }
@@ -334,14 +334,14 @@ final class QWMTPBatchedMLPTests: XCTestCase {
         for i in 0..<words.count {
             words[i] = 0x2800 | UInt16((i &* 131 &+ 17) & 0x07FF)
         }
-        let fullData = words.withUnsafeBytes { Data($0) }
+        let fullData = words.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) }
         let rawBlocks = try tensor(fullData)
         let arena = try QWArena(hal: hal, weights: 256, activations: 16 << 20, kv: 256, gdnStates: 256)
         let alloc = arena.activationsRegion()
         let batch = try QWMTPBatchedMLP(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 4)
         let trunk = try QWMTPBatchedTrunk(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 4)
         let vals = (0..<(4 * geom.hidden)).map { Float16(Float(($0 * 17 + 11) % 61 - 30) / 32) }
-        let input4 = try tensor(vals.withUnsafeBytes { Data($0) })
+        let input4 = try tensor(vals.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
         let aLog = try alloc.allocate(QWTensorShape([48], .f32))
         let bias = try alloc.allocate(aLog.shape)
         let aPtr = aLog.region.pointer.advanced(by: aLog.offset).assumingMemoryBound(to: Float.self)
@@ -431,7 +431,7 @@ final class QWMTPBatchedMLPTests: XCTestCase {
                         enc.dispatchThreadgroups(MTLSize(width: geom.intermediate / 32, height: 1, depth: 1),
                                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-                        var nGdn = UInt32(gdnW.n), zRow0 = UInt32(geom.gdnZRow0), aRow0 = UInt32(geom.gdnARow0), bRow0 = UInt32(geom.gdnBRow0), ctrlStride: UInt32 = 96
+                        var nGdn = UInt32(gdnW.n), zRow0 = UInt32(geom.gdnQKVChannels), aRow0 = UInt32(geom.gdnARow0), bRow0 = UInt32(geom.gdnBRow0), ctrlStride: UInt32 = 96
                         enc.setComputePipelineState(psoGdn1)
                         gdnW.blocks.bind(enc, index: 0); in1.bind(enc, index: 1); gs.bind(enc, index: 2)
                         y32.bind(enc, index: 3)
@@ -470,5 +470,34 @@ final class QWMTPBatchedMLPTests: XCTestCase {
                     "AQ(\(bits), G\(group)) M=\(m) GDN controls parity failed")
             }
         }
+    }
+}
+
+private extension QWMTPBatchedMLP {
+    func downRow(_ row: Int) throws -> QWTensorValue {
+        guard (0..<rows).contains(row) else { throw QWEngineDriverError.state("invalid batched MLP down row") }
+        return downViews[row]
+    }
+
+    func outputSumRow(_ row: Int) throws -> QWTensorValue {
+        guard (0..<rows).contains(row) else { throw QWEngineDriverError.state("invalid batched output sum row") }
+        return sumViews[row]
+    }
+}
+
+private extension QWMTPBatchedTrunk {
+    func gdnRow(_ row: Int) throws -> (qkv: QWTensorValue, z: QWTensorValue, beta: QWTensorValue, decay: QWTensorValue) {
+        try validate(row)
+        return (qkv[row], z[row], beta[row], decay[row])
+    }
+
+    func attentionRow(_ row: Int) throws -> (q: QWTensorValue, k: QWTensorValue, v: QWTensorValue) {
+        try validate(row)
+        return (q[row], k[row], v[row])
+    }
+
+    func outputRow(_ row: Int) throws -> QWTensorValue {
+        try validate(row)
+        return outputs[row]
     }
 }

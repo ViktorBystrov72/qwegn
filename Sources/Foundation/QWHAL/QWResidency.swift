@@ -94,11 +94,6 @@ extension QWHal {
         makeResident(QWResidencyRegistry.drain(device: device))
     }
 
-    public var keepAliveCount: Int {
-        residencyLock.lock(); defer { residencyLock.unlock() }
-        return keepAlive.count
-    }
-
     /// References every long-lived allocation from `enc` (cheap: one call, no GPU work).
     @inline(__always)
     public func touchKeepAlive(_ enc: any MTLComputeCommandEncoder) {

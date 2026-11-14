@@ -1,6 +1,5 @@
-// QWWeightStreamer.swift — Asynchronous unbuffered direct DMA weight streamer via QWDispatchIO
+// QWWeightStreamer.swift — Synchronous unbuffered direct DMA weight streamer via QWDispatchIO
 import Foundation
-import Dispatch
 
 public enum QWWeightStreamerError: Error, CustomStringConvertible {
     case fileNotFound(String)
@@ -42,12 +41,5 @@ public final class QWWeightStreamer: Sendable {
             throw QWWeightStreamerError.invalidRange(offset: offset, count: byteCount, fileLength: fileLength)
         }
         _ = try dispatchIO.readSync(offset: Int64(offset), into: destination, length: byteCount)
-    }
-
-    public func streamTensorAsync(offset: Int, byteCount: Int) async throws -> DispatchData {
-        guard offset >= 0, byteCount >= 0, offset + byteCount <= fileLength else {
-            throw QWWeightStreamerError.invalidRange(offset: offset, count: byteCount, fileLength: fileLength)
-        }
-        return try await dispatchIO.read(offset: Int64(offset), length: byteCount)
     }
 }

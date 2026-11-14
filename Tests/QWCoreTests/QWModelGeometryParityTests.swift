@@ -33,7 +33,7 @@ final class QWModelGeometryParityTests: XCTestCase {
         XCTAssertEqual(g.gdnZChannels, QWModelGeometry.qwen38_27b.gdnZChannels)
         XCTAssertEqual(g.gdnConvKernel, QWModelGeometry.qwen38_27b.gdnConvKernel)
         XCTAssertEqual(g.mtpLayers, QWModelGeometry.qwen38_27b.mtpLayers)
-        XCTAssertEqual(g.endOfTextTokenId, QWModelGeometry.qwen38_27b.endOfTextTokenId)
+        XCTAssertEqual(g.descriptor.specialTokens.eosTokenId, QWModelGeometry.qwen38_27b.descriptor.specialTokens.eosTokenId)
         XCTAssertEqual(g.imStartTokenId, QWModelGeometry.qwen38_27b.imStartTokenId)
         XCTAssertEqual(g.imEndTokenId, QWModelGeometry.qwen38_27b.imEndTokenId)
         XCTAssertEqual(g.thinkTokenId, QWModelGeometry.qwen38_27b.thinkTokenId)

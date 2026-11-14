@@ -14,6 +14,9 @@ public enum FNGPULayerPasses {
         t.slice(byteOffset: byteOffset, count: count, dtype: dtype)
     }
 
+    static let pleFusedEnabled = ProcessInfo.processInfo.environment["QW_FN_PLE_FUSED"] != "0"
+    private static let gdnBAFusedEnabled = ProcessInfo.processInfo.environment["QW_FN_GDN_BA_FUSED"] != "0"
+
     static func barrier(_ enc: any MTLComputeCommandEncoder) { enc.memoryBarrier(scope: .buffers) }
 
     /// Dense HQ4 projection over T rows using the shared QWGemm.encodeDenseProjF32 dispatcher.
@@ -27,8 +30,14 @@ public enum FNGPULayerPasses {
     }
 
     public static func ple(_ enc: any MTLComputeCommandEncoder, hal: QWHal, p: FNGPUPLE, s: FNGPUScratch,
-                           stream: QWTensorValue, out: QWTensorValue, embed: QWTensorValue? = nil) throws {
+                           stream: QWTensorValue, out: QWTensorValue, embed: QWTensorValue? = nil,
+                           inInject: (base: QWTensorValue, src: QWTensorValue, scale: QWTensorValue)? = nil) throws {
         let T = s.T, W = s.width, H = s.hidden, C = s.hc, E = p.embedDim
+        let useInjectNorm = (inInject != nil) && (T > 8) && pleFusedEnabled
+        if let inj = inInject, !useInjectNorm {
+            try QWHCOperator.encodeInject(enc, hal: hal, base: inj.base, src: inj.src, scale: inj.scale,
+                                          out: stream, rows: T, hidden: H, hc: C)
+        }
         let e = embed ?? s.pleEmbed
         let rotEmbed: QWTensorValue
         if hal.weightBasis.rotatesActivations {
@@ -64,8 +73,13 @@ public enum FNGPULayerPasses {
             barrier(enc)
             return
         }
-        try QWGemm.encodeFnHCNorm(enc, hal: hal, x: stream, weight: p.normQuery, xn: s.pleQueryN, rows: T, width: W, hidden: H, eps: p.eps)
-        barrier(enc)
+        if let inj = inInject, useInjectNorm {
+            try QWGemm.encodeFnHCInjectNorm(enc, hal: hal, base: inj.base, src: inj.src, inj: inj.scale,
+                                            xOut: stream, weight: p.normQuery, xn: s.pleQueryN,
+                                            rows: T, width: W, hidden: H, eps: p.eps)
+        } else {
+            try QWGemm.encodeFnHCNorm(enc, hal: hal, x: stream, weight: p.normQuery, xn: s.pleQueryN, rows: T, width: W, hidden: H, eps: p.eps)
+        }
         let x16Pre: QWTensorValue?
         if T >= 64 && W % 64 == 0 && H % 64 == 0 && E % 64 == 0 && E <= s.width {
             let count = T * E
@@ -74,7 +88,26 @@ public enum FNGPULayerPasses {
             barrier(enc)
             x16Pre = xHi
         } else {
+            if !pleFusedEnabled { barrier(enc) }
             x16Pre = nil
+        }
+        let p0 = p.parity & QWFourSlotRollbackRing.ringMask
+        let p1 = (p0 + 1) & QWFourSlotRollbackRing.ringMask
+        let hist = p.history[p0]
+        if pleFusedEnabled {
+            try denseProj(enc, hal: hal, s: s, weight: p.keyValueBank, x: rotEmbed, y: s.pleKV, rows: T, x16Precast: x16Pre)
+            barrier(enc)
+            try QWGemm.encodeFnPLEFusedGateNorm(
+                enc, hal: hal, kv: s.pleKV, queryNorm: s.pleQueryN, normKey: p.normKey, normConv: p.normConv,
+                gv: s.pleGV, gvNorm: s.pleGVN, rows: T, hidden: H, hc: C, kvStride: W + H, eps: p.eps)
+            barrier(enc)
+            try QWGemm.encodeFnPLEConv(enc, hal: hal, gv: s.pleGV, gvNorm: s.pleGVN, convWeight: p.convW, out: out,
+                                       rows: T, width: W, kernel: p.kernel, dilation: p.dilation, hist: hist, residual: stream)
+            try QWGemm.encodeFnPLEHistory(enc, hal: hal, oldHist: hist, gvNorm: s.pleGVN, newHist: p.history[p1],
+                                          width: W, historyRows: p.historyRows, rows: T)
+            p.parity = p1
+            barrier(enc)
+            return
         }
         try denseProj(enc, hal: hal, s: s, weight: p.keyBank, x: rotEmbed, y: s.pleK, rows: T, x16Precast: x16Pre)
         try denseProj(enc, hal: hal, s: s, weight: p.valueBank, x: rotEmbed, y: s.pleV, rows: T, x16Precast: x16Pre)
@@ -86,9 +119,6 @@ public enum FNGPULayerPasses {
         barrier(enc)
         try QWGemm.encodeFnHCNorm(enc, hal: hal, x: s.pleGV, weight: p.normConv, xn: s.pleGVN, rows: T, width: W, hidden: H, eps: p.eps)
         barrier(enc)
-        let p0 = p.parity & QWFourSlotRollbackRing.ringMask
-        let p1 = (p0 + 1) & QWFourSlotRollbackRing.ringMask
-        let hist = p.history[p0]
         try QWGemm.encodeFnPLEConv(enc, hal: hal, gv: s.pleGV, gvNorm: s.pleGVN, convWeight: p.convW, out: s.pleOut, rows: T,
                                    width: W, kernel: p.kernel, dilation: p.dilation, hist: hist)
         try QWGemm.encodeFnPLEHistory(enc, hal: hal, oldHist: hist, gvNorm: s.pleGVN, newHist: p.history[p1],
@@ -170,17 +200,28 @@ public enum FNGPULayerPasses {
         let CONV = g.convDim, VH = g.vHeads, VALUE = g.vHeads * g.vDim
         // s.rot32 is already populated by hcMix; for T <= 8 inProjBA and qkvZ keep the T = 1
         // kernel family (rows-parameterized V4 GEMVs — bit-identical per-row reduction order).
+        let useFusedBA = gdnBAFusedEnabled && g.inProjBA32 != nil
         if T <= 8, let qkvZ = g.qkvZ {
             try QWGemm.encodeHQ4F32V4(enc, hal: hal, weight: g.inProjBA, x: s.rot32, y: s.gdnBA, rows: T)
             try denseProj(enc, hal: hal, s: s, weight: qkvZ, x: s.rot32, y: s.qkvZ32, rows: T)
         } else if let qkvZ = g.qkvZ {
             try denseProj(enc, hal: hal, s: s, weight: qkvZ, x: s.rot32, y: s.qkvZ32, rows: T,
                           x16Precast: T >= 64 ? s.naxX16 : nil)
-            try QWGemm.encodeF32Gemv(enc, hal: hal, weight: g.inProjB, x: mixed, y: s.gdnB, rows: T, n: VH, k: H, epilogue: 0, scale: 1)
-            try QWGemm.encodeF32Gemv(enc, hal: hal, weight: g.inProjA, x: mixed, y: s.gdnA, rows: T, n: VH, k: H, epilogue: 0, scale: 1)
+            if let ba32 = g.inProjBA32, useFusedBA {
+                try QWGemm.encodeF32Gemv(enc, hal: hal, weight: ba32, x: mixed, y: s.gdnBA,
+                                         rows: T, n: 2 * VH, k: H, epilogue: 0, scale: 1)
+            } else {
+                try QWGemm.encodeF32Gemv(enc, hal: hal, weight: g.inProjB, x: mixed, y: s.gdnB, rows: T, n: VH, k: H, epilogue: 0, scale: 1)
+                try QWGemm.encodeF32Gemv(enc, hal: hal, weight: g.inProjA, x: mixed, y: s.gdnA, rows: T, n: VH, k: H, epilogue: 0, scale: 1)
+            }
         } else {
-            try QWGemm.encodeF32Gemv(enc, hal: hal, weight: g.inProjB, x: mixed, y: s.gdnB, rows: T, n: VH, k: H, epilogue: 0, scale: 1)
-            try QWGemm.encodeF32Gemv(enc, hal: hal, weight: g.inProjA, x: mixed, y: s.gdnA, rows: T, n: VH, k: H, epilogue: 0, scale: 1)
+            if let ba32 = g.inProjBA32, useFusedBA {
+                try QWGemm.encodeF32Gemv(enc, hal: hal, weight: ba32, x: mixed, y: s.gdnBA,
+                                         rows: T, n: 2 * VH, k: H, epilogue: 0, scale: 1)
+            } else {
+                try QWGemm.encodeF32Gemv(enc, hal: hal, weight: g.inProjB, x: mixed, y: s.gdnB, rows: T, n: VH, k: H, epilogue: 0, scale: 1)
+                try QWGemm.encodeF32Gemv(enc, hal: hal, weight: g.inProjA, x: mixed, y: s.gdnA, rows: T, n: VH, k: H, epilogue: 0, scale: 1)
+            }
             barrier(enc)
             try denseProj(enc, hal: hal, s: s, weight: g.qkv, x: s.rot32, y: s.qkv32, rows: T,
                           x16Precast: T >= 64 ? s.naxX16 : nil)
@@ -234,18 +275,26 @@ public enum FNGPULayerPasses {
             let xStride = interleaved ? (CONV + VALUE) : CONV
             let zIn = interleaved ? view(s.qkvZ32, byteOffset: CONV * 4, count: T * (CONV + VALUE) - CONV, dtype: .f32) : s.z32
             let zStride = interleaved ? (CONV + VALUE) : VALUE
+            let baStride = useFusedBA ? 2 * VH : VH
+            let bIn = useFusedBA ? s.gdnBA : s.gdnB
+            let aIn = useFusedBA
+                ? view(s.gdnBA, byteOffset: VH * 4, count: T * baStride - VH, dtype: .f32)
+                : s.gdnA
             try QWGDNF32.encodeConvPrepSeqF32(enc, hal: hal, x: xIn, w: g.conv, stIn: st, stOut: stNext,
-                                              b: s.gdnB, a: s.gdnA, aLog: g.aLog, dtBias: g.dtBias,
-                                              y: s.yDense32, glog: s.glog, beta: s.beta, rows: T, xStride: xStride)
+                                              b: bIn, a: aIn, aLog: g.aLog, dtBias: g.dtBias,
+                                              y: s.yDense32, glog: s.glog, beta: s.beta,
+                                              rows: T, xStride: xStride, baStride: baStride)
             barrier(enc)
+            let useNaxOut = T >= 64 && g.out.n % 64 == 0 && g.out.k % 64 == 0 && g.out.k <= s.width
             try QWGDNF32.encodeRecurrentSeqF32(enc, hal: hal, y: s.yDense32, betas: s.beta, glog: s.glog,
                                                state: g.state, z: zIn, normWeight: g.normWeight, out: s.outNorm32,
                                                tokens: T, convDim: CONV, vHeads: VH, zStride: zStride,
-                                               out16: T >= 64 ? s.naxX16 : nil)
+                                               out16: useNaxOut ? s.naxX16 : nil)
             barrier(enc)
         }
+        let useNaxOut = T >= 64 && g.out.n % 64 == 0 && g.out.k % 64 == 0 && g.out.k <= s.width
         try denseProj(enc, hal: hal, s: s, weight: g.out, x: s.outNorm32, y: out, rows: T,
-                      x16Precast: T >= 64 ? s.naxX16 : nil)
+                      x16Precast: useNaxOut ? s.naxX16 : nil)
         barrier(enc)
     }
 
@@ -527,12 +576,8 @@ public enum FNGPULayerPasses {
         var h = stream
         var attnInject = inInject
         if let p = L.ple {
-            if let inj = attnInject {
-                try QWHCOperator.encodeInject(enc, hal: hal, base: inj.base, src: inj.src, scale: inj.scale,
-                                              out: stream, rows: T, hidden: H, hc: s.hc)
-                attnInject = nil
-            }
-            try QWPLEOperator.encode(enc, hal: hal, p: p, s: s, stream: stream, out: s.h, embed: pleEmbed)
+            try QWPLEOperator.encode(enc, hal: hal, p: p, s: s, stream: stream, out: s.h, embed: pleEmbed, inInject: attnInject)
+            attnInject = nil
             h = s.h
         }
         try QWHCOperator.encodeMix(enc, hal: hal, hc: L.attnHC, s: s, stream: h, mixed: s.mixedA, inj: s.injA,
@@ -565,12 +610,8 @@ public enum FNGPULayerPasses {
         var h = stream
         var attnInject = inInject
         if let p = L.ple {
-            if let inj = attnInject {
-                try QWHCOperator.encodeInject(enc, hal: hal, base: inj.base, src: inj.src, scale: inj.scale,
-                                              out: stream, rows: s.T, hidden: s.hidden, hc: s.hc)
-                attnInject = nil
-            }
-            try QWPLEOperator.encode(enc, hal: hal, p: p, s: s, stream: stream, out: s.h)
+            try QWPLEOperator.encode(enc, hal: hal, p: p, s: s, stream: stream, out: s.h, inInject: attnInject)
+            attnInject = nil
             h = s.h
         }
         try QWHCOperator.encodeMix(enc, hal: hal, hc: L.attnHC, s: s, stream: h, mixed: s.mixedA, inj: s.injA,

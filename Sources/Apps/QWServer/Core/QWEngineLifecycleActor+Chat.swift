@@ -42,7 +42,8 @@ extension QWEngineLifecycleActor {
     nonisolated public func handleChatCompletion(
         request: ChatCompletionRequest,
         onToken: ((String) -> Void)? = nil,
-        onTokenLogprob: ((ChatLogprobTokenEntry) -> Void)? = nil
+        onTokenLogprob: ((ChatLogprobTokenEntry) -> Void)? = nil,
+        shouldStop: (@Sendable () -> Bool)? = nil
     ) async throws -> ChatCompletionExecutionResult {
         try await selectModelIfNeeded(request.model, allowSameFamilyQuantSwitch: false)
         await beginInFlightRequest()
@@ -50,7 +51,8 @@ extension QWEngineLifecycleActor {
             let result = try await executeChatCompletion(
                 request: request,
                 onToken: onToken,
-                onTokenLogprob: onTokenLogprob
+                onTokenLogprob: onTokenLogprob,
+                shouldStop: shouldStop
             )
             await endInFlightRequest()
             return result
@@ -63,7 +65,8 @@ extension QWEngineLifecycleActor {
     nonisolated private func executeChatCompletion(
         request: ChatCompletionRequest,
         onToken: ((String) -> Void)?,
-        onTokenLogprob: ((ChatLogprobTokenEntry) -> Void)?
+        onTokenLogprob: ((ChatLogprobTokenEntry) -> Void)?,
+        shouldStop: (@Sendable () -> Bool)?
     ) async throws -> ChatCompletionExecutionResult {
         let memState = await autoMountAndPrepareMemoryState(for: request)
         let loaded = try await ensureLoaded()
@@ -96,11 +99,17 @@ extension QWEngineLifecycleActor {
         )
         let promptTokens = encodedWire.tokens
         let systemPrefixTokenCount = encodedWire.systemPrefixTokenCount
+        let imagePolicy = QWImageDecodePolicy(
+            allowDataURLs: true,
+            allowLocalImagePaths: config.allowLocalImagePaths,
+            allowRemoteImageURLs: config.allowRemoteImageURLs
+        )
         let mmTurn = try await QWImageDecoder.prepareMultimodalTurn(
             promptTokens: promptTokens,
             imageUrls: imageUrls,
             hiddenDim: loaded.descriptor.hidden,
             visionBackend: loaded.visionBackend,
+            policy: imagePolicy,
             onImageEncoded: { [logger] idx, total, h, w, ms in
                 logger.log(.info, String(format: "vision_encode_ms=%.1f image=%d/%d patches=%dx%d",
                                          ms, idx, total, h, w))
@@ -228,8 +237,13 @@ extension QWEngineLifecycleActor {
         telemetry.beginPrefill(promptTokens: genPromptTokens.count)
         let promptTokCount = genPromptTokens.count
         let stopOnSingleTool = (request.parallelToolCalls == false) && hasActiveTools
+        let cancelFlag = QWGenerationCancelFlag()
 
         let tokenCallback: @Sendable (Int) -> Bool = { id in
+            if cancelFlag.isCancelled || shouldStop?() == true {
+                capture.stoppedByCustomRule = true
+                return false
+            }
             if capture.ttftSec == nil {
                 let firstElapsed = max(0.0001, Date().timeIntervalSince(inferStart))
                 capture.ttftSec = firstElapsed
@@ -249,7 +263,7 @@ extension QWEngineLifecycleActor {
                 let lastClose = capture.fullText.range(of: "</function>", options: .backwards)
                 let insideOpenToolFunction: Bool
                 if let lo = lastOpen {
-                    insideOpenToolFunction = (lastClose == nil) || (lo.lowerBound > lastClose!.lowerBound)
+                    insideOpenToolFunction = lastClose.map { lo.lowerBound > $0.lowerBound } ?? true
                 } else {
                     insideOpenToolFunction = false
                 }
@@ -296,11 +310,10 @@ extension QWEngineLifecycleActor {
                 var earliestRange: Range<String.Index>? = nil
                 var matchedStop: String? = nil
                 for stopStr in customStopStrings {
-                    if let r = capture.fullText.range(of: stopStr) {
-                        if earliestRange == nil || r.lowerBound < earliestRange!.lowerBound {
-                            earliestRange = r
-                            matchedStop = stopStr
-                        }
+                    if let r = capture.fullText.range(of: stopStr),
+                       earliestRange.map({ r.lowerBound < $0.lowerBound }) ?? true {
+                        earliestRange = r
+                        matchedStop = stopStr
                     }
                 }
                 if let range = earliestRange, let matchedStop {
@@ -367,6 +380,9 @@ extension QWEngineLifecycleActor {
             && (effectiveSystemPrefixTokenCount ?? 0) < firstVisualOffset)
             ? effectiveSystemPrefixTokenCount
             : nil
+        let prefillProgressCallback: @Sendable (Int, Int) -> Void = { completed, total in
+            telemetry.updatePrefillProgress(completedTokens: completed, totalTokens: total)
+        }
         let genRequest = QWModelGenerationRequest(
             promptTokens: genPromptTokens,
             maxNewTokens: genMaxNew,
@@ -379,27 +395,36 @@ extension QWEngineLifecycleActor {
             onTokenLogprob: logprobCallback,
             constraint: activeGenConstraint,
             exactSpeculation: isConstrainedJson || sampling.hasExplicitSeed,
-            visualSpans: visualSpans
+            visualSpans: visualSpans,
+            onPrefillProgress: prefillProgressCallback
         )
 
         let metrics: QWModelCompletionMetrics
         preparingActive = false
         QWConcurrentBatchTracker.endPreparing()
         do {
-            metrics = try await withCheckedThrowingContinuation { cont in
-                DispatchQueue.global(qos: .userInitiated).async {
-                    do {
-                        let m = try capture.modelBackend.generate(
-                            request: genRequest,
-                            config: config,
-                            onToken: tokenCallback
-                        )
-                        cont.resume(returning: m)
-                    } catch {
-                        cont.resume(throwing: error)
+            metrics = try await withTaskCancellationHandler(
+                operation: {
+                    if Task.isCancelled || shouldStop?() == true {
+                        cancelFlag.cancel()
                     }
-                }
-            }
+                    return try await withCheckedThrowingContinuation { cont in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                let m = try capture.modelBackend.generate(
+                                    request: genRequest,
+                                    config: config,
+                                    onToken: tokenCallback
+                                )
+                                cont.resume(returning: m)
+                            } catch {
+                                cont.resume(throwing: error)
+                            }
+                        }
+                    }
+                },
+                onCancel: { cancelFlag.cancel() }
+            )
         } catch {
             telemetry.resetToIdle()
             QWRequestRecordStore.shared.append(QWRequestRecord(
@@ -521,229 +546,4 @@ extension QWEngineLifecycleActor {
         )
     }
 
-    nonisolated private static func makeLogprobEntry(_ lp: QWTokenLogprob, tokenizer: QWTokenizer) -> ChatLogprobTokenEntry {
-        let tokStr = (try? tokenizer.decode([lp.tokenId], skipSpecialTokens: false)) ?? ""
-        let tokBytes = Array(tokStr.utf8).map { Int($0) }
-        let tops: [ChatLogprobTokenEntry.TopLogprob] = lp.topCandidates.map { cand in
-            let cStr = (try? tokenizer.decode([cand.tokenId], skipSpecialTokens: false)) ?? ""
-            let cBytes = Array(cStr.utf8).map { Int($0) }
-            return ChatLogprobTokenEntry.TopLogprob(token: cStr, logprob: cand.logprob, bytes: cBytes)
-        }
-        return ChatLogprobTokenEntry(token: tokStr, logprob: lp.logprob, bytes: tokBytes, topLogprobs: tops)
-    }
-
-    nonisolated private static func heldStopSuffixUTF8(_ text: String, stops: [String]) -> Int {
-        var best = 0
-        for s in stops {
-            let maxChars = min(s.count - 1, text.count)
-            guard maxChars > 0 else { continue }
-            for len in stride(from: maxChars, through: 1, by: -1) {
-                let prefix = String(s.prefix(len))
-                if text.hasSuffix(prefix) {
-                    best = max(best, prefix.utf8.count)
-                    break
-                }
-            }
-        }
-        return best
-    }
-
-    nonisolated private static func firstCompleteJsonObjectEnd(in text: String) -> String.Index? {
-        var depth = 0
-        var inString = false
-        var escaped = false
-        var started = false
-        for idx in text.indices {
-            let ch = text[idx]
-            if inString {
-                if escaped {
-                    escaped = false
-                } else if ch == "\\" {
-                    escaped = true
-                } else if ch == "\"" {
-                    inString = false
-                }
-                continue
-            }
-            if ch == "\"" {
-                inString = true
-            } else if ch == "{" {
-                depth += 1
-                started = true
-            } else if ch == "}" {
-                depth -= 1
-                if started && depth == 0 {
-                    return text.index(after: idx)
-                }
-            }
-        }
-        return nil
-    }
-
-    /// Incrementally encodes a rendered chat wire string by caching tokenized prefixes up to
-    /// `<|im_start|>` turn boundaries across concurrent sessions. Because `<|im_start|>` is an added
-    /// special token starting with `<` (U+003C, ccc=0), NFC normalization and BPE chunking never cross the boundary.
-    func encodeWireIncrementally(wire: String, tokenizer tok: QWTokenizer, packPath: String) throws -> [Int] {
-        try encodeWireIncrementallyWithSystemPrefix(wire: wire, tokenizer: tok, packPath: packPath).tokens
-    }
-
-    func encodeWireIncrementallyWithSystemPrefix(
-        wire: String,
-        tokenizer tok: QWTokenizer,
-        packPath: String
-    ) throws -> (tokens: [Int], systemPrefixTokenCount: Int?) {
-        let marker = "<|im_start|>"
-        guard tok.tokenId(for: marker) != nil,
-              let lastRange = wire.range(of: marker, options: .backwards),
-              lastRange.lowerBound > wire.startIndex else {
-            return (try tok.encode(wire), nil)
-        }
-        let maxEntries = max(12, config.maxConcurrentSessions * 2 + 4)
-        func storePrefixEntry(_ entry: CachedTokenPrefixEntry) {
-            cachedTokenPrefixes.removeAll { $0.packPath == entry.packPath && $0.prefixWire == entry.prefixWire }
-            cachedTokenPrefixes.append(entry)
-            if cachedTokenPrefixes.count > maxEntries {
-                cachedTokenPrefixes.removeFirst(cachedTokenPrefixes.count - maxEntries)
-            }
-        }
-
-        var systemWire: String? = nil
-        if wire.hasPrefix("<|im_start|>system") || wire.hasPrefix("<|im_start|>developer") {
-            let afterFirst = wire.index(wire.startIndex, offsetBy: marker.count)
-            if let secondRange = wire.range(of: marker, range: afterFirst..<wire.endIndex),
-               secondRange.lowerBound <= lastRange.lowerBound {
-                systemWire = String(wire[..<secondRange.lowerBound])
-            }
-        }
-
-        let newPrefixWire = String(wire[..<lastRange.lowerBound])
-        let tailWire = String(wire[lastRange.lowerBound...])
-        let newUTF8Count = newPrefixWire.utf8.count
-        let markerUTF8 = Array(marker.utf8)
-
-        var bestIdx: Int? = nil
-        var bestLen = 0
-        for (idx, entry) in cachedTokenPrefixes.enumerated() where entry.packPath == packPath && !entry.prefixWire.isEmpty {
-            let count = entry.prefixWire.utf8.count
-            guard count > bestLen, count <= newUTF8Count,
-                  newPrefixWire.utf8.starts(with: entry.prefixWire.utf8) else { continue }
-            if count == newUTF8Count {
-                bestIdx = idx; bestLen = count
-            } else {
-                let deltaStart = newPrefixWire.utf8.index(newPrefixWire.utf8.startIndex, offsetBy: count)
-                if newPrefixWire.utf8[deltaStart...].starts(with: markerUTF8) {
-                    bestIdx = idx; bestLen = count
-                }
-            }
-        }
-
-        if let idx = bestIdx {
-            let matched = cachedTokenPrefixes.remove(at: idx)
-            cachedTokenPrefixes.append(matched)
-            let deltaStart = newPrefixWire.utf8.index(newPrefixWire.utf8.startIndex, offsetBy: matched.prefixWire.utf8.count)
-            let deltaWire = String(newPrefixWire[deltaStart...])
-            if deltaWire.isEmpty {
-                let tailTokens = try tok.encode(tailWire)
-                return (matched.prefixTokens + tailTokens, matched.systemTokenCount)
-            } else if deltaWire.utf8.starts(with: markerUTF8) {
-                let deltaTokens = try tok.encode(deltaWire)
-                let updatedPrefixTokens = matched.prefixTokens + deltaTokens
-                let sysCount = matched.systemTokenCount
-                    ?? (systemWire != nil && matched.prefixWire == systemWire ? matched.prefixTokens.count : nil)
-                storePrefixEntry(CachedTokenPrefixEntry(
-                    packPath: packPath, prefixWire: newPrefixWire,
-                    prefixTokens: updatedPrefixTokens, systemTokenCount: sysCount))
-                let tailTokens = try tok.encode(tailWire)
-                return (updatedPrefixTokens + tailTokens, sysCount)
-            }
-        }
-
-        var resolvedSystemTokenCount: Int? = nil
-        let prefixTokens: [Int]
-        if let sysW = systemWire, sysW.utf8.count < newUTF8Count, newPrefixWire.utf8.starts(with: sysW.utf8) {
-            let sysTokens = try tok.encode(sysW)
-            resolvedSystemTokenCount = sysTokens.count
-            storePrefixEntry(CachedTokenPrefixEntry(
-                packPath: packPath, prefixWire: sysW, prefixTokens: sysTokens, systemTokenCount: sysTokens.count))
-            let remStart = newPrefixWire.utf8.index(newPrefixWire.utf8.startIndex, offsetBy: sysW.utf8.count)
-            let remTokens = try tok.encode(String(newPrefixWire[remStart...]))
-            prefixTokens = sysTokens + remTokens
-        } else {
-            prefixTokens = try tok.encode(newPrefixWire)
-            if let sysW = systemWire, sysW.utf8.count == newUTF8Count {
-                resolvedSystemTokenCount = prefixTokens.count
-            }
-        }
-        storePrefixEntry(CachedTokenPrefixEntry(
-            packPath: packPath, prefixWire: newPrefixWire,
-            prefixTokens: prefixTokens, systemTokenCount: resolvedSystemTokenCount))
-        let tailTokens = try tok.encode(tailWire)
-        return (prefixTokens + tailTokens, resolvedSystemTokenCount)
-    }
-
-    nonisolated public func validateRequestCapabilities(_ request: ChatCompletionRequest) throws {
-        guard !request.extractImageUrls().isEmpty else { return }
-        let cfg = statusBox.getConfig()
-        let eager = cfg.loadVision || ProcessInfo.processInfo.environment["QW_VISION_EAGER"] == "1"
-        guard eager else {
-            throw QWMultimodalError.badArgument(
-                "Vision tower is disabled (--no-load-vision). Enable --load-vision to process image inputs."
-            )
-        }
-        let state = statusBox.engineState()
-        if state.isLoaded {
-            let visDepth = statusBox.getLoadedParamsInfo()?.modelDescriptor?.visDepth ?? 0
-            if !state.capabilities.contains(.vision) || visDepth <= 0
-                || !QWVisionOnDemandBackend.hasVisionWeights(modelPath: cfg.packPath) {
-                throw QWMultimodalError.badArgument("Loaded model does not support vision inputs.")
-            }
-        } else if !QWVisionOnDemandBackend.hasVisionWeights(modelPath: cfg.packPath) {
-            throw QWMultimodalError.badArgument("Model pack does not contain vision weights.")
-        }
-    }
-
-    nonisolated private static func prepareTokenHeal(
-        prepared: QWPreparedChatPrompt,
-        request: ChatCompletionRequest,
-        promptTokens: [Int],
-        systemPrefixTokenCount: Int?,
-        stops: Set<Int>,
-        tokenizer: QWTokenizer,
-        vocabulary: Int,
-        supportsTokenConstraints: Bool,
-        hasImages: Bool
-    ) -> (promptTokens: [Int], constraint: (any QWTokenConstraint)?, stripUTF8Count: Int, didPeel: Bool) {
-        guard prepared.isAssistantPrefill,
-              prepared.activeConstraint == nil,
-              supportsTokenConstraints,
-              !hasImages,
-              promptTokens.count >= 2 else {
-            return (promptTokens, prepared.activeConstraint, 0, false)
-        }
-        let prefillText = request.messages.last?.extractTextContent() ?? ""
-        let prefillUTF8 = Array(prefillText.utf8)
-        let lastTok = promptTokens[promptTokens.count - 1]
-        guard !prefillUTF8.isEmpty,
-              !stops.contains(lastTok),
-              (promptTokens.count - 1) >= (systemPrefixTokenCount ?? 0) else {
-            return (promptTokens, prepared.activeConstraint, 0, false)
-        }
-        let table = QWStructuredOutput.tokenTable(for: tokenizer, vocabulary: vocabulary)
-        guard lastTok >= 0 && lastTok < table.vocabulary,
-              let tokBytes = table.bytes[lastTok], !tokBytes.isEmpty,
-              tokBytes.count <= prefillUTF8.count,
-              prefillUTF8.suffix(tokBytes.count).elementsEqual(tokBytes) else {
-            return (promptTokens, prepared.activeConstraint, 0, false)
-        }
-        var probe = QWStreamDecoder(tokenizer)
-        guard let healedStr = try? probe.decode(lastTok, skipSpecialTokens: true),
-              !healedStr.isEmpty, probe.flush().isEmpty else {
-            return (promptTokens, prepared.activeConstraint, 0, false)
-        }
-        let constraint = QWPrefixHealingConstraint(prefixBytes: tokBytes, table: table)
-        guard constraint.hasSupport else {
-            return (promptTokens, prepared.activeConstraint, 0, false)
-        }
-        return (Array(promptTokens.dropLast()), constraint, healedStr.utf8.count, true)
-    }
 }

@@ -7,6 +7,7 @@ import QWCore
 import QWFlashNext
 import QWHead
 import QWHAL
+import QWKV
 
 /// One Flash-Next session behind the seam. The engine owns the numerics;
 /// this owns the request.
@@ -83,6 +84,38 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
                                      engineBackend: nil,
                                      reportedDrafts: parameters.enabled ? max(0, min(FNGPUSessionData.defaultMTPDrafts, parameters.mtpDrafts)) : 0,
                                      reportedBackend: mode.rawValue)
+    }
+
+    public static func estimateContextMemory(
+        descriptor: QWModelDescriptor, packPath: String?, contextTokens: Int, kvMode: QWKVMode,
+        mtpDrafts: Int, mtpBackend: String, prefillChunkSize: Int, tuning: QWEngineTuning,
+        physicalMemoryBytes: Int?
+    ) -> QWContextMemoryEstimate {
+        let clampedContext = max(64, min(1_048_576, contextTokens))
+        let perTokBytes: Int = switch kvMode {
+        case .f16: 31_296
+        case .q8:  18_096
+        case .q4:  11_752
+        }
+        let hiBit = (descriptor.quantization?.bits ?? 4) > 4
+        let minWeights = (hiBit ? 3_408 : 2_384) << 20
+        let onDisk = QWResidencyAdmission.flashNextOnDiskFootprint(packPath: packPath, minWeightsBytes: minWeights)
+        let weightsBytes = onDisk.weightsBytes + onDisk.pleBytes
+        let scratchBytes = (1408 << 20) + (836 << 20)
+        let fixedBytes = weightsBytes + scratchBytes
+        let alignedCap = QWCapacityPlan.steppedCapacity(clampedContext)
+        let kvCap = alignedCap >= 32_768 ? (alignedCap + 1024) : alignedCap
+        let kvBytes = kvCap * perTokBytes
+        let requiredBytes = fixedBytes + kvBytes
+        let reserveGiB = tuning.osReserveGiB ?? Double(QWCapacityBudget.osReserveBytes >> 30)
+        let reserveBytes = max(0, Int((reserveGiB * Double(1 << 30)).rounded()))
+        let availBytes = max(0, (physicalMemoryBytes ?? 0) - reserveBytes)
+        let maxFitting = availBytes > fixedBytes ? min(1_048_576, (availBytes - fixedBytes) / perTokBytes) : 0
+        return QWContextMemoryEstimate(
+            contextTokens: clampedContext, weightsBytes: weightsBytes, kvBytes: kvBytes,
+            scratchAndStateBytes: scratchBytes, requiredBytes: requiredBytes,
+            availableBytes: availBytes, maxFittingContext: maxFitting,
+            fits: availBytes == 0 || requiredBytes <= availBytes)
     }
 
     /// Capabilities supported by Flash-Next (`qwen4_exp`), including the 27-block ViT vision tower.
@@ -196,7 +229,8 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
                 evictPrefillScratch: options.prefillScratchEviction.shouldEvict(),
                 prewarmDoors: FlashNextModule.requiredDoors,
                 lsaConfig: options.lsaConfig,
-                streamNgrams: resolvedTuning.streamNgrams
+                streamNgrams: resolvedTuning.streamNgrams,
+                ropeYarnFactor: options.ropeYarnFactor
             )
         }
         return FlashNextModule(engine: engine)
@@ -293,13 +327,6 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
     /// Tokens committed per speculative round in this session.
     public func roundTokenCounts(_ state: any QWModuleSessionState) -> [Int] {
         (state as? FNGPUSessionState)?.data.roundTokenCounts ?? []
-    }
-
-    public func sampleLogits(_ state: any QWModuleSessionState) throws -> [Float] {
-        guard let engine else {
-            throw QWModuleError.notImplemented("FlashNextModule has no engine yet")
-        }
-        return engine.currentLogits()
     }
 
     /// The concrete session behind the seam. A state this module did not make

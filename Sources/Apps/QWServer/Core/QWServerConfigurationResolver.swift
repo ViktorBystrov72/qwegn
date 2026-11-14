@@ -3,97 +3,6 @@ import QWCore
 import QWEngine
 import QWQuant
 
-/// Resolved runtime configuration adhering to the standard configuration hierarchy:
-/// CLI Options > Environment Variables > Config File (~/.qwg/settings.json) > Built-in Defaults
-public struct QWResolvedServerConfig: Sendable, Equatable {
-    public var host: String, port: Int
-    public var modelPackPath: String, modelName: String, modelAlias: String
-    public var maxContext: Int, kvMode: String
-    public var ropeScalingType: String, ropeScalingFactor: Double
-    public var temperature: Double, topP: Double, topK: Int
-    public var maxTokens: Int, modelMaxLength: Int?
-    public var repetitionPenalty: Double, seed: Int
-    public var enableThinking: Bool, reasoningEffort: String, systemPrompt: String
-    public var speculativeDecodingEnabled: Bool, mtpDrafts: Int, mtpBackend: String?
-    public var mtpRelaxedMargin: Double, mtpRelaxedMinProb: Double, mtpDraftStrategy: String, mtpQuadraticSeeding: Bool
-    public var mtpAdaptiveDepth: Bool, mtpEntropyThreshold: Double
-    public var dflashDraftPackPath: String, dflashSelectorTopK: Int
-    public var gdnPrefill: String, evictPrefillScratch: String, prefillChunkSize: Int
-    public var maxConcurrentSessions: Int
-    public var lsaMode: String, lsaBudget: Int, lsaClusterBlock: Int, lsaSidecarPath: String
-    public var warmRAMLimitGB: Double, ssdCacheEnabled: Bool, ssdCacheLimitGB: Double, cacheDir: String
-    public var logDir: String, logFileName: String, logLevel: String
-    public var lazy: Bool, sourceSummary: [String: String]
-    public var loadVision: Bool = false
-    /// Engine tuning from the settings/profile; `QW_*` env vars overlay it in the engine.
-    public var engineTuning: QWEngineTuning = .default
-
-    public init(
-        host: String = "127.0.0.1", port: Int = 8080,
-        modelPackPath: String = "", modelName: String = "Qwen3.8-27B", modelAlias: String = "",
-        maxContext: Int = 4096, kvMode: String = "q4",
-        ropeScalingType: String = "none", ropeScalingFactor: Double = 1.0,
-        temperature: Double = 0.7, topP: Double = 0.9, topK: Int = 40,
-        maxTokens: Int = 512, modelMaxLength: Int? = nil,
-        repetitionPenalty: Double = 1.05, seed: Int = -1,
-        enableThinking: Bool = true, reasoningEffort: String = "xhigh", systemPrompt: String = "",
-        speculativeDecodingEnabled: Bool = true, mtpDrafts: Int = 3, mtpBackend: String? = "variational",
-        mtpRelaxedMargin: Double = 1.5, mtpRelaxedMinProb: Double = QWSpeculativeParameters.defaultRelaxedMinProb,
-        mtpDraftStrategy: String = "hybrid", mtpQuadraticSeeding: Bool = true,
-        mtpAdaptiveDepth: Bool = false, mtpEntropyThreshold: Double = 0.7,
-        dflashDraftPackPath: String = "", dflashSelectorTopK: Int = 16,
-        gdnPrefill: String = "chunked", evictPrefillScratch: String = "auto",
-        prefillChunkSize: Int = QWPrefillLimits.chunkRows,
-        maxConcurrentSessions: Int = 8,
-        lsaMode: String = "auto", lsaBudget: Int = QWLSAConfig.defaultBudget,
-        lsaClusterBlock: Int = QWLSAConfig.defaultClusterBlock, lsaSidecarPath: String = "",
-        warmRAMLimitGB: Double = 4.0, ssdCacheEnabled: Bool = false, ssdCacheLimitGB: Double = 10.0, cacheDir: String = "~/.qwg/cache",
-        logDir: String = "~/.qwg/logs", logFileName: String = "qwg.log", logLevel: String = "info",
-        lazy: Bool = true, loadVision: Bool = false, sourceSummary: [String: String] = [:]
-    ) {
-        self.host = host; self.port = port
-        self.modelPackPath = modelPackPath; self.modelName = modelName; self.modelAlias = modelAlias
-        self.maxContext = maxContext; self.kvMode = kvMode
-        self.ropeScalingType = ropeScalingType; self.ropeScalingFactor = ropeScalingFactor
-        self.temperature = temperature; self.topP = topP; self.topK = topK
-        self.maxTokens = maxTokens; self.modelMaxLength = modelMaxLength
-        self.repetitionPenalty = repetitionPenalty; self.seed = seed
-        self.enableThinking = enableThinking; self.reasoningEffort = reasoningEffort; self.systemPrompt = systemPrompt
-        self.speculativeDecodingEnabled = speculativeDecodingEnabled; self.mtpDrafts = mtpDrafts; self.mtpBackend = mtpBackend
-        self.mtpRelaxedMargin = mtpRelaxedMargin; self.mtpRelaxedMinProb = mtpRelaxedMinProb; self.mtpDraftStrategy = mtpDraftStrategy; self.mtpQuadraticSeeding = mtpQuadraticSeeding
-        self.mtpAdaptiveDepth = mtpAdaptiveDepth; self.mtpEntropyThreshold = mtpEntropyThreshold
-        self.dflashDraftPackPath = dflashDraftPackPath; self.dflashSelectorTopK = dflashSelectorTopK
-        self.gdnPrefill = gdnPrefill; self.evictPrefillScratch = evictPrefillScratch
-        self.prefillChunkSize = prefillChunkSize
-        self.maxConcurrentSessions = max(1, min(16, maxConcurrentSessions))
-        self.lsaMode = lsaMode; self.lsaBudget = lsaBudget
-        self.lsaClusterBlock = lsaClusterBlock; self.lsaSidecarPath = lsaSidecarPath
-        self.warmRAMLimitGB = warmRAMLimitGB; self.ssdCacheEnabled = ssdCacheEnabled; self.ssdCacheLimitGB = ssdCacheLimitGB; self.cacheDir = cacheDir
-        self.logDir = logDir; self.logFileName = logFileName; self.logLevel = logLevel
-        self.lazy = lazy; self.loadVision = loadVision; self.sourceSummary = sourceSummary
-    }
-
-    /// Cohesive sampling parameters resolved for the server.
-    public var samplingParameters: QWSamplingParameters {
-        QWSamplingParameters(temperature: temperature, topP: topP, topK: topK,
-                             maxTokens: maxTokens, repetitionPenalty: repetitionPenalty, seed: seed)
-    }
-
-    /// Cohesive speculative decoding parameters resolved for the server.
-    public var speculativeParameters: QWSpeculativeParameters {
-        QWSpeculativeParameters(enabled: speculativeDecodingEnabled, mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
-                                mtpRelaxedMargin: mtpRelaxedMargin, mtpRelaxedMinProb: mtpRelaxedMinProb,
-                                mtpDraftStrategy: mtpDraftStrategy, mtpQuadraticSeeding: mtpQuadraticSeeding,
-                                adaptiveDepth: mtpAdaptiveDepth, entropyThreshold: mtpEntropyThreshold)
-    }
-
-    /// Cohesive Latent Sparse Attention configuration resolved for the server.
-    public var lsaConfig: QWLSAConfig {
-        QWLSAConfig(mode: QWLSAMode.resolve(lsaMode) ?? .off, budget: lsaBudget,
-                    clusterBlock: lsaClusterBlock, sidecarPath: lsaSidecarPath)
-    }
-}
-
 /// Resolves server settings with strict precedence:
 /// Request > CLI Options > Environment Variables > Server Config > Model Config > Built-in Defaults
 public enum QWServerConfigurationResolver {
@@ -120,6 +29,7 @@ public enum QWServerConfigurationResolver {
 
     public static func resolve(
         cliConfigPath: String? = nil, cliPack: String? = nil, cliHost: String? = nil, cliPort: Int? = nil,
+        cliApiKey: String? = nil, cliAllowLocalImagePaths: Bool? = nil, cliAllowRemoteImageURLs: Bool? = nil,
         cliModelName: String? = nil, cliModelAlias: String? = nil, cliMaxContext: Int? = nil, cliKVMode: String? = nil,
         cliTemperature: Double? = nil, cliTopP: Double? = nil, cliTopK: Int? = nil, cliMaxTokens: Int? = nil,
         cliRepetitionPenalty: Double? = nil, cliSeed: Int? = nil, cliEnableThinking: Bool? = nil,
@@ -375,6 +285,48 @@ public enum QWServerConfigurationResolver {
             return fileSettings.port
         }()
 
+        let resolvedApiKey: String = {
+            if let k = cliApiKey, !k.isEmpty {
+                sources["apiKey"] = "cli"
+                return k
+            }
+            if let k = environment["QWG_API_KEY"], !k.isEmpty {
+                sources["apiKey"] = "env"
+                return k
+            }
+            sources["apiKey"] = fileSettings.apiKey.isEmpty ? "none" : "config-file"
+            return fileSettings.apiKey
+        }()
+
+        let resolvedCorsAllowedOrigins: [String] = {
+            if let raw = environment["QWG_CORS_ALLOWED_ORIGINS"], !raw.isEmpty {
+                sources["corsAllowedOrigins"] = "env"
+                return raw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            }
+            sources["corsAllowedOrigins"] = fileSettings.corsAllowedOrigins.isEmpty ? "default" : "config-file"
+            return fileSettings.corsAllowedOrigins
+        }()
+
+        let resolvedAllowLocalImagePaths: Bool = {
+            if let v = cliAllowLocalImagePaths { sources["allowLocalImagePaths"] = "cli"; return v }
+            if let envStr = environment["QWG_ALLOW_LOCAL_IMAGE_PATHS"] {
+                sources["allowLocalImagePaths"] = "env"
+                return envStr == "1" || envStr.lowercased() == "true"
+            }
+            sources["allowLocalImagePaths"] = "config-file"
+            return fileSettings.allowLocalImagePaths
+        }()
+
+        let resolvedAllowRemoteImageURLs: Bool = {
+            if let v = cliAllowRemoteImageURLs { sources["allowRemoteImageURLs"] = "cli"; return v }
+            if let envStr = environment["QWG_ALLOW_REMOTE_IMAGE_URLS"] {
+                sources["allowRemoteImageURLs"] = "env"
+                return envStr == "1" || envStr.lowercased() == "true"
+            }
+            sources["allowRemoteImageURLs"] = "config-file"
+            return fileSettings.allowRemoteImageURLs
+        }()
+
         // 7. Context & KV Mode
         let resolvedMaxContext: Int = {
             if let c = cliMaxContext, c > 0 {
@@ -496,283 +448,52 @@ public enum QWServerConfigurationResolver {
             sources["mtpDrafts"] = "config-file"; return fileSettings.mtpDrafts
         }()
 
-        let resolvedDFlashDraftPackPath: String = {
-            if let p = cliDFlashDraftPack, !p.isEmpty { sources["dflashDraftPackPath"] = "cli"; return p.canonicalPath }
-            if let p = environment["QW_DFLASH_DRAFT_PACK"] ?? environment["QWG_DFLASH_DRAFT_PACK"], !p.isEmpty {
-                sources["dflashDraftPackPath"] = "env"; return p.canonicalPath
-            }
-            if !fileSettings.dflashDraftPackPath.isEmpty {
-                sources["dflashDraftPackPath"] = "config-file"; return fileSettings.dflashDraftPackPath.canonicalPath
-            }
-            if let first = QWServerSettings.scanDrafterModelsDirectory().first(where: { !$0.packPath.isEmpty }) {
-                sources["dflashDraftPackPath"] = "discovered (~/.qwg/models/\(first.name))"; return first.packPath
-            }
-            sources["dflashDraftPackPath"] = "default"
-            return QWDFlashConfig.defaultPackPath
-        }()
-
-        let resolvedMTPBackend: String? = {
-            if let b = cliMTPBackend, !b.isEmpty { sources["mtpBackend"] = "cli"; return b }
-            if let bs = cliDFlashBlockSize, (2...16).contains(bs) {
-                sources["mtpBackend"] = "cli (--dflash-window)"
-                return QWDFlashConfig.inferBackendAndMaxDrafts(packPath: resolvedDFlashDraftPackPath).backend
-            }
-            if let b = environment["QWG_MTP_BACKEND"], !b.isEmpty { sources["mtpBackend"] = "env"; return b }
-            if !fileSettings.mtpBackend.isEmpty { sources["mtpBackend"] = "config-file"; return fileSettings.mtpBackend }
-            return nil
-        }()
-
-        let resolvedDFlashSelectorTopK: Int = {
-            if let tk = cliDFlashTopK, (1...16).contains(tk) { sources["dflashSelectorTopK"] = "cli"; return tk }
-            if let envStr = environment["QW_DFLASH_TOP_K"] ?? environment["QWG_DFLASH_TOP_K"],
-               let tk = Int(envStr), (1...16).contains(tk) { sources["dflashSelectorTopK"] = "env"; return tk }
-            sources["dflashSelectorTopK"] = "config-file"; return max(1, min(16, fileSettings.dflashSelectorTopK))
-        }()
-
-        // 11. GDN Prefill & Eviction
-        let resolvedGDNPrefill: String = {
-            if let g = cliGDNPrefill, !g.isEmpty { sources["gdnPrefill"] = "cli"; return g }
-            if let g = environment["QWG_GDN_PREFILL"], !g.isEmpty { sources["gdnPrefill"] = "env"; return g }
-            sources["gdnPrefill"] = "config-file"; return fileSettings.gdnPrefill
-        }()
-
-        let resolvedEvictScratch: String = {
-            if let e = cliEvictScratch, !e.isEmpty { sources["evictPrefillScratch"] = "cli"; return e }
-            if let e = environment["QWG_EVICT_PREFILL_SCRATCH"], !e.isEmpty { sources["evictPrefillScratch"] = "env"; return e }
-            sources["evictPrefillScratch"] = "config-file"; return fileSettings.evictPrefillScratch
-        }()
-
-        let resolvedPrefillChunkSize: Int = {
-            if let c = cliPrefillChunkSize, c >= QWPrefillLimits.minRows {
-                sources["prefillChunkSize"] = "cli"; return QWPrefillLimits.clampedRows(c)
-            }
-            if let envStr = environment["QWG_PREFILL_CHUNK_SIZE"], let c = Int(envStr), c >= QWPrefillLimits.minRows {
-                sources["prefillChunkSize"] = "env"; return QWPrefillLimits.clampedRows(c)
-            }
-            sources["prefillChunkSize"] = "config-file"; return QWPrefillLimits.clampedRows(fileSettings.prefillChunkSize)
-        }()
-
-        let resolvedMaxConcurrentSessions: Int = {
-            if let s = cliMaxConcurrentSessions, (1...16).contains(s) {
-                sources["maxConcurrentSessions"] = "cli"; return s
-            }
-            if let envStr = environment["QWG_MAX_CONCURRENT_SESSIONS"] ?? environment["QW_MAX_CONCURRENT_SESSIONS"],
-               let s = Int(envStr), (1...16).contains(s) {
-                sources["maxConcurrentSessions"] = "env"; return s
-            }
-            sources["maxConcurrentSessions"] = "config-file"; return max(1, min(16, fileSettings.maxConcurrentSessions))
-        }()
-
-        let resolvedLSAMode: String = {
-            if let m = cliLSAMode, !m.isEmpty { sources["lsaMode"] = "cli"; return m.lowercased() }
-            if let m = environment["QWG_LSA_MODE"] ?? environment["QW_LSA_MODE"], !m.isEmpty {
-                sources["lsaMode"] = "env"; return m.lowercased()
-            }
-            sources["lsaMode"] = "config-file"; return fileSettings.lsaMode.lowercased()
-        }()
-
-        let resolvedLSABudget: Int = {
-            if let b = cliLSABudget { sources["lsaBudget"] = "cli"; return b }
-            if let envStr = environment["QWG_LSA_BUDGET"] ?? environment["QW_LSA_BUDGET"], let b = Int(envStr) {
-                sources["lsaBudget"] = "env"; return b
-            }
-            sources["lsaBudget"] = "config-file"; return fileSettings.lsaBudget
-        }()
-
-        let resolvedLSAClusterBlock: Int = {
-            if let cb = cliLSAClusterBlock { sources["lsaClusterBlock"] = "cli"; return cb }
-            if let envStr = environment["QWG_LSA_CLUSTER_BLOCK"] ?? environment["QW_LSA_CLUSTER_BLOCK"], let cb = Int(envStr) {
-                sources["lsaClusterBlock"] = "env"; return cb
-            }
-            sources["lsaClusterBlock"] = "config-file"; return fileSettings.lsaClusterBlock
-        }()
-
-        let resolvedLSASidecarPath: String = {
-            if let sp = cliLSASidecarPath, !sp.isEmpty { sources["lsaSidecarPath"] = "cli"; return sp }
-            if let sp = environment["QWG_LSA_SIDECAR"] ?? environment["QW_LSA_SIDECAR"], !sp.isEmpty {
-                sources["lsaSidecarPath"] = "env"; return sp
-            }
-            sources["lsaSidecarPath"] = "config-file"; return fileSettings.lsaSidecarPath
-        }()
-
-        // 12. Cache
-        let resolvedWarmRAM: Double = {
-            if let w = cliWarmRAMLimitGB { sources["warmRAM"] = "cli"; return w }
-            if let envStr = environment["QWG_WARM_CACHE_LIMIT"], let w = Double(envStr) { sources["warmRAM"] = "env"; return w }
-            sources["warmRAM"] = "config-file"; return fileSettings.warmRAMLimitGB
-        }()
-
-        let resolvedSSDCacheEnabled: Bool = {
-            if let s = cliSSDCacheLimitGB { sources["ssdCacheEnabled"] = "cli"; return s > 0 }
-            if let envStr = environment["QWG_SSD_CACHE_ENABLED"] ?? environment["QW_SSD_CACHE_ENABLED"] {
-                sources["ssdCacheEnabled"] = "env"; return envStr == "1" || envStr.lowercased() == "true"
-            }
-            if let envStr = environment["QWG_SSD_CACHE_LIMIT"], let s = Double(envStr) { sources["ssdCacheEnabled"] = "env"; return s > 0 }
-            sources["ssdCacheEnabled"] = "config-file"; return fileSettings.ssdCacheEnabled
-        }()
-
-        let resolvedSSDCache: Double = {
-            if let s = cliSSDCacheLimitGB { sources["ssdCache"] = "cli"; return s }
-            if let envStr = environment["QWG_SSD_CACHE_LIMIT"], let s = Double(envStr) { sources["ssdCache"] = "env"; return s }
-            sources["ssdCache"] = "config-file"; return resolvedSSDCacheEnabled ? fileSettings.ssdCacheLimitGB : 0.0
-        }()
-
-        let resolvedCacheDir: String = {
-            if let c = cliCacheDir, !c.isEmpty { sources["cacheDir"] = "cli"; return c }
-            if let c = environment["QWG_CACHE_DIR"], !c.isEmpty { sources["cacheDir"] = "env"; return c }
-            sources["cacheDir"] = "config-file"; return fileSettings.cacheDir
-        }()
-
-        // 13. Logging & Lazy
-        let resolvedLogLevel: String = {
-            if let l = cliLogLevel, !l.isEmpty { sources["logLevel"] = "cli"; return l }
-            if let l = environment["QWG_LOG_LEVEL"], !l.isEmpty { sources["logLevel"] = "env"; return l }
-            sources["logLevel"] = "config-file"; return fileSettings.logLevel
-        }()
-
-        let resolvedLogDir: String = {
-            if let d = cliLogDir, !d.isEmpty { sources["logDir"] = "cli"; return d }
-            if let d = environment["QWG_LOG_DIR"], !d.isEmpty { sources["logDir"] = "env"; return d }
-            sources["logDir"] = "config-file"; return fileSettings.logDir
-        }()
-
-        let resolvedLogFile: String = {
-            if let f = cliLogFileName, !f.isEmpty { sources["logFileName"] = "cli"; return f }
-            if let f = environment["QWG_LOG_FILE"], !f.isEmpty { sources["logFileName"] = "env"; return f }
-            sources["logFileName"] = "config-file"; return fileSettings.logFileName
-        }()
-
-        let resolvedLazy = cliLazy ?? fileSettings.lazyLoad
-
-        let (resolvedRopeType, resolvedRopeFactor): (String, Double) = {
-            if let envStr = environment["QW_ROPE_YARN_FACTOR"], let factor = Double(envStr), factor > 0 {
-                sources["ropeScaling"] = "env (QW_ROPE_YARN_FACTOR=\(factor))"
-                return (factor > 1.0 ? "yarn" : "none", factor)
-            }
-            let nativeMaxPos = (!resolvedPack.isEmpty
-                ? (try? QWModelGeometry.load(packPath: resolvedPack).maxPositionEmbeddings)
-                : nil) ?? QWModelGeometry.qwen38_27b.maxPositionEmbeddings
-            if resolvedMaxContext > nativeMaxPos {
-                let autoFactor = Double(resolvedMaxContext) / Double(nativeMaxPos)
-                sources["ropeScaling"] = "auto-derived (context \(resolvedMaxContext) > native \(nativeMaxPos))"
-                return ("yarn", autoFactor)
-            }
-            sources["ropeScaling"] = "config-file"
-            return (fileSettings.ropeScalingType, fileSettings.ropeScalingFactor)
-        }()
-
-        let resolvedSpeculativeEnabled: Bool = {
-            if let envStr = environment["QWG_SPECULATIVE_DECODING"] ?? environment["QW_SPECULATIVE"] {
-                sources["speculativeDecodingEnabled"] = "env"
-                return envStr == "1" || envStr.lowercased() == "true"
-            }
-            sources["speculativeDecodingEnabled"] = "config-file"; return fileSettings.speculativeDecodingEnabled
-        }()
-
-        let resolvedMTPAdaptiveDepth: Bool = {
-            if let ad = cliMTPAdaptiveDepth { sources["mtpAdaptiveDepth"] = "cli"; return ad }
-            if let envStr = environment["QW_MTP_ADAPTIVE_DEPTH"] ?? environment["QWG_MTP_ADAPTIVE_DEPTH"] {
-                sources["mtpAdaptiveDepth"] = "env"; return envStr == "1" || envStr.lowercased() == "true"
-            }
-            sources["mtpAdaptiveDepth"] = "config-file"; return fileSettings.mtpAdaptiveDepth
-        }()
-
-        let resolvedMTPEntropyThreshold: Double = {
-            if let et = cliMTPEntropyThreshold { sources["mtpEntropyThreshold"] = "cli"; return et }
-            if let envStr = environment["QW_MTP_ADAPTIVE_ENTROPY_THRESHOLD"] ?? environment["QWG_MTP_ADAPTIVE_ENTROPY_THRESHOLD"],
-               let val = Double(envStr) { sources["mtpEntropyThreshold"] = "env"; return val }
-            sources["mtpEntropyThreshold"] = "config-file"; return fileSettings.mtpEntropyThreshold
-        }()
-
-        let resolvedMTPRelaxedMargin: Double = {
-            if let rm = cliMTPRelaxedMargin { sources["mtpRelaxedMargin"] = "cli"; return max(0.0, rm) }
-            if let envStr = environment["QW_MTP_RELAXED_MARGIN"] ?? environment["QWG_MTP_RELAXED_MARGIN"],
-               let val = Double(envStr) { sources["mtpRelaxedMargin"] = "env"; return max(0.0, val) }
-            sources["mtpRelaxedMargin"] = "config-file"; return max(0.0, fileSettings.mtpRelaxedMargin)
-        }()
-        let resolvedMTPRelaxedMinProb = resolveRelaxedMinProb(cli: cliMTPRelaxedMinProb, environment: environment,
-                                                              file: fileSettings.mtpRelaxedMinProb, sources: &sources)
-
-        let resolvedMTPDraftStrategy: String = {
-            if let ds = cliMTPDraftStrategy, !ds.isEmpty { sources["mtpDraftStrategy"] = "cli"; return ds }
-            if let envStr = environment["QW_MTP_DRAFT_STRATEGY"] ?? environment["QWG_MTP_DRAFT_STRATEGY"], !envStr.isEmpty {
-                sources["mtpDraftStrategy"] = "env"; return envStr
-            }
-            sources["mtpDraftStrategy"] = "config-file"; return fileSettings.mtpDraftStrategy
-        }()
-
-        let resolvedMTPQuadraticSeeding: Bool = {
-            if let qs = cliMTPQuadraticSeeding { sources["mtpQuadraticSeeding"] = "cli"; return qs }
-            if let envStr = environment["QW_MTP_QUADRATIC_SEEDING"] ?? environment["QWG_MTP_QUADRATIC_SEEDING"] {
-                sources["mtpQuadraticSeeding"] = "env"; return envStr == "1" || envStr.lowercased() == "true"
-            }
-            sources["mtpQuadraticSeeding"] = "config-file"; return fileSettings.mtpQuadraticSeeding
-        }()
-
-        let resolvedLoadVision: Bool = {
-            if let cli = cliLoadVision {
-                sources["loadVision"] = "cli (--load-vision)"; return cli
-            }
-            if let envStr = environment["QWG_LOAD_VISION"] ?? environment["QW_LOAD_VISION"] ?? environment["QW_VISION_EAGER"] {
-                sources["loadVision"] = "env"; return envStr == "1" || envStr.lowercased() == "true"
-            }
-            sources["loadVision"] = "config-file"; return fileSettings.loadVision
-        }()
-
-        var resolvedTuning = fileSettings.resolvedEngineTuning
-        if let cliPol = cliMemoryPolicy, let parsed = QWMemoryPolicy(rawValue: cliPol) {
-            resolvedTuning.memoryPolicy = parsed
-            sources["memoryPolicy"] = "cli (--memory-policy)"
-        }
-        if let cliOS = cliOSReserveGiB {
-            resolvedTuning.osReserveGiB = cliOS
-            sources["osReserveGiB"] = "cli (--os-reserve)"
-        }
-        if let cliRes = cliResidentExpertsPerLayer {
-            resolvedTuning.residentExpertsPerLayer = cliRes > 0 ? cliRes : nil
-            sources["residentExpertsPerLayer"] = "cli (--resident-experts-per-layer)"
-        }
-        if let cliBudget = cliMoESpecBudget {
-            resolvedTuning.moeSpecBudget = cliBudget
-            sources["moeSpecBudget"] = "cli (--moe-spec-budget)"
-        }
-        if let cliStream = cliStreamNgrams {
-            resolvedTuning.streamNgrams = cliStream
-            sources["streamNgrams"] = "cli (--stream-ngrams)"
-        }
-
-        for id in QWEngineTuning.knobIds where sources[id] == nil {
-            if let env = QWEngineTuning.environmentNames[id], environment[env] != nil {
-                sources[id] = "env"
-            } else if fileSettings.engineTuning[id] != nil {
-                sources[id] = "config-file"
-            }
-        }
+        let extra = Self.resolveSpeculativeAndTuning(
+            fileSettings: fileSettings, environment: environment, sources: &sources,
+            resolvedPack: resolvedPack, resolvedMaxContext: resolvedMaxContext,
+            cliMTPBackend: cliMTPBackend, cliDFlashDraftPack: cliDFlashDraftPack,
+            cliDFlashBlockSize: cliDFlashBlockSize, cliDFlashTopK: cliDFlashTopK,
+            cliGDNPrefill: cliGDNPrefill, cliEvictScratch: cliEvictScratch,
+            cliPrefillChunkSize: cliPrefillChunkSize, cliMaxConcurrentSessions: cliMaxConcurrentSessions,
+            cliLSAMode: cliLSAMode, cliLSABudget: cliLSABudget,
+            cliLSAClusterBlock: cliLSAClusterBlock, cliLSASidecarPath: cliLSASidecarPath,
+            cliWarmRAMLimitGB: cliWarmRAMLimitGB, cliSSDCacheLimitGB: cliSSDCacheLimitGB,
+            cliCacheDir: cliCacheDir, cliLogDir: cliLogDir, cliLogFileName: cliLogFileName,
+            cliLogLevel: cliLogLevel, cliLazy: cliLazy,
+            cliMTPAdaptiveDepth: cliMTPAdaptiveDepth, cliMTPEntropyThreshold: cliMTPEntropyThreshold,
+            cliMTPRelaxedMargin: cliMTPRelaxedMargin, cliMTPRelaxedMinProb: cliMTPRelaxedMinProb,
+            cliMTPDraftStrategy: cliMTPDraftStrategy, cliMTPQuadraticSeeding: cliMTPQuadraticSeeding,
+            cliLoadVision: cliLoadVision, cliMemoryPolicy: cliMemoryPolicy,
+            cliOSReserveGiB: cliOSReserveGiB, cliResidentExpertsPerLayer: cliResidentExpertsPerLayer,
+            cliMoESpecBudget: cliMoESpecBudget, cliStreamNgrams: cliStreamNgrams)
         var resolvedConfig = QWResolvedServerConfig(
-            host: resolvedHost, port: resolvedPort, modelPackPath: resolvedPack,
+            host: resolvedHost, port: resolvedPort,
+            apiKey: resolvedApiKey, corsAllowedOrigins: resolvedCorsAllowedOrigins,
+            allowLocalImagePaths: resolvedAllowLocalImagePaths, allowRemoteImageURLs: resolvedAllowRemoteImageURLs,
+            modelPackPath: resolvedPack,
             modelName: resolvedModelName, modelAlias: resolvedModelAlias,
             maxContext: resolvedMaxContext, kvMode: resolvedKVMode,
-            ropeScalingType: resolvedRopeType, ropeScalingFactor: resolvedRopeFactor,
+            ropeScalingType: extra.ropeType, ropeScalingFactor: extra.ropeFactor,
             temperature: resolvedTemperature, topP: resolvedTopP, topK: resolvedTopK,
             maxTokens: resolvedMaxTokens, modelMaxLength: resolvedModelMaxLength,
             repetitionPenalty: resolvedRepetitionPenalty, seed: resolvedSeed,
             enableThinking: resolvedEnableThinking, reasoningEffort: resolvedReasoningEffort,
-            systemPrompt: resolvedSystemPrompt, speculativeDecodingEnabled: resolvedSpeculativeEnabled,
-            mtpDrafts: resolvedMTPDrafts, mtpBackend: resolvedMTPBackend,
-            mtpRelaxedMargin: resolvedMTPRelaxedMargin, mtpRelaxedMinProb: resolvedMTPRelaxedMinProb, mtpDraftStrategy: resolvedMTPDraftStrategy,
-            mtpQuadraticSeeding: resolvedMTPQuadraticSeeding, mtpAdaptiveDepth: resolvedMTPAdaptiveDepth,
-            mtpEntropyThreshold: resolvedMTPEntropyThreshold, dflashDraftPackPath: resolvedDFlashDraftPackPath,
-            dflashSelectorTopK: resolvedDFlashSelectorTopK, gdnPrefill: resolvedGDNPrefill,
-            evictPrefillScratch: resolvedEvictScratch, prefillChunkSize: resolvedPrefillChunkSize,
-            maxConcurrentSessions: resolvedMaxConcurrentSessions,
-            lsaMode: resolvedLSAMode, lsaBudget: resolvedLSABudget,
-            lsaClusterBlock: resolvedLSAClusterBlock, lsaSidecarPath: resolvedLSASidecarPath,
-            warmRAMLimitGB: resolvedWarmRAM, ssdCacheEnabled: resolvedSSDCacheEnabled,
-            ssdCacheLimitGB: resolvedSSDCache, cacheDir: resolvedCacheDir,
-            logDir: resolvedLogDir, logFileName: resolvedLogFile,
-            logLevel: resolvedLogLevel, lazy: resolvedLazy, loadVision: resolvedLoadVision, sourceSummary: sources
+            systemPrompt: resolvedSystemPrompt, speculativeDecodingEnabled: extra.speculativeEnabled,
+            mtpDrafts: resolvedMTPDrafts, mtpBackend: extra.mtpBackend,
+            mtpRelaxedMargin: extra.mtpRelaxedMargin, mtpRelaxedMinProb: extra.mtpRelaxedMinProb, mtpDraftStrategy: extra.mtpDraftStrategy,
+            mtpQuadraticSeeding: extra.mtpQuadraticSeeding, mtpAdaptiveDepth: extra.mtpAdaptiveDepth,
+            mtpEntropyThreshold: extra.mtpEntropyThreshold, dflashDraftPackPath: extra.dflashDraftPackPath,
+            dflashSelectorTopK: extra.dflashSelectorTopK, gdnPrefill: extra.gdnPrefill,
+            evictPrefillScratch: extra.evictPrefillScratch, prefillChunkSize: extra.prefillChunkSize,
+            maxConcurrentSessions: extra.maxConcurrentSessions,
+            lsaMode: extra.lsaMode, lsaBudget: extra.lsaBudget,
+            lsaClusterBlock: extra.lsaClusterBlock, lsaSidecarPath: extra.lsaSidecarPath,
+            warmRAMLimitGB: extra.warmRAM, ssdCacheEnabled: extra.ssdCacheEnabled,
+            ssdCacheLimitGB: extra.ssdCache, cacheDir: extra.cacheDir,
+            logDir: extra.logDir, logFileName: extra.logFile,
+            logLevel: extra.logLevel, lazy: extra.lazy, loadVision: extra.loadVision, sourceSummary: sources
         )
-        resolvedConfig.engineTuning = resolvedTuning
+        resolvedConfig.engineTuning = extra.tuning
         return resolvedConfig
     }
 }

@@ -30,11 +30,11 @@ final class QWMMTests: XCTestCase {
 
     static func ints(_ name: String) throws -> [Int32] {
         let d = try fixture(name)
-        return d.withUnsafeBytes { Array($0.bindMemory(to: Int32.self)) }
+        return d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Int32.self)) }
     }
     static func floats(_ name: String) throws -> [Float] {
         let d = try fixture(name)
-        return d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        return d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) }
     }
 
     static func grid(_ j: QWJson) throws -> QWVisionGrid {
@@ -392,4 +392,13 @@ extension QWJson {
         if case .object(let p) = self { return p }
         return []
     }
+}
+
+private func qwVisionCuSeqlens(grid: QWVisionGrid) -> [Int32] {
+    var cu = [Int32](); cu.reserveCapacity(grid.t + 1)
+    var acc: Int32 = 0
+    cu.append(acc)
+    let step = Int32(grid.h * grid.w)
+    for _ in 0..<grid.t { acc += step; cu.append(acc) }
+    return cu
 }

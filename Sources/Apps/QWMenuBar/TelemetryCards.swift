@@ -1,661 +1,504 @@
-// TelemetryCards.swift — CupertinoTelemetryView card subviews
-// (split from CupertinoTelemetryView.swift; same-module extension).
-import SwiftUI
+// TelemetryCards.swift — Popover header, model lifecycle, unified metrics, and dock
+
 import AppKit
+import QWCore
 import QWServer
+import SwiftUI
 
 extension CupertinoTelemetryView {
-    // MARK: - 1. Command Header Bar
-    var headerSection: some View {
-        HStack(spacing: 10) {
-            // Emblem with live status halo badge
-            ZStack(alignment: .bottomTrailing) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color.white.opacity(0.07))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 0.5)
-                        )
-                    QGProcessorLogoView()
-                        .frame(width: 20, height: 20)
-                }
-                .frame(width: 32, height: 32)
+    // MARK: - Header (Daemon Controls Separated from Model Lifecycle)
 
-                // Live status dot + pulse when actively generating
-                ZStack {
-                    if telemetry.isServing {
-                        Circle()
-                            .fill(statusIndicatorColor)
-                            .frame(width: 12, height: 12)
-                            .opacity(isGenerating && !reduceMotion ? 0.40 : 0.15)
-                            .scaleEffect(isGenerating && !reduceMotion ? 1.35 : 1.0)
-                            .animation(isGenerating && !reduceMotion
-                                       ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
-                                       : .default, value: isGenerating)
-                    }
-                    Circle()
-                        .fill(Color(hex: "#111318"))
-                        .frame(width: 10, height: 10)
-                    Circle()
-                        .fill(statusIndicatorColor)
-                        .frame(width: 7, height: 7)
-                        .shadow(color: statusIndicatorColor.opacity(0.7), radius: 2)
-                }
-                .offset(x: 2, y: 2)
+    var headerSection: some View {
+        let daemonBusy = telemetry.engineState.isTransitioning || telemetry.isDaemonTransitioning
+        let modelBusy = telemetry.isModelTransitioning
+            || telemetry.enginePhase == .loading
+            || telemetry.enginePhase == .unloading
+        let isRunning = telemetry.isAnyServerRunning
+        let powerTint = isRunning ? TelemetryTheme.failure : TelemetryTheme.active
+
+        return HStack(spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(statusDotColor.opacity(isActivelyGenerating && !reduceMotion ? 0.16 : 0.08))
+                    .frame(width: 32, height: 32)
+                QGProcessorLogoView()
+                    .frame(width: 20, height: 20)
+                    .foregroundStyle(TelemetryTheme.logoInk)
             }
 
-            // Title, Version & Status Subtitle
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text("Qwegn Engine")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(TelemetryTheme.primary(increasedContrast: contrast == .increased))
-                        .lineLimit(1)
-
-                    Text(telemetry.engineVersion.hasPrefix("v") ? telemetry.engineVersion : "v\(telemetry.engineVersion)")
-                        .font(TelemetryTheme.numeric(9, .medium))
-                        .foregroundColor(.white.opacity(0.70))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1.5)
-                        .background(Color.white.opacity(0.08))
-                        .cornerRadius(TelemetryTheme.Radius.small)
+                HStack(spacing: 5) {
+                    Text("Qwegn")
+                        .font(TelemetryTheme.ui(13, .semibold))
+                        .foregroundStyle(TelemetryTheme.primary(increasedContrast: contrast == .increased))
+                    Text("v\(telemetry.engineVersion)")
+                        .font(TelemetryTheme.numeric(11, .medium))
+                        .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+                    Text(":\(telemetry.serverPortString)")
+                        .font(TelemetryTheme.numeric(11))
+                        .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                 }
 
                 HStack(spacing: 5) {
+                    Circle()
+                        .fill(statusDotColor)
+                        .frame(width: 7, height: 7)
                     Text(telemetry.serverStatusText)
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(statusIndicatorColor)
-                        .lineLimit(1)
-
-                    Text("•")
-                        .foregroundColor(.white.opacity(0.28))
-                        .font(TelemetryTheme.ui(8))
-
-                    Text("\(telemetry.settings.host):\(telemetry.serverPortString)")
-                        .font(TelemetryTheme.numeric(10, .medium))
-                        .foregroundColor(.white.opacity(0.65))
+                        .font(TelemetryTheme.ui(11, .medium))
+                        .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
                         .lineLimit(1)
                 }
             }
 
             Spacer(minLength: 4)
 
-            // Primary Lifecycle Controls: Start/Stop & Restart
             HStack(spacing: 6) {
-                let actionTitle = telemetry.primaryActionTitle
-                let actionColor = (actionTitle == "Stop") ? TelemetryTheme.failure : TelemetryTheme.active
-                Button(action: { telemetry.performPrimaryAction() }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: telemetry.primaryActionIcon)
-                            .font(.system(size: 9, weight: .bold))
-                        Text(actionTitle)
-                            .font(.system(size: 10, weight: .semibold))
+                if isRunning {
+                    headerActionButton(
+                        title: "Restart",
+                        icon: "arrow.clockwise",
+                        tint: TelemetryTheme.accent,
+                        busy: false,
+                        disabled: daemonBusy || modelBusy
+                    ) {
+                        telemetry.restartServerProcess()
                     }
-                    .foregroundColor(actionColor)
-                    .padding(.horizontal, 2)
-                }
-                .buttonStyle(.glass)
+                    .help("Restart qwg server (⌘R)")
 
-                Button(action: { telemetry.restartEngine() }) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.75))
+                    headerActionButton(
+                        title: "Stop",
+                        icon: "power",
+                        tint: powerTint,
+                        busy: daemonBusy,
+                        disabled: daemonBusy
+                    ) {
+                        telemetry.toggleDaemon()
+                    }
+                    .help("Stop qwg server")
+                } else {
+                    headerActionButton(
+                        title: telemetry.daemonActionTitle,
+                        icon: telemetry.daemonActionIcon,
+                        tint: powerTint,
+                        busy: daemonBusy,
+                        disabled: daemonBusy
+                    ) {
+                        telemetry.toggleDaemon()
+                    }
                 }
-                .buttonStyle(.glass)
-                .disabled(!telemetry.isConnected)
-                .accessibilityLabel("Restart model")
-                .help("Restart the model inside the running server (⌘R)")
             }
         }
         .padding(.horizontal, 2)
     }
 
-    // MARK: - 2. Loaded Model Weights Card
+    // MARK: - Resident Model Card
+
     var loadedWeightsCard: some View {
-        // The model the server says is engaged, not the name the user
-        // configured: the server can swap models at runtime.
         let modelName = telemetry.dashboard?.lifecycle.model
-        // What the server says about the resident model. Nothing is
-        // assumed: a fact the server did not report is not shown.
-        let facts = telemetry.dashboard?.facts
-        let quant = facts?.quantization
-        let metal = facts?.metalFamily
+        let modelBusy = telemetry.isModelTransitioning
+            || telemetry.enginePhase == .loading
+            || telemetry.enginePhase == .unloading
+        let traits = residentTraitPills
 
-        let alias = telemetry.settings.modelAlias.trimmingCharacters(in: .whitespacesAndNewlines)
-        let showAlias = !alias.isEmpty && alias.lowercased() != (modelName ?? "").lowercased()
-        let badgeParts = [quant, metal].compactMap { $0 }
-        let badge = badgeParts.isEmpty ? nil : badgeParts.joined(separator: " • ")
-
-        return VStack(alignment: .leading, spacing: 6) {
-            // Row 1: Left-aligned interactive Model Selector pill + flush-right Load/Unload button
-            HStack(spacing: 6) {
-                Button(action: { showModelSelectorMenu() }) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "cpu.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(TelemetryTheme.accent)
-
-                        // No model named: either the engine has none, or the
-                        // server did not answer. Only the first is a fact.
-                        Text(modelName ?? (telemetry.connection == .connected ? "No model loaded" : "—"))
-                            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-                            .foregroundColor(modelName == nil ? .white.opacity(0.55) : .white.opacity(0.96))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.75)
-
-                        Spacer(minLength: 4)
-
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 8.5, weight: .bold))
-                            .foregroundColor(.white.opacity(0.60))
-                    }
-                    .padding(.horizontal, 8)
-                    .frame(maxWidth: .infinity, minHeight: 25, maxHeight: 25, alignment: .leading)
-                    .background(Color.black.opacity(0.28))
-                    .cornerRadius(TelemetryTheme.Radius.small)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: TelemetryTheme.Radius.small)
-                            .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
-                    )
-                    .contentShape(Rectangle())
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("RESIDENT MODEL")
+                        .font(TelemetryTheme.ui(10, .semibold))
+                        .tracking(0.4)
+                        .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                    Text(modelName ?? (telemetry.isConnected ? "No model loaded" : "—"))
+                        .font(TelemetryTheme.ui(13, .semibold))
+                        .foregroundStyle(TelemetryTheme.primary(increasedContrast: contrast == .increased))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
-                .buttonStyle(.plain)
-                .help(modelName.map { "Active model: \($0) — click to switch model" } ?? "Click to select and load a model")
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                modelActions
-            }
-
-            // Row 2: Full Quantization + Metal family details & optional Alias (flush left-to-right)
-            if badge != nil || showAlias {
                 HStack(spacing: 6) {
-                    if let badge {
-                        MarqueeBadgeView(text: badge, maxAvailableWidth: .infinity)
-                    }
-                    if showAlias {
-                        factPill(label: "Alias", value: alias, valueColor: TelemetryTheme.accent.opacity(0.95), expand: true)
+                    modelSwitcherControl
+
+                    if let unloadAction = action("unload") {
+                        lifecycleButton(
+                            title: modelBusy ? "Working…" : "Unload",
+                            icon: "eject.fill",
+                            tint: TelemetryTheme.warning,
+                            busy: modelBusy,
+                            disabled: modelBusy || !unloadAction.isEnabled || !telemetry.isConnected
+                        ) {
+                            telemetry.unloadModel()
+                        }
+                        .help("Unload model weights from memory")
+                    } else if let loadAction = action("load") {
+                        lifecycleButton(
+                            title: modelBusy ? "Loading…" : "Load",
+                            icon: "arrow.down.circle.fill",
+                            tint: TelemetryTheme.active,
+                            busy: modelBusy,
+                            disabled: modelBusy || !loadAction.isEnabled || !telemetry.isConnected
+                        ) {
+                            telemetry.reloadModel()
+                        }
+                        .help(loadAction.reason ?? "Load active model into memory")
                     }
                 }
             }
 
-            Divider()
-                .overlay(TelemetryTheme.hairline(increasedContrast: contrast == .increased))
-
-            // Row 3: Hardware & Engine Configuration Facts (evenly spanning full card width)
-            modelFacts
-                .font(TelemetryTheme.metric)
-                .foregroundColor(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+            if telemetry.isModelLoaded, !traits.isEmpty {
+                HStack(spacing: 5) {
+                    ForEach(traits, id: \.text) { trait in
+                        factPill(trait.text, tint: trait.tint)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .help(trait.help ?? trait.text)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
         .background(TelemetryTheme.substrate)
-        .cornerRadius(TelemetryTheme.Radius.large)
+        .clipShape(.rect(cornerRadius: TelemetryTheme.Radius.large))
         .overlay(
             RoundedRectangle(cornerRadius: TelemetryTheme.Radius.large)
-                .stroke(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 0.5)
+                .stroke(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 0.75)
         )
     }
 
-    @MainActor
-    func showModelSelectorMenu() {
+    private struct TraitPill: Equatable {
+        let text: String
+        let tint: Color
+        let help: String?
+    }
+
+    private var residentTraitPills: [TraitPill] {
+        guard let dashboard = telemetry.dashboard else { return [] }
+        var pills: [TraitPill] = []
+
+        if let q = dashboard.facts?.quantization, !q.isEmpty {
+            let cleanQ = q.replacingOccurrences(of: " (online GPU)", with: "")
+            pills.append(TraitPill(text: cleanQ, tint: TelemetryTheme.accent, help: q))
+        }
+        if let kv = dashboard.knobs["kvMode"]?.stringValue, !kv.isEmpty {
+            pills.append(TraitPill(text: "KV \(kv.uppercased())", tint: TelemetryTheme.neutral, help: "KV cache format"))
+        }
+        if let budget = telemetry.contextBudget, budget > 0 {
+            let compact = QWMenuBarStatusFormatter.formatCompactBudget(budget)
+            pills.append(TraitPill(text: "\(compact) ctx", tint: TelemetryTheme.neutral, help: "Context budget"))
+        }
+        let specEnabled = dashboard.knobs["speculativeEnabled"]?.boolValue ?? true
+        if specEnabled, let drafts = dashboard.knobs["mtpDrafts"]?.intValue, drafts > 0 {
+            pills.append(TraitPill(text: "Spec ×\(drafts)", tint: TelemetryTheme.prefill, help: "Speculative draft tokens"))
+        }
+        if let memPack = dashboard.facts?.mountedMemoryPack, !memPack.isEmpty {
+            pills.append(TraitPill(text: "MemPack", tint: TelemetryTheme.cool, help: memPack))
+        }
+        return pills
+    }
+
+    private var modelSwitcherControl: some View {
+        Button(action: presentModelSwitcherMenu) {
+            HStack(spacing: 4) {
+                Text("Switch")
+                    .font(TelemetryTheme.ui(11, .medium))
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9.5, weight: .medium))
+            }
+            .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+            .padding(.horizontal, 8)
+            .frame(height: 25)
+            .background(TelemetryTheme.rowSubstrate)
+            .clipShape(.rect(cornerRadius: TelemetryTheme.Radius.small))
+            .overlay(
+                RoundedRectangle(cornerRadius: TelemetryTheme.Radius.small)
+                    .stroke(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 0.5)
+            )
+            .background(MenuAnchorBridge { switcherAnchor = $0 })
+        }
+        .buttonStyle(.plain)
+        .help("Switch active model pack")
+        .onAppear { telemetry.refreshDiscoveredModels() }
+    }
+
+    private func presentModelSwitcherMenu() {
         telemetry.refreshDiscoveredModels()
-        let menu = NSMenu(title: "Select Model")
+        let menu = NSMenu()
         let currentModel = telemetry.dashboard?.lifecycle.model
+        let targets = NSMutableArray()
 
         if telemetry.discoveredModels.isEmpty {
-            let emptyItem = NSMenuItem(title: "No models found in ~/.qwg/models", action: nil, keyEquivalent: "")
-            emptyItem.isEnabled = false
-            menu.addItem(emptyItem)
+            let empty = NSMenuItem(title: "No models in ~/.qwg/models", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
         } else {
-            for item in telemetry.discoveredModels {
-                let menuItem = NSMenuItem(
-                    title: item.name,
-                    action: #selector(ModelSelectorMenuTarget.selectModel(_:)),
-                    keyEquivalent: ""
-                )
-                menuItem.target = ModelSelectorMenuTarget.shared
-                menuItem.representedObject = ModelSelectorPayload(telemetry: telemetry, model: item)
-                menuItem.state = (item.name == currentModel) ? .on : .off
-                menu.addItem(menuItem)
+            for model in telemetry.discoveredModels {
+                let target = MenuClosureTarget { telemetry.switchModel(to: model) }
+                targets.add(target)
+                let item = NSMenuItem(title: model.name, action: #selector(MenuClosureTarget.invoke), keyEquivalent: "")
+                item.target = target
+                if model.name == currentModel { item.state = .on }
+                menu.addItem(item)
             }
         }
 
         menu.addItem(.separator())
-
-        let refreshItem = NSMenuItem(
-            title: "Refresh Models",
-            action: #selector(ModelSelectorMenuTarget.refreshModels(_:)),
-            keyEquivalent: ""
-        )
-        refreshItem.target = ModelSelectorMenuTarget.shared
-        refreshItem.representedObject = telemetry
+        let refreshTarget = MenuClosureTarget { telemetry.refreshDiscoveredModels() }
+        targets.add(refreshTarget)
+        let refreshItem = NSMenuItem(title: "Refresh Models List", action: #selector(MenuClosureTarget.invoke), keyEquivalent: "")
+        refreshItem.target = refreshTarget
         menu.addItem(refreshItem)
 
-        let finderItem = NSMenuItem(
-            title: "Show ~/.qwg/models in Finder…",
-            action: #selector(ModelSelectorMenuTarget.revealFinder(_:)),
-            keyEquivalent: ""
-        )
-        finderItem.target = ModelSelectorMenuTarget.shared
-        finderItem.representedObject = telemetry
+        let finderTarget = MenuClosureTarget { telemetry.revealModelsFolder() }
+        targets.add(finderTarget)
+        let finderItem = NSMenuItem(title: "Open ~/.qwg/models in Finder", action: #selector(MenuClosureTarget.invoke), keyEquivalent: "")
+        finderItem.target = finderTarget
         menu.addItem(finderItem)
 
-        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        objc_setAssociatedObject(menu, &menuTargetsAssocKey, targets, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        guard let anchor = switcherAnchor ?? NSApp.keyWindow?.contentView else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.height + 4), in: anchor)
     }
 
-    /// The facts the server reported about the resident model. Each is
-    /// shown only when the server reported it, and each says what it is:
-    /// the host's cores are not the engine's threads.
-    var modelFacts: some View {
-        HStack(spacing: 5) {
-            if let cores = telemetry.dashboard?.facts?.hostLogicalCores {
-                factPill(label: "Cores", value: "\(cores)", valueColor: .white.opacity(0.92), expand: true)
-            }
-            if let gdn = telemetry.dashboard?.facts?.gdnPrefillMode, !gdn.isEmpty {
-                factPill(label: "GDN", value: gdn, valueColor: TelemetryTheme.active, expand: true)
-            }
-            if let ctx = telemetry.contextBudget {
-                factPill(label: "Context", value: "\(ctx / 1024)k", valueColor: .white.opacity(0.92), expand: true)
-            }
-            if let kv = telemetry.dashboard?.knobs["kvMode"]?.stringValue, !kv.isEmpty {
-                factPill(label: "KV", value: kv.uppercased(), valueColor: TelemetryTheme.accent, expand: true)
-            }
-            if let drafts = telemetry.dashboard?.knobs["mtpDrafts"]?.intValue {
-                factPill(label: "MTP", value: drafts > 0 ? "\(drafts)d" : "off",
-                         valueColor: drafts > 0 ? TelemetryTheme.active : .white.opacity(0.65), expand: true)
-            }
-        }
-        .frame(maxWidth: .infinity)
-    }
+    // MARK: - Unified Inference Performance Card
 
-    func factPill(label: String, value: String, valueColor: Color, expand: Bool = false) -> some View {
-        HStack(spacing: 3) {
-            Text("\(label):")
-                .font(TelemetryTheme.ui(9, .medium))
-                .foregroundColor(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
-            Text(value)
-                .font(TelemetryTheme.numeric(9, .semibold))
-                .foregroundColor(valueColor)
-        }
-        .lineLimit(1)
-        .fixedSize(horizontal: true, vertical: true)
-        .padding(.horizontal, 6)
-        .frame(maxWidth: expand ? .infinity : nil, minHeight: 22, maxHeight: 22)
-        .background(Color.black.opacity(0.26))
-        .cornerRadius(TelemetryTheme.Radius.small)
-        .overlay(
-            RoundedRectangle(cornerRadius: TelemetryTheme.Radius.small)
-                .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
-        )
-    }
+    var inferenceTelemetryCard: some View {
+        let decodeCard = card("throughput.display_decode_tokens_per_sec")
+        let prefillCard = card("throughput.display_prefill_tokens_per_sec")
+        let prefillProgCard = card("prefill.progress_tokens")
+        let prefillTotalCard = card("prefill.total_tokens")
+        let ttftCard = card("latency.ttft_ms")
+        let contextCard = card("context.active_tokens")
+        let engGpuCard = card("gpu.busy_ratio")
 
-    /// The actions the server says this model can perform. The renderer
-    /// does not decide: it draws the published list.
-    var modelActions: some View {
-        HStack(spacing: 6) {
-            if let load = action("load") {
-                Button(action: { telemetry.reloadModel() }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrow.down.circle")
-                            .font(.system(size: 9, weight: .semibold))
-                        Text(load.title)
-                            .font(TelemetryTheme.ui(9, .semibold))
-                    }
-                    .foregroundColor(TelemetryTheme.accent)
-                    .padding(.horizontal, 8)
-                    .frame(minHeight: 25, maxHeight: 25)
-                    .background(TelemetryTheme.accent.opacity(0.14))
-                    .cornerRadius(TelemetryTheme.Radius.small)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: TelemetryTheme.Radius.small)
-                            .stroke(TelemetryTheme.accent.opacity(0.30), lineWidth: 0.5)
-                    )
-                }
-                .buttonStyle(.plain)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: true)
-                .disabled(!load.isEnabled)
-                .help(load.reason ?? "Load the model")
+        let prefillSeries = prefillCard?.series ?? []
+        let decodeSeries = decodeCard?.series ?? []
+        let hasPrefillTrace = prefillSeries.contains { $0 != nil }
+        let hasDecodeTrace = decodeSeries.contains { $0 != nil }
+        let prefillProgNum = prefillProgCard?.number
+        let prefillTotalNum = prefillTotalCard?.number
+        let showPrefillProgress = telemetry.dashboard?.generation == .prefill
+            && prefillProgNum != nil
+            && (prefillTotalNum ?? 0) > 0
+
+        return VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                heroMetricColumn(title: "Decode", card: decodeCard, tint: TelemetryTheme.accent)
+                verticalHairline
+                heroMetricColumn(title: "Prefill", card: prefillCard, tint: TelemetryTheme.prefill)
             }
-            if let unload = action("unload") {
-                Button(action: { telemetry.unloadModel() }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "eject.fill")
-                            .font(.system(size: 8, weight: .semibold))
-                        Text(unload.title)
-                            .font(TelemetryTheme.ui(9, .medium))
-                    }
-                    .foregroundColor(.white.opacity(0.85))
-                    .padding(.horizontal, 8)
-                    .frame(minHeight: 25, maxHeight: 25)
-                    .background(Color.white.opacity(0.08))
-                    .cornerRadius(TelemetryTheme.Radius.small)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: TelemetryTheme.Radius.small)
-                            .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
-                    )
-                }
-                .buttonStyle(.plain)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: true)
-                .disabled(!unload.isEnabled)
-                .help(unload.reason ?? "Unload the model")
-            }
-        }
-    }
+            .padding(.vertical, 10)
 
-    // MARK: - Compact Quantization Badge View
-    // Displays the quantization & Metal family pill without ever expanding parent layout width.
-    public struct MarqueeBadgeView: View {
-        public let text: String
-        public let maxAvailableWidth: CGFloat?
-
-        let badgeFont = Font.system(size: 9, weight: .semibold, design: .monospaced)
-        let badgeColor = TelemetryTheme.active
-
-        public init(text: String, maxAvailableWidth: CGFloat? = nil) {
-            self.text = text
-            self.maxAvailableWidth = maxAvailableWidth
-        }
-
-        public var body: some View {
-            Text(text)
-                .font(badgeFont)
-                .foregroundColor(badgeColor)
-                .lineLimit(1)
-                .minimumScaleFactor(0.80)
-                .truncationMode(.tail)
-                .fixedSize(horizontal: true, vertical: true)
-                .padding(.horizontal, 8)
-                .frame(maxWidth: maxAvailableWidth, minHeight: 22, maxHeight: 22, alignment: .center)
-                .background(badgeColor.opacity(0.14))
-                .cornerRadius(TelemetryTheme.Radius.small)
-                .overlay(
-                    RoundedRectangle(cornerRadius: TelemetryTheme.Radius.small)
-                        .stroke(badgeColor.opacity(0.30), lineWidth: 0.5)
+            if showPrefillProgress, let prog = prefillProgNum, let total = prefillTotalNum, total > 0 {
+                horizontalHairline
+                prefillProgressBarRow(
+                    prog: prog,
+                    total: total,
+                    progValue: prefillProgCard?.value ?? "—",
+                    totalText: formattedCardValue(prefillTotalCard)
                 )
-                .help(text)
-        }
-    }
-
-    // MARK: - 3. The Measurements
-    /// Every measurement the server published, in one grid. One shape
-    /// for every tile and one column for every row: the panel is read
-    /// by looking across it, and an uneven row breaks the reading.
-    var metricGrid: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 6) {
-                metricTile("Prefill", card("throughput.display_prefill_tokens_per_sec"),
-                           accent: TelemetryTheme.prefill)
-                metricTile("Decode", card("throughput.display_decode_tokens_per_sec"),
-                           accent: TelemetryTheme.accent)
-                metricTile("TTFT", card("latency.ttft_ms"),
-                           accent: TelemetryTheme.cool)
-                metricTile("Engine GPU", card("gpu.busy_ratio"),
-                           accent: TelemetryTheme.active)
             }
-            .frame(maxHeight: .infinity)
-            HStack(spacing: 6) {
-                metricTile("Host GPU", card("gpu.device"),
-                           accent: TelemetryTheme.cool)
-                metricTile("Host CPU", card("hardware.cpu_percent"),
-                           accent: TelemetryTheme.cool)
-                metricTile("Memory", card("hardware.memory_percent"),
-                           accent: TelemetryTheme.neutral)
-                metricTile("Memory pressure", card("hardware.memory_pressure_level"),
-                           accent: TelemetryTheme.warning)
-            }
-            .frame(maxHeight: .infinity)
-            HStack(spacing: 6) {
-                metricTile("Warm cache", card("cache.warm_bytes"),
-                           accent: TelemetryTheme.active)
-                metricTile("SSD cache", card("cache.ssd_bytes"),
-                           accent: TelemetryTheme.cool)
-                metricTile("Reused", card("cache.tokens_reused_total"),
-                           accent: TelemetryTheme.warning)
-                metricTile("Context", card("context.active_tokens"),
-                           accent: TelemetryTheme.accent)
-            }
-            .frame(maxHeight: .infinity)
-        }
-        .frame(maxHeight: .infinity)
-    }
 
-    // MARK: - 4. Live Trace Card
-    /// The published trace: the samples the server recorded, gaps and
-    /// all (Amber Prefill + Blue Decode).
-    var traceStrip: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 8) {
-                Text("Live trace")
-                    .font(TelemetryTheme.ui(9, .semibold))
-                    .foregroundColor(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+            horizontalHairline
 
-                HStack(spacing: 6) {
-                    HStack(spacing: 3) {
-                        Circle()
-                            .fill(TelemetryTheme.prefill)
-                            .frame(width: 5, height: 5)
-                        Text("Prefill")
-                            .font(TelemetryTheme.ui(8, .medium))
-                            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+            HStack(spacing: 0) {
+                inlineMetricCell(
+                    label: "TTFT",
+                    valueText: formattedCardValue(ttftCard),
+                    isAvailable: ttftCard?.value != nil,
+                    tint: TelemetryTheme.cool,
+                    help: ttftCard?.reason
+                )
+                verticalHairline
+                inlineMetricCell(
+                    label: "Context",
+                    valueText: formattedContextSummary(contextCard),
+                    isAvailable: contextCard?.value != nil || telemetry.contextBudget != nil,
+                    tint: TelemetryTheme.primary(increasedContrast: contrast == .increased),
+                    help: contextCard?.reason ?? "Active context usage against configured budget"
+                )
+                verticalHairline
+                inlineMetricCell(
+                    label: "Eng GPU",
+                    valueText: formattedCardValue(engGpuCard),
+                    isAvailable: engGpuCard?.value != nil,
+                    tint: TelemetryTheme.accent,
+                    help: engGpuCard?.reason
+                )
+            }
+            .padding(.vertical, 8)
+
+            if hasPrefillTrace || hasDecodeTrace {
+                horizontalHairline
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Text("THROUGHPUT TRACE")
+                            .font(TelemetryTheme.ui(10, .semibold))
+                            .tracking(0.4)
+                            .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                        Spacer()
+                        if hasPrefillTrace {
+                            legendChip("Prefill", color: TelemetryTheme.prefill)
+                        }
+                        if hasDecodeTrace {
+                            legendChip("Decode", color: TelemetryTheme.accent)
+                        }
                     }
-                    HStack(spacing: 3) {
-                        Circle()
-                            .fill(TelemetryTheme.accent)
-                            .frame(width: 5, height: 5)
-                        Text("Decode")
-                            .font(TelemetryTheme.ui(8, .medium))
-                            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                    }
+                    DualSparklineView(prefillData: prefillSeries, decodeData: decodeSeries)
+                        .frame(height: 50)
                 }
-
-                Spacer()
-
-                Text("last 60 turns")
-                    .font(TelemetryTheme.ui(8))
-                    .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
             }
-
-            DualSparklineView(prefillData: card("throughput.display_prefill_tokens_per_sec")?.series ?? [],
-                              decodeData: card("throughput.display_decode_tokens_per_sec")?.series ?? [])
-                .frame(height: 28)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(Color.black.opacity(0.28))
-                .cornerRadius(TelemetryTheme.Radius.medium)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
         .background(TelemetryTheme.substrate)
-        .cornerRadius(TelemetryTheme.Radius.large)
+        .clipShape(.rect(cornerRadius: TelemetryTheme.Radius.large))
         .overlay(
             RoundedRectangle(cornerRadius: TelemetryTheme.Radius.large)
-                .stroke(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 0.5)
+                .stroke(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 0.75)
         )
     }
 
-    // MARK: - 5. Footer Command Dock
-    var footerDock: some View {
-        HStack(spacing: 8) {
-            Button(action: onOpenWebUI) {
-                HStack(spacing: 4) {
-                    Image(systemName: "globe")
-                        .font(TelemetryTheme.label)
-                    Text("Web UI")
-                        .font(TelemetryTheme.label)
-                }
-                .foregroundColor(TelemetryTheme.cool)
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.glass)
-            .help("Open Web Dashboard in Browser (⌘D)")
+    // MARK: - Unified Memory, Cache & System Card
 
-            Button(action: onOpenLogs) {
-                HStack(spacing: 4) {
-                    Image(systemName: "terminal")
-                        .font(TelemetryTheme.label)
-                    Text("Logs")
-                        .font(TelemetryTheme.label)
-                }
-                .foregroundColor(.white.opacity(0.80))
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.glass)
-            .help("Open Live Logs Window (⌘L)")
+    var memoryAndSystemCard: some View {
+        let arenaCard = card("memory.arena_reserved_bytes")
+        let residentCard = card("memory.resident_bytes")
+        let engineMemCard = (arenaCard?.value != nil ? arenaCard : residentCard)
+        let hasPrefixCache = telemetry.dashboard?.capabilities.contains("prefixCache") == true
+        let warmCard = card("cache.warm_bytes")
+        let ssdCard = card("cache.ssd_bytes")
+        let reusedCard = card("cache.tokens_reused_total")
+        let memCard = card("hardware.memory_percent")
+        let pressureCard = card("hardware.memory_pressure_level")
 
-            Button(action: onOpenSettings) {
-                HStack(spacing: 4) {
-                    Image(systemName: "gearshape")
-                        .font(TelemetryTheme.label)
-                    Text("Settings")
-                        .font(TelemetryTheme.label)
-                }
-                .foregroundColor(.white.opacity(0.80))
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.glass)
-            .help("Open Engine Settings (⌘,)")
+        return VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                inlineMetricCell(
+                    label: "Engine RAM",
+                    valueText: formattedCardValue(engineMemCard),
+                    isAvailable: engineMemCard?.value != nil,
+                    tint: TelemetryTheme.highlight,
+                    help: engineMemoryHelp(arena: arenaCard, resident: residentCard)
+                )
 
-            Button(action: onQuit) {
-                HStack(spacing: 4) {
-                    Image(systemName: "power")
-                        .font(TelemetryTheme.label)
-                    Text("Quit")
-                        .font(TelemetryTheme.label)
+                if hasPrefixCache {
+                    verticalHairline
+                    inlineMetricCell(
+                        label: "Warm RAM",
+                        valueText: formattedCardValue(warmCard),
+                        isAvailable: warmCard?.value != nil,
+                        tint: TelemetryTheme.cool,
+                        help: warmCard?.reason
+                    )
+                    verticalHairline
+                    inlineMetricCell(
+                        label: "SSD Cache",
+                        valueText: formattedCardValue(ssdCard),
+                        isAvailable: ssdCard?.value != nil,
+                        tint: TelemetryTheme.highlight,
+                        help: ssdCard?.reason
+                    )
+                    verticalHairline
+                    inlineMetricCell(
+                        label: "Reused",
+                        valueText: formattedCardValue(reusedCard),
+                        isAvailable: reusedCard?.value != nil,
+                        tint: TelemetryTheme.active,
+                        help: reusedCard?.reason
+                    )
+                } else {
+                    verticalHairline
+                    inlineMetricCell(
+                        label: "Weights",
+                        valueText: formattedCardValue(residentCard),
+                        isAvailable: residentCard?.value != nil,
+                        tint: TelemetryTheme.cool,
+                        help: residentCard?.reason
+                    )
                 }
-                .foregroundColor(TelemetryTheme.failure.opacity(0.90))
-                .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.glass)
-            .help("Quit QWEGN Engine (⌘Q)")
+            .padding(.vertical, 8)
+
+            horizontalHairline
+
+            HStack(spacing: 0) {
+                siliconGaugeCell(title: "Sys GPU", card: card("gpu.device"), tint: TelemetryTheme.accent)
+                verticalHairline
+                siliconGaugeCell(title: "CPU", card: card("hardware.cpu_percent"), tint: TelemetryTheme.warning)
+                verticalHairline
+                siliconGaugeCell(
+                    title: "Memory",
+                    card: memCard,
+                    tint: memoryBarTint(pressureCard: pressureCard),
+                    helpSuffix: pressureCard?.value
+                )
+            }
+            .padding(.vertical, 8)
         }
-        .padding(.horizontal, 2)
+        .background(TelemetryTheme.substrate)
+        .clipShape(.rect(cornerRadius: TelemetryTheme.Radius.large))
+        .overlay(
+            RoundedRectangle(cornerRadius: TelemetryTheme.Radius.large)
+                .stroke(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 0.75)
+        )
     }
-}
 
-extension CupertinoTelemetryView {
-    /// The published card with this id. The MenuBar draws what the
-    /// server published; it computes nothing of its own.
-    func card(_ id: String) -> QWDashboardCard? {
+    // MARK: - Symmetric Footer Dock
+
+    var footerDock: some View {
+        HStack(spacing: 6) {
+            dockButton(title: "Web UI", icon: "globe", shortcut: "⌘D", action: onOpenWebUI)
+            dockButton(title: "Logs", icon: "doc.text.magnifyingglass", shortcut: "⌘L", action: onOpenLogs)
+            dockButton(title: "Settings", icon: "slider.horizontal.3", shortcut: "⌘,", action: onOpenSettings)
+            dockButton(title: "Quit", icon: "power", shortcut: "⌘Q", isDestructive: true, action: onQuit)
+        }
+        .padding(.top, 2)
+    }
+
+    // MARK: - Card & Control Builders
+
+    private func card(_ id: String) -> QWDashboardCard? {
         telemetry.dashboard?.cards.first { $0.id == id }
     }
 
-    /// The published action with this id. An action the model cannot
-    /// perform is not published, so there is nothing to draw.
-    func action(_ id: String) -> QWDashboardAction? {
+    private func action(_ id: String) -> QWDashboardAction? {
         telemetry.dashboard?.actions.first { $0.id == id }
     }
 
-    /// Formats large token integers cleanly (e.g., 2019842 -> 2.02M, 127793 -> 127.8k)
-    /// so numbers never crowd or clip their unit labels.
-    func displayValue(for card: QWDashboardCard?) -> String {
-        guard let raw = card?.value else { return "—" }
-        if card?.unit == "tok", let n = Double(raw), n >= 10_000 {
-            if n >= 1_000_000 {
-                return String(format: "%.2fM", n / 1_000_000.0)
-            } else {
-                return String(format: "%.1fk", n / 1_000.0)
-            }
-        }
-        return raw
-    }
-
-    /// One measurement, in the panel's one tile shape. The title is the
-    /// panel's short name; the value is the server's. A reading the
-    /// server has not taken is a dash, and its reason is a tooltip.
-    func metricTile(_ title: String, _ card: QWDashboardCard?, accent: Color) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(TelemetryTheme.ui(9, .medium))
-                .foregroundColor(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-
-            HStack(alignment: .firstTextBaseline, spacing: 2) {
-                Text(displayValue(for: card))
-                    .font(TelemetryTheme.numeric(13, .semibold))
-                    .foregroundColor(card?.value == nil ? .white.opacity(0.40) : accent)
+    private func prefillProgressBarRow(
+        prog: Double,
+        total: Double,
+        progValue: String,
+        totalText: String
+    ) -> some View {
+        let fraction = min(1.0, max(0.0, prog / total))
+        let pct = Int((fraction * 100.0).rounded())
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Text("PREFILL PROGRESS")
+                    .font(TelemetryTheme.ui(9.5, .semibold))
+                    .tracking(0.4)
+                    .foregroundStyle(TelemetryTheme.prefill)
+                Spacer(minLength: 4)
+                Text("\(progValue) / \(totalText) · \(pct)%")
+                    .font(TelemetryTheme.numeric(11, .medium))
+                    .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
                     .lineLimit(1)
-                    .minimumScaleFactor(0.65)
-                if let unit = card?.unit {
-                    Text(unit)
-                        .font(TelemetryTheme.ui(8))
-                        .foregroundColor(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
-                        .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2.5)
+                        .fill(TelemetryTheme.rowSubstrate)
+                        .frame(height: 4.5)
+                    RoundedRectangle(cornerRadius: 2.5)
+                        .fill(TelemetryTheme.prefill)
+                        .frame(width: max(fraction > 0 ? 3 : 0, geo.size.width * fraction), height: 4.5)
                 }
             }
-
-            Spacer(minLength: 0)
-
-            // A bar for a percentage, the age of a reading that has gone
-            // stale. One or the other: the tile has room for one, and
-            // every tile has the same room.
-            if card?.isStale == true {
-                Text(ageText(card))
-                    .font(TelemetryTheme.numeric(8))
-                    .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                    .lineLimit(1)
-            } else if let number = card?.number, card?.unit == "%" {
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(Color.black.opacity(0.38))
-                        Capsule().fill(accent)
-                            .frame(width: max(0, min(geo.size.width,
-                                                     geo.size.width * CGFloat(number / 100.0))))
-                    }
-                }
-                .frame(height: 3)
-            }
+            .frame(height: 4.5)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(minHeight: 48, maxHeight: .infinity, alignment: .topLeading)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(Color.black.opacity(0.24))
-        .cornerRadius(TelemetryTheme.Radius.medium)
-        .overlay(
-            RoundedRectangle(cornerRadius: TelemetryTheme.Radius.medium)
-                .stroke(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 0.5)
-        )
-        .help(card?.reason ?? (card?.value.map { "\(title): \($0) \(card?.unit ?? "")" } ?? ""))
-    }
-
-    /// How old a reading is, in words.
-    func ageText(_ card: QWDashboardCard?) -> String {
-        guard let age = card?.age else { return "" }
-        if age < 60 { return "\(Int(age)) s ago" }
-        return "\(Int(age / 60)) min ago"
-    }
-}
-
-private final class ModelSelectorPayload: NSObject {
-    let telemetry: TelemetryObservable
-    let model: DiscoveredModel
-
-    init(telemetry: TelemetryObservable, model: DiscoveredModel) {
-        self.telemetry = telemetry
-        self.model = model
-    }
-}
-
-@MainActor
-private final class ModelSelectorMenuTarget: NSObject {
-    static let shared = ModelSelectorMenuTarget()
-
-    @objc func selectModel(_ sender: NSMenuItem) {
-        guard let payload = sender.representedObject as? ModelSelectorPayload else { return }
-        payload.telemetry.switchModel(to: payload.model)
-    }
-
-    @objc func refreshModels(_ sender: NSMenuItem) {
-        guard let telemetry = sender.representedObject as? TelemetryObservable else { return }
-        telemetry.refreshDiscoveredModels()
-    }
-
-    @objc func revealFinder(_ sender: NSMenuItem) {
-        guard let telemetry = sender.representedObject as? TelemetryObservable else { return }
-        telemetry.revealModelsFolder()
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 }

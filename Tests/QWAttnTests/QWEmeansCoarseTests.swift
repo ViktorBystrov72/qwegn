@@ -95,13 +95,15 @@ final class QWEmeansCoarseTests: XCTestCase {
     }
 
     func testEmeansCluster1024CSRPartitionAndDeterminism() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG cluster1024 e-means kernel requires Metal 4 hardware")
         let op = try Self.makeLSA(maxContext: 8192, budget: 512, clusterBlock: 4096)
         XCTAssertTrue(op.isEmeansCoarse)
         let numPools = 2048
         let (pools, _) = Self.synthTopicHaystack(numPools: numPools, dim: 64, rmsScale: 1.0, needlePools: [300, 1400])
         let ls = op.layers[0]
         let basePtr = op.region.pointer
-        pools.withUnsafeBytes { raw in
+        pools.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             basePtr.advanced(by: ls.pooledKeys.offset).copyMemory(from: raw.baseAddress!, byteCount: raw.count)
         }
 
@@ -165,6 +167,8 @@ final class QWEmeansCoarseTests: XCTestCase {
     }
 
     func testLSASnapshotCompressionAndCOWDeltaRoundTrip() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG cluster1024 e-means kernel requires Metal 4 hardware")
         let wardOp = try Self.makeLSA(maxContext: 16384, budget: 512, clusterBlock: 512)
         let emOp = try Self.makeLSA(maxContext: 16384, budget: 512, clusterBlock: 4096)
 
@@ -235,6 +239,8 @@ final class QWEmeansCoarseTests: XCTestCase {
     }
 
     func testLSAThreeNeedleRecallAt64K() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG cluster1024 e-means kernel requires Metal 4 hardware")
         let totalTokens = 65_536
         let numPools = totalTokens / 4
         let needles = [1500, 7400, 13200]
@@ -243,7 +249,7 @@ final class QWEmeansCoarseTests: XCTestCase {
             numPools: numPools, dim: 64, rmsScale: 1.0, needlePools: needles)
         let ls = op.layers[0]
         let basePtr = op.region.pointer
-        pools.withUnsafeBytes { raw in
+        pools.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             basePtr.advanced(by: ls.pooledKeys.offset).copyMemory(from: raw.baseAddress!, byteCount: raw.count)
         }
         let pipes = try QWCoarsePoolIndex.Pipelines(hal: Self.hal)
@@ -333,6 +339,8 @@ final class QWEmeansCoarseTests: XCTestCase {
     func testMLACoarseIndexThreeNeedleRecallAt64K() throws {
         let geo = try Self.mlaCoarseGeometry()
         let hal = try QWHal(geometry: geo)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG cluster1024 e-means kernel requires Metal 4 hardware")
         let totalTokens = 65_536
         let numPools = totalTokens / 4
         let needles = [1800, 8100, 14500]
@@ -344,7 +352,7 @@ final class QWEmeansCoarseTests: XCTestCase {
         let (pools, needleDirs) = Self.synthTopicHaystack(
             numPools: numPools, dim: 128, rmsScale: sqrt(128.0), needlePools: needles, seed: 0xABCD_1234)
         let basePtr = mla.region.pointer
-        pools.withUnsafeBytes { raw in
+        pools.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             basePtr.advanced(by: mla.layers[0].pooledKeys.offset).copyMemory(from: raw.baseAddress!, byteCount: raw.count)
         }
 
@@ -446,6 +454,8 @@ final class QWEmeansCoarseTests: XCTestCase {
     }
 
     func testPairedPerfAB_LSA_and_MLA() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG cluster1024 e-means kernel requires Metal 4 hardware")
         guard ProcessInfo.processInfo.environment["QW_PERF_GATE"] == "1" else {
             throw XCTSkip("Set QW_PERF_GATE=1 to run paired interleaved LSA & MLA coarse A/B benchmarks")
         }

@@ -15,14 +15,14 @@ struct QWMTPBatchedTrunk {
     let gdnPipelines: [Int: any MTLComputePipelineState]
     private let gdnRowPairedPipelines: [Int: any MTLComputePipelineState]
     let rows: Int
-    private let qkv: [QWTensorValue]
-    private let z: [QWTensorValue]
-    private let beta: [QWTensorValue]
-    private let decay: [QWTensorValue]
-    private let q: [QWTensorValue]
-    private let k: [QWTensorValue]
-    private let v: [QWTensorValue]
-    private let outputs: [QWTensorValue]
+    let qkv: [QWTensorValue]
+    let z: [QWTensorValue]
+    let beta: [QWTensorValue]
+    let decay: [QWTensorValue]
+    let q: [QWTensorValue]
+    let k: [QWTensorValue]
+    let v: [QWTensorValue]
+    let outputs: [QWTensorValue]
 
     static func allocationBytes(geometry: QWModelGeometry, rows: Int) -> Int {
         precondition((2...16).contains(rows))
@@ -94,21 +94,6 @@ struct QWMTPBatchedTrunk {
                         count: outCols, dtype: .f16)
     }
 
-    func gdnRow(_ row: Int) throws -> (qkv: QWTensorValue, z: QWTensorValue, beta: QWTensorValue, decay: QWTensorValue) {
-        try validate(row)
-        return (qkv[row], z[row], beta[row], decay[row])
-    }
-
-    func attentionRow(_ row: Int) throws -> (q: QWTensorValue, k: QWTensorValue, v: QWTensorValue) {
-        try validate(row)
-        return (q[row], k[row], v[row])
-    }
-
-    func outputRow(_ row: Int) throws -> QWTensorValue {
-        try validate(row)
-        return outputs[row]
-    }
-
     func gdnPipeline(forActiveRows activeRows: Int, rowPaired: Bool = false) throws -> any MTLComputePipelineState {
         guard (2...rows).contains(activeRows),
               let pipeline = (rowPaired ? gdnRowPairedPipelines : gdnPipelines)[activeRows] else {
@@ -117,7 +102,7 @@ struct QWMTPBatchedTrunk {
         return pipeline
     }
 
-    private func validate(_ row: Int) throws {
+    func validate(_ row: Int) throws {
         guard (0..<rows).contains(row) else { throw QWEngineDriverError.state("invalid batched trunk row") }
     }
 }

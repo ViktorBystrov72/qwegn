@@ -302,7 +302,7 @@ public final class QWServerLogger: @unchecked Sendable {
         }
 
         let line = "\(timeStr) \(levelTag) \(message)\n"
-        line.utf8CString.withUnsafeBytes { raw in
+        line.utf8CString.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             os_unfair_lock_lock(&self.lock)
             write(lvl >= .warn ? STDERR_FILENO : STDOUT_FILENO, raw.baseAddress, raw.count - 1)
             if self.fileDescriptor >= 0 {
@@ -328,7 +328,7 @@ public final class QWServerLogger: @unchecked Sendable {
             && utf8[20] == UInt8(ascii: "]")
         if isPreformatted {
             let line = rawLine.hasSuffix("\n") ? rawLine : (rawLine + "\n")
-            line.utf8CString.withUnsafeBytes { raw in
+            line.utf8CString.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 os_unfair_lock_lock(&self.lock)
                 write(STDOUT_FILENO, raw.baseAddress, raw.count - 1)
                 if self.fileDescriptor >= 0 {
@@ -344,7 +344,7 @@ public final class QWServerLogger: @unchecked Sendable {
 
     /// Emits the hardware and engine audit banner directly to stdout and sinks
     public func logStartupBanner(_ banner: String) {
-        banner.utf8CString.withUnsafeBytes { raw in
+        banner.utf8CString.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             os_unfair_lock_lock(&self.lock)
             write(STDOUT_FILENO, raw.baseAddress, raw.count - 1)
             if self.fileDescriptor >= 0 {

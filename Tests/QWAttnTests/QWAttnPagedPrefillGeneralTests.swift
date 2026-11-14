@@ -245,6 +245,8 @@ final class QWAttnPagedPrefillGeneralTests: XCTestCase {
     func testTheGeneralPagedPrefillThroughput() throws {
         let geometry = try Self.tinyGeometry()
         let hal = try QWHal(geometry: geometry)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable && ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true",
+                          "GPU timestamp scaling check requires bare-metal Apple Silicon GPU")
         let pos = 512, T = 512
         let data = Self.fixture(geometry: geometry, keys: pos + T, queries: T)
         let views = try Self.permutedViews(hal: hal, geometry: geometry,
@@ -272,6 +274,8 @@ final class QWAttnPagedPrefillGeneralTests: XCTestCase {
     func testTheGeneralPagedPrefillCostsGrowWithTheContext() throws {
         let geometry = try Self.tinyGeometry()
         let hal = try QWHal(geometry: geometry)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable && ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true",
+                          "GPU timestamp scaling check requires bare-metal Apple Silicon GPU")
         let op = try QWAttnPagedPrefillGeneral(hal: hal, geometry: geometry)
         let T = 512
         var rows: [(pos: Int, ms: Double, usPerToken: Double)] = []
@@ -324,7 +328,7 @@ final class QWAttnPagedPrefillGeneralTests: XCTestCase {
         let outHalves = T * geometry.qHeads * geometry.headDim
         let out = hal.device.makeBuffer(length: outHalves * 2, options: .storageModeShared)!
         let qBuf = hal.device.makeBuffer(length: data.qRows.count * 2, options: .storageModeShared)!
-        data.qRows.withUnsafeBytes { _ = memcpy(qBuf.contents(), $0.baseAddress!, $0.count) }
+        data.qRows.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(qBuf.contents(), raw.baseAddress!, raw.count) }
         let qgate = QWTensorValue(region: QWMRegion(buffer: qBuf, base: 0, length: qBuf.length),
                                    offset: 0, shape: QWTensorShape([data.qRows.count], .f16))
         let outT = QWTensorValue(region: QWMRegion(buffer: out, base: 0, length: out.length),
@@ -360,7 +364,7 @@ final class QWAttnPagedPrefillGeneralTests: XCTestCase {
         let outHalves = T * geometry.qHeads * geometry.headDim
         let out = hal.device.makeBuffer(length: outHalves * 2, options: .storageModeShared)!
         let qBuf = hal.device.makeBuffer(length: data.qRows.count * 2, options: .storageModeShared)!
-        data.qRows.withUnsafeBytes { _ = memcpy(qBuf.contents(), $0.baseAddress!, $0.count) }
+        data.qRows.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(qBuf.contents(), raw.baseAddress!, raw.count) }
         guard let (cb, enc) = hal.begin() else { throw NSError(domain: "hal", code: 1) }
         try op.encode(enc,
                       qgate: QWTensorValue(region: QWMRegion(buffer: qBuf, base: 0, length: qBuf.length),

@@ -97,7 +97,7 @@ final class QWSHVQSub2Tests: XCTestCase {
                     block[b] = UInt8((r * 37 + b * 23 + 11) & 0xFF)
                 }
                 var unpacked = [Float]()
-                block.withUnsafeBytes { QWSHVQBlock.unpack(group: $0, bits: bits, group: group, into: &unpacked) }
+                block.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWSHVQBlock.unpack(group: raw, bits: bits, group: group, into: &unpacked) }
                 unpacked.withUnsafeMutableBufferPointer { buf in
                     for off in stride(from: 0, to: cols, by: 32) {
                         QWQuant.fwht32OrthoBlock(buf.baseAddress! + off)
@@ -140,7 +140,7 @@ final class QWSHVQSub2Tests: XCTestCase {
             ]
             let hdrData = try JSONSerialization.data(withJSONObject: hdrObj, options: [.sortedKeys])
             var hdrLenLE = UInt64(hdrData.count).littleEndian
-            withUnsafeBytes(of: &hdrLenLE) { raw in
+            withUnsafeBytes(of: &hdrLenLE) { (raw: UnsafeRawBufferPointer) in
                 fileBytes.replaceSubrange(4..<12, with: raw)
             }
             fileBytes.append(hdrData)

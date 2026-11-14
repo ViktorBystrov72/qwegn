@@ -28,7 +28,7 @@ final class QWOnlineQuantTests: XCTestCase {
             let block = try QWAQProducer.repackMLXGroup(bits: bits, group: group, packed: payload,
                                                         scale: scale, bias: bias)
             var values: [Float] = []
-            block.withUnsafeBytes { QWAQBlock.unpack(group: $0, bits: bits, group: group, into: &values) }
+            block.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.unpack(group: raw, bits: bits, group: group, into: &values) }
             for i in 0..<group {
                 let mlx = scale * Float(codes[i]) + bias
                 XCTAssertEqual(Double(values[i]), Double(mlx), accuracy: 1e-6,

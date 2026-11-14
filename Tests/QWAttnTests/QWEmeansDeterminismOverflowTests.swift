@@ -26,6 +26,8 @@ final class QWEmeansDeterminismOverflowTests: XCTestCase {
     }
 
     func testEqualScoreTieDeterminismAcrossSimdgroupsAndChunks() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG / multi-TG atomic e-means selector requires Metal 4 hardware")
         let numMacros = 6
         let numClusters = numMacros * 64 // 384 clusters -> spans 2 chunks of 256 in collect
         let numPools = numMacros * 1024  // 6144 pools
@@ -145,6 +147,8 @@ final class QWEmeansDeterminismOverflowTests: XCTestCase {
     }
 
     func testCandidateOverflowFallsBackToExactFlatTopKWithoutLoss() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG / multi-TG atomic e-means selector requires Metal 4 hardware")
         let numMacros = 2
         let numClusters = numMacros * 64
         let numPools = numMacros * 1024 // 2048 pools
@@ -257,6 +261,8 @@ final class QWEmeansDeterminismOverflowTests: XCTestCase {
     }
 
     func testBelowPruneThresholdBypassesStage1AndMLADefaultsExact() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "32 KiB-TG / multi-TG atomic e-means selector requires Metal 4 hardware")
         let shortBg = QWCoarsePoolIndex.batchGeometry(
             pos0: 16_384, units: 1, budgetBlocks: 512, windowBlocks: 128,
             hasSink: true, writeCount: true, probeClusters: 320)

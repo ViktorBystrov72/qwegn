@@ -1,6 +1,6 @@
 // QWUnifiedEngine.swift — Unified Top-Level Inference Engine Handle (QWEngine).
 // Loads and serves any supported model architecture from its config/pack
-// through a single concrete engine handle, compiled layer stack, and batch scheduler.
+// through a single concrete engine handle, plan, and batch scheduler.
 
 import Foundation
 import QWCore
@@ -12,9 +12,6 @@ import QWQuant
 public final class QWEngine: QWInferenceEngine, @unchecked Sendable {
     public let descriptor: QWModelDescriptor
     public let plan: QWEnginePlan
-    public var compiledStack: QWCompiledLayerStack {
-        QWCompiledLayerStack(plan: plan, descriptor: descriptor)
-    }
     public let underlying: any QWInferenceEngine
     public let batchScheduler: QWBatchScheduler
 
@@ -22,7 +19,7 @@ public final class QWEngine: QWInferenceEngine, @unchecked Sendable {
         engine: any QWInferenceEngine,
         descriptor: QWModelDescriptor,
         plan: QWEnginePlan? = nil
-    ) {
+    ) throws {
         self.underlying = engine
         self.descriptor = descriptor
         let resolvedPlan: QWEnginePlan
@@ -34,7 +31,7 @@ public final class QWEngine: QWInferenceEngine, @unchecked Sendable {
             resolvedPlan = moduleEngine.plan
         } else {
             let geom = QWModelGeometry(descriptor: descriptor)
-            resolvedPlan = try! QWEngineBootstrap.makePlan(
+            resolvedPlan = try QWEngineBootstrap.makePlan(
                 geometry: geom,
                 packPath: descriptor.family.rawValue,
                 prefillChunkRows: QWPrefillLimits.chunkRows,
@@ -68,7 +65,7 @@ public final class QWEngine: QWInferenceEngine, @unchecked Sendable {
             throw QWModuleError.unsupportedFamily(resolvedDescriptor.family)
         }
         let engine = try resolvedModule.makeEngine(options: options)
-        self.init(engine: engine, descriptor: resolvedDescriptor)
+        try self.init(engine: engine, descriptor: resolvedDescriptor)
     }
 
     public var capabilities: Set<QWKnobCapability> { underlying.capabilities }
@@ -121,7 +118,7 @@ public final class QWEngine: QWInferenceEngine, @unchecked Sendable {
         tuning: QWEngineTuning = .default,
         physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes()
     ) -> QWContextMemoryEstimate {
-        QWEngineDriver.estimateContextMemory(
+        QWModuleRegistry.estimateContextMemory(
             descriptor: descriptor, packPath: packPath, contextTokens: contextTokens,
             kvMode: kvMode, mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
             prefillChunkSize: prefillChunkSize, tuning: tuning,

@@ -57,11 +57,10 @@ final class QWEnginePlanDispatchTests: XCTestCase {
     }
 
     func testAPlanWithoutAWinnerMapKeepsItsDigest() throws {
-        // Pinned so a plan without a map cannot silently change the digest
-        // every existing pack and PSO cache is keyed by. The value was read
-        // off the tree before the winner map was added, so it is the old one.
+        // Pinned so a plan without a map keeps its deterministic V3 digest
+        // when no winner map is attached (updated for geometryDigestV3Hex under D1).
         let plan = try plan(with: nil)
-        XCTAssertEqual(plan.digest, "138f51ca40d5db3d0d0963282a41557a92dfb386140d1a11aa4a01cc69dd38f3")
+        XCTAssertEqual(plan.digest, "845cfab9b2a555c0436c12c954e5607f8e3750b6b98f5824e8c67dfa631aacd5")
     }
 
     func testTwoMapsThatSelectDifferentKernelsHaveDifferentDigests() throws {

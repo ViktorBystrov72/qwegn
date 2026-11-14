@@ -13,6 +13,14 @@ permissions:
 jobs:
   package:
     runs-on: macos-26
+    env:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_DEVELOPER_ID_APP: ${{ secrets.APPLE_DEVELOPER_ID_APP }}
+      APPLE_DEVELOPER_ID_INSTALLER: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,10 +39,7 @@ jobs:
         run: xcodebuild -downloadComponent MetalToolchain || true
 
       - name: Import Apple Developer ID certificate (if configured)
-        if: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
-        env:
-          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        if: env.APPLE_CERTIFICATE_P12 != ''
         run: |
           KEYCHAIN="$RUNNER_TEMP/qwegn-release.keychain-db"
           KEYCHAIN_PW="$(uuidgen)"
@@ -58,12 +63,6 @@ jobs:
           swift build -c release --product qwg-menu
 
       - name: Build macOS .pkg installer and portable .tar.gz
-        env:
-          APPLE_DEVELOPER_ID_APP: ${{ secrets.APPLE_DEVELOPER_ID_APP }}
-          APPLE_DEVELOPER_ID_INSTALLER: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           ./Scripts/build_pkg.sh --skip-build --version "$VERSION" --output .
@@ -85,16 +84,52 @@ jobs:
           The CLI finds kernel*.metallib next to itself or inside Qwegn.app.
           TXT
           tar -czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "Qwegn-${VERSION}-macos-arm64.pkg" "$STAGE.tar.gz" > SHA256SUMS.txt
 
-      - name: Create release with .pkg and .tar.gz artifacts
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES="$RUNNER_TEMP/release_notes.md"
+          python3 - "$VERSION" "$NOTES" <<'PY'
+          import pathlib, re, sys
+          version, out_path = sys.argv[1], pathlib.Path(sys.argv[2])
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pat = re.compile(rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)", re.M | re.S)
+          m = pat.search(text)
+          body = m.group(1).strip() if m else ""
+          out_path.write_text(body + ("\n" if body else ""), encoding="utf-8")
+          PY
+          echo "notes_file=$NOTES" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release with .pkg, .tar.gz, and checksums
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" \
-            --generate-notes \
-            "Qwegn-${VERSION}-macos-arm64.pkg" \
-            "qwegn-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+          PKG="Qwegn-${VERSION}-macos-arm64.pkg"
+          TAR="qwegn-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+          NOTES="${{ steps.notes.outputs.notes_file }}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            if [ -s "$NOTES" ]; then
+              gh release edit "$GITHUB_REF_NAME" --title "Qwegn $GITHUB_REF_NAME" --notes-file "$NOTES"
+            else
+              gh release edit "$GITHUB_REF_NAME" --title "Qwegn $GITHUB_REF_NAME"
+            fi
+            gh release upload "$GITHUB_REF_NAME" --clobber "$PKG" "$TAR" SHA256SUMS.txt
+          else
+            if [ -s "$NOTES" ]; then
+              gh release create "$GITHUB_REF_NAME" \
+                --title "Qwegn $GITHUB_REF_NAME" \
+                --notes-file "$NOTES" \
+                "$PKG" "$TAR" SHA256SUMS.txt
+            else
+              gh release create "$GITHUB_REF_NAME" \
+                --title "Qwegn $GITHUB_REF_NAME" \
+                --generate-notes \
+                "$PKG" "$TAR" SHA256SUMS.txt
+            fi
+          fi
 
       - name: Clean up temporary signing keychain
         if: always() && env.SIGN_KEYCHAIN != ''

@@ -64,9 +64,9 @@ public final class FNGPUDecodeStack {
             }
             if uniform {
                 let rowIds = try act.allocate(QWTensorShape([pleSlots.count * rows * hcNgram], .i32))
-                let dstOffsets = try act.allocate(QWTensorShape([pleSlots.count], .i32))
+                let dstOffsets = try act.allocate(QWTensorShape([pleSlots.count * 2], .i32))
                 let wordOffs = pleSlots.map {
-                    UInt32(($0.1.region.base - act.region.base + $0.1.offset) / 4)
+                    Self.pleTargetWordOffset(regionBase: $0.1.region.base, actBase: act.region.base, tensorOffset: $0.1.offset)
                 }
                 arena.write(dstOffsets, from: wordOffs)
                 self.gpuPLE = (table, pleSlots.map(\.0), hcNgram, rowIds, dstOffsets)
@@ -126,10 +126,6 @@ public final class FNGPUDecodeStack {
 
     static func supportsRollbackWindow(_ rows: Int) -> Bool {
         QWFourSlotRollbackRing.supportsWindow(rows)
-    }
-
-    public func rollbackLastVerifyRow() throws {
-        rollbackVerifyRows(rejectedCount: 1)
     }
 
     /// The chunk boundaries. Exposed so the ordering test can pin them.
@@ -431,5 +427,12 @@ public final class FNGPUDecodeStack {
         }
         lastGPUMillis = gpuTotal
         return head.argmaxTokens(count: B)
+    }
+
+    /// Computes a 64-bit float-word offset inside `activationsRegion` so >16 GiB arenas never overflow UInt32.
+    public static func pleTargetWordOffset(regionBase: Int, actBase: Int, tensorOffset: Int) -> UInt64 {
+        let byteDelta = regionBase - actBase + tensorOffset
+        precondition(byteDelta >= 0 && byteDelta % 4 == 0, "invalid PLE target byte delta \(byteDelta)")
+        return UInt64(byteDelta / 4)
     }
 }

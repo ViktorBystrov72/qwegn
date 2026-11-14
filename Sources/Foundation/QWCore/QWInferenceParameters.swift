@@ -35,7 +35,7 @@ public struct QWSamplingParameters: Codable, Sendable, Equatable {
 
     /// True when the hyperparameters specify deterministic greedy argmax decoding.
     public var isGreedy: Bool {
-        temperature <= 0.0 || topK == 1
+        temperature <= 0.0 || topK == 1 || (topP > 0.0 && topP <= 1e-5)
     }
 
     /// True when the caller supplied an explicit non-negative RNG seed.

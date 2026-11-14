@@ -24,8 +24,8 @@ public enum QWEpilogue: String, Sendable {
 public struct QWGemmShape: Sendable, Hashable {
     public let m: Int, n: Int, k: Int
     public init(m: Int, n: Int, k: Int) { self.m = m; self.n = n; self.k = k }
-    public func family(vocab: Int = QWModelGeometry.qwen38_27b.vocab) -> QWGemmFamily {
-        if m == 1 && n == vocab { return .f2LmHeadGemv }
+    public func family(vocab: Int? = nil) -> QWGemmFamily {
+        if m == 1, let vocab, n == vocab { return .f2LmHeadGemv }
         if m == 1 { return .f1DecodeGemv }
         if m >= 512 { return .f3PrefillGemm }
         if m <= 8 { return .f5SkinnyGemm }
@@ -79,107 +79,8 @@ public enum QWGemmError: Error, CustomStringConvertible {
     }
 }
 
-/// Read-side view of one quantized weight tensor: it names the FORMAT as well
-/// as the shape, so the arena can be sized at the pair's NATIVE bytes. It also
-/// names the BASIS, and every construction states it (specs/04-qwquant.md).
-public struct QWWeightView: Sendable {
-    public let blocks: QWTensorValue
-    public var nibbles: QWTensorValue { blocks }
-    public var scales: QWTensorValue { blocks }
-    public var mins: QWTensorValue { blocks }
-    public let n: Int          // output rows
-    public let k: Int          // inner dim (must be % groupSize)
-    public let bits: Int       // 2, 3, 4, 6, 8
-    public let groupSize: Int  // 32, 64, 128, 256
-    public let isRotated: Bool // true: the FWHT-rotated basis (HQ4_G32 or HQ{2,3,4,6,8}_G{32,64,128,256})
-    /// Whether the INCUMBENT's container (`Block_HQ4_G32`, folded bias, word-interleaved nibbles)
-    /// holds this view. Rotated `HQ{2,3,4,6,8}_G{32,64,128,256}` bit-stream blocks set `isRotated = true`
-    /// and `isIncumbentContainer = false`.
-    public let isIncumbentContainer: Bool
-    /// Whether this view holds rotated `SHVQ{2,3,4}_G{32,64,128,256}` vector-quantized blocks.
-    public let isSHVQ: Bool
-
-    /// The bytes this bank's rows take at the pair's native size.
-    public var rowBytes: Int {
-        isSHVQ
-            ? QWSHVQBlock.rowBytes(bits: bits, group: groupSize, k: k)
-            : QWAQBlock.rowBytes(bits: bits, group: groupSize, k: k)
-    }
-    /// The bytes the whole bank takes at the pair's native size.
-    public var requiredBytes: Int { rowBytes * n }
-    /// The container's name — `HQ4_G32` for the incumbent's container, `SHVQ{b}_G{G}` for
-    /// rotated SHVQ blocks, `HQ{b}_G{G}` for rotated bit-stream blocks, and `AQ{b}_G{G}` for affine blocks.
-    public var formatName: String {
-        if isIncumbentContainer { return "HQ4_G32" }
-        if isSHVQ { return QWSHVQBlock.formatName(bits: bits, group: groupSize) }
-        if isRotated { return "HQ\(bits)_G\(groupSize)" }
-        return QWAQBlock.formatName(bits: bits, group: groupSize)
-    }
-
-    /// `isRotated` has no default ON PURPOSE: a view that guessed the basis
-    /// could carry rotated weights into a standard-basis run. Stating it
-    /// everywhere means the compiler finds the sites when the basis changes.
-    public init?(blocks: QWTensorValue, n: Int, k: Int,
-                 bits: Int = 4, groupSize: Int = 32, isRotated: Bool,
-                 isIncumbentContainer: Bool? = nil, isSHVQ: Bool = false) {
-        let incumbent = isIncumbentContainer ?? (!isSHVQ && isRotated && bits == 4 && groupSize == 32)
-        if isSHVQ {
-            guard isRotated && !incumbent && QWSHVQBlock.isSupported(bits: bits, group: groupSize) else { return nil }
-        } else if incumbent {
-            guard isRotated && bits == 4 && groupSize == 32 else { return nil }
-        } else if isRotated {
-            guard QWAQBlock.isHQSupported(bits: bits, group: groupSize) else { return nil }
-        } else {
-            guard QWAQBlock.isSupported(bits: bits, group: groupSize) else { return nil }
-        }
-        let maybeGroupBytes = isSHVQ
-            ? QWSHVQBlock.bytesIfSupported(bits: bits, group: groupSize)
-            : QWAQBlock.bytesIfBlockSupported(bits: bits, group: groupSize)
-        guard n > 0, k > 0, k % groupSize == 0,
-              let groupBytes = maybeGroupBytes,
-              blocks.bytes >= n * (k / groupSize) * groupBytes
-        else { return nil }
-        self.blocks = blocks
-        self.n = n; self.k = k
-        self.bits = bits; self.groupSize = groupSize
-        self.isRotated = isRotated
-        self.isIncumbentContainer = incumbent
-        self.isSHVQ = isSHVQ
-    }
-    public init?(nibbles: QWTensorValue, scales: QWTensorValue? = nil, mins: QWTensorValue? = nil,
-                 n: Int, k: Int,
-                 bits: Int = 4, groupSize: Int = 32, isRotated: Bool,
-                 isIncumbentContainer: Bool? = nil, isSHVQ: Bool = false) {
-        self.init(blocks: nibbles, n: n, k: k,
-                  bits: bits, groupSize: groupSize, isRotated: isRotated,
-                  isIncumbentContainer: isIncumbentContainer, isSHVQ: isSHVQ)
-    }
-
-    /// A view over other bytes of the same bank — a slice of a concatenated
-    /// bank, an expert's rows out of a stack. It is the SAME weights in the
-    /// SAME basis, so it inherits the basis rather than being told again.
-    public func subview(blocks: QWTensorValue, n: Int, k: Int) -> QWWeightView? {
-        QWWeightView(blocks: blocks, n: n, k: k,
-                     bits: bits, groupSize: groupSize, isRotated: isRotated,
-                     isIncumbentContainer: isIncumbentContainer, isSHVQ: isSHVQ)
-    }
-}
-
-extension QWWeightView: Equatable {
-    /// Two views are the same tensor when they name the same format and
-    /// shape over the same bytes of the same buffer.
-    public static func == (a: QWWeightView, b: QWWeightView) -> Bool {
-        a.n == b.n && a.k == b.k
-            && a.bits == b.bits && a.groupSize == b.groupSize
-            && a.isRotated == b.isRotated
-            && a.isIncumbentContainer == b.isIncumbentContainer
-            && a.isSHVQ == b.isSHVQ
-            && a.blocks.bytes == b.blocks.bytes
-            && a.blocks.offset == b.blocks.offset
-            && a.blocks.region.base == b.blocks.region.base
-            && a.blocks.region.buffer === b.blocks.region.buffer
-    }
-}
+/// Canonical weight view definition lives in `QWAlloc`.
+public typealias QWWeightView = QWAlloc.QWWeightView
 
 public enum QWGemm {
     /// Constant-BINDING cap for the v7 skinny window: 256 KB — a MEASURED
@@ -188,8 +89,8 @@ public enum QWGemm {
     public static let maxConstantBytes: Int = 256 * 1024
 
     /// Pure table lookup — ADR-001 winners. No side effects.
-    public static func plan(_ shape: QWGemmShape, dtype: QWDType, epi: QWEpilogue, outDtype: QWDType = .f32) -> QWGemmPlan {
-        let fam = shape.family()
+    public static func plan(_ shape: QWGemmShape, dtype: QWDType, epi: QWEpilogue, outDtype: QWDType = .f32, vocab: Int? = nil) -> QWGemmPlan {
+        let fam = shape.family(vocab: vocab)
         switch (fam, dtype, epi, outDtype) {
         case (_, .q4g, .siluMulPair, .f16):
             return QWGemmPlan(backend: .handQ4gSiluPairH16, kernel: "qwg_gemv_q4g_silu_pair_h16",

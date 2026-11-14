@@ -106,6 +106,7 @@ extension QWHttpServer {
         let msgId = "msg_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
         let hasActiveTools = !(req.tools?.isEmpty ?? true) && !req.isToolChoiceNone
         let shouldThink = req.effectiveEnableThinking(defaultValue: thinkingEnabled)
+        let shouldStop = generationShouldStop(for: connection)
 
         do {
             try self.actor.validateRequestCapabilities(req)
@@ -196,8 +197,9 @@ extension QWHttpServer {
             do {
                 result = try await actor.handleChatCompletion(request: req, onToken: { piece in
                     for d in streamParser.feed(piece) { emitDelta(d) }
-                })
+                }, shouldStop: shouldStop)
             } catch {
+                if shouldStop() { return }
                 sendEvent("error", [
                     "type": "error",
                     "error": ["type": "api_error", "message": "\(error)"],
@@ -208,6 +210,7 @@ extension QWHttpServer {
                 return
             }
 
+            guard !shouldStop() else { return }
             for d in streamParser.finish() { emitDelta(d) }
             closeCurrentBlockIfOpen()
 
@@ -263,11 +266,12 @@ extension QWHttpServer {
         } else {
             let result: ChatCompletionExecutionResult
             do {
-                result = try await actor.handleChatCompletion(request: req, onToken: nil)
+                result = try await actor.handleChatCompletion(request: req, onToken: nil, shouldStop: shouldStop)
             } catch let mmErr as QWMultimodalError {
                 sendAnthropicError(connection, status: 400, type: "invalid_request_error", message: "\(mmErr)")
                 return
             }
+            guard !shouldStop() else { return }
             let parsedResult = QWToolCallParser.parse(
                 text: result.content,
                 tools: req.tools,

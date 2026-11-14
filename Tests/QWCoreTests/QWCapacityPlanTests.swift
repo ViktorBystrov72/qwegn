@@ -88,3 +88,13 @@ final class QWCapacityPlanTests: XCTestCase {
         XCTAssertTrue(log.contains("[memory] weights=2.00 GiB fixed_scratch=1.00 GiB kv_mode=f16 kv_per_tok=31296 B max_tokens=8192"))
     }
 }
+
+private extension QWCapacityPlan {
+    static func kvBytesPerToken(attentionLayers: Int, kvHeads: Int, headDim: Int,
+                                bytesPerElement: Double, kvLoraRank: Int = 0) -> Int {
+        if kvLoraRank > 0 {
+            return Int((Double(attentionLayers) * Double(kvLoraRank) * bytesPerElement).rounded(.up))
+        }
+        return Int((Double(attentionLayers) * 2 * Double(kvHeads * headDim) * bytesPerElement).rounded(.up))
+    }
+}

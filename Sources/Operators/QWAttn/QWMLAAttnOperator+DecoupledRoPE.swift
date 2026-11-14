@@ -289,6 +289,7 @@ extension QWMLAAttnOperator {
                     enc.setComputePipelineState(split.score)
                     enc.dispatchThreadgroups(MTLSize(width: (midPools + 63) / 64, height: batchRows, depth: 1),
                                              threadsPerThreadgroup: tg256)
+                    QWCoarsePoolIndex.barrierIfConcurrent(enc)
                     enc.setComputePipelineState(split.select)
                 } else {
                     enc.setComputePipelineState(psoIndexerScoreSelect)

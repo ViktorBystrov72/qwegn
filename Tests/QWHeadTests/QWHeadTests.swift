@@ -25,13 +25,13 @@ final class QWHeadTests: XCTestCase {
         }
         return d
     }
-    static func f32s(_ d: Data) -> [Float] { d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }
-    static func f16s(_ d: Data) -> [UInt16] { d.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) } }
-    static func u32s(_ d: Data) -> [UInt32] { d.withUnsafeBytes { Array($0.bindMemory(to: UInt32.self)) } }
-    static func i32s(_ d: Data) -> [Int32] { d.withUnsafeBytes { Array($0.bindMemory(to: Int32.self)) } }
+    static func f32s(_ d: Data) -> [Float] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) } }
+    static func f16s(_ d: Data) -> [UInt16] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: UInt16.self)) } }
+    static func u32s(_ d: Data) -> [UInt32] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: UInt32.self)) } }
+    static func i32s(_ d: Data) -> [Int32] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Int32.self)) } }
     static func buf(_ d: Data) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
-        d.withUnsafeBytes { p in _ = memcpy(b.contents(), p.baseAddress!, p.count) }
+        d.withUnsafeBytes { (p: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), p.baseAddress!, p.count) }
         return b
     }
     static func zeros(_ elems: Int, _ dt: QWDType) -> MTLBuffer {
@@ -323,4 +323,8 @@ final class QWHeadTests: XCTestCase {
         XCTAssertThrowsError(try head.encodeMultiMax(enc, logits: dummyLogits, params: shortParams, count: 6))
         enc.endEncoding()
     }
+}
+
+private extension QWSampler {
+    func resetCallSequence() { callIndex = 0 }
 }

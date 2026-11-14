@@ -1,7 +1,6 @@
 import Foundation
 import Darwin
 import XCTest
-import QWCli
 @testable import QWEngine
 
 final class QWPhase4PerformanceReport {
@@ -52,7 +51,7 @@ final class QWPhase4PerformanceReport {
         // Swift print can split a record across writes while XCTest writes stderr.
         var written: Int
         repeat {
-            written = data.withUnsafeBytes { Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count) }
+            written = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Darwin.write(STDOUT_FILENO, raw.baseAddress, raw.count) }
         } while written < 0 && errno == EINTR
         guard written == data.count else {
             throw QWEngineDriverError.state("report stdout write failed or was partial: \(written)/\(data.count)")

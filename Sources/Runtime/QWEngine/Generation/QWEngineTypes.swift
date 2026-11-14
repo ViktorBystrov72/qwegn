@@ -53,16 +53,6 @@ public struct QWExperimentalGenerationStats: Sendable {
     public let decodeSec: Double
     public let roundMs: [Double]
     public let roundTokenCounts: [Int]
-
-    public var prefillTokensPerSecond: Double {
-        guard prefillSec > 0, prefillSec.isFinite else { return 0 }
-        return Double(promptTokens) / prefillSec
-    }
-
-    public var decodeTokensPerSecond: Double {
-        guard decodeSec > 0, decodeSec.isFinite else { return 0 }
-        return Double(roundTokenCounts.reduce(0, +)) / decodeSec
-    }
 }
 
 /// The cache an engine holds right now. A byte count nobody measured is
@@ -116,6 +106,9 @@ public struct QWGenerationRequest: Sendable {
     public var topLogprobsCount: Int
     /// Optional per-token logprob callback invoked immediately before `onToken`.
     public var onTokenLogprob: (@Sendable (QWTokenLogprob) -> Void)?
+    /// Optional callback invoked after prefill cache resolution and each prefill chunk
+    /// with `(completedComputedTokens, totalComputedTokens)`.
+    public var onPrefillProgress: (@Sendable (Int, Int) -> Void)?
     /// Request-local token constraint (structured output). Only engines whose
     /// `supportsTokenConstraints` is true may be handed one.
     public var constraint: (any QWTokenConstraint)?
@@ -135,7 +128,8 @@ public struct QWGenerationRequest: Sendable {
         topLogprobsCount: Int = 0,
         onTokenLogprob: (@Sendable (QWTokenLogprob) -> Void)? = nil,
         constraint: (any QWTokenConstraint)? = nil,
-        visualSpans: [QWVisualSpan] = []
+        visualSpans: [QWVisualSpan] = [],
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         self.constraint = constraint
         self.prompt = prompt
@@ -149,6 +143,7 @@ public struct QWGenerationRequest: Sendable {
         self.collectLogprobs = collectLogprobs
         self.topLogprobsCount = topLogprobsCount
         self.onTokenLogprob = onTokenLogprob
+        self.onPrefillProgress = onPrefillProgress
         self.visualSpans = visualSpans
     }
 }

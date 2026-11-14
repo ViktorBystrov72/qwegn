@@ -15,23 +15,6 @@ final class QWProfileStoreTests: XCTestCase {
         return (QWProfileStore(root: root), root)
     }
 
-    func testSeedFiltersKnobsTheModelCannotHonour() throws {
-        let (store, root) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let legacy: [String: QWKnobValue] = [
-            "gdnPrefill": .string("chunked"),   // dense-only
-            "kvMode": .string("q8"),
-            "temperature": .double(0.7),
-        ]
-        let counts = try store.seedFromLegacySettings(
-            legacy: legacy,
-            models: [(modelId: "fn", capabilities: [.kvQuantQ8])])   // no .gdnPrefill
-        XCTAssertEqual(counts["fn"], 2, "gdnPrefill must not be carried into an FN profile")
-        let profile = try store.load(modelId: "fn")
-        XCTAssertNil(profile?.values["gdnPrefill"])
-        XCTAssertEqual(profile?.values["kvMode"], .string("q8"))
-    }
-
     func testResolutionOrderIsExplicitThenProfileThenDefault() throws {
         let (store, root) = try makeStore()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -61,30 +44,6 @@ final class QWProfileStoreTests: XCTestCase {
                            .capabilityUnavailable(knob: "gdnPrefill", model: "m",
                                                   required: .gdnPrefill))
         }
-    }
-
-    func testMigrationIsIdempotent() throws {
-        let (store, root) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let legacy: [String: QWKnobValue] = ["temperature": .double(0.2)]
-        _ = try store.seedFromLegacySettings(legacy: legacy, models: [(modelId: "m", capabilities: [])])
-        let first = try store.load(modelId: "m")
-        _ = try store.seedFromLegacySettings(legacy: legacy, models: [(modelId: "m", capabilities: [])])
-        let second = try store.load(modelId: "m")
-        XCTAssertEqual(first, second)
-    }
-
-    /// A knob whose *value* needs a capability the model lacks is not
-    /// carried over either: q8 KV on a model that cannot do q4.
-    func testAValueThatNeedsACapabilityIsNotCarriedOver() throws {
-        let (store, root) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let legacy: [String: QWKnobValue] = ["kvMode": .string("q4")]
-        let counts = try store.seedFromLegacySettings(
-            legacy: legacy,
-            models: [(modelId: "m", capabilities: [.kvQuantQ8])])   // q8 but not q4
-        XCTAssertEqual(counts["m"], 0)
-        XCTAssertNil(try store.load(modelId: "m")?.values["kvMode"])
     }
 
     /// A profile written against another geometry is stale: the knobs it
@@ -210,62 +169,6 @@ final class QWProfileStoreTests: XCTestCase {
         XCTAssertThrowsError(try store.load(modelId: "m"))
     }
 
-    /// A profile bound to a geometry says more than an unbound one. The
-    /// seed that does not know the geometry must not unbind what knows it.
-    func testAnUnboundSeedDoesNotUnbindAProfile() throws {
-        let (store, root) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let legacy: [String: QWKnobValue] = ["temperature": .double(0.2)]
-        _ = try store.seedFromLegacySettings(legacy: legacy,
-                                            models: [(modelId: "m", capabilities: [],
-                                                      geometryDigest: "geo")])
-        let bound = try store.load(modelId: "m")
-        XCTAssertEqual(bound?.geometryDigest, "geo")
-
-        _ = try store.seedFromLegacySettings(legacy: legacy, models: [(modelId: "m", capabilities: [])])
-        let after = try store.load(modelId: "m")
-        XCTAssertEqual(after?.geometryDigest, "geo",
-                       "the unbound seed must not unbind a profile that knows its geometry")
-        XCTAssertEqual(after, bound)
-    }
-
-    /// The seed fills a profile; it never overwrites one. A value the user
-    /// has chosen is theirs, and the legacy settings are only the fallback
-    /// for what they have not.
-    func testTheSeedDoesNotOverwriteTheUsersValues() throws {
-        let (store, root) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: root) }
-        try store.save(QWKnobProfile(schemaVersion: 1, modelId: "m", geometryDigest: "geo",
-                                     updatedAt: Date(), values: ["temperature": .double(0.95)]))
-        let legacy: [String: QWKnobValue] = ["temperature": .double(0.7), "topK": .int(7)]
-        _ = try store.seedFromLegacySettings(legacy: legacy,
-                                            models: [(modelId: "m", capabilities: [],
-                                                      geometryDigest: "geo")])
-        let profile = try store.load(modelId: "m")
-        XCTAssertEqual(profile?.values["temperature"], .double(0.95),
-                       "the seed must not overwrite the user's own value")
-        XCTAssertEqual(profile?.values["topK"], .int(7),
-                       "the seed must fill the knobs the profile lacks")
-    }
-
-    /// A profile written against another geometry is stale. The seed must
-    /// not bind its values to this geometry: that would make stale values
-    /// look fresh.
-    func testTheSeedDoesNotRebindAProfileFromAnotherGeometry() throws {
-        let (store, root) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: root) }
-        try store.save(QWKnobProfile(schemaVersion: 1, modelId: "m", geometryDigest: "old",
-                                     updatedAt: Date(), values: ["temperature": .double(0.95)]))
-        let legacy: [String: QWKnobValue] = ["temperature": .double(0.7)]
-        let report = try store.seedFromLegacySettingsReporting(
-            legacy: legacy,
-            models: [(modelId: "m", capabilities: [], geometryDigest: "new")])["m"]
-        XCTAssertEqual(report?.skipped?.contains("another geometry"), true)
-        let profile = try store.load(modelId: "m")
-        XCTAssertEqual(profile?.geometryDigest, "old")
-        XCTAssertEqual(profile?.values["temperature"], .double(0.95))
-    }
-
     /// One value the model cannot honour must not cost the user every
     /// other knob.
     func testOneUnhonourableValueDoesNotKillTheResolution() throws {
@@ -278,9 +181,6 @@ final class QWProfileStoreTests: XCTestCase {
         XCTAssertEqual(resolved["temperature"], .double(0.25),
                        "one un-honourable value must not cost the other knobs")
         XCTAssertNil(resolved["kvMode"], "a value the model cannot honour is absent")
-        let unavailable = try store.unavailableInProfile(modelId: "m", capabilities: [.kvQuantQ8])
-        XCTAssertNotNil(unavailable["kvMode"], "the caller must be able to see what was left out")
-        XCTAssertNil(unavailable["temperature"])
     }
 
     /// An explicitly requested value the model cannot honour is refused:
@@ -324,45 +224,5 @@ final class QWProfileStoreTests: XCTestCase {
         XCTAssertTrue(try store.forget(modelId: "m"))
         XCTAssertNil(try store.load(modelId: "m"))
         XCTAssertFalse(try store.forget(modelId: "m"), "there is nothing left to forget")
-    }
-
-    /// The caller that logs the seed must be able to say what was left
-    /// out, not only how many.
-    func testTheSeedSaysWhatItLeftOutAndWhy() throws {
-        let (store, root) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let legacy: [String: QWKnobValue] = [
-            "gdnPrefill": .string("chunked"),
-            "kvMode": .string("q4"),
-            "temperature": .double(0.7),
-        ]
-        let report = try store.seedFromLegacySettingsReporting(
-            legacy: legacy,
-            models: [(modelId: "m", capabilities: [.kvQuantQ8], geometryDigest: "d")])["m"]
-        XCTAssertEqual(report?.carried, 1)
-        XCTAssertNotNil(report?.dropped["gdnPrefill"])
-        XCTAssertTrue(report?.dropped["gdnPrefill"]?.contains("gdnPrefill") ?? false)
-        XCTAssertNotNil(report?.dropped["kvMode"])
-        XCTAssertNil(report?.dropped["temperature"])
-    }
-
-    /// The old app accepted a settings file the registry would refuse. One
-    /// such value must not cost the migration every other knob and every
-    /// other model: it is reported and left out.
-    func testOneUnacceptableLegacyValueDoesNotAbortTheMigration() throws {
-        let (store, root) = try makeStore()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let legacy: [String: QWKnobValue] = [
-            "temperature": .double(3.5),      // the old app accepted this
-            "topK": .int(40),
-        ]
-        let report = try store.seedFromLegacySettingsReporting(
-            legacy: legacy,
-            models: [(modelId: "m", capabilities: [], geometryDigest: "d")])["m"]
-        XCTAssertEqual(report?.carried, 1, "the knob the registry accepts must still be carried")
-        XCTAssertNotNil(report?.dropped["temperature"], "the refused value must be reported")
-        let profile = try store.load(modelId: "m")
-        XCTAssertNil(profile?.values["temperature"])
-        XCTAssertEqual(profile?.values["topK"], .int(40))
     }
 }

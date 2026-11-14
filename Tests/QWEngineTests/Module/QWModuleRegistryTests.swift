@@ -50,10 +50,19 @@ final class QWModuleRegistryTests: XCTestCase {
             XCTAssertNotNil(QWModuleRegistry.moduleType(for: family), family.rawValue)
         }
 
-        XCTAssertEqual(QWModuleRegistry.supportedFamilies.count, 7)
-        XCTAssertEqual(Set(QWModuleRegistry.supportedFamilies),
-                       [.qwen38Dense, .qwen38FlashNext, .qwen2Dense, .llamaDense,
-                        .mistralDense, .qwen3Dense, .qwen3MoE])
+        XCTAssertEqual(QWModuleRegistry.supportedFamilies.count, 11)
+        XCTAssertEqual(Set(QWModuleRegistry.supportedFamilies), Set(QWModelDescriptor.Family.allCases))
+        // Each hybrid family resolves to its dedicated non-overloaded module class.
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen38Dense))),
+                       ObjectIdentifier(DenseModule.self))
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen38MoE))),
+                       ObjectIdentifier(Qwen38MoEModule.self))
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .senseNovaLoop))),
+                       ObjectIdentifier(SenseNovaLoopModule.self))
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .glm5Next))),
+                       ObjectIdentifier(Glm5NextModule.self))
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .ernie55MoE))),
+                       ObjectIdentifier(Ernie55MoEModule.self))
     }
 
     func testSpeculationPolicyForInitialLoadAndModelSwitch() throws {
@@ -86,9 +95,7 @@ final class QWModuleRegistryTests: XCTestCase {
         // registry says so.
         let served = Set(QWModuleRegistry.supportedFamilies)
         let unserved = Set(QWModelDescriptor.Family.allCases).subtracting(served)
-        XCTAssertEqual(served, [.qwen38Dense, .qwen38FlashNext,
-                                 .qwen2Dense, .llamaDense, .mistralDense,
-                                 .qwen3Dense, .qwen3MoE])
+        XCTAssertEqual(served, Set(QWModelDescriptor.Family.allCases))
         XCTAssertEqual(unserved, [])
         for family in unserved {
             XCTAssertNil(QWModuleRegistry.moduleType(for: family), family.rawValue)
@@ -269,15 +276,37 @@ final class QWModuleRegistryTests: XCTestCase {
                                     modelId: "qwen3.8-flash-next", geometryDigest: "d",
                                     prefillChunkRows: 512, kvStorageMode: "f16")
         let flashModule = FlashNextModule(plan: plan)
-        let unified = QWEngine(engine: flashModule, descriptor: desc, plan: plan)
+        let unified = try QWEngine(engine: flashModule, descriptor: desc, plan: plan)
         XCTAssertEqual(unified.plan.modelId, "qwen3.8-flash-next")
-        XCTAssertEqual(unified.compiledStack.layers.count, 4)
-        XCTAssertTrue(unified.compiledStack.layers.allSatisfy {
-            $0.streamCarrier == .hyperConnection && $0.channelMixer == .moe
-        })
-        XCTAssertEqual(unified.compiledStack.layers[0].sequenceMixer, .gdn)
-        XCTAssertEqual(unified.compiledStack.layers[3].sequenceMixer, .qsaSparse)
+        XCTAssertEqual(unified.plan.layers.count, 4)
+        XCTAssertTrue(unified.plan.layers.allSatisfy { $0.mlp == .moe })
+        XCTAssertEqual(unified.plan.layers[0].attention, .gdn)
+        XCTAssertEqual(unified.plan.layers[3].attention, .qsaSparse)
         XCTAssertEqual(unified.batchScheduler.inFlightRequests, 0)
         XCTAssertTrue(unified.supportsTokenConstraints)
+    }
+}
+
+private extension QWModuleRegistry {
+    static func requiredCapabilities(
+        advertised: Set<QWModelDescriptor.Capability>) -> Set<QWKnobCapability> {
+        var required: Set<QWKnobCapability> = []
+        if advertised.contains(.vision) { required.insert(.vision) }
+        if advertised.contains(.mtp) { required.insert(.speculative) }
+        return required
+    }
+
+    static func makeModule(
+        plan: QWEnginePlan, engine: (any QWLoadedEngine)?
+    ) throws -> any QWInferenceModule {
+        guard let type = moduleType(for: plan.family) else {
+            throw QWModuleError.unsupportedFamily(plan.family)
+        }
+        for capability in requiredCapabilities(advertised: plan.modelCapabilities) {
+            guard type.capabilities.contains(capability) else {
+                throw QWModuleError.unsupportedCapability(model: plan.modelId, capability: capability)
+            }
+        }
+        return try type.make(plan: plan, engine: engine)
     }
 }

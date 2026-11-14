@@ -23,7 +23,7 @@ using namespace metal;
 // lanes) runs FULLY PARALLEL; K2 (48 heads × 8 v-bands of 16) is the ONLY
 // sequential loop (chunk carries, state slab resident in threadgroup
 // memory); K3 is the per-(token,head) GatedRMSNorm epilogue (identical math
-// to C12's qwg_gdn_norm_sigmoid, batched — o_scr row layout t*48+h agrees with K2's
+// to the C12 decode fused norm, batched — o_scr row layout t*48+h agrees with K2's
 // writes).
 //
 // MUFU LAW (measured THREE times on this kernel family — K2 v1: 4096
@@ -690,7 +690,7 @@ kernel void qwg_gdn_prefill_scan_hybrid(
 }
 
 // K3 — per-row GatedRMSNorm over [T][48] rows, row = t*48+h (agrees with
-// K2's o_scr layout; math identical to C12 qwg_gdn_norm_sigmoid: o·rsqrt(mean(o²)
+// K2's o_scr layout; math identical to C12 decode fused norm: o·rsqrt(mean(o²)
 // +1e-6)·w ⊙ silu(z_f32) → f16 store).
 kernel void qwg_gdn_prefill_norm(
         device const float* o_scr [[buffer(0)]],

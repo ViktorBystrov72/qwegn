@@ -95,6 +95,8 @@ final class FNLatentMoETests: XCTestCase {
     func testGroupLatentMoEMatchesCPUAcrossDecodeVerifyAndPrefill() throws {
         let H = 64, NG = 4, L = 64, E = 32, K = 4, I = 64, IS = 64
         let hal = try QWHal(geometry: .qwen38_27b, weightBasis: .rotated)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable,
+                          "Group-latent NAX MoE requires Metal 4 tensor hardware")
         let dMats = try (0..<NG).map { try Self.makeAQMatrix(rows: L, cols: H, bits: 8, group: 32, seed: 1 + $0, foldOutputFwht: true) }
         let uMats = try (0..<NG).map { try Self.makeAQMatrix(rows: H, cols: L, bits: 8, group: 32, seed: 11 + $0, foldOutputFwht: false) }
         let guMats = try (0..<E).map { try Self.makeAQMatrix(rows: 2 * I, cols: L, bits: 4, group: 64, seed: 21 + $0, foldOutputFwht: false) }

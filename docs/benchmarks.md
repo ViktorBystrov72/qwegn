@@ -8,13 +8,14 @@ Variational MTP relaxes only MTP-sourced draft rows, and only when the verifier 
 
 | Model pack (`~/.qwg/models`) | Architecture | Prefill (4K / 10.4K / 16K / 64K) | Cold TTFT | Warm cache TTFT | Standard decode | Speculative decode | 1M Prefill / Decode (LSA · `e-means`) | Eval / Needle (16K–1M) | 
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | 
-| `GLM-5.3-Flash-shvq4g32-shvq2g64-shvq3g64` | 45L MoE (`321B`/`18B`, 288 exp, `100.63 GiB` 100% UMA resident) | **1,006 tok/s** @5.2K (`825–869` serve, `780` @65.6K) | 180–339 ms | **10–18 ms** (`96–193×`) | **44.6–46.4 tok/s** | **48.9–53.6 tok/s** (`51.2` CLI, `1.98/step`) | **743.0 / 45.0 tok/s** @242.5K (`e-means`) · 1M `102.3 GiB` UMA | **81/100 code (`92%` HE) · 184/184 API · 37/37 cap · 99.74% fid · 3/3 needle** |
-| `ERNIE-5.5-Flash-Base-hq8g32-shvq15g64-shvq3g64` | 43L MoE (`280B`/`14B`, 512 exp Latent-MoE, `37` HCA + `6` MLA-DSA, `81.61 GiB` 100% UMA) | **825–899 tok/s** @0.6K–18.8K (`604` @149.5K, `303` @300K) | 90–130 ms | **0.29 s** (`78.6×`, `19.3K` `.qwcache`) | **31.4–37.2 tok/s** | **40.2–42.6 tok/s** (ECHO `d=1`, `1.88–1.96/step`) | **302.6 / 16.3 tok/s** @300K (`e-means`) · 1M `87.6 GiB` UMA | **3/3 needle (`18.8K`, `149.5K`, `300K`) · KL `0.176` · Base** |
+| `GLM-5.3-Flash-shvq4g32-shvq2g64-shvq3g64` | 45L MoE (`321B`/`18B`, 288 exp, `100.63 GiB` 100% UMA resident) | **1,014 tok/s** @4K (`1,006` @5.2K, `825–869` serve, `780` @65.6K) | 180–339 ms | **10–18 ms** (`96–193×`) | **44.6–46.4 tok/s** | **48.9–53.6 tok/s** (`51.2` CLI, `1.98/step`) | **743.0 / 45.0 tok/s** @242.5K (`e-means`) · 1M `102.3 GiB` UMA | **81/100 code (`92%` HE) · 184/184 API · 37/37 cap · 99.74% fid · 3/3 needle** |
+| `ERNIE-5.5-Flash-Base-hq8g32-shvq15g64-shvq3g64` | 43L MoE (`280B`/`14B`, 512 exp Latent-MoE, `37` HCA + `6` MLA-DSA, `81.61 GiB` 100% UMA) | **989 tok/s** @4K (`992` pk, `909` @16K, `899` @18.8K, `604` @149.5K) | 90–130 ms | **0.29 s** (`78.6×`, `19.3K` `.qwcache`) | **31.4–37.2 tok/s** | **40.2–42.6 tok/s** (ECHO `d=1`, `1.88–1.96/step`) | **302.6 / 16.3 tok/s** @300K (`e-means`) · 1M `87.6 GiB` UMA | **3/3 needle (`18.8K`, `149.5K`, `300K`) · 3/10 Code-10 (Base) · KL `0.176`** |
 | `GLM-5.3-Flash` (`HQ4_G32_M5 + HQ3_G64`) | 45L MoE (`321B`/`18B`, `134.37 GiB` NVMe-streamed) | **858–968 tok/s** @16K (`maxResident`) | — | MLA Key-Pool(4) snapshot | **31.6 tok/s** (`44.8` GPU proxy) | **34.8 tok/s** (NextN MTP-1 · `31.1` MoE-Spec) | 1M arch ready (`1,024 B/tok/L` KV) | **100% (conformance & needle)** |
-| `Qwen3.6-35B-A3B-hq4g32` | 40L MoE (256 exp, 8 act) | **6,142 tok/s** @64K (6,389 peak) | **45–71 ms** | 5–7 ms (55×) | **148.3–155.1 tok/s** | **233.4 tok/s** | **2,317 / 105.6 tok/s** (`136.8` @64K `e-means`) | **3 / 3 (100%)** |
-| `Qwen3.8-Flash-Next-hq8g32-hq4g64` (`+ VQ2 PLE`) | 48L MoE (512 exp, 10 act, `71.3 GiB + 27.1 GiB VQ2`) | 2,528–2,688 tok/s (2,696 peak) | 113–155 ms | 7–11 ms (63×–99×) | 72.3–81.5 tok/s | **95.1–113.7 tok/s** (`145.4` pred) | **1,888 / 63.7 tok/s** (`e-means` · `1,350 / 41.1` QSA) | **10/10 core · 3/3 needle** |
-| `Qwen3.8-27B-hq4g32` | 64L dense hybrid | **914 tok/s** @64K (`e-means`, 850 @10K) | 113 ms | 6 ms (307×) | 31.2–32.8 tok/s | 84.4 tok/s (MTP-3) | **831 / 35.6 tok/s** (`e-means` · `805 / 36.5` Ward) | **3 / 3 (100%)** |
-| `Qwen3.8-27B-hq4g32` + `DSpine-b16` | 64L dense + 5L block-causal drafter (`B=2..16`) | 850–914 tok/s | 94 ms | 7–12 ms (159×) | 32.1–32.9 tok/s | **100.5 tok/s geomean** (`134.5` peak, `4.19×`) | — | **8/10 core · 3/3 needle** |
+| `Qwen3.6-35B-A3B-hq4g32` | 40L MoE (256 exp, 8 act) | **6,419 tok/s** @4K (`6,307` @16K, `6,142` @64K) | **45–71 ms** | 5–7 ms (55×) | **148.3–155.1 tok/s** | **233.4 tok/s** | **2,317 / 105.6 tok/s** (`136.8` @64K `e-means`) | **3 / 3 (100%)** |
+| `Qwen3.8-Flash-Next-hq8g32-hq4g64` (`+ VQ2 PLE`) | 48L MoE (512 exp, 10 act, `71.3 GiB + 27.1 GiB VQ2`) | **2,941–3,035 tok/s** (`2,725` @32K, `2,385` @65K) | 113–155 ms | 7–11 ms (63×–99×) | 72.3–81.5 tok/s (`53.4` @4K) | **95.1–113.7 tok/s** (`145.4` pred · `79.9` CLI MTP-3) | **1,888 / 63.7 tok/s** (`e-means` · `1,840` @256K QSA) | **10/10 core · 9/10 Code-10 · 3/3 needle** |
+| `Edge0-145B-hq8g32-hq4g64` (`+ VQ2 PLE`) | 48L MoE (`145B`, 512 exp `10+1`, `56.0 GiB + 27.1 GiB VQ2`) | **2,543–2,572 tok/s** (`2,292` @32K, `2,132` @65K) | `0.28 s` CLI | **8 ms (`119.8×`)** | 44.2–44.7 tok/s | **80.9 novel / 116.4 pred** (`67.6` CLI MTP-3 · `102.6` 4-stream) | **1,886 tok/s** @300K YaRN (`3/3` · 1M `69.7 GiB` `q4` / `103.0 GiB` `q8` UMA) | **9/10 Code-10 & Core-10 · 3/3 needle (`16K`/`128K`/`300K`)** |
+| `Qwen3.8-27B-hq4g32` | 64L dense hybrid | **1,035 tok/s** @4K (`914` @64K `e-means`, 850 @10K) | 113 ms | 6 ms (307×) | 31.2–32.8 tok/s | 84.4 tok/s (MTP-3) | **831 / 35.6 tok/s** (`e-means` · `805 / 36.5` Ward) | **3 / 3 (100%)** |
+| `Qwen3.8-27B-hq4g32` + `DSpine-b16` | 64L dense + 5L block-causal drafter (`B=2..16`) | 1,035 tok/s @4K (850–914 @10K–64K) | 94 ms | 7–12 ms (159×) | 32.1–32.9 tok/s | **100.5 tok/s geomean** (`134.5` peak, `4.19×`) | — | **8/10 core · 3/3 needle** |
 | `Qwen3.8-27B-hq4g32` + `DFlash2` | 64L dense + 5L diffusion drafter | 832 tok/s (869 peak) | 94 ms | 7 ms (266×) | 31.2 tok/s | 83.8 tok/s | — | **3 / 3 (100%)** |
 | `SenseNova-Loop-9B-Preview` | 56L looped (32L, 2× loop, mHC) | 1,749 tok/s @64K | 64 ms | 7 ms (164×) | 48.9 tok/s | 93.9 tok/s | 1,476 / 46.5 tok/s | **3 / 3 (100%)** | 
 
@@ -64,10 +65,16 @@ Quiet-GPU (`0% / 0%` baseline utilization) long-context scaling and 3-needle pas
   <img src="../assets/qwegn_lsa_scaling_flash_next.svg" alt="Qwen3.8-Flash-Next 64K-1M Prefill Profile and Decode Scaling" width="100%">
 </p>
 <p align="center">
+  <img src="../assets/qwegn_lsa_scaling_edge0_145b.svg" alt="Edge0-145B 512-300K Prefill Profile and 1M UMA Residency" width="100%">
+</p>
+<p align="center">
   <img src="../assets/qwegn_lsa_scaling_qwen38_27b.svg" alt="Qwen3.8-27B 64K-1M Prefill Profile and Decode Scaling" width="100%">
 </p>
 <p align="center">
   <img src="../assets/qwegn_lsa_scaling_glm53_flash.svg" alt="GLM-5.3-Flash 321B SHVQ 16K-1M Prefill Profile and Decode Scaling" width="100%">
+</p>
+<p align="center">
+  <img src="../assets/qwegn_lsa_scaling_ernie55_flash.svg" alt="ERNIE-5.5-Flash-Base 280B SHVQ 578-300K Prefill Profile and 1M UMA Residency" width="100%">
 </p>
 
 ### Regime Summary: When to Use `Ward-512` vs `e-means-4096`
@@ -213,6 +220,45 @@ Measured on an idle (`0% / 0%` GPU) Apple M5 Max (`Mac17,6`, 128 GB UMA) via 5 a
 | **`Qwen3.8-Flash-Next-hq8g32-hq4g64`** | `1,510.2 →` **`1,518.0`** (`0.9916×`, MAD `0.0177`) / `59.39 →` **`59.15`** (`0.9958×`, MAD `0.0010`) | `--no-stream-ngrams` `106.24 GiB` → `--stream-ngrams` **`79.17 GiB`** planned (`-27.07 GiB` GPU UMA, `10.77 GiB` RSS, `0` allocs) | **`9 / 10`** `code-10` | **`5 / 5 SHA-256`** exact · **`3 / 3`** `16K` needle (`2,791.8 / 66.82 tok/s`) |
 | **`Qwen3.8-27B-hq4g32` (+ `DSpine-b16`)** | `925.2 →` **`925.5`** (`1.0003×`, MAD `0.0013`) / `31.14 →` **`31.16`** (`0.9990×`) · `T=41` `415.6 →` **`414.8`** (`0.9981×`)<br>`DSpine-b16`: `43.06 →` **`43.10`** (**`1.0014×`**) | `16.48–16.50 GiB` RSS / `15.61 GiB` planned (`DSpine`: `19.64 GiB` RSS, `0` allocs); `--load-vision`/`--no-load-vision` `SHA-256` exact | **`9 / 10`** `code-10` | **`5 / 5 SHA-256`** exact (`3 / 3` `DSpine` exact) · **`3 / 3`** `16K` needle (`794.4 / 48.01 tok/s`) |
 | **`ERNIE-5.5-Flash-Base-hq8g32-shvq15g64-shvq3g64`** *(New)* | Prefill `825.3` (`578`) · `855.9–898.9` (`18.8K`) · `603.6` (`149.5K`) · `302.6` (`300K`) · `.qwcache` `0.29 s` (**`78.59×`**)<br>Decode `31.39` (`d=0`) → **`40.22 tok/s`** (`ECHO d=1`, `+28.1%`, peak `42.57`) | **`85.74 GiB`** planned / `86.25 GiB` RSS (`4/4` vision×ngram toggles `SHA-256` exact) · **`1M` `87.59 GiB` planned / `91.31 GiB` RSS** (`0` allocs) | `1 / 10` chat `code-10` *(Base checkpoint)* · `--bench-only` **`37.0 tok/s`** med (`+15.4%` improved drift) | **`3 / 3`** `18.8K`, `149.5K`, `300K` needles · Teacher-KL **`0.1757`** (`79.69%` top-1) |
+
+## FlashNext / `Edge0-145B` `3K` Prefill Wave, `>256K` Qualification & `v0.20.0` 6-Flagship Gate
+
+Measured on an idle (`0% / 0%` GPU) Apple M5 Max (`Mac17,6`, 128 GB UMA) comparing fresh release `v0.19.1` (`b5fc673f`) vs `v0.20.0` (`93893f4a`, `--kv-mode q4 --temperature 0 --no-profile --prefill-chunk-size 4096`):
+
+### 1. Paired Interleaved `512–256K` Prefill Sweep (`min-of-2` GPU `tok/s`, `0` Steady Allocs)
+
+| Context Target | `Qwen3.8-Flash-Next` (`v0.19.1 → v0.20.0`) | Ratio | `Edge0-145B` (`v0.19.1 → v0.20.0`) | Ratio |
+| :--- | :---: | :---: | :---: | :---: |
+| `512` (`522` tok, res) | `2,045.4 →` **`2,072.9`** | `1.0134×` | `1,943.4 →` **`1,945.8`** | `1.0012×` |
+| `2,048` (`2,058` tok, res) | `2,911.6 →` **`2,941.3`** | `1.0102×` | `2,545.5 →` **`2,543.4`** | `0.9992×` |
+| `8,192` (`8,192` tok, res) | `3,015.5 →` **`3,034.8`** | `1.0064×` | `2,542.5 →` **`2,568.4`** | `1.0102×` |
+| `32,768` (`32,764` tok) | `2,700.0 →` **`2,724.7`** *(stream)* | `1.0091×` | `2,183.6 →` **`2,291.8`** *(res)* | **`1.0496×`** |
+| `65,536` (`65,536` tok) | `1,846.5 →` **`2,385.1`** *(stream)* | **`1.2917×`** | `2,103.5 →` **`2,132.3`** *(res)* | `1.0137×` |
+| `131,072` (`131,084` tok, stream) | `1,858.7 →` **`1,909.0`** | **`1.0271×`** | `1,967.6 →` **`2,051.7`** | **`1.0427×`** |
+| `256,000` (`255,992` tok, stream) | `1,761.0 →` **`1,839.7`** | **`1.0447×`** | `1,850.2 →` **`1,899.3`** | **`1.0265×`** |
+
+*Prefill chunk scaling (`512 → 2048 → 4096`): `Qwen3.8-Flash-Next` `2,046.6 → 2,888.3 → 3,027.6 tok/s` (`@8K`), `1,851.8 → 2,640.4 → 2,763.4` (`@32K`); `Edge0-145B` `1,952.5 → 2,467.9 → 2,474.4` (`@8K`), `1,710.3 → 2,297.7 → 2,351.7` (`@32K`).*
+
+### 2. `Edge0-145B` Beyond-`256K` (`320K → 1M`) Qualification & 64-Bit PLE Arena Parity
+
+| Check / Regime | Planned UMA / Available | Status / Result (`allocs = 0`) | Notes |
+| :--- | :---: | :---: | :--- |
+| `320K` / `512K` / `1M` (`q4 --stream-ngrams`) | `61.84` / `63.99` / **`69.73 GiB`** (`/ 107.52`) | Admitted (`rc=0`, `0` allocs) | Above `262,144` card limit |
+| **`1M` `q8 --no-stream-ngrams` (GPU PLE)** | **`102.99 / 107.52 GiB`** | Admitted (`rc=0`, `0` allocs) | Verifies `64`-bit `ulong` PLE gather offsets `>16 GiB` |
+| Law 12 refusal guards (`1M f16`, `--os-reserve 65`, `2M` cap) | Over budget / out of range | Clean `rc=1` (`0` SIGTRAPs) | `contextDoesNotFit` / `QWKnob` validation |
+| `16K` / `128K` 3-needle passkeys (`q4`) | Resident / `--stream-ngrams` | **`3/3`** @ **`2,507.8`** / **`1,918.7 tok/s`** | `SHA-256` prefix `4ebbde8d60f7` |
+| **`300K` Beyond-Card 3-Needle** (`1.25×` YaRN & Raw RoPE) | `61.84 GiB` (`--stream-ngrams`) | **`3/3`** @ **`1,885.5`** (`1.25×`) & **`1,882.6`** (`1.0×`) | Identical `4ebbde8d60f7` output |
+
+### 3. `v0.20.0` Law 9 6-Flagship 4-Category Verification (`v0.19.1 → v0.20.0`)
+
+| Flagship Model Pack | Paired Prefill & Decode (`min-of-2`) | UMA / Residency (`0` allocs) | `llmprobe` `code-10` | Determinism & `16K` Needle |
+| :--- | :--- | :--- | :---: | :--- |
+| **`Edge0-145B-hq8g32-hq4g64`** | Pre `2,538.7 →` **`2,572.0`** (`1.0131×`)<br>Dec `44.22 →` **`44.19`** · MTP-3 `61.31 →` **`67.59`** (**`1.1024×`**) | `85.36 GiB` res / `58.30 GiB` stream (`-27.06 GiB`) | **`9 / 10`** (`5/5` HE, `4/5` MBPP) | `SHA-256` exact (`d0`: `ef4734bc883a`) · **`3/3`** (`2,504.5 tok/s`) |
+| **`Qwen3.8-Flash-Next-hq8g32-hq4g64`** | Pre `2,915.9 →` **`2,947.3`** (`1.0108×`)<br>Dec `53.87 →` **`53.42`** · MTP-3 `78.27 →` **`79.91`** (**`1.0210×`**) | `100.66 GiB` res / `73.59 GiB` stream (`-27.07 GiB`) | **`9 / 10`** (`5/5` HE, `4/5` MBPP) | `SHA-256` exact (`d0`: `8bd771edd57b`) · **`3/3`** (`2,983.7 tok/s`) |
+| **`GLM-5.3-Flash-shvq4g32-shvq2g64-shvq3g64`** | Pre `955.0 →` **`1,014.4`** (`1.0622×`)<br>Dec `46.20 →` **`47.10`** (`1.0195×`) · MTP-3 `41.98 →` **`43.87`** (`1.0450×`) | `96.86 GiB` planned | **`9 / 10`** (`5/5` HE, `4/5` MBPP) | `SHA-256` exact · **`3/3`** (`931.3 tok/s`) |
+| **`ERNIE-5.5-Flash-Base-hq8g32-shvq15g64-shvq3g64`** | Pre `991.9 →` **`989.1`** (`0.9972×`)<br>Dec `32.43 →` **`32.54`** (`1.0034×`) · MTP-1 `39.42 →` **`39.87`** (`1.0114×`) | `80.38 GiB` planned | `3 / 10` (`3/5` HE, Base, `0` err) | `SHA-256` exact · **`3/3`** (`908.8 tok/s`) |
+| **`Qwen3.6-35B-A3B-hq4g32`** | Pre `6,402.4 →` **`6,418.6`** (`1.0025×`)<br>Dec `130.50 →` **`134.39`** (`1.0298×`) · MTP-3 `194.14 →` **`194.89`** (`1.0039×`) | `20.20 GiB` planned | **`9 / 10`** (`5/5` HE, `4/5` MBPP) | `SHA-256` exact · **`3/3`** (`6,306.5 tok/s`) |
+| **`Qwen3.8-27B-hq4g32` + `DSpine-b16`** | Pre `1,030.8 →` **`1,035.1`** (`1.0042×`)<br>Dec `31.03 →` **`31.28`** (`1.0081×`) · DSpine `30.33 →` **`30.37`** (`1.0013×`) | `15.40 GiB` planned | **`9 / 10`** (`5/5` HE, `4/5` MBPP) | `SHA-256` exact · **`3/3`** (`865.3 tok/s`) |
 
 ## Reproducing these numbers
 

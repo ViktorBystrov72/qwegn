@@ -69,15 +69,25 @@ public struct QWDashboardFacts: Sendable, Codable, Equatable {
     public let gpuName: String?
     /// The Metal family the device supports.
     public let metalFamily: String?
+    /// Total unified memory reported by the host, in GiB.
+    public let physicalMemoryGB: Double?
+    /// Active Latent Sparse Attention mode reported by engine config.
+    public let lsaMode: String?
+    /// Mounted codebase memory pack summary, when active.
+    public let mountedMemoryPack: String?
 
     public init(quantization: String? = nil, hostLogicalCores: Int? = nil,
                 gdnPrefillMode: String? = nil, gpuName: String? = nil,
-                metalFamily: String? = nil) {
+                metalFamily: String? = nil, physicalMemoryGB: Double? = nil,
+                lsaMode: String? = nil, mountedMemoryPack: String? = nil) {
         self.quantization = quantization
         self.hostLogicalCores = hostLogicalCores
         self.gdnPrefillMode = gdnPrefillMode
         self.gpuName = gpuName
         self.metalFamily = metalFamily
+        self.physicalMemoryGB = physicalMemoryGB
+        self.lsaMode = lsaMode
+        self.mountedMemoryPack = mountedMemoryPack
     }
 }
 
@@ -162,24 +172,4 @@ public struct QWDashboardViewModel: Sendable, Codable, Equatable {
         self.knobSources = knobSources
         self.requests = requests
     }
-}
-
-/// The card ids the MenuBar renders: the set it expects, and the set
-/// the parity test asserts the published model is a superset of. A card
-/// the model does not publish is never drawn.
-public enum MenuBarCardCatalogue {
-    public static let ids: [String] = [
-        "gpu.busy_ratio",
-        "gpu.device",
-        "hardware.cpu_percent",
-        "hardware.memory_percent",
-        "hardware.memory_pressure_level",
-        "throughput.display_prefill_tokens_per_sec",
-        "throughput.display_decode_tokens_per_sec",
-        "latency.ttft_ms",
-        "context.active_tokens",
-        "cache.warm_bytes",
-        "cache.ssd_bytes",
-        "cache.tokens_reused_total"
-    ]
 }

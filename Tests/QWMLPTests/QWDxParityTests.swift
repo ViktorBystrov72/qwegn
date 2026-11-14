@@ -15,6 +15,45 @@ import QWQuant
 final class QWDxParityTests: XCTestCase {
 
     static let hal: QWHal = { try! QWHal(geometry: .qwen38_27b) }()
+    private static let fixtureDir = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("Scripts/spike/out")
+
+    private static func load(_ name: String) throws -> Data {
+        let p = fixtureDir.appendingPathComponent(name)
+        guard let d = FileManager.default.contents(atPath: p.path) else {
+            throw NSError(domain: "fixture", code: 2, userInfo: [NSLocalizedDescriptionKey: "missing \(name)"])
+        }
+        return d
+    }
+
+    private static func buf(_ d: Data) -> MTLBuffer {
+        let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
+        d.withUnsafeBytes { (p: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), p.baseAddress!, p.count) }
+        return b
+    }
+
+    private static func zeros(_ elems: Int, _ dt: QWDType) -> MTLBuffer {
+        let b = hal.device.makeBuffer(length: max(16, Int((Double(elems) * dt.bytesPerParam).rounded())),
+                                      options: .storageModeShared)!
+        memset(b.contents(), 0, b.length)
+        return b
+    }
+
+    private static func tv(_ b: MTLBuffer, _ n: Int, _ dt: QWDType) -> QWTensorValue {
+        QWTensorValue(region: QWMRegion(buffer: b, base: 0,
+                                        length: max(16, Int((Double(n) * dt.bytesPerParam).rounded()))),
+                      offset: 0, shape: QWTensorShape([n], dt))
+    }
+
+    private static func weights() throws -> (QWMLPWeight, QWMLPWeight) {
+        let gu = QWMLPWeight(blocks: tv(buf(try load("mlp_gu.bin")), 2 * 17408 * (5120 / 32) * 10, .f16),
+                             n: 2 * 17408, k: 5120, isRotated: true)
+        let dn = QWMLPWeight(blocks: tv(buf(try load("mlp_down.bin")), 5120 * (17408 / 32) * 10, .f16),
+                             n: 5120, k: 17408, isRotated: true)
+        XCTAssertNotNil(gu); XCTAssertNotNil(dn)
+        return (gu!, dn!)
+    }
 
     private func pso(_ name: String) throws -> MTLComputePipelineState {
         try XCTUnwrap(try Self.hal.pipeline(name), "kernel \(name) missing from metallib")
@@ -60,10 +99,10 @@ final class QWDxParityTests: XCTestCase {
     // MARK: down-shape GEMV family (n=5120 k=17408 — 544 blocks of 32)
 
     func testDxAndMtgGEMVBitExactVsShipping() throws {
-        let (_, dn) = try QWMLPTests.weights()          // mlp_down blocks
+        let (_, dn) = try Self.weights()          // mlp_down blocks
         let n = 5120, k: UInt32 = 17408
-        let hIn = QWMLPTests.buf(try QWMLPTests.load("mlp_h_M1.bin"))  // down's x = h (17408 f16)
-        let hs = QWMLPTests.zeros(136, .f32)
+        let hIn = Self.buf(try Self.load("mlp_h_M1.bin"))  // down's x = h (17408 f16)
+        let hs = Self.zeros(136, .f32)
 
         let variants: [(String, Int, Int)] = [
             ("qwg_gemv_q4g_v4_h16_dual", 32, 1),           // ship reference — first
@@ -73,8 +112,8 @@ final class QWDxParityTests: XCTestCase {
         var ref16 = Data(), ref32 = Data()
         for (v, threads, rows) in variants {
             let p = try pso(v)
-            let y16 = QWMLPTests.zeros(n, .f16)
-            let y32 = QWMLPTests.zeros(n, .f32)
+            let y16 = Self.zeros(n, .f16)
+            let y32 = Self.zeros(n, .f32)
             let tgs = (n + rows - 1) / rows
             guard let (cb, ce) = Self.hal.begin() else { throw NSError(domain: "hal", code: 1) }
             encode(ce, p, threads: threads, tgs: tgs,
@@ -83,7 +122,7 @@ final class QWDxParityTests: XCTestCase {
             ce.endEncoding(); cb.commit(); cb.waitUntilCompleted()
             if v == variants[0].0 {
                 let nz = Data(bytes: y32.contents(), count: n * 4)
-                    .withUnsafeBytes { $0.bindMemory(to: Float.self).filter { $0 != 0 }.count }
+                    .withUnsafeBytes { (raw: UnsafeRawBufferPointer) in raw.bindMemory(to: Float.self).filter { $0 != 0 }.count }
                 XCTAssertGreaterThan(nz, n / 2, "shipping dual wrote ~zeros — fixture wiring broken")
                 ref16 = bytes(y16); ref32 = bytes(y32)
             } else {
@@ -96,10 +135,10 @@ final class QWDxParityTests: XCTestCase {
     // MARK: gu-shape silu pair family (N=34816 K=5120)
 
     func testSiluPairDxAndMtg2BitExactVsShipping() throws {
-        let (gu, _) = try QWMLPTests.weights()
+        let (gu, _) = try Self.weights()
         let bigN: UInt32 = 2 * 17408, k: UInt32 = 5120
-        let x = QWMLPTests.buf(try QWMLPTests.load("mlp_x_M1.bin"))   // ln2 (5120 f16)
-        let gs = QWMLPTests.zeros(40, .f32)
+        let x = Self.buf(try Self.load("mlp_x_M1.bin"))   // ln2 (5120 f16)
+        let gs = Self.zeros(40, .f32)
 
         let variants: [(String, Int, Int)] = [
             ("qwg_gemv_q4g_silu_pair_h16", 64, 1),        // ship reference — first
@@ -109,8 +148,8 @@ final class QWDxParityTests: XCTestCase {
         var ref = Data()
         for (v, threads, pairs) in variants {
             let p = try pso(v)
-            let h16 = QWMLPTests.zeros(17408, .f16)
-            let dummy = QWMLPTests.zeros(1, .f32)
+            let h16 = Self.zeros(17408, .f16)
+            let dummy = Self.zeros(1, .f32)
             let tgs = (17408 + pairs - 1) / pairs
             guard let (cb, ce) = Self.hal.begin() else { throw NSError(domain: "hal", code: 1) }
             encode(ce, p, threads: threads, tgs: tgs,
@@ -119,7 +158,7 @@ final class QWDxParityTests: XCTestCase {
             ce.endEncoding(); cb.commit(); cb.waitUntilCompleted()
             if v == variants[0].0 {
                 let nz = Data(bytes: h16.contents(), count: 17408 * 2)
-                    .withUnsafeBytes { $0.bindMemory(to: UInt16.self).filter { $0 != 0 }.count }
+                    .withUnsafeBytes { (raw: UnsafeRawBufferPointer) in raw.bindMemory(to: UInt16.self).filter { $0 != 0 }.count }
                 XCTAssertGreaterThan(nz, 17408 / 2, "shipping silu_pair wrote ~zeros — wiring broken")
                 ref = bytes(h16)
             } else {

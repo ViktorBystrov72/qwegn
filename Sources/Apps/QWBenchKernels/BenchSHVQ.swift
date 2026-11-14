@@ -73,7 +73,7 @@ enum SHVQSuites {
         let gBytes = QWSHVQBlock.bytes(bits: bits, group: group)
         var val: Float = 0, mag: Float = 0
         var tmp = [Float]()
-        bank.withUnsafeBytes { raw in
+        bank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
             for g in 0..<groups {
                 let off = (row * groups + g) * gBytes
@@ -122,8 +122,8 @@ enum SHVQSuites {
         let aBank = AQBanks.make(bits: ab, group: group, rows: rows, cols: cols)
         let sW = try BenchRunner.buffer(device, bytes: sBank.count)
         let aW = try BenchRunner.buffer(device, bytes: aBank.count)
-        sBank.withUnsafeBytes { sW.contents().copyMemory(from: $0.baseAddress!, byteCount: sBank.count) }
-        aBank.withUnsafeBytes { aW.contents().copyMemory(from: $0.baseAddress!, byteCount: aBank.count) }
+        sBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in sW.contents().copyMemory(from: raw.baseAddress!, byteCount: sBank.count) }
+        aBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in aW.contents().copyMemory(from: raw.baseAddress!, byteCount: aBank.count) }
         let xs = BenchRunner.makeActivations(cols: cols)
         let xBuf = try BenchRunner.buffer(device, bytes: cols * 2)
         BenchRunner.fillF16(xBuf, xs)
@@ -191,8 +191,8 @@ enum SHVQSuites {
         let aBank = AQBanks.make(bits: ab, group: group, rows: totalRows, cols: cols)
         let sW = try BenchRunner.buffer(device, bytes: sBank.count)
         let aW = try BenchRunner.buffer(device, bytes: aBank.count)
-        sBank.withUnsafeBytes { sW.contents().copyMemory(from: $0.baseAddress!, byteCount: sBank.count) }
-        aBank.withUnsafeBytes { aW.contents().copyMemory(from: $0.baseAddress!, byteCount: aBank.count) }
+        sBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in sW.contents().copyMemory(from: raw.baseAddress!, byteCount: sBank.count) }
+        aBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in aW.contents().copyMemory(from: raw.baseAddress!, byteCount: aBank.count) }
         let xs = BenchRunner.makeActivations(cols: cols)
         let xBuf = try BenchRunner.buffer(device, bytes: cols * 4)
         BenchRunner.fillF32(xBuf, xs)
@@ -284,8 +284,8 @@ enum SHVQSuites {
         let aBank = AQBanks.make(bits: ab, group: group, rows: totalRows, cols: cols)
         let sW = try BenchRunner.buffer(device, bytes: sBank.count)
         let aW = try BenchRunner.buffer(device, bytes: aBank.count)
-        sBank.withUnsafeBytes { sW.contents().copyMemory(from: $0.baseAddress!, byteCount: sBank.count) }
-        aBank.withUnsafeBytes { aW.contents().copyMemory(from: $0.baseAddress!, byteCount: aBank.count) }
+        sBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in sW.contents().copyMemory(from: raw.baseAddress!, byteCount: sBank.count) }
+        aBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in aW.contents().copyMemory(from: raw.baseAddress!, byteCount: aBank.count) }
         let xs = BenchRunner.makeActivations(cols: routes * cols)
         let xBuf = try BenchRunner.buffer(device, bytes: routes * cols * 4)
         BenchRunner.fillF32(xBuf, xs)
@@ -382,8 +382,8 @@ enum SHVQSuites {
         let aBank = AQBanks.make(bits: ab, group: group, rows: rows, cols: cols)
         let sW = try BenchRunner.buffer(device, bytes: sBank.count)
         let aW = try BenchRunner.buffer(device, bytes: aBank.count)
-        sBank.withUnsafeBytes { sW.contents().copyMemory(from: $0.baseAddress!, byteCount: sBank.count) }
-        aBank.withUnsafeBytes { aW.contents().copyMemory(from: $0.baseAddress!, byteCount: aBank.count) }
+        sBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in sW.contents().copyMemory(from: raw.baseAddress!, byteCount: sBank.count) }
+        aBank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in aW.contents().copyMemory(from: raw.baseAddress!, byteCount: aBank.count) }
         let xs = BenchRunner.makeActivations(cols: m * cols)
         let xhBuf = try BenchRunner.buffer(device, bytes: m * cols * 2)
         BenchRunner.fillF16(xhBuf, xs)

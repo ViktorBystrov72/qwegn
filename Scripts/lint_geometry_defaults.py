@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """The geometry-default gate.
 
-A helper that takes a `QWModelGeometry` must be TOLD which geometry. A
-default is how a 27B-shaped number sneaks back in: the call compiles, the
-constants are the 27B's, and the model runs with the wrong numbers. Task
-4.3g removed the defaults that were there and this gate keeps them gone.
-
-The rule: a parameter of type `QWModelGeometry` carries NO default value.
+Enforces three invariants across `Sources`:
+1. No `QWModelGeometry` or `QWModelDescriptor` parameter carries a default value.
+2. No `?? ...qwen38_27b` nil-coalescing fallback exists.
+3. No `.qwen38_27b` reference appears outside the 5 allowlisted files.
 """
 import os
 import re
 import sys
 
-# A parameter declaration of type QWModelGeometry with a default value.
-# The declaration may span lines, so the pattern is matched over the whole
-# file text and the line number is recovered from the match offset.
-PARAM_RE = re.compile(r"\b[A-Za-z_]\w*\s*:\s*QWModelGeometry\s*=\s*[^,)\n]+")
+PARAM_RE = re.compile(r"\b[A-Za-z_]\w*\s*:\s*QWModel(?:Geometry|Descriptor)\s*=\s*[^,)\n]+")
+NIL_COALESCE_RE = re.compile(r"\?\?\s*(?:QWModel(?:Geometry|Descriptor)\s*)?\.qwen38_27b\b")
+REF_RE = re.compile(r"\.qwen38_27b\b")
+
+ALLOWED_QWEN38_27B_FILES = {
+    "Sources/Foundation/QWCore/QWModelDescriptor.swift",
+    "Sources/Foundation/QWCore/QWModelGeometry.swift",
+    "Sources/Foundation/QWQuant/QWPack.swift",
+    "Sources/Apps/QWCli/QWCli.swift",
+    "Sources/Apps/QWBenchKernels/main.swift",
+}
 
 problems = 0
 roots = sys.argv[1:] or ["Sources"]
@@ -24,14 +29,26 @@ for root in roots:
         for fn in filenames:
             if not fn.endswith(".swift"):
                 continue
-            path = os.path.join(dirpath, fn)
+            path = os.path.normpath(os.path.join(dirpath, fn))
             text = open(path, encoding="utf-8", errors="replace").read()
             for m in PARAM_RE.finditer(text):
+                if re.search(r"\b(?:let|var)\s+$", text[:m.start()]):
+                    continue
                 line = text.count("\n", 0, m.start()) + 1
                 snippet = " ".join(m.group(0).split())
-                print(f"{path}:{line}: a QWModelGeometry parameter carries a "
+                print(f"{path}:{line}: model geometry/descriptor parameter carries a "
                       f"default — {snippet}")
                 problems += 1
+            for m in NIL_COALESCE_RE.finditer(text):
+                line = text.count("\n", 0, m.start()) + 1
+                snippet = " ".join(m.group(0).split())
+                print(f"{path}:{line}: forbidden nil-coalescing .qwen38_27b fallback — {snippet}")
+                problems += 1
+            if path not in ALLOWED_QWEN38_27B_FILES:
+                for m in REF_RE.finditer(text):
+                    line = text.count("\n", 0, m.start()) + 1
+                    print(f"{path}:{line}: unexpected .qwen38_27b reference outside allowlist")
+                    problems += 1
 
 if problems:
     print(f"geometry: {problems} violation(s)")

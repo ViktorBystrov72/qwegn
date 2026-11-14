@@ -110,6 +110,39 @@ final class QWWaveAConformanceTests: XCTestCase {
         XCTAssertEqual(r3.toolCalls?.count, 2)
         XCTAssertEqual(r3.toolCalls?[0].function.name, "alpha")
         XCTAssertEqual(r3.toolCalls?[1].function.name, "beta")
+
+        let xmlUnclosedFuncProse = """
+        <tool_call>
+        <function=alpha>
+        <parameter=x>1</parameter>
+        </tool_call>
+        Now inspect the second file:
+        <tool_call>
+        <function=beta>
+        <parameter=y>2</parameter>
+        </tool_call>
+        """
+        let r4 = QWToolCallParser.parse(text: xmlUnclosedFuncProse, tools: nil)
+        XCTAssertEqual(r4.toolCalls?.count, 2)
+        XCTAssertEqual(r4.toolCalls?[0].function.name, "alpha")
+        XCTAssertEqual(r4.toolCalls?[1].function.name, "beta")
+
+        let literalPair = """
+        <tool_call>
+        {"name": "sh", "arguments": {"cmd": "echo </tool_call> and <tool_call>"}}
+        </tool_call>
+        """
+        let r5 = QWToolCallParser.parse(text: literalPair, tools: nil)
+        XCTAssertEqual(r5.toolCalls?.count, 1)
+        XCTAssertEqual(r5.toolCalls?[0].function.name, "sh")
+        XCTAssertTrue(r5.toolCalls?[0].function.arguments.contains("</tool_call> and <tool_call>") == true)
+    }
+
+    func testTinyTopPIsGreedyAndZeroTopPIsNotGreedy() {
+        XCTAssertTrue(QWSamplingParameters(temperature: 1.0, topP: 1e-6, topK: 40).isGreedy)
+        XCTAssertTrue(QWSamplerConfig(temperature: 1.0, topK: 40, topP: 1e-6).isGreedy)
+        XCTAssertFalse(QWSamplingParameters(temperature: 0.7, topP: 0.0, topK: 40).isGreedy)
+        XCTAssertFalse(QWSamplerConfig(temperature: 0.7, topK: 40, topP: 0.0).isGreedy)
     }
 
     func testValidateRequestCapabilitiesRejectsImagesWhenVisionDisabled() throws {

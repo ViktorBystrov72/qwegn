@@ -7,7 +7,6 @@ import Foundation
 import Metal
 import QWAlloc
 import QWCore
-import QWGEMM
 import QWHAL
 import QWQuant
 
@@ -82,19 +81,6 @@ public struct QWDeviceEmbedTable: Sendable {
                                   vocab: vocab, hidden: hidden, hc: hc,
                                   containerNote: "the family's \(format) blocks")
     }
-
-    /// Gathers the rows of `token` into `out` on the device.
-    public func gather(enc: any MTLComputeCommandEncoder, hal: QWHal,
-                       token: QWTensorValue, out: QWTensorValue, rows: Int, hc: Int) throws {
-        switch storage {
-        case .bf16(let table):
-            try QWGemm.encodeEmbedBf16F32(enc, hal: hal, table: table, token: token, out: out,
-                                          hidden: hidden, hc: hc, rows: rows)
-        case .nativeAffine(let blocks, let bits, let group):
-            try QWGemmAQ.encodeEmbedAQ(enc, hal: hal, blocks: blocks, token: token, out: out,
-                                       hidden: hidden, hc: hc, bits: bits, group: group, rows: rows)
-        }
-    }
 }
 
 /// Deep module for checkpoint-to-GPU weight bank materialization.
@@ -164,6 +150,22 @@ public enum QWCheckpointTensorLoader {
         }
     }
 
+    /// Builds a validated weight view, throwing `.notHQ4(name)` when container layout mismatches.
+    private static func makeWeightView(
+        blocks: QWTensorValue, n: Int, k: Int,
+        bits: Int = 4, groupSize: Int = 32, isRotated: Bool,
+        isIncumbentContainer: Bool? = nil, isSHVQ: Bool = false,
+        name: String
+    ) throws -> QWWeightView {
+        guard let view = QWWeightView(
+            blocks: blocks, n: n, k: k, bits: bits, groupSize: groupSize,
+            isRotated: isRotated, isIncumbentContainer: isIncumbentContainer, isSHVQ: isSHVQ
+        ) else {
+            throw QWCheckpointLoaderError.notHQ4(name)
+        }
+        return view
+    }
+
     public static func span(_ pack: QWQuant.Pack, _ name: String) throws -> PackSpan {
         let e = try pack.entry(name)
         guard e.quantized, let off = e.hq4Off, let rows = e.nRows, let cols = e.kCols else {
@@ -220,10 +222,10 @@ public enum QWCheckpointTensorLoader {
             off += s.bytes
         }
         let rot = arena.hal.weightBasis.rotatesActivations
-        return QWWeightView(blocks: t, n: n, k: k,
-                            bits: first.bits, groupSize: first.group,
-                            isRotated: rot, isIncumbentContainer: rot && first.isIncumbent,
-                            isSHVQ: rot && first.isSHVQ)!
+        return try makeWeightView(blocks: t, n: n, k: k,
+                                  bits: first.bits, groupSize: first.group,
+                                  isRotated: rot, isIncumbentContainer: rot && first.isIncumbent,
+                                  isSHVQ: rot && first.isSHVQ, name: "concatBank")
     }
 
     public static func hqBank(arena: QWArena, pack: QWQuant.Pack?, st: QWSafeTensorsContainer?,
@@ -243,9 +245,9 @@ public enum QWCheckpointTensorLoader {
                 bits: layout.bits, group: layout.group,
                 into: t.region.buffer, dstByteOffset: t.region.base + t.offset
             )
-            return QWWeightView(blocks: t, n: n, k: k,
-                                bits: layout.bits, groupSize: layout.group,
-                                isRotated: false)!
+            return try makeWeightView(blocks: t, n: n, k: k,
+                                      bits: layout.bits, groupSize: layout.group,
+                                      isRotated: false, name: name)
         }
         let totalBytes = n * (k / 32) * 20
         let t = try arena.weightsRegion().allocate(QWTensorShape([totalBytes / 2], .f16))
@@ -253,8 +255,8 @@ public enum QWCheckpointTensorLoader {
             hal: arena.hal, st: st, name: name, srcRowOffset: 0, rowCount: n, k: k,
             dstBuffer: t.region.buffer, dstByteOffset: t.region.base + t.offset, staging: staging
         )
-        return QWWeightView(blocks: t, n: n, k: k,
-                             isRotated: arena.hal.weightBasis.rotatesActivations)!
+        return try makeWeightView(blocks: t, n: n, k: k,
+                                  isRotated: arena.hal.weightBasis.rotatesActivations, name: name)
     }
 
     public static func concatHQBank(arena: QWArena, pack: QWQuant.Pack?, st: QWSafeTensorsContainer?,
@@ -288,9 +290,9 @@ public enum QWCheckpointTensorLoader {
                     )
                     rowOff += rows
                 }
-                return (QWWeightView(blocks: t, n: totalRows, k: k,
-                                     bits: first.bits, groupSize: first.group,
-                                     isRotated: false)!, totalRows)
+                return (try makeWeightView(blocks: t, n: totalRows, k: k,
+                                           bits: first.bits, groupSize: first.group,
+                                           isRotated: false, name: names.first ?? ""), totalRows)
             }
         }
         let rowBytes = (k / 32) * 20
@@ -306,8 +308,9 @@ public enum QWCheckpointTensorLoader {
             )
             rowOff += rows
         }
-        return (QWWeightView(blocks: t, n: totalRows, k: k,
-                              isRotated: arena.hal.weightBasis.rotatesActivations)!, totalRows)
+        return (try makeWeightView(blocks: t, n: totalRows, k: k,
+                                   isRotated: arena.hal.weightBasis.rotatesActivations,
+                                   name: names.first ?? ""), totalRows)
     }
 
     private static let stageLock = NSLock()
@@ -363,6 +366,9 @@ public enum QWCheckpointTensorLoader {
 
     private static func mapCachedMoESlab(at url: URL, alignedGU: Int, alignedDN: Int,
                                          device: any MTLDevice) -> (guBuf: any MTLBuffer, dnBuf: any MTLBuffer)? {
+        let pageSize = Int(sysconf(_SC_PAGESIZE))
+        guard pageSize > 0, alignedGU > 0, alignedDN > 0,
+              alignedGU % pageSize == 0, alignedDN % pageSize == 0 else { return nil }
         let totalBytes = alignedGU + alignedDN
         let fd = Darwin.open(url.path, O_RDONLY)
         guard fd >= 0 else { return nil }
@@ -446,10 +452,12 @@ public enum QWCheckpointTensorLoader {
                                                      offset: 0, shape: QWTensorShape([guBytes / 2], .f16))
                         let dnTensor = QWTensorValue(region: QWMRegion(buffer: mapped.dnBuf, base: 0, length: dnBytes),
                                                      offset: 0, shape: QWTensorShape([dnBytes / 2], .f16))
-                        return (QWWeightView(blocks: guTensor, n: guRows, k: hidden,
-                                             bits: guLayout.bits, groupSize: guLayout.group, isRotated: false)!,
-                                QWWeightView(blocks: dnTensor, n: dnRows, k: inter,
-                                             bits: dnLayout.bits, groupSize: dnLayout.group, isRotated: false)!)
+                        return (try makeWeightView(blocks: guTensor, n: guRows, k: hidden,
+                                                   bits: guLayout.bits, groupSize: guLayout.group,
+                                                   isRotated: false, name: mp + "experts.gate_up_proj"),
+                                try makeWeightView(blocks: dnTensor, n: dnRows, k: inter,
+                                                   bits: dnLayout.bits, groupSize: dnLayout.group,
+                                                   isRotated: false, name: downName))
                     }
                     if let stageBuf = acquireRepackStage(device: arena.hal.device, minBytes: max(alignedGU, alignedDN)) {
                         let tmpURL = slabURL.appendingPathExtension("tmp.\(getpid())")
@@ -484,10 +492,12 @@ public enum QWCheckpointTensorLoader {
                                                                  offset: 0, shape: QWTensorShape([guBytes / 2], .f16))
                                     let dnTensor = QWTensorValue(region: QWMRegion(buffer: mapped.dnBuf, base: 0, length: dnBytes),
                                                                  offset: 0, shape: QWTensorShape([dnBytes / 2], .f16))
-                                    return (QWWeightView(blocks: guTensor, n: guRows, k: hidden,
-                                                         bits: guLayout.bits, groupSize: guLayout.group, isRotated: false)!,
-                                            QWWeightView(blocks: dnTensor, n: dnRows, k: inter,
-                                                         bits: dnLayout.bits, groupSize: dnLayout.group, isRotated: false)!)
+                                    return (try makeWeightView(blocks: guTensor, n: guRows, k: hidden,
+                                                               bits: guLayout.bits, groupSize: guLayout.group,
+                                                               isRotated: false, name: mp + "experts.gate_up_proj"),
+                                            try makeWeightView(blocks: dnTensor, n: dnRows, k: inter,
+                                                               bits: dnLayout.bits, groupSize: dnLayout.group,
+                                                               isRotated: false, name: downName))
                                 }
                             } else {
                                 Darwin.close(tmpFD)
@@ -524,10 +534,12 @@ public enum QWCheckpointTensorLoader {
                     hal: arena.hal, container: st, name: downName,
                     rows: dnRows, cols: inter, bits: dnLayout.bits, group: dnLayout.group,
                     into: dnBuf, dstByteOffset: 0)
-                return (QWWeightView(blocks: guTensor, n: guRows, k: hidden,
-                                     bits: guLayout.bits, groupSize: guLayout.group, isRotated: false)!,
-                        QWWeightView(blocks: dnTensor, n: dnRows, k: inter,
-                                     bits: dnLayout.bits, groupSize: dnLayout.group, isRotated: false)!)
+                return (try makeWeightView(blocks: guTensor, n: guRows, k: hidden,
+                                           bits: guLayout.bits, groupSize: guLayout.group,
+                                           isRotated: false, name: mp + "experts.gate_up_proj"),
+                        try makeWeightView(blocks: dnTensor, n: dnRows, k: inter,
+                                           bits: dnLayout.bits, groupSize: dnLayout.group,
+                                           isRotated: false, name: downName))
             }
         }
 
@@ -564,7 +576,7 @@ public enum QWCheckpointTensorLoader {
             srcRowOffset: 0, rowCount: dnRows, k: inter,
             dstBuffer: dnBuf, dstByteOffset: 0, staging: stageBuf)
         let rot = arena.hal.weightBasis.rotatesActivations
-        return (QWWeightView(blocks: guTensor, n: guRows, k: hidden, isRotated: rot)!,
-                QWWeightView(blocks: dnTensor, n: dnRows, k: inter, isRotated: rot)!)
+        return (try makeWeightView(blocks: guTensor, n: guRows, k: hidden, isRotated: rot, name: mp + "experts.gate_up_proj"),
+                try makeWeightView(blocks: dnTensor, n: dnRows, k: inter, isRotated: rot, name: downName))
     }
 }

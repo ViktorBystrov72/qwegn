@@ -14,21 +14,6 @@ public enum QWKnobRegistry {
         all.first { $0.id == id }
     }
 
-    /// Every knob reachable from a surface.
-    public static func descriptors(for surface: QWKnobSurface) -> [QWKnobDescriptor] {
-        all.filter { $0.surfaces.contains(surface) }
-    }
-
-    /// Every knob that needs the given capability.
-    public static func descriptors(requireing capability: QWKnobCapability) -> [QWKnobDescriptor] {
-        all.filter { $0.requiredCapability == capability }
-    }
-
-    /// Every knob the model behind `capabilities` can actually honour.
-    public static func descriptors(availableUnder capabilities: Set<QWKnobCapability>) -> [QWKnobDescriptor] {
-        all.filter { $0.isAvailable(under: capabilities) }
-    }
-
     // MARK: - Normal tier
 
     private static let normalSurfaces: Set<QWKnobSurface> = [.cli, .api, .menuBar, .dashboard, .profile]

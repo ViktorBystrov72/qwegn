@@ -46,7 +46,7 @@ final class QWHeadContainerTests: XCTestCase {
     private func reference(_ bytes: Data, bits: Int, group: Int, x: [Float16]) -> [Float] {
         let blockBytes = QWAQBlock.bytes(bits: bits, group: group)
         let xs = x.map(Float.init)
-        return bytes.withUnsafeBytes { raw in
+        return bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             (0..<rows).map { r in
                 (0..<(k / group)).reduce(Float(0)) { acc, g in
                     let at = (r * (k / group) + g) * blockBytes

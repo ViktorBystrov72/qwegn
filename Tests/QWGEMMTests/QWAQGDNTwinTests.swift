@@ -95,8 +95,8 @@ final class QWAQGDNTwinTests: XCTestCase {
             let offset = (row * groups + g) * bytesPerGroup
             let slice = bank.subdata(in: offset..<(offset + bytesPerGroup))
             let xs = (0..<group).map { Float(Float16(x[g * group + $0])) }
-            value += slice.withUnsafeBytes { QWAQBlock.dot(group: $0, bits: bits, group: group, x: xs) }
-            magnitude += slice.withUnsafeBytes { raw -> Float in
+            value += slice.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.dot(group: raw, bits: bits, group: group, x: xs) }
+            magnitude += slice.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Float in
                 let (scale, bias) = QWAQBlock.header(raw)
                 let payload = UnsafeRawBufferPointer(rebasing: raw.dropFirst(4))
                 var m: Float = 0
@@ -121,7 +121,7 @@ final class QWAQGDNTwinTests: XCTestCase {
         for g in 0..<groups {
             let offset = (row * groups + g) * bytesPerGroup
             let slice = bank.subdata(in: offset..<(offset + bytesPerGroup))
-            slice.withUnsafeBytes { raw in
+            slice.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 let (scale, bias) = QWAQBlock.header(raw)
                 let payload = UnsafeRawBufferPointer(rebasing: raw.dropFirst(4))
                 for i in 0..<group {

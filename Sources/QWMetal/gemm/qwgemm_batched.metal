@@ -302,8 +302,10 @@ kernel void qwg_moe_nax_gemm(device const Block_HQ4_G32* w [[buffer(0)]],
     const uint wExp = isCold ? (e - residentE) : e;
     device const Block_HQ4_G32* we = (isCold ? coldW : w) + size_t(wExp) * size_t(p.n) * size_t(p.blocksPerRow);
     device half* ye = y + size_t(rowBase) * size_t(p.n);
-    uint3 tid = uint3(tg.x, uint(tileR[t]), 0);
-    const int bm = qw_moe_tile_block(rowCount, int(tileBlock & 0x3Fu));
+    int bm;
+    uint tidY;
+    qw_moe_decode_tile(tileR[t], rowCount, int(tileBlock & 0x3Fu), bm, tidY);
+    uint3 tid = uint3(tg.x, tidY, 0);
     if (hasGather != 0u) {
         device const int32_t* st = sortedTok + rowBase;
         if (bm == 16) {
@@ -479,8 +481,10 @@ kernel void qwg_moe_nax_split_f32(device const Block_HQ4_G32* w [[buffer(0)]],
     device const Block_HQ4_G32* we = (isCold ? coldW : w) + size_t(wExp) * size_t(p.n) * size_t(p.blocksPerRow);
     device const half* xhe = xh + size_t(rowBase) * size_t(p.k);
     device const half* xle = xl + size_t(rowBase) * size_t(p.k);
-    uint3 tid = uint3(tg.x, uint(tileR[t]), 0);
-    const int bm = qw_moe_tile_block(rowCount, int(tileBlock & 0x3Fu));
+    int bm;
+    uint tidY;
+    qw_moe_decode_tile(tileR[t], rowCount, int(tileBlock & 0x3Fu), bm, tidY);
+    uint3 tid = uint3(tg.x, tidY, 0);
     if ((tileBlock & 0x80000000u) != 0u) {
         device half* ye16 = ((device half*)y32) + size_t(rowBase) * size_t(p.n);
         if (bm == 16) {

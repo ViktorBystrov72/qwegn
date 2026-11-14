@@ -1,10 +1,8 @@
 // QWGDNDecode.swift — engine-side encoder for the C12 GDN recurrent step.
 //
-// Mirrors qwgdn_decode.metal: two launches per token —
-//   qwg_gdn_recurrent    : grid (48 heads) × 128 lanes (lane owns v-column) —
-//                          decay + delta-rule update of the fp32 state IN PLACE
-//                          + raw o fold;
-//   qwg_gdn_norm_sigmoid : grid (48 heads) × 128 lanes — GatedRMSNorm epilogue
+// Mirrors qwgdn_decode.metal: `qwg_gdn_recurrent` (grid = vHeads × 128 lanes)
+// performs decay + delta-rule update of the fp32 state IN PLACE plus the fused
+// GatedRMSNorm epilogue.
 import Foundation
 import Metal
 import QWCore
@@ -19,15 +17,26 @@ public enum QWGDNDecodeError: Error, CustomStringConvertible {
 public final class QWGDNDecode {
     public static let vHeads = 48
     public static let headDim = 128
-    /// fp32 elements of per-step o scratch (48 heads × 128 v).
-    public static let oScratchElems = vHeads * headDim
 
     private let hal: QWHal
     private let psoRec: any MTLComputePipelineState
     private let psoRecRows: any MTLComputePipelineState
     private let psoRollbackRows: any MTLComputePipelineState
-    private lazy var psoKDAGates: any MTLComputePipelineState = { try! hal.pipeline("qwg_kda_gates") }()
-    private lazy var psoKDAGatesMMA: any MTLComputePipelineState = { try! hal.pipeline("qwg_kda_gates_mma") }()
+    private var cachedKDAGates: (any MTLComputePipelineState)?
+    private var cachedKDAGatesMMA: (any MTLComputePipelineState)?
+
+    private func kdaGatesPipeline(mma: Bool) throws -> any MTLComputePipelineState {
+        if mma {
+            if let p = cachedKDAGatesMMA { return p }
+            let p = try hal.pipeline("qwg_kda_gates_mma")
+            cachedKDAGatesMMA = p
+            return p
+        }
+        if let p = cachedKDAGates { return p }
+        let p = try hal.pipeline("qwg_kda_gates")
+        cachedKDAGates = p
+        return p
+    }
     /// Prefill rows use the 32-token simdgroup-MMA gates kernel (`QW_KDA_GATES_MMA=0` disables).
     public var kdaGatesMMAEnabled = ProcessInfo.processInfo.environment["QW_KDA_GATES_MMA"] != "0"
 
@@ -55,7 +64,7 @@ public final class QWGDNDecode {
         let vh = instVHeads, zCh = instZCh
         guard rows > 0 else { return }
         let useMMA = kdaGatesMMAEnabled && rows >= 16
-        enc.setComputePipelineState(useMMA ? psoKDAGatesMMA : psoKDAGates)
+        enc.setComputePipelineState(try kdaGatesPipeline(mma: useMMA))
         fgb.bind(enc, index: 0)
         fB.bind(enc, index: 1)
         gB.bind(enc, index: 2)
@@ -131,30 +140,6 @@ public final class QWGDNDecode {
         } else {
             enc.setBuffer(nil, offset: 0, index: 9)
         }
-        enc.dispatchThreadgroups(MTLSize(width: vh, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: hd * 8, height: 1, depth: 1))
-    }
-
-    /// One recurrent step without the gated-norm epilogue: writes only the pre-norm readout `oScratch` ([vHeads][128] f32).
-    public func encodeRaw(_ enc: any MTLComputeCommandEncoder,
-                          y: QWTensorValue, betas: QWTensorValue, glog: QWTensorValue,
-                          state: QWTensorValue, oScratch: QWTensorValue) throws {
-        let vh = instVHeads, hd = instHeadDim, qkv = instQKVCh, zCh = instZCh, gCh = instGlogCh
-        let S = vh * hd * hd
-        func ok(_ t: QWTensorValue, _ n: Int, _ dt: QWDType) -> Bool {
-            t.shape.elementCount == n && t.shape.dtype == dt
-                && t.region.length >= Int((Double(n) * dt.bytesPerParam).rounded())
-        }
-        guard ok(y, qkv, .f16), ok(betas, vh, .f32), ok(glog, gCh, .f32),
-              ok(state, S, .f32), ok(oScratch, zCh, .f32)
-        else { throw QWGDNDecodeError.badShape("encodeRaw y=\(y.shape.elementCount) state=\(state.shape.elementCount)") }
-        enc.setComputePipelineState(psoRec)
-        y.bind(enc, index: 0)
-        betas.bind(enc, index: 1)
-        glog.bind(enc, index: 2)
-        state.bind(enc, index: 3)          // IN PLACE
-        oScratch.bind(enc, index: 4)
-        for index in 5...9 { enc.setBuffer(nil, offset: 0, index: index) }   // z, w, o_out, out_gs, innovation: absent
         enc.dispatchThreadgroups(MTLSize(width: vh, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: hd * 8, height: 1, depth: 1))
     }

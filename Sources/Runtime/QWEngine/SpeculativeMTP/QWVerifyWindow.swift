@@ -5,7 +5,6 @@ import QWHAL
 import QWHead
 import QWGEMM
 import QWGDN
-import QWMTP
 
 /// Driver-wide scratch, owned by a single unresolved verification window.
 struct QWVerifyWindow {
@@ -90,23 +89,6 @@ struct QWVerifyWindow {
             : nil
         targetSelector = gpuTargets ? try QWMTPGreedySelector(geometry: geometry, allocator: allocator, vocabulary: vocabulary) : nil
         targetTokens = gpuTargets ? try allocator.allocate(QWTensorShape([rows], .i32)) : nil
-    }
-
-    func normalizedRow(_ row: Int) throws -> QWTensorValue {
-        guard let normalized, (0..<rows).contains(row) else {
-            throw QWEngineDriverError.state("layer-major normalized row unavailable")
-        }
-        return QWTensorValue(region: normalized.region, offset: normalized.offset + row * geometry.hidden * 2,
-                             shape: QWTensorShape([geometry.hidden], .f16))
-    }
-
-    func mlpRow(_ row: Int) throws -> QWTensorValue {
-        guard let mlpRows, (0..<rows).contains(row) else {
-            throw QWEngineDriverError.state("layer-major MLP row unavailable")
-        }
-        let effInter = max(1, max(geometry.intermediate, geometry.moeIntermediate))
-        return QWTensorValue(region: mlpRows.region, offset: mlpRows.offset + row * effInter * 2,
-                             shape: QWTensorShape([effInter], .f16))
     }
 
     func hiddenRow(_ row: Int) throws -> QWTensorValue {
@@ -226,101 +208,6 @@ struct QWVerifyWindow {
                 try selector.encode(enc, hal: hal, logits: scores, ordering: .shippingTarget, destination: saved)
             }
         }
-    }
-
-    /// Encodes shared-noise draft/target argmax pairs for each draft row and
-    /// the target-only bonus row into `[draft, target]` i32 pairs.
-    func encodeGumbelComparisons(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
-                                 draftLogits: [QWTensorValue], seed: UInt64,
-                                 startingPosition: UInt64, temperature: Float,
-                                 winners: QWTensorValue) throws {
-        guard draftLogits.count + 1 == rows, temperature.isFinite, temperature > 0,
-              winners.shape.dtype == .i32, winners.shape.dims == [2 * rows],
-              winners.bytes == 2 * rows * MemoryLayout<Int32>.size else {
-            throw QWEngineDriverError.state("Gumbel verification shape or temperature is invalid")
-        }
-        func valid(_ value: QWTensorValue, dtype: QWDType, elements: Int) -> Bool {
-            value.shape.dtype == dtype && value.shape.dims == [elements]
-                && value.bytes == elements * (dtype == .f32 || dtype == .i32 ? 4 : 2)
-                && value.offset >= 0 && value.region.base >= 0
-                && value.offset <= value.region.length
-                && value.bytes <= value.region.length - value.offset
-                && value.region.base <= value.region.buffer.length
-                && value.region.length <= value.region.buffer.length - value.region.base
-                && (value.region.base + value.offset) % 4 == 0
-        }
-        guard valid(winners, dtype: .i32, elements: 2 * rows),
-              draftLogits.allSatisfy({ valid($0, dtype: .f32, elements: vocabulary) }) else {
-            throw QWEngineDriverError.state("Gumbel verification tensor extent or alignment is invalid")
-        }
-        var inputs = draftLogits
-        inputs.append(contentsOf: try (0..<rows).map { try logitRow($0) })
-        for input in inputs {
-            if input.region.buffer === winners.region.buffer {
-                let inputStart = input.region.base + input.offset
-                let winnerStart = winners.region.base + winners.offset
-                guard inputStart + input.bytes <= winnerStart ||
-                      winnerStart + winners.bytes <= inputStart else {
-                    throw QWEngineDriverError.state("Gumbel winner buffer aliases verification logits")
-                }
-            }
-        }
-        let (lastPosition, rowOverflow) = startingPosition.addingReportingOverflow(UInt64(rows - 1))
-        let maxCounter = (UInt64.max - UInt64(vocabulary - 1)) / UInt64(vocabulary)
-        guard !rowOverflow, lastPosition <= maxCounter else {
-            throw QWEngineDriverError.state("Gumbel verification Philox counter overflows")
-        }
-        let pso = try hal.pipeline("qwg_gumbel_sample_argmax")
-        guard pso.maxTotalThreadsPerThreadgroup >= 256 else {
-            throw QWEngineDriverError.state("Gumbel pipeline requires 256 threads per threadgroup")
-        }
-        for row in 0..<rows {
-            let target = try logitRow(row)
-            let draft = row < draftLogits.count ? draftLogits[row] : target
-            let result = QWTensorValue(region: winners.region,
-                offset: winners.offset + row * 2 * MemoryLayout<Int32>.size,
-                shape: QWTensorShape([2], .i32))
-            guard valid(target, dtype: .f32, elements: vocabulary),
-                  valid(result, dtype: .i32, elements: 2) else {
-                throw QWEngineDriverError.state("Gumbel target row or output tensor extent is invalid")
-            }
-            enc.setComputePipelineState(pso)
-            draft.bind(enc, index: 0)
-            target.bind(enc, index: 1)
-            result.bind(enc, index: 2)
-            var vocab = UInt32(vocabulary), rowPosition = startingPosition + UInt64(row)
-            var seedValue = seed, temp = temperature
-            enc.setBytes(&vocab, length: MemoryLayout<UInt32>.size, index: 3)
-            enc.setBytes(&seedValue, length: MemoryLayout<UInt64>.size, index: 4)
-            enc.setBytes(&rowPosition, length: MemoryLayout<UInt64>.size, index: 5)
-            enc.setBytes(&temp, length: MemoryLayout<Float>.size, index: 6)
-            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-            enc.memoryBarrier(scope: .buffers)
-        }
-    }
-
-    /// Publishes the completed GPU winner pairs through QWMTP's checked
-    /// coupling resolver. Call only after the producing command buffer ends.
-    func completedGumbelDecision(winners: QWTensorValue) throws -> QWMTP.GumbelRoundResult {
-        guard winners.shape.dtype == .i32, winners.shape.dims == [2 * rows],
-              winners.offset >= 0, winners.region.base >= 0,
-              winners.bytes == 2 * rows * MemoryLayout<Int32>.size,
-              winners.offset <= winners.region.length,
-              winners.bytes <= winners.region.length - winners.offset,
-              winners.region.base <= winners.region.buffer.length,
-              winners.region.length <= winners.region.buffer.length - winners.region.base,
-              (winners.region.base + winners.offset) % MemoryLayout<Int32>.alignment == 0 else {
-            throw QWEngineDriverError.state("completed Gumbel winner buffer is invalid")
-        }
-        let ids = winners.region.pointer.advanced(by: winners.offset).assumingMemoryBound(to: Int32.self)
-        var pairs: [[Int]] = []
-        pairs.reserveCapacity(rows - 1)
-        for row in 0..<(rows - 1) {
-            pairs.append([Int(ids[row * 2]), Int(ids[row * 2 + 1])])
-        }
-        return try QWMTP.checkedGumbelCouplingRound(winnerPairs: pairs,
-            bonusTarget: Int(ids[(rows - 1) * 2 + 1]), vocabulary: vocabulary)
     }
 
     /// Completed immutable row decisions. The unresolved window lease prevents

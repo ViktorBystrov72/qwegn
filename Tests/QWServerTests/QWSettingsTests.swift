@@ -2,6 +2,13 @@ import XCTest
 @testable import QWServer
 import QWCore
 
+private extension QWSettingsManager {
+    func invalidateCache() {
+        lock.lock(); defer { lock.unlock() }
+        cachedSettings = nil; cachedBytes = nil; cachedURL = nil
+    }
+}
+
 final class QWSettingsTests: XCTestCase {
     func testSettingsDefaultsAndCustomValues() {
         let defaults = QWServerSettings()

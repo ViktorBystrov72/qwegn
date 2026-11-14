@@ -125,8 +125,8 @@ final class QWSHVQTests: XCTestCase {
 
             var posOut = [Float]()
             var negOut = [Float]()
-            posBlock.withUnsafeBytes { QWSHVQBlock.unpack(group: $0, bits: bits, group: group, into: &posOut) }
-            negBlock.withUnsafeBytes { QWSHVQBlock.unpack(group: $0, bits: bits, group: group, into: &negOut) }
+            posBlock.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWSHVQBlock.unpack(group: raw, bits: bits, group: group, into: &posOut) }
+            negBlock.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWSHVQBlock.unpack(group: raw, bits: bits, group: group, into: &negOut) }
             XCTAssertEqual(posOut.count, group)
             XCTAssertEqual(negOut.count, group)
             for i in 0..<group {
@@ -135,8 +135,8 @@ final class QWSHVQTests: XCTestCase {
             }
 
             let xs = (0..<group).map { Float(($0 % 17) - 8) * 0.125 }
-            let posDot = posBlock.withUnsafeBytes { QWSHVQBlock.dot(group: $0, bits: bits, group: group, x: xs) }
-            let negDot = negBlock.withUnsafeBytes { QWSHVQBlock.dot(group: $0, bits: bits, group: group, x: xs) }
+            let posDot = posBlock.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWSHVQBlock.dot(group: raw, bits: bits, group: group, x: xs) }
+            let negDot = negBlock.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWSHVQBlock.dot(group: raw, bits: bits, group: group, x: xs) }
             XCTAssertEqual(negDot, -posDot, accuracy: 1e-6)
         }
     }
@@ -163,7 +163,7 @@ final class QWSHVQTests: XCTestCase {
                 block[2 + 3 * oct + 2] = UInt8((r * 11 + oct * 23) & 0xFF)
             }
             var unpacked = [Float]()
-            block.withUnsafeBytes { QWSHVQBlock.unpack(group: $0, bits: bits, group: group, into: &unpacked) }
+            block.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWSHVQBlock.unpack(group: raw, bits: bits, group: group, into: &unpacked) }
             // Inverse 32-point orthonormal FWHT matches QWQuant.Pack.dequantQ4g.
             unpacked.withUnsafeMutableBufferPointer { buf in
                 for b in stride(from: 0, to: cols, by: 32) {
@@ -208,7 +208,7 @@ final class QWSHVQTests: XCTestCase {
         ]
         let hdrData = try JSONSerialization.data(withJSONObject: hdrObj, options: [.sortedKeys])
         var hdrLenLE = UInt64(hdrData.count).littleEndian
-        withUnsafeBytes(of: &hdrLenLE) { raw in
+        withUnsafeBytes(of: &hdrLenLE) { (raw: UnsafeRawBufferPointer) in
             fileBytes.replaceSubrange(4..<12, with: raw)
         }
         fileBytes.append(hdrData)
@@ -232,5 +232,11 @@ final class QWSHVQTests: XCTestCase {
         for i in 0..<deqExp1.count {
             XCTAssertEqual(deqExp1[i], expectedFlat[i], accuracy: 1e-6)
         }
+    }
+}
+
+private extension QWSHVQBlock {
+    static func bitsPerWeight(bits: Int, group: Int) -> Double {
+        Double(bytes(bits: bits, group: group) * 8) / Double(group)
     }
 }

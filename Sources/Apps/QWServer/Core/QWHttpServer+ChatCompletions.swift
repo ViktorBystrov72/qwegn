@@ -58,6 +58,7 @@ extension QWHttpServer {
             && !hasActiveTools
         let allowToolCalls = hasActiveTools
         let allowReasoningTags = !isConstrainedJson
+        let shouldStop = generationShouldStop(for: connection)
 
         if req.isStreaming {
             sendSSEHeaders(connection)
@@ -128,9 +129,11 @@ extension QWHttpServer {
                     },
                     onTokenLogprob: (req.logprobs == true) ? { lp in
                         lpBox.pending.append(lp)
-                    } : nil
+                    } : nil,
+                    shouldStop: shouldStop
                 )
             } catch {
+                if shouldStop() { return }
                 self.logger.log(.error, "HTTP POST /v1/chat/completions (stream) failed: \(error)")
                 let errPayload = ServerErrorPayload(message: "\(error)", type: "server_error", code: 500)
                 if let errData = try? sseEncoder.encode(errPayload) {
@@ -147,6 +150,7 @@ extension QWHttpServer {
                 return
             }
 
+            guard !shouldStop() else { return }
             let tailDeltas = streamParser.finish()
             for delta in tailDeltas {
                 let chunkLP = lpBox.drain()
@@ -197,7 +201,8 @@ extension QWHttpServer {
                 connection.cancel()
             }))
         } else {
-            let result = try await self.actor.handleChatCompletion(request: req, onToken: nil)
+            let result = try await self.actor.handleChatCompletion(request: req, onToken: nil, shouldStop: shouldStop)
+            guard !shouldStop() else { return }
             let parsed = QWToolCallParser.parse(
                 text: result.content,
                 tools: req.tools,

@@ -35,9 +35,9 @@ final class QWNormTests: XCTestCase {
     /// f16 bits → f32 exact (delegates to the C04 converter — the same math
     /// the packer reader uses, so the test proves engine↔packer agreement).
     static func f16(_ bits: UInt16) -> Float { QWQuant.f16tof32Bits(bits) }
-    static func floats(_ d: Data) -> [Float] { d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }
+    static func floats(_ d: Data) -> [Float] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) } }
     static func f16Vals(_ d: Data) -> [Float] {
-        d.withUnsafeBytes { raw in
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             (0..<d.count / 2).map { f16(raw.load(fromByteOffset: $0 * 2, as: UInt16.self)) }
         }
     }

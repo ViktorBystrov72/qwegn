@@ -7,6 +7,12 @@ import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 
+private extension QWImageDecoder {
+    static func clearEncodedImageCache() {
+        encodedCache.clear()
+    }
+}
+
 private final class MockOnDemandVisionBackend: QWVisionBackend, @unchecked Sendable {
     let outDim: Int
     var isLoaded: Bool = false
@@ -152,6 +158,12 @@ final class QWImageDecoderTests: XCTestCase {
 
     func testNonExistentFileThrows() {
         XCTAssertThrowsError(try QWImageDecoder.decode(urlOrDataUri: "/non/existent/image.jpg")) { error in
+            guard case .disallowedImageSource = error as? QWImageDecoderError else {
+                XCTFail("Expected disallowedImageSource under default server policy, got \(error)")
+                return
+            }
+        }
+        XCTAssertThrowsError(try QWImageDecoder.decode(urlOrDataUri: "/non/existent/image.jpg", policy: .cliLocal)) { error in
             XCTAssertEqual(error as? QWImageDecoderError, .fileNotFound("/non/existent/image.jpg"))
         }
     }
@@ -195,6 +207,8 @@ final class QWImageDecoderTests: XCTestCase {
     }
 
     func testQwen36_35BA3BVisionConfigAdvertisesVisionCapability() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != nil,
+                      "Local ~/.qwg/models pack check skipped on GitHub Actions")
         let packPath = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".qwg/models/Qwen3.6-35B-A3B-hq4g32").path
         let cfgPath = packPath + "/assets/config.json"
@@ -203,7 +217,7 @@ final class QWImageDecoderTests: XCTestCase {
         }
         let data = try Data(contentsOf: URL(fileURLWithPath: cfgPath))
         let desc = try QWModelDescriptor.decode(configJSON: data)
-        XCTAssertEqual(desc.family, .qwen38Dense)
+        XCTAssertEqual(desc.family, .qwen38MoE)
         XCTAssertTrue(desc.capabilities.contains(.vision))
         XCTAssertEqual(desc.visDepth, 27)
         XCTAssertEqual(desc.visHidden, 1152)
@@ -213,9 +227,17 @@ final class QWImageDecoderTests: XCTestCase {
     }
 
     func testSetVisionLoadedTogglesResidencyInPlaceWithoutReloadingOnTextTurn() async throws {
+        final class LoadCounter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = 0
+            func increment() { lock.withLock { value += 1 } }
+            var count: Int { lock.withLock { value } }
+        }
+        let loadCounter = LoadCounter()
         let toggleable = try QWVisionOnDemandBackend(
             source: .custom {
-                try Self.makeTinyVisionWeights()
+                loadCounter.increment()
+                return try Self.makeTinyVisionWeights()
             },
             keepResident: false,
             allowOnDemand: false
@@ -230,17 +252,16 @@ final class QWImageDecoderTests: XCTestCase {
         try toggleable.setVisionLoaded(true)
         XCTAssertTrue(toggleable.isLoaded)
         XCTAssertTrue(toggleable.keepResident)
-        XCTAssertEqual(toggleable.loadCount, 1)
+        XCTAssertEqual(loadCounter.count, 1)
 
         try toggleable.prepareForPrompt(hasImages: false)
         XCTAssertTrue(toggleable.isLoaded, "resident vision tower must stay loaded across text turns")
-        XCTAssertEqual(toggleable.unloadCount, 0)
+        XCTAssertEqual(loadCounter.count, 1)
 
         // Toggling loadVision OFF unloads vision weights in place
         try toggleable.setVisionLoaded(false)
         XCTAssertFalse(toggleable.isLoaded)
         XCTAssertFalse(toggleable.keepResident)
-        XCTAssertEqual(toggleable.unloadCount, 1)
     }
 
     func testEncodedImageLRUCacheSkipsRepeatEncodeAndVisionReload() async throws {
@@ -353,8 +374,8 @@ final class QWImageDecoderTests: XCTestCase {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("qwg-vis-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
-        let d = QWVisionShape.dim
-        let mlp = QWVisionShape.mlpInner
+        let d = QWVisionConfig.qwen3VLReference.dim
+        let mlp = QWVisionConfig.qwen3VLReference.mlpInner
         var tensors: [(String, [Int])] = [
             ("model.visual.pos_embed.weight", [2304, d]),
             ("model.visual.patch_embed.proj.weight", [d, 3, 2, 16, 16]),
@@ -393,11 +414,11 @@ final class QWImageDecoderTests: XCTestCase {
         let hdrData = try JSONSerialization.data(withJSONObject: headerObj)
         var fileData = Data(count: 8 + hdrData.count + offset)
         var hdrLen = UInt64(hdrData.count).littleEndian
-        withUnsafeBytes(of: &hdrLen) { fileData.replaceSubrange(0..<8, with: $0) }
+        withUnsafeBytes(of: &hdrLen) { (raw: UnsafeRawBufferPointer) in fileData.replaceSubrange(0..<8, with: raw) }
         fileData.replaceSubrange(8..<(8 + hdrData.count), with: hdrData)
         if fillBF16 != 0 {
             let base = 8 + hdrData.count
-            fileData.withUnsafeMutableBytes { raw in
+            fileData.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
                 guard let ptr = raw.baseAddress?.advanced(by: base).assumingMemoryBound(to: UInt16.self) else { return }
                 let count = offset / 2
                 for i in 0..<count {

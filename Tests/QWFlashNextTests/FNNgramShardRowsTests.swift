@@ -40,7 +40,7 @@ final class FNNgramShardRowsTests: XCTestCase {
         ]
         let headerJSON = try JSONSerialization.data(withJSONObject: header)
         var out = Data()
-        out.append(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { Array($0) })
+        out.append(contentsOf: withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         out.append(headerJSON)
         out.append(payload)
         let url = dir.appendingPathComponent(name)

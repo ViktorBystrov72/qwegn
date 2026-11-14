@@ -383,4 +383,42 @@ final class QWTelemetryHonestyTests: XCTestCase {
         XCTAssertGreaterThan(rate, 70.0,
                              "speculative 3-token bursts of ~30ms must report ~90-100 tok/s, not round rate (~30 tok/s)")
     }
+
+    func testLiveDecodeProjectsTrailingTracePointWithoutDuplicatingOnEndRequest() {
+        let registry = QWEngineTelemetryRegistry()
+        registry.beginPrefill(promptTokens: 100)
+        registry.beginDecode(promptTokens: 100)
+        var t = Date()
+        for _ in 0..<3 {
+            t = t.addingTimeInterval(0.020)
+            registry.recordDecodeToken(at: t)
+        }
+        let duringTurn1 = registry.snapshot().throughput
+        XCTAssertEqual(duringTurn1.decodeRateSeries.count, 1)
+        XCTAssertNotNil(duringTurn1.decodeRateSeries[0])
+        XCTAssertEqual(duringTurn1.prefillRateSeries, [nil])
+
+        registry.endRequest(tokensIn: 100, tokensOut: 4, cachedTokens: 0,
+                            prefillSec: 0.5, decodeSec: 0.1, ttftSec: 0.55)
+        let afterTurn1 = registry.snapshot().throughput
+        XCTAssertEqual(afterTurn1.decodeRateSeries.count, 1)
+        XCTAssertNotNil(afterTurn1.decodeRateSeries[0])
+        XCTAssertEqual(afterTurn1.prefillRateSeries.count, 1)
+        XCTAssertNotNil(afterTurn1.prefillRateSeries[0])
+
+        registry.beginPrefill(promptTokens: 120)
+        registry.beginDecode(promptTokens: 120)
+        t = Date()
+        for _ in 0..<3 {
+            t = t.addingTimeInterval(0.015)
+            registry.recordDecodeToken(at: t)
+        }
+        let duringTurn2 = registry.snapshot().throughput
+        XCTAssertEqual(duringTurn2.decodeRateSeries.count, 2)
+        XCTAssertNotNil(duringTurn2.decodeRateSeries[0])
+        XCTAssertNotNil(duringTurn2.decodeRateSeries[1])
+        XCTAssertEqual(duringTurn2.prefillRateSeries.count, 2)
+        XCTAssertNotNil(duringTurn2.prefillRateSeries[0])
+        XCTAssertNil(duringTurn2.prefillRateSeries[1])
+    }
 }

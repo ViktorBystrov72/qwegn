@@ -63,16 +63,6 @@ public struct QWModelGeometry: Sendable, Equatable {
     public var swigluLimit: Float? { descriptor.swigluLimit }
     public var hasBiasCorrectedRouter: Bool { descriptor.hasBiasCorrectedRouter }
     public var effectiveResidentExperts: Int { descriptor.effectiveResidentExperts }
-    /// Number of ephemeral staging slots per MoE layer when `effectiveResidentExperts < numExperts`.
-    public var coldExpertStagingSlots: Int {
-        let res = effectiveResidentExperts
-        guard res < numExperts else { return 0 }
-        return min(expertsPerTok, numExperts - res)
-    }
-    /// Total allocated expert slots per MoE layer (`effectiveResidentExperts + coldExpertStagingSlots`).
-    public var allocatedExpertSlots: Int {
-        effectiveResidentExperts + coldExpertStagingSlots
-    }
     public func withResidentExperts(_ count: Int?) -> QWModelGeometry {
         guard let count else { return self }
         var d = descriptor
@@ -149,11 +139,6 @@ public struct QWModelGeometry: Sendable, Equatable {
         let r = indexerCompressRatio
         return r > 1 ? r.trailingZeroBitCount : 0
     }
-    /// Block-shift (`log2(compressRatio)`) for `QWCoarsePoolIndex` on HCA compressed pools (`7` for 128-token HCA).
-    public var hcaPoolShift: Int {
-        let r = max(1, descriptor.hcaConfig?.defaultCompressRatio ?? 128)
-        return r > 1 ? r.trailingZeroBitCount : 0
-    }
     /// True when the model's norm weights are already stored as `γ − 1`:
     /// the engine's law is `1 + w` and the Qwen3.8 checkpoint stores
     /// `w = γ − 1` under it, while a standard HF checkpoint stores γ.
@@ -183,8 +168,6 @@ public struct QWModelGeometry: Sendable, Equatable {
     public var gdnGateLowerBound: Float { descriptor.gdnGateLowerBound ?? -1e38 }
     public var gdnSeparateConv: Bool { descriptor.gdnSeparateConv }
     public var gdnGlogChannels: Int { gdnVectorDecay ? gdnZChannels : gdnVHeads }
-    public var gdnLowRankGateInChannels: Int { gdnVectorDecay ? (2 * gdnHeadDim + gdnVHeads) : 0 }
-    public var gdnZRow0: Int { gdnQKVChannels }
     public var gdnARow0: Int { gdnQKVChannels + gdnZChannels }
     public var gdnBRow0: Int { gdnQKVChannels + gdnZChannels + gdnVHeads }
     public var gdnTotalN: Int { gdnQKVChannels + gdnZChannels + 2 * gdnVHeads }
@@ -246,7 +229,6 @@ public struct QWModelGeometry: Sendable, Equatable {
             && moeIntermediate > 0 && moeIntermediate % 64 == 0
     }
 
-    public var endOfTextTokenId: Int { descriptor.specialTokens.eosTokenId }
     public var imStartTokenId: Int { descriptor.specialTokens.imStartTokenId }
     public var imEndTokenId: Int { descriptor.specialTokens.imEndTokenId }
     public var imageTokenId: Int { descriptor.imageTokenId }

@@ -33,9 +33,6 @@ public struct QWVariationalAcceptance {
 }
 
 extension QWGemm {
-    /// Dense NAX mode is Single-Pass (`qwg_gemm_q4g_nax_f32`) across both stochastic and greedy hyperparameters.
-    public static let denseNaxMode: QWDenseNaxMode = .singlePass
-
     /// Resolves and applies the active Dense NAX kernel mode for the given sampling hyperparameters.
     @discardableResult
     public static func configureDenseNax(

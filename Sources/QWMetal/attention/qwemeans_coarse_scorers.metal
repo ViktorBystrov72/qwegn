@@ -540,3 +540,119 @@ kernel void qwg_emeans_mla_flat_fallback(device const half*        mlaQFull   [[
         return emeans_float_to_u32(sumVal);
     });
 }
+
+// 2a-tiled. Matrix-tiled coarse centroid scoring for Flash-Next QSA (8 rows x 32 clusters, dim=128).
+// Splits K-dim (0..63, 64..127) across sg 0..3 and sg 4..7 so all 8 simdgroups stay active at 21.1 KiB TG SRAM.
+kernel void qwg_emeans_qsa_score_coarse_tiled(device const float*       idxQ         [[buffer(0)]],
+                                              device const half*        centroids    [[buffer(1)]],
+                                              device const ushort2*     clusterSpans [[buffer(2)]],
+                                              device uint*              cScore       [[buffer(3)]],
+                                              device atomic_uint*       uHist        [[buffer(4)]],
+                                              constant EmeansSelParams& p            [[buffer(5)]],
+                                              uint2 tg  [[threadgroup_position_in_grid]],
+                                              uint  tid [[thread_index_in_threadgroup]],
+                                              uint  sgi [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint BM = 8u, BN = 32u, DI = 128u, NI = 4u, LDK = 136u;
+    const uint unitBase = tg.y * BM;
+    if (unitBase >= p.T) return;
+    const uint lastUnit = min(unitBase + BM - 1u, p.T - 1u);
+    const EmeansSelGeom gLast = emeans_sel_geom(p, lastUnit);
+    const uint cBase = tg.x * BN;
+    if (gLast.dense || cBase >= gLast.numClusters) return;
+
+    threadgroup half        shK[BN * LDK];
+    threadgroup half        shQ[BM * LDK];
+    threadgroup float       shTmp[8u * 64u];
+    threadgroup atomic_uint hist[BM][256u];
+
+    for (uint r = 0u; r < BM; r++) {
+        atomic_store_explicit(&hist[r][tid], 0u, memory_order_relaxed);
+    }
+    for (uint i = tid; i < BN * (DI / 4u); i += 256u) {
+        const uint c  = i >> 5u;
+        const uint d4 = i & 31u;
+        const uint gb = cBase + c;
+        const half4 cv = (gb < gLast.numClusters && clusterSpans[gb].y > 0u)
+            ? *((device const half4*)(centroids + uint64_t(gb) * p.indexDim) + d4)
+            : half4(0.0h);
+        *((threadgroup half4*)(shK + c * LDK) + d4) = cv;
+    }
+
+    const uint qLoadRow  = tid >> 5u;
+    const uint qLoadD4   = tid & 31u;
+    const uint qLoadUnit = unitBase + qLoadRow;
+    bool qLoadValid = false;
+    uint qLoadGlobRow = 0u;
+    if (qLoadUnit < p.T) {
+        const EmeansSelGeom gq = emeans_sel_geom(p, qLoadUnit);
+        qLoadValid = (!gq.dense && cBase < gq.numClusters);
+        qLoadGlobRow = gq.qRow;
+    }
+
+    const uint cTile   = tid >> 6u;
+    const uint inTile  = tid & 63u;
+    const uint r       = inTile >> 3u;
+    const uint c       = (cTile << 3u) + (inTile & 7u);
+    const uint sgCTile = sgi & 3u;
+    const uint sgDBase = (sgi >> 2u) * 64u;
+
+    float scoreSum = 0.0f;
+    for (uint h = 0u; h < NI; h++) {
+        const float4 qf = qLoadValid
+            ? *((device const float4*)(idxQ + (uint64_t(qLoadGlobRow) * NI + h) * p.indexDim) + qLoadD4)
+            : float4(0.0f);
+        const half4 qHi = half4(qf);
+        *((threadgroup half4*)(shQ + qLoadRow * LDK) + qLoadD4) = qHi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        #pragma unroll
+        for (uint k0 = 0u; k0 < 64u; k0 += 8u) {
+            const uint k = sgDBase + k0;
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, shQ + k, LDK, ulong2(0, 0), false);
+            simdgroup_load(b, shK + (sgCTile * 8u) * LDK + k, LDK, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc, a, b, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        *((threadgroup half4*)(shQ + qLoadRow * LDK) + qLoadD4) = half4(qf - float4(qHi));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint k0 = 0u; k0 < 64u; k0 += 8u) {
+            const uint k = sgDBase + k0;
+            simdgroup_half8x8 a, b;
+            simdgroup_load(a, shQ + k, LDK, ulong2(0, 0), false);
+            simdgroup_load(b, shK + (sgCTile * 8u) * LDK + k, LDK, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc, a, b, acc);
+        }
+        simdgroup_store(acc, shTmp + sgi * 64u, 8u, ulong2(0, 0), false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float dotH = shTmp[cTile * 64u + inTile] + shTmp[(cTile + 4u) * 64u + inTile];
+        scoreSum += max(dotH, 0.0f);
+    }
+
+    const uint elemUnit = unitBase + r;
+    const uint gb = cBase + c;
+    if (elemUnit < p.T) {
+        const EmeansSelGeom ge = emeans_sel_geom(p, elemUnit);
+        if (!ge.dense && gb < ge.numClusters) {
+            uint u = 0u;
+            if (clusterSpans[gb].y > 0u) {
+                u = emeans_nonzero_score_u32(scoreSum * rsqrt(float(DI)));
+            }
+            cScore[uint64_t(elemUnit) * p.clusterStride + gb] = u;
+            atomic_fetch_add_explicit(&hist[r][(u >> 24u) & 0xFFu], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = 0u; row < BM; row++) {
+        const uint uRow = unitBase + row;
+        if (uRow >= p.T) break;
+        const uint cnt = atomic_load_explicit(&hist[row][tid], memory_order_relaxed);
+        if (cnt != 0u) atomic_fetch_add_explicit(&uHist[uRow * 512u + tid], cnt, memory_order_relaxed);
+    }
+}

@@ -81,7 +81,7 @@ final class FNPackIdentityTests: XCTestCase {
                                                   headDim: 160, rowBytes: 320, l1Hot: 0)
         // One sector of rows, but the header claims 25 rows spread over 3.
         var data = Data(count: 4096 + 4096)
-        data.withUnsafeMutableBytes { raw in
+        data.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             let p = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
             for (i, b) in header.enumerated() { p[i] = b }
         }
@@ -117,7 +117,7 @@ final class FNPackIdentityTests: XCTestCase {
                                                   l1Hot: 0)
 
         var data = Data(count: 4096 + 3 * 4096)
-        data.withUnsafeMutableBytes { raw in
+        data.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             let p = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
             for (i, b) in header.enumerated() { p[i] = b }
 

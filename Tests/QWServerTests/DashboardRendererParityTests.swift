@@ -253,6 +253,59 @@ final class DashboardRendererParityTests: XCTestCase {
                       "a model with no prefix cache has no cache section")
     }
 
+    /// The workbench UI must load zero external CDN scripts, stylesheets, or URLs.
+    func testDashboardHasNoExternalCDNDependencies() throws {
+        let markup = try html()
+        XCTAssertFalse(markup.contains("https://"),
+                       "controlbar.html must remain strictly offline with zero https URLs")
+        XCTAssertFalse(markup.contains("cdn.tailwindcss.com"),
+                       "controlbar.html must not reference Tailwind CDN")
+        XCTAssertFalse(markup.contains("fonts.googleapis.com"),
+                       "controlbar.html must not reference Google Fonts CDN")
+    }
+
+    /// All four QWG processor vector marks must stay free of the left-pin 340 bug.
+    func testProcessorVectorMarksHaveNoLeftPin340Bug() throws {
+        for path in [
+            "Sources/Apps/QWServer/Resources/logo.svg",
+            "Sources/Apps/QWServer/Resources/controlbar.html",
+            "Sources/Apps/QWMenuBar/QGProcessorLogoView.swift",
+            "Scripts/gen_app_icon.swift",
+        ] {
+            let source = try Self.read(path)
+            XCTAssertFalse(source.contains("x2=\"340\""),
+                           "\(path) must not contain x2=\"340\" left-pin regression")
+            XCTAssertFalse(source.contains("x: 340"),
+                           "\(path) must not contain x: 340 left-pin regression")
+        }
+    }
+
+    /// Prefill banner tracks live percentage, holds 100% completion briefly, and uses compact M/comma token formatting.
+    func testPrefillBannerTracksProgressHoldsCompletionAndResetsOnDisconnect() throws {
+        let html = try html()
+        let script = try script()
+        XCTAssertTrue(html.contains("data-card=\"prefill.progress_tokens\" data-card-unit=\"separate\""))
+        XCTAssertTrue(html.contains("id=\"prefill-pct\""))
+
+        let formatter = try XCTUnwrap(Self.function("formatTokenCount", in: script))
+        XCTAssertFalse(formatter.contains("|| 0"), "formatTokenCount must never coerce unavailable counts to zero")
+        XCTAssertTrue(formatter.contains("1000000"), "formatTokenCount must switch to M indicator at 1,000,000")
+
+        let contextFn = try XCTUnwrap(Self.function("renderContext", in: script))
+        XCTAssertTrue(contextFn.contains("formatTokenCount("))
+        XCTAssertFalse(contextFn.contains("toLocaleString()"))
+
+        let bannerFn = try XCTUnwrap(Self.function("renderPrefillBanner", in: script))
+        XCTAssertTrue(bannerFn.contains("Prefill Complete"))
+        XCTAssertTrue(bannerFn.contains("prefillHoldTimer"))
+        XCTAssertTrue(bannerFn.contains("100%"))
+
+        let disconnectFn = try XCTUnwrap(Self.function("renderDisconnected", in: script))
+        XCTAssertTrue(disconnectFn.contains("prefillHoldTimer"))
+        XCTAssertTrue(disconnectFn.contains("prefill-progress-fill"))
+        XCTAssertTrue(disconnectFn.contains("prefill-pct"))
+    }
+
     /// The script body of the document: the last script block, which
     /// is the dashboard's. Taking the first would make every assertion
     /// below vacuous the day another script is added above it.

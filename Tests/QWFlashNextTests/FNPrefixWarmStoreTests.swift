@@ -275,3 +275,9 @@ final class FNPrefixWarmStoreTests: XCTestCase {
         XCTAssertEqual(match6?.name, baseName)
     }
 }
+
+private extension FNPrefixWarmStore {
+    func isProtectedLastEntry(_ name: String, excludingSlot: Int? = nil) -> Bool {
+        core.isProtectedLastKey(name, excludingSlot: excludingSlot)
+    }
+}

@@ -254,7 +254,8 @@ final class QWServerMemoryPackTests: XCTestCase {
             """.utf8)
         )
 
-        let prefixTokens = await actor.autoMountAndPrepareMemoryPrefix(for: req)
+        let state = await actor.autoMountAndPrepareMemoryState(for: req)
+        let prefixTokens = state.mountedTokens + state.deltaTokens
         XCTAssertEqual(prefixTokens.count, 2048)
         XCTAssertEqual(actor.getConfig().kvMode, .q4)
         XCTAssertEqual(actor.getMountedMemoryPackInfo()?.packName, "auto-repo")

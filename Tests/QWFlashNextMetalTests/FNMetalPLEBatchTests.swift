@@ -4,7 +4,7 @@ import QWCore
 import QWHAL
 import QWAlloc
 import QWGEMM
-import QWQuant
+@testable import QWQuant
 @testable import QWFlashNext
 
 final class FNMetalPLEBatchTests: XCTestCase {
@@ -186,13 +186,13 @@ final class FNMetalPLEBatchTests: XCTestCase {
             let act = arena.activationsRegion()
             let numTargets = 12, rowsPerTarget = entryCount == 4500 ? 64 : 16
             let rowIds = try act.allocate(QWTensorShape([numTargets * rowsPerTarget], .i32))
-            let dstOffsets = try act.allocate(QWTensorShape([numTargets], .i32))
+            let dstOffsets = try act.allocate(QWTensorShape([numTargets * 2], .i32))
             let outs = try (0..<numTargets).map { _ in try act.allocate(QWTensorShape([rowsPerTarget * headDim], .f32)) }
             let pickedIds: [UInt32] = (0..<(numTargets * rowsPerTarget)).map { i in
                 UInt32((i * 53 + 43) % entryCount)
             }
-            let dstWordOffsets: [UInt32] = outs.map { out in
-                UInt32((out.region.base - act.region.base + out.offset) / 4)
+            let dstWordOffsets: [UInt64] = outs.map { out in
+                FNGPUDecodeStack.pleTargetWordOffset(regionBase: out.region.base, actBase: act.region.base, tensorOffset: out.offset)
             }
             arena.write(rowIds, from: pickedIds)
             arena.write(dstOffsets, from: dstWordOffsets)
@@ -377,13 +377,13 @@ final class FNMetalPLEBatchTests: XCTestCase {
             let act = arena.activationsRegion()
             let numTargets = 12, rowsPerTarget = entryCount == 4500 ? 64 : 16
             let rowIds = try act.allocate(QWTensorShape([numTargets * rowsPerTarget], .i32))
-            let dstOffsets = try act.allocate(QWTensorShape([numTargets], .i32))
+            let dstOffsets = try act.allocate(QWTensorShape([numTargets * 2], .i32))
             let outs = try (0..<numTargets).map { _ in try act.allocate(QWTensorShape([rowsPerTarget * headDim], .f32)) }
             let pickedIds: [UInt32] = (0..<(numTargets * rowsPerTarget)).map { i in
                 UInt32((i * 59 + 41) % entryCount)
             }
-            let dstWordOffsets: [UInt32] = outs.map { out in
-                UInt32((out.region.base - act.region.base + out.offset) / 4)
+            let dstWordOffsets: [UInt64] = outs.map { out in
+                FNGPUDecodeStack.pleTargetWordOffset(regionBase: out.region.base, actBase: act.region.base, tensorOffset: out.offset)
             }
             arena.write(rowIds, from: pickedIds)
             arena.write(dstOffsets, from: dstWordOffsets)
@@ -423,5 +423,215 @@ final class FNMetalPLEBatchTests: XCTestCase {
                 XCTAssertEqual(streamed.residentBytes, 0)
             }
         }
+    }
+
+    func testFusedPLEGateNormAndResidualConvMatchesSeparateDispatches() throws {
+        let hal = try QWHal(geometry: .qwen38_27b)
+        let hc = 4, kernel = 4, dilation = 1, hl = (kernel - 1) * dilation, eps: Float = 1e-6
+        for (rows, hidden) in [(9, 1280), (17, 2048), (64, 256), (97, 2560)] {
+            let width = hc * hidden, kvRow = width + hidden
+            let arena = try QWArena(hal: hal, weights: 1 << 20, activations: 128 << 20, kv: 0, gdnStates: 0)
+            let act = arena.activationsRegion()
+            let dummy = try XCTUnwrap(QWWeightView(blocks: try act.allocate(QWTensorShape([1024], .f16)),
+                                                   n: 32, k: 32, isRotated: true))
+            let normKey = try act.allocate(QWTensorShape([width], .f32))
+            let normQuery = try act.allocate(QWTensorShape([width], .f32))
+            let normConv = try act.allocate(QWTensorShape([width], .f32))
+            let convW = try act.allocate(QWTensorShape([width * kernel], .f32))
+            let histBuf = try act.allocate(QWTensorShape([hl * width], .f32))
+            let streamBuf = try act.allocate(QWTensorShape([rows * width], .f32))
+            let outRefBuf = try act.allocate(QWTensorShape([rows * width], .f32))
+            let outFusedBuf = try act.allocate(QWTensorShape([rows * width], .f32))
+            let scratch = try FNGPUScratch(arena: arena, T: rows, hidden: hidden, hc: hc, lowrank: 1,
+                                           moe: FNGPUMoE(gateAndSharedBF16: normKey, gateUp: dummy, down: dummy,
+                                                         sharedGateUp: dummy, sharedDown: dummy, sharedGateScalar: normKey,
+                                                         experts: 1, topK: 1, intermediate: 1, sharedIntermediate: 1),
+                                           ple: nil, gdn: nil, attn: nil)
+            let nk = (0..<width).map { Float((($0 * 7) % 19) - 9) * 0.04 }
+            let nq = (0..<width).map { Float((($0 * 11) % 17) - 8) * 0.05 }
+            let nc = (0..<width).map { Float((($0 * 13) % 23) - 11) * 0.03 }
+            let cw = (0..<(width * kernel)).map { Float((($0 * 5) % 13) - 6) * 0.08 }
+            let hist = (0..<(hl * width)).map { Float((($0 * 3) % 29) - 14) * 0.05 }
+            let stream = (0..<(rows * width)).map { Float((($0 * 17) % 31) - 15) * 0.06 }
+            let kv = (0..<(rows * kvRow)).map { Float((($0 * 23) % 37) - 18) * 0.05 }
+            arena.write(normKey, from: nk); arena.write(normQuery, from: nq)
+            arena.write(normConv, from: nc); arena.write(convW, from: cw)
+            arena.write(histBuf, from: hist); arena.write(streamBuf, from: stream)
+            arena.write(scratch.pleKV, from: kv)
+            // Also inject an all-zero edge row inside kv to verify sgn(g == 0) parity.
+            arena.write(scratch.pleKV.slice(byteOffset: 0, count: kvRow, dtype: .f32),
+                        from: [Float](repeating: 0, count: kvRow))
+            let valSlice = scratch.pleKV.slice(byteOffset: width * 4, count: (rows - 1) * kvRow + hidden, dtype: .f32)
+
+            let refPair = try XCTUnwrap(hal.begin(.concurrent))
+            try QWGemm.encodeFnHCNorm(refPair.1, hal: hal, x: streamBuf, weight: normQuery, xn: scratch.pleQueryN,
+                                      rows: rows, width: width, hidden: hidden, eps: eps)
+            try QWGemm.encodeFnHCNorm(refPair.1, hal: hal, x: scratch.pleKV, weight: normKey, xn: scratch.pleKeyN,
+                                      rows: rows, width: width, hidden: hidden, eps: eps, xStride: kvRow)
+            refPair.1.memoryBarrier(scope: .buffers)
+            try QWGemm.encodeFnPLEGate(refPair.1, hal: hal, keyNorm: scratch.pleKeyN, queryNorm: scratch.pleQueryN,
+                                       vals: valSlice, gv: scratch.pleGV, rows: rows, hidden: hidden, hc: hc, valStride: kvRow)
+            refPair.1.memoryBarrier(scope: .buffers)
+            try QWGemm.encodeFnHCNorm(refPair.1, hal: hal, x: scratch.pleGV, weight: normConv, xn: scratch.pleGVN,
+                                      rows: rows, width: width, hidden: hidden, eps: eps)
+            refPair.1.memoryBarrier(scope: .buffers)
+            try QWGemm.encodeFnPLEConv(refPair.1, hal: hal, gv: scratch.pleGV, gvNorm: scratch.pleGVN, convWeight: convW,
+                                       out: scratch.pleOut, rows: rows, width: width, kernel: kernel, dilation: dilation, hist: histBuf)
+            refPair.1.memoryBarrier(scope: .buffers)
+            try QWGemm.encodeAddF32(refPair.1, hal: hal, a: streamBuf, b: scratch.pleOut, out: outRefBuf, count: rows * width)
+            hal.end(refPair.0, refPair.1)
+            refPair.0.waitUntilCompleted()
+            XCTAssertNil(refPair.0.error)
+            let refGVN = arena.read(scratch.pleGVN, as: Float.self, count: rows * width)
+            let refOut = arena.read(outRefBuf, as: Float.self, count: rows * width)
+
+            let fusedPair = try XCTUnwrap(hal.begin(.concurrent))
+            try QWGemm.encodeFnPLEFusedGateNorm(fusedPair.1, hal: hal, kv: scratch.pleKV, queryNorm: scratch.pleQueryN,
+                                                normKey: normKey, normConv: normConv, gv: scratch.pleGV, gvNorm: scratch.pleGVN,
+                                                rows: rows, hidden: hidden, hc: hc, kvStride: kvRow, eps: eps)
+            fusedPair.1.memoryBarrier(scope: .buffers)
+            try QWGemm.encodeFnPLEConv(fusedPair.1, hal: hal, gv: scratch.pleGV, gvNorm: scratch.pleGVN, convWeight: convW,
+                                       out: outFusedBuf, rows: rows, width: width, kernel: kernel, dilation: dilation,
+                                       hist: histBuf, residual: streamBuf)
+            hal.end(fusedPair.0, fusedPair.1)
+            fusedPair.0.waitUntilCompleted()
+            XCTAssertNil(fusedPair.0.error)
+            let fusedGVN = arena.read(scratch.pleGVN, as: Float.self, count: rows * width)
+            let fusedOut = arena.read(outFusedBuf, as: Float.self, count: rows * width)
+
+            XCTAssertEqual(fusedGVN.map(\.bitPattern), refGVN.map(\.bitPattern),
+                           "fused gvNorm must match unfused dispatches bit-exactly (0 ULP) for rows=\(rows) H=\(hidden)")
+            XCTAssertEqual(fusedOut.map(\.bitPattern), refOut.map(\.bitPattern),
+                           "fused PLE out must match unfused dispatches bit-exactly (0 ULP) for rows=\(rows) H=\(hidden)")
+
+            // Also verify in-place residual aliasing (out === residual === streamBuf).
+            let aliasPair = try XCTUnwrap(hal.begin(.concurrent))
+            try QWGemm.encodeFnPLEConv(aliasPair.1, hal: hal, gv: scratch.pleGV, gvNorm: scratch.pleGVN, convWeight: convW,
+                                       out: streamBuf, rows: rows, width: width, kernel: kernel, dilation: dilation,
+                                       hist: histBuf, residual: streamBuf)
+            hal.end(aliasPair.0, aliasPair.1)
+            aliasPair.0.waitUntilCompleted()
+            XCTAssertNil(aliasPair.0.error)
+            let aliasOut = arena.read(streamBuf, as: Float.self, count: rows * width)
+            XCTAssertEqual(aliasOut, fusedOut)
+        }
+    }
+
+    func testFusedHCInjectNormMatchesSeparateDispatchesBitExact() throws {
+        let hal = try QWHal(geometry: .qwen38_27b)
+        let hc = 4, eps: Float = 1e-6
+        for (rows, hidden) in [(9, 1280), (17, 2048), (65, 2560)] {
+            let width = hc * hidden
+            let arena = try QWArena(hal: hal, weights: 1 << 20, activations: 64 << 20, kv: 0, gdnStates: 0)
+            let act = arena.activationsRegion()
+            let base = try act.allocate(QWTensorShape([rows * width], .f32))
+            let src = try act.allocate(QWTensorShape([rows * hidden], .f32))
+            let inj = try act.allocate(QWTensorShape([rows * hc], .f32))
+            let w = try act.allocate(QWTensorShape([width], .f32))
+            let refOut = try act.allocate(QWTensorShape([rows * width], .f32))
+            let refXN = try act.allocate(QWTensorShape([rows * width], .f32))
+            let fusedOut = try act.allocate(QWTensorShape([rows * width], .f32))
+            let fusedXN = try act.allocate(QWTensorShape([rows * width], .f32))
+            arena.write(base, from: (0..<(rows * width)).map { Float((($0 * 17) % 31) - 15) * 0.06 })
+            arena.write(src, from: (0..<(rows * hidden)).map { Float((($0 * 13) % 29) - 14) * 0.05 })
+            arena.write(inj, from: (0..<(rows * hc)).map { Float((($0 * 7) % 19) - 9) * 0.1 })
+            arena.write(w, from: (0..<width).map { Float((($0 * 11) % 23) - 11) * 0.04 })
+
+            let refPair = try XCTUnwrap(hal.begin(.concurrent))
+            try QWGemm.encodeFnInject(refPair.1, hal: hal, base: base, src: src, inj: inj, out: refOut,
+                                      rows: rows, hidden: hidden, hc: hc)
+            refPair.1.memoryBarrier(scope: .buffers)
+            try QWGemm.encodeFnHCNorm(refPair.1, hal: hal, x: refOut, weight: w, xn: refXN,
+                                      rows: rows, width: width, hidden: hidden, eps: eps)
+            hal.end(refPair.0, refPair.1)
+            refPair.0.waitUntilCompleted()
+            XCTAssertNil(refPair.0.error)
+
+            let fusedPair = try XCTUnwrap(hal.begin(.concurrent))
+            try QWGemm.encodeFnHCInjectNorm(fusedPair.1, hal: hal, base: base, src: src, inj: inj,
+                                            xOut: fusedOut, weight: w, xn: fusedXN,
+                                            rows: rows, width: width, hidden: hidden, eps: eps)
+            hal.end(fusedPair.0, fusedPair.1)
+            fusedPair.0.waitUntilCompleted()
+            XCTAssertNil(fusedPair.0.error)
+
+            let refOutVals = arena.read(refOut, as: Float.self, count: rows * width)
+            let refXNVals = arena.read(refXN, as: Float.self, count: rows * width)
+            let fusedOutVals = arena.read(fusedOut, as: Float.self, count: rows * width)
+            let fusedXNVals = arena.read(fusedXN, as: Float.self, count: rows * width)
+            XCTAssertEqual(fusedOutVals.map(\.bitPattern), refOutVals.map(\.bitPattern))
+            XCTAssertEqual(fusedXNVals.map(\.bitPattern), refXNVals.map(\.bitPattern))
+
+            let aliasPair = try XCTUnwrap(hal.begin(.concurrent))
+            try QWGemm.encodeFnHCInjectNorm(aliasPair.1, hal: hal, base: base, src: src, inj: inj,
+                                            xOut: base, weight: w, xn: fusedXN,
+                                            rows: rows, width: width, hidden: hidden, eps: eps)
+            hal.end(aliasPair.0, aliasPair.1)
+            aliasPair.0.waitUntilCompleted()
+            XCTAssertNil(aliasPair.0.error)
+            XCTAssertEqual(arena.read(base, as: Float.self, count: rows * width).map(\.bitPattern), refOutVals.map(\.bitPattern))
+            XCTAssertEqual(arena.read(fusedXN, as: Float.self, count: rows * width).map(\.bitPattern), refXNVals.map(\.bitPattern))
+        }
+    }
+
+    func testPLETargetWordOffsetExceeding16GiBDoesNotOverflowUInt32() throws {
+        let wordOffset = FNGPUDecodeStack.pleTargetWordOffset(
+            regionBase: 2_684_354_560,
+            actBase: 2_684_354_560,
+            tensorOffset: 20 * (1 << 30)
+        )
+        XCTAssertEqual(wordOffset, 5_368_709_120)
+        XCTAssertGreaterThan(wordOffset, UInt64(UInt32.max))
+    }
+}
+
+private extension QWNgramFormat {
+    static func makeHeader(
+        version: UInt16,
+        dtype: QWNgramDType,
+        entryCount: UInt64,
+        headDim: UInt16,
+        rowBytes: UInt16,
+        l1Hot: UInt32,
+        note: String = "",
+        codebook: [UInt16] = []
+    ) throws -> [UInt8] {
+        try checkVersionPairing(version: version, dtype: dtype)
+        if dtype == .vq2g32 {
+            _ = try validateVQ2Codebook(codebook)
+        } else if dtype == .vq4g32 {
+            _ = try validateVQ4Codebook(codebook)
+        } else if !codebook.isEmpty {
+            throw QWNgramFormatError.badHeader("codebook is only valid for v3 vq2g32 or vq4g32")
+        }
+        guard rowBytes == (try dtype.rowBytes(headDim: Int(headDim))) else {
+            throw QWNgramFormatError.badRowSize(Int(rowBytes))
+        }
+        guard entryCount > 0 else { throw QWNgramFormatError.badHeader("entryCount is zero") }
+        guard l1Hot <= entryCount else {
+            throw QWNgramFormatError.badHeader("l1Hot \(l1Hot) exceeds entryCount \(entryCount)")
+        }
+        let noteBytes = Array(note.utf8)
+        guard noteBytes.isEmpty || noteBytes.count == self.noteBytes else {
+            throw QWNgramFormatError.badHeader("note must be \(self.noteBytes) bytes or empty")
+        }
+        var h = [UInt8](repeating: 0, count: headerBytes)
+        func put16(_ o: Int, _ v: UInt16) { h[o] = UInt8(v & 0xFF); h[o + 1] = UInt8(v >> 8) }
+        func put32(_ o: Int, _ v: UInt32) {
+            for i in 0..<4 { h[o + i] = UInt8((v >> (8 * UInt32(i))) & 0xFF) }
+        }
+        func put64(_ o: Int, _ v: UInt64) {
+            for i in 0..<8 { h[o + i] = UInt8((v >> (8 * UInt64(i))) & 0xFF) }
+        }
+        put64(0, magic)
+        put16(8, version); put16(10, 0); put32(12, dtype.rawValue)
+        put64(16, entryCount); put16(24, headDim); put16(26, rowBytes)
+        put32(28, l1Hot); put64(32, UInt64(headerBytes))
+        h[44] = UInt8(self.noteBytes)
+        for (i, b) in noteBytes.enumerated() { h[45 + i] = b }
+        if dtype == .vq2g32 || dtype == .vq4g32 {
+            for (i, u) in codebook.enumerated() { put16(vq2CodebookOffset + i * 2, u) }
+        }
+        return h
     }
 }

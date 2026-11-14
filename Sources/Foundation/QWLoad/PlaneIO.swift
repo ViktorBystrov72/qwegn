@@ -182,7 +182,7 @@ public final class PlaneIO: @unchecked Sendable {
     public func load(_ name: String, layout: PlaneLayout) throws -> Data {
         let (offset, count) = try region(name, layout)
         var out = Data(count: count)
-        try out.withUnsafeMutableBytes { raw in
+        try out.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             try read(name, offset: offset, count: count, into: raw.baseAddress!)
         }
         return out
@@ -243,11 +243,13 @@ public final class PlaneIO: @unchecked Sendable {
         let (padded, ov1) = spanBytes.addingReportingOverflow(page - 1)
         guard !ov0, !ov1 else { return nil }
         let length = (padded / page) * page
+        nonisolated(unsafe) let retainedPack = pack
         let mapped: (any MTLBuffer)? = (try? pack.withRawPointer(at: start, byteCount: length) { raw -> (any MTLBuffer)? in
             guard UInt(bitPattern: raw) % UInt(page) == 0 else { return nil }
             return device.makeBuffer(
                 bytesNoCopy: UnsafeMutableRawPointer(mutating: raw),
-                length: length, options: .storageModeShared, deallocator: nil)
+                length: length, options: .storageModeShared,
+                deallocator: { _, _ in withExtendedLifetime(retainedPack) {} })
         }) ?? nil
         guard let buf = mapped else { return nil }
         QWResidencyRegistry.note(buf)

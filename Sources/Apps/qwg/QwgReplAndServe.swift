@@ -76,7 +76,7 @@ struct Repl: ParsableCommand {
         let effectiveChunkSize = QWPrefillLimits.clampedRows(knobs.prefillChunkSize ?? effSettings.prefillChunkSize)
         let resolvedCacheDirURL = cliCfg.resolvedCacheDirURL
         let warmBytes = Int((knobs.warmCacheLimit ?? 4.0) * 1024 * 1024 * 1024)
-        let ssdEnabled = knobs.ssdCacheLimit != nil ? (knobs.ssdCacheLimit! > 0) : effSettings.ssdCacheEnabled
+        let ssdEnabled = knobs.ssdCacheLimit.map { $0 > 0 } ?? effSettings.ssdCacheEnabled
         let ssdBytes = ssdEnabled ? Int((knobs.ssdCacheLimit ?? effSettings.ssdCacheLimitGB) * 1024 * 1024 * 1024) : 0
         // The engine is built by the module that serves this pack: the
         // CLI names no engine type, and it does not pick a path.
@@ -164,147 +164,22 @@ struct Repl: ParsableCommand {
             if trimmed.isEmpty { continue }
 
             if trimmed.hasPrefix("/") {
-                let parts = trimmed.split(separator: " ", maxSplits: 1).map(String.init)
-                let cmd = parts[0].lowercased()
-                let arg = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
-                switch cmd {
-                case "/exit", "/quit", "/q":
-                    print("Goodbye!")
-                    break replLoop
-                case "/clear", "/reset":
-                    conversation?.reset()
-                    history.removeAll()
-                    activeImageHistory.removeAll()
-                    recalledVaultPaths.removeAll()
-                    visionController?.unload()
-                    if let s = currentSystem, !s.isEmpty {
-                        history.append(.object([("role", .string("system")), ("content", .string(s))]))
-                    }
-                    print("\(cliColor.systemNotice)[Conversation history cleared.]\(cliColor.reset)\n")
-                    continue
-                case "/image":
-                    pendingTurnImage = arg.isEmpty ? nil : arg
-                    print("\(cliColor.systemNotice)[Next turn image: \(pendingTurnImage ?? "none")]\(cliColor.reset)\n")
-                    continue
-                case "/help", "/h", "/?":
-                    print("""
-                    \(cliColor.bold)Commands:\(cliColor.reset)
-                      /help, /h               Show this help message
-                      /clear, /reset          Clear conversation history
-                      /image [path]           Attach an image to the next turn
-                      /system [prompt]        View or update system prompt (empty to clear)
-                      /thinking [on|off]      Toggle or set thinking mode
-                      /effort [low|med|xhigh] Set reasoning effort
-                      /tokens [N]             Set max generated tokens per turn
-                      /stats                  Toggle performance statistics display
-                      /cache                  Show prefix cache memory and SSD usage
-                      /memory [mount|unmount] Inspect, mount, or unmount LSA codebase memory pack
-                      /history                Show conversation turn count
-                      /exit, /quit, /q        Exit REPL
-
-                    """)
-                    continue
-                case "/memory", "/repo":
-                    if arg.lowercased() == "unmount" {
-                        engine.unmountSharedBasePrefixes()
-                        activeMemoryPack = nil
-                        mountedMemoryTokens = []
-                        recalledVaultPaths.removeAll()
-                        print("\(cliColor.systemNotice)[Memory pack unmounted.]\(cliColor.reset)\n")
-                    } else if arg.lowercased().hasPrefix("mount ") {
-                        let targetPath = String(arg.dropFirst("mount ".count)).trimmingCharacters(in: .whitespaces)
-                        if let resolvedMem = QWResolvedCliMemoryPack.resolve(
-                            explicitRepoPath: targetPath, disableMemoryPack: false,
-                            modelName: runtimeAssets.descriptor.family.rawValue,
-                            geometryDigest: runtimeAssets.descriptor.geometryDigestV2Hex,
-                            preferredKVMode: String(describing: cliCfg.resolvedKVMode)
-                        ), resolvedMem.artifact.kvMode.lowercased() == String(describing: cliCfg.resolvedKVMode).lowercased(),
-                           let mounted = try? engine.mountStandalonePrefixCache(from: resolvedMem.cacheFileURL) {
-                            activeMemoryPack = resolvedMem
-                            mountedMemoryTokens = mounted.tokens
-                            recalledVaultPaths.removeAll()
-                            print("\(cliColor.systemNotice)[Mounted '\(resolvedMem.manifest.packName)' (\(mounted.tokens.count) tokens, kv=\(resolvedMem.artifact.kvMode.uppercased())).]\(cliColor.reset)\n")
-                        } else {
-                            print("\(cliColor.systemNotice)[Could not mount memory pack at '\(targetPath)' (check .qwg/manifest.json and matching KV mode '\(cliCfg.resolvedKVMode)').]\(cliColor.reset)\n")
-                        }
-                    } else if let mem = activeMemoryPack {
-                        let delta = QWMemoryPack.computeDelta(for: mem.manifest)
-                        let cortexCount = mem.manifest.files.filter(\.inCortex).count
-                        let vaultCount = mem.manifest.files.count - cortexCount
-                        print("\(cliColor.bold)Active LSA Memory Pack:\(cliColor.reset) \(mem.manifest.packName) (\(mem.manifest.rootPath))")
-                        print("  Files / Tokens : \(mem.manifest.files.count) files (\(cortexCount) cortex + \(vaultCount) vault), \(mountedMemoryTokens.count) cortex tokens (enforced KV: \(mem.artifact.kvMode.uppercased()))")
-                        print("  Vault Recalled : \(recalledVaultPaths.count) file(s) paged into session")
-                        print("  Live Delta     : \(delta.modifiedFiles.count) modified, \(delta.deletedFiles.count) deleted\n")
-                    } else {
-                        print("\(cliColor.dim)No LSA memory pack mounted. Use '/memory mount <path>' or run 'qwg index'.\(cliColor.reset)\n")
-                    }
-                    continue
-                case "/cache":
-                    let cacheState = engine.prefixCache
-                    if cacheState.isConfigured {
-                        print("\(cliColor.bold)Prefix Cache Status:\(cliColor.reset)")
-                        print("  Warm RAM : \(QWStatFormat.mebibytes(cacheState.warmBytes)) (\(cacheState.warmEntries.map(String.init) ?? "unavailable") entries)")
-                        print("  Cold SSD : \(QWStatFormat.mebibytes(cacheState.ssdBytes)) (\(cacheState.ssdEntries.map(String.init) ?? "unavailable") entries)")
-                    } else {
-                        print("\(cliColor.dim)Prefix cache is not enabled.\(cliColor.reset)")
-                    }
-                    print("")
-                    continue
-                case "/system":
-                    conversation?.reset()
-                    if arg.isEmpty {
-                        currentSystem = nil
-                        if let first = history.first, first.get("role").isString("system") { history.removeFirst() }
-                        print("\(cliColor.systemNotice)[System prompt cleared.]\(cliColor.reset)\n")
-                    } else {
-                        currentSystem = arg
-                        if let first = history.first, first.get("role").isString("system") {
-                            history[0] = .object([("role", .string("system")), ("content", .string(arg))])
-                        } else {
-                            history.insert(.object([("role", .string("system")), ("content", .string(arg))]), at: 0)
-                        }
-                        print("\(cliColor.systemNotice)[System prompt updated.]\(cliColor.reset)\n")
-                    }
-                    continue
-                case "/thinking":
-                    conversation?.reset()
-                    if arg.lowercased() == "on" || arg.lowercased() == "true" { isThinking = true }
-                    else if arg.lowercased() == "off" || arg.lowercased() == "false" { isThinking = false }
-                    else { isThinking.toggle() }
-                    displayThinking = isThinking && showThinking && !hideThinking
-                    print("\(cliColor.systemNotice)[Thinking \(isThinking ? "enabled" : "disabled").]\(cliColor.reset)\n")
-                    continue
-                case "/effort":
-                    conversation?.reset()
-                    let validEfforts = ["low", "medium", "xhigh"]
-                    if validEfforts.contains(arg.lowercased()) {
-                        currentReasoningEffort = arg.lowercased()
-                        print("\(cliColor.systemNotice)[Reasoning effort set to '\(currentReasoningEffort)'.]\(cliColor.reset)\n")
-                    } else {
-                        print("\(cliColor.systemNotice)[Usage: /effort low|medium|xhigh (current: \(currentReasoningEffort))]\(cliColor.reset)\n")
-                    }
-                    continue
-                case "/tokens":
-                    if let n = Int(arg), n > 0 {
-                        currentMaxTokens = n
-                        print("\(cliColor.systemNotice)[Max generated tokens set to \(n).]\(cliColor.reset)\n")
-                    } else {
-                        let cur = currentMaxTokens.map(String.init) ?? (isThinking ? "512 (default)" : "128 (default)")
-                        print("\(cliColor.systemNotice)[Usage: /tokens <positive integer> (current: \(cur))]\(cliColor.reset)\n")
-                    }
-                    continue
-                case "/stats":
-                    showStats.toggle()
-                    print("\(cliColor.systemNotice)[Performance statistics \(showStats ? "enabled" : "disabled").]\(cliColor.reset)\n")
-                    continue
-                case "/history":
-                    let turns = history.filter { $0.get("role").isString("user") }.count
-                    print("\(cliColor.systemNotice)[History contains \(turns) user turn(s), total \(history.count) message(s).]\(cliColor.reset)\n")
-                    continue
-                default:
-                    print("\(cliColor.systemNotice)Unknown command '\(cmd)'. Type '/help' for available commands.\(cliColor.reset)\n")
-                    continue
-                }
+                let cmdParts = trimmed.split(separator: " ", maxSplits: 1).map(String.init)
+                let cmd = cmdParts[0].lowercased()
+                let arg = cmdParts.count > 1 ? cmdParts[1].trimmingCharacters(in: .whitespaces) : ""
+                let action = Repl.handleSlashCommand(
+                    cmd: cmd, arg: arg, cliColor: cliColor, engine: engine,
+                    runtimeAssets: runtimeAssets, cliCfg: cliCfg, showThinking: showThinking,
+                    hideThinking: hideThinking, conversation: conversation,
+                    visionController: visionController, history: &history,
+                    activeImageHistory: &activeImageHistory, recalledVaultPaths: &recalledVaultPaths,
+                    pendingTurnImage: &pendingTurnImage, activeMemoryPack: &activeMemoryPack,
+                    mountedMemoryTokens: &mountedMemoryTokens, currentSystem: &currentSystem,
+                    isThinking: &isThinking, displayThinking: &displayThinking,
+                    currentReasoningEffort: &currentReasoningEffort,
+                    currentMaxTokens: &currentMaxTokens, showStats: &showStats)
+                if action == .exit { break replLoop }
+                continue
             }
 
             let turnImage = pendingTurnImage
@@ -500,68 +375,6 @@ struct Repl: ParsableCommand {
     }
 }
 
-// MARK: - Bench
-
-struct Bench: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        abstract: "Ratchet gate: re-verify the m1 soak artifact + baselines (m1 --check); other names race Scripts/bench binaries.")
-    @Argument(help: "Bench name: 'm1' (the M1 soak/ratchet gate) or a Scripts/bench/* component name.") var component: String = "m1"
-    @Flag(name: .customLong("check"), help: "m1: re-verify newest soak log + ratchet vs baselines (CI merge gate; exit 1 on FAIL). For components: 3%-regression check after the run.") var check: Bool = false
-    @Option(name: .customLong("soak-dir"), help: "Directory holding m1_soak_*.jsonl (default: cwd).") var soakDir: String?
-    @Option(name: .customLong("baselines"), help: "Baseline JSON (default: Scripts/bench/baselines.json).") var baselines: String?
-    @Flag(name: .customLong("run"), help: "Component benches: execute Scripts/bench/run_sweep.sh first (authoritative, GPU-quiet); default is re-verify only.") var runSweep: Bool = false
-
-    func run() throws {
-        guard component != "m1", component != "full" else {
-            try runM1Gate()
-            return
-        }
-        let fm = FileManager.default
-        let repo = fm.currentDirectoryPath
-        let script = repo + "/Scripts/bench/run_sweep.sh"
-        guard fm.fileExists(atPath: script) else {
-            FileHandle.standardError.write("qwg bench \(component): no run_sweep.sh at \(script)\n".data(using: .utf8)!)
-            throw ExitCode(2)
-        }
-        if !runSweep {
-            FileHandle.standardError.write("qwg bench \(component): component benches run via `Scripts/bench/run_sweep.sh \(component)` (GPU-quiet, operator; add --run to invoke from here)\n".data(using: .utf8)!)
-            throw ExitCode(0)
-        }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [script, component]
-        p.standardOutput = FileHandle.standardOutput
-        p.standardError = FileHandle.standardError
-        try p.run(); p.waitUntilExit()
-        throw ExitCode(p.terminationStatus)
-    }
-
-    func runM1Gate() throws {
-        let dir = URL(fileURLWithPath: soakDir ?? FileManager.default.currentDirectoryPath)
-        let baselineURL = URL(fileURLWithPath: baselines
-            ?? FileManager.default.currentDirectoryPath + "/Scripts/bench/baselines.json")
-        guard let log = QWCli.newestSoakLog(in: dir) else {
-            FileHandle.standardError.write("[bench m1] FAIL no m1_soak_*.jsonl in \(dir.path) — run `make m1` first; the artifact IS the gate\n".data(using: .utf8)!)
-            throw ExitCode(1)
-        }
-        let samples = try QWCli.SoakSample.load(log)
-        let verdict = QWCli.verifySoak(samples: samples)
-        for l in verdict.lines { print(l) }
-        var pass = verdict.allPass
-        if FileManager.default.fileExists(atPath: baselineURL.path) {
-            let base = try QWCli.Baselines.load(baselineURL)
-            let rows = QWCli.ratchetCheck(current: verdict.metrics, baseline: base)
-            for l in QWCli.ratchetLines(rows) { print(l) }
-            if !rows.allSatisfy({ $0.ok }) { pass = false }
-        } else {
-            print("[bench m1] SKIP ratchet (no \(baselineURL.lastPathComponent); m1 --ratchet-update writes it on the first authoritative pass)")
-        }
-        print(pass ? "[bench m1] VERDICT: PASS — soak verified, ratchet green"
-                   : "[bench m1] VERDICT: FAIL")
-        if !pass { throw ExitCode(1) }
-    }
-}
-
 // MARK: - Serve
 
 struct Serve: AsyncParsableCommand {
@@ -574,6 +387,9 @@ struct Serve: AsyncParsableCommand {
     @Option(name: .customLong("config"), help: "Path to settings JSON file (default: ~/.qwg/settings.json if present).") var config: String?
     @Option(name: .customLong("host"), help: "Network host interface to bind.") var host: String?
     @Option(name: .customLong("port"), help: "Port to listen on.") var port: Int?
+    @Option(name: .customLong("api-key"), help: "Bearer / x-api-key token required on HTTP requests (required for non-loopback host binds).") var apiKey: String?
+    @Flag(name: .customLong("allow-local-images"), help: "Allow local file:// / filesystem image URLs in server chat requests.") var allowLocalImages: Bool = false
+    @Flag(name: .customLong("allow-remote-images"), help: "Allow public http/https remote image URLs in server chat requests.") var allowRemoteImages: Bool = false
     @Option(name: .customLong("model-name"), help: "Model name reported in /v1/models.") var modelName: String?
     @Option(name: .customLong("model-alias"), help: "Model alias accepted in /v1/chat/completions.") var modelAlias: String?
     @Option(name: .customLong("dflash-window"), help: "DFlash 2 / DSpine window B in 2...16 (auto-detects dflash2 vs dspine from drafter pack and sets --mtp-drafts B-1).") var dflashWindow: Int?
@@ -598,6 +414,9 @@ struct Serve: AsyncParsableCommand {
         }
         let resolved = try QWServerConfigurationResolver.resolve(
             cliConfigPath: config, cliPack: modelOption ?? pack, cliHost: host, cliPort: port,
+            cliApiKey: apiKey,
+            cliAllowLocalImagePaths: allowLocalImages ? true : nil,
+            cliAllowRemoteImageURLs: allowRemoteImages ? true : nil,
             cliModelName: modelName, cliModelAlias: modelAlias, cliMaxContext: knobs.contextTokens,
             cliKVMode: knobs.kvMode, cliTemperature: knobs.temperature,
             cliTopP: knobs.topP, cliTopK: knobs.topK,
@@ -699,6 +518,8 @@ struct Serve: AsyncParsableCommand {
             enableThinking: resolved.enableThinking, reasoningEffort: resolved.reasoningEffort,
             systemPrompt: resolved.systemPrompt,
             loadVision: resolved.loadVision,
+            allowLocalImagePaths: resolved.allowLocalImagePaths,
+            allowRemoteImageURLs: resolved.allowRemoteImageURLs,
             sourceSummary: resolved.sourceSummary
         )
         actorConfig.engineTuning = resolved.engineTuning
@@ -734,7 +555,14 @@ struct Serve: AsyncParsableCommand {
             logger.log(.info, "Lazy loading active: model '\(resolved.modelName)' will load on first inference request.")
         }
 
-        let server = QWHttpServer(actor: actor, host: resolved.host, port: resolved.port, logger: logger)
+        let server = QWHttpServer(
+            actor: actor,
+            host: resolved.host,
+            port: resolved.port,
+            logger: logger,
+            apiKey: resolved.apiKey,
+            corsAllowedOrigins: resolved.corsAllowedOrigins
+        )
         do {
             try server.start()
         } catch {

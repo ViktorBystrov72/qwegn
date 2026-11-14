@@ -297,22 +297,26 @@ kernel void qwg_emeans_cluster_1024(device const half* pooledKeys   [[buffer(0)]
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    threadgroup ushort* tgMem = reinterpret_cast<threadgroup ushort*>(tgMaxSim);
     if (tid < K_ALL) {
         ushort pos = tgOff[tid];
         device ushort* dstMem = memberPools + uint64_t(macroIdx) * 1024u;
         for (uint i = 0u; i < 1024u; i++) {
-            if (tgAssign[i] == tid) dstMem[pos++] = ushort(i);
+            if (tgAssign[i] == tid) {
+                tgMem[pos] = ushort(i);
+                dstMem[pos] = ushort(i);
+                pos++;
+            }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const ushort startM = tgOff[cId];
     const ushort countM = tgOff[cId + 1u] - startM;
-    device const ushort* srcMem = memberPools + uint64_t(macroIdx) * 1024u;
     float meanSub[32];
     for (uint d = 0u; d < subDim; d++) meanSub[d] = 0.0f;
     for (ushort k = 0u; k < countM; k++) {
-        const uint pLocal = uint(srcMem[startM + k]);
+        const uint pLocal = uint(tgMem[startM + k]);
         const float invP = tgInvNorm[pLocal];
         device const half* xp = chunkKeys + pLocal * indexDim + dBase;
         for (uint d = 0u; d < subDim; d++) meanSub[d] += float(xp[d]) * invP;
@@ -335,7 +339,7 @@ kernel void qwg_emeans_cluster_1024(device const half* pooledKeys   [[buffer(0)]
 kernel void qwg_emeans_collect(device const ushort*      memberPools  [[buffer(0)]],
                                device const ushort2*     clusterSpans [[buffer(1)]],
                                device const uint*        cScore       [[buffer(2)]],
-                               device const uint*        uHist        [[buffer(3)]],
+                               device atomic_uint*       uHist        [[buffer(3)]],
                                device uint*              candState    [[buffer(4)]],
                                device uint*              candPools    [[buffer(5)]],
                                constant EmeansSelParams& p            [[buffer(6)]],
@@ -366,7 +370,7 @@ kernel void qwg_emeans_collect(device const ushort*      memberPools  [[buffer(0
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (g.numClusters > 0u) {
-        hist[tid] = uHist[unit * 512u + tid];
+        hist[tid] = atomic_load_explicit(&uHist[unit * 512u + tid], memory_order_relaxed);
         if (tid == 0u) { greaterAccum = 0u; chosenBin = 0u; sgTotal = 0u; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         emeans_pick_radix_bin(hist, scanSum, greaterAccum, chosenBin, sgTotal, g.probeEff, false, tid, sg, lane);
@@ -464,7 +468,7 @@ kernel void qwg_emeans_collect(device const ushort*      memberPools  [[buffer(0
 // 3. Final top-k radix selection + bitonic ascending pool writeout + zero-at-rest cleanup.
 kernel void qwg_emeans_finalize(device int*               blockList  [[buffer(0)]],
                                 device uint*              blockCount [[buffer(1)]],
-                                device uint*              uHist      [[buffer(2)]],
+                                device atomic_uint*       uHist      [[buffer(2)]],
                                 device uint*              candState  [[buffer(3)]],
                                 device const uint*        candPools  [[buffer(4)]],
                                 device const uint*        candU      [[buffer(5)]],
@@ -483,8 +487,8 @@ kernel void qwg_emeans_finalize(device int*               blockList  [[buffer(0)
     const bool flatContig = (p.probeClusters == 0u && g.numMiddle <= p.candCap);
     const bool overflow = (candState[unit * 2u + 1u] != 0u) || (p.probeClusters == 0u && g.numMiddle > p.candCap);
     if (overflow) {
-        uHist[unit * 512u + tid] = 0u;
-        uHist[unit * 512u + 256u + tid] = 0u;
+        atomic_store_explicit(&uHist[unit * 512u + tid], 0u, memory_order_relaxed);
+        atomic_store_explicit(&uHist[unit * 512u + 256u + tid], 0u, memory_order_relaxed);
         if (tid == 0u) candState[unit * 2u + 1u] = 1u;
         return;
     }
@@ -573,7 +577,7 @@ kernel void qwg_emeans_finalize(device int*               blockList  [[buffer(0)
 
     emeans_sort_and_emit(outRow, blockCount, p, g, keep, kTarget, nPow2, tid);
 
-    uHist[unit * 512u + tid] = 0u;
-    uHist[unit * 512u + 256u + tid] = 0u;
+    atomic_store_explicit(&uHist[unit * 512u + tid], 0u, memory_order_relaxed);
+    atomic_store_explicit(&uHist[unit * 512u + 256u + tid], 0u, memory_order_relaxed);
     if (tid < 2u) candState[unit * 2u + tid] = 0u;
 }

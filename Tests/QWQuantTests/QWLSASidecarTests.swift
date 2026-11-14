@@ -143,7 +143,7 @@ final class QWLSASidecarTests: XCTestCase {
                     kProj[r * cols + c] = sin(Float((layer + 1) * (r * 5 + c * 3)) * 0.04)
                 }
             }
-            let bytes = kProj.withUnsafeBytes { Array($0) }
+            let bytes = kProj.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw) }
             let name = "model.layers.\(layer).self_attn.k_proj.weight"
             header[name] = [
                 "dtype": "F32",
@@ -154,7 +154,7 @@ final class QWLSASidecarTests: XCTestCase {
         }
         let headerData = try JSONSerialization.data(withJSONObject: header)
         var fileData = Data()
-        fileData.append(contentsOf: withUnsafeBytes(of: UInt64(headerData.count).littleEndian) { Array($0) })
+        fileData.append(contentsOf: withUnsafeBytes(of: UInt64(headerData.count).littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         fileData.append(headerData)
         fileData.append(payload)
         try fileData.write(to: tmpDir.appendingPathComponent("model.safetensors"))
@@ -237,7 +237,7 @@ final class QWLSASidecarTests: XCTestCase {
 
         let headerData = try JSONSerialization.data(withJSONObject: header)
         var fileData = Data()
-        fileData.append(contentsOf: withUnsafeBytes(of: UInt64(headerData.count).littleEndian) { Array($0) })
+        fileData.append(contentsOf: withUnsafeBytes(of: UInt64(headerData.count).littleEndian) { (raw: UnsafeRawBufferPointer) in Array(raw) })
         fileData.append(headerData)
         fileData.append(payload)
         try fileData.write(to: tmpDir.appendingPathComponent("model.safetensors"))

@@ -19,7 +19,7 @@ final class QWModelDescriptorTests: XCTestCase {
         XCTAssertEqual(control.family, .qwen38Dense)
         XCTAssertEqual(control.fullAttentionLayers.count, 16)
         XCTAssertEqual(control.specialTokens.defaultStopTokenIds,
-                       [QWModelGeometry.qwen38_27b.endOfTextTokenId, QWModelGeometry.qwen38_27b.imEndTokenId])
+                       [QWModelGeometry.qwen38_27b.descriptor.specialTokens.eosTokenId, QWModelGeometry.qwen38_27b.imEndTokenId])
         XCTAssertEqual(control.specialTokens.endThinkTokenId, QWModelGeometry.qwen38_27b.endThinkTokenId)
     }
 
@@ -181,7 +181,9 @@ final class QWModelDescriptorTests: XCTestCase {
         """.data(using: .utf8)!
         let d = try QWModelDescriptor.decode(configJSON: glmConfig)
         XCTAssertEqual(d.verifyInternalConsistency(), [])
-        XCTAssertEqual(d.family, .qwen38Dense)
+        XCTAssertEqual(d.family, .glm5Next)
+        XCTAssertEqual(d.role, .multimodalConditionalLM)
+        XCTAssertEqual(d.visPosEmbeds, 4096)
         XCTAssertEqual(d.modelType, "glm5_next_text")
         XCTAssertEqual(d.envelopeModelType, "glm5_next")
         XCTAssertFalse(d.usesPlusOneRMSNorm)
@@ -315,7 +317,10 @@ final class QWModelDescriptorTests: XCTestCase {
 
         let d = try QWModelDescriptor.decode(configJSON: ernieConfig)
         XCTAssertEqual(d.verifyInternalConsistency(), [])
-        XCTAssertEqual(d.family, .qwen38Dense)
+        XCTAssertEqual(d.family, .ernie55MoE)
+        XCTAssertEqual(d.role, .causalLM)
+        XCTAssertEqual(d.visDepth, 0)
+        XCTAssertEqual(d.imageTokenId, -1)
         XCTAssertEqual(d.modelType, "ernie5_5_moe")
         XCTAssertFalse(d.usesPlusOneRMSNorm)
         XCTAssertTrue(d.attnOutputGate)
@@ -324,7 +329,6 @@ final class QWModelDescriptorTests: XCTestCase {
         XCTAssertEqual(d.fullAttentionLayers, [7, 14, 21, 28, 35, 42])
         XCTAssertEqual(d.linearAttentionLayers, [])
         XCTAssertEqual(d.fullAttentionInterval, 0)
-        XCTAssertTrue(d.isNextNLayerDSA(0))
         XCTAssertEqual(d.activationKind, .situ(beta: 4.0, linearBeta: 25.0))
         XCTAssertEqual(d.moeLatentSize, 2048)
         XCTAssertTrue(d.latentMoeUseNorm)
@@ -340,7 +344,6 @@ final class QWModelDescriptorTests: XCTestCase {
         XCTAssertEqual(geo.mlaLayerCount, 6)
         XCTAssertEqual(geo.gdnLayerCount, 0)
         XCTAssertEqual(geo.indexerPoolShift, 0)
-        XCTAssertEqual(geo.hcaPoolShift, 7)
         XCTAssertTrue(geo.usesDecoupledRopeMLA)
         XCTAssertTrue(geo.usesLatentOrCompressedAttention)
         XCTAssertTrue(geo.supportsGroupedNAXMoEPrefill)

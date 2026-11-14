@@ -33,23 +33,7 @@ public indirect enum QWJson: Equatable, Sendable {
     }
 
     public var isUndefined: Bool { if case .undefined = self { return true }; return false }
-    public var isNull: Bool { if case .null = self { return true }; return false }
     public var isString: Bool { if case .string = self { return true }; return false }
-    public var isArray: Bool { if case .array = self { return true }; return false }
-    public var isObject: Bool { if case .object = self { return true }; return false }
-
-    /// jinja truthiness: undefined / None / False / 0 / "" / [] / [:] are falsy.
-    public var truthy: Bool {
-        switch self {
-        case .undefined, .null: return false
-        case .bool(let b): return b
-        case .int(let i): return i != 0
-        case .double(let d): return d != 0
-        case .string(let s): return !s.isEmpty
-        case .array(let a): return !a.isEmpty
-        case .object(let o): return !o.isEmpty
-        }
-    }
 
     /// jinja getattr on plain data: mapping key, else undefined.
     public func get(_ key: String) -> QWJson {

@@ -1,12 +1,23 @@
 import Foundation
 import CryptoKit
 
+/// Execution role of a decoded model pack.
+public enum QWModelRole: String, Sendable, Hashable, CaseIterable, Codable {
+    case causalLM
+    case multimodalConditionalLM
+    case speculativeDrafter
+}
+
 /// C01/§2 — Immutable model identity + geometry for ANY supported model.
 public struct QWModelDescriptor: Sendable, Hashable {
 
     public enum Family: String, Sendable, Hashable, CaseIterable, Codable {
         case qwen38Dense = "qwen3.8-27b"          // control adapter
+        case qwen38MoE = "qwen3.8-moe"
         case qwen38FlashNext = "qwen3.8-flash-next"
+        case senseNovaLoop = "sensenova_loop"
+        case glm5Next = "glm5_next"
+        case ernie55MoE = "ernie5_5_moe"
         case qwen3Dense = "qwen3-dense"            // standard HF/MLX, dense MLP
         case qwen3MoE = "qwen3-moe"                // standard HF/MLX, sparse MoE
         case qwen2Dense = "qwen2-dense"
@@ -59,6 +70,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
     }
 
     public let family: Family
+    public let role: QWModelRole
     public let modelType: String                  // HF `model_type`
     public let envelopeModelType: String?         // Top-level `model_type` when wrapped (e.g. "sensenova_loop")
     public let capabilities: Set<Capability>
@@ -197,7 +209,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
         if let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelType) {
             return spec.usesQwenChatTemplateIds && vocab > 248046
         }
-        return (family == .qwen38Dense || family == .qwen38FlashNext) && vocab > 248046
+        return [.qwen38Dense, .qwen38MoE, .qwen38FlashNext, .senseNovaLoop].contains(family) && vocab > 248046
     }
 
     public init(family: Family, modelType: String, capabilities: Set<Capability>,
@@ -261,8 +273,10 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 moeSplitFeatureRouting: Bool = false,
                 routedScalingFactorLearnable: Bool = false,
                 multimaxHead: Bool = false,
-                mtpSharedLastLayer: Bool = false) {
+                mtpSharedLastLayer: Bool = false,
+                role: QWModelRole? = nil) {
         self.family = family; self.modelType = modelType
+        self.role = role ?? (capabilities.contains(.vision) ? .multimodalConditionalLM : .causalLM)
         self.envelopeModelType = envelopeModelType
         self.capabilities = capabilities
         self.loopSettings = loopSettings
@@ -314,7 +328,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
         self.visionStartTokenId = visionStartTokenId; self.visionEndTokenId = visionEndTokenId
         self.hasQKNorm = hasQKNorm
         let defaultPlusOne = QWModelFamilyRegistry.shared.spec(forModelType: modelType)?.usesPlusOneRMSNorm
-            ?? (family == .qwen38Dense)
+            ?? [.qwen38Dense, .qwen38MoE, .senseNovaLoop].contains(family)
         self.usesPlusOneRMSNorm = usesPlusOneRMSNorm ?? defaultPlusOne
         self.quantization = quantization; self.hasMropeSection = hasMropeSection
         self.tieWordEmbeddings = tieWordEmbeddings; self.normTopKProb = normTopKProb
@@ -328,9 +342,22 @@ public struct QWModelDescriptor: Sendable, Hashable {
         mtpLayers > 0 || capabilities.contains(.mtp)
     }
 
+    /// True when routed experts can be streamed via DenseModule's cold-expert streamer.
+    public var supportsExpertStreaming: Bool {
+        guard (numExperts ?? 0) > 0 else { return false }
+        if let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelType) {
+            return spec.supportsExpertStreaming
+        }
+        return family != .qwen38FlashNext
+    }
+
     /// Maximum supported speculative draft depth for this model architecture.
     public var maxSpeculativeDrafts: Int {
-        family == .qwen38FlashNext ? 3 : 5
+        if role == .speculativeDrafter { return 0 }
+        if let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelType) {
+            return spec.maxSpeculativeDrafts
+        }
+        return family == .qwen38FlashNext ? 3 : 5
     }
 
     /// True when physical layer `l` uses a sparse MoE block rather than a dense MLP.
@@ -399,7 +426,8 @@ public struct QWModelDescriptor: Sendable, Hashable {
             latentMoeUseNorm: latentMoeUseNorm,
             moeSplitFeatureRouting: moeSplitFeatureRouting,
             routedScalingFactorLearnable: routedScalingFactorLearnable,
-            multimaxHead: multimaxHead, mtpSharedLastLayer: mtpSharedLastLayer
+            multimaxHead: multimaxHead, mtpSharedLastLayer: mtpSharedLastLayer,
+            role: role
         )
     }
 
@@ -471,12 +499,35 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public var geometryDigestV2: String {
         "qwg-geo-v2:" + Self.digestFields(self).joined(separator: "|")
     }
+    public var geometryDigestV3: String {
+        "qwg-geo-v3:" + Self.digestV3Fields(self).joined(separator: "|")
+    }
     public var legacyGeoV1String: String {
         "qwg-geo-v1:\(hidden)|\(vocab)|\((family == .qwen38Dense ? denseIntermediate : nil) ?? 0)|"
         + "\(numLayers)|\(qHeads)|\(kvHeads)|\(headDim)|\(gdnQKVChannels)|\(gdnVHeads)"
     }
     public var geometryDigestV2Hex: String {
         sha256Hex(geometryDigestV2)
+    }
+    public var geometryDigestV3Hex: String {
+        sha256Hex(geometryDigestV3)
+    }
+
+    internal static func digestV3Fields(_ d: QWModelDescriptor) -> [String] {
+        var f = digestFields(d)
+        f.append("family=\(d.family.rawValue)")
+        f.append("role=\(d.role.rawValue)")
+        f.append("env_type=\(d.envelopeModelType ?? "-")")
+        f.append("kda=\(d.gdnVectorDecay ? 1 : 0),\(d.gdnLowRankDim ?? 0)")
+        f.append("mla=\(d.mlaUseNoPE ? 1 : 0),\(d.kvLoraRank ?? 0),\(d.qLoraRank ?? 0),\(d.hybridMLAConfig != nil ? 1 : 0)")
+        f.append("loop=\(d.loopSettings.map { "\($0.start),\($0.end),\($0.evalCount)" } ?? "-")")
+        f.append("mhc=\(d.mhcConfig.map { "\($0.start),\($0.end),\($0.streams),\($0.iterations)" } ?? "-")")
+        if d.capabilities.contains(.vision) {
+            f.append("vis=\(d.visDepth),\(d.visHidden),\(d.visHeads),\(d.visIntermediate),\(d.visPatch),\(d.visMerge),\(d.visPosEmbeds),\(d.visOut),\(d.imageTokenId),\(d.videoTokenId)")
+        } else {
+            f.append("vis=-")
+        }
+        return f
     }
 
     internal static func digestFields(_ d: QWModelDescriptor) -> [String] {

@@ -12,10 +12,19 @@ struct SettingsRestartBadge: View {
 
     var body: some View {
         if QWSettingsCoherence.needsServerRestart(key) {
-            Image(systemName: "arrow.clockwise.circle")
-                .font(.system(size: 9))
-                .foregroundColor(TelemetryTheme.warning)
-                .help("The server reads this setting when it starts. A change to it takes effect after the server restarts.")
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 9.5, weight: .semibold))
+                Text("Restart")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .foregroundColor(TelemetryTheme.warning)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1.5)
+            .background(TelemetryTheme.warning.opacity(0.14))
+            .clipShape(Capsule())
+            .fixedSize()
+            .help("The server reads this setting when it starts. A change to it takes effect after the server restarts.")
         }
     }
 }
@@ -25,12 +34,14 @@ struct SettingsRestartBadge: View {
 struct SettingsRowLabel: View {
     let text: String
     let key: String
+    @Environment(\.colorSchemeContrast) private var contrast: ColorSchemeContrast
 
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 6) {
             Text(text)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(.white.opacity(0.70))
+                .font(TelemetryTheme.ui(11.5, .medium))
+                .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+                .lineLimit(1)
             SettingsRestartBadge(key: key)
         }
     }
@@ -51,22 +62,20 @@ struct VariationalFloorRow: View {
                     .foregroundColor(value == 0 ? TelemetryTheme.warning : TelemetryTheme.accent)
             }
             Slider(value: $value, in: 0.0...0.5, step: 0.05)
-            Text("A relaxed draft must also hold at least τ of the verifier's probability mass")
-                .font(.system(size: 9))
-                .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+            Text("A relaxed draft must also hold at least τ of the verifier's probability mass.")
+                .font(TelemetryTheme.ui(11))
+                .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
         }
     }
 }
 
-/// Power-of-2 Context Limit slider (64 to 1,048,576 tokens) with live model memory prediction and over-budget alert.
+/// Power-of-2 Context Limit slider (64 to 1,048,576 tokens) with live UMA memory bar and inline clamp.
 struct ContextLimitSliderRow: View {
     @Binding var maxContext: Int
     let estimate: QWContextMemoryEstimate?
     let modelName: String
     let kvMode: String
     let contrast: ColorSchemeContrast
-    @State private var isDraggingSlider = false
-    @State private var showOverBudgetAlert = false
 
     private var isOverBudget: Bool {
         guard let estimate else { return false }
@@ -94,19 +103,13 @@ struct ContextLimitSliderRow: View {
                 SettingsRowLabel(text: "Context Limit:", key: "maxContext")
                 Spacer()
                 Text(QWSettingsCoherence.formatContextTokens(maxContext))
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundColor(isOverBudget ? TelemetryTheme.failure : TelemetryTheme.accent)
+                    .font(TelemetryTheme.numeric(11, .semibold))
+                    .foregroundStyle(isOverBudget ? TelemetryTheme.failure : TelemetryTheme.accent)
             }
             Slider(
                 value: stepBinding,
                 in: 0...Double(QWSettingsCoherence.contextSliderSteps.count - 1),
-                step: 1,
-                onEditingChanged: { editing in
-                    isDraggingSlider = editing
-                    if !editing && isOverBudget {
-                        showOverBudgetAlert = true
-                    }
-                }
+                step: 1
             )
             HStack {
                 Text("64")
@@ -119,72 +122,117 @@ struct ContextLimitSliderRow: View {
                 Spacer()
                 Text("1M")
             }
-            .font(.system(size: 9, design: .monospaced))
-            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+            .font(TelemetryTheme.numeric(10))
+            .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
 
             if let est = estimate {
-                let gib = 1_073_741_824.0
-                let reqGiB = Double(est.requiredBytes) / gib
-                let wGiB = Double(est.weightsBytes) / gib
-                let kvGiB = Double(est.kvBytes) / gib
-                let scrGiB = Double(est.scratchAndStateBytes) / gib
-                let availGiB = Double(est.availableBytes) / gib
-                Text(String(
-                    format: "Predicted Memory: %.1f GiB (Weights %.1f GiB · KV %.1f GiB · Scratch %.1f GiB) / %.1f GiB budget",
-                    reqGiB, wGiB, kvGiB, scrGiB, availGiB
-                ))
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundColor(est.fits
-                    ? TelemetryTheme.quiet(increasedContrast: contrast == .increased)
-                    : TelemetryTheme.failure)
+                memorySummarySection(est)
+            }
+        }
+    }
 
-                if !est.fits {
-                    let overGiB = Double(est.requiredBytes - est.availableBytes) / gib
-                    HStack(spacing: 5) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 9))
-                            .foregroundColor(TelemetryTheme.failure)
+    @ViewBuilder
+    private func memorySummarySection(_ est: QWContextMemoryEstimate) -> some View {
+        let gib = 1_073_741_824.0
+        let reqGiB = Double(est.requiredBytes) / gib
+        let wGiB = Double(est.weightsBytes) / gib
+        let kvGiB = Double(est.kvBytes) / gib
+        let scrGiB = Double(est.scratchAndStateBytes) / gib
+        let availGiB = Double(est.availableBytes) / gib
+
+        VStack(alignment: .leading, spacing: 6) {
+            proportionalUMABar(est)
+            Text(String(
+                format: "Predicted Memory: %.1f GiB (Weights %.1f GiB · KV %.1f GiB · Scratch %.1f GiB) / %.1f GiB budget",
+                reqGiB, wGiB, kvGiB, scrGiB, availGiB
+            ))
+            .font(TelemetryTheme.numeric(11))
+            .foregroundStyle(est.fits
+                ? TelemetryTheme.quiet(increasedContrast: contrast == .increased)
+                : TelemetryTheme.failure)
+
+            if !est.fits {
+                let overGiB = Double(est.requiredBytes - est.availableBytes) / gib
+                HStack(alignment: .center, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(TelemetryTheme.failure)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Context Limit Exceeds Available Memory")
+                            .font(TelemetryTheme.ui(11, .semibold))
+                            .foregroundStyle(TelemetryTheme.failure)
                         Text(String(
-                            format: "Exceeds available memory budget by %.1f GiB (max fitting context: %@).",
-                            overGiB, QWSettingsCoherence.formatContextTokens(maxFittingStep)
+                            format: "%@ (%@ KV) exceeds the %.1f GiB budget by %.1f GiB for %@.",
+                            QWSettingsCoherence.formatContextTokens(maxContext),
+                            kvMode.uppercased(),
+                            availGiB,
+                            overGiB,
+                            modelName.isEmpty ? "the selected model" : modelName
                         ))
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(TelemetryTheme.failure)
+                        .font(TelemetryTheme.ui(11))
+                        .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
                     }
+                    Spacer(minLength: 6)
+                    if maxFittingStep < maxContext {
+                        Button("Clamp to \(QWSettingsCoherence.formatContextTokens(maxFittingStep))") {
+                            maxContext = maxFittingStep
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(TelemetryTheme.failure)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(8)
+                .background(TelemetryTheme.failure.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: TelemetryTheme.Radius.medium))
+                .overlay(
+                    RoundedRectangle(cornerRadius: TelemetryTheme.Radius.medium)
+                        .strokeBorder(TelemetryTheme.failure.opacity(0.35), lineWidth: 1)
+                )
+            }
+        }
+    }
+
+    private func proportionalUMABar(_ est: QWContextMemoryEstimate) -> some View {
+        let totalDenominator = max(Double(max(est.availableBytes, est.requiredBytes)), 1.0)
+        let weightsFrac = CGFloat(max(0, Double(est.weightsBytes)) / totalDenominator)
+        let kvFrac = CGFloat(max(0, Double(est.kvBytes)) / totalDenominator)
+        let scratchFrac = CGFloat(max(0, Double(est.scratchAndStateBytes)) / totalDenominator)
+        let budgetFrac = CGFloat(max(0, Double(est.availableBytes)) / totalDenominator)
+
+        return GeometryReader { geo in
+            let width = geo.size.width
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(TelemetryTheme.substrate)
+                HStack(spacing: 1) {
+                    if weightsFrac > 0 {
+                        Rectangle()
+                            .fill(TelemetryTheme.accent)
+                            .frame(width: max(2, width * weightsFrac))
+                    }
+                    if kvFrac > 0 {
+                        Rectangle()
+                            .fill(est.fits ? TelemetryTheme.cool : TelemetryTheme.failure)
+                            .frame(width: max(2, width * kvFrac))
+                    }
+                    if scratchFrac > 0 {
+                        Rectangle()
+                            .fill(TelemetryTheme.prefill)
+                            .frame(width: max(2, width * scratchFrac))
+                    }
+                }
+                .frame(height: 6)
+                .clipShape(RoundedRectangle(cornerRadius: 3))
+
+                if !est.fits && budgetFrac > 0 && budgetFrac < 1 {
+                    Rectangle()
+                        .fill(TelemetryTheme.primary(increasedContrast: true))
+                        .frame(width: 1.5, height: 10)
+                        .offset(x: min(width - 2, width * budgetFrac))
                 }
             }
         }
-        .onChange(of: maxContext) { _, _ in
-            if !isDraggingSlider && isOverBudget {
-                showOverBudgetAlert = true
-            }
-        }
-        .onChange(of: kvMode) { _, _ in
-            if isOverBudget {
-                showOverBudgetAlert = true
-            }
-        }
-        .alert("Context Limit Exceeds Available Memory", isPresented: $showOverBudgetAlert) {
-            Button("Clamp to \(QWSettingsCoherence.formatContextTokens(maxFittingStep))") {
-                maxContext = maxFittingStep
-            }
-            Button("Keep Anyway", role: .cancel) {}
-        } message: {
-            if let est = estimate {
-                let gib = 1_073_741_824.0
-                Text(String(
-                    format: "%@ at %@ KV requires %.1f GiB (%.1f GiB weights + %.1f GiB KV + %.1f GiB scratch), which exceeds the %.1f GiB available memory budget for %@. Reduce Context Limit to %@ or switch KV Cache Mode to a lower bit-width.",
-                    QWSettingsCoherence.formatContextTokens(maxContext),
-                    kvMode.uppercased(),
-                    Double(est.requiredBytes) / gib,
-                    Double(est.weightsBytes) / gib,
-                    Double(est.kvBytes) / gib,
-                    Double(est.scratchAndStateBytes) / gib,
-                    Double(est.availableBytes) / gib,
-                    modelName.isEmpty ? "the selected model" : modelName,
-                    QWSettingsCoherence.formatContextTokens(maxFittingStep)
-                ))
-            }
-        }
+        .frame(height: 10)
     }
 }

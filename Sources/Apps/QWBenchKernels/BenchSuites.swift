@@ -199,7 +199,7 @@ enum AQBanks {
         let bytesPerGroup = QWAQBlock.bytes(bits: bits, group: group)
         var value: Float = 0
         var magnitude: Float = 0
-        bank.withUnsafeBytes { raw in
+        bank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             for g in 0..<groups {
                 let off = (row * groups + g) * bytesPerGroup
                 let slice = UnsafeRawBufferPointer(start: raw.baseAddress! + off,
@@ -266,7 +266,7 @@ enum AQBanks {
         let groups = cols / 32
         var value: Float = 0
         var magnitude: Float = 0
-        bank.withUnsafeBytes { raw in
+        bank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             for g in 0..<groups {
                 let off = row * groups * 20 + g * 20
                 let slice = UnsafeRawBufferPointer(start: raw.baseAddress! + off, count: 20)
@@ -331,7 +331,7 @@ enum MLXBanks {
         let payload = group * bits / 8
         var value: Float = 0
         var magnitude: Float = 0
-        w.withUnsafeBytes { raw in
+        w.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             for g in 0..<groups {
                 let scale = scales[row * groups + g]
                 let bias = biases[row * groups + g]

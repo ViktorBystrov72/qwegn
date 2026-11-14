@@ -192,7 +192,7 @@ struct QWResolvedCliEngineConfig {
             explicitRepoPath: repoPath,
             disableMemoryPack: disableMemoryPack,
             modelName: modelName.isEmpty ? settings.modelName : modelName,
-            geometryDigest: runtimeAssets.descriptor.geometryDigestV2Hex,
+            geometryDigest: runtimeAssets.descriptor.geometryDigestV3Hex,
             preferredKVMode: knobs.kvMode
         )
         let minMemoryContext = memoryPack.map { max(4096, (($0.artifact.tokenCount + 16384 + 255) / 256) * 256) } ?? 0

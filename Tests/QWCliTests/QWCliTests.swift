@@ -3,6 +3,12 @@ import Foundation
 @testable import QWCli
 import QWQuant
 
+private extension QWCli.MultimodalInputOptions {
+    var hasInputs: Bool {
+        !(imagePath ?? "").isEmpty || !(videoPath ?? "").isEmpty
+    }
+}
+
 // C22 — the CLI logic library. The rules this suite binds:
 //  1. npy bytes: writeNpy ≡ numpy.save BYTE-IDENTICAL (goldens in fixtures/,
 //     produced by the live oracle venv — rule 2; the alignment law: header
@@ -489,6 +495,20 @@ func admissionPlanReportErnie55() throws {
     #expect((comps["kv_bytes"] as? Int ?? 0) < (600 << 20))
 }
 
+@Test("pull checkpoint relative path guard blocks traversal and allows nested checkpoint assets")
+func validatedRelativeDestinationGuard() throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwg_pull_guard_\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
 
+    let ok = try QWCli.validatedRelativeDestination(baseDir: root, relativePath: "weights/model.safetensors")
+    #expect(ok.lastPathComponent == "model.safetensors")
+    #expect(ok.path.hasPrefix(root.resolvingSymlinksInPath().standardizedFileURL.path + "/"))
 
-
+    for bad in ["../escape.bin", "weights/../../escape.bin", "/etc/passwd", "~/secret", ""] {
+        #expect(throws: Error.self) {
+            _ = try QWCli.validatedRelativeDestination(baseDir: root, relativePath: bad)
+        }
+    }
+}

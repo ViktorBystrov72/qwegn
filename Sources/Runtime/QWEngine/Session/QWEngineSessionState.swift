@@ -119,30 +119,30 @@ enum QWEngineSessionState {
             try mtpCache.rollback(mtpKV, by: mtpCache.written(mtpKV) - written)
             session.mtpKVViews = [try mtpCache.layerViews(mtpKV, layer: 0)]
         }
-        snapshot.recData.withUnsafeBytes {
+        snapshot.recData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             session.recSlab.region.pointer.advanced(by: session.recSlab.offset)
-                .copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+                .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
         }
-        snapshot.ringData.withUnsafeBytes {
+        snapshot.ringData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             session.ringSlab.region.pointer.advanced(by: session.ringSlab.offset)
-                .copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+                .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
         }
         session.position = snapshot.position
         session.generated = snapshot.generated
         session.roundRecord = snapshot.roundRecord
         if let owner = session.stochastic { session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed }
         if let hidden = session.trunkHidden, let data = snapshot.trunkHiddenData {
-            data.withUnsafeBytes {
-                hidden.region.pointer.advanced(by: hidden.offset).copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                hidden.region.pointer.advanced(by: hidden.offset).copyMemory(from: raw.baseAddress!, byteCount: raw.count)
             }
         }
         if let dSlot = session.dflashSlot, let kData = snapshot.dflashKData, let vData = snapshot.dflashVData,
            kData.count == dSlot.kSlab.bytes, vData.count == dSlot.vSlab.bytes {
-            kData.withUnsafeBytes {
-                dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset).copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+            kData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset).copyMemory(from: raw.baseAddress!, byteCount: raw.count)
             }
-            vData.withUnsafeBytes {
-                dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset).copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+            vData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset).copyMemory(from: raw.baseAddress!, byteCount: raw.count)
             }
         }
         session.dflashCacheOffset = snapshot.dflashCacheOffset

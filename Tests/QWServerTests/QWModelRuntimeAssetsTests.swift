@@ -7,6 +7,14 @@ import QWHAL
 import QWToken
 import QWVision
 
+private extension QWModelBackendRegistry {
+    var registeredModules: [Any.Type] {
+        lock.lock()
+        defer { lock.unlock() }
+        return builders.values.map(\.module)
+    }
+}
+
 final class QWModelRuntimeAssetsTests: XCTestCase {
     private func makeModelDirectory(
         _ generationConfig: String? = nil,
@@ -18,6 +26,16 @@ final class QWModelRuntimeAssetsTests: XCTestCase {
         let assets = root.appendingPathComponent("assets", isDirectory: true)
         try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
         try Data().write(to: root.appendingPathComponent("model.qwp"))
+        let minimalConfig = """
+        {"model_type":"qwen3_5_text","hidden_size":5120,"vocab_size":248320,
+         "num_hidden_layers":4,"layer_types":["linear_attention","linear_attention","linear_attention","full_attention"],
+         "full_attention_interval":4,"rms_norm_eps":1e-6,"max_position_embeddings":262144,
+         "num_attention_heads":24,"num_key_value_heads":4,"head_dim":256,
+         "partial_rotary_factor":0.25,"linear_key_head_dim":128,"linear_num_key_heads":16,
+         "linear_num_value_heads":48,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,
+         "eos_token_id":199999,"intermediate_size":17408}
+        """
+        try Data(minimalConfig.utf8).write(to: assets.appendingPathComponent("config.json"))
         try Data("{}".utf8).write(to: assets.appendingPathComponent("tokenizer.json"))
         if let generationConfig {
             try Data(generationConfig.utf8)
@@ -294,6 +312,20 @@ final class QWModelRuntimeAssetsTests: XCTestCase {
         XCTAssertEqual(engine.received?.prompt, [1, 2])
         XCTAssertEqual(engine.received?.speculative, speculation)
         XCTAssertTrue(backend.capabilities.contains(.speculative))
+    }
+
+    func testMissingConfigThrowsConfigMissingError() throws {
+        let root = try makeModelDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cfgURL = root.appendingPathComponent("assets/config.json")
+        try FileManager.default.removeItem(at: cfgURL)
+
+        XCTAssertThrowsError(try QWModelRuntimeAssets.load(
+            packPath: root.appendingPathComponent("model.qwp").path)) { err in
+            guard case QWModelRuntimeAssets.Error.configMissing = err else {
+                return XCTFail("expected configMissing, got \(err)")
+            }
+        }
     }
 }
 

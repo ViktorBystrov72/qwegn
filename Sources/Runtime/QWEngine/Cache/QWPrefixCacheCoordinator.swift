@@ -5,12 +5,10 @@
 import Foundation
 import QWCore
 import QWKV
-import QWState
 
 /// Unified three-tier prefix cache coordinator.
 public final class QWPrefixCacheCoordinator: @unchecked Sendable {
     public let tiers: QWPrefixCacheTiers
-    public var tier0Watermark = QWResidentKVWatermarkTracker<Int>()
     let warmStore: QWEnginePrefixStore<QWEngineCachedPrefix>?
     let diskManager: QWCacheDiskManager?
 
@@ -31,11 +29,6 @@ public final class QWPrefixCacheCoordinator: @unchecked Sendable {
     }
 
     public var isEnabled: Bool { tiers.isEnabled }
-
-    public var warmState: (entries: Int, bytes: Int)? {
-        guard let warmStore else { return nil }
-        return (warmStore.count, warmStore.chargedBytes)
-    }
 
     public var diskState: (entries: Int, bytes: Int)? {
         guard let diskManager, tiers.ssdByteLimit > 0 else { return nil }

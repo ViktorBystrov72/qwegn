@@ -1,29 +1,23 @@
-import SwiftUI
-import AppKit
+// SystemVibrancyView.swift — Adaptive Liquid Glass / Reduce Transparency backdrop
 
-/// The popover's canvas: macOS Liquid Glass, drawn by the system.
-/// The old canvas was an `NSVisualEffectView` — pre-Liquid-Glass.
+import SwiftUI
+
+/// Adaptive translucency surface that falls back cleanly under Reduce Transparency.
 public struct SystemVibrancyView: View {
-    /// Reduce Transparency asks for no glass. The canvas becomes the
-    /// surface it was standing in for.
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     public init() {}
 
     public var body: some View {
-        ZStack {
-            Color.clear
+        Group {
             if reduceTransparency {
-                Rectangle()
-                    .fill(TelemetryTheme.surface)
+                TelemetryTheme.surface
             } else {
-                // The system glass: the blur, the saturation and the
-                // tint are the system's business, not ours.
                 Rectangle()
-                    .fill(.clear)
-                    .background(.ultraThinMaterial)
+                    .fill(.ultraThinMaterial)
                     .glassEffect(.regular, in: .rect(cornerRadius: 0))
             }
         }
+        .ignoresSafeArea()
     }
 }

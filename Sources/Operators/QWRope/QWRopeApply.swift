@@ -41,15 +41,15 @@ public final class QWRopeApply: @unchecked Sendable {
     /// re-bumping activationsRegion() would restart the cursor at 0 and stomp
     /// earlier tensors; measured bug). Caller copyIns the fixture bytes.
     init(tableTensor t: QWTensorValue, hal: QWHal, nullSlab slab: MTLBuffer,
-         geometry: QWModelGeometry) {
+         geometry: QWModelGeometry) throws {
         self.tables = nil
         self.geometry = geometry
         self.tableTensor = t
         self.nullSlab = slab
-        self.pso = try! hal.pipeline("qwg_rope_norm_qk")
-        self.psoExtract = try! hal.pipeline("qwg_extract_rope_norm_qk")
-        self.psoGeneral = try! hal.pipeline("qwg_rope_qk_general")
-        self.psoExtractGeneral = try! hal.pipeline("qwg_extract_rope_qk_general")
+        self.pso = try hal.pipeline("qwg_rope_norm_qk")
+        self.psoExtract = try hal.pipeline("qwg_extract_rope_norm_qk")
+        self.psoGeneral = try hal.pipeline("qwg_rope_qk_general")
+        self.psoExtractGeneral = try hal.pipeline("qwg_extract_rope_qk_general")
     }
 
     public init(tables: QWRopeTables, hal: QWHal, weights: QWSubAllocator, arena: QWArena,
@@ -57,7 +57,7 @@ public final class QWRopeApply: @unchecked Sendable {
         self.tables = tables
         self.geometry = geometry ?? tables.geometry
         let t = try weights.allocate(QWTensorShape([tables.rows, tables.width], .f32))
-        tables.cosSin.withUnsafeBytes { arena.copyIn(t, from: Data($0)) }
+        tables.cosSin.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in arena.copyIn(t, from: Data(raw)) }
         self.tableTensor = t
         guard let slab = hal.device.makeBuffer(length: 16, options: .storageModeShared)
         else { throw QWRopeError.badShape("null slab alloc failed") }
@@ -154,7 +154,7 @@ public final class QWRopeApply: @unchecked Sendable {
                               kNormBaseU4: UInt32(S * (geometry.qHeads * geometry.headDim) / 8),
                               normOn: wq == nil ? 0 : 1)                 // no q/k norm → no norm
         var eps = geometry.rmsEps
-        withUnsafeBytes(of: &flags) { enc.setBytes($0.baseAddress!, length: 16, index: Buffer.headU4.rawValue) }
+        withUnsafeBytes(of: &flags) { (raw: UnsafeRawBufferPointer) in enc.setBytes(raw.baseAddress!, length: 16, index: Buffer.headU4.rawValue) }
         enc.setBytes(&eps, length: 4, index: Buffer.eps.rawValue)
         // fold rowBase into the table bind: +rowBase·width f32 = rowBase·width·4 B
         enc.setBuffer(tableTensor.region.buffer,
@@ -213,7 +213,7 @@ public final class QWRopeApply: @unchecked Sendable {
                               writeNorm: 0,
                               kNormBaseU4: UInt32(S * (geometry.qHeads * geometry.headDim) / 8),
                               normOn: wq == nil ? 0 : 1)
-        withUnsafeBytes(of: &flags) { enc.setBytes($0.baseAddress!, length: 16, index: 8) }
+        withUnsafeBytes(of: &flags) { (raw: UnsafeRawBufferPointer) in enc.setBytes(raw.baseAddress!, length: 16, index: 8) }
         enc.dispatchThreadgroups(MTLSize(width: S, height: geometry.qHeads + geometry.kvHeads, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }

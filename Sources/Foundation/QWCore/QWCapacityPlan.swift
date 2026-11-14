@@ -41,15 +41,6 @@ public struct QWCapacityPlan: Equatable, Sendable {
                               maxFittingContext: maxFitting, fits: required <= availableBytes)
     }
 
-    /// K+V bytes per token across all attention layers.
-    public static func kvBytesPerToken(attentionLayers: Int, kvHeads: Int, headDim: Int,
-                                       bytesPerElement: Double, kvLoraRank: Int = 0) -> Int {
-        if kvLoraRank > 0 {
-            return Int((Double(attentionLayers) * Double(kvLoraRank) * bytesPerElement).rounded(.up))
-        }
-        return Int((Double(attentionLayers) * 2 * Double(kvHeads * headDim) * bytesPerElement).rounded(.up))
-    }
-
     /// Stepped KV allocation quantum (8,192 tokens, matching oMLX QSAKVCache).
     public static let kvStepTokens = 8_192
 

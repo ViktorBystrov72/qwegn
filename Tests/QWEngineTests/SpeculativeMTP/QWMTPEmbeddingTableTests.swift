@@ -18,7 +18,7 @@ final class QWMTPEmbeddingTableTests: XCTestCase {
         let words: [UInt16] = [0, 0x8000, 0x3f80, 0xbf80, 0x7f7f, 0x0080, 0x3eaa, 0xc100,
                                0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100, 0x4110]
         var data = Data(repeating: 0, count: 256)
-        words.withUnsafeBytes { data.append(contentsOf: $0) }
+        words.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in data.append(contentsOf: raw) }
         try data.write(to: URL(fileURLWithPath: path))
         let table = try QWMTPEmbeddingTable(hal: hal, path: path, offset: 256, vocabulary: 2, hidden: 8)
         XCTAssertThrowsError(try QWMTPEmbeddingTable(hal: hal, path: path, offset: 257, vocabulary: 2, hidden: 8))
@@ -37,7 +37,9 @@ final class QWMTPEmbeddingTableTests: XCTestCase {
             guard cb.status == .completed else { continue }
             let bits = output.region.pointer.advanced(by: output.offset).assumingMemoryBound(to: UInt16.self)
             for i in 0..<8 {
-                let expected = (0..<2).contains(id) ? QWQuant.f32tof16Bits(QWQuant.bf16tof32Bits(words[id * 8 + i])) : 0
+                let expected = (0..<2).contains(id)
+                    ? QWQuant.f32tof16Bits(Float(bitPattern: UInt32(words[id * 8 + i]) << 16))
+                    : 0
                 XCTAssertEqual(bits[i], expected, "row \(id) element \(i)")
             }
         }

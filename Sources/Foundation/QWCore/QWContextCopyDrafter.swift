@@ -53,10 +53,6 @@ public enum QWContextCopyDrafter {
                        maxPeriod: maxPeriod, minRepeats: minRepeats)
     }
 
-    public static func periodicDraft(history: [Int64], maxPeriod: Int = 8, minRepeats: Int = 2) -> Int? {
-        periodicDrafts(history: history, maxCount: 1, maxPeriod: maxPeriod, minRepeats: minRepeats)?.first
-    }
-
     /// Single-pass suffix matcher returning up to `maxCount` continuation tokens and the matched suffix length.
     /// When `appendedToken` is supplied, matches against `history + [appendedToken]` without copying `history`.
     public static func drafts(history: [Int64], appendedToken: Int64? = nil, maxCount: Int = 3,

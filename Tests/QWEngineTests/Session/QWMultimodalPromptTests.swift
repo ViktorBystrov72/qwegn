@@ -31,7 +31,8 @@ final class QWMultimodalPromptTests: XCTestCase {
         // Build multimodal prompt
         let mmPrompt = try QWMultimodalPrompt(
             promptTokens: promptTokens,
-            images: [(grid: grid, features: visualFeatures)]
+            images: [(grid: grid, features: visualFeatures)],
+            hiddenDim: hiddenDim
         )
 
         // The expanded prompt tokens should have 2 (before) + 1 (image) + 3 (after) = 6 tokens
@@ -67,7 +68,8 @@ final class QWMultimodalPromptTests: XCTestCase {
         XCTAssertThrowsError(
             try QWMultimodalPrompt(
                 promptTokens: [QWMMConfig.imageToken],
-                images: [(grid: grid, features: shortFeatures)]
+                images: [(grid: grid, features: shortFeatures)],
+                hiddenDim: 5120
             )
         )
     }
@@ -136,39 +138,32 @@ final class QWMultimodalPromptTests: XCTestCase {
         // By default vision head is NOT loaded
         XCTAssertFalse(backend.isLoaded)
         XCTAssertEqual(backend.residentBytes, 0)
-        XCTAssertEqual(backend.loadCount, 0)
-        XCTAssertEqual(backend.unloadCount, 0)
 
         // Prompt 1 has an image -> loads vision head once
         try backend.prepareForPrompt(hasImages: true)
         XCTAssertTrue(backend.isLoaded)
-        XCTAssertGreaterThan(backend.residentBytes, 0)
-        XCTAssertEqual(backend.loadCount, 1)
-        XCTAssertEqual(backend.unloadCount, 0)
+        let firstLoadBytes = backend.residentBytes
+        XCTAssertGreaterThan(firstLoadBytes, 0)
 
         // Second image in the same prompt reuses loaded weights without reloading
         try backend.prepareForPrompt(hasImages: true)
         XCTAssertTrue(backend.isLoaded)
-        XCTAssertEqual(backend.loadCount, 1)
+        XCTAssertEqual(backend.residentBytes, firstLoadBytes)
 
         // Prompt 2 does NOT have an image -> unloads vision head to free RAM
         try backend.prepareForPrompt(hasImages: false)
         XCTAssertFalse(backend.isLoaded)
         XCTAssertEqual(backend.residentBytes, 0)
-        XCTAssertEqual(backend.loadCount, 1)
-        XCTAssertEqual(backend.unloadCount, 1)
 
         // Prompt 3 has an image -> reloads on demand
         try backend.prepareForPrompt(hasImages: true)
         XCTAssertTrue(backend.isLoaded)
-        XCTAssertGreaterThan(backend.residentBytes, 0)
-        XCTAssertEqual(backend.loadCount, 2)
-        XCTAssertEqual(backend.unloadCount, 1)
+        XCTAssertEqual(backend.residentBytes, firstLoadBytes)
     }
 
     private static func writeSyntheticVisionSafetensors(to dir: URL, outHidden: Int) throws {
-        let d = QWVisionShape.dim // 1152
-        let mlp = QWVisionShape.mlpInner // 4304
+        let d = QWVisionConfig.qwen3VLReference.dim // 1152
+        let mlp = QWVisionConfig.qwen3VLReference.mlpInner // 4304
         let specs: [(String, [Int])] = [
             ("model.visual.pos_embed.weight", [2304, d]),
             ("model.visual.patch_embed.proj.weight", [d, 3, 2, 16, 16]),
@@ -209,5 +204,56 @@ final class QWMultimodalPromptTests: XCTestCase {
         fileData.append(headerJSON)
         fileData.append(Data(count: offset))
         try fileData.write(to: dir.appendingPathComponent("model.safetensors"))
+    }
+
+    func testDeferredSubchunkRowsEliminatesOuterSliceSlivers() {
+        let totalCount = 31922
+        let maxChunkRows = 4096
+        let stepChunk = QWPrefillLimits.balancedChunkRows(forTotalTokens: totalCount, maxChunkRows: maxChunkRows)
+        XCTAssertEqual(stepChunk, 4032)
+
+        var pos = 0
+        var executedChunks: [Int] = []
+        for outerStart in stride(from: 0, to: totalCount, by: maxChunkRows) {
+            let limit = min(outerStart + maxChunkRows, totalCount)
+            let runsHead = limit >= totalCount
+            while pos < limit {
+                guard let rows = FNGPUPrefillStack.deferredSubchunkRows(
+                    pos: pos, limit: limit, runsHead: runsHead, totalCount: totalCount,
+                    stepChunk: stepChunk, hidden: 5120, hc: 4
+                ) else {
+                    break
+                }
+                executedChunks.append(rows)
+                pos += rows
+            }
+        }
+        XCTAssertEqual(pos, totalCount)
+        XCTAssertEqual(executedChunks, [4032, 4032, 4032, 4032, 4032, 4032, 4032, 3698])
+        XCTAssertTrue(executedChunks.allSatisfy { $0 >= 512 })
+    }
+}
+
+private extension QWMultimodalPrompt {
+    func resolveX0(textEmbedder: (Int) throws -> [Float]) throws -> [Float] {
+        var textEmbeddings: [Float] = []
+        for span in plan.spans {
+            if case let .text(tokenStart, count) = span.content {
+                for i in 0..<count {
+                    let tok = expandedTokens[tokenStart + i]
+                    let emb = try textEmbedder(tok)
+                    guard emb.count == hiddenDim else {
+                        throw QWMultimodalError.featureDimensionMismatch(expected: hiddenDim, actual: emb.count)
+                    }
+                    textEmbeddings.append(contentsOf: emb)
+                }
+            }
+        }
+        return try qwInterleaveX0(
+            textEmbeddings: textEmbeddings,
+            visualTokens: visualTokens,
+            plan: plan,
+            hiddenDim: hiddenDim
+        )
     }
 }

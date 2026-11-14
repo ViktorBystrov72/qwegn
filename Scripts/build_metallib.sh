@@ -32,18 +32,43 @@ else
   METALLIB_LD=("$CRYPTEX_BIN/metallib")
 fi
 
+JOBS="${QW_METAL_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
+
 # build_variant <output> [extra compiler flags...]
 build_variant() {
   local out="$1"; shift
   local tmp; tmp="$(mktemp -d)"
-  local airs=()
+  local airs=() pids=() errs=() sources=()
+  local idx=0 m a err fail=0
   while IFS= read -r -d '' m; do
-    a="$tmp/$(basename "${m%.metal}").air"
+    a="$(printf '%s/%04d_%s.air' "$tmp" "$idx" "$(basename "${m%.metal}")")"
+    err="$a.err"
     "${METAL_CC[@]}" -std=metal4.0 -O2 "$@" \
       -ISources/QWMetal -ISources/QWMetal/include -ISources/QWMetal/gdn \
-      -c "$m" -o "$a"
+      -c "$m" -o "$a" 2>"$err" &
+    pids+=($!)
+    errs+=("$err")
+    sources+=("$m")
     airs+=("$a")
+    idx=$((idx + 1))
+    if [ "${#pids[@]}" -ge "$JOBS" ]; then
+      if ! wait "${pids[0]}"; then fail=1; fi
+      pids=("${pids[@]:1}")
+    fi
   done < <(find Sources/QWMetal -name '*.metal' -print0 | sort -z)
+  for p in "${pids[@]}"; do
+    if ! wait "$p"; then fail=1; fi
+  done
+  if [ "$fail" -ne 0 ]; then
+    for ((i=0; i<${#sources[@]}; i++)); do
+      if [ -s "${errs[$i]}" ]; then
+        echo "metal compile failed for ${sources[$i]}:" >&2
+        cat "${errs[$i]}" >&2
+      fi
+    done
+    rm -rf "$tmp"
+    return 1
+  fi
   "${METALLIB_LD[@]}" "${airs[@]}" -o "$out"
   rm -rf "$tmp"
 }

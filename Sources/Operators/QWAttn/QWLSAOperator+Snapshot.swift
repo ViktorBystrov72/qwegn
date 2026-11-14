@@ -56,7 +56,7 @@ extension QWLSAOperator {
         guard let data else { return false }
         if data.count == fullIndexerStateBytes(position: position) { return true }
         guard data.count >= 16 else { return false }
-        let (magic, baseAligned, hdrPos) = data.withUnsafeBytes { raw -> (UInt64, Int, Int) in
+        let (magic, baseAligned, hdrPos) = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> (UInt64, Int, Int) in
             let m = raw.loadUnaligned(fromByteOffset: 0, as: UInt64.self)
             let b = Int(raw.loadUnaligned(fromByteOffset: 8, as: UInt32.self))
             let p = Int(raw.loadUnaligned(fromByteOffset: 12, as: UInt32.self))
@@ -89,9 +89,9 @@ extension QWLSAOperator {
             var magic = Self.deltaMagic
             var baseU = UInt32(baseAligned)
             var posU = UInt32(position)
-            withUnsafeBytes(of: &magic) { out.append(contentsOf: $0) }
-            withUnsafeBytes(of: &baseU) { out.append(contentsOf: $0) }
-            withUnsafeBytes(of: &posU) { out.append(contentsOf: $0) }
+            withUnsafeBytes(of: &magic) { (raw: UnsafeRawBufferPointer) in out.append(contentsOf: raw) }
+            withUnsafeBytes(of: &baseU) { (raw: UnsafeRawBufferPointer) in out.append(contentsOf: raw) }
+            withUnsafeBytes(of: &posU) { (raw: UnsafeRawBufferPointer) in out.append(contentsOf: raw) }
             for ls in layers {
                 if deltaPooledBytes > 0 {
                     out.append(base.advanced(by: ls.pooledKeys.offset + startPooledOff).assumingMemoryBound(to: UInt8.self),
@@ -155,7 +155,7 @@ extension QWLSAOperator {
         let fullUnits = fullPos / unitTok
         let copyUnits = baseAligned / unitTok
         let base = region.pointer
-        baseData.withUnsafeBytes { raw in
+        baseData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             var src = 0
             for ls in layers {
                 if copyPooledBytes > 0 {
@@ -194,7 +194,7 @@ extension QWLSAOperator {
         let openStart = (position / 4) * 4
         let base = region.pointer
         if data.count >= 16 {
-            let (magic, baseAligned, hdrPos) = data.withUnsafeBytes { raw -> (UInt64, Int, Int) in
+            let (magic, baseAligned, hdrPos) = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> (UInt64, Int, Int) in
                 (raw.loadUnaligned(fromByteOffset: 0, as: UInt64.self),
                  Int(raw.loadUnaligned(fromByteOffset: 8, as: UInt32.self)),
                  Int(raw.loadUnaligned(fromByteOffset: 12, as: UInt32.self)))
@@ -212,7 +212,7 @@ extension QWLSAOperator {
                 let deltaCentBytes = deltaUnits * centPerUnit
                 let deltaMemBytes = deltaUnits * memPerUnit
                 let deltaSizeBytes = deltaUnits * sizePerUnit
-                data.withUnsafeBytes { raw in
+                data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                     var src = 16
                     for ls in layers {
                         if deltaPooledBytes > 0 {
@@ -252,7 +252,7 @@ extension QWLSAOperator {
             let unitBytes = centPerUnit + memPerUnit + sizePerUnit
             let tailCopyNeeded = tailPooledBytes > 0 || openStart < position
             guard tailCopyNeeded else { return true }
-            data.withUnsafeBytes { raw in
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 var src = 0
                 for ls in layers {
                     if tailPooledBytes > 0 {
@@ -276,7 +276,7 @@ extension QWLSAOperator {
         let centBytes = numUnits * centPerUnit
         let memBytes = numUnits * memPerUnit
         let sizeBytes = numUnits * sizePerUnit
-        data.withUnsafeBytes { raw in
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             var src = 0
             for ls in layers {
                 if pooledBytes > 0 {

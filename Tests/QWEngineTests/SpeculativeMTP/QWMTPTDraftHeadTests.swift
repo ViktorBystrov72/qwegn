@@ -31,7 +31,7 @@ final class QWMTPTDraftHeadTests: XCTestCase {
         defer { try? file.close() }
         file.seek(toFileOffset: 0)
         file.write(Data("QWP1".utf8))
-        withUnsafeBytes(of: UInt64(header.count).littleEndian) { file.write(Data($0)) }
+        withUnsafeBytes(of: UInt64(header.count).littleEndian) { (raw: UnsafeRawBufferPointer) in file.write(Data(raw)) }
         file.seek(toFileOffset: UInt64(payloadEnd))
         file.write(header)
         file.truncateFile(atOffset: UInt64(payloadEnd + header.count))
@@ -43,7 +43,7 @@ final class QWMTPTDraftHeadTests: XCTestCase {
             .appendingPathComponent("qw-draft-head-\(UUID().uuidString)").path
         defer { try? FileManager.default.removeItem(atPath: path) }
         try Self.makeSparseQ4gSidecar(at: path, n: QWModelGeometry.qwen38_27b.vocab, k: QWModelGeometry.qwen38_27b.hidden)
-        let pack = try QWQuant.Pack(url: URL(fileURLWithPath: path))
+        let pack = try QWQuant.Pack(url: URL(fileURLWithPath: path), descriptor: .qwen38_27b, skipIdentityCheck: true)
         let head = try QWMTPTDraftHead(geometry: QWTestGeometry.g27, hal: hal, sidecar: pack)
         XCTAssertEqual(head.n, QWModelGeometry.qwen38_27b.vocab)
         XCTAssertEqual(head.k, QWModelGeometry.qwen38_27b.hidden)

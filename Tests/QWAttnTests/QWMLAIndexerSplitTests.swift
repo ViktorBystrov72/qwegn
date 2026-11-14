@@ -13,6 +13,8 @@ final class QWMLAIndexerSplitTests: XCTestCase {
     func testSplitScoreSelectMatchesFused() throws {
         let geo = try QWMLAAttnOperatorTests.mlaGeometry()
         let hal = try QWHal(geometry: geo)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable,
+                          "MLA MMA indexer split kernel requires Metal 4 tensor hardware")
         let fused = try hal.pipeline("qwg_mla_indexer_score_select")
         let score = try hal.pipeline("qwg_mla_indexer_score_mma")
         let select = try hal.pipeline("qwg_mla_indexer_select")

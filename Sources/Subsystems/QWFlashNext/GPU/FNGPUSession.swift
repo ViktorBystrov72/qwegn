@@ -46,6 +46,8 @@ public struct FNGPUSessionData {
     public var sampler: QWSampler
     /// How far the prefill has consumed the prompt.
     public var prefillPos: Int
+    /// Balanced prefill chunk size locked once per prompt so outer slices do not create small tail slivers.
+    public var prefillStepChunk: Int
     /// The head's token for the last prefill row.
     public var lastArgmax: Int
     /// The rows the last prefill chunk ran.
@@ -120,6 +122,9 @@ public struct FNGPUSessionData {
     /// Unique valid token IDs seen in `history` so far, maintained incrementally
     /// so repetition-penalty sampling is O(unique) instead of O(history.count) per step.
     public var seenTokens: Set<Int>
+    /// Deterministic insertion-ordered unique token IDs matching `seenTokens`
+    /// so `Array(seenTokens)` heap allocations and Set hash iteration variance are avoided.
+    public var seenTokenList: [Int]
     /// Total speculative draft proposals in this session.
     public var specProposals: Int
     /// Total accepted speculative draft tokens in this session.
@@ -140,19 +145,26 @@ public struct FNGPUSessionData {
     public var retainPrefixLength: Int?
     /// Merged visual feature spans sorted by `tokenOffset` in the expanded prompt.
     public var visualSpans: [QWVisualSpan]
+    /// Optional prefill progress callback invoked with `(completedComputedTokens, totalComputedTokens)`.
+    public var onPrefillProgress: (@Sendable (Int, Int) -> Void)?
+    /// Starting prefill position after prefix-cache restoration so progress excludes reused tokens.
+    public var prefillProgressBasePos: Int
 
     public init(history: [Int64], sampler: QWSampler, useSpec: Bool = false,
                 collectLogprobs: Bool = false, topLogprobsCount: Int = 0,
                 constraint: (any QWTokenConstraint)? = nil,
                 retainPrefixLength: Int? = nil,
-                visualSpans: [QWVisualSpan] = []) {
+                visualSpans: [QWVisualSpan] = [],
+                onPrefillProgress: (@Sendable (Int, Int) -> Void)? = nil) {
         self.history = history
         self.sampler = sampler
         self.constraint = constraint
         self.retainPrefixLength = retainPrefixLength
         self.visualSpans = visualSpans.sorted { $0.tokenOffset < $1.tokenOffset }
+        self.onPrefillProgress = onPrefillProgress
         self.useSpec = useSpec && !collectLogprobs && (constraint?.allowsSpeculation ?? true)
         prefillPos = 0
+        prefillStepChunk = 0
         lastArgmax = 0
         lastRows = 1
         pleParity = 0
@@ -182,16 +194,32 @@ public struct FNGPUSessionData {
         lastStepGPUMillis = 0
         roundTokenCounts = []
         seenTokens = []
+        seenTokenList = []
         specProposals = 0
         specAccepted = 0
         pendingPrefixSave = false
         self.collectLogprobs = collectLogprobs
         self.topLogprobsCount = topLogprobsCount
         self.tokenLogprobs = []
+        self.prefillProgressBasePos = 0
+    }
+
+    /// Emits incremental prefill progress relative to `prefillProgressBasePos`.
+    public func reportPrefillProgress() {
+        let total = max(0, history.count - prefillProgressBasePos)
+        let done = min(total, max(0, prefillPos - prefillProgressBasePos))
+        onPrefillProgress?(done, total)
     }
 
     /// The number of tokens the session has consumed.
     public var activeTokens: Int { history.count }
+
+    /// Records a token into `seenTokens` and `seenTokenList` if in-bounds and unseen.
+    public mutating func recordSeenToken(_ token: Int, vocab: Int) {
+        if token >= 0 && token < vocab, seenTokens.insert(token).inserted {
+            seenTokenList.append(token)
+        }
+    }
 }
 
 // MARK: - The session's state wipe
@@ -335,7 +363,9 @@ extension FNGPUEngine {
     func drawFirstToken(_ session: inout FNGPUSessionData) throws -> Int {
         session.hasFirstToken = true
         let tok = try sampleFromHead(argmaxToken: session.lastArgmax,
-                                     seenTokens: session.seenTokens, sampler: session.sampler,
+                                     seenTokens: session.seenTokens,
+                                     seenTokenList: session.seenTokenList,
+                                     sampler: session.sampler,
                                      constraint: session.constraint)
         session.firstToken = tok
         if session.collectLogprobs {
@@ -373,11 +403,12 @@ extension FNGPUEngine {
     /// Samples one token from the head's logit row with the SHARED sampler.
     /// Both families go through `QWSampler`, so the same seed and the same
     /// logits pick the same token on either engine.
-    func sampleFromHead(argmaxToken: Int, seenTokens: Set<Int>,
+    func sampleFromHead(argmaxToken: Int, seenTokens: Set<Int>, seenTokenList: [Int],
                         sampler: QWSampler, row: Int = 0,
                         constraint: (any QWTokenConstraint)? = nil) throws -> Int {
         guard let constraint else {
             return try unconstrainedSample(argmaxToken: argmaxToken, seenTokens: seenTokens,
+                                           seenTokenList: seenTokenList,
                                            sampler: sampler, row: row)
         }
         let token: Int
@@ -395,13 +426,14 @@ extension FNGPUEngine {
             }
         } else {
             token = try unconstrainedSample(argmaxToken: argmaxToken, seenTokens: seenTokens,
+                                            seenTokenList: seenTokenList,
                                             sampler: sampler, row: row)
         }
         try constraint.accept(token)
         return token
     }
 
-    private func unconstrainedSample(argmaxToken: Int, seenTokens: Set<Int>,
+    private func unconstrainedSample(argmaxToken: Int, seenTokens: Set<Int>, seenTokenList: [Int],
                                      sampler: QWSampler, row: Int) throws -> Int {
         let config = sampler.config
         if config.isGreedy && config.repetitionPenalty == 1.0 {
@@ -417,7 +449,7 @@ extension FNGPUEngine {
         }
         return try sampler.sampleToken(
             logits: rowBuf,
-            repetitionHistory: config.repetitionPenalty == 1.0 ? [] : Array(seenTokens)
+            repetitionHistory: config.repetitionPenalty == 1.0 ? [] : seenTokenList
         )
     }
 
@@ -429,7 +461,7 @@ extension FNGPUEngine {
         let prevCount = session.history.count
         let trackRep = session.sampler.config.repetitionPenalty != 1.0
         session.history.append(Int64(token))
-        if trackRep && token >= 0 && token < vocab { session.seenTokens.insert(token) }
+        if trackRep { session.recordSeenToken(token, vocab: vocab) }
         let (drafts, stepMTP) = draftsFor(&session, mtp: mtp)
         let dCount = drafts.count
         let activeRows = 1 + dCount
@@ -446,7 +478,7 @@ extension FNGPUEngine {
                                     relaxedRows: session.mtpSourcedDrafts + 1,
                                     relaxedMinProb: session.relaxedMinProb)
         let verifyMs = Date().timeIntervalSince(stepT0) * 1000.0
-        if !session.sampler.config.hasExplicitSeed {
+        if !session.sampler.config.hasExplicitSeed && !session.sampler.config.isGreedy {
             session.chainPolicy.observeRound(rows: activeRows, ms: verifyMs)
         }
         let v = head.argmaxTokens(count: activeRows)
@@ -462,6 +494,7 @@ extension FNGPUEngine {
                 sampled = draftTok
             } else {
                 sampled = try sampleFromHead(argmaxToken: v[r], seenTokens: session.seenTokens,
+                                             seenTokenList: session.seenTokenList,
                                              sampler: session.sampler, row: r,
                                              constraint: session.constraint)
             }
@@ -472,17 +505,18 @@ extension FNGPUEngine {
             }
             if sampled == draftTok && v[r] == draftTok {
                 accepted += 1
-                if trackRep && draftTok >= 0 && draftTok < vocab { session.seenTokens.insert(draftTok) }
+                if trackRep { session.recordSeenToken(draftTok, vocab: vocab) }
             } else {
-                if trackRep && sampled >= 0 && sampled < vocab { session.seenTokens.insert(sampled) }
+                if trackRep { session.recordSeenToken(sampled, vocab: vocab) }
                 break
             }
         }
         if accepted == dCount {
             let bonusTok = try sampleFromHead(argmaxToken: v[dCount], seenTokens: session.seenTokens,
+                                              seenTokenList: session.seenTokenList,
                                               sampler: session.sampler, row: dCount,
                                               constraint: session.constraint)
-            if trackRep && bonusTok >= 0 && bonusTok < vocab { session.seenTokens.insert(bonusTok) }
+            if trackRep { session.recordSeenToken(bonusTok, vocab: vocab) }
             session.pendingTokens.append(bonusTok)
         } else {
             let rejected = dCount - accepted
@@ -553,7 +587,7 @@ extension FNGPUEngine {
                     session.mtpDraft = stepMTP.mtpHead.argmaxToken()
                 }
                 let chainMs = Date().timeIntervalSince(chainT0) * 1000
-                if passes > 0 && !session.sampler.config.hasExplicitSeed {
+                if passes > 0 && !session.sampler.config.hasExplicitSeed && !session.sampler.config.isGreedy {
                     session.chainPolicy.observeChain(passes: passes, ms: chainMs)
                 }
                 FNMTPChain.ms += chainMs

@@ -5,6 +5,7 @@
 
 import XCTest
 @testable import QWServer
+import QWCore
 import Foundation
 
 final class MenuBarRendererParityTests: XCTestCase {
@@ -12,7 +13,7 @@ final class MenuBarRendererParityTests: XCTestCase {
     private let serverDirectory = "Sources/Apps/QWServer"
     /// The files a renderer draws its numbers from.
     private let renderers = ["TelemetryCards.swift", "TelemetryObservable.swift",
-                             "CupertinoTelemetryView.swift"]
+                             "CupertinoTelemetryView.swift", "DualSparklineView.swift"]
     /// The literals the old renderer asserted. Each was a fact nobody
     /// measured.
     private let invented = [
@@ -48,7 +49,7 @@ final class MenuBarRendererParityTests: XCTestCase {
         let model = QWDashboardViewModel.build(
             lifecycle: .init(phase: .loaded, since: nil, model: "m", detail: nil),
             modelId: "m", capabilities: [.prefixCache])
-        let menuBarIds = Set(MenuBarCardCatalogue.ids)
+        let menuBarIds = Set(Self.menuBarCardCatalogueIds)
         let dashboardIds = Set(model.cards.map(\.id))
         XCTAssertTrue(menuBarIds.isSubset(of: dashboardIds),
                       "the MenuBar renders cards the dashboard does not publish")
@@ -59,10 +60,29 @@ final class MenuBarRendererParityTests: XCTestCase {
         let drawn = Self.cardIds(in: source)
         XCTAssertFalse(drawn.isEmpty, "the MenuBar draws no published card at all")
         for id in drawn {
-            XCTAssertTrue(MenuBarCardCatalogue.ids.contains(id),
+            XCTAssertTrue(Self.menuBarCardCatalogueIds.contains(id),
                           "the MenuBar draws '\(id)', which the catalogue does not name")
         }
     }
+
+    private static let menuBarCardCatalogueIds: [String] = [
+        "gpu.busy_ratio",
+        "gpu.device",
+        "hardware.cpu_percent",
+        "hardware.memory_percent",
+        "hardware.memory_pressure_level",
+        "throughput.display_prefill_tokens_per_sec",
+        "throughput.display_decode_tokens_per_sec",
+        "prefill.progress_tokens",
+        "prefill.total_tokens",
+        "latency.ttft_ms",
+        "context.active_tokens",
+        "cache.warm_bytes",
+        "cache.ssd_bytes",
+        "cache.tokens_reused_total",
+        "memory.resident_bytes",
+        "memory.arena_reserved_bytes",
+    ]
 
     /// A renderer that invents a value shows the user a fact nobody
     /// measured. The literals the old renderer asserted are gone — from
@@ -168,6 +188,209 @@ final class MenuBarRendererParityTests: XCTestCase {
             XCTAssertTrue(source.contains("guard generation == \(counter) else { return }"),
                           "a response must be checked against \(counter)")
         }
+    }
+
+    /// The app bundle must ship a signed sibling `qwg` executable beside `qwg-menu`.
+    func testAppBundleShipsAndSignsQWGSiblingExecutable() throws {
+        let script = try Self.read("Scripts/build_app.sh")
+        XCTAssertTrue(script.contains("$APP/Contents/MacOS/qwg\""),
+                      "build_app.sh must copy qwg into Contents/MacOS/qwg")
+        XCTAssertTrue(script.contains("codesign") && script.contains("Contents/MacOS/qwg"),
+                      "build_app.sh must sign Contents/MacOS/qwg")
+    }
+
+    /// Resident Model card must stay model-centric: no alias clutter, constant host chip, or kernel mode.
+    func testResidentModelCardOmitsStaticHostHardwareAndAlias() throws {
+        let source = try Self.read("\(menuBarDirectory)/TelemetryCards.swift")
+        for forbidden in ["modelAlias", "gpuName", "metalFamily", "hostLogicalCores", "gdnPrefillMode"] {
+            XCTAssertFalse(source.contains(forbidden),
+                           "TelemetryCards.swift must not render '\(forbidden)' on the Resident Model card")
+        }
+    }
+
+    /// Popover header status must not duplicate prefill/decode rates already shown on hero tiles.
+    func testPopoverHeaderOmitsDuplicateThroughputRates() throws {
+        let cardsSource = try Self.read("\(menuBarDirectory)/TelemetryCards.swift")
+        let observableSource = try Self.read("\(menuBarDirectory)/TelemetryObservable+MenuBar.swift")
+        XCTAssertFalse(cardsSource.contains("liveMenuBarRateText"),
+                       "TelemetryCards.swift header must not render duplicate liveMenuBarRateText next to status")
+        XCTAssertFalse(observableSource.contains("liveMenuBarRateText"),
+                       "Dead liveMenuBarRateText helper must not remain in TelemetryObservable+MenuBar.swift")
+        if let headerRange = cardsSource.range(of: "var headerSection: some View"),
+           let residentRange = cardsSource.range(of: "// MARK: - Resident Model Card"),
+           headerRange.lowerBound < residentRange.lowerBound {
+            let headerSlice = String(cardsSource[headerRange.lowerBound..<residentRange.lowerBound])
+            XCTAssertFalse(headerSlice.contains("tok/s"),
+                           "Popover headerSection must not render inline tok/s speeds")
+        } else {
+            XCTFail("Expected headerSection and Resident Model Card markers in TelemetryCards.swift")
+        }
+    }
+
+    /// Selectable menu bar telemetry must honor visibility, generation gating, and unavailable gaps.
+    func testMenuBarStatusFormatterHonorsSelectedMetricsAndHonesty() {
+        func makeCard(_ id: String, value: String?, unit: String?, number: Double? = nil) -> QWDashboardCard {
+            QWDashboardCard(
+                id: id,
+                title: id,
+                value: value,
+                unit: unit,
+                number: number,
+                provenance: value == nil ? .unavailable : .measured,
+                sampledAt: value == nil ? nil : Date(),
+                age: value == nil ? nil : 0.1,
+                isStale: false,
+                reason: value == nil ? "not measured" : nil,
+                series: []
+            )
+        }
+
+        let loadedDashboard = QWDashboardViewModel(
+            sampledAt: Date(),
+            lifecycle: .init(phase: .loaded, since: Date(), model: "m", detail: nil),
+            modelId: "m",
+            capabilities: [QWKnobCapability.prefixCache.rawValue],
+            generation: .idle,
+            facts: nil,
+            cards: [
+                makeCard("throughput.display_decode_tokens_per_sec", value: "91.9", unit: "tok/s", number: 91.9),
+                makeCard("throughput.display_prefill_tokens_per_sec", value: "93.3", unit: "tok/s", number: 93.3),
+                makeCard("memory.arena_reserved_bytes", value: "25.01", unit: "GiB", number: 25.01),
+                makeCard("memory.resident_bytes", value: "24.20", unit: "GiB", number: 24.20),
+                makeCard("context.active_tokens", value: "38", unit: "tok", number: 38),
+            ],
+            actions: [],
+            knobs: ["contextTokens": .int(262_144)],
+            knobSources: [:]
+        )
+
+        // Disconnected or unloaded or empty selection yields nil (icon only).
+        XCTAssertNil(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: loadedDashboard, isConnected: false, enabledMetrics: [.decodeSpeed], hideSpeedsWhenIdle: false
+        ))
+        let unloaded = QWDashboardViewModel.build(
+            lifecycle: .init(phase: .unloaded, since: nil, model: nil, detail: nil), modelId: nil
+        )
+        XCTAssertNil(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: unloaded, isConnected: true, enabledMetrics: [.decodeSpeed], hideSpeedsWhenIdle: false
+        ))
+        XCTAssertNil(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: loadedDashboard, isConnected: true, enabledMetrics: [], hideSpeedsWhenIdle: false
+        ))
+
+        // Individual metrics and combined formatting.
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.decodeSpeed], hideSpeedsWhenIdle: false
+        ), "91.9 tok/s")
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.prefillSpeed], hideSpeedsWhenIdle: false
+        ), "↑93.3 tok/s")
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.engineMemory], hideSpeedsWhenIdle: false
+        ), "25.01 GiB")
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.contextSize], hideSpeedsWhenIdle: false
+        ), "38/256k")
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: loadedDashboard, isConnected: true, enabledMetrics: Set(QWMenuBarMetric.allCases),
+            hideSpeedsWhenIdle: false
+        ), "↓91.9 · ↑93.3 tok/s · 25.01 GiB · 38/256k")
+
+        // Idle speed hiding keeps non-speed metrics and resumes speeds on decode/prefill.
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: loadedDashboard, isConnected: true, enabledMetrics: Set(QWMenuBarMetric.allCases),
+            hideSpeedsWhenIdle: true
+        ), "25.01 GiB · 38/256k")
+
+        let activeDecode = QWDashboardViewModel(
+            sampledAt: Date(), lifecycle: loadedDashboard.lifecycle, modelId: "m",
+            capabilities: [], generation: .decode, facts: nil, cards: loadedDashboard.cards,
+            actions: [], knobs: loadedDashboard.knobs, knobSources: [:]
+        )
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: activeDecode, isConnected: true, enabledMetrics: Set(QWMenuBarMetric.allCases),
+            hideSpeedsWhenIdle: true
+        ), "↓91.9 · ↑93.3 tok/s · 25.01 GiB · 38/256k")
+
+        // Cached prefill + missing active_tokens + absent memory honesty checks.
+        let unmeasured = QWDashboardViewModel(
+            sampledAt: Date(), lifecycle: loadedDashboard.lifecycle, modelId: "m",
+            capabilities: [], generation: .idle, facts: nil,
+            cards: [
+                makeCard("throughput.display_prefill_tokens_per_sec", value: "from cache", unit: nil),
+                makeCard("memory.arena_reserved_bytes", value: nil, unit: "GiB"),
+                makeCard("memory.resident_bytes", value: nil, unit: "GiB"),
+                makeCard("context.active_tokens", value: nil, unit: "tok"),
+            ],
+            actions: [], knobs: ["contextTokens": .int(262_144)], knobSources: [:]
+        )
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: unmeasured, isConnected: true, enabledMetrics: [.prefillSpeed], hideSpeedsWhenIdle: false
+        ), "↑cache")
+        XCTAssertNil(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: unmeasured, isConnected: true, enabledMetrics: [.engineMemory], hideSpeedsWhenIdle: false
+        ))
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: unmeasured, isConnected: true, enabledMetrics: [.contextSize], hideSpeedsWhenIdle: false
+        ), "256k ctx")
+    }
+
+    func testMenuBarRendersPrefillProgressCards() throws {
+        XCTAssertTrue(Self.menuBarCardCatalogueIds.contains("prefill.progress_tokens"))
+        XCTAssertTrue(Self.menuBarCardCatalogueIds.contains("prefill.total_tokens"))
+        let cardsSource = try Self.read("\(menuBarDirectory)/TelemetryCards.swift")
+        XCTAssertTrue(cardsSource.contains("card(\"prefill.progress_tokens\")"))
+        XCTAssertTrue(cardsSource.contains("card(\"prefill.total_tokens\")"))
+        XCTAssertTrue(cardsSource.contains("PREFILL PROGRESS"))
+        let primitivesSource = try Self.read("\(menuBarDirectory)/TelemetryCardPrimitives.swift")
+        XCTAssertTrue(primitivesSource.contains("QWTokenCountFormatter.format("))
+    }
+
+    func testDualSparklineGeometryHandlesSingleTurnGapsAndWideDynamicRange() throws {
+        // Single completed turn: isolated points and guides for both prefill and decode,
+        // normalized independently so decode is not crushed near the bottom axis.
+        let single = QWSparklineGeometry.layout(
+            prefill: [1756.2], decode: [54.0], width: 388, height: 50
+        )
+        XCTAssertEqual(single.totalSlots, 1)
+        XCTAssertEqual(single.prefill.isolatedPoints.count, 1)
+        XCTAssertEqual(single.decode.isolatedPoints.count, 1)
+        let prefillGuide = try XCTUnwrap(single.prefill.singleSlotGuideY)
+        let decodeGuide = try XCTUnwrap(single.decode.singleSlotGuideY)
+        XCTAssertLessThan(prefillGuide, decodeGuide - 6.0)
+        XCTAssertLessThan(decodeGuide, 30.0)
+
+        // In-flight Turn 2: slot 1 nil prefill remains isolated without bridging,
+        // while decode forms a 2-point rising run.
+        let inflight = QWSparklineGeometry.layout(
+            prefill: [1756.2, nil], decode: [54.0, 71.7], width: 388, height: 50
+        )
+        XCTAssertTrue(inflight.prefill.runs.isEmpty)
+        XCTAssertEqual(inflight.prefill.isolatedPoints.map(\.index), [0])
+        XCTAssertEqual(inflight.decode.runs.count, 1)
+        XCTAssertEqual(inflight.decode.runs[0].count, 2)
+        XCTAssertLessThan(inflight.decode.runs[0][1].y, inflight.decode.runs[0][0].y)
+
+        // Gapped alternating turns keep isolated points unbridged and omit single-slot guides.
+        let gapped = QWSparklineGeometry.layout(
+            prefill: [1756.2, nil, 1810.0], decode: [], width: 388, height: 50
+        )
+        XCTAssertTrue(gapped.prefill.runs.isEmpty)
+        XCTAssertEqual(gapped.prefill.isolatedPoints.count, 2)
+        XCTAssertNil(gapped.prefill.singleSlotGuideY)
+
+        // All-nil series remain empty rather than inventing zeros.
+        let empty = QWSparklineGeometry.layout(
+            prefill: [nil, nil], decode: [nil, nil], width: 388, height: 50
+        )
+        XCTAssertTrue(empty.prefill.runs.isEmpty)
+        XCTAssertTrue(empty.prefill.isolatedPoints.isEmpty)
+        XCTAssertNil(empty.prefill.latestPoint)
+        XCTAssertNil(empty.prefill.singleSlotGuideY)
+        XCTAssertTrue(empty.decode.runs.isEmpty)
+        XCTAssertTrue(empty.decode.isolatedPoints.isEmpty)
+        XCTAssertNil(empty.decode.latestPoint)
+        XCTAssertNil(empty.decode.singleSlotGuideY)
     }
 
     /// The card ids a source asks for, by the only way it asks for one.

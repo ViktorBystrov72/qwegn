@@ -271,4 +271,23 @@ final class QWEngineCoreTests: XCTestCase {
         // Two generated tokens means one decode step, at position 0.
         XCTAssertEqual(module.decoded.map(\.position), [0])
     }
+
+    func testPrefillProgressCallbackReportsEachChunk() throws {
+        let (core, _) = try makeCore()
+        let prompt = Array(1...1200)
+        var events: [(Int, Int)] = []
+        _ = try core.generate(
+            prompt: prompt,
+            maxNew: 2,
+            stopIDs: [],
+            sampling: .greedy,
+            onToken: nil,
+            onStopToken: nil,
+            onPrefillProgress: { done, total in
+                events.append((done, total))
+            }
+        )
+        XCTAssertEqual(events.map(\.0), [0, 512, 1024, 1200])
+        XCTAssertEqual(events.map(\.1), [1200, 1200, 1200, 1200])
+    }
 }

@@ -17,7 +17,6 @@ import QWGDN
 import QWMLP
 import QWHead
 import QWMTP
-import QWState
 
 extension QWEngineDriver {
     static func loadMTPWeights(_ L: inout WeightLoader, drafts: Int, geometry: QWModelGeometry) throws -> MTPWeights? {
@@ -59,9 +58,9 @@ extension QWEngineDriver {
             let mWkT = try L.allocateWeight(QWTensorShape([(geometry.kvHeads * geometry.headDim)], .f16))
             let pWkT = mWkT.region.buffer.contents().advanced(by: mWkT.region.base + mWkT.offset)
             for h in 0..<geometry.kvHeads {
-                mKnBits.withUnsafeBytes {
+                mKnBits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                     pWkT.advanced(by: h * geometry.headDim * 2)
-                        .copyMemory(from: $0.baseAddress!, byteCount: geometry.headDim * 2)
+                        .copyMemory(from: raw.baseAddress!, byteCount: geometry.headDim * 2)
                 }
             }
             let mPostAttnNorm = try L.f16wNorm("mtp.layers.0.post_attention_layernorm.weight", geometry.hidden)

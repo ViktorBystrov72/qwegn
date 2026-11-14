@@ -317,15 +317,6 @@ open class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendabl
         (state as? DenseSessionState)?.prefillGPUSec ?? 0
     }
 
-    /// The logit row the shared sampler consumes. The greedy head already
-    /// picked the token; this row is what a caller samples from.
-    public func sampleLogits(_ state: any QWModuleSessionState) throws -> [Float] {
-        guard let engine else {
-            throw QWModuleError.notImplemented("DenseModule has no engine yet")
-        }
-        return engine.logitVector()
-    }
-
     /// The concrete session behind the seam. A state this module did not make
     /// is an error, never a silently mis-typed session.
     private func unwrap(_ state: any QWModuleSessionState) throws -> DenseSessionState {

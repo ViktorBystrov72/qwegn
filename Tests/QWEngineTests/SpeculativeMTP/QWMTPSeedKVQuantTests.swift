@@ -20,7 +20,7 @@ final class QWMTPSeedKVQuantTests: XCTestCase {
     {
         let hal = try QWHal(geometry: .qwen38_27b)
         let pso = try hal.pipeline("qwg_mtp_seed_kv")
-        let pageBytes = QWKVCache.pageBytes(mode: mode)
+        let pageBytes = QWKVCache.pageBytes(mode: mode, geometry: .qwen38_27b)
         // Two pages per pool so table ids ≠ 0 exercise the stride math.
         func pool(_ bytes: Int) -> MTLBuffer { hal.device.makeBuffer(length: bytes * 2, options: .storageModeShared)! }
         let kPool = pool(pageBytes), vPool = pool(pageBytes)
@@ -29,8 +29,8 @@ final class QWMTPSeedKVQuantTests: XCTestCase {
         memset(vPool.contents(), 0x5A, pageBytes * 2)
         let kSrc = hal.device.makeBuffer(length: 1024 * 2, options: .storageModeShared)!
         let vSrc = hal.device.makeBuffer(length: 1024 * 2, options: .storageModeShared)!
-        k.withUnsafeBytes { _ = memcpy(kSrc.contents(), $0.baseAddress!, 2048) }
-        v.withUnsafeBytes { _ = memcpy(vSrc.contents(), $0.baseAddress!, 2048) }
+        k.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(kSrc.contents(), raw.baseAddress!, 2048) }
+        v.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(vSrc.contents(), raw.baseAddress!, 2048) }
         let kTable = hal.device.makeBuffer(length: 8, options: .storageModeShared)!
         let vTable = hal.device.makeBuffer(length: 8, options: .storageModeShared)!
         kTable.contents().assumingMemoryBound(to: Int32.self)[0] = 0

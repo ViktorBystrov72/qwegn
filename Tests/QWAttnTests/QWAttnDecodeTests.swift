@@ -21,7 +21,7 @@ final class QWAttnDecodeTests: XCTestCase {
         .appendingPathComponent("Scripts/spike/out")
 
     static func u16s(_ d: Data) -> [UInt16] {
-        d.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: UInt16.self)) }
     }
     static func load(_ name: String) throws -> Data {
         let p = spikeOut.appendingPathComponent(name)
@@ -32,7 +32,7 @@ final class QWAttnDecodeTests: XCTestCase {
     }
     static func buf(_ d: Data) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
-        d.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
     static func f16(_ bits: UInt16) -> Float { QWQuant.f16tof32Bits(bits) }
@@ -60,7 +60,7 @@ final class QWAttnDecodeTests: XCTestCase {
     /// LAW: the cache pools claim the whole kv region at init — the decode
     /// partials scratch therefore rides the arena's GDN region (production
     static func makeEnv(tokensCeiling: Int) throws -> (QWKVCache, QWArena, QWMRegion) {
-        let pageBytes = QWKVCache.pageBytes(mode: .f16)
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
         let needPages = (tokensCeiling + 255) / 256
         let poolBytes = pageBytes * needPages * 2
         let tables = QWKVCache.tableSlotBytes * 2 * layers.count * QWKVCache.maxSeqs
@@ -176,7 +176,7 @@ final class QWAttnDecodeTests: XCTestCase {
         _ = try Self.runDecode(cache: cache, handle: h, layer: QWAttnDecodeTests.layers[0],
                                qgate: try Self.load("attn_qgate_dec_t257.bin"),
                                knew: knewData, vnew: vnewData, partials: part, C: C, splits: 2)
-        let pageBytes = QWKVCache.pageBytes(mode: .f16)
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
         let rowElems = QWModelGeometry.qwen38_27b.kvHeads * QWModelGeometry.qwen38_27b.headDim       // 1024 halves
         for (kind, fixture) in [(QWKVKind.k, Self.u16s(knewData)),
                                 (QWKVKind.v, Self.u16s(vnewData))] {

@@ -9,7 +9,6 @@ import QWHAL
 import QWAlloc
 import QWKV
 import QWToken
-@testable import QWState
 
 final class QWStateTests: XCTestCase {
 
@@ -20,7 +19,7 @@ final class QWStateTests: XCTestCase {
 
     static func bins(_ name: String) -> [Float] {
         let d = try! Data(contentsOf: out.appendingPathComponent("\(name).bin"))
-        return d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        return d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) }
     }
 
     // MARK: family B — prefix algebra trace, event-for-event

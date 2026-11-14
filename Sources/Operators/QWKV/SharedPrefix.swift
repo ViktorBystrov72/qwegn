@@ -10,7 +10,7 @@ extension QWKVCache {
     public func serializedPlaneBytes(tokenCount: Int) -> Int {
         guard tokenCount > 0 else { return 0 }
         if mode == .f16 {
-            return tokenCount * Self.rowBytes
+            return tokenCount * f16RowBytes
         }
         let required = (tokenCount + Self.pageTokens - 1) / Self.pageTokens
         return required * bytesPerPage
@@ -42,10 +42,10 @@ extension QWKVCache {
                     throw QWKVError.badArgument("invalid private prefix page ID")
                 }
                 var data = Data(count: planeBytes)
-                data.withUnsafeMutableBytes { destination in
+                data.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
                     for page in 0..<required {
                         let bytes = mode == .f16
-                            ? min(Self.pageTokens, count - page * Self.pageTokens) * Self.rowBytes
+                            ? min(Self.pageTokens, count - page * Self.pageTokens) * f16RowBytes
                             : bytesPerPage
                         destination.baseAddress!.advanced(by: page * bytesPerPage)
                             .copyMemory(from: region.pointer.advanced(by: Int(table[page]) * bytesPerPage),
@@ -138,7 +138,7 @@ extension QWKVCache {
                 let region = pool(layer, kind).pages.region
                 for page in 0..<required {
                     let bytes = mode == .f16
-                        ? min(Self.pageTokens, prefix.tokenCount - page * Self.pageTokens) * Self.rowBytes
+                        ? min(Self.pageTokens, prefix.tokenCount - page * Self.pageTokens) * f16RowBytes
                         : bytesPerPage
                     let ptr = UnsafeRawPointer(region.pointer.advanced(by: Int(ids[page]) * bytesPerPage))
                     try body(planeIdx, page, ptr, bytes)
@@ -170,7 +170,7 @@ extension QWKVCache {
                 let region = pool(layer, kind).pages.region
                 for page in 0..<required {
                     let bytes = mode == .f16
-                        ? min(Self.pageTokens, tokenCount - page * Self.pageTokens) * Self.rowBytes
+                        ? min(Self.pageTokens, tokenCount - page * Self.pageTokens) * f16RowBytes
                         : bytesPerPage
                     let ptr = region.pointer.advanced(by: Int(table[page]) * bytesPerPage)
                     try body(planeIdx, page, ptr, bytes)
@@ -197,10 +197,10 @@ extension QWKVCache {
             for (ki, kind) in QWKVKind.allCases.enumerated() {
                 let table = kind == .k ? st.tablesK[li] : st.tablesV[li]
                 let region = pool(layer, kind).pages.region
-                prefix.planes[li * 2 + ki].withUnsafeBytes { source in
+                prefix.planes[li * 2 + ki].withUnsafeBytes { (source: UnsafeRawBufferPointer) in
                     for page in 0..<required {
                         let bytes = mode == .f16
-                            ? min(Self.pageTokens, prefix.tokenCount - page * Self.pageTokens) * Self.rowBytes
+                            ? min(Self.pageTokens, prefix.tokenCount - page * Self.pageTokens) * f16RowBytes
                             : bytesPerPage
                         region.pointer.advanced(by: Int(table[page]) * bytesPerPage)
                             .copyMemory(from: source.baseAddress!.advanced(by: page * bytesPerPage),
@@ -210,40 +210,6 @@ extension QWKVCache {
             }
         }
         st.writtenTokens = prefix.tokenCount
-    }
-
-    /// Export a shared prefix's planes as cold bytes (same serialization as
-    /// capturePrivatePrefix), for disk adoption. Caller completes GPU writes.
-    public func exportSharedPrefixPlanes(_ prefix: QWKVSharedPrefix) -> [Data] {
-        lock.lock(); defer { lock.unlock() }
-        let planeBytes = serializedPlaneBytes(tokenCount: prefix.tokenCount)
-        var planes: [Data] = []
-        planes.reserveCapacity(layers.count * 2)
-        for (li, layer) in layers.enumerated() {
-            for (ki, kind) in QWKVKind.allCases.enumerated() {
-                var data = Data(count: planeBytes)
-                let ids = prefix.pages[li * 2 + ki]
-                let region = pool(layer, kind).pages.region
-                data.withUnsafeMutableBytes { destination in
-                    for page in 0..<ids.count {
-                        let bytes = mode == .f16
-                            ? min(Self.pageTokens, prefix.tokenCount - page * Self.pageTokens) * Self.rowBytes
-                            : bytesPerPage
-                        destination.baseAddress!.advanced(by: page * bytesPerPage)
-                            .copyMemory(from: region.pointer.advanced(by: Int(ids[page]) * bytesPerPage),
-                                        byteCount: bytes)
-                    }
-                }
-                planes.append(data)
-            }
-        }
-        return planes
-    }
-
-    /// Reconstruct a private prefix from deserialized plane data for adoption.
-    public func makePrivatePrefix(tokenCount: Int, planes: [Data]) -> QWKVPrivatePrefix {
-        let total = planes.reduce(0) { $0 + $1.count }
-        return QWKVPrivatePrefix(tokenCount: tokenCount, memoryBytes: total, mode: mode, cache: self, planes: planes)
     }
 
     func validatePrivateAdoptionLocked(_ prefix: QWKVPrivatePrefix, into h: QWKVHandle) throws {
@@ -384,19 +350,11 @@ extension QWKVCache {
         st.pins.removeAll()
         h.tokenCapacity = 0
     }
-    /// Page ids for a (seq, layer, kind) — parity: burst-written ids ==
-    /// streamed-written ids AND their bytes (spec gate).
-    public func pageIDs(_ h: QWKVHandle, layer: Int, kind: QWKVKind) -> [Int32] {
-        lock.lock(); defer { lock.unlock() }
-        guard let st = seqs[h.seq], let li = layerIndex(layer) else { return [] }
-        return kind == .k ? st.tablesK[li] : st.tablesV[li]
-    }
     public func markSteadyState() { lock.lock(); steady = true; lock.unlock() }
     public var freePageCount: Int {
         lock.lock(); defer { lock.unlock() }
         return poolsFlat.reduce(0) { $0 + $1.pages.freePages }
     }
-    public var totalPages: Int { poolsFlat.reduce(0) { $0 + $1.pages.pageCount } }
 
     func validateSharedPrefixLocked(_ prefix: QWKVSharedPrefix) throws {
         guard prefix.cache === self, prefix.epoch == cacheEpoch,

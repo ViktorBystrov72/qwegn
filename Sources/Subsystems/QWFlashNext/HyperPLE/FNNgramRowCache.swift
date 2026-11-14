@@ -78,12 +78,12 @@ public final class FNNgramRowCache: @unchecked Sendable {
 
     private let capacityBytes: Int
     private let rowBytes: Int
-    private let stripes: [FNNgramRowCacheStripe]
+    let stripes: [FNNgramRowCacheStripe]
     private let stripeBudget: Int
 
     /// - Parameters: `capacityBytes` is the cache's total row budget, `rowBytes` the bytes one row occupies
     ///   (`headDim * 4`), and `maxStripes` the most locks to spread the rows over. The budget is **global**:
-    ///   each stripe gets `capacityBytes / stripeCount`, so the cache never exceeds it.
+    ///   each stripe gets `capacityBytes / stripes.count`, so the cache never exceeds it.
     public init(capacityBytes: Int, rowBytes: Int, maxStripes: Int = 4096) {
         precondition(rowBytes > 0, "the cache needs a positive row size")
         self.capacityBytes = max(0, capacityBytes)
@@ -158,56 +158,6 @@ public final class FNNgramRowCache: @unchecked Sendable {
         }
     }
 
-    public var hitCount: Int {
-        var total = 0
-        for s in stripes {
-            s.lock.lock()
-            total += s.hits
-            s.lock.unlock()
-        }
-        return total
-    }
-
-    public var missCount: Int {
-        var total = 0
-        for s in stripes {
-            s.lock.lock()
-            total += s.misses
-            s.lock.unlock()
-        }
-        return total
-    }
-
-    /// The share of reads that were served from the cache. It is a ratio of
-    /// two separate snapshots, so a read racing with the counters can move
-    /// it by one — the counters only ever grow.
-    public var hitRate: Double {
-        let hits = hitCount
-        let total = hits + missCount
-        return total == 0 ? 0 : Double(hits) / Double(total)
-    }
-
-    /// The row payload the cache holds, in bytes.
-    public var approximateBytes: Int {
-        var total = 0
-        for s in stripes {
-            s.lock.lock()
-            total += s.bytes
-            s.lock.unlock()
-        }
-        return total
-    }
-
-    public var storedRowCount: Int {
-        var total = 0
-        for s in stripes {
-            s.lock.lock()
-            total += s.rows.count
-            s.lock.unlock()
-        }
-        return total
-    }
-
     /// The cache's total budget, in bytes.
     public var budgetBytes: Int { capacityBytes }
 
@@ -215,11 +165,6 @@ public final class FNNgramRowCache: @unchecked Sendable {
     /// layer gets a cache with no budget, and a miss must not then pay for a
     /// row copy that will be thrown away.
     public var isEnabled: Bool { capacityBytes > 0 }
-
-    /// How many locks the rows are spread over. Derived from the budget, so
-    /// that no single stripe grows large enough to make an eviction scan
-    /// expensive.
-    public var stripeCount: Int { stripes.count }
 }
 
 /// An `FNNgramRows` that serves from a cache and falls through to the source.

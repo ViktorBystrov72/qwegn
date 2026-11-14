@@ -6,10 +6,6 @@ import QWGEMM
 import QWHAL
 import QWQuant
 
-/// Backward-compatible alias for the unified `QWContextCopyDrafter` in `QWCore`.
-public typealias FNContextCopyDrafter = QWContextCopyDrafter
-
-
 /// 1-layer Multi-Token Prediction (`mtp.*`) module on the GPU for Qwen3.8-Flash-Next speculative decoding.
 /// Fuses the trunk's Layer-47 4-branch residual stream with the next token's embedding, runs `mtp.layers.0`
 /// (Full-Attention QSA + 512-expert MoE), and projects through `mtp.hyper_connection_mixer` + shared `lm_head`.

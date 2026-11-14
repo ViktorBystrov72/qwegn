@@ -167,15 +167,39 @@ public enum QWToolCallParser {
         return false
     }
 
+    private static func hasUnclosedLiteralContainer(_ raw: Substring) -> Bool {
+        let trimmed = raw.drop(while: { $0.isWhitespace })
+        if trimmed.hasPrefix("{") {
+            var depth = 0, inString = false, escaped = false
+            for ch in trimmed {
+                if inString {
+                    if escaped { escaped = false } else if ch == "\\" { escaped = true } else if ch == "\"" { inString = false }
+                    continue
+                }
+                if ch == "\"" { inString = true } else if ch == "{" { depth += 1 } else if ch == "}" { depth -= 1 }
+            }
+            return inString || depth > 0
+        }
+        if trimmed.hasPrefix("<function=") {
+            return trimmed.components(separatedBy: "<parameter=").count > trimmed.components(separatedBy: "</parameter>").count
+        }
+        return false
+    }
+
     private static func matchingToolCallClose(in afterOpen: Substring) -> Range<String.Index>? {
         var searchFrom = afterOpen.startIndex
         while let close = afterOpen[searchFrom...].range(of: "</tool_call>") {
-            if isBalancedToolPayload(afterOpen[..<close.lowerBound]) {
+            let prefix = afterOpen[..<close.lowerBound]
+            if isBalancedToolPayload(prefix) {
                 return close
             }
             let tail = afterOpen[close.upperBound...].drop(while: { $0.isWhitespace })
-            if tail.isEmpty || tail.hasPrefix("<tool_call>") || tail.range(of: "</tool_call>") == nil {
-                return close
+            guard let nextClose = tail.range(of: "</tool_call>") else { return close }
+            if !hasUnclosedLiteralContainer(prefix) {
+                if tail.hasPrefix("<tool_call>") { return close }
+                if let nextOpen = tail.range(of: "<tool_call>"), nextOpen.lowerBound < nextClose.lowerBound {
+                    return close
+                }
             }
             searchFrom = close.upperBound
         }
@@ -468,9 +492,6 @@ public final class QWChatStreamParser: @unchecked Sendable {
     public private(set) var content = ""
     public private(set) var toolText = ""
 
-    public var isInToolCall: Bool { mode == .toolCall }
-    public var isInReasoning: Bool { mode == .reasoning }
-
     public init(startsInReasoning: Bool, allowToolCalls: Bool = true, allowReasoningTags: Bool = true) {
         self.mode = (startsInReasoning && allowReasoningTags) ? .reasoning : .content
         self.allowToolCalls = allowToolCalls
@@ -536,7 +557,7 @@ public final class QWChatStreamParser: @unchecked Sendable {
                 }
                 let close = buffer.range(of: Self.thinkClose)
                 let tool = allowToolCalls ? buffer.range(of: Self.toolOpen) : nil
-                if let close, tool == nil || close.lowerBound < tool!.lowerBound {
+                if let close, tool.map({ close.lowerBound < $0.lowerBound }) ?? true {
                     emit(buffer[..<close.lowerBound], as: .reasoning, into: &out)
                     buffer = String(buffer[close.upperBound...])
                     mode = .content

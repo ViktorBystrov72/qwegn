@@ -8,27 +8,58 @@ import Metal
 
 public final class QWHttpServer: @unchecked Sendable {
     // Internal, not private: the endpoints live in extensions across
-    // several files, and a private member is invisible from them.
+    // several files, and a member is invisible from them.
     let actor: QWEngineLifecycleActor
-    private let host: String
-    private let port: UInt16
+    let host: String
+    let port: UInt16
+    let apiKey: String?
+    let corsAllowedOrigins: [String]
+    let allowUnauthenticatedPublicBind: Bool
     let logger: QWServerLogger
-    private var listener: NWListener?
-    private let queue = DispatchQueue(label: "qwg.server.nw", qos: .userInitiated)
+    var listener: NWListener?
+    let queue = DispatchQueue(label: "qwg.server.nw", qos: .userInitiated)
+    let connectionStateLock = NSLock()
+    var cancellationHubs: [ObjectIdentifier: QWConnectionCancellationHub] = [:]
+    var connectionOrigins: [ObjectIdentifier: String] = [:]
 
-    public init(actor: QWEngineLifecycleActor, host: String = "127.0.0.1", port: Int = 8080, logger: QWServerLogger = .shared) {
+    public init(
+        actor: QWEngineLifecycleActor,
+        host: String = "127.0.0.1",
+        port: Int = 8080,
+        logger: QWServerLogger = .shared,
+        apiKey: String? = nil,
+        corsAllowedOrigins: [String] = [],
+        allowUnauthenticatedPublicBind: Bool = false
+    ) {
         self.actor = actor
         self.host = host
-        self.port = UInt16(port)
+        self.port = UInt16(clamping: max(0, port))
         self.logger = logger
+        let trimmedKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.apiKey = (trimmedKey?.isEmpty == false) ? trimmedKey : nil
+        self.corsAllowedOrigins = corsAllowedOrigins
+        self.allowUnauthenticatedPublicBind = allowUnauthenticatedPublicBind
     }
 
     public func start() throws {
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty, !trimmedHost.contains(where: \.isWhitespace) else {
+            throw QWHttpServerError.invalidListenHost(host)
+        }
+        if !QWHttpSecurity.isLoopbackHost(trimmedHost) && !allowUnauthenticatedPublicBind && apiKey == nil {
+            throw QWHttpServerError.unauthenticatedNonLoopbackBind(host: trimmedHost)
+        }
+
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        let nwPort = NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(integerLiteral: 8080)
-
-        let listener = try NWListener(using: params, on: nwPort)
+        let nwPort: NWEndpoint.Port = port == 0 ? .any : (NWEndpoint.Port(rawValue: port) ?? .any)
+        let listener: NWListener
+        if trimmedHost == "0.0.0.0" || trimmedHost == "::" || trimmedHost == "*" {
+            listener = try NWListener(using: params, on: nwPort)
+        } else {
+            params.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(trimmedHost), port: nwPort)
+            listener = try NWListener(using: params)
+        }
         self.listener = listener
 
         let readySem = DispatchSemaphore(value: 0)
@@ -40,7 +71,8 @@ public final class QWHttpServer: @unchecked Sendable {
             guard let self else { return }
             switch state {
             case .ready:
-                self.logger.log(.info, "HTTP Server listening on http://\(self.host):\(self.port)")
+                let activePort = listener.port?.rawValue ?? self.port
+                self.logger.log(.info, "HTTP Server listening on http://\(trimmedHost):\(activePort)")
                 stateLock.lock()
                 let shouldSignal = !signaled
                 signaled = true
@@ -88,12 +120,78 @@ public final class QWHttpServer: @unchecked Sendable {
     }
 
     private func handleConnection(_ connection: NWConnection) {
+        let id = ObjectIdentifier(connection)
+        let hub = QWConnectionCancellationHub()
+        connectionStateLock.lock()
+        cancellationHubs[id] = hub
+        connectionStateLock.unlock()
+        hub.attach(to: connection)
+        hub.register { [weak self] in
+            self?.cleanupConnectionState(for: id)
+        }
         connection.start(queue: queue)
-        readHttpRequest(connection: connection)
+        receiveNextChunk(connection: connection, parser: QWHttpIncrementalParser())
     }
 
-    private func readHttpRequest(connection: NWConnection, accumulatedData: Data = Data()) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, context, isComplete, error in
+    private func cleanupConnectionState(for id: ObjectIdentifier) {
+        connectionStateLock.lock()
+        cancellationHubs.removeValue(forKey: id)
+        connectionOrigins.removeValue(forKey: id)
+        connectionStateLock.unlock()
+    }
+
+    func registerCancellationHandler(for connection: NWConnection, _ handler: @escaping @Sendable () -> Void) {
+        let id = ObjectIdentifier(connection)
+        connectionStateLock.lock()
+        let hub = cancellationHubs[id]
+        connectionStateLock.unlock()
+        if let hub {
+            hub.register(handler)
+            return
+        }
+        switch connection.state {
+        case .cancelled, .failed:
+            handler()
+        default:
+            break
+        }
+    }
+
+    func isConnectionTerminated(_ connection: NWConnection) -> Bool {
+        let id = ObjectIdentifier(connection)
+        connectionStateLock.lock()
+        let hub = cancellationHubs[id]
+        connectionStateLock.unlock()
+        if let hub {
+            return hub.isTerminated
+        }
+        switch connection.state {
+        case .cancelled, .failed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    func generationShouldStop(for connection: NWConnection) -> (@Sendable () -> Bool) {
+        { [weak self] in
+            Task.isCancelled || self?.isPeerGone(connection) == true
+        }
+    }
+
+    func corsHeaderLines(for connection: NWConnection) -> String {
+        let id = ObjectIdentifier(connection)
+        connectionStateLock.lock()
+        let origin = connectionOrigins[id]
+        connectionStateLock.unlock()
+        guard let allowed = QWHttpSecurity.resolvedAllowedOrigin(origin, allowlist: corsAllowedOrigins) else {
+            return ""
+        }
+        return "Access-Control-Allow-Origin: \(allowed)\r\nVary: Origin\r\n"
+    }
+
+    private func receiveNextChunk(connection: NWConnection, parser: QWHttpIncrementalParser) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if error != nil {
                 connection.cancel()
@@ -103,99 +201,68 @@ public final class QWHttpServer: @unchecked Sendable {
                 if isComplete { connection.cancel() }
                 return
             }
-
-            var totalData = accumulatedData
-            totalData.append(data)
-
-            // Look for header boundary \r\n\r\n
-            guard let headerEndRange = totalData.range(of: Data([13, 10, 13, 10])) else {
-                if totalData.count > 1_000_000 {
-                    self.sendSimpleResponse(connection, status: 413, body: "Headers too large\n")
-                    return
+            var nextParser = parser
+            do {
+                switch try nextParser.append(data) {
+                case .needMoreData:
+                    if isComplete {
+                        self.sendSimpleResponse(connection, status: 400, body: "Incomplete HTTP request\n")
+                        return
+                    }
+                    self.receiveNextChunk(connection: connection, parser: nextParser)
+                case .complete(let request):
+                    let id = ObjectIdentifier(connection)
+                    if let origin = request.headers["origin"] {
+                        self.connectionStateLock.lock()
+                        self.connectionOrigins[id] = origin
+                        self.connectionStateLock.unlock()
+                    }
+                    self.dispatchRoute(
+                        connection: connection,
+                        method: request.method.uppercased(),
+                        path: request.path,
+                        headers: request.headers,
+                        body: request.body
+                    )
                 }
-                self.readHttpRequest(connection: connection, accumulatedData: totalData)
-                return
-            }
-
-            let headerData = totalData.subdata(in: 0..<headerEndRange.lowerBound)
-            guard let headerStr = String(data: headerData, encoding: .utf8) else {
-                self.sendSimpleResponse(connection, status: 400, body: "Bad request encoding\n")
-                return
-            }
-
-            let lines = headerStr.components(separatedBy: "\r\n")
-            guard let requestLine = lines.first else {
-                self.sendSimpleResponse(connection, status: 400, body: "Missing request line\n")
-                return
-            }
-
-            let parts = requestLine.components(separatedBy: " ")
-            guard parts.count >= 2 else {
-                self.sendSimpleResponse(connection, status: 400, body: "Malformed request line\n")
-                return
-            }
-
-            let method = parts[0].uppercased()
-            let path = parts[1]
-
-            // Parse Content-Length
-            var contentLength = 0
-            for line in lines.dropFirst() {
-                let kv = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-                if kv.count == 2 && kv[0].lowercased() == "content-length" {
-                    contentLength = Int(kv[1]) ?? 0
-                }
-            }
-
-            let bodyStart = headerEndRange.upperBound
-            let bodyBytesNeeded = contentLength - (totalData.count - bodyStart)
-
-            if bodyBytesNeeded > 0 {
-                self.readRemainingBody(connection: connection, totalData: totalData, needed: bodyBytesNeeded, method: method, path: path)
-            } else {
-                let bodyData = totalData.subdata(in: bodyStart..<(bodyStart + contentLength))
-                self.dispatchRoute(connection: connection, method: method, path: path, body: bodyData)
+            } catch let parseError as QWHttpParseError {
+                self.sendSimpleResponse(connection, status: parseError.httpStatus, body: "\(parseError.message)\n")
+            } catch {
+                self.sendSimpleResponse(connection, status: 400, body: "Malformed HTTP request\n")
             }
         }
     }
 
-    private func readRemainingBody(connection: NWConnection, totalData: Data, needed: Int, method: String, path: String) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: max(needed, 65536)) { [weak self] data, context, isComplete, error in
-            guard let self else { return }
-            if error != nil {
-                connection.cancel()
-                return
-            }
-            guard let data, !data.isEmpty else {
-                connection.cancel()
-                return
-            }
-            var updated = totalData
-            updated.append(data)
-            let headerEndRange = updated.range(of: Data([13, 10, 13, 10]))!
-            let bodyStart = headerEndRange.upperBound
-            let remaining = needed - data.count
-            if remaining > 0 && !isComplete {
-                self.readRemainingBody(connection: connection, totalData: updated, needed: remaining, method: method, path: path)
-            } else {
-                let bodyData = updated.subdata(in: bodyStart..<updated.count)
-                self.dispatchRoute(connection: connection, method: method, path: path, body: bodyData)
-            }
-        }
-    }
-
-    private func dispatchRoute(connection: NWConnection, method: String, path: String, body: Data) {
-        // Handle CORS OPTIONS preflight
+    private func dispatchRoute(
+        connection: NWConnection,
+        method: String,
+        path: String,
+        headers: [String: String],
+        body: Data
+    ) {
         if method == "OPTIONS" {
-            let corsHeader = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\n\r\n"
-            connection.send(content: corsHeader.data(using: .utf8), completion: .contentProcessed({ _ in connection.cancel() }))
+            var corsHeader = "HTTP/1.1 204 No Content\r\n"
+            corsHeader += corsHeaderLines(for: connection)
+            corsHeader += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            corsHeader += "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key\r\n"
+            corsHeader += "Access-Control-Max-Age: 86400\r\n"
+            corsHeader += "Content-Length: 0\r\nConnection: close\r\n\r\n"
+            connection.send(content: Data(corsHeader.utf8), completion: .contentProcessed({ _ in connection.cancel() }))
             return
+        }
+
+        if let expectedKey = apiKey {
+            let presented = QWHttpSecurity.extractPresentedToken(headers: headers)
+            guard let presented, QWHttpSecurity.constantTimeEquals(presented, expectedKey) else {
+                sendSimpleResponse(connection, status: 401, body: "Unauthorized\n")
+                return
+            }
         }
 
         // Clean path (strip query params)
         let cleanPath = path.components(separatedBy: "?").first ?? path
 
-        Task {
+        let routeTask = Task {
             do {
                 switch (method, cleanPath) {
                 case ("POST", "/v1/chat/completions"):
@@ -361,7 +428,10 @@ public final class QWHttpServer: @unchecked Sendable {
                     self.sendJsonResponse(connection, status: 200, object: snapshot)
 
                 case ("GET", "/v1/settings"), ("GET", "/api/settings"):
-                    let settings = QWSettingsManager.shared.loadSettings()
+                    var settings = QWSettingsManager.shared.loadSettings()
+                    if !settings.apiKey.isEmpty {
+                        settings.apiKey = "********"
+                    }
                     self.sendJsonResponse(connection, status: 200, object: settings)
 
                 case ("POST", "/v1/settings"), ("POST", "/api/settings"):
@@ -369,6 +439,10 @@ public final class QWHttpServer: @unchecked Sendable {
                     do {
                         let oldSettings = QWSettingsManager.shared.loadSettings()
                         var newSettings = try decoder.decode(QWServerSettings.self, from: body)
+                        let rawObj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+                        if newSettings.apiKey == "********" || rawObj?["apiKey"] == nil {
+                            newSettings.apiKey = oldSettings.apiKey
+                        }
                         let modelChanged = (newSettings.modelPackPath != oldSettings.modelPackPath)
                             || (newSettings.modelName != oldSettings.modelName)
                         if modelChanged {
@@ -465,96 +539,7 @@ public final class QWHttpServer: @unchecked Sendable {
                     self.sendJsonResponse(connection, status: 200, object: resp)
 
                 case ("GET", "/v1/engine/info"), ("GET", "/api/engine/info"):
-                    let hw = QWMachineHardwareInfo.current()
-                    let caps = QWDeviceCaps.current
-                    let config = self.actor.getConfig()
-                    let engineState = self.actor.engineState()
-                    let isLoaded = engineState.isLoaded
-                    let params = self.actor.getLoadedParamsInfo()
-
-                    let metalDevName = caps?.name ?? MTLCreateSystemDefaultDevice()?.name
-                    let isTensor = caps?.isMetal4TensorCapable ?? false
-                    // The Metal family the device really supports, from
-                    // the probes the HAL made. A device that supports
-                    // none of them has no version to report.
-                    let metalVer: String? = if caps?.familyApple11 == true || caps?.familyApple10 == true {
-                        "Metal 4"
-                    } else if caps?.familyApple9 == true {
-                        "Metal 3"
-                    } else {
-                        nil
-                    }
-                    // The HAL's DRAM bandwidth is a constant from one
-                    // machine, not a measurement of this one. It is not
-                    // published as a fact about this host.
-                    let dramBw: Double? = nil
-
-                    let hwFacts = QWEngineInfoResponse.HardwareFacts(
-                        modelIdentifier: hw.modelIdentifier,
-                        cpuBrand: hw.cpuBrand,
-                        physicalCores: hw.physicalCores,
-                        logicalCores: hw.logicalCores,
-                        physicalMemoryBytes: hw.physicalMemoryBytes,
-                        physicalMemoryGB: hw.physicalMemoryGB,
-                        metalDeviceName: metalDevName,
-                        metalVersion: metalVer,
-                        isTensorCapable: isTensor,
-                        dramBwGBs: dramBw
-                    )
-
-                    let srvParams = QWEngineInfoResponse.ServerParameters(
-                        modelName: self.actor.getModelName(),
-                        modelPackPath: config.packPath,
-                        // The head storage of the resident model. With no
-                        // model resident there is no head, and a
-                        // quantization that describes nothing is a claim
-                        // about nothing.
-                        headStorage: params?.headStorage,
-                        contextBudget: config.maxContext,
-                        kvMode: String(describing: config.kvMode),
-                        mtpDrafts: config.mtpDrafts,
-                        mtpBackend: config.mtpBackend,
-                        gdnPrefillMode: config.gdnPrefill,
-                        prefillScratchEviction: config.evictPrefillScratch,
-                        lsaMode: config.lsaConfig.mode.rawValue,
-                        hostLogicalCores: hw.logicalCores,
-                        isLoaded: isLoaded
-                    )
-
-                    let cacheInfo = QWEngineInfoResponse.CacheConfigInfo(
-                        warmLimitBytes: config.cacheConfig.warmByteLimit,
-                        ssdLimitBytes: config.cacheConfig.ssdByteLimit,
-                        cacheDir: config.cacheConfig.cacheDirectory.path
-                    )
-
-                    let snap = QWEngineTelemetryRegistry.shared.snapshot()
-                    let hwUtil = snap.hardware ?? QWSystemMetricsSampler.shared.sample()
-                    let info = QWEngineInfoResponse(
-                        status: engineState.lifecycle.phase.rawValue,
-                        version: QWVersion.current,
-                        pid: Int(ProcessInfo.processInfo.processIdentifier),
-                        hardware: hwFacts,
-                        parameters: srvParams,
-                        cacheConfig: cacheInfo,
-                        hardwareUtilization: hwUtil,
-                        lifecycle: engineState.lifecycle,
-                        sources: config.sourceSummary.mapValues { QWKnobSource.normalise($0).rawValue },
-                        capabilities: engineState.capabilities.map(\.rawValue).sorted(),
-                        mountedMemoryPack: self.actor.getMountedMemoryPackInfo(),
-                        endpoints: [
-                            "chat": "POST /v1/chat/completions",
-                            "models": "GET /v1/models",
-                            "metrics": "GET /v1/metrics",
-                            "metrics_stream": "GET /v1/metrics/stream",
-                            "logs_stream": "GET /v1/logs/stream",
-                            "engine_info": "GET /v1/engine/info",
-                            "memory_mount": "POST /v1/memory/mount",
-                            "memory_unmount": "POST /v1/memory/unmount",
-                            "restart": "POST /v1/engine/restart",
-                            "ui": "GET /ui"
-                        ]
-                    )
-                    self.sendJsonResponse(connection, status: 200, object: info)
+                    self.handleEngineInfoRoute(connection: connection)
 
                 case ("GET", "/v1/metrics/stream"):
                     self.handleMetricsStream(connection: connection)
@@ -594,6 +579,7 @@ public final class QWHttpServer: @unchecked Sendable {
                 self.logger.log(.warn, "HTTP \(method) \(cleanPath) bad multimodal request: \(mmError)")
                 self.sendJsonResponse(connection, status: 400, object: err)
             } catch {
+                if Task.isCancelled || self.isPeerGone(connection) { return }
                 let err = ServerErrorPayload(message: "\(error)", type: "server_error", code: 500)
                 // The reason goes to the log, not only to the response body:
                 // a 500 with no recorded reason is undebuggable after the fact.
@@ -601,95 +587,12 @@ public final class QWHttpServer: @unchecked Sendable {
                 self.sendJsonResponse(connection, status: 500, object: err)
             }
         }
+        registerCancellationHandler(for: connection) {
+            routeTask.cancel()
+        }
     }
 
     // The stream endpoints and the static UI live in QWHttpServer+Streams.swift.
     // POST /v1/chat/completions lives in QWHttpServer+ChatCompletions.swift.
 
-    /// The published model. The route and the stream publish the same
-    /// thing, so a renderer cannot see two truths.
-    func dashboardModel() -> QWDashboardViewModel {
-        let engineState = self.actor.engineState()
-        let config = self.actor.getConfig()
-        // A knob the model cannot honour is not offered: the renderer
-        // must not be asked to hide what it cannot show.
-        let offered = Set(engineState.capabilities)
-        let knobs = config.knobValues.filter { id, _ in
-            guard let descriptor = QWKnobRegistry.descriptor(id) else { return true }
-            guard let capability = descriptor.requiredCapability else { return true }
-            return offered.contains(capability)
-        }
-        return QWDashboardViewModel.build(
-            lifecycle: engineState.lifecycle,
-            modelId: engineState.loadedModelName,
-            capabilities: engineState.capabilities,
-            knobs: knobs,
-            knobSources: QWKnobSource.sources(from: config.sourceSummary,
-                                              for: Array(knobs.keys)),
-            facts: self.dashboardFacts(),
-            requests: QWRequestRecordStore.shared.recent(QWRequestRecordStore.capacity))
-    }
-
-    /// The facts about the machine and the resident model, for the
-    /// renderers. A fact nobody could establish is absent.
-    private func dashboardFacts() -> QWDashboardFacts {
-        let params = self.actor.getLoadedParamsInfo()
-        let config = self.actor.getConfig()
-        let caps = QWDeviceCaps.current
-        let hw = QWMachineHardwareInfo.current()
-        let metalFamily: String? = if caps?.familyApple11 == true || caps?.familyApple10 == true {
-            "Metal 4"
-        } else if caps?.familyApple9 == true {
-            "Metal 3"
-        } else {
-            nil
-        }
-        return QWDashboardFacts(
-            quantization: params?.headStorage,
-            hostLogicalCores: hw.logicalCores,
-            gdnPrefillMode: config.gdnPrefill,
-            gpuName: caps?.name ?? MTLCreateSystemDefaultDevice()?.name,
-            metalFamily: metalFamily)
-    }
-
-    /// A response whose dates are ISO-8601 instants, so a client in any
-    /// language can read them.
-    func sendIsoJsonResponse<T: Encodable>(_ connection: NWConnection, status: Int, object: T) {
-        do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(object)
-            sendRawData(connection, status: status, contentType: "application/json", data: data)
-        } catch {
-            sendSimpleResponse(connection, status: 500, body: "{\"error\": \"JSON encoding error\"}\n")
-        }
-    }
-
-    func sendJsonResponse<T: Encodable>(_ connection: NWConnection, status: Int, object: T) {
-        do {
-            let data = try JSONEncoder().encode(object)
-            sendRawData(connection, status: status, contentType: "application/json", data: data)
-        } catch {
-            sendSimpleResponse(connection, status: 500, body: "{\"error\": \"JSON encoding error\"}\n")
-        }
-    }
-
-    func sendRawData(_ connection: NWConnection, status: Int, contentType: String, data: Data) {
-        var header = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Error")\r\n"
-        header += "Content-Type: \(contentType)\r\n"
-        header += "Content-Length: \(data.count)\r\n"
-        header += "Access-Control-Allow-Origin: *\r\n"
-        header += "Connection: close\r\n\r\n"
-
-        var packet = header.data(using: .utf8)!
-        packet.append(data)
-        connection.send(content: packet, completion: .contentProcessed({ _ in
-            connection.cancel()
-        }))
-    }
-
-    func sendSimpleResponse(_ connection: NWConnection, status: Int, body: String) {
-        let data = body.data(using: .utf8)!
-        sendRawData(connection, status: status, contentType: "text/plain", data: data)
-    }
 }

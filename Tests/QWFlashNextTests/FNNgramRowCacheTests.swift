@@ -213,7 +213,7 @@ private final class FNCacheFileRows: FNNgramRows, @unchecked Sendable {
         for i in 0..<rowCount {
             for j in 0..<headDim { table[i * headDim + j] = UInt16(truncatingIfNeeded: i % 1000) }
         }
-        let data = table.withUnsafeBytes { Data(bytes: $0.baseAddress!, count: $0.count) }
+        let data = table.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(bytes: raw.baseAddress!, count: raw.count) }
         try data.write(to: url)
         let opened = Darwin.open(url.path, O_RDONLY)
         guard opened >= 0 else { throw NSError(domain: "FNCacheFileRows", code: 1) }
@@ -392,4 +392,54 @@ final class FNNgramRowCachePerfTests: XCTestCase {
                           "the cache must break even below a 75% hit rate")
         #endif
     }
+}
+
+private extension FNNgramRowCache {
+    var hitRate: Double {
+        let hits = hitCount
+        let total = hits + missCount
+        return total == 0 ? 0 : Double(hits) / Double(total)
+    }
+
+    var approximateBytes: Int {
+        var total = 0
+        for s in stripes {
+            s.lock.lock()
+            total += s.bytes
+            s.lock.unlock()
+        }
+        return total
+    }
+
+    var storedRowCount: Int {
+        var total = 0
+        for s in stripes {
+            s.lock.lock()
+            total += s.rows.count
+            s.lock.unlock()
+        }
+        return total
+    }
+
+    var hitCount: Int {
+        var total = 0
+        for s in stripes {
+            s.lock.lock()
+            total += s.hits
+            s.lock.unlock()
+        }
+        return total
+    }
+
+    var missCount: Int {
+        var total = 0
+        for s in stripes {
+            s.lock.lock()
+            total += s.misses
+            s.lock.unlock()
+        }
+        return total
+    }
+
+    var stripeCount: Int { stripes.count }
 }

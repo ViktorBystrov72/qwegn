@@ -24,11 +24,11 @@ final class QWGDNPrefillProbeTests: XCTestCase {
         }
         return d
     }
-    static func f32s(_ d: Data) -> [Float] { d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }
-    static func u16s(_ d: Data) -> [UInt16] { d.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) } }
+    static func f32s(_ d: Data) -> [Float] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) } }
+    static func u16s(_ d: Data) -> [UInt16] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: UInt16.self)) } }
     static func buf(_ d: Data) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
-        d.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
     static func tv(_ b: MTLBuffer, _ n: Int, _ dt: QWDType) -> QWTensorValue {
@@ -217,6 +217,8 @@ final class QWGDNPrefillProbeTests: XCTestCase {
     }
 
     func testPrefillParityNaxK2() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "GDN NAX prefill scan requires Metal 4 tensor hardware")
         for (tag, T) in [("r", 130), ("k", 1024)] {
             let ship = try runPrefill(tag: tag, T: T, backend: .scalar)
             let nax = try runPrefill(tag: tag, T: T, backend: .nax)
@@ -235,6 +237,8 @@ final class QWGDNPrefillProbeTests: XCTestCase {
     }
 
     func testPrefillParityHybridK2() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "GDN NAX prefill scan requires Metal 4 tensor hardware")
         for (tag, T) in [("r", 130), ("k", 1024)] {
             let ship = try runPrefill(tag: tag, T: T, backend: .scalar)
             let hybrid = try runPrefill(tag: tag, T: T, backend: .hybrid)

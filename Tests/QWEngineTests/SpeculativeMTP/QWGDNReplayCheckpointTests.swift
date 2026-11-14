@@ -4,7 +4,6 @@ import QWAlloc
 import QWCore
 import QWGDN
 import QWHAL
-import QWState
 @testable import QWEngine
 
 final class QWGDNReplayCheckpointTests: XCTestCase {
@@ -24,114 +23,23 @@ final class QWGDNReplayCheckpointTests: XCTestCase {
     }
 
     func testDestructiveRestoreAndEveryRetainedBoundary() throws {
-        try destructiveRestoreAndEveryRetainedBoundary(fusedCapture: false, unsafeDecay: false)
-    }
-
-    func testFusedCaptureDestructiveRestoreAndEveryRetainedBoundary() throws {
-        try destructiveRestoreAndEveryRetainedBoundary(fusedCapture: true, unsafeDecay: false)
+        try destructiveRestoreAndEveryRetainedBoundary(unsafeDecay: false)
     }
 
     func testIllConditionedInnovationUsesSnapshotReplayFallback() throws {
-        try destructiveRestoreAndEveryRetainedBoundary(fusedCapture: false, unsafeDecay: true)
+        try destructiveRestoreAndEveryRetainedBoundary(unsafeDecay: true)
     }
 
-    func testFusedCaptureWordParityAndComponentTiming() throws {
-        try XCTSkipUnless(ProcessInfo.processInfo.environment["QW_PERF_GATE"] == "1",
-                          "perf gate — run via `make perf`, not the unit path")
+    private func destructiveRestoreAndEveryRetainedBoundary(unsafeDecay: Bool) throws {
         let hal = try QWHal(geometry: .qwen38_27b)
-        let budget = QWGDNReplayCheckpoint.allocationBytes(geometry: QWTestGeometry.g27, layers: 1, rows: 3)
-        let arena = try QWArena(hal: hal, weights: 256, activations: 4 << 20,
-                                kv: 256, gdnStates: 2 * budget)
-        let g = arena.gdnRegion(), a = arena.activationsRegion()
-        memset(g.region.pointer, 0, g.region.length)
-        let reference = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: 1, rows: 3)
-        let fused = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: 1, rows: 3, fusedCapture: true)
-        let rec = try a.allocate(QWTensorShape([QWSlotGeometry.recElems(geometry: .qwen38_27b)], .f32))
-        let ring = try a.allocate(QWTensorShape([QWSlotGeometry.ringElems(geometry: .qwen38_27b)], .f16))
-        let raw = try a.allocate(QWTensorShape([10240], .f16))
-        let normalized = try a.allocate(QWTensorShape([10240], .f16))
-        let beta = try a.allocate(QWTensorShape([48], .f32))
-        let decay = try a.allocate(QWTensorShape([48], .f32))
-        memset(a.region.pointer, 0, a.region.length)
-        for (index, tensor) in [raw, normalized, beta, decay].enumerated() {
-            let words = tensor.region.pointer.advanced(by: tensor.offset).assumingMemoryBound(to: UInt32.self)
-            for word in 0..<(tensor.bytes / 4) {
-                words[word] = UInt32(truncatingIfNeeded: word &* 7919 &+ index &* 104729)
-            }
-            words[0] = 0x7FC01234
-            words[tensor.bytes / 4 - 1] = 0x80000000
-        }
-        let backup = try XCTUnwrap(hal.queue.makeCommandBuffer())
-        let blit = try XCTUnwrap(backup.makeBlitCommandEncoder())
-        try reference.encodeBackup(blit, rec: rec, ring: ring)
-        try fused.encodeBackup(blit, rec: rec, ring: ring)
-        blit.endEncoding()
-        backup.commit()
-        backup.waitUntilCompleted()
-        XCTAssertEqual(backup.status, .completed)
-        _ = try hal.pipeline("qwg_gdn_capture_replay")
-        _ = try hal.pipeline("qwg_verify_copy")
-        a.markSteadyState()
-        g.markSteadyState()
-        var referenceTimes: [Double] = [], fusedTimes: [Double] = []
-        for iteration in 0..<40 {
-            let order = iteration % 2 == 0 ? [reference, fused] : [fused, reference]
-            for checkpoint in order {
-                let started = DispatchTime.now().uptimeNanoseconds
-                let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
-                let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
-                func capture() throws {
-                    defer { enc.endEncoding() }
-                    if iteration == 0 {
-                        XCTAssertThrowsError(try checkpoint.encodeCapture(enc, hal: hal, layer: 1, row: 0,
-                            rawInput: raw, postConv: normalized, beta: beta, decay: decay))
-                        XCTAssertThrowsError(try checkpoint.encodeCapture(enc, hal: hal, layer: 0, row: 3,
-                            rawInput: raw, postConv: normalized, beta: beta, decay: decay))
-                        XCTAssertThrowsError(try checkpoint.encodeCapture(enc, hal: hal, layer: 0, row: 0,
-                            rawInput: checkpoint.rings, postConv: normalized, beta: beta, decay: decay))
-                    }
-                    for _ in 0..<16 {
-                        for row in 0..<3 {
-                            try checkpoint.encodeCapture(enc, hal: hal, layer: 0, row: row,
-                                rawInput: raw, postConv: normalized, beta: beta, decay: decay)
-                            enc.memoryBarrier(scope: .buffers)
-                        }
-                    }
-                }
-                try capture()
-                cb.commit()
-                cb.waitUntilCompleted()
-                guard cb.status == .completed else {
-                    throw QWEngineDriverError.state("capture parity/timing GPU failure: \(String(describing: cb.error))")
-                }
-                if iteration >= 10 {
-                    let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-                    if checkpoint === reference { referenceTimes.append(ms) }
-                    else { fusedTimes.append(ms) }
-                }
-            }
-        }
-        try reference.validateCompleteCapture()
-        try fused.validateCompleteCapture()
-        XCTAssertEqual(Data(bytes: g.region.pointer, count: budget),
-                       Data(bytes: g.region.pointer.advanced(by: budget), count: budget),
-                       "all journal words and padding must match the four-copy reference")
-        XCTAssertEqual(a.steadyStateAllocs, 0)
-        XCTAssertEqual(g.steadyStateAllocs, 0)
-        let referenceP50 = referenceTimes.sorted()[14], fusedP50 = fusedTimes.sorted()[14]
-        print("CAPTURE_COMPONENT 10 discarded/30 measured, 48 captures/submit; host wall p50 reference=\(referenceP50) ms fused=\(fusedP50) ms gain=\(referenceP50 / fusedP50)x; not full-model qualification")
-    }
-
-    private func destructiveRestoreAndEveryRetainedBoundary(fusedCapture: Bool,
-                                                            unsafeDecay: Bool) throws {
-        let hal = try QWHal(geometry: .qwen38_27b)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable,
+                          "1024-thread GDN recurrent kernel requires bare-metal Apple Silicon GPU")
         let layers = 2, rows = 3
         let allocatorBytes = 2 * QWGDNReplayCheckpoint.allocationBytes(geometry: QWTestGeometry.g27, layers: layers, rows: rows) + (1 << 20)
         let arena = try QWArena(hal: hal, weights: 256, activations: 1 << 20,
                                 kv: 256, gdnStates: allocatorBytes)
         let g = arena.gdnRegion(), a = arena.activationsRegion()
-        let checkpoint = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: layers, rows: rows,
-                                                   fusedCapture: fusedCapture)
+        let checkpoint = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: layers, rows: rows)
         let window = try QWVerifyWindow(geometry: QWTestGeometry.g27, allocator: a, rows: rows, vocabulary: 1)
         let hiddenCarry = try a.allocate(QWTensorShape([QWModelGeometry.qwen38_27b.hidden], .f16))
         let rec = try g.allocate(QWTensorShape([layers * QWSlotGeometry.recElems(geometry: .qwen38_27b)], .f32))
@@ -217,7 +125,7 @@ final class QWGDNReplayCheckpointTests: XCTestCase {
                     try compute(cb) { enc in
                         try conv.encodeT1WithHeadnorm(enc, x: rawRow, w: convWeight, bias: nil,
                                                       stIn: history, y: y, stOut: history)
-                        if fusedCapture || row % 2 == 0 {
+                        if row % 2 == 0 {
                             try checkpoint.encodeCapture(enc, hal: hal, layer: layer, row: row,
                                                          rawInput: rawRow, postConv: y, beta: beta, decay: decay)
                         }
@@ -225,7 +133,7 @@ final class QWGDNReplayCheckpointTests: XCTestCase {
                                            z: z, w: norm, o: output, oScratch: outputScratch,
                                            innovation: try checkpoint.innovationRow(layer: layer, row: row))
                     }
-                    if !fusedCapture && row % 2 != 0 {
+                    if row % 2 != 0 {
                         try blit(cb) {
                             try checkpoint.encodeCapture($0, layer: layer, row: row, rawInput: rawRow,
                                                          postConv: y, beta: beta, decay: decay)
@@ -267,8 +175,8 @@ final class QWGDNReplayCheckpointTests: XCTestCase {
                                                 rec: rec, ring: ring, trunkHidden: hiddenCarry, retaining: retained)
             }
             let actualState = rec.region.pointer.advanced(by: rec.offset).assumingMemoryBound(to: Float.self)
-            let expectedState = expectedRec[retained].withUnsafeBytes {
-                $0.bindMemory(to: Float.self).baseAddress!
+            let expectedState = expectedRec[retained].withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                raw.bindMemory(to: Float.self).baseAddress!
             }
             var maxStateError: Float = 0
             for index in 0..<rec.shape.elementCount {
@@ -308,13 +216,15 @@ final class QWGDNReplayCheckpointTests: XCTestCase {
 
     func testBatchedGDNVerifyAndRollbackParity() throws {
         let hal = try QWHal(geometry: .qwen38_27b)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable,
+                          "1024-thread GDN recurrent kernel requires bare-metal Apple Silicon GPU")
         let layers = 2, rows = 4
         let allocatorBytes = 4 * QWGDNReplayCheckpoint.allocationBytes(geometry: QWTestGeometry.g27, layers: layers, rows: rows) + (16 << 20)
         let arena = try QWArena(hal: hal, weights: 256, activations: 8 << 20,
                                 kv: 256, gdnStates: allocatorBytes)
         let g = arena.gdnRegion(), a = arena.activationsRegion()
-        let refCheckpoint = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: layers, rows: rows, fusedCapture: true)
-        let batCheckpoint = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: layers, rows: rows, fusedCapture: true)
+        let refCheckpoint = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: layers, rows: rows)
+        let batCheckpoint = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: layers, rows: rows)
         let window = try QWVerifyWindow(geometry: QWTestGeometry.g27, allocator: a, rows: rows, vocabulary: 1)
         let hiddenCarry = try a.allocate(QWTensorShape([QWModelGeometry.qwen38_27b.hidden], .f16))
         let refRec = try g.allocate(QWTensorShape([layers * QWSlotGeometry.recElems(geometry: .qwen38_27b)], .f32))
@@ -408,5 +318,14 @@ final class QWGDNReplayCheckpointTests: XCTestCase {
         XCTAssertEqual(bytes(batRec), bytes(refRec), "batched GDN verify state must be bit-exact")
         XCTAssertEqual(bytes(batOut), bytes(refOut), "batched GDN verify output must be bit-exact")
         try batCheckpoint.validateCompleteCapture(activeRows: rows)
+    }
+}
+
+private extension QWGDNReplayCheckpoint {
+    func innovationRow(layer: Int, row: Int) throws -> QWTensorValue {
+        guard (0..<layers).contains(layer), (0..<rows).contains(row) else {
+            throw QWEngineDriverError.state("GPU innovation tape index is invalid")
+        }
+        return view(innovations, index: layer * rows + row, count: geometry.gdnZChannels)
     }
 }

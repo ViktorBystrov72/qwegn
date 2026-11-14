@@ -300,11 +300,11 @@ enum MoESuites {
         // --- the weights, in both formats ---
         let weights = MoEWeights.build(rows: experts * rowsPerExpert, cols: hidden)
         let bankBuf = try BenchRunner.buffer(device, bytes: weights.bank.count)
-        weights.bank.withUnsafeBytes { src in
+        weights.bank.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             bankBuf.contents().copyMemory(from: src.baseAddress!, byteCount: weights.bank.count)
         }
         let mlxW = try BenchRunner.buffer(device, bytes: weights.w.count)
-        weights.w.withUnsafeBytes { src in
+        weights.w.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             mlxW.contents().copyMemory(from: src.baseAddress!, byteCount: weights.w.count)
         }
         let mlxScales = try BenchRunner.buffer(device, bytes: weights.scales.count * 2)

@@ -27,9 +27,9 @@ final class QWRopeTests: XCTestCase {
 
 
     static func f16(_ bits: UInt16) -> Float { QWQuant.f16tof32Bits(bits) }
-    static func floats(_ d: Data) -> [Float] { d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }
+    static func floats(_ d: Data) -> [Float] { d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) } }
     static func f16Vals(_ d: Data) -> [Float] {
-        d.withUnsafeBytes { raw in (0..<d.count / 2).map { f16(raw.load(fromByteOffset: $0 * 2, as: UInt16.self)) } }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in (0..<d.count / 2).map { f16(raw.load(fromByteOffset: $0 * 2, as: UInt16.self)) } }
     }
 
     /// 1-ulp adjacency count (C06 law: f16 outputs compare bit-adjacent, not raw abs)
@@ -83,7 +83,9 @@ final class QWRopeTests: XCTestCase {
 
     func testTableParityYarn() throws {
         let posProbe = Self.floats(Self.fixture("rope_pos_ids.bin"))
-        let t = QWRopeTables(rows: Int(posProbe.max() ?? 0) + 1, yarn: QWYaRNConfig(factor: 4), geometry: .qwen38_27b)
+        let t = QWRopeTables(rows: Int(posProbe.max() ?? 0) + 1,
+                             yarn: QWYaRNConfig(factor: 4, originalMaxPosition: QWModelGeometry.qwen38_27b.maxPositionEmbeddings),
+                             geometry: .qwen38_27b)
         let refC = Self.floats(Self.fixture("rope_yarn4_cos.bin"))
         let refS = Self.floats(Self.fixture("rope_yarn4_sin.bin"))
         let pos = posProbe
@@ -97,7 +99,9 @@ final class QWRopeTests: XCTestCase {
 
     func testYarnNeedle1M() throws {
         // extrapolation sanity (spec: needle at simulated 1M position)
-        let t = QWRopeTables(rows: 1_000_001, yarn: QWYaRNConfig(factor: 4), geometry: .qwen38_27b)
+        let t = QWRopeTables(rows: 1_000_001,
+                             yarn: QWYaRNConfig(factor: 4, originalMaxPosition: QWModelGeometry.qwen38_27b.maxPositionEmbeddings),
+                             geometry: .qwen38_27b)
         let refC = Self.floats(Self.fixture("rope_yarn4_cos_1m.bin"))   // [2,64] cat[f,f]
         let refS = Self.floats(Self.fixture("rope_yarn4_sin_1m.bin"))
         // engine row = [cos0..31 | sin0..31]; HF files each duplicate (cat[f,f])
@@ -177,10 +181,10 @@ final class QWRopeTests: XCTestCase {
                 rows[p * 64 + 32 + i] = s[p * 64 + i]
             }
         }
-        rows.withUnsafeBytes { io.arena.copyIn(io.table, from: Data($0)) }
+        rows.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in io.arena.copyIn(io.table, from: Data(raw)) }
         _ = tables
-        let rope = QWRopeApply(tableTensor: io.table, hal: Self.hal,
-                               nullSlab: io.nullSlab, geometry: .qwen38_27b)
+        let rope = try QWRopeApply(tableTensor: io.table, hal: Self.hal,
+                                   nullSlab: io.nullSlab, geometry: .qwen38_27b)
         guard let (cb, enc) = Self.hal.begin() else { throw NSError(domain: "hal", code: 1) }
         do {
             try rope.encodeQK(enc, hal: Self.hal,
@@ -297,7 +301,7 @@ final class QWRopeTests: XCTestCase {
         }
 
         // Run fused extractQK
-        let apply = QWRopeApply(tableTensor: io.table, hal: Self.hal, nullSlab: io.nullSlab, geometry: .qwen38_27b)
+        let apply = try QWRopeApply(tableTensor: io.table, hal: Self.hal, nullSlab: io.nullSlab, geometry: .qwen38_27b)
         guard let (cb, enc) = Self.hal.begin() else { XCTFail("hal.begin"); return }
         try apply.encodeExtractQK(enc, hal: Self.hal,
                                   attnY: attnY,

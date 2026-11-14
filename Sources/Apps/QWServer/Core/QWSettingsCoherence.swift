@@ -32,7 +32,8 @@ public enum QWSettingsCoherence {
     /// QWServerConfigurationResolver). A change to one of them is not in
     /// force for the running server until the process restarts.
     public static let serverRestartKeys: Set<String> = [
-        "host", "port",
+        "host", "port", "apiKey", "corsAllowedOrigins",
+        "allowLocalImagePaths", "allowRemoteImageURLs",
         "modelPackPath", "modelName",
         "maxContext", "kvMode", "ropeScalingType", "ropeScalingFactor",
         "temperature", "topP", "topK", "maxTokens", "repetitionPenalty", "seed",
@@ -46,14 +47,6 @@ public enum QWSettingsCoherence {
         "warmRAMLimitGB", "ssdCacheEnabled", "ssdCacheLimitGB", "cacheDir",
         "logLevel",
         "keepServerRunningAfterQuit",
-    ]
-
-    /// The settings that are read on demand and apply at once: the alias
-    /// table, the app's own log sink, and the app's own start-up choices.
-    public static let liveKeys: Set<String> = [
-        "modelAlias", "modelAliases", "loadVision",
-        "logDir", "logFileName",
-        "telemetryPollIntervalMs", "runAtStartup", "autoStartServer",
     ]
 
     /// When the value of `key` takes effect.
@@ -102,6 +95,10 @@ public enum QWSettingsCoherence {
     private static let displayNames: [String: String] = [
         "host": "Listen host",
         "port": "Listen port",
+        "apiKey": "API key",
+        "corsAllowedOrigins": "Allowed CORS origins",
+        "allowLocalImagePaths": "Allow local image paths",
+        "allowRemoteImageURLs": "Allow remote image URLs",
         "modelPackPath": "Model pack path",
         "modelName": "Model",
         "maxContext": "Context limit",

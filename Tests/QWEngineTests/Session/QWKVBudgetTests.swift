@@ -12,7 +12,7 @@ final class QWKVBudgetTests: XCTestCase {
     private func pagesPerPool(regionBytes: Int, layers: Int) -> Int {
         let tables = QWKVCache.tableSlotBytes * 2 * layers * QWKVCache.maxSeqs
         let poolBytes = (regionBytes - tables) / (2 * layers)
-        return poolBytes / QWKVCache.pageBytes(mode: .f16)
+        return poolBytes / QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b)
     }
 
     /// The failed run geometry: maxTokens 33024, one MTP cache, one donor
@@ -41,7 +41,7 @@ final class QWKVBudgetTests: XCTestCase {
 
         // The OLD budget (what the failing run used) is reproduced and
         // proven to be the defect: no free page for the COW replacement.
-        let oldMtpRegion = QWKVCache.kvBytes(tokens: maxTokens, layers: 1, mode: .f16)
+        let oldMtpRegion = QWKVCache.kvBytes(tokens: maxTokens, layers: 1, mode: .f16, geometry: .qwen38_27b)
             + QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs
         XCTAssertEqual(pagesPerPool(regionBytes: oldMtpRegion, layers: 1), sessionPages)
         XCTAssertLessThan(pagesPerPool(regionBytes: oldMtpRegion, layers: 1), requiredPerPool)
@@ -58,11 +58,12 @@ final class QWKVBudgetTests: XCTestCase {
         // Exact layout: the budget leaves no slack beyond whole pages and
         // the MTP region is exactly one extra-page-per-pool cache.
         XCTAssertEqual((bytes0 - QWKVCache.tableSlotBytes * 2 * 16 * QWKVCache.maxSeqs)
-                       % QWKVCache.pageBytes(mode: .f16), 0)
+                       % QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b), 0)
         XCTAssertEqual((mtp - QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs)
-                       % QWKVCache.pageBytes(mode: .f16), 0)
+                       % QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b), 0)
         XCTAssertEqual(mtp,
-                       QWKVCache.kvBytes(tokens: 4096 + QWKVCache.pageTokens, layers: 1, mode: .f16)
+                       QWKVCache.kvBytes(tokens: 4096 + QWKVCache.pageTokens, layers: 1,
+                                         mode: .f16, geometry: .qwen38_27b)
                        + QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs)
     }
 }

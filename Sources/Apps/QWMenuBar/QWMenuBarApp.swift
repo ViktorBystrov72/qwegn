@@ -1,8 +1,14 @@
-import SwiftUI
+// QWMenuBarApp.swift — Menu bar status item, 6-state icon, shortcuts, and windows
+
 import AppKit
-import Combine
+import Observation
 import QWCore
 import QWServer
+import SwiftUI
+
+public extension Notification.Name {
+    static let qwgSettingsWindowDidOpen = Notification.Name("qwgSettingsWindowDidOpen")
+}
 
 public struct QWMenuBarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -17,24 +23,18 @@ public struct QWMenuBarApp: App {
 }
 
 @MainActor
-public final class AppDelegate: NSObject, NSApplicationDelegate {
+public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private let telemetry = TelemetryObservable()
-    private var cancellables = Set<AnyCancellable>()
 
     private var settingsWindow: NSWindow?
     private var logsWindow: NSWindow?
     private var isTerminating = false
 
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if isTerminating {
-            return .terminateNow
-        }
+        if isTerminating { return .terminateNow }
 
-        // The server outlives the app only when the setting says so and
-        // no watchdog would kill it; a server that would die with the app
-        // anyway is stopped on the way out.
         let decision = QWServerLifecycleRules.quitDecision(
             keepServerRunningAfterQuit: telemetry.settings.keepServerRunningAfterQuit,
             parentWatchdogArmed: telemetry.parentPidWatchdogArmed
@@ -47,17 +47,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateNow
         }
         if telemetry.settings.keepServerRunningAfterQuit {
-            QWServerLogger.shared.log(.warn, "Menu bar app quitting: the running server has a parent-pid watchdog and would die with the app, so it is stopped now. Restart the server to make 'Keep server running after quit' take effect.")
+            QWServerLogger.shared.log(
+                .warn,
+                "Menu bar app quitting: server has parent-pid watchdog so it stops now. Restart server to apply Keep Running."
+            )
         }
 
         isTerminating = true
-        QWServerLogger.shared.log(.info, "Menu bar app quitting: stopping engine server...")
-
+        QWServerLogger.shared.log(.info, "Menu bar app quitting: stopping engine server…")
         Task { @MainActor in
             await telemetry.stopEngineAsync()
             sender.reply(toApplicationShouldTerminate: true)
         }
-
         return .terminateLater
     }
 
@@ -71,40 +72,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NSApp.setActivationPolicy(.accessory)
-
-        // Configure file sink logger using persistent settings
         let logPath = telemetry.settings.expandedLogFilePath
         QWServerLogger.shared.configureFileSink(path: logPath)
-        QWServerLogger.shared.log(.info, "QWEGN Menu Bar Controller initialized. Logging to \(logPath)")
+        QWServerLogger.shared.log(.info, "Qwegn Menu Bar Controller initialized. Logging to \(logPath)")
 
-        // Configure status item in menu bar
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = createMenuBarIcon(isServing: telemetry.isServing)
-            button.imagePosition = .imageOnly
             button.target = self
             button.action = #selector(togglePopover)
         }
+        observeStatusItem()
 
-        // Wire dynamic menu bar icon observation: gray when not serving, active when serving.
-        // The icon reads the same two facts the popover draws: the
-        // connection and the engine's published phase.
-        telemetry.$dashboard
-            .combineLatest(telemetry.$connection)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] dashboard, connection in
-                guard let self else { return }
-                let isServing = connection == .connected
-                    && dashboard?.lifecycle.phase == .loaded
-                self.statusItem.button?.image = self.createMenuBarIcon(isServing: isServing)
-            }
-            .store(in: &cancellables)
-
-        // Configure popover with authentic macOS system-level liquid glass
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 440, height: 550)
+        popover.contentSize = NSSize(width: 440, height: 520)
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
 
         let contentView = CupertinoTelemetryView(
             telemetry: telemetry,
@@ -114,45 +97,104 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             onQuit: { NSApp.terminate(nil) }
         )
         let hostingController = NSHostingController(rootView: contentView)
+        hostingController.sizingOptions = [.preferredContentSize]
         hostingController.view.wantsLayer = true
         hostingController.view.layer?.backgroundColor = .clear
         popover.contentViewController = hostingController
 
-        // The popover can be opened at launch, for a check that does not
-        // need a click: `QWG_OPEN_POPOVER=1 qwg-menu`. The status item
-        // is the only way in otherwise, and a click cannot be scripted
-        // without assistive access.
         if ProcessInfo.processInfo.environment["QWG_OPEN_POPOVER"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 guard let self, let button = self.statusItem.button else { return }
                 self.popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+                self.telemetry.setPopoverVisible(true)
             }
         }
 
-        // Register global keyboard monitor for ⌘R, ⌘D, ⌘L, ⌘,, ⌘Q
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.modifierFlags.contains(.command) {
-                switch event.charactersIgnoringModifiers {
-                case "r":
-                    self?.telemetry.restartEngine()
-                    return nil
-                case "d":
-                    self?.openWebUI()
-                    return nil
-                case "l":
-                    self?.openLogsWindow()
-                    return nil
-                case ",":
-                    self?.openSettingsWindow()
-                    return nil
-                case "q":
-                    NSApp.terminate(nil)
-                    return nil
-                default:
-                    break
-                }
+            self?.handleShortcutEvent(event) ?? event
+        }
+    }
+
+    @MainActor
+    private func observeStatusItem() {
+        withObservationTracking {
+            updateStatusItem()
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.observeStatusItem()
             }
+        }
+    }
+
+    private func updateStatusItem() {
+        guard let button = statusItem?.button else { return }
+        let state = telemetry.menuBarStatusState
+        let dotColor: NSColor? = switch state {
+        case .offline: nil
+        case .standby, .transitioning: .systemOrange
+        case .ready: .systemGreen
+        case .prefilling: .systemYellow
+        case .decoding: .systemBlue
+        case .failed: .systemRed
+        }
+        button.image = QGProcessorLogoView.statusBarImage(
+            pointSize: 18,
+            statusDotColor: dotColor,
+            dimmed: state == .offline
+        )
+        if let statusTitle = telemetry.menuBarStatusTitle {
+            button.imagePosition = .imageLeading
+            button.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            button.title = " \(statusTitle)"
+        } else {
+            button.imagePosition = .imageOnly
+            button.title = ""
+        }
+    }
+
+    private func handleShortcutEvent(_ event: NSEvent) -> NSEvent? {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags == [.command],
+              let key = event.charactersIgnoringModifiers?.lowercased() else {
             return event
+        }
+        let isEditingText = NSApp.keyWindow?.firstResponder is NSTextView
+        switch key {
+        case "r":
+            if isEditingText { return event }
+            telemetry.restartServerProcess()
+            return nil
+        case "d":
+            if isEditingText { return event }
+            openWebUI()
+            return nil
+        case "l":
+            if isEditingText { return event }
+            openLogsWindow()
+            return nil
+        case ",":
+            openSettingsWindow()
+            return nil
+        case "q":
+            NSApp.terminate(nil)
+            return nil
+        default:
+            return event
+        }
+    }
+
+    public func popoverDidShow(_ notification: Notification) {
+        telemetry.setPopoverVisible(true)
+    }
+
+    public func popoverDidClose(_ notification: Notification) {
+        telemetry.setPopoverVisible(false)
+    }
+
+    public func windowWillClose(_ notification: Notification) {
+        guard let closed = notification.object as? NSWindow else { return }
+        if closed === logsWindow {
+            telemetry.setLogWindowVisible(false)
         }
     }
 
@@ -168,11 +210,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
+            telemetry.setPopoverVisible(true)
         }
     }
 
     public func openSettingsWindow() {
         popover.performClose(nil)
+        NotificationCenter.default.post(name: .qwgSettingsWindowDidOpen, object: nil)
         if let window = settingsWindow {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -185,10 +229,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let hosting = NSHostingController(rootView: settingsView)
         let window = NSWindow(contentViewController: hosting)
-        window.title = "QWEGN Settings"
+        window.title = "Qwegn Settings"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 580, height: 490))
-        window.minSize = NSSize(width: 520, height: 420)
+        window.setContentSize(NSSize(width: 740, height: 540))
+        window.minSize = NSSize(width: 660, height: 480)
+        window.isMovableByWindowBackground = false
         window.isReleasedWhenClosed = false
         window.center()
         self.settingsWindow = window
@@ -199,41 +244,27 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     public func openLogsWindow() {
         popover.performClose(nil)
+        telemetry.setLogWindowVisible(true)
         if let window = logsWindow {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
 
-        let logsView = LogViewerWindow(
-            telemetry: telemetry,
-            onClose: { [weak self] in self?.logsWindow?.close() }
-        )
+        let logsView = LogViewerWindow(telemetry: telemetry)
         let hosting = NSHostingController(rootView: logsView)
         let window = NSWindow(contentViewController: hosting)
-        window.title = "QWEGN Logs"
+        window.title = "Qwegn Logs"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 780, height: 500))
-        window.minSize = NSSize(width: 640, height: 380)
+        window.setContentSize(NSSize(width: 760, height: 500))
+        window.minSize = NSSize(width: 600, height: 380)
+        window.isMovableByWindowBackground = false
         window.isReleasedWhenClosed = false
+        window.delegate = self
         window.center()
         self.logsWindow = window
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-    }
-
-    /// Generates the 18x18 QG processor microchip emblem for the macOS menu bar:
-    /// Active template image when serving model; dimmed non-template gray when stopped or in standby.
-    private func createMenuBarIcon(isServing: Bool = false) -> NSImage {
-        let size = NSSize(width: 18, height: 18)
-        let image = NSImage(size: size, flipped: true) { rect in
-            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            let strokeColor = isServing ? NSColor.black.cgColor : NSColor(white: 0.55, alpha: 0.85).cgColor
-            QGProcessorLogoView.draw(in: ctx, size: rect.size, strokeColor: strokeColor)
-            return true
-        }
-        image.isTemplate = isServing
-        return image
     }
 }

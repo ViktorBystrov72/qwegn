@@ -121,9 +121,9 @@ def strip_comments(text: str) -> str:
     return re.sub(r"(?m)//.*$", "", text)
 
 
-def swift_refs() -> tuple[dict[str, list[str]], set[str]]:
-    """(kernel name -> files) for every kernel string Swift asks for, plus the
-    interpolated prefixes it can build at runtime."""
+def prod_swift_refs() -> tuple[dict[str, list[str]], set[str]]:
+    """(kernel name -> files) for every kernel production Swift asks for, plus
+    the interpolated prefixes production Swift can build at runtime."""
     refs: dict[str, list[str]] = {}
     dynamic: set[str] = set()
     lit = re.compile(r"[\"'](q[a-z0-9_]{6,})[\"']")
@@ -137,6 +137,14 @@ def swift_refs() -> tuple[dict[str, list[str]], set[str]]:
                 refs.setdefault(name, []).append(str(path.relative_to(ROOT)))
         for pre in interp.findall(text):
             dynamic.add(pre)
+    return refs, dynamic
+
+
+def swift_refs() -> tuple[dict[str, list[str]], set[str]]:
+    """(kernel name -> files) for every kernel string Swift asks for, plus the
+    interpolated prefixes it can build at runtime."""
+    refs, dynamic = prod_swift_refs()
+    lit = re.compile(r"[\"'](q[a-z0-9_]{6,})[\"']")
     # benches and tests may load bench-local kernels on purpose
     for base in ("Scripts", "Tests"):
         for path in (ROOT / base).rglob("*.swift"):
@@ -237,10 +245,16 @@ def dispatched_in(dirs: list[str], skip: tuple[str, ...] = ()) -> set[str]:
 
 
 DENSE_ENGINE_DIRS = ["Sources/Runtime/QWEngine"]
+NON_STANDARD_KERNEL_PREFIXES = (
+    "qwg_dflash_", "qwg_dspine_", "qwg_echo_", "qwg_mtp_",
+    "qwg_gdn_", "qwg_kda_", "qwg_hca_", "qwg_mla_",
+    "qwg_emeans_mla_", "qwg_mhc_", "qwg_moe_",
+    "qwg_cold_event_", "qwg_router_gemm",
+)
 FLASH_NEXT_ENGINE_DIRS = ["Sources/Subsystems/QWFlashNext"]
 SHARED_OPERATOR_DIRS = ["Sources/Operators/QWAttn", "Sources/Operators/QWGDN",
                         "Sources/Operators/QWGEMM", "Sources/Operators/QWHead",
-                        "Sources/Operators/QWKV", "Sources/Operators/QWMLP",
+                        "Sources/Operators/QWKV",
                         "Sources/Operators/QWNorm", "Sources/Operators/QWRope",
                         "Sources/Foundation/QWQuant"]
 FLASH_NEXT_OPERATOR_DIRS = ["Sources/Operators/QWGDN", "Sources/Operators/QWGEMM",
@@ -273,7 +287,7 @@ def door_problems(available: set[str], dynamic: set[str] | None = None) -> list[
              | dispatched_in(SHARED_OPERATOR_DIRS))
     flash = (dispatched_in(FLASH_NEXT_ENGINE_DIRS)
              | dispatched_in(FLASH_NEXT_OPERATOR_DIRS))
-    standard = dense - set(inventory["dense_only"])
+    standard = {k for k in dense if not k.startswith(NON_STANDARD_KERNEL_PREFIXES)}
     # The sparse family adds the chain's own kernels to the standard set.
     chain = chain_kernels()
     expected = {
@@ -302,17 +316,18 @@ def door_problems(available: set[str], dynamic: set[str] | None = None) -> list[
 
 def main() -> int:
     names = metallib_names() - declared_helpers()
+    prod_refs, prod_dynamic = prod_swift_refs()
     refs, dynamic = swift_refs()
     local = bench_local_kernels()
     problems = []
 
     for name in sorted(names):
-        if name in refs:
+        if name in prod_refs:
             continue
-        if any(name.startswith(d) for d in dynamic):
+        if any(name.startswith(d) for d in prod_dynamic):
             continue          # built by string interpolation at dispatch time
         problems.append(f"UNREACHABLE KERNEL: {name} ships in the metallib but "
-                        f"nothing dispatches it")
+                        f"no production Swift dispatches it")
 
     for name, files in sorted(refs.items()):
         if name in local:

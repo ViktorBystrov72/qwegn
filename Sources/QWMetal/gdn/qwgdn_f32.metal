@@ -193,6 +193,7 @@ kernel void qwg_gdn_conv_prep_seq_f32(device const float* x       [[buffer(0)]],
                                       device float*       beta    [[buffer(10)]],  // [T][48]
                                       constant uint&      T       [[buffer(11)]],
                                       constant uint&      xStride [[buffer(12)]],
+                                      constant uint&      baStride [[buffer(13)]],
                                       uint2 tg [[threadgroup_position_in_grid]],
                                       uint  d  [[thread_index_in_threadgroup]]) {
     constexpr uint DK = 128u, KH = 16u, VH = 48u, CONV = 10240u, KEYDIM = 2048u;
@@ -245,10 +246,10 @@ kernel void qwg_gdn_conv_prep_seq_f32(device const float* x       [[buffer(0)]],
             stOut[cv] = pv1; stOut[CONV + cv] = pv2; stOut[2u * CONV + cv] = pv3;
         }
         if (d == 0u) {
-            const float xv = aIn[t * VH + hv] + dtBias[hv];
+            const float xv = aIn[(uint64_t)t * baStride + hv] + dtBias[hv];
             const float sp = (xv > 20.0f) ? xv : log(1.0f + exp(xv));
-            glog[t * VH + hv] = -exp(aLog[hv]) * sp;
-            beta[t * VH + hv] = 1.0f / (1.0f + exp(-bIn[t * VH + hv]));
+            glog[(uint64_t)t * VH + hv] = -exp(aLog[hv]) * sp;
+            beta[(uint64_t)t * VH + hv] = 1.0f / (1.0f + exp(-bIn[(uint64_t)t * baStride + hv]));
         }
     }
 }
@@ -267,7 +268,9 @@ static inline void qwg_gdn_recurrent_seq_tg_impl(device const float* y, device c
     const uint kch = lane & 3u;
     const uint cl = (sgi << 3u) + (lane >> 2u);
     const uint c = cBlock * 32u + cl;
-    const uint i = h / 3u;
+    const uint qCh = (CONV - VHEADS * 128u) >> 1u;
+    const uint kh = max(1u, qCh >> 7u);
+    const uint i = (VHEADS == kh * 3u) ? (h / 3u) : (h / max(1u, VHEADS / kh));
     const uint k0 = kch * 32u;
     const uint VD = 128u;
     const uint VSTRIDE = VHEADS * VD;
@@ -283,9 +286,9 @@ static inline void qwg_gdn_recurrent_seq_tg_impl(device const float* y, device c
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint b = 0u; b < nb; ++b) {
             device const float* yT = y + (uint64_t)(tb + b) * CONV;
-            kS[b * 128u + tid] = yT[2048u + i * VD + tid];
+            kS[b * 128u + tid] = yT[qCh + i * VD + tid];
             qS[b * 128u + tid] = yT[i * VD + tid];
-            if (tid < 32u) vS[b * 32u + tid] = yT[4096u + (uint64_t)h * VD + cBlock * 32u + tid];
+            if (tid < 32u) vS[b * 32u + tid] = yT[2u * qCh + (uint64_t)h * VD + cBlock * 32u + tid];
         }
         if (tid < nb) {
             bS[tid] = betas[(uint64_t)(tb + tid) * VHEADS + h];

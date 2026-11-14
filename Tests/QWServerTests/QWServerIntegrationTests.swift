@@ -94,13 +94,14 @@ final class QWServerIntegrationTests: XCTestCase {
         XCTAssertTrue((tagsList?.count ?? 0) >= 1)
         XCTAssertEqual(tagsList?[0]["name"] as? String, "test-model")
 
-        // 5. Test OPTIONS CORS preflight
+        // 5. Test OPTIONS CORS preflight (reflects loopback Origin, never *)
         var optReq = URLRequest(url: baseURL.appendingPathComponent("v1/chat/completions"))
         optReq.httpMethod = "OPTIONS"
+        optReq.setValue("http://127.0.0.1:8080", forHTTPHeaderField: "Origin")
         let (_, optResp) = try await session.data(for: optReq)
         let httpOpt = optResp as! HTTPURLResponse
         XCTAssertEqual(httpOpt.statusCode, 204)
-        XCTAssertEqual(httpOpt.value(forHTTPHeaderField: "Access-Control-Allow-Origin"), "*")
+        XCTAssertEqual(httpOpt.value(forHTTPHeaderField: "Access-Control-Allow-Origin"), "http://127.0.0.1:8080")
         XCTAssertNotNil(httpOpt.value(forHTTPHeaderField: "Access-Control-Allow-Methods"))
 
         // 6. Test 404 for unknown route

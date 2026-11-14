@@ -273,6 +273,7 @@ kernel void qwg_attn_decode_combine_batched(const device half* qgate     [[buffe
     const uint head = tg.x;
     const uint qi = tg.y;
     const uint d0 = lane * 8u;
+    if (QW_HEAD_DIM < 256u && d0 >= QW_HEAD_DIM) return;
     const uint splitStride = max(QW_MAXSPLITS, splits);
     const device float* base = partials
         + (uint64_t)qi * (QW_Q_HEADS * splitStride * (QW_HEAD_DIM + 2u))
@@ -297,13 +298,18 @@ kernel void qwg_attn_decode_combine_batched(const device half* qgate     [[buffe
         device const float* ob = base + i * (QW_HEAD_DIM + 2u) + d0;
         for (uint j = 0; j < 8u; j++) o[j] += w * ob[j];
     }
-    const device half* g4 = qgate + (uint64_t)qi * QW_QPROJ_OUT + head * (2u * QW_HEAD_DIM) + QW_HEAD_DIM + d0;
-    half gg[8];
-    for (uint i = 0; i < 8u; i++) gg[i] = g4[i];
     const float linv = (L > 0.0f) ? 1.0f / L : 0.0f;
     half hv[8];
-    for (uint i = 0; i < 8u; i++)
-        hv[i] = half(o[i] * linv * (1.0f / (1.0f + metal::exp(-float(gg[i])))));
+    if (QW_HAS_Q_GATE) {
+        const device half* g4 = qgate + (uint64_t)qi * QW_QPROJ_OUT + head * (QW_Q_STRIDE * QW_HEAD_DIM) + QW_HEAD_DIM + d0;
+        half gg[8];
+        for (uint i = 0; i < 8u; i++) gg[i] = g4[i];
+        for (uint i = 0; i < 8u; i++)
+            hv[i] = half(o[i] * linv * (1.0f / (1.0f + metal::exp(-float(gg[i])))));
+    } else {
+        for (uint i = 0; i < 8u; i++)
+            hv[i] = half(o[i] * linv);
+    }
     fwht32_inplace(hv, lane);
     device half* ov = outp + (uint64_t)qi * (QW_Q_HEADS * QW_HEAD_DIM) + head * QW_HEAD_DIM + d0;
     for (uint i = 0; i < 8u; i++)

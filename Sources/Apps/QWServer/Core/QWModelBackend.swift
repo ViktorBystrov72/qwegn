@@ -28,6 +28,8 @@ public struct QWModelGenerationRequest: Sendable {
     public let exactSpeculation: Bool
     /// Merged visual feature spans for multimodal prompts.
     public let visualSpans: [QWVisualSpan]
+    /// Optional prefill progress callback invoked with `(completedComputedTokens, totalComputedTokens)`.
+    public let onPrefillProgress: (@Sendable (Int, Int) -> Void)?
 
     public init(
         promptTokens: [Int],
@@ -41,7 +43,8 @@ public struct QWModelGenerationRequest: Sendable {
         onTokenLogprob: (@Sendable (QWTokenLogprob) -> Void)? = nil,
         constraint: (any QWTokenConstraint)? = nil,
         exactSpeculation: Bool = false,
-        visualSpans: [QWVisualSpan] = []
+        visualSpans: [QWVisualSpan] = [],
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         self.constraint = constraint
         self.exactSpeculation = exactSpeculation
@@ -55,6 +58,7 @@ public struct QWModelGenerationRequest: Sendable {
         self.topLogprobsCount = topLogprobsCount
         self.onTokenLogprob = onTokenLogprob
         self.visualSpans = visualSpans
+        self.onPrefillProgress = onPrefillProgress
     }
 }
 
@@ -164,8 +168,8 @@ public struct QWModelBackendRegistration: @unchecked Sendable {
 public final class QWModelBackendRegistry: @unchecked Sendable {
     public static let shared = QWModelBackendRegistry()
 
-    private let lock = NSLock()
-    private var builders: [ObjectIdentifier: QWModelBackendRegistration]
+    let lock = NSLock()
+    var builders: [ObjectIdentifier: QWModelBackendRegistration]
 
     public init(registrations: [QWModelBackendRegistration] = []) {
         var map: [ObjectIdentifier: QWModelBackendRegistration] = [:]
@@ -191,13 +195,6 @@ public final class QWModelBackendRegistry: @unchecked Sendable {
             try QWUnifiedModelBackend.load(moduleType: moduleType, config: config,
                                            descriptor: descriptor, logger: logger)
         }
-    }
-
-    /// The modules with explicitly registered backend overrides.
-    public var registeredModules: [Any.Type] {
-        lock.lock()
-        defer { lock.unlock() }
-        return builders.values.map(\.module)
     }
 
     public func loadBackend(
@@ -368,8 +365,7 @@ public struct QWUnifiedModelBackend: QWModelBackend {
         let vt0 = clock.now
         let eager = loadVision || ProcessInfo.processInfo.environment["QW_VISION_EAGER"] == "1"
         do {
-            let vb = try QWVision.makeOnDemand(
-                mode: .ref,
+            let vb = try QWVisionOnDemandBackend(
                 modelPath: packPath,
                 keepResident: eager,
                 allowOnDemand: false
@@ -411,7 +407,8 @@ public struct QWUnifiedModelBackend: QWModelBackend {
             topLogprobsCount: request.topLogprobsCount,
             onTokenLogprob: request.onTokenLogprob,
             constraint: request.constraint,
-            visualSpans: request.visualSpans
+            visualSpans: request.visualSpans,
+            onPrefillProgress: request.onPrefillProgress
         )
         let result = try engine.generate(request: engineRequest, onToken: onToken)
         let cache = engine.prefixCache

@@ -5,6 +5,7 @@
 
 import XCTest
 import QWCore
+import QWFlashNext
 import QWHead
 @testable import QWEngine
 
@@ -14,10 +15,14 @@ final class QWLayerKernelTests: XCTestCase {
     private static let served: Set<QWEnginePlan.LayerKernelKey> = [
         .init(attention: .gdn, mlp: .dense, ple: false),
         .init(attention: .gdn, mlp: .moe, ple: false),
+        .init(attention: .kda, mlp: .dense, ple: false),
+        .init(attention: .kda, mlp: .moe, ple: false),
         .init(attention: .fullAttention, mlp: .dense, ple: false),
         .init(attention: .fullAttention, mlp: .moe, ple: false),
         .init(attention: .qsaSparse, mlp: .dense, ple: false),
         .init(attention: .qsaSparse, mlp: .moe, ple: false),
+        .init(attention: .mlaCompressed, mlp: .dense, ple: false),
+        .init(attention: .mlaCompressed, mlp: .moe, ple: false),
         .init(attention: .hcaCompressed, mlp: .dense, ple: false),
         .init(attention: .hcaCompressed, mlp: .moe, ple: false),
     ]
@@ -159,17 +164,17 @@ final class QWLayerKernelTests: XCTestCase {
         XCTAssertEqual(module.finishedRequests, 1)
     }
 
-    func testCompiledLayerStackUnifies4SeamsAndRollbackRing() throws {
+    func testLayerStackScheduleAndRollbackRing() throws {
         let densePlan = try QWEnginePlan(geometry: QWModelGeometry.qwen38_27b, modelId: "toy-27b",
                                          geometryDigest: "d", prefillChunkRows: 512,
                                          kvStorageMode: "f16")
-        let denseStack = DenseModule(plan: densePlan).compiledStack
-        XCTAssertEqual(denseStack.layers.count, QWModelGeometry.qwen38_27b.numLayers)
-        XCTAssertTrue(denseStack.layers.allSatisfy { $0.streamCarrier == .singleStream && $0.channelMixer == .dense && !$0.hasPLE })
-        XCTAssertEqual(denseStack.cuts, [0, denseStack.layers.count])
-        XCTAssertEqual(denseStack.steps, [[.commit]])
-        XCTAssertTrue(QWCompiledLayerStack.supportsRollbackWindow(4))
-        XCTAssertTrue(QWCompiledLayerStack.supportsRollbackWindow(8))
-        XCTAssertFalse(QWCompiledLayerStack.supportsRollbackWindow(9))
+        XCTAssertEqual(densePlan.layers.count, QWModelGeometry.qwen38_27b.numLayers)
+        XCTAssertTrue(densePlan.layers.allSatisfy { $0.mlp == .dense && !$0.hasPLE })
+        XCTAssertEqual(QWLayerStackSchedule.decodeCuts(slotCount: densePlan.layers.count, hasPLE: false),
+                       [0, densePlan.layers.count])
+        XCTAssertEqual(QWLayerStackSchedule.stepOrder(chunkHasPLE: [false]), [[.commit]])
+        XCTAssertTrue(QWFourSlotRollbackRing.supportsWindow(4))
+        XCTAssertTrue(QWFourSlotRollbackRing.supportsWindow(8))
+        XCTAssertFalse(QWFourSlotRollbackRing.supportsWindow(9))
     }
 }

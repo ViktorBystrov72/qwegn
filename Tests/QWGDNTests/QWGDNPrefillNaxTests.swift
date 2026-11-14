@@ -28,7 +28,7 @@ final class QWGDNPrefillNaxTests: XCTestCase {
 
     static func buf(_ d: Data) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
-        d.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
     static func tv(_ b: MTLBuffer, _ n: Int, _ dt: QWDType) -> QWTensorValue {
@@ -111,6 +111,8 @@ final class QWGDNPrefillNaxTests: XCTestCase {
     }
 
     func testScanParityNax() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "GDN NAX prefill scan requires Metal 4 tensor hardware")
         let shipName = "qwg_gdn_prefill_scan"
         let naxName = "qwg_gdn_prefill_scan_nax"
         for (tag, T) in [("k", 1024), ("r", 130)] {
@@ -131,8 +133,8 @@ final class QWGDNPrefillNaxTests: XCTestCase {
             XCTAssertEqual(vo.0, 0, "\(tag): nax-vs-ship o parity (worst \(vo.1) @\(vo.2))")
             XCTAssertEqual(stNax.filter { !$0.isFinite }.count, 0, "\(tag): nax state non-finite")
             // state vs the FIXTURE golden (1e-4 rung) + vs shipping arm
-            let stRef = try Self.load("gdn_pre_state_\(tag).bin").withUnsafeBytes {
-                Array($0.bindMemory(to: Float.self))
+            let stRef = try Self.load("gdn_pre_state_\(tag).bin").withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                Array(raw.bindMemory(to: Float.self))
             }
             let vg = Self.violS(stNax, stRef)
             XCTAssertEqual(vg.0, 0, "\(tag): nax state vs fixture golden (worst \(vg.1) @\(vg.2))")

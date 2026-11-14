@@ -343,15 +343,16 @@ def synthesize_base_chat_template(source: Path) -> str:
     lead = json.dumps(sp0 if isinstance(sp0, str) else "")
     bo, bc, vo, vc = "{" + "%-", " %" + "}", "{" + "{-", " }" + "}"
     return "\n".join([
-        f"{bo} set ns = namespace(multi=false) {bc}",
-        f"{bo} for m in messages {bc}{bo} if m['role'] == 'assistant' {bc}{bo} set ns.multi = true {bc}{bo} endif {bc}{bo} endfor {bc}",
+        f"{bo} set ns = namespace(chat=(add_generation_prompt | default(false)), users=0) {bc}",
+        f"{bo} for m in messages {bc}{bo} if m['role'] in ['assistant', 'system'] {bc}{bo} set ns.chat = true {bc}{bo} endif {bc}{bo} if m['role'] == 'user' {bc}{bo} set ns.users = ns.users + 1 {bc}{bo} endif {bc}{bo} endfor {bc}",
+        f"{bo} if ns.users > 1 {bc}{bo} set ns.chat = true {bc}{bo} endif {bc}",
         f"{vo} {lead} {vc}",
         f"{bo} for m in messages {bc}",
         f"{bo} if not loop.first {bc}{vo} '\\n\\n' {vc}{bo} endif {bc}",
-        f"{bo} if ns.multi and m['role'] == 'user' {bc}{vo} 'User: ' {vc}{bo} elif ns.multi and m['role'] == 'assistant' {bc}{vo} 'Assistant: ' {vc}{bo} endif {bc}",
+        f"{bo} if ns.chat and m['role'] == 'system' {bc}{vo} 'System: ' {vc}{bo} elif ns.chat and m['role'] == 'user' {bc}{vo} 'User: ' {vc}{bo} elif ns.chat and m['role'] == 'assistant' {bc}{vo} 'Assistant: ' {vc}{bo} endif {bc}",
         f"{bo} if m['content'] is string {bc}{vo} m['content'] {vc}{bo} elif m['content'] is iterable {bc}{bo} for it in m['content'] {bc}{bo} if 'text' in it {bc}{vo} it['text'] {vc}{bo} endif {bc}{bo} endfor {bc}{bo} endif {bc}",
         f"{bo} endfor {bc}",
-        f"{bo} if ns.multi and add_generation_prompt {bc}{vo} '\\n\\nAssistant: ' {vc}{bo} endif {bc}",
+        f"{bo} if ns.chat and add_generation_prompt {bc}{vo} '\\n\\nAssistant: ' {vc}{bo} endif {bc}",
     ])
 
 

@@ -1,7 +1,12 @@
+import Foundation
 import Metal
 import QWAlloc
 import QWGEMM
 import QWHAL
+
+private enum FNAttentionToggles {
+    static let qsaMatEnabled = ProcessInfo.processInfo.environment["QW_FN_QSA_MAT"] != "0"
+}
 
 // FlashNext full-attention core dispatch (Sources/QWMetal/qwattn_sparse.metal).
 extension QWGemm {
@@ -86,6 +91,7 @@ extension QWGemm {
             if bg.shouldPrune {
                 let pipes = try QWCoarsePoolIndex.Pipelines(hal: hal)
                 let psoCoarse = try hal.pipeline("qwg_emeans_qsa_score_coarse")
+                let psoCoarseTiled = try hal.pipeline("qwg_emeans_qsa_score_coarse_tiled")
                 let psoCands = try hal.pipeline("qwg_emeans_qsa_score_cands")
                 let psoFallback = try hal.pipeline("qwg_emeans_qsa_flat_fallback")
                 let csr = QWCoarsePoolIndex.LayerCSR(
@@ -106,16 +112,20 @@ extension QWGemm {
                         rowStep: 1, maxRow: subRows, clusterStride: cScratch.clusterStride,
                         probeClusters: probe, candCap: cScratch.candCap)
                     let plen = MemoryLayout<QWCoarsePoolIndex.SelectParams>.stride
-                    enc.setComputePipelineState(psoCoarse)
-                    qSlice.bind(enc, index: 0)
-                    csr.centroids.bind(enc, index: 1)
-                    csr.clusterSpans.bind(enc, index: 2)
-                    cScratch.cScore.bind(enc, index: 3)
-                    cScratch.uHist.bind(enc, index: 4)
-                    enc.setBytes(&ePrm, length: plen, index: 5)
-                    enc.dispatchThreadgroups(
-                        MTLSize(width: (subBg.numClusters + 255) / 256, height: subRows, depth: 1),
-                        threadsPerThreadgroup: tpg)
+                    if subBg.numClusters > 0 {
+                        let useCoarseTiled = FNAttentionToggles.qsaMatEnabled && subRows >= 4
+                        enc.setComputePipelineState(useCoarseTiled ? psoCoarseTiled : psoCoarse)
+                        qSlice.bind(enc, index: 0)
+                        csr.centroids.bind(enc, index: 1)
+                        csr.clusterSpans.bind(enc, index: 2)
+                        cScratch.cScore.bind(enc, index: 3)
+                        cScratch.uHist.bind(enc, index: 4)
+                        enc.setBytes(&ePrm, length: plen, index: 5)
+                        let grid = useCoarseTiled
+                            ? MTLSize(width: (subBg.numClusters + 31) / 32, height: (subRows + 7) / 8, depth: 1)
+                            : MTLSize(width: (subBg.numClusters + 255) / 256, height: subRows, depth: 1)
+                        enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tpg)
+                    }
                     QWCoarsePoolIndex.encodeHistCollectScoreFinalize(
                         enc, pipelines: pipes, csr: csr, scratch: cScratch,
                         blockList: listSlice, blockCount: listSlice, params: &ePrm,
@@ -156,7 +166,8 @@ extension QWGemm {
         let maxBlocks = max(1, (pos0 + rows) / 4)
         let totalScoreElems = scores.shape.elementCount
         let rawTileRows = max(1, min(rows, totalScoreElems / max(1, maxBlocks)))
-        let tileRows = (rawTileRows >= 16 && rows > rawTileRows) ? (rawTileRows & ~7) : rawTileRows
+        let tileAlignMask = FNAttentionToggles.qsaMatEnabled ? ~15 : ~7
+        let tileRows = (rawTileRows >= 16 && rows > rawTileRows) ? (rawTileRows & tileAlignMask) : rawTileRows
         guard tileRows >= 1 && maxBlocks <= totalScoreElems else {
             throw FNGPUError.selectionLimitExceeded(positions: pos0 + rows, limit: totalScoreElems * 4)
         }
@@ -182,7 +193,9 @@ extension QWGemm {
             }
             return
         }
+        let useMatScores = FNAttentionToggles.qsaMatEnabled && tileRows >= 16
         let useTiledScores = tileRows >= 8
+        let scoreMatPso = useMatScores ? try hal.pipeline("qwg_qsa_scores_mat") : nil
         let scorePso = try hal.pipeline(useTiledScores ? "qwg_qsa_scores_tiled" : "qwg_qsa_scores")
         let radixPso = try hal.pipeline("qwg_qsa_topk_radix")
         var r0 = 0
@@ -193,7 +206,14 @@ extension QWGemm {
             let subNumChunks = max(1, (subMaxBlocks + 255) / 256)
             let qSlice = idxQ.slice(byteOffset: r0 * 4 * 128 * 4, count: subRows * 4 * 128, dtype: .f32)
             let listSlice = list.slice(byteOffset: r0 * blockTopK * 4, count: subRows * blockTopK, dtype: .i32)
-            if useTiledScores && subRows >= 8 {
+            if let scoreMatPso, subRows >= 16 {
+                enc.setComputePipelineState(scoreMatPso)
+                enc.bindTensors(qSlice, pooled, scores, startIndex: 0)
+                enc.setUInt32s(subRows, blockTopK, subPos0, subMaxBlocks, startIndex: 3)
+                enc.dispatchThreadgroups(
+                    MTLSize(width: (subMaxBlocks + 63) / 64, height: (subRows + 15) / 16, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            } else if useTiledScores && subRows >= 8 {
                 enc.setComputePipelineState(scorePso)
                 enc.bindTensors(qSlice, pooled, scores, startIndex: 0)
                 enc.setUInt32s(subRows, blockTopK, subPos0, subMaxBlocks, startIndex: 3)

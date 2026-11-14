@@ -18,7 +18,7 @@ final class QWBatchedGemmTests: XCTestCase {
         var data = Data(count: totalBlocks * 20)
         let s16 = Float16(0.01)
         let b16 = Float16(-0.08 - 1024.0 * Float(s16))
-        data.withUnsafeMutableBytes { raw in
+        data.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             let u16 = raw.bindMemory(to: UInt16.self)
             for b in 0..<totalBlocks {
                 let base = b * 10
@@ -57,7 +57,7 @@ final class QWBatchedGemmTests: XCTestCase {
         // Fill X [M, K]
         let xV = try act.allocate(QWTensorShape([M * K], .f16))
         var xData = Data(count: M * K * 2)
-        xData.withUnsafeMutableBytes { buf in
+        xData.withUnsafeMutableBytes { (buf: UnsafeMutableRawBufferPointer) in
             let ptr = buf.bindMemory(to: UInt16.self)
             for i in 0..<(M * K) {
                 let v = Float((i % 13) - 6) * 0.05
@@ -152,7 +152,7 @@ final class QWBatchedGemmTests: XCTestCase {
         let input = try activations.allocate(QWTensorShape([M * K], .f16))
         var inputData = [UInt16](repeating: 0, count: M * K)
         for i in inputData.indices { inputData[i] = Float16(Float(i % 19 - 9) / 23).bitPattern }
-        inputData.withUnsafeBytes { arena.copyIn(input, from: Data($0)) }
+        inputData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in arena.copyIn(input, from: Data(raw)) }
         let partial = try activations.allocate(QWTensorShape([M * N], .f16))
         let reference = try activations.allocate(partial.shape)
         let dummy32 = try activations.allocate(QWTensorShape([M * N], .f32))
@@ -234,7 +234,7 @@ final class QWBatchedGemmTests: XCTestCase {
         let y64 = try act.allocate(QWTensorShape([M * N], .f16))
         let y128 = try act.allocate(QWTensorShape([M * N], .f16))
         var xData = Data(count: M * K * 2)
-        xData.withUnsafeMutableBytes { raw in
+        xData.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             let values = raw.bindMemory(to: UInt16.self)
             for i in 0..<(M * K) {
                 values[i] = Float16(Float((i % 19) - 9) * 0.025).bitPattern

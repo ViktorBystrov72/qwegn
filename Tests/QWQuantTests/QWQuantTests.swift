@@ -14,12 +14,22 @@ final class QWQuantTests: XCTestCase {
         let location = try QWModelLocation(url: root)
         XCTAssertEqual(location.weights, weights)
         XCTAssertEqual(location.assets, root.appendingPathComponent("assets", isDirectory: true))
+        let legacy = try QWModelLocation(url: weights)
+        XCTAssertEqual(legacy.assets.path, weights.path + ".assets")
+        XCTAssertThrowsError(try QWQuant.Pack(url: root)) { err in
+            guard case QWModelRootError.missingConfig = err else { return XCTFail("\(err)") }
+        }
+        try FileManager.default.createDirectory(at: location.assets, withIntermediateDirectories: true)
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        try FileManager.default.copyItem(
+            at: repoRoot.appendingPathComponent("Scripts/oracle/config_golden.json"),
+            to: location.assets.appendingPathComponent("config.json")
+        )
         let pack = try QWQuant.Pack(url: root)
         XCTAssertEqual(pack.url, weights)
         XCTAssertEqual(try pack.dequantQ4g("w_test"),
-                       try QWQuant.Pack(url: weights).dequantQ4g("w_test"))
-        let legacy = try QWModelLocation(url: weights)
-        XCTAssertEqual(legacy.assets.path, weights.path + ".assets")
+                       try QWQuant.Pack(url: weights, descriptor: .qwen38_27b).dequantQ4g("w_test"))
         let override = root.appendingPathComponent("external-assets")
         XCTAssertEqual(try QWModelLocation(url: root, assetsOverride: override).assets, override)
         try FileManager.default.removeItem(at: weights)
@@ -49,7 +59,7 @@ final class QWQuantTests: XCTestCase {
         let base = d.startIndex + 10 + hdrLen
         let n = (d.count - (10 + hdrLen)) / 4
         var out = [Float](repeating: 0, count: n)
-        d.withUnsafeBytes { raw in
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let p = raw.baseAddress!.advanced(by: base).assumingMemoryBound(to: Float.self)
             for i in 0..<n { out[i] = p[i] }
         }
@@ -57,7 +67,7 @@ final class QWQuantTests: XCTestCase {
     }
 
     func testSwiftReaderMatchesNumpyDequant() throws {
-        let pack = try QWQuant.Pack(url: Self.fixtures)
+        let pack = try QWQuant.Pack(url: Self.fixtures, descriptor: .qwen38_27b)
         let dq4 = try pack.dequantQ4g("w_test")
         let ref4 = try Self.readNpyF32(URL(fileURLWithPath: Self.fixtures.path + ".dq4.npy"))
         XCTAssertEqual(dq4.count, ref4.count)
@@ -75,7 +85,7 @@ final class QWQuantTests: XCTestCase {
     }
 
     func testRawBf16Plane() throws {
-        let pack = try QWQuant.Pack(url: Self.fixtures)
+        let pack = try QWQuant.Pack(url: Self.fixtures, descriptor: .qwen38_27b)
         let e = try pack.entry("norm_test")
         XCTAssertTrue(e.isRawBf16, "norm_test must be a raw plane")
         XCTAssertFalse(e.quantized)
@@ -106,7 +116,7 @@ final class QWQuantTests: XCTestCase {
         bad[at] = bad[at] == UInt8(ascii: "0") ? UInt8(ascii: "1") : UInt8(ascii: "0")
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("bad.qwp")
         try bad.write(to: tmp)
-        XCTAssertThrowsError(try QWQuant.Pack(url: tmp)) { err in
+        XCTAssertThrowsError(try QWQuant.Pack(url: tmp, descriptor: .qwen38_27b)) { err in
             guard case QWQuantError.geometryMismatch = err else { return XCTFail("\(err)") }
         }
     }
@@ -153,5 +163,39 @@ final class QWQuantTests: XCTestCase {
             dir = dir.deletingLastPathComponent()
         }
         return nil
+    }
+
+    func testLiveInstalledPacksValidateWithoutFallback() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != nil, "requires bare-metal ~/.qwg/models")
+        let modelsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".qwg/models")
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: modelsDir.path), "~/.qwg/models absent")
+        let entries = try FileManager.default.contentsOfDirectory(at: modelsDir, includingPropertiesForKeys: [.isDirectoryKey])
+        var validated = 0
+        for dir in entries where (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+            guard FileManager.default.fileExists(atPath: dir.appendingPathComponent("model.qwp").path) else { continue }
+            let cfgURL = dir.appendingPathComponent("assets/config.json")
+            guard FileManager.default.fileExists(atPath: cfgURL.path) else { continue }
+            let name = dir.lastPathComponent.lowercased()
+            if name.contains("dflash") || name.contains("dspine") {
+                let d = try QWModelDescriptor.decodeDrafter(configJSON: Data(contentsOf: cfgURL))
+                let pk = try QWQuant.Pack(url: dir, descriptor: d)
+                XCTAssertEqual(pk.descriptor.role, .speculativeDrafter, dir.lastPathComponent)
+            } else {
+                let pk = try QWQuant.Pack(url: dir)
+                XCTAssertNotEqual(pk.descriptor.role, .speculativeDrafter, dir.lastPathComponent)
+            }
+            validated += 1
+        }
+        XCTAssertGreaterThan(validated, 0)
+    }
+}
+
+private extension QWQuant {
+    static func f16bits(_ bits: UInt16) -> Double {
+        let sign: Double = (bits >> 15) & 1 == 1 ? -1 : 1
+        let e = Int((bits >> 10) & 0x1F), m = Int(bits & 0x3FF)
+        if e == 0 { return sign * Double(m) * pow(2.0, -24) }
+        if e == 31 { return m != 0 ? .nan : sign * .infinity }
+        return sign * (1.0 + Double(m) / 1024.0) * pow(2.0, Double(e - 15))
     }
 }

@@ -5,10 +5,21 @@ import XCTest
 /// room, the disk answers the rest, and neither tier is advertised
 /// without the plumbing that feeds it.
 final class FNPrefixCacheWiringTests: XCTestCase {
-    private static let cacheSource = "Sources/Subsystems/QWFlashNext/GPU/FNPrefixCache.swift"
-    private static let engineSource = "Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift"
+    private static let cacheSources = [
+        "Sources/Subsystems/QWFlashNext/GPU/FNPrefixCache.swift",
+        "Sources/Subsystems/QWFlashNext/GPU/FNPrefixCache+Save.swift",
+    ]
+    private static let engineSources = [
+        "Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift",
+        "Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine+Seam.swift",
+    ]
     private static let moduleSource = "Sources/Runtime/QWEngine/Module/FlashNextModule.swift"
     private static let generationSource = "Sources/Runtime/QWEngine/Module/FlashNextGeneration.swift"
+
+    /// The source of a file (or split family of files), read from the package root.
+    private static func read(_ relativePaths: [String]) throws -> String {
+        try relativePaths.map { try read($0) }.joined(separator: "\n")
+    }
 
     /// The source of a file, read from the package root.
     private static func read(_ relativePath: String) throws -> String {
@@ -22,7 +33,7 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     /// The RAM answers before the disk does. The order is the policy: a
     /// hit in the RAM costs no disk at all.
     func testTheRamTierIsAskedBeforeTheDisk() throws {
-        let source = try Self.read(Self.cacheSource)
+        let source = try Self.read(Self.cacheSources)
         let warm = try XCTUnwrap(source.range(of: "prefixCacheWarmStore, let blob = warm.blob(name: exactName)"),
                                   "the lookup no longer asks the RAM for the exact prefix")
         let cold = try XCTUnwrap(source.range(of: "readPrefixFile(url: exactURL"),
@@ -34,7 +45,7 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     /// The disk tier is read only when it is on. With no room on the
     /// disk there is nothing to read.
     func testTheDiskIsOnlyReadWhenTheColdTierIsOn() throws {
-        let source = try Self.read(Self.cacheSource)
+        let source = try Self.read(Self.cacheSources)
         XCTAssertTrue(source.contains("guard prefixCacheSSDByteLimit > 0, let cacheDir else { return nil }"),
                       "the disk tier must be gated on the cold limit")
     }
@@ -42,7 +53,7 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     /// With no tier to hold it, the prefix is not built at all: the
     /// blob is a hundred megabytes of copy.
     func testNothingIsBuiltWhenNoTierCanHoldIt() throws {
-        let source = try Self.read(Self.cacheSource)
+        let source = try Self.read(Self.cacheSources)
         XCTAssertTrue(source.contains("guard prefixCacheSSDByteLimit > 0 || prefixCacheWarmStore != nil else { return }"),
                       "the save path must not build a prefix no tier can hold")
     }
@@ -50,7 +61,7 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     /// A prefix the cold tier cannot hold is not written to it: the
     /// tier stays inside the limit the settings gave it.
     func testTheColdTierNeverGrowsPastItsLimit() throws {
-        let source = try Self.read(Self.cacheSource)
+        let source = try Self.read(Self.cacheSources)
         XCTAssertTrue(source.contains("if out.count <= prefixCacheSSDByteLimit {"),
                       "a prefix bigger than the cold limit must not be written to it")
     }
@@ -68,7 +79,7 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     /// The engine runs its cache paths when a tier is on, not when a
     /// directory happens to be there.
     func testTheEngineRunsItsCacheWhenATierIsOn() throws {
-        let source = try Self.read(Self.engineSource)
+        let source = try Self.read(Self.engineSources)
         XCTAssertTrue(source.contains("if hasPrefixCacheTier,"),
                       "the lookup must run when a tier is on")
         XCTAssertFalse(source.contains("if let cacheDir = prefixCacheDirectory,\n               let restored"),
@@ -76,7 +87,7 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     }
 
     func testPromptsAbove4096TokensAreNotRejectedBySavePrefixCache() throws {
-        let source = try Self.read(Self.cacheSource)
+        let source = try Self.read(Self.cacheSources)
         XCTAssertFalse(source.contains("N <= 4096"),
                        "savePrefixCache must not cap cached prefixes at 4096 tokens")
         XCTAssertTrue(source.contains("guard N >= 128 else { return }"),
@@ -84,7 +95,7 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     }
 
     func testColdSSDSavesEvenWhenWarmStoreIsPresent() throws {
-        let source = try Self.read(Self.cacheSource)
+        let source = try Self.read(Self.cacheSources)
         XCTAssertFalse(source.contains("prefixCacheWarmStore == nil"),
                        "Cold SSD write must not be skipped when Warm RAM store is enabled")
     }

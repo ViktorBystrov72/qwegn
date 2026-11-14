@@ -3,7 +3,7 @@ import XCTest
 
 final class QWEnginePrefixStoreTests: XCTestCase {
     func testExactPolicyLongestEligiblePrefixAndLRU() throws {
-        let store = try QWEnginePrefixStore<Int>(byteLimit: 128, entryLimit: 3)
+        let store = try QWEnginePrefixStore<Int>(byteLimit: 128, entryLimit: 3, vocab: 1000)
         XCTAssertTrue(try store.insert(tokens: [11], mode: "a", value: 1, payloadBytes: 8, allowsSuffix: true))
         XCTAssertTrue(try store.insert(tokens: [11, 22], mode: "a", value: 2, payloadBytes: 8, allowsSuffix: true))
         XCTAssertTrue(try store.insert(tokens: [11, 22, 33], mode: "a", value: 3, payloadBytes: 8))
@@ -18,7 +18,7 @@ final class QWEnginePrefixStoreTests: XCTestCase {
     }
 
     func testChargeReplacementOversizeAndRefusalHaveNoEvictionSideEffects() throws {
-        let store = try QWEnginePrefixStore<Int>(byteLimit: 32)
+        let store = try QWEnginePrefixStore<Int>(byteLimit: 32, vocab: 1000)
         XCTAssertTrue(try store.insert(tokens: [11], mode: "a", value: 1, payloadBytes: 8))
         XCTAssertEqual(store.chargedBytes, 17)
         XCTAssertTrue(try store.insert(tokens: [11], mode: "a", value: 2, payloadBytes: 16))
@@ -34,11 +34,11 @@ final class QWEnginePrefixStoreTests: XCTestCase {
         XCTAssertTrue(store.evictOldest())
         XCTAssertEqual(store.chargedBytes, 0)
         XCTAssertFalse(store.evictOldest())
-        XCTAssertThrowsError(try QWEnginePrefixStore<Int>(byteLimit: 0))
+        XCTAssertThrowsError(try QWEnginePrefixStore<Int>(byteLimit: 0, vocab: 1000))
     }
 
     func testPolicyBytesAreChargedAndOversizedReplacementPreservesEntry() throws {
-        let store = try QWEnginePrefixStore<Int>(byteLimit: 16)
+        let store = try QWEnginePrefixStore<Int>(byteLimit: 16, vocab: 1000)
         XCTAssertTrue(try store.insert(tokens: [11], mode: "policy", value: 1, payloadBytes: 2))
         XCTAssertEqual(store.chargedBytes, 16)
         XCTAssertEqual(try store.keyBytes(tokens: [11], mode: "policy"), 14)
@@ -51,7 +51,7 @@ final class QWEnginePrefixStoreTests: XCTestCase {
     }
 
     func testIncrementalAgentPromptsMatchLongestPrefix() throws {
-        let store = try QWEnginePrefixStore<String>(byteLimit: 1024, entryLimit: 10)
+        let store = try QWEnginePrefixStore<String>(byteLimit: 1024, entryLimit: 10, vocab: 1000)
         let mode = "chunked:nax_x64"
 
         // Turn 1: System prompt + User request 1

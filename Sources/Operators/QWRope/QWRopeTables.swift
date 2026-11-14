@@ -17,8 +17,7 @@ import QWCore
 /// measured bound, not bitwise.
 ///
 /// TEXT-ONLY fast path (the engine's decode/prefill reality): position.t =
-/// position.h = position.w ⇒ the (11,11,10) interleaved selection is a NO-OP;
-/// `cosSinRowMrope` still routes per-pair axes for the vision path.
+/// position.h = position.w ⇒ the (11,11,10) interleaved selection is a NO-OP.
 
 public struct QWYaRNConfig: Sendable, Hashable {
     public let factor: Float
@@ -26,7 +25,7 @@ public struct QWYaRNConfig: Sendable, Hashable {
     public let betaFast: Float
     public let betaSlow: Float
     public let truncate: Bool
-    public init(factor: Float, originalMaxPosition: Int = QWModelGeometry.qwen38_27b.maxPositionEmbeddings,
+    public init(factor: Float, originalMaxPosition: Int,
                 betaFast: Float = 32, betaSlow: Float = 1, truncate: Bool = true) {
         self.factor = factor; self.originalMaxPosition = originalMaxPosition
         self.betaFast = betaFast; self.betaSlow = betaSlow; self.truncate = truncate
@@ -34,7 +33,7 @@ public struct QWYaRNConfig: Sendable, Hashable {
 
     public static func config1M(
         targetContext: Int = 1_048_576,
-        originalMaxPosition: Int = QWModelGeometry.qwen38_27b.maxPositionEmbeddings,
+        originalMaxPosition: Int,
         betaFast: Float = 32,
         betaSlow: Float = 1,
         truncate: Bool = true
@@ -80,7 +79,7 @@ public final class QWRopeTables: @unchecked Sendable {
 
     /// HF compute_default_rope_parameters: inv_freq[i] = θ^(−2i/dim), dim=64,
     /// in Float (torch float32) — base ** (arange/dim) is the f32 tensor op.
-    static func invFreqDefault(theta: Float = 1e7, rotaryDims: Int = QWModelGeometry.qwen38_27b.rotaryDims) -> [Float] {
+    static func invFreqDefault(theta: Float = 1e7, rotaryDims: Int) -> [Float] {
         let dim = Float(rotaryDims)
         let pairs = rotaryDims / 2
         return (0..<pairs).map { 1.0 / pow(theta, Float($0) * 2.0 / dim) }   // f32 pow
@@ -135,29 +134,6 @@ public final class QWRopeTables: @unchecked Sendable {
         // a REAL contract (spec 07), so it gets real concurrency (static fn:
         // concurrentPerform may not capture self pre-init).
         self.cosSin = Self.fill(rows: rows, invf: invf, scaling: attentionScaling)
-    }
-
-    /// Row for a scalar text position ([cos, sin] f32, width floats).
-    public func cosSinRow(_ p: Int) -> [Float] {
-        precondition((0..<rows).contains(p), "position \(p) beyond table rows \(rows)")
-        return Array(cosSin[p * width ..< (p + 1) * width])
-    }
-
-    /// mrope (vision) row per HF recomposition_frequencies. HF loop:
-    /// `for dim, offset in enumerate((1,2), start=1)` (H=1, W=2) replaces
-    /// `freqs_thw[dim][idx]` at idx = offset, offset+3, … (residue ≡ dim mod 3,
-    public func cosSinRowMrope(_ posThw: (t: Int, h: Int, w: Int)) -> [Float] {
-        let invf = yarn.map { Self.invFreqYarn($0, geometry: geometry).invf }
-            ?? Self.invFreqDefault(theta: Float(geometry.ropeTheta), rotaryDims: geometry.rotaryDims)
-        let (t, h, w) = (Float(posThw.t), Float(posThw.h), Float(posThw.w))
-        var row = [Float](repeating: 0, count: width)
-        for i in 0..<pairs {
-            let pos = i % 3 == 0 ? t : (i % 3 == 1 ? h : w)
-            let f = pos * invf[i]
-            row[i] = Foundation.cos(f) * attentionScaling
-            row[pairs + i] = Foundation.sin(f) * attentionScaling
-        }
-        return row
     }
 
     /// Parallel table fill: [rows][2·pairs] f32 rows = [cos, sin].

@@ -32,7 +32,8 @@ public struct QWMultimodalPrompt: Sendable {
         promptTokens: [Int],
         images: [(grid: QWVisionGrid, features: [Float])],
         videos: [(grid: QWVisionGrid, features: [Float])] = [],
-        hiddenDim: Int = QWModelGeometry.qwen38_27b.hidden
+        hiddenDim: Int,
+        spec: QWMMSpec = .qwen3VLReference
     ) throws {
         self.originalTokens = promptTokens
         self.hiddenDim = hiddenDim
@@ -58,7 +59,7 @@ public struct QWMultimodalPrompt: Sendable {
         }
 
         self.visualTokens = allVisTokens
-        self.plan = try QWX0Plan(tokens: promptTokens, images: imageGrids, videos: videoGrids)
+        self.plan = try QWX0Plan(tokens: promptTokens, images: imageGrids, videos: videoGrids, spec: spec)
         self.expandedTokens = plan.tokens
     }
 
@@ -75,28 +76,5 @@ public struct QWMultimodalPrompt: Sendable {
             }
         }
         return out
-    }
-
-    /// Resolves the full X0 slab with text embeddings and visual features interleaved.
-    public func resolveX0(textEmbedder: (Int) throws -> [Float]) throws -> [Float] {
-        var textEmbeddings: [Float] = []
-        for span in plan.spans {
-            if case let .text(tokenStart, count) = span.content {
-                for i in 0..<count {
-                    let tok = expandedTokens[tokenStart + i]
-                    let emb = try textEmbedder(tok)
-                    guard emb.count == hiddenDim else {
-                        throw QWMultimodalError.featureDimensionMismatch(expected: hiddenDim, actual: emb.count)
-                    }
-                    textEmbeddings.append(contentsOf: emb)
-                }
-            }
-        }
-        return try qwInterleaveX0(
-            textEmbeddings: textEmbeddings,
-            visualTokens: visualTokens,
-            plan: plan,
-            hiddenDim: hiddenDim
-        )
     }
 }

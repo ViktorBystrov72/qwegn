@@ -340,31 +340,31 @@ final class QWServerSchemaTests: XCTestCase {
 
         let glm5TemplatePath = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".qwg/models/GLM-5.3-Flash/assets/chat_template.jinja").path
-        guard FileManager.default.fileExists(atPath: glm5TemplatePath) else {
-            throw XCTSkip("requires a local GLM-5.3-Flash model pack; skipped")
+        if ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == nil,
+           FileManager.default.fileExists(atPath: glm5TemplatePath) {
+            let src = try String(contentsOfFile: glm5TemplatePath, encoding: .utf8)
+            let tpl = try QWChatTemplate(source: src)
+            let reqJson = """
+            {
+              "model": "GLM-5.3-Flash",
+              "messages": [
+                {"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\\"city\\":\\"Paris\\",\\"days\\":3}"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\\"temp\\": 22}"}
+              ],
+              "tools": [{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}}]
+            }
+            """
+            let req = try JSONDecoder().decode(ChatCompletionRequest.self, from: Data(reqJson.utf8))
+            var opts = QWChatTemplateOptions()
+            opts.addGenerationPrompt = true
+            opts.enableThinking = .bool(false)
+            opts.tools = .array(req.tools ?? [])
+            let rendered = try tpl.render(messages: req.toQWJsonMessages(), options: opts)
+            XCTAssertTrue(rendered.contains("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"))
+            XCTAssertTrue(rendered.contains("<|observation|><tool_response>{\"temp\": 22}</tool_response>"))
+            XCTAssertTrue(rendered.hasSuffix("<|assistant|>\u{3c}think\u{3e}\u{3c}/think\u{3e}"))
         }
-        let src = try String(contentsOfFile: glm5TemplatePath, encoding: .utf8)
-        let tpl = try QWChatTemplate(source: src)
-        let reqJson = """
-        {
-          "model": "GLM-5.3-Flash",
-          "messages": [
-            {"role": "user", "content": "Weather in Paris?"},
-            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\\"city\\":\\"Paris\\",\\"days\\":3}"}}]},
-            {"role": "tool", "tool_call_id": "call_1", "content": "{\\"temp\\": 22}"}
-          ],
-          "tools": [{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}}]
-        }
-        """
-        let req = try JSONDecoder().decode(ChatCompletionRequest.self, from: Data(reqJson.utf8))
-        var opts = QWChatTemplateOptions()
-        opts.addGenerationPrompt = true
-        opts.enableThinking = .bool(false)
-        opts.tools = .array(req.tools ?? [])
-        let rendered = try tpl.render(messages: req.toQWJsonMessages(), options: opts)
-        XCTAssertTrue(rendered.contains("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"))
-        XCTAssertTrue(rendered.contains("<|observation|><tool_response>{\"temp\": 22}</tool_response>"))
-        XCTAssertTrue(rendered.hasSuffix("<|assistant|>\u{3c}think\u{3e}\u{3c}/think\u{3e}"))
     }
 
     func testResolveReplyModelNameAndKeepaliveGate() {

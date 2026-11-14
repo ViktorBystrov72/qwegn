@@ -47,7 +47,7 @@ final class QWTwoTierCacheTests: XCTestCase {
         let events = Events()
         var buffer = [UInt8](repeating: 0, count: 8)
         let result: Void? = QWCacheIO.attempt(.restore, onEvent: { events.value = $0 }) {
-            try buffer.withUnsafeMutableBytes { raw in
+            try buffer.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
                 try QWCacheDiskManager.readExactly(io, offset: 0, into: raw.baseAddress!, length: raw.count)
             }
         }

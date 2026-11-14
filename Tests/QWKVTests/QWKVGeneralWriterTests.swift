@@ -80,8 +80,8 @@ final class QWKVGeneralWriterTests: XCTestCase {
                                                        options: .storageModeShared))
         let vBuf = try XCTUnwrap(hal.device.makeBuffer(length: vIn.count * 2,
                                                        options: .storageModeShared))
-        _ = kIn.withUnsafeBytes { memcpy(kBuf.contents(), $0.baseAddress!, $0.count) }
-        _ = vIn.withUnsafeBytes { memcpy(vBuf.contents(), $0.baseAddress!, $0.count) }
+        _ = kIn.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in memcpy(kBuf.contents(), raw.baseAddress!, raw.count) }
+        _ = vIn.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in memcpy(vBuf.contents(), raw.baseAddress!, raw.count) }
 
         let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
         let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
@@ -173,7 +173,7 @@ final class QWKVGeneralWriterTests: XCTestCase {
         XCTAssertEqual(rowElems, 2 * 128)
         XCTAssertEqual(QWKVCache.pageBytes(mode: .f16, geometry: geometry),
                        QWKVCache.pageTokens * rowElems * 2)
-        XCTAssertEqual(QWKVCache.pageBytes(mode: .f16),
+        XCTAssertEqual(QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b),
                        QWKVCache.pageBytes(mode: .f16, geometry: .qwen38_27b))
     }
 
@@ -239,26 +239,56 @@ final class QWKVGeneralWriterTests: XCTestCase {
         }
     }
 
-    /// A compressed mode is the 27B's layout: a cache on any other geometry
-    /// refuses it, and so does the host-side compressed fill.
-    func testACompressedModeIsRefusedOffThe27BShape() throws {
+    /// Compressed `.q8` and `.q4` KV modes generalize across non-27B shapes
+    /// using the model's own geometry and `QWKVCompressedLayout`.
+    func testCompressedModesRoundTripOffThe27BShape() throws {
         let geometry = try Self.tinyGeometry()
         let hal = try QWHal(geometry: geometry)
         let layers = [0]
+        let rowElems = geometry.kvHeads * geometry.headDim
         let tables = QWKVCache.tableSlotBytes * 2 * layers.count * QWKVCache.maxSeqs
-        func arena(_ mode: QWKVMode) throws -> QWArena {
-            let pageBytes = QWKVCache.pageBytes(mode: mode, geometry: .qwen38_27b)
-            return try QWArena(hal: hal, weights: 0, activations: 0,
-                               kv: pageBytes * 2 * layers.count + tables, gdnStates: 4096)
-        }
-        // The cache constructs on any geometry; the compressed layout is
-        // enforced where data is written (QWKVCache.append), by name.
-        let cache = try QWKVCache(hal: hal, arena: try arena(.q8), layers: layers,
-                                  mode: .q8, geometry: geometry)
-        let h = try cache.allocate(promptTokens: 1)
-        let src = [UInt16](repeating: 0, count: geometry.kvHeads * geometry.headDim)
-        XCTAssertThrowsError(try cache.append(h, positions: 0..<1, layer: 0, kind: .k, src: src)) { e in
-            XCTAssertTrue("\(e)".contains("27B"), "the refusal names the law: \(e)")
+        let srcFloats = (0..<(2 * rowElems)).map { Float(($0 % 31) - 15) * 0.125 }
+        let src = srcFloats.map { Float16($0).bitPattern }
+
+        for (mode, tol): (QWKVMode, Float) in [(.q8, 0.03), (.q4, 0.25)] {
+            let pageBytes = QWKVCache.pageBytes(mode: mode, geometry: geometry)
+            let arena = try QWArena(hal: hal, weights: 0, activations: 0,
+                                    kv: pageBytes * 2 * layers.count + tables, gdnStates: 4096)
+            let cache = try QWKVCache(hal: hal, arena: arena, layers: layers, mode: mode, geometry: geometry)
+            let h = try cache.allocate(promptTokens: 2)
+            try cache.append(h, positions: 0..<2, layer: 0, kind: .k, src: src)
+            let views = try cache.layerViews(h, layer: 0)
+            let layout = QWKVCompressedLayout(mode: mode, geometry: geometry)
+            let pageBase = views.k.pool.buffer.contents().advanced(by: views.k.pool.base)
+            let effHeads = geometry.kvHeads
+            let effHeadDim = geometry.headDim
+            var decoded = [Float](repeating: 0, count: rowElems)
+            for tok in 0..<2 {
+                if mode == .q8 {
+                    let qPtr = pageBase.advanced(by: tok * rowElems).assumingMemoryBound(to: Int8.self)
+                    let sPtr = pageBase.advanced(by: layout.dataBytesPerPage + tok * (effHeads * 2))
+                        .assumingMemoryBound(to: Float16.self)
+                    try QWKVCompressedLayout.dequantizeQ8(
+                        qIn: Array(UnsafeBufferPointer(start: qPtr, count: rowElems)),
+                        scalesIn: Array(UnsafeBufferPointer(start: sPtr, count: effHeads)),
+                        out: &decoded, kvHeads: effHeads, headDim: effHeadDim)
+                } else {
+                    let groupsPerHead = max(1, (effHeadDim + 127) / 128)
+                    let totalGroups = effHeads * groupsPerHead
+                    let qPtr = pageBase.advanced(by: tok * (rowElems / 2)).assumingMemoryBound(to: UInt8.self)
+                    let hPtr = pageBase.advanced(by: layout.dataBytesPerPage + tok * (totalGroups * 4))
+                        .assumingMemoryBound(to: Float16.self)
+                    let sc = (0..<totalGroups).map { hPtr[2 * $0] }
+                    let mn = (0..<totalGroups).map { hPtr[2 * $0 + 1] }
+                    try QWKVCompressedLayout.dequantizeQ4(
+                        qIn: Array(UnsafeBufferPointer(start: qPtr, count: rowElems / 2)),
+                        scalesIn: sc, minsIn: mn, out: &decoded, kvHeads: effHeads, headDim: effHeadDim)
+                }
+                for e in 0..<rowElems {
+                    XCTAssertEqual(decoded[e], Float(Float16(bitPattern: src[tok * rowElems + e])),
+                                   accuracy: tol, "\(mode) tok=\(tok) e=\(e)")
+                }
+            }
         }
     }
 

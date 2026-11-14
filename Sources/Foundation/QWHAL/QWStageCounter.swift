@@ -89,7 +89,6 @@ public final class QWGPUStageProfiler<Stage: Hashable & Sendable> {
 
     /// False once the segment budget is spent; callers fall back to plain doors.
     public var hasSegmentCapacity: Bool { segments.count < capacity }
-    public var segmentCount: Int { segments.count }
 
     /// Encoder with start/end timestamp samples booked under `stage`.
     public func makeEncoder(commandBuffer: any MTLCommandBuffer,
@@ -147,7 +146,7 @@ public final class QWGPUStageProfiler<Stage: Hashable & Sendable> {
         }
         let stride = MemoryLayout<MTLCounterResultTimestamp>.stride
         guard resolved.count >= window.usedSamples * stride else { throw ProfileError.sampleResolution }
-        return resolved.withUnsafeBytes { raw in
+        return resolved.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             (0..<window.usedSamples).map { index in
                 raw.loadUnaligned(fromByteOffset: index * stride,
                                   as: MTLCounterResultTimestamp.self).timestamp

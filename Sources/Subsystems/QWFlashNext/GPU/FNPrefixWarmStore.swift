@@ -13,7 +13,7 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
     public static var maxSlots: Int { defaultMaxSlots }
     public static let rootPrefixTokenCount = QWSlotPinnedLRUStore<String, Data>.defaultRootPrefixTokenCount
 
-    private let core: QWSlotPinnedLRUStore<String, Data>
+    let core: QWSlotPinnedLRUStore<String, Data>
     public var onEvict: ((Int, Int) -> Void)?
 
     public init(byteLimit: Int, maxSlots: Int = FNPrefixWarmStore.defaultMaxSlots) {
@@ -52,10 +52,6 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
         core.isEnabled && (core.sharedBaseBytes + bytes <= core.byteLimit)
     }
 
-    public func isProtectedLastEntry(_ name: String, excludingSlot: Int? = nil) -> Bool {
-        core.isProtectedLastKey(name, excludingSlot: excludingSlot)
-    }
-
     public func isSharedBaseEntry(_ name: String) -> Bool {
         core.isSharedBaseKey(name)
     }
@@ -92,13 +88,6 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
 
     public func makeRoom(for incomingBytes: Int, activeSlot: Int? = nil) {
         core.makeRoom(for: incomingBytes, activeSlot: activeSlot)
-    }
-
-    public func evictPrefixes(of history: [Int64], kvMode: FNKVStorageMode, hasMTP: Bool) {
-        core.evictMatchingPrefixes(maxTokenCount: history.count) { name, count in
-            let expected = FNGPUEngine.fnPrefixHash(tokens: history.prefix(count), kvMode: kvMode, hasMTP: hasMTP)
-            return Self.hash(in: name) == String(format: "%016llx", expected)
-        }
     }
 
     public func store(name: String, blob: Data, slot: Int? = nil, rootHash: UInt64? = nil,

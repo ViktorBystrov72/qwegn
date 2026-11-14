@@ -29,10 +29,12 @@ public enum QWGDNF32 {
                                             w: QWTensorValue, stIn: QWTensorValue, stOut: QWTensorValue,
                                             b: QWTensorValue, a: QWTensorValue, aLog: QWTensorValue,
                                             dtBias: QWTensorValue, y: QWTensorValue, glog: QWTensorValue,
-                                            beta: QWTensorValue, rows: Int, xStride: Int = 10240) throws {
+                                            beta: QWTensorValue, rows: Int, xStride: Int = 10240,
+                                            baStride: Int? = nil) throws {
+        let stride = baStride ?? (aLog.bytes / 4)
         enc.setComputePipelineState(try hal.pipeline("qwg_gdn_conv_prep_seq_f32"))
         enc.bindTensors(x, w, stIn, stOut, b, a, aLog, dtBias, y, glog, beta, startIndex: 0)
-        enc.setUInt32s(rows, xStride, startIndex: 11)
+        enc.setUInt32s(rows, xStride, stride, startIndex: 11)
         enc.dispatchThreadgroups(MTLSize(width: 64, height: rows, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
     }

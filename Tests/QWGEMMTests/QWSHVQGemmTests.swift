@@ -47,7 +47,7 @@ final class QWSHVQGemmTests: XCTestCase {
             for g in 0..<groups {
                 let off = (r * groups + g) * gBytes
                 let sub = bank.subdata(in: off..<(off + gBytes))
-                sub.withUnsafeBytes { QWSHVQBlock.unpack(group: $0, bits: bits, group: group, into: &tmp) }
+                sub.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWSHVQBlock.unpack(group: raw, bits: bits, group: group, into: &tmp) }
                 row.append(contentsOf: tmp)
             }
             rows.append(row)
@@ -528,7 +528,7 @@ final class QWSHVQGemmTests: XCTestCase {
             let gBytes = QWSHVQBlock.bytes(bits: bits, group: group)
             let groups = k / group
             var d = Data(count: n * groups * gBytes)
-            d.withUnsafeMutableBytes { raw in
+            d.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
                 guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
                 var s = seed
                 for r in 0..<n {

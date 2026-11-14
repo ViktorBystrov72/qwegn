@@ -17,7 +17,7 @@ final class QWHQ8PackTests: XCTestCase {
     }
 
     func testEntryFieldsAndPlaneExtents() throws {
-        let pack = try QWQuant.Pack(url: fixture("selfpack_hq8.qwp"))
+        let pack = try QWQuant.Pack(url: fixture("selfpack_hq8.qwp"), descriptor: .qwen38_27b)
         let e = try pack.entry("w_test8")
         XCTAssertEqual(e.shape, [64, 256])
         XCTAssertNotNil(e.hq8Off)
@@ -28,13 +28,13 @@ final class QWHQ8PackTests: XCTestCase {
     }
 
     func testDequantRotMatchesPackerGolden() throws {
-        let pack = try QWQuant.Pack(url: fixture("selfpack_hq8.qwp"))
+        let pack = try QWQuant.Pack(url: fixture("selfpack_hq8.qwp"), descriptor: .qwen38_27b)
         let got = try pack.dequantHQ8Rot("w_test8")
         XCTAssertEqual(got.count, 64 * 256)
         let golden = try Data(contentsOf: fixture("selfpack_hq8.qwp.dq8rot.f32.bin"))
         XCTAssertEqual(golden.count, 64 * 256 * 4)
         var worst: Float = 0
-        golden.withUnsafeBytes { g in
+        golden.withUnsafeBytes { (g: UnsafeRawBufferPointer) in
             let ref = g.bindMemory(to: Float32.self)
             for i in 0..<got.count {
                 worst = max(worst, abs(got[i] - ref[i]))
@@ -44,7 +44,7 @@ final class QWHQ8PackTests: XCTestCase {
     }
 
     func testLegacySelfpackHasNoHQ8Entries() throws {
-        let pack = try QWQuant.Pack(url: fixture("selfpack.qwp"))
+        let pack = try QWQuant.Pack(url: fixture("selfpack.qwp"), descriptor: .qwen38_27b)
         let e = try pack.entry("w_test")
         XCTAssertNil(e.hq8Off)
         XCTAssertNotNil(e.hq4Off)

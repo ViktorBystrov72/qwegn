@@ -243,7 +243,7 @@ extension QWServerSettings {
         lsaClusterBlock = defaults.lsaClusterBlock
         lsaSidecarPath = defaults.lsaSidecarPath
         engineTuning = [:]
-        let isMoE = (descriptor?.numExperts ?? 0) > 0 || descriptor?.family == .qwen38FlashNext
+        let isMoE = (descriptor?.numExperts ?? 0) > 0 || descriptor?.capabilities.contains(.moe) == true
         let hasLargeUnifiedMemory = Double(ProcessInfo.processInfo.physicalMemory) / 1_000_000_000.0 > 36.5
         prefillChunkSize = (isMoE && hasLargeUnifiedMemory) ? 4096 : defaults.prefillChunkSize
         maxConcurrentSessions = defaults.maxConcurrentSessions

@@ -16,12 +16,6 @@ public enum QWBF16 {
         return UInt16(truncatingIfNeeded: rounded >> 16)
     }
 
-    /// Converts a bfloat16 bit pattern back to a 32-bit float.
-    @inline(__always)
-    public static func toFloat(_ u16: UInt16) -> Float {
-        Float(bitPattern: UInt32(u16) << 16)
-    }
-
     /// True when `bits` is a supported MLX affine quantization bit-width (2, 3, 4, 5, 6, or 8).
     @inline(__always)
     public static func isSupportedMLXAffineBits(_ bits: Int) -> Bool {

@@ -67,13 +67,13 @@ extension QWHttpServer {
     }
 
     func sendSSEHeaders(_ connection: NWConnection) {
-        let sseHeaders = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
-        connection.send(content: sseHeaders.data(using: .utf8), isComplete: false, completion: .contentProcessed({ _ in }))
+        let sseHeaders = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\(corsHeaderLines(for: connection))\r\n"
+        connection.send(content: Data(sseHeaders.utf8), isComplete: false, completion: .contentProcessed({ _ in }))
     }
 
     func sendNDJSONHeaders(_ connection: NWConnection) {
-        let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
-        connection.send(content: headers.data(using: .utf8), isComplete: false, completion: .contentProcessed({ _ in }))
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\(corsHeaderLines(for: connection))\r\n"
+        connection.send(content: Data(headers.utf8), isComplete: false, completion: .contentProcessed({ _ in }))
     }
 
     func startSSEKeepalive(connection: NWConnection) -> (gate: QWStreamKeepaliveGate, task: Task<Void, Never>) {
@@ -110,7 +110,10 @@ extension QWHttpServer {
                         }
                     }))
                 }
-                try? await Task.sleep(nanoseconds: 500_000_000)
+                let intervalNs: UInt64 = (snapshot.throughput.phase == "prefill" || snapshot.throughput.phase == "decode")
+                    ? 150_000_000
+                    : 500_000_000
+                try? await Task.sleep(nanoseconds: intervalNs)
             }
             connection.cancel()
         }
@@ -119,17 +122,14 @@ extension QWHttpServer {
     /// The peer is gone: the connection is cancelled or it failed. A
     /// stream must stop building a payload for nobody.
     func isPeerGone(_ connection: NWConnection) -> Bool {
-        if connection.state == .cancelled { return true }
-        if case .failed = connection.state { return true }
-        return false
+        isConnectionTerminated(connection)
     }
 
     /// The published view model, pushed as it changes. The renderer
     /// receives the same model the dashboard endpoint serves.
     /// `/v1/metrics/stream` still serves the raw metrics.
     func handleDashboardStream(connection: NWConnection) {
-        let sseHeaders = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
-        connection.send(content: sseHeaders.data(using: .utf8), isComplete: false, completion: .contentProcessed({ _ in }))
+        sendSSEHeaders(connection)
 
         Task {
             while !Task.isCancelled {
@@ -150,15 +150,17 @@ extension QWHttpServer {
                         }
                     }))
                 }
-                try? await Task.sleep(nanoseconds: 500_000_000)
+                let intervalNs: UInt64 = (model.generation == .prefill || model.generation == .decode)
+                    ? 150_000_000
+                    : 500_000_000
+                try? await Task.sleep(nanoseconds: intervalNs)
             }
             connection.cancel()
         }
     }
 
     func handleLogsStream(connection: NWConnection) {
-        let sseHeaders = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
-        connection.send(content: sseHeaders.data(using: .utf8), isComplete: false, completion: .contentProcessed({ _ in }))
+        sendSSEHeaders(connection)
 
         // Send recent logs first
         let recent = self.logger.getRecentLogs()
@@ -166,7 +168,7 @@ extension QWHttpServer {
             if let json = try? JSONEncoder().encode(["line": line]),
                let str = String(data: json, encoding: .utf8) {
                 let msg = "data: \(str)\n\n"
-                connection.send(content: msg.data(using: .utf8), isComplete: false, completion: .contentProcessed({ _ in }))
+                connection.send(content: Data(msg.utf8), isComplete: false, completion: .contentProcessed({ _ in }))
             }
         }
 
@@ -175,14 +177,12 @@ extension QWHttpServer {
             if let json = try? JSONEncoder().encode(["line": line]),
                let str = String(data: json, encoding: .utf8) {
                 let msg = "data: \(str)\n\n"
-                connection.send(content: msg.data(using: .utf8), isComplete: false, completion: .contentProcessed({ _ in }))
+                connection.send(content: Data(msg.utf8), isComplete: false, completion: .contentProcessed({ _ in }))
             }
         }
 
-        connection.stateUpdateHandler = { [weak self] state in
-            if state == .cancelled {
-                self?.logger.unsubscribe(subId)
-            }
+        registerCancellationHandler(for: connection) { [weak self] in
+            self?.logger.unsubscribe(subId)
         }
     }
 
@@ -199,26 +199,38 @@ extension QWHttpServer {
             relative = "controlbar.html"
         }
 
+        guard isSafeStaticRelativePath(relative) else {
+            sendSimpleResponse(connection, status: 403, body: "Forbidden\n")
+            return
+        }
+
         let fm = FileManager.default
-        // Resolved from the package's resources (see Sources/Apps/QWServer/Resources),
-        // installed bundle locations, and never from the caller's working directory unless last resort.
         let stem = (relative as NSString).deletingPathExtension
         let ext = (relative as NSString).pathExtension
-        let localPath = Self.resolveStaticUIResourcePath(stem: stem, ext: ext, relative: relative, fm: fm)
-
-        if fm.fileExists(atPath: localPath), let data = try? Data(contentsOf: URL(fileURLWithPath: localPath)) {
+        if let localPath = Self.resolveStaticUIResourcePath(stem: stem, ext: ext, relative: relative, fm: fm),
+           fm.fileExists(atPath: localPath),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: localPath)) {
             let contentType = relative.hasSuffix(".svg") ? "image/svg+xml" : (relative.hasSuffix(".js") ? "application/javascript" : "text/html; charset=utf-8")
             sendRawData(connection, status: 200, contentType: contentType, data: data)
         } else {
-            // The file is not there. A page that says "not found" with
-            // status 200 reports a success the server did not have;
-            // the UI is unavailable until it is built.
-            let body = "<html><body style='background:#111318;color:#e2e2e9;font-family:sans-serif;padding:24px;'><h2>QWEGN Controlbar</h2><p>The control bar UI is not installed at <code>\(localPath)</code>.</p><p>Build it: <code>make build</code></p></body></html>"
+            let escapedPath = QWHttpSecurity.escapeHTML(relative)
+            let body = "<html><body style='background:#111318;color:#e2e2e9;font-family:sans-serif;padding:24px;'><h2>QWEGN Controlbar</h2><p>The control bar UI resource <code>\(escapedPath)</code> is not installed.</p><p>Build it: <code>make build</code></p></body></html>"
             sendRawData(connection, status: 503, contentType: "text/html; charset=utf-8", data: Data(body.utf8))
         }
     }
 
-    private static func resolveStaticUIResourcePath(stem: String, ext: String, relative: String, fm: FileManager) -> String {
+    private func isSafeStaticRelativePath(_ relative: String) -> Bool {
+        guard !relative.isEmpty,
+              !relative.hasPrefix("/"),
+              !relative.contains("\\"),
+              !relative.contains("\0") else {
+            return false
+        }
+        let components = relative.split(separator: "/", omittingEmptySubsequences: false)
+        return !components.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." })
+    }
+
+    private static func resolveStaticUIResourcePath(stem: String, ext: String, relative: String, fm: FileManager) -> String? {
         let execDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
         let bundleCandidates = [
             Bundle.main.resourceURL?.appendingPathComponent("qwegine_QWServer.bundle"),
@@ -228,13 +240,28 @@ extension QWHttpServer {
             URL(fileURLWithPath: "/Applications/Qwegn.app/Contents/Resources/qwegine_QWServer.bundle"),
         ].compactMap { $0 }
         for bURL in bundleCandidates {
-            if let b = Bundle(url: bURL), let hit = b.url(forResource: stem, withExtension: ext) {
-                return hit.path
+            if let b = Bundle(url: bURL), let hit = containedResourcePath(bundle: b, stem: stem, ext: ext) {
+                return hit
             }
         }
-        if let hit = Bundle.module.url(forResource: stem, withExtension: ext) {
-            return hit.path
+        if let hit = containedResourcePath(bundle: Bundle.module, stem: stem, ext: ext) {
+            return hit
         }
-        return (fm.currentDirectoryPath as NSString).appendingPathComponent(relative)
+        let devStaticRoot = URL(fileURLWithPath: fm.currentDirectoryPath)
+            .appendingPathComponent("Sources/Apps/QWServer/Resources", isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let candidate = devStaticRoot.appendingPathComponent(relative).resolvingSymlinksInPath().standardizedFileURL
+        let rootPrefix = devStaticRoot.path.hasSuffix("/") ? devStaticRoot.path : devStaticRoot.path + "/"
+        return candidate.path.hasPrefix(rootPrefix) && fm.fileExists(atPath: candidate.path) ? candidate.path : nil
+    }
+
+    private static func containedResourcePath(bundle: Bundle, stem: String, ext: String) -> String? {
+        guard let root = bundle.resourceURL?.resolvingSymlinksInPath().standardizedFileURL,
+              let hit = bundle.url(forResource: stem, withExtension: ext)?.resolvingSymlinksInPath().standardizedFileURL else {
+            return nil
+        }
+        let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        return hit.path.hasPrefix(rootPrefix) ? hit.path : nil
     }
 }

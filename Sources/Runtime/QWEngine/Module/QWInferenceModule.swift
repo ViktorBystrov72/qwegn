@@ -9,6 +9,7 @@
 import Foundation
 import QWCore
 import QWHead
+import QWKV
 
 /// A module-owned session. The core allocates and recycles it; everything
 /// behind it belongs to the module.
@@ -63,6 +64,11 @@ public protocol QWInferenceModule: AnyObject, Sendable {
     static func makeEngine(options: QWEngineBuildOptions) throws -> any QWInferenceEngine
     static func resolveSpeculation(_ parameters: QWSpeculativeParameters, descriptor: QWModelDescriptor,
                                    environment: [String: String], modelSwitch: Bool) throws -> QWResolvedSpeculation
+    static func estimateContextMemory(
+        descriptor: QWModelDescriptor, packPath: String?, contextTokens: Int, kvMode: QWKVMode,
+        mtpDrafts: Int, mtpBackend: String, prefillChunkSize: Int, tuning: QWEngineTuning,
+        physicalMemoryBytes: Int?
+    ) -> QWContextMemoryEstimate
     /// The frozen numeric plan of the loaded model.
     var plan: QWEnginePlan { get }
     /// The KV storage mode this module runs in.
@@ -101,16 +107,9 @@ public protocol QWInferenceModule: AnyObject, Sendable {
     /// Tokens committed per speculative verification round in this session,
     /// when the module runs speculative rounds internally.
     func roundTokenCounts(_ state: any QWModuleSessionState) -> [Int]
-    /// The logit row the shared sampler consumes. A module that cannot
-    /// sample has no row to give.
-    func sampleLogits(_ state: any QWModuleSessionState) throws -> [Float]
 }
 
 extension QWInferenceModule {
-    public var compiledStack: QWCompiledLayerStack {
-        QWCompiledLayerStack(plan: plan)
-    }
-
     public func roundTokenCounts(_ state: any QWModuleSessionState) -> [Int] { [] }
 
     public static func resolveSpeculation(
@@ -139,6 +138,18 @@ extension QWInferenceModule {
         return QWResolvedSpeculation(parameters: parameters, engineDrafts: drafts,
                                      engineBackend: backend, reportedDrafts: drafts,
                                      reportedBackend: parameters.mtpBackend ?? "standard")
+    }
+
+    public static func estimateContextMemory(
+        descriptor: QWModelDescriptor, packPath: String?, contextTokens: Int, kvMode: QWKVMode,
+        mtpDrafts: Int, mtpBackend: String, prefillChunkSize: Int, tuning: QWEngineTuning,
+        physicalMemoryBytes: Int?
+    ) -> QWContextMemoryEstimate {
+        QWEngineDriver.estimateDriverContextMemory(
+            descriptor: descriptor, packPath: packPath, contextTokens: contextTokens,
+            kvMode: kvMode, mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
+            prefillChunkSize: prefillChunkSize, tuning: tuning,
+            physicalMemoryBytes: physicalMemoryBytes)
     }
 }
 

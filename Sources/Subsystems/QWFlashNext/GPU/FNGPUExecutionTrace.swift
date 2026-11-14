@@ -12,10 +12,6 @@ final class FNGPUExecutionTrace {
         let submitMS: Double
         let gpuStartMS: Double
         let gpuEndMS: Double
-
-        var encodeMS: Double { submitMS - encodeStartMS }
-        var submitToStartMS: Double { gpuStartMS - submitMS }
-        var gpuMS: Double { gpuEndMS - gpuStartMS }
     }
 
     struct Report: Encodable {
@@ -32,13 +28,6 @@ final class FNGPUExecutionTrace {
         let completionWaitMS: Double
         let stackToGPUCompleteMS: Double
         let buffers: [BufferTiming]
-
-        var encodeMS: Double { buffers.reduce(0) { $0 + $1.encodeMS } - pleWaitMS }
-        var gpuMS: Double { buffers.reduce(0) { $0 + $1.gpuMS } }
-        var gpuSpanMS: Double { (buffers.last?.gpuEndMS ?? 0) - (buffers.first?.gpuStartMS ?? 0) }
-        var gpuIdleBetweenBuffersMS: Double {
-            zip(buffers, buffers.dropFirst()).reduce(0) { $0 + max(0, $1.1.gpuStartMS - $1.0.gpuEndMS) }
-        }
     }
 
     enum TraceError: Error, CustomStringConvertible {

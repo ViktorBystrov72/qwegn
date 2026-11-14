@@ -26,11 +26,11 @@ final class QWGDNConvTests: XCTestCase {
         return d
     }
     static func u16s(_ d: Data) -> [UInt16] {
-        d.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: UInt16.self)) }
     }
     static func buf(_ d: Data) -> MTLBuffer {
         let b = hal.device.makeBuffer(length: max(16, d.count), options: .storageModeShared)!
-        d.withUnsafeBytes { _ = memcpy(b.contents(), $0.baseAddress!, $0.count) }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in _ = memcpy(b.contents(), raw.baseAddress!, raw.count) }
         return b
     }
     static func f16(_ bits: UInt16) -> Float { QWQuant.f16tof32Bits(bits) }
@@ -70,7 +70,7 @@ final class QWGDNConvTests: XCTestCase {
         let actual = try XCTUnwrap(hal.device.makeBuffer(length: expected.length, options: .storageModeShared))
         for fused in [false, true] {
             for iteration in 0..<64 {
-                state.withUnsafeBytes { inplace.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+                state.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in inplace.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count) }
                 let pair = try XCTUnwrap(hal.begin())
                 func encode(stateOut: MTLBuffer, stateIn: MTLBuffer, output: MTLBuffer) throws {
                     if fused {

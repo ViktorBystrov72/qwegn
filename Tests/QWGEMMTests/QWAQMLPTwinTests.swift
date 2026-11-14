@@ -58,7 +58,7 @@ final class QWAQMLPTwinTests: XCTestCase {
             let offset = (row * groups + g) * bytesPerGroup
             let slice = bank.subdata(in: offset..<(offset + bytesPerGroup))
             let xs = (0..<group).map { Float(Float16(x[g * group + $0])) }
-            acc += slice.withUnsafeBytes { QWAQBlock.dot(group: $0, bits: bits, group: group, x: xs) }
+            acc += slice.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.dot(group: raw, bits: bits, group: group, x: xs) }
         }
         return acc
     }

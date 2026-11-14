@@ -9,11 +9,18 @@ import QWEngine
 
 extension QWDashboardViewModel {
     /// Every reading the cards can show, by metric name.
-    static func readings() -> [String: CardReading] {
+    static func readings(now: Date = Date(),
+                         telemetry: QWEngineTelemetryRegistry = .shared) -> [String: CardReading] {
+        readings(snapshot: telemetry.snapshot(at: now), now: now)
+    }
+
+    /// Readings derived from a single captured metrics snapshot.
+    static func readings(snapshot: QWEngineTelemetryRegistry.MetricsSnapshot,
+                         now: Date = Date()) -> [String: CardReading] {
         var out: [String: CardReading] = [:]
         // The server's own measurements first, the engine's after: what
         // the engine measured about itself is the more specific reading.
-        for (name, reading) in serverReadings(QWEngineTelemetryRegistry.shared.snapshot()) {
+        for (name, reading) in serverReadings(snapshot, now: now) {
             out[name] = reading
         }
         for (name, value) in QWTelemetryRegistry.shared.snapshot() {
@@ -31,7 +38,8 @@ extension QWDashboardViewModel {
 
     /// The server's own measurements, in the same vocabulary.
     private static func serverReadings(
-        _ snap: QWEngineTelemetryRegistry.MetricsSnapshot
+        _ snap: QWEngineTelemetryRegistry.MetricsSnapshot,
+        now: Date
     ) -> [String: CardReading] {
         var out: [String: CardReading] = [:]
         let hardware = snap.hardware
@@ -51,7 +59,7 @@ extension QWDashboardViewModel {
                                          sampledAt: nil,
                                          reason: reason ?? snap.unavailableReasons[metric]
                                              ?? "the engine has not measured this yet",
-                                         note: nil)
+                                         note: nil, series: series)
                 return
             }
             guard let at else {
@@ -61,7 +69,7 @@ extension QWDashboardViewModel {
                                          sampledAt: nil,
                                          reason: snap.unavailableReasons[metric]
                                              ?? "the engine has not measured this yet",
-                                         note: note)
+                                         note: note, series: series)
                 return
             }
             // The registry's own reason, when it has one: a reading that
@@ -82,7 +90,7 @@ extension QWDashboardViewModel {
                                          sampledAt: nil,
                                          reason: reason ?? snap.unavailableReasons[metric]
                                              ?? "the engine has not measured this yet",
-                                         note: nil)
+                                         note: nil, series: series)
                 return
             }
             out[name] = CardReading(number: nil, text: text,
@@ -107,7 +115,9 @@ extension QWDashboardViewModel {
         // turn whose prompt came entirely from the cache ran no prefill
         // phase: the card says where the prompt came from, not a rate.
         let prefillMetric = QWTelemetryMetric.prefillFromCache.rawValue
-        if snap.throughput.prefillFromCache, let at = snap.sampledAt[prefillMetric] {
+        if snap.throughput.prefillFromCache,
+           snap.throughput.livePrefillTokensPerSec == nil,
+           let at = snap.sampledAt[prefillMetric] {
             putText("throughput.display_prefill_tokens_per_sec", "from cache", at,
                     snap.unavailableReasons[prefillMetric], registry: prefillMetric,
                     series: snap.throughput.prefillRateSeries)
@@ -128,9 +138,73 @@ extension QWDashboardViewModel {
         put("latency.ttft_ms", snap.latency.lastTtftMs,
             snap.sampledAt[QWTelemetryMetric.ttftMs.rawValue],
             snap.unavailableReasons[QWTelemetryMetric.ttftMs.rawValue])
+        put("latency.avg_ttft_ms", snap.latency.avgTtftMs,
+            snap.sampledAt[QWTelemetryMetric.ttftMs.rawValue],
+            snap.unavailableReasons[QWTelemetryMetric.ttftMs.rawValue],
+            registry: QWTelemetryMetric.ttftMs.rawValue)
+        put("session.ema_decode_tps", snap.throughput.ema1mDecodeTokensPerSec,
+            snap.sampledAt[QWTelemetryMetric.ema1mDecodeTokensPerSec.rawValue],
+            snap.unavailableReasons[QWTelemetryMetric.ema1mDecodeTokensPerSec.rawValue],
+            registry: QWTelemetryMetric.ema1mDecodeTokensPerSec.rawValue)
+        put("session.ema_prefill_tps", snap.throughput.ema1mPrefillTokensPerSec,
+            snap.sampledAt[QWTelemetryMetric.ema1mPrefillTokensPerSec.rawValue],
+            snap.unavailableReasons[QWTelemetryMetric.ema1mPrefillTokensPerSec.rawValue],
+            registry: QWTelemetryMetric.ema1mPrefillTokensPerSec.rawValue)
+        put("session.avg_decode_tps", snap.throughput.avgDecodeTokensPerSec,
+            snap.sampledAt[QWTelemetryMetric.avgDecodeTokensPerSec.rawValue],
+            snap.unavailableReasons[QWTelemetryMetric.avgDecodeTokensPerSec.rawValue],
+            registry: QWTelemetryMetric.avgDecodeTokensPerSec.rawValue)
+        put("session.avg_prefill_tps", snap.throughput.avgPrefillTokensPerSec,
+            snap.sampledAt[QWTelemetryMetric.avgPrefillTokensPerSec.rawValue],
+            snap.unavailableReasons[QWTelemetryMetric.avgPrefillTokensPerSec.rawValue],
+            registry: QWTelemetryMetric.avgPrefillTokensPerSec.rawValue)
+        let turnAt = snap.sampledAt[QWTelemetryMetric.avgDecodeTokensPerSec.rawValue]
+            ?? snap.sampledAt[QWTelemetryMetric.lastPrefillTokensPerSec.rawValue]
+            ?? snap.sampledAt[QWTelemetryMetric.prefillFromCache.rawValue]
+            ?? snap.context.sampledAt
+        let hasTurnCounts = snap.throughput.tokensInTotal > 0 || turnAt != nil
+        put("session.tokens_in_total",
+            hasTurnCounts ? Double(snap.throughput.tokensInTotal) : nil,
+            hasTurnCounts ? (turnAt ?? now) : nil,
+            "no turn has run in this session")
+        put("session.tokens_out_total",
+            hasTurnCounts ? Double(snap.throughput.tokensOutTotal) : nil,
+            hasTurnCounts ? (turnAt ?? now) : nil,
+            "no turn has run in this session")
+        let prefillInFlight = snap.throughput.phase == "prefill" && snap.throughput.prefillTotalTokens > 0
+        put("prefill.progress_tokens",
+            prefillInFlight ? Double(snap.throughput.prefillProgressTokens) : nil,
+            prefillInFlight ? now : nil,
+            "no prompt prefill is currently in flight")
+        put("prefill.total_tokens",
+            prefillInFlight ? Double(snap.throughput.prefillTotalTokens) : nil,
+            prefillInFlight ? now : nil,
+            "no prompt prefill is currently in flight")
+        put("memory.resident_bytes",
+            snap.memory.residentBytes > 0 ? Double(snap.memory.residentBytes) : nil,
+            snap.memory.residentBytes > 0 ? now : nil,
+            "no model weights resident in unified memory")
+        put("memory.arena_reserved_bytes",
+            snap.memory.arenaReservedBytes > 0 ? Double(snap.memory.arenaReservedBytes) : nil,
+            snap.memory.arenaReservedBytes > 0 ? now : nil,
+            "no Metal arena reserved")
         put("cache.warm_bytes", snap.cache.warmBytes.map(Double.init), snap.cache.sampledAt, nil)
+        put("cache.warm_limit_bytes",
+            snap.cache.warmLimitBytes > 0 ? Double(snap.cache.warmLimitBytes) : nil,
+            snap.cache.sampledAt ?? now,
+            "warm cache limit is not configured")
         put("cache.ssd_bytes", snap.cache.ssdBytes.map(Double.init), snap.cache.sampledAt, nil)
+        put("cache.ssd_limit_bytes",
+            snap.cache.ssdLimitBytes > 0 ? Double(snap.cache.ssdLimitBytes) : nil,
+            snap.cache.sampledAt ?? now,
+            "cold SSD cache is disabled")
         put("cache.tokens_reused_total", Double(snap.cache.tokensReusedTotal),
+            snap.cache.sampledAt, nil)
+        put("cache.lookups_total", Double(snap.cache.lookupsTotal), snap.cache.sampledAt, nil)
+        put("cache.hits_warm_total", Double(snap.cache.hitsWarmTotal), snap.cache.sampledAt, nil)
+        put("cache.hits_ssd_total", Double(snap.cache.hitsSSDTotal), snap.cache.sampledAt, nil)
+        put("cache.evictions_total",
+            Double(snap.cache.evictionsWarmTotal + snap.cache.evictionsSSDTotal),
             snap.cache.sampledAt, nil)
         put("context.active_tokens", snap.context.activeTokens.map(Double.init),
             snap.context.sampledAt, nil)

@@ -15,13 +15,8 @@ public struct QWKVCompressedLayout: Sendable {
     public let scaleBytesPerPage: Int
     public let totalBytesPerPage: Int
 
-    public init(mode: QWKVMode) {
-        self.init(mode: mode, geometry: .qwen38_27b)
-    }
-
     /// The page's layout, from the model's own geometry: a page is 256
-    /// tokens of `kvHeads × headDim` elements. The **compressed** modes are
-    /// the 27B's layout only — their readers hard-code 4 heads × 256 (C103).
+    /// tokens of `kvHeads × headDim` elements (or `kvLoraRank` under MLA).
     public init(mode: QWKVMode, geometry: QWModelGeometry) {
         self.mode = mode
         let pageTokens = QWKVCache.pageTokens
@@ -82,29 +77,6 @@ public struct QWKVCompressedLayout: Sendable {
         }
     }
 
-    /// Symmetric per-(token, head) Q8 dequantization of `kvHeads × headDim` elements.
-    public static func dequantizeQ8(
-        qIn: [Int8],
-        scalesIn: [Float16],
-        out: inout [Float],
-        kvHeads: Int = 4,
-        headDim: Int = 256
-    ) throws {
-        let total = kvHeads * headDim
-        guard kvHeads > 0, headDim > 0,
-              qIn.count == total, scalesIn.count == kvHeads, out.count == total else {
-            throw QWKVError.badArgument(
-                "q8 dequantization expects \(total) elements and \(kvHeads) scales (got \(qIn.count), \(scalesIn.count), \(out.count))")
-        }
-        for h in 0..<kvHeads {
-            let offset = h * headDim
-            let sc = Float(scalesIn[h])
-            for d in 0..<headDim {
-                out[offset + d] = Float(qIn[offset + d]) * sc
-            }
-        }
-    }
-
     /// Asymmetric group-128 Q4 quantization of `kvHeads × headDim` elements.
     public static func quantizeQ4(
         input: [Float],
@@ -155,61 +127,5 @@ public struct QWKVCompressedLayout: Sendable {
                 }
             }
         }
-    }
-
-    /// Asymmetric group-128 Q4 dequantization of `kvHeads × headDim` elements.
-    public static func dequantizeQ4(
-        qIn: [UInt8],
-        scalesIn: [Float16],
-        minsIn: [Float16],
-        out: inout [Float],
-        kvHeads: Int = 4,
-        headDim: Int = 256
-    ) throws {
-        let total = kvHeads * headDim
-        let groupsPerHead = max(1, (headDim + 127) / 128)
-        let totalGroups = kvHeads * groupsPerHead
-        guard kvHeads > 0, headDim > 0, headDim % 2 == 0,
-              qIn.count == total / 2, scalesIn.count == totalGroups,
-              minsIn.count == totalGroups, out.count == total else {
-            throw QWKVError.badArgument(
-                "q4 dequantization expects \(total / 2) bytes, \(totalGroups) scales and mins, \(total) elements (got \(qIn.count), \(scalesIn.count), \(minsIn.count), \(out.count))")
-        }
-        for h in 0..<kvHeads {
-            for g in 0..<groupsPerHead {
-                let gIdx = h * groupsPerHead + g
-                let groupStart = g * 128
-                let groupLen = min(128, headDim - groupStart)
-                let outOffset = h * headDim + groupStart
-                let inByteOffset = outOffset / 2
-                let sc = Float(scalesIn[gIdx])
-                let mn = Float(minsIn[gIdx])
-                for i in 0..<(groupLen / 2) {
-                    let byte = qIn[inByteOffset + i]
-                    let q0 = Float(byte & 0x0F)
-                    let q1 = Float(byte >> 4)
-                    out[outOffset + 2 * i] = q0 * sc + mn
-                    out[outOffset + 2 * i + 1] = q1 * sc + mn
-                }
-            }
-        }
-    }
-
-    /// Calibrated group-128 Q4 quantization using an out-of-sample `slow-EMA` codebook;
-    /// writes standard `(qOut, scalesOut, minsOut)` readable by `dequantizeQ4` and GPU Q4 pages.
-    public static func quantizeQ4Calibrated(
-        input: [Float],
-        codebook: QWKVSlowEMACodebook,
-        qOut: inout [UInt8],
-        scalesOut: inout [Float16],
-        minsOut: inout [Float16]
-    ) throws {
-        try QWKVSlowEMACalibrator.quantizeQ4Calibrated(
-            input: input,
-            codebook: codebook,
-            qOut: &qOut,
-            scalesOut: &scalesOut,
-            minsOut: &minsOut
-        )
     }
 }

@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 990" width="960" height="990">
+  <defs>
+    <radialGradient id="bgGlow" cx="20%" cy="10%" r="90%">
+      <stop offset="0%" stop-color="#19152c"/>
+      <stop offset="55%" stop-color="#0c0a16"/>
+      <stop offset="100%" stop-color="#040309"/>
+    </radialGradient>
+    <linearGradient id="cardGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#192136" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#0d1220" stop-opacity="0.88"/>
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <linearGradient id="purpleGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#c084fc"/><stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+    <linearGradient id="amberGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#fbbf24"/><stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+      <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <style>
+    svg { text-rendering: geometricPrecision; -webkit-font-smoothing: antialiased; }
+    .title { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif; font-weight: 800; }
+    .subtitle { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif; font-weight: 500; }
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", system-ui, sans-serif; }
+    .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; font-weight: 600; }
+  </style>
+  <rect width="960" height="990" rx="20" fill="url(#bgGlow)" stroke="#1e293b" stroke-width="2"/>
+  <g opacity="0.04" stroke="#ffffff" stroke-width="1">
+    <line x1="0" y1="150" x2="960" y2="150"/>
+    <line x1="0" y1="438" x2="960" y2="438"/>
+    <line x1="326" y1="0" x2="326" y2="990"/>
+    <line x1="634" y1="0" x2="634" y2="990"/>
+  </g>
+
+  <g transform="translate(28, 24)">
+    <rect x="0.0" y="0.0" width="277" height="28" rx="14.0" fill="#281638" stroke="#a855f7" stroke-width="1.2"/>
+    <circle cx="15.0" cy="14.0" r="4.5" fill="#c084fc"/>
+    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#e9d5ff" letter-spacing="0.25">QWEGN v0.20.5 · MODEL PROFILE</text>
+    <rect x="289.0" y="0.0" width="405" height="28" rx="14.0" fill="#064e3b" stroke="#10b981" stroke-width="1.2"/>
+    <text x="491.5" y="18.6" text-anchor="middle" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">2,572 TOK/S PREFILL · 3/3 NEEDLE TO 300K</text>
+    <text x="0" y="64" fill="#f8fafc" class="title" font-size="27">Edge0-145B (HQ8+HQ4 + VQ2 PLE)</text>
+    <text x="0" y="92" fill="#cbd5e1" class="subtitle" font-size="14.5">48-Layer Hybrid MoE (145B · 512 Experts · 10 Routed + 1 Shared · 12 QSA + 36 GDN)</text>
+    <text x="0" y="114" fill="#cbd5e1" class="subtitle" font-size="14.5">4-Branch HC · 56.00 GiB QWP + 27.13 GiB VQ2_G32 PLE = 83.13 GiB · Up to 1M Ctx</text>
+  </g>
+  <g transform="translate(736, 20)">
+    <rect width="196" height="58" rx="13" fill="#0b1222" stroke="#334155" stroke-width="1.3"/>
+    <rect x="11" y="11" width="36" height="36" rx="9" fill="url(#mark)"/>
+    <text x="29" y="36" text-anchor="middle" class="sans" font-size="21" font-weight="900" fill="#04110c">Q</text>
+    <text x="56" y="29" class="sans" font-size="21" font-weight="800" fill="#f8fafc">Qwegn</text>
+    <text x="56" y="46" class="mono" font-size="11.5" font-weight="700" fill="#94a3b8">SWIFT 6.2 · METAL 4</text>
+  </g>
+
+  <g transform="translate(28, 160)">
+    <rect width="288" height="268" rx="16" fill="url(#cardGrad)" stroke="#322954" stroke-width="1.4"/>
+    <rect x="18.0" y="16.0" width="142" height="26" rx="13.0" fill="#0c2a3a" stroke="#0ea5e9" stroke-width="1.2"/>
+    <text x="89.0" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#7dd3fc" letter-spacing="0.2">PREFILL &amp; CACHE</text>
+    <text x="18" y="90" fill="url(#cyanGrad)" class="title mono" font-size="44">2,572</text>
+    <text x="164.5" y="88" fill="#38bdf8" class="title mono" font-size="17">tok/s</text>
+    <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">2,568 @8K · 1,886 @300K</text>
+    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">2,292 @32K · 2,132 @64K</text>
+    <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13.5">2,052 @128K · 1,899 @256K</text>
+    <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
+    <text x="18" y="218" fill="#38bdf8" class="mono" font-size="13">8 ms warm TTFT</text>
+    <text x="18" y="238" fill="#38bdf8" class="mono" font-size="13">(119.8x warm prefix cache)</text>
+  </g>
+  <g transform="translate(336, 160)">
+    <rect width="288" height="268" rx="16" fill="url(#cardGrad)" stroke="#322954" stroke-width="1.4"/>
+    <rect x="18.0" y="16.0" width="165" height="26" rx="13.0" fill="#281638" stroke="#a855f7" stroke-width="1.2"/>
+    <text x="100.5" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#e9d5ff" letter-spacing="0.2">DECODE &amp; SERVER</text>
+    <text x="18" y="90" fill="url(#purpleGrad)" class="title mono" font-size="44">80.9</text>
+    <text x="142.0" y="88" fill="#c084fc" class="title mono" font-size="17">tok/s</text>
+    <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">44.2 Serial · 102.6 4-Stream</text>
+    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">140/141 API conformance (99.3%)</text>
+    <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13.5">36/36 engine fidelity (greedy)</text>
+    <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
+    <text x="18" y="218" fill="#c084fc" class="mono" font-size="13">0.28 s CLI cold TTFT</text>
+    <text x="18" y="238" fill="#c084fc" class="mono" font-size="13">0 Heap / Metal decode allocs</text>
+  </g>
+  <g transform="translate(644, 160)">
+    <rect width="288" height="268" rx="16" fill="url(#cardGrad)" stroke="#322954" stroke-width="1.4"/>
+    <rect x="18.0" y="16.0" width="151" height="26" rx="13.0" fill="#33230c" stroke="#f59e0b" stroke-width="1.2"/>
+    <text x="93.5" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#fde68a" letter-spacing="0.2">SPECULATIVE MTP</text>
+    <text x="18" y="90" fill="url(#amberGrad)" class="title mono" font-size="44">116.4</text>
+    <text x="164.5" y="88" fill="#fbbf24" class="title mono" font-size="17">tok/s</text>
+    <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">67.6 CLI MTP-3 · GPU VQ2 PLE</text>
+    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">9/10 Code-10 (HE 5/5, MBPP 4/5)</text>
+    <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13.5">9/10 Core-10 · 100% capability</text>
+    <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
+    <text x="18" y="218" fill="#fbbf24" class="mono" font-size="13">8-Slot Copy + Variational MTP</text>
+    <text x="18" y="238" fill="#fbbf24" class="mono" font-size="13">1.76x spec vs 1.0x serial</text>
+  </g>
+  <g transform="translate(28, 446)">
+    <rect width="904" height="214" rx="16" fill="url(#cardGrad)" stroke="#322954" stroke-width="1.4"/>
+    <rect x="22.0" y="16.0" width="346" height="26" rx="13.0" fill="#062e22" stroke="#10b981" stroke-width="1.2"/>
+    <text x="195.0" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#6ee7b7" letter-spacing="0.3">BEYOND-256K SCALING (16K–1M Ctx)</text>
+    <text x="22" y="68" fill="#f8fafc" class="title" font-size="18">Exceeds 256K Card Limit · 300K YaRN &amp; Raw RoPE 3/3 · 1M q4 &amp; q8 UMA</text>
+    <text x="22" y="98" fill="#38bdf8" class="mono" font-size="14.5">• 16K  (GPU PLE, q4)  : 2,507.8 tok/s prefill · Needle 3/3 (SHA 4ebbde8d60f7)</text>
+    <text x="22" y="122" fill="#38bdf8" class="mono" font-size="14.5">• 128K (--stream, q4) : 1,918.7 tok/s prefill · Needle 3/3 (2,051.7 tok/s 4K-chunk)</text>
+    <text x="22" y="146" fill="#34d399" class="mono" font-size="14.5">• 300K (&gt;256K card)   : 1,885.5 tok/s (1.25x YaRN) &amp; 1,882.6 (raw RoPE) · 3/3</text>
+    <text x="22" y="170" fill="#fbbf24" class="mono" font-size="14.5">• 320K / 512K / 1M q4 : 61.84 / 63.99 / 69.73 GiB planned (--stream-ngrams, 0 allocs)</text>
+    <text x="22" y="194" fill="#c084fc" class="mono" font-size="14.5">• 1M q8 (GPU VQ2 PLE) : 102.99 / 107.52 GiB (64-bit ulong PLE gather &gt;16 GiB)</text>
+  </g>
+  <g transform="translate(28, 676)">
+    <rect width="904" height="214" rx="16" fill="url(#cardGrad)" stroke="#322954" stroke-width="1.4"/>
+    <rect x="22.0" y="16.0" width="388" height="26" rx="13.0" fill="#281638" stroke="#a855f7" stroke-width="1.2"/>
+    <text x="216.0" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#e9d5ff" letter-spacing="0.3">TWO-LEVEL HQ8+HQ4 + VQ2 PLE &amp; RESIDENCY</text>
+    <text x="22" y="68" fill="#f8fafc" class="title" font-size="18">Lossless Two-Level NVFP4 Pack &lt; 90 GB · Zero-Copy Metal 4 Residency</text>
+    <text x="22" y="98" fill="#34d399" class="mono" font-size="14.5">• Two-Level NVFP4 Pack : f8_e4m3 + f32 scales in 56.00 GiB QWP1 + 27.13 GiB VQ2</text>
+    <text x="22" y="122" fill="#34d399" class="mono" font-size="14.5">• Total Storage Budget : 83.13 GiB (&lt;90 GB) · 512 routed + 1 shared MoE + QSA/GDN</text>
+    <text x="22" y="146" fill="#38bdf8" class="mono" font-size="14.5">• Residency @ 4K (q4)  : 85.36 GiB GPU-resident vs 58.30 GiB --stream-ngrams</text>
+    <text x="22" y="170" fill="#c084fc" class="mono" font-size="14.5">• Wave 1+2 NAX Kernels : MoE tail-compact, 0-ULP PLE/HC fuse, gqa8 sparse NAX</text>
+    <text x="22" y="194" fill="#fbbf24" class="mono" font-size="14.5">• Law 12 Admiss./Guard : 1M f16 &amp; --os-reserve 65 clean rc=1 · 0 SIGTRAPs</text>
+  </g>
+
+  <g transform="translate(28, 906)">
+    <rect width="904" height="62" rx="11" fill="#0a101f" stroke="#334155" stroke-width="1.2"/>
+    <rect x="14" y="13" width="96" height="36" rx="8" fill="#111c33" stroke="#38bdf8" stroke-opacity="0.45" stroke-width="1"/>
+    <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
+    <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
+    <text x="122" y="27" class="mono" font-size="11.5" font-weight="700" fill="#e2e8f0">Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
+    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.20.5 · q4 / q8 KV + VQ2 PLE · Temp 0 · 0 Steady Allocs</text>
+  </g>
+</svg>

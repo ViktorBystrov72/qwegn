@@ -18,6 +18,8 @@ public protocol QWVisionBackend: Sendable {
     var isLoaded: Bool { get }
     /// True when vision tower weights are configured to stay resident across prompts.
     var keepResident: Bool { get }
+    /// Config-sourced vision tower geometry served by this backend.
+    var visionConfig: QWVisionConfig { get }
 }
 
 extension QWVisionBackend {
@@ -25,18 +27,7 @@ extension QWVisionBackend {
     public func setVisionLoaded(_ loaded: Bool) throws {}
     public var isLoaded: Bool { true }
     public var keepResident: Bool { isLoaded }
-}
-
-public enum QWVisionBackendMode: String, Sendable { case metal, coreai, auto, ref }
-
-/// Reference backend holding resident `QWVisionWeights` for the lifetime of the struct.
-public struct QWVisionRefBackend: QWVisionBackend {
-    public let ref: QWVisionRef
-    public init(_ ref: QWVisionRef) { self.ref = ref }
-    public func encode(patches: [Float], grid: QWVisionGridPlan,
-                       bins: QWVisionRef.InterpBins, posIds: [Int32]) async throws -> [Float] {
-        ref.encode(patches: patches, plan: grid, bins: bins, posIds: posIds)
-    }
+    public var visionConfig: QWVisionConfig { .qwen3VLReference }
 }
 
 extension QWVisionWeights {
@@ -65,11 +56,16 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
 
     public let source: Source
     private let lock = NSLock()
+    private var resolvedConfig: QWVisionConfig
     private var residentWeights: QWVisionWeights?
     private var keepResidentFlag: Bool = false
     private var allowOnDemandFlag: Bool = true
-    private var loads = 0
-    private var unloads = 0
+
+    public var visionConfig: QWVisionConfig {
+        lock.lock()
+        defer { lock.unlock() }
+        return resolvedConfig
+    }
 
     public var isLoaded: Bool {
         lock.lock()
@@ -89,29 +85,21 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         return residentWeights?.residentBytes ?? 0
     }
 
-    public var loadCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return loads
-    }
-
-    public var unloadCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return unloads
-    }
-
     public init(source: Source, keepResident: Bool = false, allowOnDemand: Bool = true) throws {
         self.source = source
         self.keepResidentFlag = keepResident
         self.allowOnDemandFlag = allowOnDemand
         switch source {
         case .pack(let packPath):
-            try Self.validate(checkpoint: try QWVisionCheckpoint(pack: packPath))
+            let ck = try QWVisionCheckpoint(pack: packPath)
+            try Self.validate(checkpoint: ck)
+            self.resolvedConfig = ck.config
         case .directory(let dir):
-            try Self.validate(checkpoint: try QWVisionCheckpoint(dir: dir))
+            let ck = try QWVisionCheckpoint(dir: dir)
+            try Self.validate(checkpoint: ck)
+            self.resolvedConfig = ck.config
         case .custom:
-            break
+            self.resolvedConfig = .qwen3VLReference
         }
         if keepResident {
             _ = try loadWeightsLocked()
@@ -151,15 +139,24 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
             ck.pack?.adviseDontNeed()
             ck.pack = nil
         }
-        guard ck.shape("pos_embed.weight") == [2304, QWVisionShape.dim] else {
+        let cfg = ck.config
+        guard cfg.dim > 0, cfg.heads > 0, cfg.headDim * cfg.heads == cfg.dim,
+              cfg.numPosEmbeds > 0, cfg.posSide * cfg.posSide == cfg.numPosEmbeds else {
+            throw QWVisionError.badLayout("vision config incomplete or invalid")
+        }
+        guard ck.shape("pos_embed.weight") == [cfg.numPosEmbeds, cfg.dim] else {
             throw QWVisionError.missingTensor("pos_embed.weight")
         }
         let pw = ck.shape("patch_embed.proj.weight")
-        guard pw == [1152, 3, 2, 16, 16] || pw == [1152, 2, 16, 16, 3] else {
+        let baseShape = [cfg.dim, 3, cfg.temporal, cfg.patch, cfg.patch]
+        let legacyShape = [cfg.dim, cfg.temporal, cfg.patch, cfg.patch, 3]
+        guard pw == baseShape || pw == legacyShape else {
             throw QWVisionError.badLayout("patch_embed.proj.weight \(pw.debugDescription) invalid")
         }
         guard ck.has("blocks.0.norm1.weight"),
               ck.has("merger.norm.weight"),
+              ck.has("merger.norm.bias"),
+              ck.has("merger.linear_fc1.weight"),
               ck.has("merger.linear_fc2.weight") else {
             throw QWVisionError.missingTensor("vision blocks/merger missing")
         }
@@ -178,8 +175,8 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         case .custom(let builder):
             loaded = try builder()
         }
+        resolvedConfig = loaded.config
         residentWeights = loaded
-        loads += 1
         return loaded
     }
 
@@ -191,7 +188,6 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
             _ = try loadWeightsLocked()
         } else if residentWeights != nil {
             residentWeights = nil
-            unloads += 1
         }
     }
 
@@ -205,7 +201,6 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
             _ = try loadWeightsLocked()
         } else if !keepResidentFlag, residentWeights != nil {
             residentWeights = nil
-            unloads += 1
         }
     }
 
@@ -214,7 +209,6 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         keepResidentFlag = false
         if residentWeights != nil {
             residentWeights = nil
-            unloads += 1
         }
         lock.unlock()
     }
@@ -241,69 +235,5 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         posIds: [Int32]
     ) async throws -> [Float] {
         try encodeSync(patches: patches, grid: grid, bins: bins, posIds: posIds)
-    }
-}
-
-/// Backwards-compatible alias for ephemeral/on-demand vision backend.
-public typealias QWVisionEphemeralBackend = QWVisionOnDemandBackend
-
-public enum QWVision {
-    public static func make(mode: QWVisionBackendMode, weightsDir: String) throws -> any QWVisionBackend {
-        let weights = try QWVisionWeights(dir: weightsDir)
-        switch mode {
-        case .ref:
-            return QWVisionRefBackend(QWVisionRef(weights: weights))
-        case .metal, .coreai, .auto:
-            throw QWVisionError.badLayout("backend \(mode.rawValue) not landed (Metal/C-AI race pending; DECISIONS gates the default)")
-        }
-    }
-
-    public static func make(mode: QWVisionBackendMode, packPath: String) throws -> any QWVisionBackend {
-        let weights = try QWVisionWeights(pack: packPath)
-        switch mode {
-        case .ref:
-            return QWVisionRefBackend(QWVisionRef(weights: weights))
-        case .metal, .coreai, .auto:
-            throw QWVisionError.badLayout("backend \(mode.rawValue) not landed (Metal/C-AI race pending; DECISIONS gates the default)")
-        }
-    }
-
-    /// Creates a prompt-scoped on-demand vision backend from a `.qwp` pack (0 B startup RAM).
-    public static func makeEphemeral(mode: QWVisionBackendMode = .ref, packPath: String) throws -> any QWVisionBackend {
-        switch mode {
-        case .ref:
-            return try QWVisionOnDemandBackend(source: .pack(packPath))
-        case .metal, .coreai, .auto:
-            throw QWVisionError.badLayout("backend \(mode.rawValue) not landed")
-        }
-    }
-
-    /// Creates a prompt-scoped on-demand vision backend from a checkpoint directory (0 B startup RAM).
-    public static func makeEphemeral(mode: QWVisionBackendMode = .ref, weightsDir: String) throws -> any QWVisionBackend {
-        switch mode {
-        case .ref:
-            return try QWVisionOnDemandBackend(source: .directory(weightsDir))
-        case .metal, .coreai, .auto:
-            throw QWVisionError.badLayout("backend \(mode.rawValue) not landed")
-        }
-    }
-
-    /// Creates a prompt-scoped or resident vision backend from any model path (`.qwp` or `.safetensors`).
-    public static func makeOnDemand(
-        mode: QWVisionBackendMode = .ref,
-        modelPath: String,
-        keepResident: Bool = false,
-        allowOnDemand: Bool = true
-    ) throws -> any QWVisionBackend {
-        switch mode {
-        case .ref:
-            return try QWVisionOnDemandBackend(
-                modelPath: modelPath,
-                keepResident: keepResident,
-                allowOnDemand: allowOnDemand
-            )
-        case .metal, .coreai, .auto:
-            throw QWVisionError.badLayout("backend \(mode.rawValue) not landed")
-        }
     }
 }

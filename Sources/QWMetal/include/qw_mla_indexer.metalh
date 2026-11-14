@@ -32,10 +32,14 @@ METAL_FUNC uint qwg_mla_float_to_sortable_u32(float f) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
+METAL_FUNC uint qwg_mla_load_score_key(device atomic_uint* rowScores, uint i) {
+    return qwg_mla_float_to_sortable_u32(as_type<float>(atomic_load_explicit(&rowScores[i], memory_order_relaxed)));
+}
+
 // 4-pass 8-bit exact radix threshold selection over sortable uint32 keys, then
 // strictly-above collection in index order plus ties. 256 threads; rowScores must be
 // visible to the whole threadgroup on entry. Writes topK indices and the count.
-METAL_FUNC void qwg_mla_select_pools(device const float* rowScores, uint nPools, uint topKPools,
+METAL_FUNC void qwg_mla_select_pools(device atomic_uint* rowScores, uint nPools, uint topKPools,
                                      device int* dstList, device int* countOut, uint tid,
                                      threadgroup atomic_uint* hist, threadgroup uint* tgState) {
     if (tid == 0u) {
@@ -53,7 +57,7 @@ METAL_FUNC void qwg_mla_select_pools(device const float* rowScores, uint nPools,
         const uint prefix = tgState[0];
         const uint mask = tgState[1];
         for (uint i = tid; i < nPools; i += 256u) {
-            const uint key = qwg_mla_float_to_sortable_u32(rowScores[i]);
+            const uint key = qwg_mla_load_score_key(rowScores, i);
             if ((key & mask) == prefix) {
                 const uint bucket = (key >> sh) & 0xFFu;
                 atomic_fetch_add_explicit(&hist[bucket], 1u, memory_order_relaxed);
@@ -85,7 +89,7 @@ METAL_FUNC void qwg_mla_select_pools(device const float* rowScores, uint nPools,
     const uint chunk = (nPools + 255u) / 256u;
     const uint b0 = min(tid * chunk, nPools), b1 = min(b0 + chunk, nPools);
     uint above = 0u;
-    for (uint i = b0; i < b1; ++i) above += qwg_mla_float_to_sortable_u32(rowScores[i]) > threshKey ? 1u : 0u;
+    for (uint i = b0; i < b1; ++i) above += qwg_mla_load_score_key(rowScores, i) > threshKey ? 1u : 0u;
     const uint lane = tid & 31u, sg = tid >> 5u;
     uint slot = simd_prefix_exclusive_sum(above);
     const uint sgTotal = simd_sum(above);
@@ -93,7 +97,7 @@ METAL_FUNC void qwg_mla_select_pools(device const float* rowScores, uint nPools,
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint g = 0u; g < sg; ++g) slot += atomic_load_explicit(&hist[g], memory_order_relaxed);
     for (uint i = b0; i < b1; ++i) {
-        if (qwg_mla_float_to_sortable_u32(rowScores[i]) > threshKey) {
+        if (qwg_mla_load_score_key(rowScores, i) > threshKey) {
             if (slot < topKPools) dstList[slot] = int(i);
             ++slot;
         }
@@ -106,14 +110,14 @@ METAL_FUNC void qwg_mla_select_pools(device const float* rowScores, uint nPools,
 
     if (baseAbove < topKPools) {
         uint ties = 0u;
-        for (uint i = b0; i < b1; ++i) ties += qwg_mla_float_to_sortable_u32(rowScores[i]) == threshKey ? 1u : 0u;
+        for (uint i = b0; i < b1; ++i) ties += qwg_mla_load_score_key(rowScores, i) == threshKey ? 1u : 0u;
         uint tieSlot = baseAbove + simd_prefix_exclusive_sum(ties);
         const uint sgTies = simd_sum(ties);
         if (lane == 0u) atomic_store_explicit(&hist[sg], sgTies, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint g = 0u; g < sg; ++g) tieSlot += atomic_load_explicit(&hist[g], memory_order_relaxed);
         for (uint i = b0; i < b1 && tieSlot < topKPools; ++i) {
-            if (qwg_mla_float_to_sortable_u32(rowScores[i]) == threshKey) {
+            if (qwg_mla_load_score_key(rowScores, i) == threshKey) {
                 dstList[tieSlot++] = int(i);
             }
         }

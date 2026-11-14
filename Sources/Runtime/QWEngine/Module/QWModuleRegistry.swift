@@ -16,7 +16,11 @@ public enum QWModuleRegistry {
     public static func moduleType(for family: QWModelDescriptor.Family) -> (any QWInferenceModule.Type)? {
         switch family {
         case .qwen38Dense: return DenseModule.self
+        case .qwen38MoE: return Qwen38MoEModule.self
         case .qwen38FlashNext: return FlashNextModule.self
+        case .senseNovaLoop: return SenseNovaLoopModule.self
+        case .glm5Next: return Glm5NextModule.self
+        case .ernie55MoE: return Ernie55MoEModule.self
         case .qwen2Dense: return Qwen2DenseModule.self
         case .llamaDense: return LlamaModule.self
         case .mistralDense: return MistralModule.self
@@ -48,22 +52,6 @@ public enum QWModuleRegistry {
         family(forPackModelId: modelId).flatMap(moduleType(for:))
     }
 
-    /// Builds the module that serves a loaded model.
-    /// - Throws: `unsupportedFamily` when no module serves the plan's family,
-    ///   `unsupportedCapability` when the module cannot honour what it advertises.
-    public static func makeModule(plan: QWEnginePlan,
-                                  engine: (any QWLoadedEngine)?) throws -> any QWInferenceModule {
-        guard let type = moduleType(for: plan.family) else {
-            throw QWModuleError.unsupportedFamily(plan.family)
-        }
-        for capability in requiredCapabilities(advertised: plan.modelCapabilities) {
-            guard type.capabilities.contains(capability) else {
-                throw QWModuleError.unsupportedCapability(model: plan.modelId, capability: capability)
-            }
-        }
-        return try type.make(plan: plan, engine: engine)
-    }
-
     /// The capabilities the module that serves a family offers. A model
     /// that is not served by any module offers none.
     public static func capabilities(for family: QWModelDescriptor.Family) -> Set<QWKnobCapability> {
@@ -80,16 +68,6 @@ public enum QWModuleRegistry {
         return try type.makeEngine(options: options)
     }
 
-    /// The capabilities a model must find in the module that serves it.
-    /// The model's own config advertises them; the module implements them.
-    public static func requiredCapabilities(
-        advertised: Set<QWModelDescriptor.Capability>) -> Set<QWKnobCapability> {
-        var required: Set<QWKnobCapability> = []
-        if advertised.contains(.vision) { required.insert(.vision) }
-        if advertised.contains(.mtp) { required.insert(.speculative) }
-        return required
-    }
-
     /// Predicts total GPU memory required (weights + KV + scratch) for a model descriptor and context length.
     public static func estimateContextMemory(
         descriptor: QWModelDescriptor,
@@ -102,7 +80,8 @@ public enum QWModuleRegistry {
         tuning: QWEngineTuning = .default,
         physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes()
     ) -> QWContextMemoryEstimate {
-        QWEngineDriver.estimateContextMemory(
+        let module = moduleType(for: descriptor.family) ?? DenseModule.self
+        return module.estimateContextMemory(
             descriptor: descriptor, packPath: packPath, contextTokens: contextTokens,
             kvMode: kvMode, mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
             prefillChunkSize: prefillChunkSize, tuning: tuning,

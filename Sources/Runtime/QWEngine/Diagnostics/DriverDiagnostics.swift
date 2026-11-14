@@ -15,7 +15,6 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
-import QWState
 
 extension QWEngineDriver {
     public func logitsStats() -> (nan: Int, argmax: Int, max: Float, min: Float) {
@@ -41,22 +40,6 @@ extension QWEngineDriver {
             .advanced(by: sc.logits.region.base + sc.logits.offset)
             .assumingMemoryBound(to: Float.self)
         return Array(UnsafeBufferPointer(start: p, count: geometry.vocab))
-    }
-
-    /// Top-k (id, logit) pairs of the last step's logits (debug bisection:
-    /// a healthy trained model puts a COMMON token in top-5; the same
-    /// exotic token every step = a stuck producer door).
-    public func topLogits(_ k: Int) -> [(id: Int, logit: Float)] {
-        let p = sc.logits.region.buffer.contents()
-            .advanced(by: sc.logits.region.base + sc.logits.offset)
-            .assumingMemoryBound(to: Float.self)
-        var heap: [(Int, Float)] = []
-        for i in 0..<geometry.vocab {
-            let v = p[i].isNaN ? -.infinity : p[i]
-            if heap.count < k { heap.append((i, v)); heap.sort { $0.1 < $1.1 } }
-            else if v > heap[0].1 { heap[0] = (i, v); heap.sort { $0.1 < $1.1 } }
-        }
-        return heap.sorted { $0.1 > $1.1 }.map { ($0.0, $0.1) }
     }
 
     /// Steady-state allocator counters (the soak gate's data feed).

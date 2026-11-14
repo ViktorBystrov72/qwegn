@@ -97,7 +97,7 @@ public final class QWSafeTensorsShard: @unchecked Sendable {
     }
 
     public func adviseDontNeed() {
-        data.withUnsafeBytes { raw in
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress, raw.count > 0 else { return }
             let pageSize = Int(sysconf(_SC_PAGESIZE))
             let addr = Int(bitPattern: base)
@@ -239,7 +239,7 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
     /// The pointer is valid only inside `body`; it must not outlive the call.
     public func withBytes<T>(of name: String, _ body: (UnsafeRawBufferPointer) throws -> T) throws -> T {
         guard let (shard, t) = locate(name) else { throw QWSafeTensorsError.missingTensor(name) }
-        return try shard.data.withUnsafeBytes { raw in
+        return try shard.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let start = shard.dataOffset + t.byteOffset
             guard start >= 0, start + t.byteLength <= raw.count else {
                 throw QWSafeTensorsError.badHeader(
@@ -254,7 +254,7 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
     public func withShardRange<T>(of name: String,
                                   _ body: (QWSafeTensorsShard, UnsafeRawBufferPointer, Range<Int>) throws -> T) throws -> T {
         guard let (shard, t) = locate(name) else { throw QWSafeTensorsError.missingTensor(name) }
-        return try shard.data.withUnsafeBytes { raw in
+        return try shard.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let start = shard.dataOffset + t.byteOffset
             guard start >= 0, start + t.byteLength <= raw.count else {
                 throw QWSafeTensorsError.badHeader(
@@ -287,7 +287,7 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
     /// without touching boundary pages shared with adjacent tensors in the same shard.
     public func adviseDontNeed(of name: String) {
         guard let (shard, t) = locate(name) else { return }
-        shard.data.withUnsafeBytes { raw in
+        shard.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress, raw.count > 0 else { return }
             let pageSize = Int(sysconf(_SC_PAGESIZE))
             guard pageSize > 0, Int(bitPattern: base) % pageSize == 0 else { return }
@@ -475,7 +475,7 @@ public final class QWSafeTensorsReader: @unchecked Sendable {
     /// The tensor's bytes. The pointer is valid only inside `body`; it must
     /// not outlive the call.
     public func withBytes<T>(_ body: (UnsafeRawBufferPointer) throws -> T) rethrows -> T {
-        try shard.data.withUnsafeBytes { raw in
+        try shard.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let start = shard.dataOffset + tensor.byteOffset
             return try body(UnsafeRawBufferPointer(rebasing: raw[start..<start + tensor.byteLength]))
         }
@@ -516,7 +516,7 @@ extension QWSafeTensorsShard {
         let data = Data(bytesNoCopy: mappedPtr, count: fileSize, deallocator: .custom { ptr, len in
             if len > 0 { _ = Darwin.munmap(ptr, len) }
         })
-        let headerLength = data.prefix(8).withUnsafeBytes { raw -> UInt64 in
+        let headerLength = data.prefix(8).withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> UInt64 in
             UInt64(littleEndian: raw.loadUnaligned(as: UInt64.self))
         }
         // The header length comes from the file, so it is untrusted: every

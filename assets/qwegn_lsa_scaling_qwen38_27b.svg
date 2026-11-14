@@ -35,7 +35,7 @@
     <rect x="0" y="0" width="290" height="28" rx="14" fill="#2e1065" stroke="#a855f7" stroke-width="1.2"/>
     <text x="145.0" y="18.6" text-anchor="middle" class="mono" font-size="12.5" font-weight="700" fill="#e9d5ff" letter-spacing="0.3">LSA &amp; E-MEANS SCALING · 3 / 5</text>
     <text x="0" y="64" class="sans" font-size="28" font-weight="800" fill="#f8fafc">Qwen3.8-27B-hq4g32</text>
-    <text x="0" y="90" class="mono" font-size="13" fill="#cbd5e1">64L Dense Hybrid (5120d) · 16 Full GQA (24Q / 4KV) + 48 GDN · Variational MTP-3</text>
+    <text x="0" y="90" class="mono" font-size="13" fill="#cbd5e1">64L Dense Hybrid · 16 GQA + 48 GDN · 1,035 @4K · 134.5 DSpine B=16 · MTP-3</text>
   </g>
   <g transform="translate(772, 20)">
     <rect width="200" height="58" rx="13" fill="#0b1222" stroke="#334155" stroke-width="1.3"/>
@@ -62,7 +62,7 @@
   </g>
   <g transform="translate(748, 142)">
     <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#a855f7" stroke-opacity="0.52" stroke-width="1.2"/>
-    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#e9d5ff">36.6 GiB · 3/3</text>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#e9d5ff">36.4 GiB · 3/3</text>
     <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">1M RAM &amp; needle recall</text>
   </g>
   <g transform="translate(28, 230)">
@@ -212,7 +212,7 @@
     <line x1="20" y1="27" x2="50" y2="27" stroke="#a855f7" stroke-width="3.2"/>
     <circle cx="35" cy="27" r="5" fill="#a855f7"/>
     <text x="60" y="23" class="sans" font-size="13" font-weight="700" fill="#e9d5ff">LSA Ward-512 (k = 2048)</text>
-    <text x="60" y="40" class="mono" font-size="11" fill="#94a3b8">~805–876 tok/s flat prefill to 1M</text>
+    <text x="60" y="40" class="mono" font-size="11" fill="#94a3b8">~805–914 tok/s flat prefill to 1M</text>
     <line x1="336" y1="27" x2="366" y2="27" stroke="#38bdf8" stroke-width="3.2" stroke-dasharray="3 2"/>
     <polygon points="351,21 357,27 351,33 345,27" fill="#38bdf8"/>
     <text x="376" y="23" class="sans" font-size="13" font-weight="700" fill="#7dd3fc">LSA + e-means (4096 macro)</text>
@@ -228,8 +228,8 @@
     <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
     <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
     <text x="124" y="27" class="mono" font-size="12" font-weight="700" fill="#e2e8f0">INFERENCE MACHINE · Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
-    <text x="124" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.14.1 (Swift 6.2 &amp; Metal 4) · q4 KV · Temp 0 · 0 Steady Allocs</text>
+    <text x="124" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.20.5 (Swift 6.2 &amp; Metal 4) · q4 KV · Temp 0 · 0 Steady Allocs</text>
   </g>
-  <text x="500" y="782" text-anchor="middle" class="mono" font-size="12" fill="#94a3b8">Near-constant ~805–876 tok/s prefill across a 16× context increase (64K → 1M) because 48/64 layers are linear GDN.</text>
-  <text x="500" y="802" text-anchor="middle" class="mono" font-size="12" fill="#64748b">Sustains 1.98 emitted tokens/round (MTP-3) and 100% (3/3) passkey retrieval at 1,039,928 prompt tokens in 36.6 GiB RAM.</text>
+  <text x="500" y="782" text-anchor="middle" class="mono" font-size="12" fill="#94a3b8">Near-constant ~805–914 tok/s prefill across a 16× context increase (64K–1M) because 48/64 layers are linear GDN.</text>
+  <text x="500" y="802" text-anchor="middle" class="mono" font-size="12" fill="#64748b">Sustains 1.98 emitted tokens/round (MTP-3) and 100% (3/3) passkey retrieval at 1,039,928 prompt tokens in 36.4 GiB RAM.</text>
 </svg>

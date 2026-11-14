@@ -32,9 +32,9 @@ final class QWEngineModelIdentityGateTests: XCTestCase {
         out.append(data.subdata(in: 0..<insertAt))
         out.append(Data(extra.utf8))
         out.append(data.subdata(in: insertAt..<data.count))
-        var len = out.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt64.self) }
+        var len = out.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in raw.loadUnaligned(fromByteOffset: 4, as: UInt64.self) }
         len += UInt64(extra.utf8.count)
-        withUnsafeBytes(of: len) { out.replaceSubrange(4..<12, with: $0) }
+        withUnsafeBytes(of: len) { (raw: UnsafeRawBufferPointer) in out.replaceSubrange(4..<12, with: raw) }
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("fn-gate.qwp")
         try out.write(to: tmp)
         return tmp

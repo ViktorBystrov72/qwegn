@@ -15,7 +15,6 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
-import QWState
 
 extension QWEngineDriver {
     func sampleStochasticTarget(_ session: QWEngineSession,

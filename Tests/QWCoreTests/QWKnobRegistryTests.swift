@@ -70,8 +70,6 @@ final class QWKnobRegistryTests: XCTestCase {
         let knob = try XCTUnwrap(QWKnobRegistry.descriptor("gdnPrefill"))
         XCTAssertFalse(knob.isAvailable(under: []))
         XCTAssertTrue(knob.isAvailable(under: [.gdnPrefill]))
-        let without = QWKnobRegistry.descriptors(availableUnder: [])
-        XCTAssertFalse(without.contains { $0.id == "gdnPrefill" })
     }
 
     func testValueCapabilityIsEnforcedSeparatelyFromKnobAvailability() throws {
@@ -87,14 +85,6 @@ final class QWKnobRegistryTests: XCTestCase {
                 return XCTFail("expected capabilityUnavailable, got \(error)")
             }
         }
-    }
-
-    func testDescriptorsAreFilterableBySurfaceAndCapability() {
-        let cli = QWKnobRegistry.descriptors(for: .cli)
-        XCTAssertTrue(cli.contains { $0.id == "prefillChunkRows" })
-        let cache = QWKnobRegistry.descriptors(requireing: .prefixCache)
-        XCTAssertTrue(cache.contains { $0.id == "warmCacheLimitGiB" })
-        XCTAssertFalse(cache.contains { $0.id == "prefillChunkRows" })
     }
 
     func testTierPartitionIsDisjoint() {

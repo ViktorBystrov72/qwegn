@@ -20,6 +20,8 @@ final class FNMetalGDNF32Tests: XCTestCase {
     }
 
     func testF32GDNKernelsMatchFp16Originals() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable,
+                          "1024-thread GDN recurrent kernel requires bare-metal Apple Silicon GPU")
         let T = 2, C = 10240, VH = 48, D = 128
         let arena = try QWArena(hal: Self.hal, weights: 64 << 20, activations: 512 << 20, kv: 0, gdnStates: 0)
         // The context prewarms the doors it is given; this test wants
@@ -88,14 +90,12 @@ final class FNMetalGDNF32Tests: XCTestCase {
         let sA = try t32(stateInit), sB = try t32(stateInit)
         let oA = try act.allocate(QWTensorShape([VH * D], .f32)), oB = try act.allocate(QWTensorShape([VH * D], .f32))
         let outA = try act.allocate(QWTensorShape([VH * D], .f16))
-        let zHalfRef = try t16(zIn), zF32 = try t32(zIn), nwF32 = try t32(nwIn)
+        let zHalfRef = try t16(zIn), zF32 = try t32(zIn), nwHalfRef = try t16(nwIn), nwF32 = try t32(nwIn)
         let yHalfRef = try t16(Array(yPRef[0..<C])), yF32 = try t32(Array(yPNew[0..<C]))
         let gl0 = read32(glPf, T * VH), be0 = read32(btPf, T * VH)
         let glT = try t32(Array(gl0[0..<VH])), beT = try t32(Array(be0[0..<VH]))
         guard let (cb3, enc3) = Self.hal.begin() else { throw XCTSkip("no cb") }
-        try ctx.recurrence.encodeRaw(enc3, y: yHalfRef, betas: beT, glog: glT, state: sA, oScratch: oA)
-        enc3.memoryBarrier(scope: .buffers)
-        try QWGDNSigmoidNorm.encode(enc3, hal: Self.hal, oRaw: oA, z: zHalfRef, weight: nwF32, out: outA)
+        try ctx.recurrence.encode(enc3, y: yHalfRef, betas: beT, glog: glT, state: sA, z: zHalfRef, w: nwHalfRef, o: outA, oScratch: oA)
         try QWGDNF32.encodeRecurrentF32(enc3, hal: Self.hal, y: yF32, betas: beT, glog: glT, state: sB, z: zF32, normWeight: nwF32, out: oB)
         Self.hal.end(cb3, enc3); cb3.waitUntilCompleted()
         XCTAssertNil(cb3.error)
@@ -103,5 +103,45 @@ final class FNMetalGDNF32Tests: XCTestCase {
         print(String(format: "GDN32 recurrence out: nan=%d rel=%.3e", rel(oNew, oRef).nan, rel(oNew, oRef).rel))
         let sRef = read32(sA, VH * D * D), sNew = read32(sB, VH * D * D)
         print(String(format: "GDN32 recurrence state: nan=%d rel=%.3e", rel(sNew, sRef).nan, rel(sNew, sRef).rel))
+    }
+
+    func testStridedConvPrepMatchesUnstrided() throws {
+        let T = 160, VH = 48, C = 10240
+        let arena = try QWArena(hal: Self.hal, weights: 32 << 20, activations: 256 << 20, kv: 0, gdnStates: 0)
+        let act = arena.activationsRegion()
+        func t32(_ a: [Float]) throws -> QWTensorValue {
+            let t = try act.allocate(QWTensorShape([a.count], .f32))
+            arena.copyIn(t, from: a.withUnsafeBufferPointer { Data(buffer: $0) }); return t
+        }
+        func read32(_ t: QWTensorValue, _ n: Int) -> [Float] {
+            Array(UnsafeBufferPointer(start: arena.cpuPointer(of: t).bindMemory(to: Float.self, capacity: n), count: n))
+        }
+        let xIn = Self.lcg(T * C, seed: 11, scale: 0.4), wIn = Self.lcg(C * 4, seed: 12, scale: 0.25)
+        let bIn = Self.lcg(T * VH, seed: 13, scale: 0.5), aIn = Self.lcg(T * VH, seed: 14, scale: 0.5)
+        var baInter = [Float](repeating: 0, count: T * 2 * VH)
+        for t in 0..<T {
+            for h in 0..<VH { baInter[t * 2 * VH + h] = bIn[t * VH + h]; baInter[t * 2 * VH + VH + h] = aIn[t * VH + h] }
+        }
+        let xf = try t32(xIn), wf = try t32(wIn)
+        let aLogF = try t32(Self.lcg(VH, seed: 15, scale: 0.2)), dtF = try t32(Self.lcg(VH, seed: 16, scale: 0.2))
+        let stInitConv = Self.lcg(3 * C, seed: 17, scale: 0.2)
+        let stSepIn = try t32(stInitConv), stSepOut = try act.allocate(QWTensorShape([3 * C], .f32))
+        let stStrIn = try t32(stInitConv), stStrOut = try act.allocate(QWTensorShape([3 * C], .f32))
+        let bSep = try t32(bIn), aSep = try t32(aIn), baF = try t32(baInter)
+        let ySep = try act.allocate(QWTensorShape([T * C], .f32))
+        let glSep = try act.allocate(QWTensorShape([T * VH], .f32)), btSep = try act.allocate(QWTensorShape([T * VH], .f32))
+        let yStr = try act.allocate(QWTensorShape([T * C], .f32))
+        let glStr = try act.allocate(QWTensorShape([T * VH], .f32)), btStr = try act.allocate(QWTensorShape([T * VH], .f32))
+        guard let (cb, enc) = Self.hal.begin() else { throw XCTSkip("no cb") }
+        try QWGDNF32.encodeConvPrepSeqF32(enc, hal: Self.hal, x: xf, w: wf, stIn: stSepIn, stOut: stSepOut,
+                                          b: bSep, a: aSep, aLog: aLogF, dtBias: dtF, y: ySep, glog: glSep, beta: btSep, rows: T)
+        try QWGDNF32.encodeConvPrepSeqF32(enc, hal: Self.hal, x: xf, w: wf, stIn: stStrIn, stOut: stStrOut,
+                                          b: baF, a: baF.slice(byteOffset: VH * 4, count: T * 2 * VH - VH, dtype: .f32),
+                                          aLog: aLogF, dtBias: dtF, y: yStr, glog: glStr, beta: btStr, rows: T, baStride: 2 * VH)
+        Self.hal.end(cb, enc); cb.waitUntilCompleted()
+        XCTAssertNil(cb.error)
+        XCTAssertEqual(read32(yStr, T * C), read32(ySep, T * C))
+        XCTAssertEqual(read32(glStr, T * VH), read32(glSep, T * VH))
+        XCTAssertEqual(read32(btStr, T * VH), read32(btSep, T * VH))
     }
 }

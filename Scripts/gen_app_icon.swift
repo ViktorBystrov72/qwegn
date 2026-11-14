@@ -1,130 +1,128 @@
 // gen_app_icon.swift — Renders Qwegn AppIcon.iconset PNGs using CoreGraphics.
-// Draws the dark macOS squircle tile and the canonical 600x600 QG microchip mark.
 
-import AppKit
 import CoreGraphics
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-func drawQGMark(in ctx: CGContext, size: CGFloat) {
-    ctx.saveGState()
-    // Flip to top-left origin inside padded inner frame
-    ctx.translateBy(x: 0, y: size)
-    ctx.scaleBy(x: 1, y: -1)
-    let pad = size * 0.11
-    let inner = size - 2 * pad
-    ctx.translateBy(x: pad, y: pad)
-    let s = inner / 600.0
-    ctx.scaleBy(x: s, y: s)
+func drawQWGMark(in ctx: CGContext, size: CGFloat) {
+    let isMicro = size <= 32
+    let pad = size * (isMicro ? 0.14 : 0.18)
+    let scale = (size - 2 * pad) / 600.0
 
-    ctx.setStrokeColor(CGColor(srgbRed: 0.91, green: 0.95, blue: 0.99, alpha: 1.0))
-    ctx.setLineWidth(24)
+    ctx.saveGState()
+    // Flip into top-left SVG space inside the padded square.
+    ctx.translateBy(x: pad, y: size - pad)
+    ctx.scaleBy(x: scale, y: -scale)
     ctx.setLineCap(.round)
     ctx.setLineJoin(.round)
 
-    for x: CGFloat in [220, 260, 300, 340, 380] {
-        ctx.move(to: CGPoint(x: x, y: 62)); ctx.addLine(to: CGPoint(x: x, y: 108))
-        ctx.move(to: CGPoint(x: x, y: 492)); ctx.addLine(to: CGPoint(x: x, y: 538))
+    let outerColor = CGColor(srgbRed: 0.78, green: 0.88, blue: 1.0, alpha: 0.90)
+    let waveColor = CGColor(srgbRed: 0.24, green: 0.56, blue: 1.0, alpha: isMicro ? 0.68 : 0.58)
+    let fgColor = CGColor(srgbRed: 0.94, green: 0.97, blue: 1.0, alpha: 1.0)
+
+    ctx.setStrokeColor(outerColor)
+    ctx.setLineWidth(isMicro ? 32 : 24)
+    if !isMicro {
+        for pos in [220, 300, 380] {
+            let p = CGFloat(pos)
+            ctx.move(to: CGPoint(x: p, y: 62)); ctx.addLine(to: CGPoint(x: p, y: 106))
+            ctx.move(to: CGPoint(x: p, y: 494)); ctx.addLine(to: CGPoint(x: p, y: 538))
+            ctx.move(to: CGPoint(x: 62, y: p)); ctx.addLine(to: CGPoint(x: 106, y: p))
+            ctx.move(to: CGPoint(x: 494, y: p)); ctx.addLine(to: CGPoint(x: 538, y: p))
+        }
+        ctx.strokePath()
     }
-    ctx.move(to: CGPoint(x: 62, y: 220)); ctx.addLine(to: CGPoint(x: 108, y: 220))
-    ctx.move(to: CGPoint(x: 62, y: 260)); ctx.addLine(to: CGPoint(x: 108, y: 260))
-    ctx.move(to: CGPoint(x: 62, y: 300)); ctx.addLine(to: CGPoint(x: 108, y: 300))
-    ctx.move(to: CGPoint(x: 62, y: 340)); ctx.addLine(to: CGPoint(x: 340, y: 340))
-    ctx.move(to: CGPoint(x: 62, y: 380)); ctx.addLine(to: CGPoint(x: 108, y: 380))
-    for y: CGFloat in [220, 260, 300, 340, 380] {
-        ctx.move(to: CGPoint(x: 492, y: y)); ctx.addLine(to: CGPoint(x: 538, y: y))
+
+    let brackets: [(CGPoint, CGPoint, CGPoint, CGPoint, CGPoint)] = [
+        (CGPoint(x: 272, y: 132), CGPoint(x: 178, y: 132), CGPoint(x: 132, y: 132), CGPoint(x: 132, y: 178), CGPoint(x: 132, y: 272)),
+        (CGPoint(x: 328, y: 132), CGPoint(x: 422, y: 132), CGPoint(x: 468, y: 132), CGPoint(x: 468, y: 178), CGPoint(x: 468, y: 272)),
+        (CGPoint(x: 132, y: 328), CGPoint(x: 132, y: 422), CGPoint(x: 132, y: 468), CGPoint(x: 178, y: 468), CGPoint(x: 272, y: 468)),
+        (CGPoint(x: 468, y: 328), CGPoint(x: 468, y: 422), CGPoint(x: 468, y: 468), CGPoint(x: 422, y: 468), CGPoint(x: 328, y: 468)),
+    ]
+    for (start, lineEnd, ctrl, cornerEnd, end) in brackets {
+        ctx.move(to: start)
+        ctx.addLine(to: lineEnd)
+        ctx.addQuadCurve(to: cornerEnd, control: ctrl)
+        ctx.addLine(to: end)
     }
     ctx.strokePath()
 
-    ctx.move(to: CGPoint(x: 276, y: 135))
-    ctx.addLine(to: CGPoint(x: 180, y: 135))
-    ctx.addQuadCurve(to: CGPoint(x: 135, y: 180), control: CGPoint(x: 135, y: 135))
-    ctx.addLine(to: CGPoint(x: 135, y: 276))
-
-    ctx.move(to: CGPoint(x: 324, y: 135))
-    ctx.addLine(to: CGPoint(x: 420, y: 135))
-    ctx.addQuadCurve(to: CGPoint(x: 465, y: 180), control: CGPoint(x: 465, y: 135))
-    ctx.addLine(to: CGPoint(x: 465, y: 276))
-
-    ctx.move(to: CGPoint(x: 135, y: 324))
-    ctx.addLine(to: CGPoint(x: 135, y: 420))
-    ctx.addQuadCurve(to: CGPoint(x: 180, y: 465), control: CGPoint(x: 135, y: 465))
-    ctx.addLine(to: CGPoint(x: 276, y: 465))
-
-    ctx.move(to: CGPoint(x: 465, y: 324))
-    ctx.addLine(to: CGPoint(x: 465, y: 420))
-    ctx.addQuadCurve(to: CGPoint(x: 420, y: 465), control: CGPoint(x: 465, y: 465))
-    ctx.addLine(to: CGPoint(x: 324, y: 465))
+    ctx.setStrokeColor(waveColor)
+    ctx.setLineWidth(isMicro ? 30 : 26)
+    ctx.move(to: CGPoint(x: 164, y: 206))
+    ctx.addLine(to: CGPoint(x: 232, y: 414))
+    ctx.addLine(to: CGPoint(x: 300, y: 264))
+    ctx.addLine(to: CGPoint(x: 368, y: 414))
+    ctx.addLine(to: CGPoint(x: 436, y: 206))
     ctx.strokePath()
 
-    ctx.setStrokeColor(CGColor(srgbRed: 0.38, green: 0.86, blue: 0.95, alpha: 1.0))
-    let qRect = CGRect(x: 180, y: 175, width: 112, height: 250)
-    ctx.addPath(CGPath(roundedRect: qRect, cornerWidth: 36, cornerHeight: 36, transform: nil))
-    ctx.move(to: CGPoint(x: 246, y: 336))
-    ctx.addLine(to: CGPoint(x: 346, y: 436))
-    ctx.strokePath()
+    ctx.setStrokeColor(fgColor)
+    ctx.setLineWidth(isMicro ? 34 : 28)
+    let qRect = CGRect(x: 172, y: 182, width: 106, height: 232)
+    ctx.addPath(CGPath(roundedRect: qRect, cornerWidth: 38, cornerHeight: 38, transform: nil))
+    ctx.move(to: CGPoint(x: 238, y: 350))
+    ctx.addLine(to: CGPoint(x: 294, y: 426))
 
-    ctx.move(to: CGPoint(x: 324, y: 175))
-    ctx.addLine(to: CGPoint(x: 380, y: 175))
-    ctx.addQuadCurve(to: CGPoint(x: 412, y: 207), control: CGPoint(x: 412, y: 175))
-    ctx.addLine(to: CGPoint(x: 412, y: 268))
-    ctx.move(to: CGPoint(x: 324, y: 326))
-    ctx.addLine(to: CGPoint(x: 412, y: 326))
-    ctx.addLine(to: CGPoint(x: 412, y: 393))
-    ctx.addQuadCurve(to: CGPoint(x: 380, y: 425), control: CGPoint(x: 412, y: 425))
-    ctx.addLine(to: CGPoint(x: 324, y: 425))
+    ctx.move(to: CGPoint(x: 426, y: 226))
+    ctx.addQuadCurve(to: CGPoint(x: 382, y: 182), control: CGPoint(x: 426, y: 182))
+    ctx.addLine(to: CGPoint(x: 366, y: 182))
+    ctx.addQuadCurve(to: CGPoint(x: 322, y: 226), control: CGPoint(x: 322, y: 182))
+    ctx.addLine(to: CGPoint(x: 322, y: 370))
+    ctx.addQuadCurve(to: CGPoint(x: 366, y: 414), control: CGPoint(x: 322, y: 414))
+    ctx.addLine(to: CGPoint(x: 386, y: 414))
+    ctx.addQuadCurve(to: CGPoint(x: 428, y: 372), control: CGPoint(x: 428, y: 414))
+    ctx.addLine(to: CGPoint(x: 428, y: 310))
+    ctx.addLine(to: CGPoint(x: 372, y: 310))
     ctx.strokePath()
-
     ctx.restoreGState()
 }
 
 func renderIcon(pixels: Int, to url: URL) throws {
-    let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+    let cs = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
     guard let ctx = CGContext(
-        data: nil, width: pixels, height: pixels,
-        bitsPerComponent: 8, bytesPerRow: pixels * 4, space: cs,
-        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0,
+        space: cs, bitmapInfo: bitmapInfo
     ) else {
-        throw NSError(domain: "gen_app_icon", code: 1)
+        throw NSError(domain: "gen_app_icon", code: 1, userInfo: [NSLocalizedDescriptionKey: "CGContext failed"])
     }
     let s = CGFloat(pixels)
-    let inset = s * 0.08
-    let tile = CGRect(x: inset, y: inset, width: s - 2 * inset, height: s - 2 * inset)
-    let radius = tile.width * 0.225
-    let path = CGPath(roundedRect: tile, cornerWidth: radius, cornerHeight: radius, transform: nil)
+    let inset = s * 0.098
+    let tileRect = CGRect(x: inset, y: inset, width: s - 2 * inset, height: s - 2 * inset)
+    let tilePath = CGPath(roundedRect: tileRect, cornerWidth: s * 0.18, cornerHeight: s * 0.18, transform: nil)
 
     ctx.saveGState()
-    ctx.addPath(path)
+    ctx.addPath(tilePath)
     ctx.clip()
     let colors = [
-        CGColor(srgbRed: 0.11, green: 0.14, blue: 0.20, alpha: 1.0),
-        CGColor(srgbRed: 0.05, green: 0.07, blue: 0.10, alpha: 1.0),
+        CGColor(srgbRed: 0.11, green: 0.14, blue: 0.21, alpha: 1.0),
+        CGColor(srgbRed: 0.05, green: 0.06, blue: 0.09, alpha: 1.0),
     ] as CFArray
     let grad = CGGradient(colorsSpace: cs, colors: colors, locations: [0.0, 1.0])!
     ctx.drawLinearGradient(grad, start: CGPoint(x: s * 0.5, y: s), end: CGPoint(x: s * 0.5, y: 0), options: [])
     ctx.restoreGState()
 
-    ctx.addPath(path)
-    ctx.setStrokeColor(CGColor(srgbRed: 0.26, green: 0.34, blue: 0.46, alpha: 0.85))
+    ctx.setStrokeColor(CGColor(srgbRed: 0.35, green: 0.50, blue: 0.75, alpha: 0.32))
     ctx.setLineWidth(max(1.0, s * 0.012))
+    ctx.addPath(tilePath)
     ctx.strokePath()
 
-    drawQGMark(in: ctx, size: s)
+    drawQWGMark(in: ctx, size: s)
 
-    guard let img = ctx.makeImage(),
+    guard let image = ctx.makeImage(),
           let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
-        throw NSError(domain: "gen_app_icon", code: 2)
+        throw NSError(domain: "gen_app_icon", code: 2, userInfo: [NSLocalizedDescriptionKey: "PNG encode failed"])
     }
-    CGImageDestinationAddImage(dest, img, nil)
+    CGImageDestinationAddImage(dest, image, nil)
     guard CGImageDestinationFinalize(dest) else {
-        throw NSError(domain: "gen_app_icon", code: 3)
+        throw NSError(domain: "gen_app_icon", code: 3, userInfo: [NSLocalizedDescriptionKey: "PNG write failed"])
     }
 }
 
 guard CommandLine.arguments.count == 2 else {
     fputs("Usage: swift Scripts/gen_app_icon.swift <AppIcon.iconset>\n", stderr)
-    exit(2)
+    exit(1)
 }
 let outDir = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)

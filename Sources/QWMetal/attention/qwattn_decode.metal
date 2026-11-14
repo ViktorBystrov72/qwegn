@@ -9,11 +9,173 @@ using namespace metal;
 
 #define QW_MAXSPLITS 64u
 #define QW_ST   12u                        // keys staged per phase (12 KiB)
+#define QW_MAXKEYS_SHARED 16u              // general tiled stage: up to 2 * gqaRatio
 #define QW_TGV  (QW_GQA_RATIO * 32u)      // one simdgroup per q head of a kv head
 #define QW_HEAD_DIM_MAX 256u
 #include "include/qw_kv_paged.metalh"
 #include "include/qw_attn_decode.metalh"
 
+
+// General shared-prefix decode attention for non-27B geometries and any
+// headDim <= 256, gqaRatio <= 8, matching qwg_decode_general_body arithmetic.
+template <uint B, uint KV>
+static inline void qwg_decode_shared_general(
+        const device half* qgate, const device half* kpool, const device half* vpool,
+        const device int* ktab, const device int* vtab,
+        const device half* knew, const device half* vnew, device float* partials,
+        uint C, uint splits, uint tid, uint3 tg,
+        threadgroup half* stageK, threadgroup half* stageV) {
+    const uint lane = tid & 31u, head = tg.x * QW_GQA_RATIO + (tid >> 5);
+    const uint kvh = tg.x, d0 = lane * 8u;
+    const bool live = d0 < QW_HEAD_DIM;
+    const uint keysPerPhase = 2u * QW_GQA_RATIO;
+    const uint per = (C + 1u + splits - 1u) / splits;
+    const uint start = tg.y * per;
+    float q[B][8], m[B], l[B], acc[B][8];
+    uint k0[B], k1[B], cEnd[B], tiledEnd[B];
+    uint sharedEnd = start;
+    #pragma unroll
+    for (uint b = 0; b < B; ++b) {
+        const uint nKeys = C + b + 1u;
+        k0[b] = min(start, nKeys);
+        k1[b] = min(start + per, nKeys);
+        cEnd[b] = min(k1[b], C + b);
+        tiledEnd[b] = start + (cEnd[b] > start ? ((cEnd[b] - start) / keysPerPhase) * keysPerPhase : 0u);
+        sharedEnd = max(sharedEnd, tiledEnd[b]);
+        m[b] = -1e30f; l[b] = 0.0f;
+        if (live) {
+            const device half* qp = qgate + uint64_t(b) * QW_QPROJ_OUT + head * QW_Q_STRIDE * QW_HEAD_DIM + d0;
+            for (uint i = 0; i < 8u; ++i) q[b][i] = float(qp[i]);
+        } else {
+            for (uint i = 0; i < 8u; ++i) q[b][i] = 0.0f;
+        }
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) acc[b][i] = 0.0f;
+    }
+    for (uint r = start; r < sharedEnd; r += keysPerPhase) {
+        if (QW_HEAD_DIM <= 128u) {
+            const uint keyIdx = tid >> 4u, col = (tid & 15u) << 3u, row = r + keyIdx;
+            const uint pk = (uint)ktab[row >> 8], pv = (uint)vtab[row >> 8];
+            const uint e = keyIdx * QW_HEAD_DIM_MAX + col;
+            if (col < QW_HEAD_DIM) {
+                if (KV == 0u) {
+                    const uint off = (row & 255u) * QW_ROW + kvh * QW_HEAD_DIM + col;
+                    *(threadgroup uint4*)&stageK[e] = *(const device uint4*)(kpool + uint64_t(pk) * QW_PGEL + off);
+                    *(threadgroup uint4*)&stageV[e] = *(const device uint4*)(vpool + uint64_t(pv) * QW_PGEL + off);
+                } else {
+                    half ka[8], va[8];
+                    QW_KV_LOAD8(ka, kpool, pk, row & 255u, kvh, col, KV);
+                    QW_KV_LOAD8(va, vpool, pv, row & 255u, kvh, col, KV);
+                    for (uint i = 0; i < 8u; ++i) { stageK[e + i] = ka[i]; stageV[e + i] = va[i]; }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (uint s = 0; s < 2u; ++s) {
+                const uint e = s * (QW_GQA_RATIO * 32u * 8u) + tid * 8u;
+                const uint row = r + (e >> 8);
+                const uint pk = (uint)ktab[row >> 8], pv = (uint)vtab[row >> 8];
+                if (live) {
+                    if (KV == 0u) {
+                        const uint off = (row & 255u) * QW_ROW + kvh * QW_HEAD_DIM + (e & 255u);
+                        *(threadgroup uint4*)&stageK[e] = *(const device uint4*)(kpool + uint64_t(pk) * QW_PGEL + off);
+                        *(threadgroup uint4*)&stageV[e] = *(const device uint4*)(vpool + uint64_t(pv) * QW_PGEL + off);
+                    } else {
+                        QW_KV_LOAD8S(stageK, kpool, pk, row & 255u, kvh, e & 255u, e, KV);
+                        QW_KV_LOAD8S(stageV, vpool, pv, row & 255u, kvh, e & 255u, e, KV);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint b = 0; b < B; ++b) {
+            if (r >= tiledEnd[b]) continue;
+            float scores[QW_MAXKEYS_SHARED];
+            for (uint j = 0; j < keysPerPhase; ++j) {
+                half kk[8];
+                if (live) {
+                    *(thread uint4*)kk = *(threadgroup const uint4*)&stageK[j * QW_HEAD_DIM_MAX + d0];
+                } else {
+                    for (uint i = 0; i < 8u; ++i) kk[i] = half(0.0h);
+                }
+                float pd = 0.0f;
+                for (uint i = 0; i < 8u; ++i) pd += q[b][i] * float(kk[i]);
+                scores[j] = simd_sum(pd) * QW_ATTN_SCALE;
+            }
+            float bm = scores[0];
+            for (uint j = 1; j < keysPerPhase; ++j) bm = max(bm, scores[j]);
+            const float mb = max(m[b], bm);
+            float lp = 0.0f, op[8];
+            for (uint i = 0; i < 8u; ++i) op[i] = 0.0f;
+            for (uint j = 0; j < keysPerPhase; ++j) {
+                const float pj = metal::exp(scores[j] - mb);
+                lp += pj;
+                half vv[8];
+                if (live) {
+                    *(thread uint4*)vv = *(threadgroup const uint4*)&stageV[j * QW_HEAD_DIM_MAX + d0];
+                } else {
+                    for (uint i = 0; i < 8u; ++i) vv[i] = half(0.0h);
+                }
+                for (uint i = 0; i < 8u; ++i) op[i] += pj * float(vv[i]);
+            }
+            const float correction = metal::exp(m[b] - mb);
+            l[b] = l[b] * correction + lp;
+            for (uint i = 0; i < 8u; ++i) acc[b][i] = acc[b][i] * correction + op[i];
+            m[b] = mb;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint b = 0; b < B; ++b) {
+        for (uint r = max(k0[b], tiledEnd[b]); r < cEnd[b]; ++r) {
+            half kk[8], vv[8];
+            if (live) {
+                if (KV == 0u) {
+                    const uint off = (r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
+                    *(thread uint4*)kk = *(const device uint4*)(kpool + uint64_t(ktab[r >> 8]) * QW_PGEL + off);
+                    *(thread uint4*)vv = *(const device uint4*)(vpool + uint64_t(vtab[r >> 8]) * QW_PGEL + off);
+                } else {
+                    QW_KV_LOAD8(kk, kpool, ktab[r >> 8], r & 255u, kvh, d0, KV);
+                    QW_KV_LOAD8(vv, vpool, vtab[r >> 8], r & 255u, kvh, d0, KV);
+                }
+            } else {
+                for (uint i = 0; i < 8u; ++i) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
+            }
+            float pd = 0.0f;
+            for (uint i = 0; i < 8u; ++i) pd += q[b][i] * float(kk[i]);
+            const float score = simd_sum(pd) * QW_ATTN_SCALE;
+            const float mn = max(m[b], score);
+            const float correction = score > m[b] ? metal::exp(m[b] - score) : 1.0f;
+            const float p = metal::exp(score - mn);
+            l[b] = l[b] * correction + p;
+            for (uint i = 0; i < 8u; ++i) acc[b][i] = acc[b][i] * correction + p * float(vv[i]);
+            m[b] = mn;
+        }
+        if (C + b >= k0[b] && C + b < k1[b]) {
+            half kk[8], vv[8];
+            if (live) {
+                *(thread uint4*)kk = *(const device uint4*)(knew + uint64_t(b) * QW_ROW + kvh * QW_HEAD_DIM + d0);
+                *(thread uint4*)vv = *(const device uint4*)(vnew + uint64_t(b) * QW_ROW + kvh * QW_HEAD_DIM + d0);
+            } else {
+                for (uint i = 0; i < 8u; ++i) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
+            }
+            float pd = 0.0f;
+            for (uint i = 0; i < 8u; ++i) pd += q[b][i] * float(kk[i]);
+            const float score = simd_sum(pd) * QW_ATTN_SCALE;
+            const float mn = max(m[b], score);
+            const float correction = score > m[b] ? metal::exp(m[b] - score) : 1.0f;
+            const float p = metal::exp(score - mn);
+            l[b] = l[b] * correction + p;
+            for (uint i = 0; i < 8u; ++i) acc[b][i] = acc[b][i] * correction + p * float(vv[i]);
+            m[b] = mn;
+        }
+        const uint splitStride = max(QW_MAXSPLITS, splits);
+        device float* dst = partials + (uint64_t(b) * QW_Q_HEADS * splitStride + head * splitStride + tg.y) * (QW_HEAD_DIM + 2u);
+        if (live) {
+            for (uint i = 0; i < 8u; ++i) dst[d0 + i] = acc[b][i];
+        }
+        if (lane == 0u) { dst[QW_HEAD_DIM] = m[b]; dst[QW_HEAD_DIM + 1u] = l[b]; }
+    }
+}
 
 // All window K/V rows must be materialized and fenced before this read-only
 // dispatch. The host falls back when query split strides differ.
@@ -27,6 +189,11 @@ static inline void qwg_decode_shared(
         const device half* knew, const device half* vnew, device float* partials,
         uint C, uint splits, uint tid, uint3 tg,
         threadgroup half* stageK, threadgroup half* stageV) {
+    if (!(QW_KV_HEADS == 4u && QW_HEAD_DIM == 256u && QW_GQA_RATIO == 6u && QW_HAS_Q_GATE)) {
+        qwg_decode_shared_general<B, KV>(qgate, kpool, vpool, ktab, vtab, knew, vnew, partials,
+                                         C, splits, tid, tg, stageK, stageV);
+        return;
+    }
     const uint lane = tid & 31u, head = tg.x * QW_GQA_RATIO + (tid >> 5);
     const uint d0 = lane * 8u;
     const uint per = (C + 1u + splits - 1u) / splits;
@@ -162,7 +329,7 @@ kernel void qwg_attn_decode_shared_m##B##SFX( \
         const device half* vnew [[buffer(6)]], device float* partials [[buffer(7)]], \
         constant uint& C [[buffer(8)]], constant uint& splits [[buffer(9)]], \
         uint tid [[thread_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { \
-    threadgroup half stageK[QW_ST * QW_HEAD_DIM_MAX], stageV[QW_ST * QW_HEAD_DIM_MAX]; \
+    threadgroup half stageK[QW_MAXKEYS_SHARED * QW_HEAD_DIM_MAX], stageV[QW_MAXKEYS_SHARED * QW_HEAD_DIM_MAX]; \
     qwg_decode_shared<B, KV>(qgate, kpool, vpool, ktab, vtab, knew, vnew, partials, \
                         C, splits, tid, tg, stageK, stageV); \
 }

@@ -101,7 +101,7 @@ final class QWMTPTDraftHead {
             throw QWEngineDriverError.state("draft head QWWeightView layout invalid")
         }
         self.view = v
-        self.f2plan = QWGemm.plan(QWGemmShape(m: 1, n: n, k: k), dtype: .q4g, epi: .none)
+        self.f2plan = QWGemm.plan(QWGemmShape(m: 1, n: n, k: k), dtype: .q4g, epi: .none, vocab: n)
     }
 
     /// Encode the draft head GEMV (M=1) on the caller's encoder:

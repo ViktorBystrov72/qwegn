@@ -10,8 +10,8 @@ struct QWMTPBatchedMLP {
     let rows: Int
     let sums: QWTensorValue
     let downRows: QWTensorValue
-    private let downViews: [QWTensorValue]
-    private let sumViews: [QWTensorValue]
+    let downViews: [QWTensorValue]
+    let sumViews: [QWTensorValue]
     private let gateUp: [Int: any MTLComputePipelineState]
     private let gateUpFwht32: [Int: any MTLComputePipelineState]
     private let down: [Int: any MTLComputePipelineState]
@@ -85,16 +85,6 @@ struct QWMTPBatchedMLP {
             QWTensorValue(region: storage.region, offset: storage.offset + row * geometry.hidden * 2,
                           shape: QWTensorShape([geometry.hidden], .f16))
         }
-    }
-
-    func downRow(_ row: Int) throws -> QWTensorValue {
-        guard (0..<rows).contains(row) else { throw QWEngineDriverError.state("invalid batched MLP down row") }
-        return downViews[row]
-    }
-
-    func outputSumRow(_ row: Int) throws -> QWTensorValue {
-        guard (0..<rows).contains(row) else { throw QWEngineDriverError.state("invalid batched output sum row") }
-        return sumViews[row]
     }
 
     func encodeProjection(_ enc: any MTLComputeCommandEncoder, input: QWTensorValue,

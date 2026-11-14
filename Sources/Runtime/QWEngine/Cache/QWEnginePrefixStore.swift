@@ -17,7 +17,7 @@ final class QWEnginePrefixStore<Value: Sendable> {
     private let core: QWSlotPinnedLRUStore<Key, Value>
     var onEvict: ((Key, Value, Bool) -> Void)?
 
-    init(byteLimit: Int, entryLimit: Int = 16, vocab: Int = QWModelGeometry.qwen38_27b.vocab,
+    init(byteLimit: Int, entryLimit: Int = 16, vocab: Int,
          maxSlots: Int = QWEnginePrefixStore.defaultMaxSlots) throws {
         guard byteLimit > 0, entryLimit > 0, vocab > 0 else {
             throw QWEngineDriverError.state("prefix store limits must be positive")

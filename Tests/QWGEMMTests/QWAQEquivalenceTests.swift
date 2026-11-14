@@ -171,7 +171,7 @@ final class QWAQEquivalenceTests: XCTestCase {
                     let rowWords = payload[(r * k * bits / 8)...]
                     var ref = 0.0 as Double
                     var magnitude = 0.0 as Double
-                    rowWords.withUnsafeBytes { raw in
+                    rowWords.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                         let words = raw.bindMemory(to: UInt32.self)
                         for c in 0..<k {
                             let code = Double(QWBF16.unpackMLXAffineQ(rowWords: words.baseAddress!,

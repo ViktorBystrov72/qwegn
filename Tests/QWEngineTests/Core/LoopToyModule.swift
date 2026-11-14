@@ -163,12 +163,6 @@ final class LoopToyModule: QWInferenceModule, @unchecked Sendable {
         0
     }
 
-    func sampleLogits(_ state: any QWModuleSessionState) throws -> [Float] {
-        // The toy has no logits. It refuses rather than answering with a row
-        // of zeros — a numeric zero is not "unavailable".
-        throw QWModuleError.notImplemented("LoopToyModule.sampleLogits")
-    }
-
     func encodeDecodeStep(_ state: any QWModuleSessionState, token: Int,
                           position: Int) throws -> Int {
         guard let toy = state as? State else {

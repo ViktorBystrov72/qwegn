@@ -74,12 +74,22 @@ public final class QWAttnDecode {
     /// EXP-9 sub-item 3 (opt-in, NOT default): batched-dispatch variants of
     /// the two kernels above. Lazily resolved so callers that never use the
     /// batched path pay no extra pipeline-build cost.
-    private lazy var psoDecodeBatched: any MTLComputePipelineState = {
-        try! hal.pipeline(Self.batchedKernelName(self.kvMode))
-    }()
-    private lazy var psoCombineBatched: any MTLComputePipelineState = {
-        try! hal.pipeline("qwg_attn_decode_combine_batched")
-    }()
+    private var cachedDecodeBatched: (any MTLComputePipelineState)?
+    private var cachedCombineBatched: (any MTLComputePipelineState)?
+
+    private func decodeBatchedPipeline() throws -> any MTLComputePipelineState {
+        if let p = cachedDecodeBatched { return p }
+        let p = try hal.pipeline(Self.batchedKernelName(self.kvMode))
+        cachedDecodeBatched = p
+        return p
+    }
+
+    private func combineBatchedPipeline() throws -> any MTLComputePipelineState {
+        if let p = cachedCombineBatched { return p }
+        let p = try hal.pipeline("qwg_attn_decode_combine_batched")
+        cachedCombineBatched = p
+        return p
+    }
 
     /// `forceGeneral` is the test seam: it selects the general kernels at a
     /// geometry the frozen ones could serve, so the equivalence test can
@@ -87,7 +97,7 @@ public final class QWAttnDecode {
     public init(hal: QWHal, sharedPrefixRows: Int? = nil, kvMode: QWKVMode = .f16,
                 geometry: QWModelGeometry,
                 forceGeneral: Bool = false) throws {
-        guard sharedPrefixRows == nil || (2...8).contains(sharedPrefixRows!) else {
+        if let rows = sharedPrefixRows, !(2...8).contains(rows) {
             throw QWAttnDecodeError.badShape("shared prefix requires B=2...8")
         }
         self.geometry = geometry
@@ -352,7 +362,7 @@ public final class QWAttnDecode {
 
         // A common split stride preserves the reference's 12-key fold boundaries.
         // At a stride transition, use the scalar reference instead of reordering.
-        if sharedPrefix && (cBase + splits) / splits != (cBase + T + splits - 1) / splits {
+        if (!sharedPrefix && isGeneral) || (sharedPrefix && (cBase + splits) / splits != (cBase + T + splits - 1) / splits) {
             func row(_ tensor: QWTensorValue, _ index: Int, _ columns: Int) -> QWTensorValue {
                 QWTensorValue(region: tensor.region, offset: tensor.offset + index * columns * 2,
                               shape: QWTensorShape([columns], .f16))
@@ -378,7 +388,7 @@ public final class QWAttnDecode {
             }
             enc.setComputePipelineState(psoSharedPrefix)
         } else {
-            enc.setComputePipelineState(psoDecodeBatched)
+            enc.setComputePipelineState(try decodeBatchedPipeline())
         }
         qgate.bind(enc, index: 0)
         kv.k.pool.bindTo(enc, index: 1)
@@ -399,7 +409,7 @@ public final class QWAttnDecode {
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(psoSharedCombine)
         } else {
-            enc.setComputePipelineState(psoCombineBatched)
+            enc.setComputePipelineState(try combineBatchedPipeline())
         }
         qgate.bind(enc, index: 0)
         out.bind(enc, index: 1)

@@ -34,18 +34,16 @@ final class QWServerMetricsTests: XCTestCase {
         XCTAssertEqual(snap0.cache.hitsSSDTotal, 0)
         XCTAssertEqual(snap0.cache.missesTotal, 0)
 
-        // 2. Record lookups and evictions
+        // 2. Record lookups
         registry.recordCacheLookup(hitTier: "warm_ram", matchedTokens: 32)
         registry.recordCacheLookup(hitTier: "cold_ssd", matchedTokens: 64)
         registry.recordCacheLookup(hitTier: nil, matchedTokens: 0)
-        registry.recordWarmEviction()
-        registry.recordSSDEviction()
 
         registry.updateCacheUsage(warmBytes: 1024 * 1024 * 50, warmLimit: 1024 * 1024 * 100,
                                   ssdBytes: 1024 * 1024 * 200, ssdLimit: 1024 * 1024 * 500)
 
         // 3. Record generation
-        registry.recordGeneration(tokensIn: 100, tokensOut: 50, prefillSec: 0.1, decodeSec: 0.5, ttftSec: 0.08)
+        registry.endRequest(tokensIn: 100, tokensOut: 50, prefillSec: 0.1, decodeSec: 0.5, ttftSec: 0.08)
         registry.updateContext(active: 150, capacity: 4096)
         registry.updateArena(reserved: 1024 * 1024 * 1024)
 
@@ -55,8 +53,8 @@ final class QWServerMetricsTests: XCTestCase {
         XCTAssertEqual(snap1.cache.hitsSSDTotal, 1)
         XCTAssertEqual(snap1.cache.missesTotal, 1)
         XCTAssertEqual(snap1.cache.tokensReusedTotal, 96)
-        XCTAssertEqual(snap1.cache.evictionsWarmTotal, 1)
-        XCTAssertEqual(snap1.cache.evictionsSSDTotal, 1)
+        XCTAssertEqual(snap1.cache.evictionsWarmTotal, 0)
+        XCTAssertEqual(snap1.cache.evictionsSSDTotal, 0)
         XCTAssertEqual(snap1.throughput.tokensInTotal, 100)
         XCTAssertEqual(snap1.throughput.tokensOutTotal, 50)
         XCTAssertEqual(snap1.context.activeTokens, 150)
@@ -167,6 +165,126 @@ final class QWServerMetricsTests: XCTestCase {
         XCTAssertNil(snap.throughput.liveDecodeTokensPerSec)
         XCTAssertEqual(snap.throughput.lastPrefillTokensPerSec ?? 0, 500.0)
         XCTAssertNotNil(snap.hardware)
+    }
+
+    func testUpdatePrefillProgressAdvancesAndClampsDuringPrefill() {
+        let registry = QWEngineTelemetryRegistry()
+
+        registry.beginPrefill(promptTokens: 65_536)
+        var snap = registry.snapshot()
+        XCTAssertEqual(snap.throughput.phase, "prefill")
+        XCTAssertEqual(snap.throughput.prefillProgressTokens, 0)
+        XCTAssertEqual(snap.throughput.prefillTotalTokens, 65_536)
+
+        // Prefix-cache partial hit adjusts computed denominator and advances incrementally.
+        registry.updatePrefillProgress(completedTokens: 16_384, totalTokens: 32_768)
+        snap = registry.snapshot()
+        XCTAssertEqual(snap.throughput.prefillProgressTokens, 16_384)
+        XCTAssertEqual(snap.throughput.prefillTotalTokens, 32_768)
+
+        // Overshoot and negative values clamp cleanly within [0, totalTokens].
+        registry.updatePrefillProgress(completedTokens: 50_000, totalTokens: 32_768)
+        snap = registry.snapshot()
+        XCTAssertEqual(snap.throughput.prefillProgressTokens, 32_768)
+        XCTAssertEqual(snap.throughput.prefillTotalTokens, 32_768)
+
+        // Outside prefill phase, progress updates are ignored.
+        registry.beginDecode(promptTokens: 65_536)
+        registry.updatePrefillProgress(completedTokens: 100, totalTokens: 200)
+        snap = registry.snapshot()
+        XCTAssertEqual(snap.throughput.phase, "decode")
+        XCTAssertEqual(snap.throughput.prefillProgressTokens, 65_536)
+        XCTAssertEqual(snap.throughput.prefillTotalTokens, 65_536)
+    }
+
+    func testActiveDecodeAdvancesThroughputTraceEverySecond() {
+        let registry = QWEngineTelemetryRegistry()
+        let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+
+        registry.beginPrefill(promptTokens: 2_000, at: t0)
+        registry.updatePrefillProgress(
+            completedTokens: 2_000,
+            totalTokens: 2_000,
+            at: t0.addingTimeInterval(0.4)
+        )
+        registry.beginDecode(promptTokens: 2_000, at: t0.addingTimeInterval(0.4))
+
+        for step in 1...4 {
+            let tokenAt = t0.addingTimeInterval(0.4 + Double(step) * 0.25)
+            registry.recordDecodeToken(at: tokenAt)
+        }
+        let s1 = registry.snapshot(at: t0.addingTimeInterval(1.5))
+        XCTAssertEqual(s1.throughput.phase, "decode")
+        XCTAssertGreaterThan(s1.throughput.liveDecodeTokensPerSec ?? 0, 0)
+        XCTAssertEqual(s1.throughput.prefillRateSeries.count, s1.throughput.decodeRateSeries.count)
+        let countAt1s = s1.throughput.decodeRateSeries.count
+        XCTAssertGreaterThanOrEqual(countAt1s, 2)
+
+        for step in 5...8 {
+            let tokenAt = t0.addingTimeInterval(0.4 + Double(step) * 0.25)
+            registry.recordDecodeToken(at: tokenAt)
+        }
+        let s2 = registry.snapshot(at: t0.addingTimeInterval(2.5))
+        XCTAssertEqual(s2.throughput.decodeRateSeries.count, countAt1s + 1)
+        XCTAssertEqual(s2.throughput.prefillRateSeries.count, s2.throughput.decodeRateSeries.count)
+
+        registry.endRequest(
+            tokensIn: 2_000,
+            tokensOut: 8,
+            prefillSec: 0.4,
+            decodeSec: 2.2,
+            ttftSec: 0.4,
+            at: t0.addingTimeInterval(2.6)
+        )
+        let afterIdle = registry.snapshot(at: t0.addingTimeInterval(3.0))
+        let laterIdle = registry.snapshot(at: t0.addingTimeInterval(12.0))
+        XCTAssertEqual(afterIdle.throughput.phase, "idle")
+        XCTAssertEqual(afterIdle.throughput.decodeRateSeries.count, laterIdle.throughput.decodeRateSeries.count)
+    }
+
+    func testActivePrefillAdvancesLiveRateAndTraceEverySecond() {
+        let registry = QWEngineTelemetryRegistry()
+        let t0 = Date(timeIntervalSince1970: 1_700_000_100)
+
+        registry.beginPrefill(promptTokens: 100_000, at: t0)
+        registry.updatePrefillProgress(completedTokens: 25_000, totalTokens: 100_000, at: t0.addingTimeInterval(1.1))
+        let s1 = registry.snapshot(at: t0.addingTimeInterval(1.2))
+        XCTAssertEqual(s1.throughput.phase, "prefill")
+        XCTAssertGreaterThan(s1.throughput.livePrefillTokensPerSec ?? 0, 0)
+        XCTAssertEqual(s1.throughput.displayPrefillTokensPerSec, s1.throughput.livePrefillTokensPerSec)
+        let count1 = s1.throughput.prefillRateSeries.count
+        XCTAssertGreaterThanOrEqual(count1, 2)
+        XCTAssertEqual(s1.throughput.prefillRateSeries.count, s1.throughput.decodeRateSeries.count)
+
+        registry.updatePrefillProgress(completedTokens: 55_000, totalTokens: 100_000, at: t0.addingTimeInterval(2.2))
+        let s2 = registry.snapshot(at: t0.addingTimeInterval(2.3))
+        XCTAssertEqual(s2.throughput.prefillRateSeries.count, count1 + 1)
+        XCTAssertEqual(s2.throughput.prefillRateSeries.count, s2.throughput.decodeRateSeries.count)
+        XCTAssertGreaterThan(s2.throughput.prefillRateSeries.compactMap { $0 }.count, 0)
+    }
+
+    func testSixtySecondTraceWindowScrollsLeftEverySecond() {
+        let registry = QWEngineTelemetryRegistry()
+        let t0 = Date(timeIntervalSince1970: 1_700_000_200)
+
+        registry.beginPrefill(promptTokens: 1_000, at: t0)
+        registry.beginDecode(promptTokens: 1_000, at: t0.addingTimeInterval(0.2))
+
+        for sec in 1...66 {
+            registry.recordDecodeToken(at: t0.addingTimeInterval(Double(sec) + 0.1))
+            if sec == 65 {
+                let s65 = registry.snapshot(at: t0.addingTimeInterval(65.5))
+                XCTAssertEqual(s65.throughput.decodeRateSeries.count, 60)
+                registry.recordDecodeToken(at: t0.addingTimeInterval(66.2))
+                let s66 = registry.snapshot(at: t0.addingTimeInterval(66.5))
+                XCTAssertEqual(s66.throughput.decodeRateSeries.count, 60)
+                XCTAssertEqual(
+                    Array(s65.throughput.decodeRateSeries.dropFirst().dropLast()),
+                    Array(s66.throughput.decodeRateSeries.dropLast(2))
+                )
+                break
+            }
+        }
     }
 }
 

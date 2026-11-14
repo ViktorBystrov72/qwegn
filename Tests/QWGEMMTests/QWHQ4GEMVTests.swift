@@ -85,7 +85,7 @@ final class QWHQ4GEMVTests: XCTestCase {
               let y = device.makeBuffer(length: rows * 4, options: .storageModeShared) else {
             XCTFail("no buffer"); return
         }
-        bank.withUnsafeBytes { weights.contents().copyMemory(from: $0.baseAddress!, byteCount: bank.count) }
+        bank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in weights.contents().copyMemory(from: raw.baseAddress!, byteCount: bank.count) }
         let xb = x.contents().bindMemory(to: UInt16.self, capacity: cols)
         for i in 0..<cols { xb[i] = Float16(xs[i]).bitPattern }
         guard let cb = Self.hal.queue.makeCommandBuffer(),

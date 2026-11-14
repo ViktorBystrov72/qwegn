@@ -23,7 +23,7 @@ final class QWMTPDraftEncoderTests: XCTestCase {
 
     private func tensor(_ data: Data, type: QWDType, hal: QWHal) throws -> QWTensorValue {
         let buffer = try XCTUnwrap(hal.device.makeBuffer(length: max(16, data.count), options: .storageModeShared))
-        data.withUnsafeBytes { buffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in buffer.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count) }
         return QWTensorValue(region: QWMRegion(buffer: buffer, base: 0, length: buffer.length),
                              offset: 0, shape: QWTensorShape([data.count / (type == .f16 ? 2 : 4)], type))
     }
@@ -78,7 +78,7 @@ final class QWMTPDraftEncoderTests: XCTestCase {
         let seedRows = 15, kvElems = 1024
         for (kind, name) in [(QWKVKind.k, "mtpc_seedkq_k.bin"), (.v, "mtpc_seedkq_v.bin")] {
             let data = try load(name)
-            let rows = data.withUnsafeBytes { p -> [UInt16] in
+            let rows = data.withUnsafeBytes { (p: UnsafeRawBufferPointer) -> [UInt16] in
                 let bits = p.bindMemory(to: UInt16.self)
                 var output = [UInt16](repeating: 0, count: seedRows * kvElems)
                 for t in 0..<seedRows {
@@ -138,8 +138,8 @@ final class QWMTPDraftEncoderTests: XCTestCase {
             let ref = try load(reference)
             XCTAssertEqual(t.bytes, ref.count, reference)
             let got = t.region.pointer.advanced(by: t.offset).assumingMemoryBound(to: Float16.self)
-            ref.withUnsafeBytes {
-                let expected = $0.bindMemory(to: UInt16.self)
+            ref.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                let expected = raw.bindMemory(to: UInt16.self)
                 var violations = 0, worst = 0.0
                 for i in 0..<expected.count {
                     let a = Double(Float(got[i])), b = Double(QWQuant.f16tof32Bits(expected[i]))
@@ -243,7 +243,7 @@ final class QWMTPDraftEncoderTests: XCTestCase {
         let source = embedding.region.pointer.advanced(by: embedding.offset).assumingMemoryBound(to: UInt16.self)
         let bf16 = (0..<h).map { UInt16(QWQuant.f16tof32Bits(source[$0]).bitPattern >> 16) }
         var tableData = Data()
-        for _ in 0..<vocabulary { bf16.withUnsafeBytes { tableData.append(contentsOf: $0) } }
+        for _ in 0..<vocabulary { bf16.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in tableData.append(contentsOf: raw) } }
         try tableData.write(to: URL(fileURLWithPath: mappedPath))
         let table = try QWMTPEmbeddingTable(hal: hal, path: mappedPath, offset: 0,
                                           vocabulary: vocabulary, hidden: h)
@@ -255,7 +255,7 @@ final class QWMTPDraftEncoderTests: XCTestCase {
                 position: 16, cacheRows: seedRows, selection: .gpuChecked,
                 embedding: { _, destination in
                     let out = destination.region.pointer.advanced(by: destination.offset).assumingMemoryBound(to: UInt16.self)
-                    for i in 0..<h { out[i] = QWQuant.f32tof16Bits(QWQuant.bf16tof32Bits(bf16[i])) }
+                    for i in 0..<h { out[i] = QWQuant.f32tof16Bits(Float(bitPattern: UInt32(bf16[i]) << 16)) }
                 }, gpuFailure: { XCTFail("CPU-embedding chain GPU failure") })
             let expectedHidden = bytes(scratch.postNorm)
             let expectedPairs = try pairBytes(start: seedRows, count: count)
@@ -271,7 +271,7 @@ final class QWMTPDraftEncoderTests: XCTestCase {
             XCTAssertEqual(cache.written(handle), seedRows)
         }
         let invalidWords = [UInt16](repeating: 0x7e00, count: vocabulary * h)
-        let invalidData = invalidWords.withUnsafeBytes { Data($0) }
+        let invalidData = invalidWords.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) }
         let invalidHead = try tensor(invalidData, type: .f16, hal: hal)
         XCTAssertThrowsError(try QWMTPDraftChain.run(
             hal: hal, draft: encoder, headWeight: invalidHead, hidden: hidden,

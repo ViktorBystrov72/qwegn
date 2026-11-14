@@ -2,7 +2,7 @@
 *.metallib
 DerivedData/
 __pycache__/
-.venv*/
+.venv*
 .vscode/
 *.pyc
 .DS_Store
@@ -22,6 +22,7 @@ m1_capture_*.gputrace
 *.log
 *.jsonl
 .bench/
+bench_kernels_report.*
 # bench-time compiled metallibs (regenerable)
 Scripts/bench/*/bench.metalib
 
@@ -34,7 +35,13 @@ models/
 # Private engineering material: specs, design notes, plans, research and
 # performance reports stay on the owner's machine and are never published.
 # docs/ is private by default; the public user manual is un-ignored below.
-/specs/
+/specs/*
+!/specs/01-architecture-and-dag.md
+!/specs/02-model-families-and-descriptor-v3.md
+!/specs/03-quant-containers-and-residency.md
+!/specs/04-hal-memory-and-metal-ceilings.md
+!/specs/05-http-server-security-and-streaming.md
+!/specs/06-menubar-and-webui-parity.md
 /docs/*
 /.hermes/
 /handoff.md

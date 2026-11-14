@@ -118,7 +118,7 @@ enum PrefillSuites {
             bank = AQBanks.makeIncumbent4G32(rows: rows, cols: cols)
         }
         let weights = try BenchRunner.buffer(device, bytes: bank.count)
-        bank.withUnsafeBytes { src in
+        bank.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             weights.contents().copyMemory(from: src.baseAddress!, byteCount: bank.count)
         }
         let activations = makeActivations(m: tokens, k: cols)
@@ -204,7 +204,7 @@ enum PrefillSuites {
         let groupBytes = QWAQBlock.bytes(bits: bits, group: group)
         var value: Float = 0
         var magnitude: Float = 0
-        work.bank.withUnsafeBytes { raw in
+        work.bank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             for g in 0..<groups {
                 let off = (row * groups + g) * groupBytes
                 let slice = UnsafeRawBufferPointer(start: raw.baseAddress! + off, count: groupBytes)
@@ -229,7 +229,7 @@ enum PrefillSuites {
         let groups = work.k / 32
         var value: Float = 0
         var magnitude: Float = 0
-        work.bank.withUnsafeBytes { raw in
+        work.bank.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             for g in 0..<groups {
                 let off = row * groups * 20 + g * 20
                 let slice = UnsafeRawBufferPointer(start: raw.baseAddress! + off, count: 20)

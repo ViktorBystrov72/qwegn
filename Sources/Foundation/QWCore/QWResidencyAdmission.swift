@@ -39,21 +39,6 @@ public struct QWLiveDeviceMemorySnapshotSource: QWDeviceMemorySnapshotSource {
     }
 }
 
-/// Deterministic in-memory adapter for unit tests (zero Mach or GPU queries).
-public struct QWSyntheticDeviceMemorySnapshot: QWDeviceMemorySnapshotSource, Equatable {
-    public let snapshot: QWDeviceMemorySnapshot
-
-    public init(physicalBytes: Int, reclaimableBytes: Int?, maxWorkingSetBytes: Int? = nil) {
-        self.snapshot = QWDeviceMemorySnapshot(
-            physicalBytes: physicalBytes,
-            reclaimableBytes: reclaimableBytes,
-            maxWorkingSetBytes: maxWorkingSetBytes
-        )
-    }
-
-    public func capture() -> QWDeviceMemorySnapshot { snapshot }
-}
-
 /// Unified residency and warm-cache admission calculations across all engine families.
 public enum QWResidencyAdmission {
     /// Minimum free/reclaimable UMA cushion preserved after wiring model + KV + warm cache.

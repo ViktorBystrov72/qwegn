@@ -156,10 +156,4 @@ final class ToyModule: QWInferenceModule, @unchecked Sendable {
     func lastStepMilliseconds(_ state: any QWModuleSessionState) -> Double { 0 }
 
     func prefillGPUSeconds(_ state: any QWModuleSessionState) -> Double { 0 }
-
-    func sampleLogits(_ state: any QWModuleSessionState) throws -> [Float] {
-        // The toy has no logits. It refuses rather than answering with a row
-        // of zeros — a numeric zero is not "unavailable".
-        throw QWModuleError.notImplemented("ToyModule.sampleLogits")
-    }
 }

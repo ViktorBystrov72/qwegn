@@ -7,7 +7,6 @@ import Foundation
 import QWQuant
 import QWHAL
 import QWCore
-import QWEngine
 
 final class PlaneIOParityTests: XCTestCase {
 
@@ -37,21 +36,15 @@ final class PlaneIOParityTests: XCTestCase {
     private func legacyBytes(_ pack: QWQuant.Pack, _ name: String,
                              _ layout: PlaneLayout) throws -> Data {
         let e = try pack.entry(name)
-        guard let count = layout.byteCount(e) else { throw NSError(domain: "t", code: 1) }
-        var d = Data(count: count)
-        try d.withUnsafeMutableBytes { raw in
-            let p = raw.baseAddress!
-            switch layout {
-            case .raw: try pack.copyRawBytes(name, to: p, at: 0, count: e.shape.reduce(1, *))
-            case .hq4: try pack.copyPlaneBytes(name, key: \.hq4Off, to: p, count: count)
-            }
+        guard let count = layout.byteCount(e), let off = layout.offset(e) else {
+            throw NSError(domain: "t", code: 1)
         }
-        return d
+        return try pack.withRawPointer(at: off, byteCount: count) { Data(bytes: $0, count: count) }
     }
 
     func testSelfpackMoverParityBothArms() throws {
         guard let url = Self.find([]) else { throw XCTSkip("selfpack fixture missing") }
-        let pack = try QWQuant.Pack(url: url)
+        let pack = try QWQuant.Pack(url: url, descriptor: .qwen38_27b)
         for arm in [["QW_PLANE_BUFFERED": "1"], [:]] {
             let io = PlaneIO(pack: pack, policy: LoadPolicy(descriptor: pack.descriptor, env: arm))
             var checked = 0
@@ -65,14 +58,6 @@ final class PlaneIOParityTests: XCTestCase {
             }
             XCTAssertGreaterThan(checked, 0, "selfpack must contain verbatim planes")
         }
-    }
-
-
-    func testHeadroomProbeSane() throws {
-        let h = PackWiring.headroomBytes()
-        let total = Int(ProcessInfo.processInfo.physicalMemory)
-        XCTAssertGreaterThan(h, 0)
-        XCTAssertLessThan(h, total)
     }
 
     func testCheckpointTensorLoaderResolveNameAndSpan() throws {
@@ -92,7 +77,7 @@ final class PlaneIOParityTests: XCTestCase {
         XCTAssertEqual(tied, "model.embed_tokens.weight")
 
         guard let url = Self.find([]) else { throw XCTSkip("selfpack fixture missing") }
-        let pack = try QWQuant.Pack(url: url)
+        let pack = try QWQuant.Pack(url: url, descriptor: .qwen38_27b)
         let span = try QWCheckpointTensorLoader.span(pack, "w_test")
         XCTAssertEqual(span.rows, 256)
         XCTAssertEqual(span.cols, 1024)

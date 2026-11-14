@@ -13,10 +13,6 @@ extension SettingsView {
     func refreshDiscoveredModels() {
         let scanned = QWServerSettings.scanModelsDirectory()
         discoveredModels = scanned
-        if draftSettings.pruneRemovedModels(discovered: scanned) {
-            try? QWSettingsManager.shared.saveSettings(draftSettings)
-            telemetry.settings = draftSettings
-        }
         // The configured pack is the model the engine runs. The name the
         // server serves it under can be an id of the user's choosing, not
         // a directory name, so a name that matches no installed pack does
@@ -25,8 +21,6 @@ extension SettingsView {
             let expandedPack = draftSettings.modelPackPath.expandingTildePath
             let inModelsFolder = expandedPack.isEmpty || expandedPack.hasPrefix(QWPaths.modelsDirectoryPath)
             if let configured = discoveredModels.first(where: { $0.packPath == expandedPack }) {
-                // The pack is installed: keep the id the server serves,
-                // and let the picker name it.
                 draftSettings.modelAlias = draftSettings.alias(for: draftSettings.modelName)
                 discoveredModels.insert(DiscoveredModel(name: draftSettings.modelName, packPath: configured.packPath), at: 0)
             } else if inModelsFolder, let first = discoveredModels.first(where: \.supported) {
@@ -40,10 +34,11 @@ extension SettingsView {
             draftSettings.modelAlias = draftSettings.alias(for: draftSettings.modelName)
         }
         discoveredDrafterModels = QWServerSettings.scanDrafterModelsDirectory()
-        if !draftSettings.dflashDraftPackPath.isEmpty && !discoveredDrafterModels.contains(where: { $0.packPath == draftSettings.dflashDraftPackPath }) {
+        if !draftSettings.dflashDraftPackPath.isEmpty
+            && !discoveredDrafterModels.contains(where: { $0.packPath == draftSettings.dflashDraftPackPath }) {
             let name = QWModelRoot.canonicalModelName(for: URL(fileURLWithPath: draftSettings.dflashDraftPackPath))
             discoveredDrafterModels.insert(DiscoveredModel(name: name, packPath: draftSettings.dflashDraftPackPath), at: 0)
-        } else if draftSettings.dflashDraftPackPath.isEmpty, let first = discoveredDrafterModels.first {
+        } else if isExternalDrafterSelected, draftSettings.dflashDraftPackPath.isEmpty, let first = discoveredDrafterModels.first {
             draftSettings.dflashDraftPackPath = first.packPath
         }
     }
@@ -94,18 +89,6 @@ extension SettingsView {
         }
         if let desc = try? draftSettings.validatePrimaryModel() {
             return desc.visDepth > 0 && desc.capabilities.contains(.vision)
-        }
-        return true
-    }
-
-    var selectedModelSupportsSpeculative: Bool {
-        if let disc = discoveredModels.first(where: { $0.name == draftSettings.modelName }) {
-            if !disc.capabilities.isEmpty {
-                return disc.capabilities.contains("mtp") || disc.maxSpeculativeDrafts > 0
-            }
-        }
-        if let desc = try? draftSettings.validatePrimaryModel() {
-            return desc.supportsNativeMTP || (desc.hcCount == nil && desc.numExperts == nil)
         }
         return true
     }
@@ -173,47 +156,120 @@ extension SettingsView {
     }
 
     func generateLSASidecarForSelectedModel() {
+        guard !isGeneratingLSASidecar else { return }
+        lsaSidecarTask?.cancel()
+        validationErrorMessage = nil
+
+        let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ref = draftSettings.resolveModelReference(
+            rawPath.isEmpty ? draftSettings.modelName : rawPath,
+            discovered: discoveredModels
+        )
+        let desc: QWModelDescriptor
         do {
-            let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            let ref = draftSettings.resolveModelReference(rawPath.isEmpty ? draftSettings.modelName : rawPath, discovered: discoveredModels)
-            let desc = try draftSettings.validatePrimaryModel()
-            let indexDim = QWLSAConfig.defaultIndexDim
-            let tensors = try QWLSASidecar.synthesizeFromModel(packPath: ref.packPath, descriptor: desc, indexDim: indexDim)
-            let root = QWModelRoot(url: URL(fileURLWithPath: ref.packPath))
-            let outURL = root.directory.appendingPathComponent("model.qlsa")
-            let prov = QWLSASidecar.Header.Provenance(
-                modelId: root.directory.lastPathComponent,
-                geometryDigest: desc.geometryDigestV2Hex,
-                method: "weight_svd",
-                indexDim: indexDim,
-                poolSize: QWLSAConfig.poolSize,
-                clusterBlockSize: draftSettings.lsaClusterBlock,
-                bucketsPerBlock: QWLSAConfig.bucketsPerBlock,
-                maxBucketKeys: QWLSAConfig.maxBucketKeys,
-                recommendedBudget: draftSettings.lsaBudget
-            )
-            let shape = [indexDim, desc.lsaInputDim]
-            try QWLSASidecar.write(to: outURL, provenance: prov, layerTensors: tensors, wqShape: shape, wkShape: shape)
-            refreshDiscoveredModels()
-            validationErrorMessage = nil
-            saveConfirmationMessage = "Built \(outURL.lastPathComponent) (\(tensors.count) layers)"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                saveConfirmationMessage = nil
-            }
+            desc = try draftSettings.validatePrimaryModel()
         } catch {
             validationErrorMessage = "LSA sidecar build failed: \(error)"
+            return
         }
+
+        let packPath = ref.packPath
+        let clusterBlock = draftSettings.lsaClusterBlock
+        let budget = draftSettings.lsaBudget
+        isGeneratingLSASidecar = true
+
+        lsaSidecarTask = Task { @MainActor in
+            defer {
+                isGeneratingLSASidecar = false
+                lsaSidecarTask = nil
+            }
+            do {
+                let outcome: (URL, Int) = try await Task.detached(priority: .userInitiated) {
+                    let indexDim = QWLSAConfig.defaultIndexDim
+                    let tensors = try QWLSASidecar.synthesizeFromModel(
+                        packPath: packPath,
+                        descriptor: desc,
+                        indexDim: indexDim
+                    )
+                    try Task.checkCancellation()
+                    let root = QWModelRoot(url: URL(fileURLWithPath: packPath))
+                    let outURL = root.directory.appendingPathComponent("model.qlsa")
+                    let prov = QWLSASidecar.Header.Provenance(
+                        modelId: root.directory.lastPathComponent,
+                        geometryDigest: desc.geometryDigestV3Hex,
+                        method: "weight_svd",
+                        indexDim: indexDim,
+                        poolSize: QWLSAConfig.poolSize,
+                        clusterBlockSize: clusterBlock,
+                        bucketsPerBlock: QWLSAConfig.bucketsPerBlock,
+                        maxBucketKeys: QWLSAConfig.maxBucketKeys,
+                        recommendedBudget: budget
+                    )
+                    let shape = [indexDim, desc.lsaInputDim]
+                    try QWLSASidecar.write(
+                        to: outURL,
+                        provenance: prov,
+                        layerTensors: tensors,
+                        wqShape: shape,
+                        wkShape: shape
+                    )
+                    return (outURL, tensors.count)
+                }.value
+
+                guard !Task.isCancelled else { return }
+                refreshDiscoveredModels()
+                validationErrorMessage = nil
+                showTimedConfirmation("Built \(outcome.0.lastPathComponent) (\(outcome.1) layers)")
+            } catch is CancellationError {
+                validationErrorMessage = nil
+            } catch {
+                validationErrorMessage = "LSA sidecar build failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func cancelLSASidecarGeneration() {
+        lsaSidecarTask?.cancel()
+        lsaSidecarTask = nil
+        isGeneratingLSASidecar = false
     }
 
     func resetToTopPerformanceDefaults() {
         let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
         let ref = draftSettings.resolveModelReference(rawPath.isEmpty ? draftSettings.modelName : rawPath)
         draftSettings.applyModelConfigDefaults(packPath: ref.packPath)
-        QWSettingsManager.shared.removeProfile(forModel: draftSettings.modelName)
+        pendingProfileReset = true
         validationErrorMessage = nil
-        saveConfirmationMessage = "Reset to model & engine defaults"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-            saveConfirmationMessage = nil
+        showTimedConfirmation("Staged model & engine defaults — click Save to apply")
+    }
+
+    func resetSpeculativeDefaults() {
+        let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ref = draftSettings.resolveModelReference(rawPath.isEmpty ? draftSettings.modelName : rawPath)
+        var baseline = draftSettings
+        baseline.applyModelConfigDefaults(packPath: ref.packPath)
+        draftSettings.speculativeDecodingEnabled = baseline.speculativeDecodingEnabled
+        draftSettings.mtpBackend = baseline.mtpBackend
+        draftSettings.mtpDrafts = baseline.mtpDrafts
+        draftSettings.mtpDraftStrategy = baseline.mtpDraftStrategy
+        draftSettings.mtpRelaxedMargin = baseline.mtpRelaxedMargin
+        draftSettings.mtpRelaxedMinProb = baseline.mtpRelaxedMinProb
+        draftSettings.mtpQuadraticSeeding = baseline.mtpQuadraticSeeding
+        draftSettings.mtpAdaptiveDepth = baseline.mtpAdaptiveDepth
+        draftSettings.mtpEntropyThreshold = baseline.mtpEntropyThreshold
+        draftSettings.dflashDraftPackPath = baseline.dflashDraftPackPath
+        draftSettings.dflashSelectorTopK = baseline.dflashSelectorTopK
+        validationErrorMessage = nil
+        showTimedConfirmation("Staged speculative defaults — click Save to apply")
+    }
+
+    private func showTimedConfirmation(_ message: String) {
+        saveConfirmationMessage = message
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            if saveConfirmationMessage == message {
+                saveConfirmationMessage = nil
+            }
         }
     }
 
@@ -334,17 +390,50 @@ extension SettingsView {
         }
     }
 
+    func discardChanges() {
+        draftSettings = baselineSettings
+        pendingProfileReset = false
+        validationErrorMessage = nil
+        saveConfirmationMessage = nil
+    }
+
     func applyAndSave() {
-        do {
-            try draftSettings.validateBeforeLaunch()
-            try telemetry.saveSettings(draftSettings)
-            validationErrorMessage = nil
-            saveConfirmationMessage = "Settings saved successfully!"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                saveConfirmationMessage = nil
+        Task { @MainActor in
+            _ = await persistDraftSettings()
+        }
+    }
+
+    func saveAndRestartServer() {
+        Task { @MainActor in
+            if await persistDraftSettings() {
+                telemetry.restartServerProcess()
             }
+        }
+    }
+
+    private func persistDraftSettings() async -> Bool {
+        guard !isSaving else { return false }
+        isSaving = true
+        defer { isSaving = false }
+        do {
+            var toSave = draftSettings
+            let scanned = QWServerSettings.scanModelsDirectory()
+            _ = toSave.pruneRemovedModels(discovered: scanned)
+            try toSave.validateBeforeLaunch()
+            updateRunAtStartup(toSave.runAtStartup)
+            if pendingProfileReset {
+                QWSettingsManager.shared.removeProfile(forModel: toSave.modelName)
+            }
+            try await telemetry.saveSettingsAndValidateLive(toSave)
+            baselineSettings = telemetry.settings
+            draftSettings = telemetry.settings
+            pendingProfileReset = false
+            validationErrorMessage = nil
+            showTimedConfirmation("Settings saved & applied")
+            return true
         } catch {
-            validationErrorMessage = "Validation failed: \(error)"
+            validationErrorMessage = "Save failed: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -358,24 +447,28 @@ extension SettingsView {
             } else {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("\(pending.count) changed setting\(pending.count == 1 ? "" : "s") need a server restart")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(TelemetryTheme.warning)
+                        .font(TelemetryTheme.ui(11, .semibold))
+                        .foregroundStyle(TelemetryTheme.warning)
                     Text(pending.map { QWSettingsCoherence.displayName(for: $0) }.joined(separator: ", "))
-                        .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.70))
+                        .font(TelemetryTheme.ui(10))
+                        .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
                     HStack(spacing: 8) {
                         Button("Restart Server") { telemetry.restartServerProcess() }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
-                            .disabled(validationErrorMessage != nil)
-                        Text("Stops the server process and starts it again. The engine restart does not.")
-                            .font(.system(size: 9))
-                            .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                            .disabled(validationErrorMessage != nil || isSaving)
+                        Text("Stops the server process and starts it again.")
+                            .font(TelemetryTheme.ui(10))
+                            .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                     }
                 }
                 .padding(10)
-                .background(Color.white.opacity(0.05))
-                .cornerRadius(8)
+                .background(TelemetryTheme.warning.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: TelemetryTheme.Radius.medium))
+                .overlay(
+                    RoundedRectangle(cornerRadius: TelemetryTheme.Radius.medium)
+                        .strokeBorder(TelemetryTheme.warning.opacity(0.30), lineWidth: 1)
+                )
             }
         }
     }
@@ -384,8 +477,47 @@ extension SettingsView {
                                 @ViewBuilder content: () -> Content) -> some View {
         HStack(alignment: .center, spacing: 12) {
             SettingsRowLabel(text: label, key: key)
-                .frame(width: 130, alignment: .leading)
+                .frame(width: 210, alignment: .leading)
             content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    func settingsToggleRow(_ title: String, key: String = "", isOn: Binding<Bool>) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text(title)
+                .font(TelemetryTheme.ui(11.5, .medium))
+                .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+                .lineLimit(1)
+            SettingsRestartBadge(key: key)
+            Spacer(minLength: 8)
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+        }
+    }
+
+    @ViewBuilder
+    func steppedSlider(value: Binding<Double>, in range: ClosedRange<Double>, step: Double) -> some View {
+        let stepCount = step > 0 ? Int(((range.upperBound - range.lowerBound) / step).rounded()) : 0
+        let snapped = Binding<Double>(
+            get: { value.wrappedValue },
+            set: { raw in
+                guard step > 0 else {
+                    value.wrappedValue = min(range.upperBound, max(range.lowerBound, raw))
+                    return
+                }
+                let rounded = ((raw - range.lowerBound) / step).rounded() * step + range.lowerBound
+                let clamped = min(range.upperBound, max(range.lowerBound, rounded))
+                // Round floating-point noise for fractional step increments.
+                value.wrappedValue = (clamped * 1000).rounded() / 1000
+            }
+        )
+        if step > 0 && stepCount <= 12 {
+            Slider(value: snapped, in: range, step: step)
+        } else {
+            Slider(value: snapped, in: range)
         }
     }
 
@@ -398,12 +530,15 @@ extension SettingsView {
                 SettingsRowLabel(text: label, key: key)
                 Spacer()
                 Text(readout(value.wrappedValue))
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundColor(tint(value.wrappedValue))
+                    .font(TelemetryTheme.numeric(11, .semibold))
+                    .foregroundStyle(tint(value.wrappedValue))
             }
-            Slider(value: Binding(get: { Double(value.wrappedValue) },
-                                  set: { value.wrappedValue = Int($0) }),
-                   in: range, step: step)
+            steppedSlider(
+                value: Binding(get: { Double(value.wrappedValue) },
+                               set: { value.wrappedValue = Int($0.rounded()) }),
+                in: range,
+                step: step
+            )
         }
     }
 
@@ -412,18 +547,21 @@ extension SettingsView {
             HStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 11))
-                    .foregroundColor(TelemetryTheme.accent)
+                    .foregroundStyle(TelemetryTheme.accent)
                 Text(title)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(TelemetryTheme.primary(increasedContrast: contrast == .increased))
+                    .font(TelemetryTheme.ui(12, .semibold))
+                    .foregroundStyle(TelemetryTheme.primary(increasedContrast: contrast == .increased))
             }
             VStack(alignment: .leading, spacing: 10) {
                 content()
             }
             .padding(12)
-            .background(Color.white.opacity(0.04))
-            .cornerRadius(8)
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08), lineWidth: 0.5))
+            .background(TelemetryTheme.substrate)
+            .clipShape(RoundedRectangle(cornerRadius: TelemetryTheme.Radius.medium))
+            .overlay(
+                RoundedRectangle(cornerRadius: TelemetryTheme.Radius.medium)
+                    .strokeBorder(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 1)
+            )
         }
     }
 
@@ -432,48 +570,5 @@ extension SettingsView {
         f.numberStyle = .none
         f.usesGroupingSeparator = false
         return f
-    }
-}
-
-extension TelemetryObservable {
-    public func mountMemoryPack(
-        path: String,
-        onComplete: (@MainActor (Result<QWEngineInfoResponse.MountedMemoryPackInfo, Error>) -> Void)? = nil
-    ) {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/v1/memory/mount") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: ["path": path])
-        req.timeoutInterval = 120.0
-        Task {
-            do {
-                let (data, res) = try await URLSession.shared.data(for: req)
-                guard let http = res as? HTTPURLResponse, http.statusCode == 200 else {
-                    let body = String(data: data, encoding: .utf8) ?? "mount failed"
-                    throw NSError(domain: "QWMemoryPack", code: 1, userInfo: [NSLocalizedDescriptionKey: body])
-                }
-                let info = try JSONDecoder().decode(QWEngineInfoResponse.MountedMemoryPackInfo.self, from: data)
-                self.settings.kvMode = info.enforcedKVMode
-                self.fetchHttpEngineInfo()
-                self.fetchDashboard()
-                onComplete?(.success(info))
-            } catch {
-                onComplete?(.failure(error))
-            }
-        }
-    }
-
-    public func unmountMemoryPack(onComplete: (@MainActor () -> Void)? = nil) {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/v1/memory/unmount") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 30.0
-        Task {
-            _ = try? await URLSession.shared.data(for: req)
-            self.fetchHttpEngineInfo()
-            self.fetchDashboard()
-            onComplete?()
-        }
     }
 }

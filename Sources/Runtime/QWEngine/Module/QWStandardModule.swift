@@ -67,11 +67,6 @@ public final class Qwen3DenseModule: StandardModule, @unchecked Sendable {
 public final class Qwen3MoEModule: StandardModule, @unchecked Sendable {
     public override class var family: QWModelDescriptor.Family { .qwen3MoE }
 
-    /// The sparse-MoE doors the standard path's routed layer dispatches: the
-    /// per-pair chain and the router's own GEMM, which only a routed layer
-    /// runs.
-    public static let moeDoors = QWKernelInventory.moe_only
-
     public override class var requiredDoors: [String] {
         QWKernelInventory.moe
     }

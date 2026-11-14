@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import QWCore
 @testable import QWFlashNext
 
 /// The decode stack's commit order is what keeps the GPU busy while the PLE
@@ -137,7 +138,7 @@ final class FNGPUDecodeStackOrderTests: XCTestCase {
     func testDynamicWideContextCopyProposesUpToSevenDrafts() {
         let block: [Int64] = [10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 24, 25, 26, 27]
         let history: [Int64] = block + [99] + [10, 11, 12, 13, 14, 15]
-        let prop = FNContextCopyDrafter.proposeDrafts(
+        let prop = QWContextCopyDrafter.proposeDrafts(
             history: history,
             mode: .hybrid,
             maxDrafts: FNGPUSessionData.defaultMTPDrafts,
@@ -154,7 +155,7 @@ final class FNGPUDecodeStackOrderTests: XCTestCase {
         XCTAssertEqual(prop.mtpSourcedDrafts, 0)
 
         let novelHistory: [Int64] = [1, 2, 3, 4, 5, 6, 7, 8]
-        let novelProp = FNContextCopyDrafter.proposeDrafts(
+        let novelProp = QWContextCopyDrafter.proposeDrafts(
             history: novelHistory,
             mode: .hybrid,
             maxDrafts: FNGPUSessionData.defaultMTPDrafts,
@@ -173,29 +174,29 @@ final class FNGPUDecodeStackOrderTests: XCTestCase {
 
     func testContextCopyDrafterReturnsMultiTokenMatch() {
         let history: [Int64] = [10, 20, 30, 40, 50, 60, 70, 99, 10, 20, 30, 40]
-        let match = FNContextCopyDrafter.drafts(history: history, maxCount: 3, minMatchLen: 3)
+        let match = QWContextCopyDrafter.drafts(history: history, maxCount: 3, minMatchLen: 3)
         XCTAssertNotNil(match)
         XCTAssertEqual(match?.matchLen, 4)
         XCTAssertEqual(match?.tokens, [50, 60, 70])
-        XCTAssertEqual(FNContextCopyDrafter.draft(history: history, minMatchLen: 4), 50)
+        XCTAssertEqual(QWContextCopyDrafter.draft(history: history, minMatchLen: 4), 50)
         let prefix: [Int64] = [10, 20, 30, 40, 50, 60, 70, 99, 10, 20, 30]
-        let appended = FNContextCopyDrafter.drafts(history: prefix, appendedToken: 40, maxCount: 3, minMatchLen: 3)
+        let appended = QWContextCopyDrafter.drafts(history: prefix, appendedToken: 40, maxCount: 3, minMatchLen: 3)
         XCTAssertEqual(appended?.matchLen, 4)
         XCTAssertEqual(appended?.tokens, [50, 60, 70])
 
         let counter = [Int64](repeating: 0, count: 2050) + [10, 1, 10, 2, 10, 1, 0, 10, 1, 1, 10]
-        XCTAssertNil(FNContextCopyDrafter.drafts(history: counter, appendedToken: 1, maxCount: 2, minMatchLen: 2))
+        XCTAssertNil(QWContextCopyDrafter.drafts(history: counter, appendedToken: 1, maxCount: 2, minMatchLen: 2))
 
         let consistentShort = [Int64](repeating: 0, count: 2050) + [10, 1, 5, 99, 10, 1, 5, 88, 10]
-        let shortMatch = FNContextCopyDrafter.drafts(history: consistentShort, appendedToken: 1, maxCount: 2, minMatchLen: 2)
+        let shortMatch = QWContextCopyDrafter.drafts(history: consistentShort, appendedToken: 1, maxCount: 2, minMatchLen: 2)
         XCTAssertEqual(shortMatch?.matchLen, 2)
         XCTAssertEqual(shortMatch?.tokens.first, 5)
     }
 
     func testContextCopyDrafterPeriodicDrafts() {
         let history: [Int64] = [1, 2, 3, 1, 2, 3]
-        let drafts = FNContextCopyDrafter.periodicDrafts(history: history, maxCount: 3)
+        let drafts = QWContextCopyDrafter.periodicDrafts(history: history, maxCount: 3)
         XCTAssertEqual(drafts, [1, 2, 3])
-        XCTAssertEqual(FNContextCopyDrafter.periodicDraft(history: history), 1)
+        XCTAssertEqual(QWContextCopyDrafter.periodicDrafts(history: history, maxCount: 1)?.first, 1)
     }
 }

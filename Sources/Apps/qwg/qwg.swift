@@ -23,24 +23,6 @@ struct Qwg: AsyncParsableCommand {
         subcommands: [Init.self, Inspect.self, Plan.self, Quantize.self, LsaConvert.self, Index.self, Pull.self, Run.self, Repl.self, Bench.self, Serve.self, Telemetry.self])
 }
 
-// MARK: - Init
-
-struct Init: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "init",
-        abstract: "Create or rebuild the Python environment in ~/Library/Application Support/Qwegn/venv/.")
-    @Flag(name: .customLong("python"), help: "Create or rebuild the Python environment for quantize.") var python: Bool = false
-
-    func validate() throws {
-        guard python else {
-            throw ValidationError("Pass --python to create or rebuild the Python environment.")
-        }
-    }
-
-    func run() throws {
-        _ = try QWCli.ensurePythonEnvironment(supportRoot: Quantize.repoRoot(), rebuild: true)
-    }
-}
 
 // MARK: - Plan
 
@@ -70,90 +52,6 @@ struct Plan: ParsableCommand {
     }
 }
 
-// MARK: - Inspect
-
-struct Inspect: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        abstract: "Dump pack provenance + tensor table; optionally dequant one tensor to .npy.")
-    @Argument(help: "Model directory or legacy .qwp pack.") var pack: String
-    @Option(name: .customLong("dequant"), help: "Tensor name → write dequantized f32 .npy.") var dequant: String?
-    @Option(name: .customLong("out"), help: "Override the .npy output path (with --dequant).") var out: String?
-
-    func run() throws {
-        let url = URL(fileURLWithPath: pack)
-        if let t = dequant {
-            let dst = out.map { URL(fileURLWithPath: $0) }
-                ?? url.deletingPathExtension().appendingPathExtension("npy")
-            try QWCli.dequantToNpy(packURL: url, tensor: t, out: dst)
-            print("wrote \(dst.path)")
-            return
-        }
-        print(try QWCli.inspectReport(packURL: url))
-    }
-}
-
-// MARK: - Quantize
-
-struct Quantize: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        abstract: "Shell out to the proven Python packer (Scripts/quantize/pack.py) — Swift never reimplements the quantizer.")
-    @Argument(help: "Source model directory (holds *.safetensors).") var model: String
-    @Option(name: .customLong("out"), help: "New output model directory (model.qwp and assets/).") var outPack: String
-    @Option(name: .customLong("quant"), help: "Quantization format (q4g, hq{2,3,4,6,8}_g{32,64,128,256}, shvq{1,15,2,3,4}_g{32,64,128,256}).") var quant: String = "q4g"
-    @Option(name: .customLong("dense-quant"), help: "Optional override for 2D dense/shared tensors.") var denseQuant: String?
-    @Option(name: .customLong("expert-quant"), help: "Optional override for routed MoE gate/up tensors.") var expertQuant: String?
-    @Option(name: .customLong("expert-down-quant"), help: "Optional override for routed MoE down_proj tensors.") var expertDownQuant: String?
-    @Option(name: .customLong("ngram-quant"), help: "Optional PLE ngram table format (q8_g32, vq2_g32, or vq4_g32).") var ngramQuant: String?
-
-    func run() throws {
-        let lowerQ = quant.lowercased()
-        guard lowerQ == "q4g" || lowerQ == "hq4_g32_m5"
-            || lowerQ.hasPrefix("hq") || lowerQ.hasPrefix("shvq") else {
-            throw ValidationError("Unsupported quant '\(quant)'; Q8 mirrors are not used by the engine.")
-        }
-        let repoRoot = Self.repoRoot()
-        let py = try QWCli.ensurePythonEnvironment(supportRoot: repoRoot)
-        let scripts = repoRoot.appendingPathComponent("Scripts")
-        let plan = QWCli.quantizePlan(repo: model, outPack: URL(fileURLWithPath: outPack),
-                                      quant: quant, scriptsDir: scripts, pythonURL: py,
-                                      denseQuant: denseQuant, expertQuant: expertQuant,
-                                      expertDownQuant: expertDownQuant, ngramQuant: ngramQuant)
-        print("provenance: \(plan.provenanceLine)")
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: plan.command[0])
-        p.arguments = Array(plan.command.dropFirst())
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
-        try p.run()
-        let h = pipe.fileHandleForReading
-        while true {
-            let d = h.availableData
-            if d.isEmpty { break }
-            FileHandle.standardOutput.write(d)
-        }
-        p.waitUntilExit()
-        if p.terminationStatus != 0 { throw ExitCode(p.terminationStatus) }
-    }
-
-    static func repoRoot() -> URL {
-        QWPaths.supportDirectoryURL
-    }
-}
-
-// MARK: - Pull
-
-struct Pull: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        abstract: "Parallel ranged download of a checkpoint from the HF hub (plan math is QWCli-downloadPlan-tested).")
-    @Argument(help: "hf repo id, e.g. org/model.") var model: String
-    @Option(name: .customLong("folder"), help: "Local destination directory (default: ~/.qwg/models).") var folder: String = QWPaths.modelsDirectoryPath
-    @Option(name: .customLong("parts"), help: "Parallel range chunks per file.") var parts: Int = 4
-
-    func run() throws {
-        let dest = URL(fileURLWithPath: (folder as NSString).expandingTildeInPath, isDirectory: true)
-        let saved = try QWCli.pullCheckpoint(repo: model, folder: dest, parts: parts)
-        print("ready: \(saved.path)")
-    }
-}
 
 // MARK: - Run
 
@@ -521,7 +419,7 @@ struct Run: ParsableCommand {
                              stream: Bool, isThinking: Bool, displayThinking: Bool,
                              inThinking: Bool, reachedAnswer: Bool, answerStarted: Bool,
                              cliColor: QWCli.Color,
-                             endThinkTokenId: Int = QWModelGeometry.qwen38_27b.endThinkTokenId) throws {
+                             endThinkTokenId: Int) throws {
         if stream {
             let tail = streamDecoder.flush()
             if !tail.isEmpty && (!inThinking || displayThinking) {
@@ -612,67 +510,5 @@ struct Run: ParsableCommand {
         \(report.detailText)
         """
         FileHandle.standardError.write(block.data(using: .utf8)!)
-    }
-}
-
-// MARK: - LsaConvert
-
-struct LsaConvert: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "lsa-convert",
-        abstract: "Generate or import a .qlsa (QLSA0001) Latent Sparse Attention projection sidecar for a model directory.")
-
-    @Argument(help: "Model directory, name in ~/.qwg/models, alias, or .qwp pack.") var model: String
-    @Option(name: .customLong("method"), help: "Conversion method: svd (zero-data weight SVD), pca (activation PCA), distill (ridge distillation), or import.") var method: String = "svd"
-    @Option(name: .customLong("out"), help: "Output .qlsa sidecar file path (default: <model_dir>/model.qlsa).") var out: String?
-    @Option(name: .customLong("calibration-file"), help: "Text file for activation calibration (with --method pca or --method distill).") var calibrationFile: String?
-    @Option(name: .customLong("import-path"), help: "External safetensors/npy file to import (with --method import).") var importPath: String?
-    @Option(name: .customLong("index-dim"), help: "Latent index dimension d_idx (default: 64).") var indexDim: Int = QWLSAConfig.defaultIndexDim
-    @Option(name: .customLong("recommended-budget"), help: "Recommended LSA key budget k (default: 2048).") var recommendedBudget: Int = QWLSAConfig.defaultBudget
-
-    func run() throws {
-        let settings = QWSettingsManager.shared.loadSettings()
-        let resolvedPack = settings.resolveModelReference(model).packPath
-        let targetPath = resolvedPack.isEmpty ? model.expandingTildePath : resolvedPack
-        let supportRoot = Quantize.repoRoot()
-        let scriptPath = supportRoot.appendingPathComponent("Scripts/convert_lsa_sidecar.py").path
-        if FileManager.default.fileExists(atPath: scriptPath) && method.lowercased() != "svd-native" {
-            let py = try QWCli.ensurePythonEnvironment(supportRoot: supportRoot)
-            var args = [scriptPath, "--model", targetPath, "--method", method.lowercased(),
-                        "--index-dim", "\(indexDim)", "--recommended-budget", "\(recommendedBudget)"]
-            if let out { args += ["--out", out.expandingTildePath] }
-            if let calibrationFile { args += ["--calibration-file", calibrationFile.expandingTildePath] }
-            if let importPath { args += ["--import-path", importPath.expandingTildePath] }
-            let p = Process()
-            p.executableURL = py
-            p.arguments = args
-            p.standardOutput = FileHandle.standardOutput
-            p.standardError = FileHandle.standardError
-            try p.run()
-            p.waitUntilExit()
-            if p.terminationStatus != 0 { throw ExitCode(p.terminationStatus) }
-            return
-        }
-        // Native Accelerate LAPACK SVD synthesis fallback for .qwp packs and .safetensors checkpoints
-        let assets = try QWModelRuntimeAssets.load(packPath: targetPath)
-        let desc = assets.descriptor
-        let layerTensors = try QWLSASidecar.synthesizeFromModel(packPath: targetPath, descriptor: desc, indexDim: indexDim)
-        let root = QWModelRoot(url: URL(fileURLWithPath: targetPath))
-        let outURL = out.map { URL(fileURLWithPath: $0.expandingTildePath) }
-            ?? root.directory.appendingPathComponent("model.qlsa")
-        let prov = QWLSASidecar.Header.Provenance(
-            modelId: root.directory.lastPathComponent,
-            geometryDigest: desc.geometryDigestV2Hex,
-            method: "weight_svd",
-            indexDim: indexDim,
-            poolSize: QWLSAConfig.poolSize,
-            clusterBlockSize: QWLSAConfig.defaultClusterBlock,
-            bucketsPerBlock: QWLSAConfig.bucketsPerBlock,
-            maxBucketKeys: QWLSAConfig.maxBucketKeys,
-            recommendedBudget: recommendedBudget
-        )
-        let shape = [indexDim, desc.lsaInputDim]
-        try QWLSASidecar.write(to: outURL, provenance: prov, layerTensors: layerTensors, wqShape: shape, wkShape: shape)
-        print("wrote \(outURL.path) (\(layerTensors.count) full-attention layers, shape=\(shape), method=weight_svd)")
     }
 }

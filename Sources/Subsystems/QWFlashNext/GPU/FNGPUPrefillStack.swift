@@ -68,10 +68,14 @@ public final class FNGPUPrefillStack {
             }
             if uniform {
                 let rowIds = try act.allocate(QWTensorShape([pleSlots.count * r * hcNgram], .i32))
-                let dst0 = try act.allocate(QWTensorShape([pleSlots.count], .i32))
-                let dst1 = try act.allocate(QWTensorShape([pleSlots.count], .i32))
-                arena.write(dst0, from: pleSlots.map { UInt32(($0.1.region.base - act.region.base + $0.1.offset) / 4) })
-                arena.write(dst1, from: pleSlots.map { UInt32(($0.2.region.base - act.region.base + $0.2.offset) / 4) })
+                let dst0 = try act.allocate(QWTensorShape([pleSlots.count * 2], .i32))
+                let dst1 = try act.allocate(QWTensorShape([pleSlots.count * 2], .i32))
+                arena.write(dst0, from: pleSlots.map {
+                    FNGPUDecodeStack.pleTargetWordOffset(regionBase: $0.1.region.base, actBase: act.region.base, tensorOffset: $0.1.offset)
+                })
+                arena.write(dst1, from: pleSlots.map {
+                    FNGPUDecodeStack.pleTargetWordOffset(regionBase: $0.2.region.base, actBase: act.region.base, tensorOffset: $0.2.offset)
+                })
                 self.gpuPLE = (table, pleSlots.map(\.0), hcNgram, rowIds, dst0, dst1)
             } else {
                 self.gpuPLE = nil
@@ -90,15 +94,6 @@ public final class FNGPUPrefillStack {
         for slot in slots {
             slot.scratch.T = newRows
         }
-    }
-
-    /// Runs `mtp` over the prefill chunk that just completed, warming up the MTP KV cache at `startPos..<(startPos + rows)`
-    /// and returning the MTP draft token for row `rows - 1` when `projectLastRow` is true.
-    public func forwardMTP(mtp: FNGPUMTP, nextTokens: [Int32], startPos: Int = 0, projectLastRow: Bool = true) throws -> Int {
-        guard let last = slots.last else { return 0 }
-        let preInj = (base: last.scratch.h2, src: last.scratch.moeOut, scale: last.scratch.injB)
-        return try mtp.forwardPrefill(streamBuf: lastStreamTensor, preInject: preInj, nextTokens: nextTokens,
-                                      startPos: startPos, prefillScratch: last.scratch, projectLastRow: projectLastRow)
     }
 
     /// Runs the whole prompt (or chunk starting at `startPos`). `streamIn` holds the T width-wide rows (the embedding, expanded over the hc groups).
@@ -239,13 +234,14 @@ public final class FNGPUPrefillStack {
                 }
                 enc.memoryBarrier(scope: .buffers)
             }
+            let fusePLEInj = rows > 8 && FNGPULayerPasses.pleFusedEnabled
             for i in chunkStart..<chunkEnd {
                 let slot = slots[i]
                 let inInj: (base: QWTensorValue, src: QWTensorValue, scale: QWTensorValue)? =
-                    (i > 0 && slot.weights.ple == nil)
+                    (i > 0 && (slot.weights.ple == nil || fusePLEInj))
                     ? (slots[i - 1].scratch.h2, slots[i - 1].scratch.moeOut, slots[i - 1].scratch.injB)
                     : nil
-                let deferOut = (i + 1 < slots.count) ? (slots[i + 1].weights.ple == nil) : true
+                let deferOut = (i + 1 < slots.count) ? (slots[i + 1].weights.ple == nil || fusePLEInj) : true
                 let pleBuf = (pleParity == 0) ? slot.pleEmbed : (slot.pleEmbedAlt ?? slot.pleEmbed)
                 try FNGPULayerPasses.layerPrefill(&enc, cb: cb, ctx: ctx, layer: slot.weights, s: slot.scratch, stream: cur, out: nxt,
                                                   attnState: slot.attn, pos: startPos, pleEmbed: pleBuf,
@@ -355,5 +351,14 @@ public final class FNGPUPrefillStack {
             }
         }
         return (baseRows, nil)
+    }
+
+    /// Returns the next balanced subchunk rows for an outer slice ending at `limit`, or `nil` to defer until the slice advances.
+    public static func deferredSubchunkRows(pos: Int, limit: Int, runsHead: Bool, totalCount: Int,
+                                             stepChunk: Int, hidden: Int, hc: Int,
+                                             visualSpans: [QWVisualSpan] = []) -> Int? {
+        let nextRows = resolveSubchunk(pos: pos, limitPos: totalCount, chunkSize: stepChunk,
+                                       hidden: hidden, hc: hc, visualSpans: visualSpans).rows
+        return (!runsHead && pos + nextRows > limit) ? nil : nextRows
     }
 }

@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 import Metal
 @testable import QWGEMM
 import QWCore
@@ -85,9 +86,14 @@ final class QWGEMMTests: XCTestCase {
         let p1 = QWGemm.plan(QWGemmShape(m: 1, n: 10240, k: 5120), dtype: .q4g, epi: .none)
         XCTAssertEqual(p1.backend, .handQ4gV4)
         XCTAssertEqual(p1.threadsPerTG, 32)
-        let p2 = QWGemm.plan(QWGemmShape(m: 1, n: QWModelGeometry.qwen38_27b.vocab, k: 5120), dtype: .q4g, epi: .none)
+        let p2 = QWGemm.plan(QWGemmShape(m: 1, n: QWModelGeometry.qwen38_27b.vocab, k: 5120),
+                             dtype: .q4g, epi: .none, vocab: QWModelGeometry.qwen38_27b.vocab)
         XCTAssertEqual(p2.family, .f2LmHeadGemv)
         XCTAssertEqual(p2.backend, .handQ4gV4)
+        XCTAssertEqual(QWGemm.plan(QWGemmShape(m: 1, n: 151936, k: 5120), dtype: .q4g, epi: .none, vocab: 151936).family,
+                       .f2LmHeadGemv)
+        XCTAssertEqual(QWGemm.plan(QWGemmShape(m: 1, n: 151936, k: 5120), dtype: .q4g, epi: .none).family,
+                       .f1DecodeGemv)
         let p3 = QWGemm.plan(QWGemmShape(m: 1, n: 12288, k: 5120), dtype: .q4g, epi: .siluMulPair)
         XCTAssertEqual(p3.backend, .handQ4gSiluPair)
         let p4 = QWGemm.plan(QWGemmShape(m: 1024, n: 12288, k: 5120), dtype: .q4g, epi: .none)
@@ -103,7 +109,7 @@ final class QWGEMMTests: XCTestCase {
         for n in [6144, 17408] {
             let f = Self.loadFixture(n)
             let r = try runEngine(f, epi: .none)
-            let ref = f.y.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            let ref = f.y.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) }
             var bad = 0, maxabs = 0.0
             for i in 0..<n where abs(r.y[i] - ref[i]) > 2e-2 {
                 bad += 1; maxabs = max(maxabs, abs(Double(r.y[i] - ref[i])))
@@ -205,7 +211,7 @@ final class QWGEMMTests: XCTestCase {
                 let got = Array(UnsafeBufferPointer(
                     start: arena.cpuPointer(of: yV).bindMemory(to: Float.self, capacity: M * sh.n),
                     count: M * sh.n))
-                let ref = y.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+                let ref = y.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Array(raw.bindMemory(to: Float.self)) }
                 let (v, worst) = viol(got, ref)
                 XCTAssertEqual(v, 0, "F5 \(sh.name) M=\(M): \(v) violations, worst \(worst)")
             }
@@ -244,12 +250,60 @@ final class QWGEMMTests: XCTestCase {
     func testSiluPairEpilogueOverheadSmoke() throws {
         let n = 17408
         let f = Self.loadFixture(n)
-        let plain = try runEngine(f, epi: .none, iters: 30)
-        let pair  = try runEngine(f, epi: .siluMulPair, iters: 30)
+        let plain = try runEngine(f, epi: .none, iters: 0)
+        let pair  = try runEngine(f, epi: .siluMulPair, iters: 0)
+        XCTAssertEqual(plain.y.count, n)
         XCTAssertEqual(pair.y.count, n / 2)
-        print(String(format: "silu_pair smoke: plain %.3f ms vs fused %.3f ms (Δ %.1f%%)",
-                     plain.p50ms, pair.p50ms, (pair.p50ms / plain.p50ms - 1) * 100))
-        XCTAssertLessThan(pair.p50ms, plain.p50ms * 1.25,
+        XCTAssertTrue(pair.y.allSatisfy(\.isFinite))
+        guard Self.hal.caps.isMetal4TensorCapable,
+              ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true" else { return }
+
+        let g32 = Self.K / 32
+        let arena = try QWArena(
+            hal: Self.hal,
+            weights: f.blocks.count + 256,
+            activations: (n + n / 2) * 4 + Self.K * 2 + (Self.K / 128) * 4 + 4 * 256,
+            kv: 0, gdnStates: 0)
+        let wreg = arena.weightsRegion(), act = arena.activationsRegion()
+        let blkV = try wreg.allocate(QWTensorShape([f.n * g32 * 10], .f16))
+        arena.copyIn(blkV, from: f.blocks)
+        let xV = try act.allocate(QWTensorShape([Self.K], .f16))
+        let gsV = try act.allocate(QWTensorShape([Self.K / 128], .f32))
+        let yPlain = try act.allocate(QWTensorShape([n], .f32))
+        let yPair = try act.allocate(QWTensorShape([n / 2], .f32))
+        arena.copyIn(xV, from: f.x)
+        arena.copyIn(gsV, from: f.gs)
+        let w = try XCTUnwrap(QWWeightView(blocks: blkV, n: f.n, k: Self.K, isRotated: true))
+        let plainPlan = QWGemm.plan(QWGemmShape(m: 1, n: f.n, k: Self.K), dtype: .q4g, epi: .none)
+        let pairPlan = QWGemm.plan(QWGemmShape(m: 1, n: f.n, k: Self.K), dtype: .q4g, epi: .siluMulPair)
+        func dispatch(isPair: Bool) throws -> Double {
+            guard let (cb, enc) = Self.hal.begin() else { throw NSError(domain: "hal", code: 1) }
+            try QWGemm.encode(enc, hal: Self.hal, plan: isPair ? pairPlan : plainPlan,
+                              x: xV, xGroupSum: gsV, wQ4: w, y: isPair ? yPair : yPlain)
+            Self.hal.end(cb, enc)
+            cb.waitUntilCompleted()
+            return (cb.gpuEndTime - cb.gpuStartTime) * 1000
+        }
+        for _ in 0..<5 {
+            _ = try dispatch(isPair: false)
+            _ = try dispatch(isPair: true)
+        }
+        var plainMs: [Double] = []
+        var pairMs: [Double] = []
+        for round in 0..<15 {
+            if round.isMultiple(of: 2) {
+                plainMs.append(try dispatch(isPair: false))
+                pairMs.append(try dispatch(isPair: true))
+            } else {
+                pairMs.append(try dispatch(isPair: true))
+                plainMs.append(try dispatch(isPair: false))
+            }
+        }
+        let plainMin = try XCTUnwrap(plainMs.min())
+        let pairMin = try XCTUnwrap(pairMs.min())
+        print(String(format: "silu_pair smoke (min of 15 interleaved): plain %.3f ms vs fused %.3f ms (Δ %.1f%%)",
+                     plainMin, pairMin, (pairMin / plainMin - 1) * 100))
+        XCTAssertLessThan(pairMin, plainMin * 1.25,
                           "fused silu_pair smoke margin blown (>25% over plain)")
     }
 }

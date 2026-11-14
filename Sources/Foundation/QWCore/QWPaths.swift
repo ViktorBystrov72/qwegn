@@ -71,10 +71,6 @@ public enum QWPaths {
         return applicationSupportDirectoryURL.appendingPathComponent("venv", isDirectory: true)
     }
 
-    public static var pythonVenvExecutableURL: URL {
-        pythonVenvDirectoryURL.appendingPathComponent("bin/python", isDirectory: false)
-    }
-
     /// Support root holding `Scripts/quantize/pack.py` (repo root in dev, `/usr/local/share/qwegn` in `.pkg`).
     public static var supportDirectoryURL: URL {
         let fm = FileManager.default
@@ -96,6 +92,20 @@ public enum QWPaths {
             return cand
         }
         return URL(fileURLWithPath: fm.currentDirectoryPath, isDirectory: true)
+    }
+
+    /// Ensures `url` exists with owner-only `0o700` directory permissions.
+    public static func ensurePrivateDirectory(_ url: URL) throws {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: url.path) {
+            try fm.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+    }
+
+    /// Sets owner-only `0o600` permissions on the file at `path`.
+    public static func setPrivateFilePermissions(atPath path: String) {
+        _ = chmod(path, 0o600)
     }
 }
 
@@ -130,10 +140,11 @@ public enum QWEngineInstanceLock {
         defer { lock.unlock() }
         if engineLockFD >= 0 { return }
 
-        try? FileManager.default.createDirectory(at: QWPaths.rootDirectoryURL, withIntermediateDirectories: true)
+        try? QWPaths.ensurePrivateDirectory(QWPaths.rootDirectoryURL)
         let path = QWPaths.engineLockFilePath
-        let fd = open(path, O_CREAT | O_RDWR, 0o644)
+        let fd = open(path, O_CREAT | O_RDWR, 0o600)
         guard fd >= 0 else { return }
+        _ = fchmod(fd, 0o600)
 
         if flock(fd, LOCK_EX | LOCK_NB) != 0 {
             let existingPid = readPID(fromPath: path) ?? readPID(fromPath: QWPaths.pidFilePath) ?? -1
@@ -150,6 +161,7 @@ public enum QWEngineInstanceLock {
         try? "\(ProcessInfo.processInfo.processIdentifier)".write(
             toFile: QWPaths.pidFilePath, atomically: true, encoding: .utf8
         )
+        QWPaths.setPrivateFilePermissions(atPath: QWPaths.pidFilePath)
         engineLockFD = fd
     }
 
@@ -197,10 +209,11 @@ public enum QWEngineInstanceLock {
         defer { lock.unlock() }
         if menuLockFD >= 0 { return }
 
-        try? FileManager.default.createDirectory(at: QWPaths.rootDirectoryURL, withIntermediateDirectories: true)
+        try? QWPaths.ensurePrivateDirectory(QWPaths.rootDirectoryURL)
         let path = QWPaths.menuLockFilePath
-        let fd = open(path, O_CREAT | O_RDWR, 0o644)
+        let fd = open(path, O_CREAT | O_RDWR, 0o600)
         guard fd >= 0 else { return }
+        _ = fchmod(fd, 0o600)
 
         if flock(fd, LOCK_EX | LOCK_NB) != 0 {
             let existingPid = readPID(fromPath: path) ?? -1

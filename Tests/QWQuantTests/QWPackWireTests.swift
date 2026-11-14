@@ -18,11 +18,11 @@ final class QWPackWireTests: XCTestCase {
     }
 
     func testWireFullAndIdempotent() throws {
-        let pack = try QWQuant.Pack(url: fixture("selfpack.qwp"))
-        let total = pack.packedByteCount
+        let pack = try QWQuant.Pack(url: fixture("selfpack.qwp"), descriptor: .qwen38_27b)
+        let total = pack.rawCount
         XCTAssertGreaterThan(total, 0)
         XCTAssertEqual(total, (try Data(contentsOf: fixture("selfpack.qwp"))).count,
-                       "packedByteCount must be the mmap span readers bound")
+                       "rawCount must be the mmap span readers bound")
         let w1 = pack.wire()
         let w2 = pack.wire()                       // idempotent
         XCTAssertEqual(w2, w1)
@@ -32,8 +32,8 @@ final class QWPackWireTests: XCTestCase {
     }
 
     func testWireCapIsHard() throws {
-        let pack = try QWQuant.Pack(url: fixture("selfpack.qwp"))
-        let cap = pack.packedByteCount / 2
+        let pack = try QWQuant.Pack(url: fixture("selfpack.qwp"), descriptor: .qwen38_27b)
+        let cap = pack.rawCount / 2
         let w = pack.wire(limitBytes: cap)
         XCTAssertLessThanOrEqual(w, cap, "wire must never exceed limitBytes")
         XCTAssertEqual(pack.wiredBytes, w)
@@ -42,7 +42,7 @@ final class QWPackWireTests: XCTestCase {
     }
 
     func testWireZeroCapTouchesNothing() throws {
-        let pack = try QWQuant.Pack(url: fixture("selfpack.qwp"))
+        let pack = try QWQuant.Pack(url: fixture("selfpack.qwp"), descriptor: .qwen38_27b)
         XCTAssertEqual(pack.wire(limitBytes: 0), 0)
         XCTAssertEqual(pack.wiredBytes, 0)
     }
@@ -52,11 +52,11 @@ final class QWPackWireTests: XCTestCase {
         // owns (second open of the same file — the engine+test co-residency
         // class): always 0 ≤ wired ≤ span, never a throw, never a signal.
         let url = fixture("selfpack.qwp")
-        let a = try QWQuant.Pack(url: url)
-        let b = try QWQuant.Pack(url: url)
+        let a = try QWQuant.Pack(url: url, descriptor: .qwen38_27b)
+        let b = try QWQuant.Pack(url: url, descriptor: .qwen38_27b)
         let wa = a.wire()
         let wb = b.wire()
-        XCTAssertTrue(wa >= 0 && wa <= a.packedByteCount)
-        XCTAssertTrue(wb >= 0 && wb <= b.packedByteCount)
+        XCTAssertTrue(wa >= 0 && wa <= a.rawCount)
+        XCTAssertTrue(wb >= 0 && wb <= b.rawCount)
     }
 }

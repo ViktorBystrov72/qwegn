@@ -274,7 +274,31 @@ class TestErnie55Adapter(unittest.TestCase):
             quantize_model(src, out)
             info = audit_release(out)
             self.assertTrue(info["ok"])
-            self.assertTrue((out / "assets" / "chat_template.jinja").is_file())
+            tmpl_path = out / "assets" / "chat_template.jinja"
+            self.assertTrue(tmpl_path.is_file())
+            from jinja2 import Template
+            tmpl = Template(tmpl_path.read_text())
+            s_gen = tmpl.render(
+                messages=[{"role": "user", "content": "def add(a, b):"}],
+                add_generation_prompt=True,
+            )
+            self.assertIn("User: def add(a, b):", s_gen)
+            self.assertTrue(s_gen.endswith("\n\nAssistant: "))
+            s_raw = tmpl.render(
+                messages=[{"role": "user", "content": "def add(a, b):"}],
+                add_generation_prompt=False,
+            )
+            self.assertNotIn("User:", s_raw)
+            self.assertNotIn("Assistant:", s_raw)
+            s_multi = tmpl.render(
+                messages=[
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": "Hello"},
+                    {"role": "user", "content": "Next"},
+                ],
+                add_generation_prompt=True,
+            )
+            self.assertIn("User: Hi\n\nAssistant: Hello\n\nUser: Next\n\nAssistant: ", s_multi)
 
 
 if __name__ == "__main__":

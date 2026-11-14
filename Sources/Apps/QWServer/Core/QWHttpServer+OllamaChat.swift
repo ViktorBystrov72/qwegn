@@ -117,19 +117,25 @@ extension QWHttpServer {
         }
 
         let created = OllamaChatResponse.now()
+        let shouldStop = generationShouldStop(for: connection)
 
         if req.isStreaming {
             sendNDJSONHeaders(connection)
 
-            let result = try await actor.handleChatCompletion(request: req) { piece in
-                let chunk = OllamaChatResponse(model: replyModel, createdAt: created, done: false, doneReason: nil,
-                                               promptEvalCount: 0, evalCount: 0,
-                                               message: OllamaChatMessage(role: "assistant", content: piece))
-                if let data = try? JSONEncoder().encode(chunk) {
-                    connection.send(content: data + Data("\n".utf8), isComplete: false, completion: .idempotent)
-                }
-            }
+            let result = try await actor.handleChatCompletion(
+                request: req,
+                onToken: { piece in
+                    let chunk = OllamaChatResponse(model: replyModel, createdAt: created, done: false, doneReason: nil,
+                                                   promptEvalCount: 0, evalCount: 0,
+                                                   message: OllamaChatMessage(role: "assistant", content: piece))
+                    if let data = try? JSONEncoder().encode(chunk) {
+                        connection.send(content: data + Data("\n".utf8), isComplete: false, completion: .idempotent)
+                    }
+                },
+                shouldStop: shouldStop
+            )
 
+            guard !shouldStop() else { return }
             let done = OllamaChatResponse(model: replyModel, createdAt: created, done: true,
                                           doneReason: result.truncated ? "length" : "stop",
                                           promptEvalCount: result.promptTokens, evalCount: result.completionTokens,
@@ -140,7 +146,8 @@ extension QWHttpServer {
                 }))
             }
         } else {
-            let result = try await actor.handleChatCompletion(request: req, onToken: nil)
+            let result = try await actor.handleChatCompletion(request: req, onToken: nil, shouldStop: shouldStop)
+            guard !shouldStop() else { return }
             let resp = OllamaChatResponse(model: replyModel, createdAt: created, done: true,
                                           doneReason: result.truncated ? "length" : "stop",
                                           promptEvalCount: result.promptTokens, evalCount: result.completionTokens,

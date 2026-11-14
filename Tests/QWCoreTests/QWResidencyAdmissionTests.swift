@@ -124,3 +124,17 @@ final class QWResidencyAdmissionTests: XCTestCase {
         ))
     }
 }
+
+private struct QWSyntheticDeviceMemorySnapshot: QWDeviceMemorySnapshotSource, Equatable {
+    let snapshot: QWDeviceMemorySnapshot
+
+    init(physicalBytes: Int, reclaimableBytes: Int?, maxWorkingSetBytes: Int? = nil) {
+        self.snapshot = QWDeviceMemorySnapshot(
+            physicalBytes: physicalBytes,
+            reclaimableBytes: reclaimableBytes,
+            maxWorkingSetBytes: maxWorkingSetBytes
+        )
+    }
+
+    func capture() -> QWDeviceMemorySnapshot { snapshot }
+}

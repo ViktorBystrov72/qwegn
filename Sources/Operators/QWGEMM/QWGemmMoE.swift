@@ -61,6 +61,9 @@ extension QWGemm {
         }
     }
 
+    private static let disableMoETailCompact: Bool =
+        ProcessInfo.processInfo.environment["QW_MOE_TAIL_COMPACT"] == "0"
+
     /// Expert-sorted pair order (counting sort of (token, route) pairs by expert id), with optional fused NAX tile list build.
     public static func encodeMoEGroupPairsF32(_ enc: any MTLComputeCommandEncoder, hal: QWHal, ids: QWTensorValue,
                                               expertOff: QWTensorValue, sortedPairIdx: QWTensorValue,
@@ -83,7 +86,9 @@ extension QWGemm {
         enc.bindTensors(ids, expertOff, sortedPairIdx, sortedTok, startIndex: 0)
         enc.setUInt32s(experts, totalPairs, routes, startIndex: 4)
         (invPerm ?? sortedPairIdx).bind(enc, index: 7)
-        let writeWordInv = (invPerm != nil ? 1 : 0) | (directSlotTok ? 2 : 0)
+        let writeWordInv = (invPerm != nil ? 1 : 0)
+            | (directSlotTok ? 2 : 0)
+            | (disableMoETailCompact ? 4 : 0)
         enc.setUInt32s(writeWordInv, startIndex: 8)
         (tileE ?? sortedPairIdx).bind(enc, index: 9)
         (tileR ?? sortedPairIdx).bind(enc, index: 10)

@@ -397,6 +397,97 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         }
     }
 
+    private func proposeSingleCB(driver: QWEngineDriver,
+                                 table: QWMTPEmbeddingTable,
+                                 initialStream: QWTensorValue,
+                                 kv: (k: QWKVLayerView, v: QWKVLayerView),
+                                 pendingToken: Int,
+                                 cacheRows: Int,
+                                 drafts: Int,
+                                 writeLogitsOnFinalDraft: Bool,
+                                 completed: ((any MTLCommandBuffer) throws -> Void)?) throws -> [Int] {
+        let h = geometry.hidden
+        greedySelector.token.region.pointer.advanced(by: greedySelector.token.offset)
+            .assumingMemoryBound(to: Int32.self).pointee = Int32(pendingToken)
+        guard let cb = driver.hal.queue.makeCommandBuffer(),
+              var enc = cb.makeComputeCommandEncoder() else {
+            throw QWEngineDriverError.state("ECHO draft command buffer creation failed")
+        }
+        func bindEchoResources(_ targetEnc: any MTLComputeCommandEncoder) {
+            driver.bindResidentResources(targetEnc)
+            targetEnc.useResource(region.buffer, usage: [.read, .write])
+            targetEnc.useResource(table.tokens, usage: [.read, .write])
+        }
+        bindEchoResources(enc)
+        var boundEncID = ObjectIdentifier(enc)
+        driver.stepCBs = []
+        driver.activeCB = cb
+        driver.activeEnc = enc
+        var open = true
+        defer {
+            driver.stepCBs = nil
+            driver.activeEnc = nil
+            driver.activeCB = nil
+        }
+        do {
+            for step in 0..<drafts {
+                let embSlice = embedBuf.slice(byteOffset: 0, count: h, dtype: .f16)
+                try table.encode(enc, token: greedySelector.token, destination: embSlice)
+                let inStream = step == 0 ? initialStream : ((step % 2 == 1) ? draftPing : draftPong)
+                let outStream = (step % 2 == 0) ? draftPing : draftPong
+                let isLast = (step + 1 == drafts)
+                try encodeStep(&enc, driver: driver, prevStream: inStream, embedding: embSlice,
+                               kv: kv, cacheRows: cacheRows + step, outStream: outStream,
+                               writeLogits: isLast && writeLogitsOnFinalDraft, selectGreedy: true)
+                if let active = driver.activeEnc { enc = active }
+                if ObjectIdentifier(enc) != boundEncID {
+                    bindEchoResources(enc)
+                    boundEncID = ObjectIdentifier(enc)
+                }
+                let saved = QWTensorValue(region: QWMRegion(buffer: table.tokens, base: 0, length: 256),
+                                          offset: step * 4, shape: QWTensorShape([1], .i32))
+                enc.memoryBarrier(scope: .buffers)
+                try QWVerifyWindow.encodeCopy(enc, hal: driver.hal, source: greedySelector.token, destination: saved)
+                if !isLast { enc.memoryBarrier(scope: .buffers) }
+            }
+            if let active = driver.activeEnc { enc = active }
+            let finalCB = driver.activeCB ?? cb
+            let extraCBs = driver.stepCBs ?? []
+            enc.endEncoding()
+            open = false
+            finalCB.commit()
+            for sub in extraCBs {
+                sub.waitUntilCompleted()
+                guard sub.status == .completed else {
+                    driver.commandBufferErrors += 1
+                    throw QWEngineDriverError.state("ECHO draft GPU failure: \(String(describing: sub.error))")
+                }
+                try completed?(sub)
+            }
+            finalCB.waitUntilCompleted()
+            driver.flushPendingColdUnloads()
+            guard finalCB.status == .completed else {
+                driver.commandBufferErrors += 1
+                throw QWEngineDriverError.state("ECHO draft GPU failure: \(String(describing: finalCB.error))")
+            }
+            try completed?(finalCB)
+        } catch {
+            if open { enc.endEncoding() }
+            throw error
+        }
+        let ids = table.tokens.contents().assumingMemoryBound(to: Int32.self)
+        var proposed: [Int] = []
+        proposed.reserveCapacity(drafts)
+        for step in 0..<drafts {
+            let id = Int(ids[step])
+            guard (0..<geometry.vocab).contains(id) else {
+                throw QWEngineDriverError.state("ECHO single-CB draft invalid token \(id) at step \(step)")
+            }
+            proposed.append(id)
+        }
+        return proposed
+    }
+
     func propose(driver: QWEngineDriver,
                  initialStream: QWTensorValue,
                  kv: (k: QWKVLayerView, v: QWKVLayerView),
@@ -409,6 +500,14 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                  completed: ((any MTLCommandBuffer) throws -> Void)? = nil) throws -> [Int] {
         guard drafts > 0 else { return [] }
         let h = geometry.hidden
+        if drafts > 1, sampledToken == nil, shouldStopAfterDraft == nil, drafts <= 64,
+           let table = driver.mtpDeviceEmbedding,
+           table.vocabulary == geometry.vocab, table.hidden == h {
+            return try proposeSingleCB(
+                driver: driver, table: table, initialStream: initialStream, kv: kv,
+                pendingToken: pendingToken, cacheRows: cacheRows, drafts: drafts,
+                writeLogitsOnFinalDraft: writeLogitsOnFinalDraft, completed: completed)
+        }
         var currentToken = pendingToken
         var proposed: [Int] = []
         proposed.reserveCapacity(drafts)

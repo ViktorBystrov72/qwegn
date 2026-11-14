@@ -39,3 +39,18 @@ final class FNGPUExecutionTraceTests: XCTestCase {
         XCTAssertEqual(report.encodeMS, 2.9)
     }
 }
+
+private extension FNGPUExecutionTrace.BufferTiming {
+    var encodeMS: Double { submitMS - encodeStartMS }
+    var submitToStartMS: Double { gpuStartMS - submitMS }
+    var gpuMS: Double { gpuEndMS - gpuStartMS }
+}
+
+private extension FNGPUExecutionTrace.Report {
+    var encodeMS: Double { buffers.reduce(0) { $0 + $1.encodeMS } - pleWaitMS }
+    var gpuMS: Double { buffers.reduce(0) { $0 + $1.gpuMS } }
+    var gpuSpanMS: Double { (buffers.last?.gpuEndMS ?? 0) - (buffers.first?.gpuStartMS ?? 0) }
+    var gpuIdleBetweenBuffersMS: Double {
+        zip(buffers, buffers.dropFirst()).reduce(0) { $0 + max(0, $1.1.gpuStartMS - $1.0.gpuEndMS) }
+    }
+}

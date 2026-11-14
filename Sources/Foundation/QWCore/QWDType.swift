@@ -8,8 +8,6 @@ public enum QWDType: String, Sendable, Hashable {
     case q4g          // HQ4_G32_M5 group-32 Hadamard + M5 magic-bias: 20 B / 32 params = 0.625 B/param
     case hq8_g32      // HQ8_G32_M5 symmetric Hadamard INT8 planar: 34 B / 32 params = 1.0625 B/param
 
-    public static let hq4_g32: QWDType = .q4g
-
     public var bytesPerParam: Double {
         switch self {
         case .bf16, .f16: return 2

@@ -1,11 +1,11 @@
 // DualSparklineView.swift — prefill/decode sparkline card
-// (split from CupertinoTelemetryView.swift).
 // A sample that was not measured is a gap in the line, never a zero on
 // the floor: a flat line at zero would claim the engine did nothing.
+
 import SwiftUI
-import AppKit
 import QWServer
 
+/// Immediate-mode dual-band Canvas sparkline preserving nil telemetry gaps.
 public struct DualSparklineView: View {
     public var prefillData: [Double?]
     public var decodeData: [Double?]
@@ -16,76 +16,120 @@ public struct DualSparklineView: View {
     }
 
     public var body: some View {
-        GeometryReader { geo in
-            let w = geo.size.width
-            let h = geo.size.height
-            let maxP = prefillData.compactMap { $0 }.max() ?? 0.0
-            let maxD = decodeData.compactMap { $0 }.max() ?? 0.0
-            let maxVal = max(40.0, max(maxP, maxD) * 1.15)
+        let prefill = prefillData
+        let decode = decodeData
+        Canvas { context, size in
+            guard size.width > 4, size.height > 4 else { return }
+            let frameRect = CGRect(origin: .zero, size: size)
+            let framePath = RoundedRectangle(cornerRadius: 7).path(in: frameRect)
+            context.fill(framePath, with: .color(Color.black.opacity(0.20)))
+            context.stroke(framePath, with: .color(Color.white.opacity(0.07)), lineWidth: 0.6)
 
-            let pRuns = runs(data: prefillData, width: w, height: h, maxVal: maxVal)
-            let dRuns = runs(data: decodeData, width: w, height: h, maxVal: maxVal)
-
-            ZStack {
-                ForEach(Array(pRuns.enumerated()), id: \.offset) { _, run in
-                    areaPath(run, height: h)
-                        .fill(LinearGradient(colors: [TelemetryTheme.prefill.opacity(0.25), Color.clear],
-                                             startPoint: .top, endPoint: .bottom))
-                    linePath(run)
-                        .stroke(TelemetryTheme.prefill, lineWidth: 1.2)
+            let gridStyle = StrokeStyle(lineWidth: 0.6, dash: [3, 3])
+            for fraction in [0.25, 0.50, 0.75] {
+                let y = size.height * fraction
+                let grid = Path { path in
+                    path.move(to: CGPoint(x: 4, y: y))
+                    path.addLine(to: CGPoint(x: size.width - 4, y: y))
                 }
-
-                ForEach(Array(dRuns.enumerated()), id: \.offset) { _, run in
-                    areaPath(run, height: h)
-                        .fill(LinearGradient(colors: [TelemetryTheme.accent.opacity(0.25), Color.clear],
-                                             startPoint: .top, endPoint: .bottom))
-                    linePath(run)
-                        .stroke(TelemetryTheme.accent, lineWidth: 1.2)
-                }
+                context.stroke(grid, with: .color(Color.white.opacity(0.05)), style: gridStyle)
             }
+
+            let plot = QWSparklineGeometry.layout(
+                prefill: prefill,
+                decode: decode,
+                width: size.width,
+                height: size.height,
+                insetX: 7.0,
+                insetY: 6.0
+            )
+            Self.drawSeries(plot.prefill, color: TelemetryTheme.prefill, in: &context, size: size)
+            Self.drawSeries(plot.decode, color: TelemetryTheme.accent, in: &context, size: size)
         }
+        .frame(maxWidth: .infinity)
+        .accessibilityLabel("Throughput trace")
     }
 
-    private func areaPath(_ points: [CGPoint], height: CGFloat) -> Path {
-        Path { p in
-            guard let first = points.first else { return }
-            p.move(to: CGPoint(x: first.x, y: height))
-            p.addLine(to: first)
-            for pt in points.dropFirst() { p.addLine(to: pt) }
-            if let last = points.last { p.addLine(to: CGPoint(x: last.x, y: height)) }
-            p.closeSubpath()
-        }
-    }
+    private static func drawSeries(
+        _ series: QWSparklineSeriesGeometry,
+        color: Color,
+        in context: inout GraphicsContext,
+        size: CGSize
+    ) {
+        let bottomY = size.height - 6.0
+        let leftX: CGFloat = 7.0
+        let rightX = max(leftX + 1.0, size.width - 7.0)
 
-    private func linePath(_ points: [CGPoint]) -> Path {
-        Path { p in
-            guard let first = points.first else { return }
-            p.move(to: first)
-            for pt in points.dropFirst() { p.addLine(to: pt) }
-        }
-    }
-
-    /// The points of the samples that exist, split into the runs between
-    /// gaps. A missing sample breaks the line instead of filling it.
-    private func runs(data: [Double?], width: CGFloat, height: CGFloat, maxVal: Double) -> [[CGPoint]] {
-        guard data.count > 1 else { return [] }
-        let step = width / CGFloat(data.count - 1)
-        var out: [[CGPoint]] = []
-        var current: [CGPoint] = []
-        for (index, val) in data.enumerated() {
-            guard let val else {
-                if current.count > 1 { out.append(current) }
-                current = []
-                continue
+        if let guideY = series.singleSlotGuideY {
+            let y = CGFloat(guideY)
+            let band = Path { path in
+                path.move(to: CGPoint(x: leftX, y: y))
+                path.addLine(to: CGPoint(x: rightX, y: y))
+                path.addLine(to: CGPoint(x: rightX, y: bottomY))
+                path.addLine(to: CGPoint(x: leftX, y: bottomY))
+                path.closeSubpath()
             }
-            let x = CGFloat(index) * step
-            let norm = CGFloat(min(1.0, max(0.0, val / maxVal)))
-            let y = height - (norm * (height - 4)) - 2
-            current.append(CGPoint(x: x, y: y))
+            context.fill(
+                band,
+                with: .linearGradient(
+                    Gradient(colors: [color.opacity(0.14), .clear]),
+                    startPoint: CGPoint(x: 0, y: y),
+                    endPoint: CGPoint(x: 0, y: bottomY)
+                )
+            )
+            let guideLine = Path { path in
+                path.move(to: CGPoint(x: leftX, y: y))
+                path.addLine(to: CGPoint(x: rightX, y: y))
+            }
+            context.stroke(
+                guideLine,
+                with: .color(color.opacity(0.60)),
+                style: StrokeStyle(lineWidth: 1.25, lineCap: .round, dash: [4, 3])
+            )
         }
-        if current.count > 1 { out.append(current) }
-        return out
+
+        let lineStyle = StrokeStyle(lineWidth: 1.65, lineCap: .round, lineJoin: .round)
+        for run in series.runs where run.count >= 2 {
+            let area = Self.areaPath(run, bottomY: bottomY)
+            let topY = run.map { CGFloat($0.y) }.min() ?? 0
+            context.fill(
+                area,
+                with: .linearGradient(
+                    Gradient(colors: [color.opacity(0.26), .clear]),
+                    startPoint: CGPoint(x: 0, y: topY),
+                    endPoint: CGPoint(x: 0, y: bottomY)
+                )
+            )
+            context.stroke(Self.linePath(run), with: .color(color), style: lineStyle)
+        }
+
+        var markers = series.isolatedPoints
+        if let latest = series.latestPoint, !markers.contains(where: { $0.index == latest.index }) {
+            markers.append(latest)
+        }
+        for pt in markers {
+            let haloRect = CGRect(x: pt.x - 4.75, y: pt.y - 4.75, width: 9.5, height: 9.5)
+            let coreRect = CGRect(x: pt.x - 2.2, y: pt.y - 2.2, width: 4.4, height: 4.4)
+            context.fill(Path(ellipseIn: haloRect), with: .color(color.opacity(0.26)))
+            context.fill(Path(ellipseIn: coreRect), with: .color(color))
+        }
+    }
+
+    private static func areaPath(_ points: [QWSparklinePoint], bottomY: CGFloat) -> Path {
+        Path { path in
+            guard let first = points.first, let last = points.last else { return }
+            path.move(to: CGPoint(x: first.x, y: bottomY))
+            for pt in points { path.addLine(to: CGPoint(x: pt.x, y: pt.y)) }
+            path.addLine(to: CGPoint(x: last.x, y: bottomY))
+            path.closeSubpath()
+        }
+    }
+
+    private static func linePath(_ points: [QWSparklinePoint]) -> Path {
+        Path { path in
+            guard let first = points.first else { return }
+            path.move(to: CGPoint(x: first.x, y: first.y))
+            for pt in points.dropFirst() { path.addLine(to: CGPoint(x: pt.x, y: pt.y)) }
+        }
     }
 }
-
-// MARK: - QG Processor Microchip Vector Logo

@@ -1,365 +1,113 @@
+// QWServerMetrics.swift — Thread-safe telemetry registry for inference & cache state.
+
 import Foundation
 import Darwin
 import QWEngine
 
-/// The names the snapshot's provenance map uses.
-public enum QWTelemetryMetric: String, Sendable, CaseIterable {
-    case livePrefillTokensPerSec = "throughput.live_prefill_tokens_per_sec"
-    case liveDecodeTokensPerSec = "throughput.live_decode_tokens_per_sec"
-    case lastPrefillTokensPerSec = "throughput.last_prefill_tokens_per_sec"
-    case lastDecodeTokensPerSec = "throughput.last_decode_tokens_per_sec"
-    case ema1mPrefillTokensPerSec = "throughput.ema_1m_prefill_tokens_per_sec"
-    case ema1mDecodeTokensPerSec = "throughput.ema_1m_decode_tokens_per_sec"
-    case avgPrefillTokensPerSec = "throughput.avg_prefill_tokens_per_sec"
-    case avgDecodeTokensPerSec = "throughput.avg_decode_tokens_per_sec"
-    case displayPrefillTokensPerSec = "throughput.display_prefill_tokens_per_sec"
-    case displayDecodeTokensPerSec = "throughput.display_decode_tokens_per_sec"
-    case ttftMs = "latency.ttft_ms"
-    case cpuPercent = "hardware.cpu_percent"
-    case gpuPercent = "hardware.gpu_percent"
-    case memoryPercent = "hardware.memory_percent"
-    case memoryPressure = "hardware.memory_pressure"
-    case gpuBusyRatio = "gpu.busy_ratio"
-    /// The last turn's prompt was served entirely from the prefix
-    /// cache: the engine ran no prefill phase, so it has no prefill speed.
-    case prefillFromCache = "throughput.prefill_from_cache"
-}
-
-/// How long a reading stays current. Past its bound a reading is stale: it
-/// was measured, but it no longer describes the present.
-public enum QWTelemetryFreshness {
-    /// A host reading is refreshed every couple of seconds.
-    public static let hardwareStaleAfter: TimeInterval = 10
-    /// A rate measured this long ago is no longer the engine's speed.
-    public static let rateStaleAfter: TimeInterval = 30
-    /// The engine's busy ratio describes its last measured step.
-    public static let busyRatioStaleAfter: TimeInterval = 30
-    /// The cache changes only when a cached request runs, so it stays
-    /// current far longer than a host reading.
-    public static let cacheStaleAfter: TimeInterval = 300
-    /// A latency describes the turn it came from.
-    public static let latencyStaleAfter: TimeInterval = 60
-}
-
-/// What a displayed rate is, so the UI can label it.
-public enum QWRateDisplayMode: String, Sendable, Codable, CaseIterable {
-    /// The current phase's live rate.
-    case live
-    /// The average over every completed turn.
-    case average = "avg"
-    /// The most recent measurement, still current.
-    case last
-    /// The most recent measurement, too old to present as current.
-    case stale
-
-    /// A payload may name a mode this build does not know. The honest
-    /// default is the least committal one.
-    public init(from decoder: Decoder) throws {
-        let raw = try decoder.singleValueContainer().decode(String.self)
-        self = QWRateDisplayMode(rawValue: raw) ?? .last
-    }
-}
-
-/// Thread-safe registry for engine performance, cache telemetry, and throughput metrics.
 public final class QWEngineTelemetryRegistry: @unchecked Sendable {
     public static let shared = QWEngineTelemetryRegistry()
 
-    public enum EngineInferencePhase: String, Codable, Sendable {
-        case idle = "idle"
-        case prefill = "prefill"
-        case decode = "decode"
-    }
-
-    public struct MetricsSnapshot: Codable, Sendable {
-        public let cache: CacheMetrics
-        public let throughput: ThroughputMetrics
-        public let latency: LatencyMetrics
-        public let context: ContextMetrics
-        public let memory: MemoryMetrics
-        public let hardware: QWSystemHardwareUtilization?
-        /// The engine's own GPU busy ratio for its last measured step.
-        public let gpuBusyRatio: Double?
-        /// How each metric was obtained. A metric that is not listed was
-        /// never measured, and the UI says so instead of showing a zero.
-        public let provenance: [String: QWTelemetryProvenance]
-        /// When each metric was taken. A cached metric says how old it is.
-        public let sampledAt: [String: Date]
-        /// Why a metric is unavailable or stale, when it is.
-        public let unavailableReasons: [String: String]
-
-        public struct CacheMetrics: Codable, Sendable {
-            /// The warm cache's bytes. Nil means the engine cannot
-            /// measure them — absent, never zero.
-            public let warmBytes: Int?
-            public let warmLimitBytes: Int
-            /// The SSD cache's bytes. Nil means the engine cannot measure
-            /// them — absent, never zero.
-            public let ssdBytes: Int?
-            public let ssdLimitBytes: Int
-            public let lookupsTotal: Int
-            public let hitsWarmTotal: Int
-            public let hitsSSDTotal: Int
-            /// Hits whose tier this build does not name. The tokens were
-            /// reused; the tier is not in the vocabulary. Nil means this
-            /// server does not report it — absent, never zero.
-            public let hitsUnclassifiedTotal: Int?
-            public let missesTotal: Int
-            public let tokensReusedTotal: Int
-            public let evictionsWarmTotal: Int
-            public let evictionsSSDTotal: Int
-            /// When the cache was last written. Nil means it never was.
-            public var sampledAt: Date? = nil
-        }
-
-        public struct ThroughputMetrics: Codable, Sendable {
-            public let phase: String
-            public let tokensInTotal: Int
-            public let tokensOutTotal: Int
-            /// The live rates. Nil means "not measured", never zero.
-            public let livePrefillTokensPerSec: Double?
-            public let liveDecodeTokensPerSec: Double?
-            public let lastPrefillTokensPerSec: Double?
-            public let lastDecodeTokensPerSec: Double?
-            public let ema1mPrefillTokensPerSec: Double?
-            public let ema1mDecodeTokensPerSec: Double?
-            /// Overall averages across every completed turn since start (token-weighted:
-            /// computed tokens / time spent computing them). Prefill counts ONLY tokens the
-            /// engine actually computed — tokens served from the prefix cache are excluded.
-            public let avgPrefillTokensPerSec: Double?
-            public let avgDecodeTokensPerSec: Double?
-            /// What a UI should show right now. The mode says which number it is.
-            public let displayPrefillTokensPerSec: Double?
-            public let displayDecodeTokensPerSec: Double?
-            public let prefillDisplayMode: QWRateDisplayMode
-            public let decodeDisplayMode: QWRateDisplayMode
-            /// The published trace of the prefill rate. A nil is a gap.
-            public var prefillRateSeries: [Double?] = []
-            /// The published trace of the decode rate. A nil is a gap.
-            public var decodeRateSeries: [Double?] = []
-            /// Progress of the turn in flight: the tokens the engine had to compute.
-            public let prefillProgressTokens: Int
-            public let prefillTotalTokens: Int
-            /// True when the last turn's prompt was served entirely from
-            /// the prefix cache: the engine computed no prefill tokens,
-            /// so that turn had no prefill speed at all.
-            public let prefillFromCache: Bool
-
-            public init(phase: String, tokensInTotal: Int, tokensOutTotal: Int,
-                        livePrefillTokensPerSec: Double?, liveDecodeTokensPerSec: Double?,
-                        lastPrefillTokensPerSec: Double?, lastDecodeTokensPerSec: Double?,
-                        ema1mPrefillTokensPerSec: Double?, ema1mDecodeTokensPerSec: Double?,
-                        avgPrefillTokensPerSec: Double?, avgDecodeTokensPerSec: Double?,
-                        displayPrefillTokensPerSec: Double?, displayDecodeTokensPerSec: Double?,
-                        prefillDisplayMode: QWRateDisplayMode, decodeDisplayMode: QWRateDisplayMode,
-                        prefillProgressTokens: Int, prefillTotalTokens: Int,
-                        prefillRateSeries: [Double?] = [], decodeRateSeries: [Double?] = [],
-                        prefillFromCache: Bool = false) {
-                self.phase = phase
-                self.tokensInTotal = tokensInTotal
-                self.tokensOutTotal = tokensOutTotal
-                self.livePrefillTokensPerSec = livePrefillTokensPerSec
-                self.liveDecodeTokensPerSec = liveDecodeTokensPerSec
-                self.lastPrefillTokensPerSec = lastPrefillTokensPerSec
-                self.lastDecodeTokensPerSec = lastDecodeTokensPerSec
-                self.ema1mPrefillTokensPerSec = ema1mPrefillTokensPerSec
-                self.ema1mDecodeTokensPerSec = ema1mDecodeTokensPerSec
-                self.avgPrefillTokensPerSec = avgPrefillTokensPerSec
-                self.avgDecodeTokensPerSec = avgDecodeTokensPerSec
-                self.displayPrefillTokensPerSec = displayPrefillTokensPerSec
-                self.displayDecodeTokensPerSec = displayDecodeTokensPerSec
-                self.prefillDisplayMode = prefillDisplayMode
-                self.decodeDisplayMode = decodeDisplayMode
-                self.prefillProgressTokens = prefillProgressTokens
-                self.prefillTotalTokens = prefillTotalTokens
-                self.prefillFromCache = prefillFromCache
-                self.prefillRateSeries = prefillRateSeries
-                self.decodeRateSeries = decodeRateSeries
-            }
-
-            /// Decodes a payload from an older server: a field that is not
-            /// there was never measured, not zero.
-            public init(from decoder: Decoder) throws {
-                let c = try decoder.container(keyedBy: CodingKeys.self)
-                self.init(
-                    phase: try c.decodeIfPresent(String.self, forKey: .phase) ?? "idle",
-                    tokensInTotal: try c.decodeIfPresent(Int.self, forKey: .tokensInTotal) ?? 0,
-                    tokensOutTotal: try c.decodeIfPresent(Int.self, forKey: .tokensOutTotal) ?? 0,
-                    livePrefillTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .livePrefillTokensPerSec),
-                    liveDecodeTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .liveDecodeTokensPerSec),
-                    lastPrefillTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .lastPrefillTokensPerSec),
-                    lastDecodeTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .lastDecodeTokensPerSec),
-                    ema1mPrefillTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .ema1mPrefillTokensPerSec),
-                    ema1mDecodeTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .ema1mDecodeTokensPerSec),
-                    avgPrefillTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .avgPrefillTokensPerSec),
-                    avgDecodeTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .avgDecodeTokensPerSec),
-                    displayPrefillTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .displayPrefillTokensPerSec),
-                    displayDecodeTokensPerSec: try c.decodeIfPresent(Double.self, forKey: .displayDecodeTokensPerSec),
-                    prefillDisplayMode: try c.decodeIfPresent(QWRateDisplayMode.self, forKey: .prefillDisplayMode) ?? .last,
-                    decodeDisplayMode: try c.decodeIfPresent(QWRateDisplayMode.self, forKey: .decodeDisplayMode) ?? .last,
-                    prefillProgressTokens: try c.decodeIfPresent(Int.self, forKey: .prefillProgressTokens) ?? 0,
-                    prefillTotalTokens: try c.decodeIfPresent(Int.self, forKey: .prefillTotalTokens) ?? 0,
-                    prefillRateSeries: try c.decodeIfPresent([Double?].self, forKey: .prefillRateSeries) ?? [],
-                    decodeRateSeries: try c.decodeIfPresent([Double?].self, forKey: .decodeRateSeries) ?? [],
-                    prefillFromCache: try c.decodeIfPresent(Bool.self, forKey: .prefillFromCache) ?? false)
-            }
-        }
-
-        public struct LatencyMetrics: Codable, Sendable {
-            public let lastTtftMs: Double?
-            public let avgTtftMs: Double?
-        }
-
-        public struct ContextMetrics: Codable, Sendable {
-            /// The tokens the last turn used. Nil means no turn has run:
-            /// absent, never zero.
-            public var activeTokens: Int?
-            public let maxTokens: Int
-            /// When the context was last updated. Nil means never.
-            public var sampledAt: Date? = nil
-        }
-
-        public struct MemoryMetrics: Codable, Sendable {
-            public let residentBytes: Int
-            public let arenaReservedBytes: Int
-        }
-
-        public init(cache: CacheMetrics, throughput: ThroughputMetrics, latency: LatencyMetrics,
-                    context: ContextMetrics, memory: MemoryMetrics,
-                    hardware: QWSystemHardwareUtilization?, gpuBusyRatio: Double?,
-                    provenance: [String: QWTelemetryProvenance], sampledAt: [String: Date],
-                    unavailableReasons: [String: String]) {
-            self.cache = cache
-            self.throughput = throughput
-            self.latency = latency
-            self.context = context
-            self.memory = memory
-            self.hardware = hardware
-            self.gpuBusyRatio = gpuBusyRatio
-            self.provenance = provenance
-            self.sampledAt = sampledAt
-            self.unavailableReasons = unavailableReasons
-        }
-
-        /// Decodes a payload from an older server: a field that is not there
-        /// is unavailable, not a zero that reads like an idle engine.
-        public init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: CodingKeys.self)
-            self.init(
-                cache: try c.decodeIfPresent(CacheMetrics.self, forKey: .cache)
-                    ?? .init(warmBytes: 0, warmLimitBytes: 0, ssdBytes: 0, ssdLimitBytes: 0,
-                             lookupsTotal: 0, hitsWarmTotal: 0, hitsSSDTotal: 0,
-                             hitsUnclassifiedTotal: nil, missesTotal: 0,
-                             tokensReusedTotal: 0, evictionsWarmTotal: 0, evictionsSSDTotal: 0),
-                throughput: try c.decodeIfPresent(ThroughputMetrics.self, forKey: .throughput)
-                    ?? .init(phase: "idle", tokensInTotal: 0, tokensOutTotal: 0,
-                             livePrefillTokensPerSec: nil, liveDecodeTokensPerSec: nil,
-                             lastPrefillTokensPerSec: nil, lastDecodeTokensPerSec: nil,
-                             ema1mPrefillTokensPerSec: nil, ema1mDecodeTokensPerSec: nil,
-                             avgPrefillTokensPerSec: nil, avgDecodeTokensPerSec: nil,
-                             displayPrefillTokensPerSec: nil, displayDecodeTokensPerSec: nil,
-                             prefillDisplayMode: .last, decodeDisplayMode: .last,
-                             prefillProgressTokens: 0, prefillTotalTokens: 0),
-                latency: try c.decodeIfPresent(LatencyMetrics.self, forKey: .latency)
-                    ?? .init(lastTtftMs: nil, avgTtftMs: nil),
-                context: try c.decodeIfPresent(ContextMetrics.self, forKey: .context)
-                    ?? .init(activeTokens: 0, maxTokens: 0),
-                memory: try c.decodeIfPresent(MemoryMetrics.self, forKey: .memory)
-                    ?? .init(residentBytes: 0, arenaReservedBytes: 0),
-                hardware: try c.decodeIfPresent(QWSystemHardwareUtilization.self, forKey: .hardware),
-                gpuBusyRatio: try c.decodeIfPresent(Double.self, forKey: .gpuBusyRatio),
-                provenance: try c.decodeIfPresent([String: QWTelemetryProvenance].self, forKey: .provenance) ?? [:],
-                sampledAt: try c.decodeIfPresent([String: Date].self, forKey: .sampledAt) ?? [:],
-                unavailableReasons: try c.decodeIfPresent([String: String].self, forKey: .unavailableReasons) ?? [:])
-        }
-    }
-
-    private let lock = NSLock()
+    let lock = NSLock()
 
     // Cache Counters
     /// The cache bytes the engine reported. Nil means the engine cannot
     /// measure them: absent, never zero.
-    private var warmCacheBytes: Int?
-    private var warmCacheLimitBytes: Int = 0
-    private var ssdCacheBytes: Int?
-    private var ssdCacheLimitBytes: Int = 0
-    private var cacheLookupsTotal: Int = 0
-    private var cacheHitsWarmTotal: Int = 0
-    private var cacheHitsSSDTotal: Int = 0
-    private var cacheHitsUnclassifiedTotal: Int = 0
-    private var cacheMissesTotal: Int = 0
-    private var cacheTokensReusedTotal: Int = 0
-    private var cacheEvictionsWarmTotal: Int = 0
-    private var cacheEvictionsSSDTotal: Int = 0
+    var warmCacheBytes: Int?
+    var warmCacheLimitBytes: Int = 0
+    var ssdCacheBytes: Int?
+    var ssdCacheLimitBytes: Int = 0
+    var cacheLookupsTotal: Int = 0
+    var cacheHitsWarmTotal: Int = 0
+    var cacheHitsSSDTotal: Int = 0
+    var cacheHitsUnclassifiedTotal: Int = 0
+    var cacheMissesTotal: Int = 0
+    var cacheTokensReusedTotal: Int = 0
+    var cacheEvictionsWarmTotal: Int = 0
+    var cacheEvictionsSSDTotal: Int = 0
     /// When the cache was last written.
-    private var cacheSampledAt: Date?
+    var cacheSampledAt: Date?
 
     // Token Throughput & Phase Trackers
-    private var phase: EngineInferencePhase = .idle
+    var phase: EngineInferencePhase = .idle
     /// The decode rate the engine's own inter-token latencies give:
     /// 1000 / p50(ITL) over the last `itlWindow` tokens, coalescing burst emissions
     /// into their round's per-token latency in a bounded FIFO window.
-    private var itlDecodeTokPerSec: Double = 0.0
+    var itlDecodeTokPerSec: Double = 0.0
     /// FIFO ring buffer of the last `itlWindow` per-token latencies in milliseconds.
-    private var itlFifo: [Double] = []
-    private var itlFifoHead: Int = 0
-    private var currentRoundMs: Double = 0.0
-    private var currentRoundTokens: Int = 0
-    private static let speculativeBurstThresholdMs: Double = 0.5
+    var itlFifo: [Double] = []
+    var itlFifoHead: Int = 0
+    var currentRoundMs: Double = 0.0
+    var currentRoundTokens: Int = 0
+    static let speculativeBurstThresholdMs: Double = 0.5
     /// The last `itlWindow` inter-token latencies in milliseconds, kept sorted so the
     /// median needs no copy.
-    private var itlSorted: [Double] = []
+    var itlSorted: [Double] = []
     /// When the last token arrived, for the next inter-token latency.
-    private var lastTokenAt: Date?
+    var lastTokenAt: Date?
 
-    private var tokensInTotal: Int = 0
-    private var tokensOutTotal: Int = 0
-    private var lastPrefillTokPerSec: Double = 0
-    private var lastDecodeTokPerSec: Double = 0
+    var tokensInTotal: Int = 0
+    var tokensOutTotal: Int = 0
+    var lastPrefillTokPerSec: Double = 0
+    var lastDecodeTokPerSec: Double = 0
     /// When the last prefill rate was measured.
-    private var lastPrefillSampledAt: Date?
+    var lastPrefillSampledAt: Date?
     /// The published trace of the two rates. A renderer draws this; it
     /// does not keep its own.
-    private var prefillRateSeries: [Double?] = []
-    private var decodeRateSeries: [Double?] = []
+    var prefillRateSeries: [Double?] = []
+    var decodeRateSeries: [Double?] = []
     /// When the last decode rate was measured.
-    private var lastDecodeSampledAt: Date?
-    private var ema1mPrefillTokPerSec: Double = 0
-    private var ema1mDecodeTokPerSec: Double = 0
+    var lastDecodeSampledAt: Date?
+    var ema1mPrefillTokPerSec: Double = 0
+    var ema1mDecodeTokPerSec: Double = 0
+
+    // Live chunked prefill rate and 1-second trace sampling state.
+    private var livePrefillTokPerSec: Double = 0.0
+    private var livePrefillSampledAt: Date?
+    private var prefillChunkAnchorTokens: Int = 0
+    private var prefillChunkAnchorAt: Date?
+    private var nextTraceTickAt: Date?
+    private var seriesTotalAppended: Int = 0
+    private var turnStartSeriesSeq: Int = 0
+    private var turnPrefillSamplesCommitted: Int = 0
+    private var turnDecodeSamplesCommitted: Int = 0
+    private static let traceWindowCapacity = 60
+    private static let traceTickIntervalSec: TimeInterval = 1.0
+    private static let minLivePrefillWindowSec: TimeInterval = 0.05
 
     // Per-turn prefill progress: the tokens the engine must compute this turn,
     // excluding tokens served from the prefix cache.
-    private var prefillComputedDone = 0
-    private var prefillComputedTotal = 0
+    var prefillComputedDone = 0
+    var prefillComputedTotal = 0
     /// Whether the last completed turn's prompt came entirely from the
     /// prefix cache. Such a turn ran no prefill phase at all.
-    private var lastTurnPrefillFromCache = false
+    var lastTurnPrefillFromCache = false
 
     // Cumulative counters for the idle-time overall averages.
-    private var totalPrefillComputedTokens: Double = 0
-    private var totalPrefillSeconds: Double = 0
-    private var totalDecodeTokens: Double = 0
-    private var totalDecodeSeconds: Double = 0
+    var totalPrefillComputedTokens: Double = 0
+    var totalPrefillSeconds: Double = 0
+    var totalDecodeTokens: Double = 0
+    var totalDecodeSeconds: Double = 0
     /// When the last completed turn finished; the averages describe the work
     /// done up to then.
-    private var lastTurnSampledAt: Date?
+    var lastTurnSampledAt: Date?
 
     // Latency Trackers
-    private var lastTtftMs: Double = 0
-    private var totalTtftMs: Double = 0
-    private var totalRequestsWithTtft: Int = 0
-    private var lastTtftSampledAt: Date?
+    var lastTtftMs: Double = 0
+    var totalTtftMs: Double = 0
+    var totalRequestsWithTtft: Int = 0
+    var lastTtftSampledAt: Date?
 
     // Context & Memory
     /// The tokens the last turn used. Nil means no turn has run: absent,
     /// never zero.
-    private var contextTokensActive: Int?
-    private var contextTokensMax: Int = 4096
-    private var contextSampledAt: Date?
-    private var arenaReservedBytes: Int = 0
+    var contextTokensActive: Int?
+    var contextTokensMax: Int = 4096
+    var contextSampledAt: Date?
+    var arenaReservedBytes: Int = 0
 
     /// How long a rate stays current. Past this the display says the
     /// measurement is stale instead of presenting it as the engine's speed.
-    private let rateStaleAfter: TimeInterval
+    let rateStaleAfter: TimeInterval
 
     public init(rateStaleAfter: TimeInterval = QWTelemetryFreshness.rateStaleAfter) {
         self.rateStaleAfter = rateStaleAfter
@@ -389,18 +137,6 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         cacheTokensReusedTotal += matchedTokens
     }
 
-    public func recordWarmEviction() {
-        lock.lock()
-        defer { lock.unlock() }
-        cacheEvictionsWarmTotal += 1
-    }
-
-    public func recordSSDEviction() {
-        lock.lock()
-        defer { lock.unlock() }
-        cacheEvictionsSSDTotal += 1
-    }
-
     public func updateCacheUsage(warmBytes: Int?, warmLimit: Int, ssdBytes: Int?, ssdLimit: Int) {
         lock.lock()
         defer { lock.unlock() }
@@ -416,9 +152,10 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
 
     // MARK: - Live Phase Transitions
 
-    public func beginPrefill(promptTokens: Int) {
+    public func beginPrefill(promptTokens: Int, at date: Date? = nil) {
         lock.lock()
         defer { lock.unlock() }
+        let now = date ?? Date()
         phase = .prefill
         itlDecodeTokPerSec = 0.0
         itlFifo.removeAll(keepingCapacity: true)
@@ -429,17 +166,62 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         lastTokenAt = nil
         prefillComputedDone = 0
         prefillComputedTotal = promptTokens
+        livePrefillTokPerSec = 0.0
+        livePrefillSampledAt = nil
+        prefillChunkAnchorTokens = 0
+        prefillChunkAnchorAt = now
+        nextTraceTickAt = now.addingTimeInterval(Self.traceTickIntervalSec)
+        turnStartSeriesSeq = seriesTotalAppended
+        turnPrefillSamplesCommitted = 0
+        turnDecodeSamplesCommitted = 0
+    }
+
+    /// Updates incremental prefill progress for the turn currently in prefill.
+    public func updatePrefillProgress(completedTokens: Int, totalTokens: Int, at date: Date? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard phase == .prefill else { return }
+        let now = date ?? Date()
+        let safeTotal = max(0, totalTokens)
+        prefillComputedTotal = safeTotal
+        prefillComputedDone = min(safeTotal, max(0, completedTokens))
+        if prefillComputedDone == 0 {
+            prefillChunkAnchorTokens = 0
+            prefillChunkAnchorAt = now
+            nextTraceTickAt = now.addingTimeInterval(Self.traceTickIntervalSec)
+        } else if prefillComputedDone > prefillChunkAnchorTokens, let anchorAt = prefillChunkAnchorAt {
+            let elapsed = now.timeIntervalSince(anchorAt)
+            if elapsed >= Self.minLivePrefillWindowSec {
+                livePrefillTokPerSec = Double(prefillComputedDone - prefillChunkAnchorTokens) / elapsed
+                livePrefillSampledAt = now
+                prefillChunkAnchorTokens = prefillComputedDone
+                prefillChunkAnchorAt = now
+                advanceActiveTraceIfNeeded(now: now)
+            }
+        }
     }
 
     /// The decode phase has begun. The prefill's own duration is not known
     /// here: the time to the first token is not the prefill's duration, and
     /// a fully cached prompt has no prefill phase at all.
-    public func beginDecode(promptTokens: Int) {
+    public func beginDecode(promptTokens: Int, at date: Date? = nil) {
         lock.lock()
         defer { lock.unlock() }
+        let now = date ?? Date()
+        if phase == .prefill && livePrefillTokPerSec > 0 {
+            advanceActiveTraceIfNeeded(now: now)
+        } else if phase == .idle {
+            turnStartSeriesSeq = seriesTotalAppended
+            turnPrefillSamplesCommitted = 0
+            turnDecodeSamplesCommitted = 0
+        }
         phase = .decode
         prefillComputedDone = promptTokens
         prefillComputedTotal = promptTokens
+        livePrefillTokPerSec = 0.0
+        livePrefillSampledAt = nil
+        prefillChunkAnchorTokens = 0
+        prefillChunkAnchorAt = nil
         itlDecodeTokPerSec = 0.0
         itlFifo.removeAll(keepingCapacity: true)
         itlFifoHead = 0
@@ -448,17 +230,8 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         itlSorted.removeAll(keepingCapacity: true)
         // The first token has arrived, so the gap to the next one is a
         // measurement: the rate exists once the turn has two tokens.
-        lastTokenAt = Date()
-    }
-
-    /// Resets the inter-token clock after synchronous post-prefill work (such as saving
-    /// the prefix cache after emitting the first token) so cache I/O is not billed to decode ITL.
-    public func resetDecodeStepClock() {
-        lock.lock()
-        defer { lock.unlock() }
-        if phase == .decode {
-            lastTokenAt = Date()
-        }
+        lastTokenAt = now
+        nextTraceTickAt = now.addingTimeInterval(Self.traceTickIntervalSec)
     }
 
     /// `at` exists for tests only: macOS Thread.sleep overshoots by 3-5x under
@@ -507,6 +280,7 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         if itlDecodeTokPerSec > 0 {
             lastDecodeSampledAt = now
         }
+        advanceActiveTraceIfNeeded(now: now)
     }
 
     /// How many inter-token latencies the live rate looks at.
@@ -546,9 +320,20 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
     }
 
     public func endRequest(tokensIn: Int, tokensOut: Int, cachedTokens: Int = 0,
-                           prefillSec: Double?, decodeSec: Double?, ttftSec: Double?) {
+                           prefillSec: Double?, decodeSec: Double?, ttftSec: Double?,
+                           at date: Date? = nil) {
         lock.lock()
         defer { lock.unlock() }
+        let now = date ?? Date()
+        if phase == .prefill || phase == .decode {
+            advanceActiveTraceIfNeeded(now: now)
+        }
+        let hadLiveDecodeTail = phase == .decode && itlDecodeTokPerSec > 0
+        let trailingDecodeRate = itlDecodeTokPerSec
+        let committedPrefill = turnPrefillSamplesCommitted
+        let committedDecode = turnDecodeSamplesCommitted
+        let startSeq = turnStartSeriesSeq
+
         phase = .idle
         itlDecodeTokPerSec = 0.0
         itlFifo.removeAll(keepingCapacity: true)
@@ -559,75 +344,105 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         lastTokenAt = nil
         prefillComputedDone = 0
         prefillComputedTotal = 0
+        livePrefillTokPerSec = 0.0
+        livePrefillSampledAt = nil
+        prefillChunkAnchorTokens = 0
+        prefillChunkAnchorAt = nil
+        nextTraceTickAt = nil
+        turnPrefillSamplesCommitted = 0
+        turnDecodeSamplesCommitted = 0
 
         tokensInTotal += tokensIn
         tokensOutTotal += tokensOut
 
-        // Prefill speed is computed tokens / time; tokens served from the cache cost
-        // nothing and would otherwise inflate the rate by 10-50x on a warm turn.
+        // Prefill speed is computed tokens / time; cache-served tokens cost nothing.
         let computed = max(0, tokensIn - cachedTokens)
-        // A prompt the cache served entirely had no prefill phase at all:
-        // the engine computed nothing, so it has no prefill speed. The
-        // card says where the prompt came from instead of a dash.
         lastTurnPrefillFromCache = tokensIn > 0 && computed == 0
+        var instPrefill: Double? = nil
         if let prefillSec, prefillSec > 0 && computed > 0 {
-            let instPrefill = Double(computed) / prefillSec
-            lastPrefillTokPerSec = instPrefill
+            let rate = Double(computed) / prefillSec
+            instPrefill = rate
+            lastPrefillTokPerSec = rate
             totalPrefillComputedTokens += Double(computed)
             totalPrefillSeconds += prefillSec
-            if ema1mPrefillTokPerSec == 0 {
-                ema1mPrefillTokPerSec = instPrefill
-            } else {
-                ema1mPrefillTokPerSec = 0.2 * instPrefill + 0.8 * ema1mPrefillTokPerSec
-            }
-            lastPrefillSampledAt = Date()
-            Self.append(lastPrefillTokPerSec, to: &prefillRateSeries)
-        } else {
-            // The turn measured no prefill rate. The trace breaks here:
-            // a gap, never a flat line at the last known value.
-            Self.append(nil, to: &prefillRateSeries)
+            ema1mPrefillTokPerSec = ema1mPrefillTokPerSec == 0 ? rate : (0.2 * rate + 0.8 * ema1mPrefillTokPerSec)
+            lastPrefillSampledAt = now
         }
-        // The first generated token is produced by prefill, so decode throughput covers
-        // the remaining tokens only.
+        // The first generated token comes from prefill, so decode counts remaining tokens.
         let decoded = tokensOut > 1 ? tokensOut - 1 : tokensOut
+        var instDecode: Double? = nil
         if let decodeSec, decodeSec > 0 && decoded > 0 {
-            let instDecode = Double(decoded) / decodeSec
-            lastDecodeTokPerSec = instDecode
+            let rate = Double(decoded) / decodeSec
+            instDecode = rate
+            lastDecodeTokPerSec = rate
             totalDecodeTokens += Double(decoded)
             totalDecodeSeconds += decodeSec
-            if ema1mDecodeTokPerSec == 0 {
-                ema1mDecodeTokPerSec = instDecode
-            } else {
-                ema1mDecodeTokPerSec = 0.2 * instDecode + 0.8 * ema1mDecodeTokPerSec
-            }
-            lastDecodeSampledAt = Date()
-            Self.append(lastDecodeTokPerSec, to: &decodeRateSeries)
-        } else {
-            // The turn measured no decode rate: the trace breaks here.
-            Self.append(nil, to: &decodeRateSeries)
+            ema1mDecodeTokPerSec = ema1mDecodeTokPerSec == 0 ? rate : (0.2 * rate + 0.8 * ema1mDecodeTokPerSec)
+            lastDecodeSampledAt = now
         }
-        // The time to the first token, when the engine reported one. A
-        // request that produced no token has no time to first token.
+
+        if committedPrefill == 0 && committedDecode == 0 {
+            appendTraceSample(prefill: instPrefill, decode: instDecode)
+        } else {
+            if hadLiveDecodeTail || (committedDecode == 0 && instDecode != nil) {
+                appendTraceSample(prefill: nil, decode: instDecode ?? (hadLiveDecodeTail ? trailingDecodeRate : nil))
+            }
+            if committedPrefill == 0, let instPrefill {
+                let ageSlots = seriesTotalAppended - startSeq
+                if ageSlots >= 1 && ageSlots <= prefillRateSeries.count {
+                    prefillRateSeries[prefillRateSeries.count - ageSlots] = instPrefill
+                }
+            }
+        }
+        // The time to the first token, when the engine reported one.
         if let ttftSec {
             let ttft = ttftSec * 1000.0
             lastTtftMs = ttft
             totalTtftMs += ttft
             totalRequestsWithTtft += 1
-            lastTtftSampledAt = Date()
+            lastTtftSampledAt = now
         }
-        lastTurnSampledAt = Date()
+        lastTurnSampledAt = now
     }
 
-    public func recordGeneration(tokensIn: Int, tokensOut: Int, cachedTokens: Int = 0,
-                                 prefillSec: Double, decodeSec: Double, ttftSec: Double?) {
-        endRequest(tokensIn: tokensIn, tokensOut: tokensOut, cachedTokens: cachedTokens,
-                   prefillSec: prefillSec, decodeSec: decodeSec, ttftSec: ttftSec)
+    /// Appends paired trace samples to the rolling 60-second series while advancing sequence count.
+    private func appendTraceSample(prefill: Double?, decode: Double?) {
+        Self.append(prefill, to: &prefillRateSeries)
+        Self.append(decode, to: &decodeRateSeries)
+        seriesTotalAppended += 1
     }
 
+    /// Advances active prefill/decode trace slots once per elapsed second without drifting when idle.
+    private func advanceActiveTraceIfNeeded(now: Date) {
+        guard var tickAt = nextTraceTickAt else { return }
+        if now.timeIntervalSince(tickAt) > Double(Self.traceWindowCapacity) {
+            tickAt = now.addingTimeInterval(-Double(Self.traceWindowCapacity - 1))
+        }
+        switch phase {
+        case .prefill:
+            guard livePrefillTokPerSec > 0 else { return }
+            while now >= tickAt {
+                appendTraceSample(prefill: livePrefillTokPerSec, decode: nil)
+                turnPrefillSamplesCommitted += 1
+                tickAt = tickAt.addingTimeInterval(Self.traceTickIntervalSec)
+            }
+            nextTraceTickAt = tickAt
+        case .decode:
+            guard itlDecodeTokPerSec > 0 else { return }
+            while now >= tickAt {
+                appendTraceSample(prefill: nil, decode: itlDecodeTokPerSec)
+                turnDecodeSamplesCommitted += 1
+                tickAt = tickAt.addingTimeInterval(Self.traceTickIntervalSec)
+            }
+            nextTraceTickAt = tickAt
+        case .idle:
+            break
+        }
+    }
     /// Keeps a bounded trace: a gap is a nil, never a zero.
-    private static func append(_ value: Double?, to series: inout [Double?]) {
+    static func append(_ value: Double?, to series: inout [Double?]) {
         series.append(value)
-        if series.count > 60 { series.removeFirst(series.count - 60) }
+        if series.count > traceWindowCapacity { series.removeFirst(series.count - traceWindowCapacity) }
     }
 
     public func resetToIdle() {
@@ -653,9 +468,16 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         lastTokenAt = nil
         prefillComputedDone = 0
         prefillComputedTotal = 0
-        // The engine is gone: the trace described a model that is no
-        // longer resident, so it goes with it. The last rate stays: it
-        // is a reading, and a reading says how old it is.
+        livePrefillTokPerSec = 0.0
+        livePrefillSampledAt = nil
+        prefillChunkAnchorTokens = 0
+        prefillChunkAnchorAt = nil
+        nextTraceTickAt = nil
+        seriesTotalAppended = 0
+        turnStartSeriesSeq = 0
+        turnPrefillSamplesCommitted = 0
+        turnDecodeSamplesCommitted = 0
+        // Clear trace series on reset; last rate stays with its measurement timestamp.
         prefillRateSeries.removeAll()
         decodeRateSeries.removeAll()
         // The state belongs to the model that ran the turn: a new model
@@ -700,16 +522,15 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         return kerr == KERN_SUCCESS ? Int(info.resident_size) : 0
     }
 
-    public func snapshot() -> MetricsSnapshot {
+    public func snapshot(at date: Date? = nil) -> MetricsSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        let now = Date()
+        let now = date ?? Date()
+        advanceActiveTraceIfNeeded(now: now)
         let hw = QWSystemMetricsSampler.shared.current()
         let busy = QWTelemetryRegistry.shared.value("gpu.busy_ratio")
 
-        // The live rates. The prefill's own rate is only known when the
-        // engine reports the phase's duration, so there is none to show.
-        let livePrefill: Double? = nil
+        let livePrefill: Double? = phase == .prefill && livePrefillTokPerSec > 0 ? livePrefillTokPerSec : nil
         let liveDecode: Double? = phase == .decode && itlDecodeTokPerSec > 0 ? itlDecodeTokPerSec : nil
         let lastPrefill: Double? = lastPrefillTokPerSec > 0 ? lastPrefillTokPerSec : nil
         let lastDecode: Double? = lastDecodeTokPerSec > 0 ? lastDecodeTokPerSec : nil
@@ -718,9 +539,7 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         let avgPrefill: Double? = totalPrefillSeconds > 0 ? totalPrefillComputedTokens / totalPrefillSeconds : nil
         let avgDecode: Double? = totalDecodeSeconds > 0 ? totalDecodeTokens / totalDecodeSeconds : nil
 
-        // What the UI shows: the live rate when there is one, the overall
-        // average when the engine is idle, and the last measurement — marked
-        // stale once it is too old to describe the present — otherwise.
+        // What the UI shows: live rate while running, overall average when idle, or last/stale rate.
         let (displayPrefill, prefillMode) = Self.displayRate(
             live: livePrefill, average: phase == .idle ? avgPrefill : nil, last: lastPrefill,
             sampledAt: lastPrefillSampledAt, now: now, staleAfter: rateStaleAfter)
@@ -732,6 +551,18 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         let hwStale = hwAge > QWTelemetryFreshness.hardwareStaleAfter
         let busyRatio = busy?.value
         let busyStale = busy.map { $0.isStale(now: now, bound: QWTelemetryFreshness.busyRatioStaleAfter) } ?? false
+        let pubPrefill: [Double?]
+        let pubDecode: [Double?]
+        if let livePrefill {
+            pubPrefill = Array((prefillRateSeries + [livePrefill]).suffix(Self.traceWindowCapacity))
+            pubDecode = Array((decodeRateSeries + [nil]).suffix(Self.traceWindowCapacity))
+        } else if let liveDecode {
+            pubPrefill = Array((prefillRateSeries + [nil]).suffix(Self.traceWindowCapacity))
+            pubDecode = Array((decodeRateSeries + [liveDecode]).suffix(Self.traceWindowCapacity))
+        } else {
+            pubPrefill = prefillRateSeries
+            pubDecode = decodeRateSeries
+        }
 
         return MetricsSnapshot(
             cache: .init(
@@ -751,15 +582,13 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
                 displayPrefillTokensPerSec: displayPrefill, displayDecodeTokensPerSec: displayDecode,
                 prefillDisplayMode: prefillMode, decodeDisplayMode: decodeMode,
                 prefillProgressTokens: prefillComputedDone, prefillTotalTokens: prefillComputedTotal,
-                prefillRateSeries: prefillRateSeries, decodeRateSeries: decodeRateSeries,
+                prefillRateSeries: pubPrefill, decodeRateSeries: pubDecode,
                 prefillFromCache: lastTurnPrefillFromCache),
             latency: .init(
                 lastTtftMs: totalRequestsWithTtft > 0 ? lastTtftMs : nil,
                 avgTtftMs: totalRequestsWithTtft > 0 ? totalTtftMs / Double(totalRequestsWithTtft) : nil),
-            context: .init(
-                activeTokens: contextTokensActive, maxTokens: contextTokensMax, sampledAt: contextSampledAt),
-            memory: .init(
-                residentBytes: Self.getResidentMemoryBytes(), arenaReservedBytes: arenaReservedBytes),
+            context: .init(activeTokens: contextTokensActive, maxTokens: contextTokensMax, sampledAt: contextSampledAt),
+            memory: .init(residentBytes: Self.getResidentMemoryBytes(), arenaReservedBytes: arenaReservedBytes),
             hardware: hw, gpuBusyRatio: busyRatio,
             provenance: Self.provenanceMap(
                 livePrefill: livePrefill, liveDecode: liveDecode,
@@ -772,11 +601,13 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
                 busyRatio: busyRatio, busyStale: busyStale,
                 prefillFromCache: lastTurnPrefillFromCache),
             sampledAt: Self.sampledAtMap(
-                liveDecode: liveDecode, lastPrefill: lastPrefill, lastDecode: lastDecode,
+                livePrefill: livePrefill, liveDecode: liveDecode,
+                lastPrefill: lastPrefill, lastDecode: lastDecode,
                 emaPrefill: emaPrefill, emaDecode: emaDecode,
                 avgPrefill: avgPrefill, avgDecode: avgDecode,
                 displayPrefill: displayPrefill, displayDecode: displayDecode,
                 ttft: totalRequestsWithTtft > 0, hw: hw, busy: busy,
+                livePrefillAt: livePrefillSampledAt,
                 lastPrefillAt: lastPrefillSampledAt, lastDecodeAt: lastDecodeSampledAt,
                 lastTurnAt: lastTurnSampledAt, lastTtftAt: lastTtftSampledAt,
                 prefillFromCache: lastTurnPrefillFromCache),

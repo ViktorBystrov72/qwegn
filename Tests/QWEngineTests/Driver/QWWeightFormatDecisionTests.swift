@@ -185,3 +185,9 @@ final class QWWeightFormatDecisionTests: XCTestCase {
         XCTAssertTrue(try reason(quantization, dense, pack: true)!.contains("pack"))
     }
 }
+
+private extension QWEngineDriver {
+    static func familyServes(geometry: QWModelGeometry, mtpDrafts: Int) -> Bool {
+        familyDeclineReason(geometry: geometry, mtpDrafts: mtpDrafts) == nil
+    }
+}

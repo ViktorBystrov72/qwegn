@@ -74,8 +74,10 @@ extension QWHttpServer {
             return
         }
 
+        let shouldStop = generationShouldStop(for: connection)
         let started = Date()
-        let result = try await actor.handleChatCompletion(request: req, onToken: nil)
+        let result = try await actor.handleChatCompletion(request: req, onToken: nil, shouldStop: shouldStop)
+        guard !shouldStop() else { return }
         let elapsedNs = Int64(Date().timeIntervalSince(started) * 1e9)
 
         // The engine's own prefill and decode timings. A timing the

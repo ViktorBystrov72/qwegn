@@ -9,6 +9,10 @@ import QWGDN
 
 /// Activation buffers for one FlashNext layer pass over T tokens (prefill / verify shape). Sized from the layer dims.
 public final class FNGPUScratch {
+    public static let defaultQSAScoreTileRows = max(
+        1,
+        Int(ProcessInfo.processInfo.environment["QW_FN_QSA_TILE_ROWS"] ?? "") ?? 256
+    )
     public var T: Int
     public let maxT: Int, hidden: Int, hc: Int, width: Int
     // PLE and stream
@@ -90,7 +94,7 @@ public final class FNGPUScratch {
         topK = attn?.blockTopK ?? 1
         blocks = attn.map { T / $0.compress } ?? 1
         let maxBlocks = attn.map { max(T, maxCapacity) / max(1, $0.compress) } ?? 1
-        let scoreElems = isPrefill ? max(min(T, 64) * maxBlocks, min(T, 4096) * 2048) : 1
+        let scoreElems = isPrefill ? max(min(T, Self.defaultQSAScoreTileRows) * maxBlocks, min(T, 4096) * 2048) : 1
         src = try f32(isPrefill ? T * bankRows : 1)
         q = try f16(1); k = try f16(1); v = try f16(1); gateF = try f32(1)
         idxQ = try f32(isPrefill ? T * IH * ID : 1); idxK = try f32(1); pooled = try f32(1)

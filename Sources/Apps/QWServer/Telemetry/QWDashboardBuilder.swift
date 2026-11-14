@@ -50,8 +50,10 @@ extension QWDashboardViewModel {
                               knobSources: [String: String] = [:],
                               facts: QWDashboardFacts? = nil,
                               requests: [QWRequestRecord]? = nil,
-                              now: Date = Date()) -> QWDashboardViewModel {
-        let allReadings = readings()
+                              now: Date = Date(),
+                              telemetry: QWEngineTelemetryRegistry = .shared) -> QWDashboardViewModel {
+        let snapshot = telemetry.snapshot(at: now)
+        let allReadings = readings(snapshot: snapshot, now: now)
         let cards = cardSpecs.compactMap { spec -> QWDashboardCard? in
             // A model without the capability has no such card at all: the
             // renderer must not draw a dash for a feature that does not
@@ -61,7 +63,6 @@ extension QWDashboardViewModel {
         }
         // The engine's own phase: a renderer that shows the engine at
         // work reads it here, not from a counter it counts itself.
-        let snapshot = QWEngineTelemetryRegistry.shared.snapshot()
         let generation = QWEngineTelemetryRegistry.EngineInferencePhase(
             rawValue: snapshot.throughput.phase) ?? .idle
         return QWDashboardViewModel(
@@ -104,13 +105,70 @@ extension QWDashboardViewModel {
         .init(id: "latency.ttft_ms", title: "Time to first token", unit: "ms",
               scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.latencyStaleAfter,
               capability: nil),
+        .init(id: "latency.avg_ttft_ms", title: "Avg first-token latency", unit: "ms",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: nil),
+        .init(id: "session.ema_decode_tps", title: "Decode (1m EMA)", unit: "tok/s",
+              scale: 1, digits: 1, staleAfter: QWTelemetryFreshness.rateStaleAfter,
+              capability: nil),
+        .init(id: "session.ema_prefill_tps", title: "Prefill (1m EMA)", unit: "tok/s",
+              scale: 1, digits: 1, staleAfter: QWTelemetryFreshness.rateStaleAfter,
+              capability: nil),
+        .init(id: "session.avg_decode_tps", title: "Decode (session avg)", unit: "tok/s",
+              scale: 1, digits: 1, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: nil),
+        .init(id: "session.avg_prefill_tps", title: "Prefill (session avg)", unit: "tok/s",
+              scale: 1, digits: 1, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: nil),
+        .init(id: "session.tokens_in_total", title: "Prompt tokens", unit: "tok",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: nil),
+        .init(id: "session.tokens_out_total", title: "Generated tokens", unit: "tok",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: nil),
+        .init(id: "prefill.progress_tokens", title: "Prefill progress", unit: "tok",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.rateStaleAfter,
+              capability: nil),
+        .init(id: "prefill.total_tokens", title: "Prefill target", unit: "tok",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.rateStaleAfter,
+              capability: nil),
+        .init(id: "memory.resident_bytes", title: "Resident weights", unit: "GiB",
+              scale: 1_073_741_824, digits: 2, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: nil),
+        .init(id: "memory.arena_reserved_bytes", title: "Metal arena", unit: "GiB",
+              scale: 1_073_741_824, digits: 2, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: nil),
+        .init(id: "decode.cb_per_step", title: "Command buffers / step", unit: "cb",
+              scale: 1, digits: 1, staleAfter: QWTelemetryFreshness.busyRatioStaleAfter,
+              capability: nil),
+        .init(id: "decode.cold_stage_host_us", title: "Cold expert stage", unit: "µs",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.busyRatioStaleAfter,
+              capability: nil),
         .init(id: "cache.warm_bytes", title: "Warm cache", unit: "GiB",
+              scale: 1_073_741_824, digits: 2, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: .prefixCache),
+        .init(id: "cache.warm_limit_bytes", title: "Warm RAM budget", unit: "GiB",
               scale: 1_073_741_824, digits: 2, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
               capability: .prefixCache),
         .init(id: "cache.ssd_bytes", title: "SSD cache", unit: "GiB",
               scale: 1_073_741_824, digits: 2, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
               capability: .prefixCache),
+        .init(id: "cache.ssd_limit_bytes", title: "Cold SSD budget", unit: "GiB",
+              scale: 1_073_741_824, digits: 2, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: .prefixCache),
         .init(id: "cache.tokens_reused_total", title: "Tokens reused", unit: "tok",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: .prefixCache),
+        .init(id: "cache.lookups_total", title: "Cache lookups", unit: "req",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: .prefixCache),
+        .init(id: "cache.hits_warm_total", title: "Warm RAM hits", unit: "hits",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: .prefixCache),
+        .init(id: "cache.hits_ssd_total", title: "Cold SSD hits", unit: "hits",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
+              capability: .prefixCache),
+        .init(id: "cache.evictions_total", title: "Evictions", unit: "evict",
               scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.cacheStaleAfter,
               capability: .prefixCache),
         .init(id: "context.active_tokens", title: "Last turn tokens", unit: "tok",
@@ -136,7 +194,11 @@ extension QWDashboardViewModel {
         let scaled = reading?.number.map { $0 / spec.scale }
         // A reading that is a word is shown as it is; a reading that is
         // a number is formatted.
-        let value = reading?.text ?? scaled.map { format($0, digits: spec.digits) }
+        let value = reading?.text ?? scaled.map {
+            spec.unit == "tok"
+                ? QWTokenCountFormatter.format($0)
+                : format($0, digits: spec.digits)
+        }
         // A word carries no unit: "from cache" is not a number of
         // tokens per second, and "normal" is not a pressure.
         let unit = reading?.text == nil ? spec.unit : nil

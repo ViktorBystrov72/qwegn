@@ -50,3 +50,9 @@ final class QWBF16Tests: XCTestCase {
         XCTAssertEqual(roundTripped, original)
     }
 }
+
+private extension QWBF16 {
+    static func toFloat(_ u16: UInt16) -> Float {
+        Float(bitPattern: UInt32(u16) << 16)
+    }
+}

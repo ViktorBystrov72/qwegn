@@ -324,7 +324,7 @@ kernel void qwg_mla_indexer_score_select(
     device const half*        mlaQFull     [[buffer(0)]],
     device const float*       idxWeights   [[buffer(1)]],
     device const half*        pooledKeys   [[buffer(2)]],
-    device float*             scoreScratch [[buffer(3)]],
+    device atomic_uint*       scoreScratch [[buffer(3)]],
     device int*               blockList    [[buffer(4)]],
     device int*               blockCount   [[buffer(5)]],
     constant MLAIndexerParams& p           [[buffer(6)]],
@@ -370,7 +370,7 @@ kernel void qwg_mla_indexer_score_select(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float scale = rsqrt(float(p.idxDim));
-    device float* rowScores = scoreScratch + (size_t)t * p.scoreStride;
+    device atomic_uint* rowScores = scoreScratch + (size_t)t * p.scoreStride;
 
     for (uint poolIdx = sg; poolIdx < midPools; poolIdx += 8u) {
         const float4 kp = float4(*(device const half4*)(pooledKeys + (size_t)poolIdx * 128u + lane * 4u));
@@ -381,9 +381,10 @@ kernel void qwg_mla_indexer_score_select(
             totalScore = fma(shW[h], max(0.0f, dotVal * scale), totalScore);
         }
         if (lane == 0u) {
-            rowScores[poolIdx] = totalScore;
+            atomic_store_explicit(&rowScores[poolIdx], as_type<uint>(totalScore), memory_order_relaxed);
         }
     }
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     threadgroup_barrier(mem_flags::mem_device);
 
     qwg_mla_select_pools(rowScores, midPools, p.topKPools, dstList, blockCount + t, tid, hist, tgState);

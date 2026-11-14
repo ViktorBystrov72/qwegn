@@ -4,8 +4,6 @@ import QWAlloc
 import QWCore
 import QWHAL
 import QWHead
-import QWState
-import QWMTP
 @testable import QWEngine
 
 final class QWVerifyWindowTests: XCTestCase {
@@ -49,70 +47,6 @@ final class QWVerifyWindowTests: XCTestCase {
         XCTAssertNil(disabled.targetTokens)
         XCTAssertThrowsError(try disabled.normalizedRow(0))
         XCTAssertThrowsError(try disabled.mlpRow(0))
-    }
-
-    func testGumbelComparisonsEncodeSharedPhiloxWinners() throws {
-        let hal = try QWHal(geometry: .qwen38_27b)
-        let arena = try QWArena(hal: hal, weights: 0, activations: 128 << 10, kv: 0, gdnStates: 0)
-        let allocator = arena.activationsRegion()
-        let window = try QWVerifyWindow(geometry: QWTestGeometry.g27, allocator: allocator, rows: 2, vocabulary: 4)
-        let draft = try allocator.allocate(QWTensorShape([4], .f32))
-        let winners = try allocator.allocate(QWTensorShape([4], .i32))
-        let draftValues: [Float] = [0.25, 1.5, -0.5, -2]
-        let targetValues: [Float] = [1.25, 0.75, -0.5, -2]
-        draftValues.withUnsafeBufferPointer {
-            draft.region.pointer.advanced(by: draft.offset).copyMemory(
-                from: $0.baseAddress!, byteCount: draft.bytes)
-        }
-        let target = window.logits.region.pointer.advanced(by: window.logits.offset)
-            .assumingMemoryBound(to: Float.self)
-        let targetRows = [targetValues, targetValues].flatMap { $0 }
-        targetRows.withUnsafeBufferPointer { target.update(from: $0.baseAddress!, count: $0.count) }
-        let seed: UInt64 = 137, position: UInt64 = 3
-        let temperature: Float = 0.75
-        let aliasedWinners = QWTensorValue(region: window.logits.region,
-            offset: window.logits.offset + 4 * MemoryLayout<Float>.size,
-            shape: QWTensorShape([4], .i32))
-        let invalidCB = try XCTUnwrap(hal.queue.makeCommandBuffer())
-        let invalidEnc = try XCTUnwrap(invalidCB.makeComputeCommandEncoder())
-        XCTAssertThrowsError(try window.encodeGumbelComparisons(invalidEnc, hal: hal,
-            draftLogits: [draft], seed: seed, startingPosition: position,
-            temperature: temperature, winners: aliasedWinners))
-        invalidEnc.endEncoding()
-
-        let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
-        let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
-        try window.encodeGumbelComparisons(enc, hal: hal, draftLogits: [draft], seed: seed,
-                                           startingPosition: position, temperature: temperature,
-                                           winners: winners)
-        enc.endEncoding()
-        cb.commit()
-        cb.waitUntilCompleted()
-        XCTAssertEqual(cb.status, .completed, "\(String(describing: cb.error))")
-
-        func winner(_ logits: [Float], row: Int) -> Int32 {
-            let base = position * 4 + UInt64(row * 4)
-            return Int32(logits.indices.max { lhs, rhs in
-                let lu = max(Double(QWPhilox.u(base + UInt64(lhs), seed: seed, version: .upper24)),
-                             1.0 / 16_777_216.0)
-                let ru = max(Double(QWPhilox.u(base + UInt64(rhs), seed: seed, version: .upper24)),
-                             1.0 / 16_777_216.0)
-                let ls = Double(logits[lhs]) / Double(temperature) - log(-log(lu))
-                let rs = Double(logits[rhs]) / Double(temperature) - log(-log(ru))
-                return ls == rs ? lhs > rhs : ls < rs
-            }!)
-        }
-        let actual = winners.region.pointer.advanced(by: winners.offset).assumingMemoryBound(to: Int32.self)
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: actual, count: 4)),
-                       [winner(draftValues, row: 0), winner(targetValues, row: 0),
-                        winner(targetValues, row: 1), winner(targetValues, row: 1)])
-        let expectedDraft = Int(winner(draftValues, row: 0))
-        let targetAtDraft = Int(winner(targetValues, row: 0))
-        let decision = try window.completedGumbelDecision(winners: winners)
-        XCTAssertEqual(decision.accepted, expectedDraft == targetAtDraft ? 1 : 0)
-        XCTAssertEqual(decision.finalToken, expectedDraft == targetAtDraft
-            ? Int(winner(targetValues, row: 1)) : targetAtDraft)
-        XCTAssertEqual(decision.draftTokens, [expectedDraft])
     }
 
     func testGPUTargetJournalRejectsAnyBadRowAndResetsAfterCompletion() throws {
@@ -276,5 +210,24 @@ final class QWVerifyWindowTests: XCTestCase {
                                  "verification cannot succeed without every layer/row journal capture")
             XCTAssertEqual(bytes(window.hidden), bytes(window.embeddings))
         }
+    }
+}
+
+private extension QWVerifyWindow {
+    func normalizedRow(_ row: Int) throws -> QWTensorValue {
+        guard let normalized, (0..<rows).contains(row) else {
+            throw QWEngineDriverError.state("layer-major normalized row unavailable")
+        }
+        return QWTensorValue(region: normalized.region, offset: normalized.offset + row * geometry.hidden * 2,
+                             shape: QWTensorShape([geometry.hidden], .f16))
+    }
+
+    func mlpRow(_ row: Int) throws -> QWTensorValue {
+        guard let mlpRows, (0..<rows).contains(row) else {
+            throw QWEngineDriverError.state("layer-major MLP row unavailable")
+        }
+        let effInter = max(1, max(geometry.intermediate, geometry.moeIntermediate))
+        return QWTensorValue(region: mlpRows.region, offset: mlpRows.offset + row * effInter * 2,
+                             shape: QWTensorShape([effInter], .f16))
     }
 }

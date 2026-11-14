@@ -5,6 +5,7 @@
 // Stage 2 (qwg_qsa_topk_radix): unbounded O(1)-register 4-pass radix top-512 by (score desc, index desc), ascending list.
 #include <metal_stdlib>
 #include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
 #include "include/qw_geometry_constants.metalh"
 using namespace metal;
 
@@ -229,7 +230,7 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
                                uint t   [[threadgroup_position_in_grid]],
                                uint tid [[thread_index_in_threadgroup]]) {
     threadgroup uint hist[256];
-    threadgroup uint chunkMax[260];
+    threadgroup uint chunkMax[516];
     threadgroup uint sgSum[8];
     threadgroup uint scanSum[8];
     threadgroup uint rankCnt[128];
@@ -246,10 +247,10 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
     }
     const uint sg = tid >> 5u, lane = tid & 31u;
     const uint numChunks = (n + 255u) >> 8u;
-    const bool trackChunkMax = (T <= 8u) && (numChunks > 16u);
+    const bool trackChunkMax = (numChunks > 16u);
     device const uint* rowScores = scores + t * scoreStride;
     if (trackChunkMax) {
-        for (uint i = tid; i < 260u; i += 256u) chunkMax[i] = 0u;
+        for (uint i = tid; i < 516u; i += 256u) chunkMax[i] = 0u;
     }
     if (tid == 0u) greaterAccum = 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -340,10 +341,10 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
             hist[tid] = 0u;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint s = 0u; s < numChunks; s++) {
-                if (trackChunkMax && pass > 0u && s < 260u && chunkMax[s] < threshU) continue;
+                if (trackChunkMax && pass > 0u && s < 516u && chunkMax[s] < threshU) continue;
                 const uint b = (s << 8u) + tid;
                 const uint u = (b < n) ? rowScores[b] : 0u;
-                if (trackChunkMax && pass == 0u && s < 260u) {
+                if (trackChunkMax && pass == 0u && s < 516u) {
                     const uint sgMax = simd_max(u);
                     if (lane == 0u && sgMax != 0u) {
                         atomic_fetch_max_explicit((threadgroup atomic_uint*)&chunkMax[s], sgMax, memory_order_relaxed);
@@ -372,7 +373,7 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
     uint outCount = 0u;
     if (skipTies == 0u) {
         for (uint s = 0u; s < numChunks; s++) {
-            if (trackChunkMax && s < 260u && chunkMax[s] < threshU) continue;
+            if (trackChunkMax && s < 516u && chunkMax[s] < threshU) continue;
             const uint b = (s << 8u) + tid;
             const uint u = (b < n) ? rowScores[b] : 0u;
             const uint sel = (b < n && u >= threshU) ? 1u : 0u;
@@ -393,7 +394,7 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
         }
     } else {
         for (uint s = 0u; s < numChunks; s++) {
-            if (trackChunkMax && s < 260u && chunkMax[s] < threshU) continue;
+            if (trackChunkMax && s < 516u && chunkMax[s] < threshU) continue;
             const uint b = (s << 8u) + tid;
             const uint u = (b < n) ? rowScores[b] : 0u;
             const uint isTie = (b < n && u == threshU) ? 1u : 0u;
@@ -421,6 +422,114 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
             threadgroup_barrier(mem_flags::mem_threadgroup);
             outCount += chunkSel;
             if (outCount >= kEff) break;
+        }
+    }
+}
+
+// Stage 1C — qwg_qsa_scores_mat: 2D grid (ceil(maxBlocks / 64), ceil(T / 16)), tpg = 256.
+// Tiles idxQ[16, 128] x pooled[64, 128]^T with simdgroup_half8x8 -> float8x8 across 4 heads.
+kernel void qwg_qsa_scores_mat(device const float* idxQ        [[buffer(0)]],
+                               device const half*  pooled      [[buffer(1)]],
+                               device uint*        scores      [[buffer(2)]],
+                               constant uint&      T           [[buffer(3)]],
+                               constant uint&      topK        [[buffer(4)]],
+                               constant uint&      pos0        [[buffer(5)]],
+                               constant uint&      scoreStride [[buffer(6)]],
+                               uint2 tg  [[threadgroup_position_in_grid]],
+                               uint  tid [[thread_index_in_threadgroup]],
+                               uint  sgi [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint BM = 16u, BN = 64u, DI = 128u, NI = 4u, LDK = 136u;
+    const uint tBase = tg.y * BM;
+    if (tBase >= T) return;
+    const uint tMax = min(tBase + BM - 1u, T - 1u);
+    const uint nMax = (tMax + pos0 + 1u) / 4u;
+    if (nMax <= topK) return;
+    const uint bBase = tg.x * BN;
+    if (bBase >= nMax) return;
+
+    threadgroup half  shK[BN * LDK];
+    threadgroup half  shQ[BM * LDK];
+    threadgroup float shScore[BM * BN];
+
+    for (uint i = tid; i < BN * (DI / 4u); i += 256u) {
+        const uint blk = i >> 5u;
+        const uint d4  = i & 31u;
+        const uint gb  = bBase + blk;
+        const half4 kv = (gb < nMax)
+            ? *((device const half4*)(pooled + uint64_t(gb) * DI) + d4)
+            : half4(0.0h);
+        *((threadgroup half4*)(shK + blk * LDK) + d4) = kv;
+    }
+
+    float myScore[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint nOff = sgi * 8u;
+    const uint r = tid >> 5u;
+    const uint d4 = tid & 31u;
+    const uint gtLoad = tBase + r;
+    const uint d4Hi = d4;
+    for (uint h = 0u; h < NI; h++) {
+        // Dual-half Q split keeps ~22-bit mantissa precision while driving 4x-rate half8x8 MMA.
+        simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        float4 qf0 = float4(0.0f), qf1 = float4(0.0f);
+        if (gtLoad < T) {
+            qf0 = *((device const float4*)(idxQ + (uint64_t(gtLoad) * NI + h) * DI) + d4Hi);
+        }
+        if (gtLoad + 8u < T) {
+            qf1 = *((device const float4*)(idxQ + (uint64_t(gtLoad + 8u) * NI + h) * DI) + d4Hi);
+        }
+        const half4 qHi0 = half4(qf0), qHi1 = half4(qf1);
+        *((threadgroup half4*)(shQ + r * LDK) + d4Hi) = qHi0;
+        *((threadgroup half4*)(shQ + (r + 8u) * LDK) + d4Hi) = qHi1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint k0 = 0u; k0 < DI; k0 += 8u) {
+            simdgroup_half8x8 a0, a1, b;
+            simdgroup_load(a0, shQ + 0u * LDK + k0, LDK, ulong2(0, 0), false);
+            simdgroup_load(a1, shQ + 8u * LDK + k0, LDK, ulong2(0, 0), false);
+            simdgroup_load(b, shK + nOff * LDK + k0, LDK, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc0, a0, b, acc0);
+            simdgroup_multiply_accumulate(acc1, a1, b, acc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        *((threadgroup half4*)(shQ + r * LDK) + d4Hi) = half4(qf0 - float4(qHi0));
+        *((threadgroup half4*)(shQ + (r + 8u) * LDK) + d4Hi) = half4(qf1 - float4(qHi1));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint k0 = 0u; k0 < DI; k0 += 8u) {
+            simdgroup_half8x8 a0, a1, b;
+            simdgroup_load(a0, shQ + 0u * LDK + k0, LDK, ulong2(0, 0), false);
+            simdgroup_load(a1, shQ + 8u * LDK + k0, LDK, ulong2(0, 0), false);
+            simdgroup_load(b, shK + nOff * LDK + k0, LDK, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc0, a0, b, acc0);
+            simdgroup_multiply_accumulate(acc1, a1, b, acc1);
+        }
+        simdgroup_store(acc0, shScore + 0u * BN + nOff, BN, ulong2(0, 0), false);
+        simdgroup_store(acc1, shScore + 8u * BN + nOff, BN, ulong2(0, 0), false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint u = 0u; u < 4u; u++) {
+            myScore[u] += max(shScore[tid + u * 256u], 0.0f);
+        }
+    }
+
+    const float invSqrtD = rsqrt(float(DI));
+    #pragma unroll
+    for (uint u = 0u; u < 4u; u++) {
+        const uint idx = tid + u * 256u;
+        const uint r   = idx >> 6u;
+        const uint c   = idx & 63u;
+        const uint gt  = tBase + r;
+        const uint gb  = bBase + c;
+        if (gt < T) {
+            const uint n = (gt + pos0 + 1u) / 4u;
+            if (n > topK && gb < n) {
+                scores[uint64_t(gt) * scoreStride + gb] = as_type<uint>((myScore[u] * invSqrtD) + 0.0f);
+            }
         }
     }
 }

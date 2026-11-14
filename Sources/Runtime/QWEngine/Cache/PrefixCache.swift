@@ -15,7 +15,6 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
-import QWState
 
 enum QWCacheIO {
     static func attempt<T>(
@@ -155,9 +154,9 @@ extension QWEngineDriver {
         }
         let session = try admitSession(promptTokens: prompt.count, prefix: value.prefix)
         if resolvedHit.tokenCount == prompt.count {
-            value.logits.withUnsafeBytes {
+            value.logits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 sc.logits.region.pointer.advanced(by: sc.logits.offset)
-                    .copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+                    .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
             }
             sc.token.region.pointer.advanced(by: sc.token.offset)
                 .assumingMemoryBound(to: Int32.self).pointee = Int32(value.nextToken)
@@ -304,7 +303,12 @@ extension QWEngineDriver {
                 unconditionedFirst = cached
                 first = try selectConstrainedToken(session: session, rawArgmax: cached)
                 session.roundRecord.pendingToken = first
+                activePrefillProgress?(0, 0)
             } else {
+                activePrefillBasePosition = loaded.matched
+                let computedTotal = max(0, prompt.count - loaded.matched)
+                activePrefillTotalTokens = computedTotal
+                activePrefillProgress?(0, computedTotal)
                 if loaded.matched > 0 {
                     // Reserve COW for the entire suffix before its first GPU
                     // chunk; retrying a partially completed prefill is forbidden.

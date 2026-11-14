@@ -85,11 +85,18 @@ final class FlashNextModuleTests: XCTestCase {
                                                  repetitionPenalty: 4.0), 3)
     }
 
+    private static func readEngineSources() throws -> String {
+        try [
+            "Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift",
+            "Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine+Seam.swift",
+        ].map {
+            try String(contentsOf: Self.repoRoot.appendingPathComponent($0), encoding: .utf8)
+        }.joined(separator: "\n")
+    }
+
     func testFlashNextHasNoTokenLoopOfItsOwn() throws {
         // C2: one token loop. FN's private loop is gone; the core drives it.
-        let source = try String(contentsOf: Self.repoRoot
-            .appendingPathComponent("Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift"),
-            encoding: .utf8)
+        let source = try Self.readEngineSources()
         XCTAssertFalse(source.contains("func generate"),
                        "FN must call the core's loop, not keep one of its own")
         XCTAssertFalse(source.contains("while generated.count < maxNew"),
@@ -99,9 +106,7 @@ final class FlashNextModuleTests: XCTestCase {
     func testFlashNextHasNoGlobalStateResetLeftInTheEngine() throws {
         // C5: one session model. The recurrent state belongs to the session,
         // not to a global operation the engine runs on every request.
-        let source = try String(contentsOf: Self.repoRoot
-            .appendingPathComponent("Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift"),
-            encoding: .utf8)
+        let source = try Self.readEngineSources()
         XCTAssertFalse(source.contains("resetState"),
                        "the global reset must not stay in the engine")
     }
@@ -120,9 +125,7 @@ final class FlashNextModuleTests: XCTestCase {
 
     func testFlashNextHasNoSamplerOfItsOwn() throws {
         // FN must go through the shared sampler, not a private top-k/top-p.
-        let engine = try String(contentsOf: Self.repoRoot
-            .appendingPathComponent("Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift"),
-            encoding: .utf8)
+        let engine = try Self.readEngineSources()
         XCTAssertFalse(engine.contains("func sampleToken("),
                        "FN must use the shared sampler, not its own")
         XCTAssertFalse(engine.contains("func sampleTopKTopP("),
@@ -137,21 +140,6 @@ final class FlashNextModuleTests: XCTestCase {
                       "the session must be handed the shared sampler")
         XCTAssertTrue(engine.contains("sampler: QWSampler"),
                       "the engine's sampler must be the shared one")
-    }
-
-    func testAModuleThatCannotSampleRefusesRatherThanAnsweringWithZeros() throws {
-        // The seam hands the shared sampler a row; a module that cannot
-        // sample has no row to give. A row of zeros is not "unavailable".
-        let plan = try QWEnginePlan(geometry: QWModelGeometry.qwen38_27b, modelId: "toy",
-                                    geometryDigest: "d", prefillChunkRows: 512,
-                                    kvStorageMode: "f16")
-        let module = LoopToyModule(plan: plan)
-        let state = try module.makeSessionState()
-        XCTAssertThrowsError(try module.sampleLogits(state)) { error in
-            guard case QWModuleError.notImplemented = error else {
-                return XCTFail("expected notImplemented, got \(error)")
-            }
-        }
     }
 
     func testTheSharedEntryPointAdvancesTheDrawCounter() throws {
@@ -270,11 +258,6 @@ final class FlashNextModuleTests: XCTestCase {
         let module = FlashNextModule(plan: try flashNextPlan())
         // A module with no engine must not pretend to serve.
         XCTAssertThrowsError(try module.makeSessionState()) { error in
-            guard case QWModuleError.notImplemented = error else {
-                return XCTFail("expected notImplemented, got \(error)")
-            }
-        }
-        XCTAssertThrowsError(try module.sampleLogits(DummyState())) { error in
             guard case QWModuleError.notImplemented = error else {
                 return XCTFail("expected notImplemented, got \(error)")
             }

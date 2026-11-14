@@ -45,21 +45,6 @@ public struct QWTelemetryValue: Sendable, Codable, Equatable {
         return now.timeIntervalSince(sampledAt) > bound
     }
 
-    /// A directly measured reading.
-    public static func measured(_ v: Double, at: Date = Date()) -> QWTelemetryValue {
-        .init(value: v, provenance: .measured, sampledAt: at, reason: nil)
-    }
-
-    /// A reading computed from other readings.
-    public static func derived(_ v: Double, at: Date = Date()) -> QWTelemetryValue {
-        .init(value: v, provenance: .derived, sampledAt: at, reason: nil)
-    }
-
-    /// An approximation, not a measurement.
-    public static func estimated(_ v: Double, at: Date = Date()) -> QWTelemetryValue {
-        .init(value: v, provenance: .estimated, sampledAt: at, reason: nil)
-    }
-
     /// No reading, and the reason there is none.
     public static func unavailable(_ reason: String) -> QWTelemetryValue {
         .init(value: nil, provenance: .unavailable, sampledAt: nil, reason: reason)

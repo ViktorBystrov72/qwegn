@@ -49,6 +49,8 @@ final class FNNgramShardRowsRealTableTests: XCTestCase {
     }
 
     func testBothPathsReturnTheSameRows() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != nil,
+                      "Local ~/.qwg/models pack check skipped on GitHub Actions")
         guard let assets = Self.assets() else {
             throw XCTSkip("the real n-gram table is not on this machine")
         }

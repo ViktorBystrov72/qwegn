@@ -49,11 +49,6 @@ public enum QWSHVQBlock {
         "SHVQ\(bits)_G\(group)"
     }
 
-    /// Effective bits per weight including the 2-byte `f16` scale header.
-    public static func bitsPerWeight(bits: Int, group: Int) -> Double {
-        Double(bytes(bits: bits, group: group) * 8) / Double(group)
-    }
-
     /// Reads the little-endian `f16` group scale widened to `Float`.
     @inline(__always)
     public static func scale(_ bytes: UnsafeRawBufferPointer) -> Float {
