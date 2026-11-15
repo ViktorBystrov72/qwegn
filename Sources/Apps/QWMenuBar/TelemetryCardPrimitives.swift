@@ -212,6 +212,22 @@ extension CupertinoTelemetryView {
             .clipShape(.rect(cornerRadius: TelemetryTheme.Radius.small))
     }
 
+    func marqueeFactPill(_ text: String, tint: Color, help: String? = nil) -> some View {
+        MarqueeText(
+            text: text,
+            fontSize: 10.5,
+            weight: .medium,
+            nsWeight: .medium,
+            color: tint,
+            shrinksToFit: true
+        )
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(tint.opacity(0.12))
+        .clipShape(.rect(cornerRadius: TelemetryTheme.Radius.small))
+        .help(help ?? text)
+    }
+
     func legendChip(_ title: String, color: Color) -> some View {
         HStack(spacing: 4) {
             Circle().fill(color).frame(width: 6, height: 6)

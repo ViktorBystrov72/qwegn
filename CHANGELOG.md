@@ -10,6 +10,23 @@ The single source of the version is `QWVersion.current` in
 
 ## [Unreleased]
 
+## [0.21.5] - 2026-11-15
+
+### Fixed
+- **Menu Bar Popover Concentric Outer Margin & Inter-Card Spacing (`CupertinoTelemetryView`, `TelemetryCards`)**: Placed `.frame(width: 420)` strictly before `.padding(10)` inside `.frame(width: 440).clipped()` with uniform `8pt` inter-card and dock spacing (`GlassEffectContainer(spacing: 8)`, `VStack(spacing: 8)`, `footerDock` `HStack(spacing: 8)` without extra `.padding(.top, 2)`), eliminating the doubled `28pt` left/right outer border (`56pt` wasted width) caused by nested `.padding(.horizontal, 14)` inside `.frame(width: 412)` and restoring `+36pt` of usable card width (`384pt` → `420pt`) with flush right-edge `headerSection` alignment (`.padding(.leading, 2)`).
+
+### Added
+- **Popover Outer Margin Regression Gates (`MenuBarRendererParityTests`, `QWMenuBarUITests`)**: Enforced modifier ordering (`.frame(width: 420)` strictly preceding `.padding(10)` plus `.clipped()`) in `MenuBarRendererParityTests`, and added `QWMenuBarUITests.testCupertinoTelemetryViewUsesConcentric10PtOuterMargin()` scanning a `2×` offscreen raster (`880px` wide) to verify symmetric `8.5..13.0pt` left/right card gutters.
+
+## [0.21.4] - 2026-11-15
+
+### Fixed
+- **Menu Bar Popover Horizontal Overflow & Long Model Name Marquee (`CupertinoTelemetryView`, `TelemetryCards`, `TelemetryCardPrimitives`, `MarqueeText`)**: Clamped `CupertinoTelemetryView`'s inner stack to `412pt` (`440pt` outer container with `.clipped()`) and preserved right-hand action clusters (`Restart`/`Stop`, `Switch`/`Unload`) via `.fixedSize(horizontal: true, vertical: false).layoutPriority(1)`, preventing long quantization badges (`HQ8_G32+ExpSHVQ15_G64/SHVQ3_G64 (native, GPU)`) and model names (`ERNIE-5.5-Flash-Base-hq8g32-shvq15g64-shvq3g64`) from expanding and clipping left/right popover edges; added reusable `MarqueeText` (`MarqueeSlotLayout` + `MarqueeMath` + `ViewThatFits`) so overflowing model names and quantization pills scroll continuously inside their fixed slot with `1.4 s` initial hold, seamless wrap, edge fade masks, `@Environment(\.accessibilityReduceMotion)` fallback, and zero animation resets across `1 Hz` telemetry ticks while staying static when text fits.
+- **WebUI `/ui` Hero Title Containment & Marquee Parity (`css/base.css`, `js/dashboard.js`, `js/actions.js`)**: Constrained `.hero-top` left metadata with `min-width: 0`, added `.hero-model-marquee` / `@keyframes qwg-hero-marquee` (`prefers-reduced-motion` safe) with bounded `.hero-quant-pill`, and guarded `#hero-model-title` DOM reconstruction via `dataset.sig` so long model IDs scroll cleanly without horizontal page overflow or `1 Hz` SSE animation restarts.
+
+### Added
+- **Popover Width & Marquee Regression Tests (`QWMenuBarUITests`, `MenuBarRendererParityTests`, `DashboardRendererParityTests`)**: Added `NSHostingView` `440.0 ± 0.5 pt` layout-width enforcement under overflowing ERNIE-5.5 model/quantization fixtures, deterministic `MarqueeMath` hold/scroll/wrap tests, and source/parity assertions across SwiftUI and WebUI assets.
+
 ## [0.21.3] - 2026-11-14
 
 ### Changed

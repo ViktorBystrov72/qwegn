@@ -252,17 +252,56 @@ html, body {
   gap: 16px;
   flex-wrap: wrap;
 }
+.hero-top > div:first-child {
+  min-width: 0;
+  flex: 1 1 320px;
+}
 h1#hero-model-title {
   margin: 4px 0 6px;
   font-size: 21px;
-  line-height: 1.2;
+  line-height: 1.25;
   font-weight: 700;
   letter-spacing: -0.02em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
 }
-.hero-quant-pill {
+.hero-model-marquee {
+  position: relative;
+  overflow: hidden;
+  min-width: 0;
+  flex: 0 1 auto;
+  max-width: 100%;
+  white-space: nowrap;
+}
+.hero-model-marquee.is-scrolling {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 12px, #000 calc(100% - 14px), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 12px, #000 calc(100% - 14px), transparent);
+}
+.hero-model-track {
   display: inline-flex;
   align-items: center;
-  margin-left: 8px;
+  gap: 32px;
+  white-space: nowrap;
+}
+.hero-model-marquee.is-scrolling .hero-model-track {
+  will-change: transform;
+  animation: qwg-hero-marquee var(--marquee-duration, 10s) linear infinite;
+}
+@keyframes qwg-hero-marquee {
+  0%, 16% { transform: translateX(0); }
+  100% { transform: translateX(var(--marquee-shift, 0px)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-model-marquee { text-overflow: ellipsis; }
+  .hero-model-marquee.is-scrolling { -webkit-mask-image: none; mask-image: none; }
+  .hero-model-marquee.is-scrolling .hero-model-track { animation: none; }
+  .hero-model-marquee.is-scrolling .hero-model-copy[aria-hidden="true"] { display: none; }
+}
+.hero-quant-pill {
+  display: inline-block;
   padding: 2px 9px;
   border-radius: 999px;
   background: var(--bg-subtle);
@@ -270,8 +309,14 @@ h1#hero-model-title {
   color: var(--ink-secondary);
   font-weight: 500;
   font-size: 12px;
-  vertical-align: middle;
+  line-height: 1.4;
   letter-spacing: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .hero-meta {
   display: flex;
@@ -286,6 +331,7 @@ h1#hero-model-title {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  flex: 0 0 auto;
 }
 .facts-grid {
   margin-top: 14px;

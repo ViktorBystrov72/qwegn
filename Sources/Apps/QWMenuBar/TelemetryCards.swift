@@ -49,8 +49,7 @@ extension CupertinoTelemetryView {
                         .lineLimit(1)
                 }
             }
-
-            Spacer(minLength: 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 6) {
                 if isRunning {
@@ -87,8 +86,10 @@ extension CupertinoTelemetryView {
                     }
                 }
             }
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(1)
         }
-        .padding(.horizontal, 2)
+        .padding(.leading, 2)
     }
 
     // MARK: - Resident Model Card
@@ -107,11 +108,13 @@ extension CupertinoTelemetryView {
                         .font(TelemetryTheme.ui(10, .semibold))
                         .tracking(0.4)
                         .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                    Text(modelName ?? (telemetry.isConnected ? "No model loaded" : "—"))
-                        .font(TelemetryTheme.ui(13, .semibold))
-                        .foregroundStyle(TelemetryTheme.primary(increasedContrast: contrast == .increased))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    MarqueeText(
+                        text: modelName ?? (telemetry.isConnected ? "No model loaded" : "—"),
+                        fontSize: 13,
+                        weight: .semibold,
+                        nsWeight: .semibold,
+                        color: TelemetryTheme.primary(increasedContrast: contrast == .increased)
+                    )
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -142,17 +145,26 @@ extension CupertinoTelemetryView {
                         .help(loadAction.reason ?? "Load active model into memory")
                     }
                 }
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
             }
 
             if telemetry.isModelLoaded, !traits.isEmpty {
                 HStack(spacing: 5) {
                     ForEach(traits, id: \.text) { trait in
-                        factPill(trait.text, tint: trait.tint)
-                            .fixedSize(horizontal: true, vertical: false)
-                            .help(trait.help ?? trait.text)
+                        if trait.allowsCompression {
+                            marqueeFactPill(trait.text, tint: trait.tint, help: trait.help)
+                                .layoutPriority(1)
+                        } else {
+                            factPill(trait.text, tint: trait.tint)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .layoutPriority(2)
+                                .help(trait.help ?? trait.text)
+                        }
                     }
                     Spacer(minLength: 0)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .padding(.horizontal, 12)
@@ -169,6 +181,7 @@ extension CupertinoTelemetryView {
         let text: String
         let tint: Color
         let help: String?
+        let allowsCompression: Bool
     }
 
     private var residentTraitPills: [TraitPill] {
@@ -177,21 +190,21 @@ extension CupertinoTelemetryView {
 
         if let q = dashboard.facts?.quantization, !q.isEmpty {
             let cleanQ = q.replacingOccurrences(of: " (online GPU)", with: "")
-            pills.append(TraitPill(text: cleanQ, tint: TelemetryTheme.accent, help: q))
+            pills.append(TraitPill(text: cleanQ, tint: TelemetryTheme.accent, help: q, allowsCompression: true))
         }
         if let kv = dashboard.knobs["kvMode"]?.stringValue, !kv.isEmpty {
-            pills.append(TraitPill(text: "KV \(kv.uppercased())", tint: TelemetryTheme.neutral, help: "KV cache format"))
+            pills.append(TraitPill(text: "KV \(kv.uppercased())", tint: TelemetryTheme.neutral, help: "KV cache format", allowsCompression: false))
         }
         if let budget = telemetry.contextBudget, budget > 0 {
             let compact = QWMenuBarStatusFormatter.formatCompactBudget(budget)
-            pills.append(TraitPill(text: "\(compact) ctx", tint: TelemetryTheme.neutral, help: "Context budget"))
+            pills.append(TraitPill(text: "\(compact) ctx", tint: TelemetryTheme.neutral, help: "Context budget", allowsCompression: false))
         }
         let specEnabled = dashboard.knobs["speculativeEnabled"]?.boolValue ?? true
         if specEnabled, let drafts = dashboard.knobs["mtpDrafts"]?.intValue, drafts > 0 {
-            pills.append(TraitPill(text: "Spec ×\(drafts)", tint: TelemetryTheme.prefill, help: "Speculative draft tokens"))
+            pills.append(TraitPill(text: "Spec ×\(drafts)", tint: TelemetryTheme.prefill, help: "Speculative draft tokens", allowsCompression: false))
         }
         if let memPack = dashboard.facts?.mountedMemoryPack, !memPack.isEmpty {
-            pills.append(TraitPill(text: "MemPack", tint: TelemetryTheme.cool, help: memPack))
+            pills.append(TraitPill(text: "MemPack", tint: TelemetryTheme.cool, help: memPack, allowsCompression: false))
         }
         return pills
     }
@@ -446,13 +459,12 @@ extension CupertinoTelemetryView {
     // MARK: - Symmetric Footer Dock
 
     var footerDock: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             dockButton(title: "Web UI", icon: "globe", shortcut: "⌘D", action: onOpenWebUI)
             dockButton(title: "Logs", icon: "doc.text.magnifyingglass", shortcut: "⌘L", action: onOpenLogs)
             dockButton(title: "Settings", icon: "slider.horizontal.3", shortcut: "⌘,", action: onOpenSettings)
             dockButton(title: "Quit", icon: "power", shortcut: "⌘Q", isDestructive: true, action: onQuit)
         }
-        .padding(.top, 2)
     }
 
     // MARK: - Card & Control Builders

@@ -436,6 +436,37 @@ function renderContext(model) {
   if (bar) bar.style.width = `${filled}%`;
 }
 
+function syncHeroTitleMarquee() {
+  const viewport = document.querySelector("#hero-model-title .hero-model-marquee");
+  if (!viewport) return;
+  const track = viewport.querySelector(".hero-model-track");
+  const primary = track ? track.querySelector(".hero-model-copy") : null;
+  if (!track || !primary) return;
+
+  const extraCopy = track.querySelector('.hero-model-copy[aria-hidden="true"]');
+  const availableWidth = viewport.clientWidth;
+  const textWidth = primary.getBoundingClientRect().width;
+  if (availableWidth > 0 && textWidth > availableWidth + 2) {
+    if (!extraCopy) {
+      const clone = document.createElement("span");
+      clone.className = "hero-model-copy";
+      clone.setAttribute("aria-hidden", "true");
+      clone.textContent = primary.textContent;
+      track.appendChild(clone);
+    }
+    const shiftDistance = Math.ceil(textWidth + 32);
+    const durationSec = Math.max(4.5, Math.round(((shiftDistance / 36) / 0.84) * 10) / 10);
+    viewport.style.setProperty("--marquee-shift", `-${shiftDistance}px`);
+    viewport.style.setProperty("--marquee-duration", `${durationSec}s`);
+    viewport.classList.add("is-scrolling");
+  } else {
+    if (extraCopy) extraCopy.remove();
+    viewport.style.removeProperty("--marquee-shift");
+    viewport.style.removeProperty("--marquee-duration");
+    viewport.classList.remove("is-scrolling");
+  }
+}
+
 function renderFacts(model) {
   const facts = model.facts || {};
   const setText = (id, val) => {
@@ -458,10 +489,17 @@ function renderFacts(model) {
   if (title) {
     if (model.modelId) {
       const cleanQuant = String(facts.quantization || "").replace(/^\((.*)\)$/, "$1");
-      title.innerHTML = cleanQuant
-        ? `${escapeHtml(model.modelId)}<span class="hero-quant-pill mono">${escapeHtml(cleanQuant)}</span>`
-        : escapeHtml(model.modelId);
+      const sig = `${model.modelId}\n${cleanQuant}`;
+      if (title.dataset.sig !== sig) {
+        title.dataset.sig = sig;
+        const modelHtml = `<span class="hero-model-marquee" title="${escapeHtml(model.modelId)}"><span class="hero-model-track"><span class="hero-model-copy">${escapeHtml(model.modelId)}</span></span></span>`;
+        title.innerHTML = cleanQuant
+          ? `${modelHtml}<span class="hero-quant-pill mono" title="${escapeHtml(cleanQuant)}">${escapeHtml(cleanQuant)}</span>`
+          : modelHtml;
+      }
+      requestAnimationFrame(syncHeroTitleMarquee);
     } else {
+      delete title.dataset.sig;
       title.textContent = "—";
     }
   }
@@ -544,6 +582,7 @@ function renderDisconnected() {
                     "ctx-used-chip", "radial-ctx-label"]) {
     const el = document.getElementById(id);
     if (el) el.textContent = "—";
+    if (id === "hero-model-title" && el && el.dataset) delete el.dataset.sig;
   }
   const budget = document.getElementById("ftr-context-budget");
   if (budget) budget.textContent = "Context: —";

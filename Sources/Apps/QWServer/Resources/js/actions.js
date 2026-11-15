@@ -467,6 +467,7 @@ if (typeof window !== "undefined") {
     if (tabParam) switchTab(tabParam, false);
 
     wireSparklineHover();
+    window.addEventListener("resize", syncHeroTitleMarquee);
     fetchDashboard();
     initMetricsStream();
     fetchEngineInfo();

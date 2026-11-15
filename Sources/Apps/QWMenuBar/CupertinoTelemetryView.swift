@@ -37,8 +37,8 @@ public struct CupertinoTelemetryView: View {
             SystemVibrancyView()
                 .ignoresSafeArea()
 
-            GlassEffectContainer(spacing: 10) {
-                VStack(spacing: 10) {
+            GlassEffectContainer(spacing: 8) {
+                VStack(spacing: 8) {
                     headerSection
                     failureBanner
                     loadedWeightsCard
@@ -46,13 +46,13 @@ public struct CupertinoTelemetryView: View {
                     memoryAndSystemCard
                     footerDock
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
-                .frame(maxWidth: .infinity)
+                .frame(width: 420)
+                .padding(10)
                 .tint(.clear)
             }
         }
         .frame(width: 440)
+        .clipped()
         .fixedSize(horizontal: false, vertical: true)
     }
 

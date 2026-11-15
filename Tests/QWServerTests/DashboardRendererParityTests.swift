@@ -529,6 +529,27 @@ final class DashboardRendererParityTests: XCTestCase {
         XCTAssertEqual((gapAttrs["sparkline-series-b-path"] as? [String: Any])?["d"] as? String, "")
     }
 
+    func testHeroModelTitlePreservesMarqueeAcrossTelemetryTicksAndContainsOverflow() throws {
+        let styles = try styles()
+        let script = try script()
+
+        XCTAssertTrue(styles.contains(".hero-model-marquee"))
+        XCTAssertTrue(styles.contains("@keyframes qwg-hero-marquee"))
+        XCTAssertTrue(styles.contains("@media (prefers-reduced-motion: reduce)"))
+        XCTAssertTrue(styles.contains(".hero-top > div:first-child"))
+        XCTAssertTrue(styles.contains("min-width: 0"))
+
+        let factsFn = try XCTUnwrap(Self.function("renderFacts", in: script), "missing renderFacts")
+        XCTAssertTrue(factsFn.contains("dataset.sig"),
+                      "hero title must keep its signature so 1Hz ticks do not restart running text")
+        XCTAssertTrue(factsFn.contains("hero-model-marquee"))
+        XCTAssertTrue(factsFn.contains("syncHeroTitleMarquee"))
+
+        let disconnectFn = try XCTUnwrap(Self.function("renderDisconnected", in: script))
+        XCTAssertTrue(disconnectFn.contains("dataset.sig"),
+                      "disconnect must clear hero signature so reconnect re-renders cleanly")
+    }
+
     private static func rawLoopbackHTTP(port: UInt16, requestLine: String) -> String {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return "" }

@@ -13,7 +13,8 @@ final class MenuBarRendererParityTests: XCTestCase {
     private let serverDirectory = "Sources/Apps/QWServer"
     /// The files a renderer draws its numbers from.
     private let renderers = ["TelemetryCards.swift", "TelemetryObservable.swift",
-                             "CupertinoTelemetryView.swift", "DualSparklineView.swift"]
+                             "CupertinoTelemetryView.swift", "DualSparklineView.swift",
+                             "MarqueeText.swift"]
     /// The literals the old renderer asserted. Each was a fact nobody
     /// measured.
     private let invented = [
@@ -197,6 +198,38 @@ final class MenuBarRendererParityTests: XCTestCase {
                       "build_app.sh must copy qwg into Contents/MacOS/qwg")
         XCTAssertTrue(script.contains("codesign") && script.contains("Contents/MacOS/qwg"),
                       "build_app.sh must sign Contents/MacOS/qwg")
+    }
+
+    func testWeightsCardUsesRunningTextMarqueeNotMiddleTruncation() throws {
+        let cardsSource = try Self.read("\(menuBarDirectory)/TelemetryCards.swift")
+        let cardBody = try XCTUnwrap(cardsSource.range(of: "var loadedWeightsCard: some View {")
+            .map { String(cardsSource[$0.lowerBound...]) })
+        let sectionEnd = cardBody.range(of: "private struct TraitPill")?.lowerBound ?? cardBody.endIndex
+        let loadedCard = String(cardBody[..<sectionEnd])
+
+        XCTAssertTrue(loadedCard.contains("MarqueeText("),
+                      "resident model name must use running text MarqueeText")
+        XCTAssertFalse(loadedCard.contains(".truncationMode(.middle)"),
+                       "long resident model name must scroll cleanly instead of middle elision")
+        XCTAssertTrue(loadedCard.contains("marqueeFactPill("),
+                      "wide quantization pill must shrink and scroll inside the 440pt card")
+
+        let popoverSource = try Self.read("\(menuBarDirectory)/CupertinoTelemetryView.swift")
+        let innerFrame = try XCTUnwrap(
+            popoverSource.range(of: ".frame(width: 420)"),
+            "popover content stack must set inner 420pt width before outer padding"
+        )
+        let outerPadding = try XCTUnwrap(
+            popoverSource.range(of: ".padding(10)"),
+            "popover content stack must apply 10pt outer padding around 420pt tiles"
+        )
+        XCTAssertLessThan(
+            innerFrame.lowerBound,
+            outerPadding.lowerBound,
+            ".frame(width: 420) must precede .padding(10) so outer inset stays 10pt instead of doubling"
+        )
+        XCTAssertTrue(popoverSource.contains(".clipped()"),
+                      "root popover container must clip overflowing child frames cleanly")
     }
 
     /// Resident Model card must stay model-centric: no alias clutter, constant host chip, or kernel mode.
