@@ -12,12 +12,15 @@ import platform
 import statistics
 import sys
 import threading
-import time
+import time as _stdlib_time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from paired_perf import arm_order, digest, write_report
+
+time = SimpleNamespace(monotonic=_stdlib_time.monotonic, sleep=_stdlib_time.sleep)
 
 
 def endpoint(value):

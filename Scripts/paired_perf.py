@@ -11,11 +11,14 @@ import re
 import statistics
 import subprocess
 import sys
-import time
+import time as _stdlib_time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from perf_gate import metrics
+
+time = SimpleNamespace(monotonic=_stdlib_time.monotonic, sleep=_stdlib_time.sleep)
 
 
 def digest(path):

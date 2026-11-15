@@ -10,6 +10,11 @@ The single source of the version is `QWVersion.current` in
 
 ## [Unreleased]
 
+## [0.21.6] - 2026-11-15
+
+### Fixed
+- **Pragmatic GitHub Actions CI Gate (`ci.yml`, `Scripts/ci.sh`, `QWTokenTests`, `QWChatTemplateGoldenTests`, `paired_perf.py`)**: Omitted `.venv-oracle` + PyTorch golden fixture generation (`make goldens`) on GitHub Actions CI, gated `Scripts/ci.sh` under `GITHUB_ACTIONS=true` to execute only non-Metal/non-golden host, CLI, server, quant, token, and UI unit test suites (`QWCoreTests`, `QWQuantTests`, `QWTokenTests`, `QWCliTests`, `QWServerTests`, `QWMenuBarTests`) while skipping performance harnesses and bare-metal GPU kernel suites, and isolated `paired_perf.time` / `paired_http_perf.time` via `SimpleNamespace` so `unittest.mock.patch("paired_perf.time.sleep")` never intercepts stdlib `subprocess.Popen._wait` backoff sleeps.
+
 ## [0.21.5] - 2026-11-15
 
 ### Fixed

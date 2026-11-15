@@ -1,8 +1,9 @@
 name: ci
 
-# Runs the repository's own gate: `make init` regenerates the goldens from
-# scratch, then `make ci` builds, lints, and tests. Nothing here depends on
-# model weights.
+# Runs the repository's CI gate on GitHub Actions: toolchain check, full build,
+# static/reachability lints, non-Metal/non-golden host & app test suites, and
+# CLI smoke. Bare-metal GPU, golden-oracle, and performance suites run on real
+# Apple Silicon machines (`GITHUB_ACTIONS != true`).
 on:
   pull_request:
   push:
@@ -33,13 +34,8 @@ jobs:
       - name: Install the Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
 
-      - name: Python 3.13
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Init (toolchain check, venv, goldens)
-        run: make init PYTHON=python3
+      - name: Check toolchain
+        run: ./Scripts/check_toolchain.sh
 
       - name: CI gate
         run: make ci

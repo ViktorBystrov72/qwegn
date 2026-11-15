@@ -27,14 +27,31 @@ echo "== geometry defaults & package DAG gates"
 python3 Scripts/lint_geometry_defaults.py Sources || { echo "FAIL: geometry-default gate"; exit 1; }
 python3 Scripts/lint_package_dag.py || { echo "FAIL: package DAG gate"; exit 1; }
 echo "== paired performance harness tests (no model or GPU)"
-python3 -m unittest discover -s Scripts -p 'test_paired*perf.py' || { echo "FAIL: paired performance harness"; exit 1; }
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  echo "skipping paired performance harness tests on GitHub Actions CI"
+else
+  python3 -m unittest discover -s Scripts -p 'test_paired*perf.py' || { echo "FAIL: paired performance harness"; exit 1; }
+fi
 echo "== test"
 # THE EXIT-CODE LAW (C22): `swift test | tail` leaks TAIL's exit code (0)
 # through pipefail when the upstream swift exits nonzero via SIGPIPE-style
-# early close — a red suite could pass CI. Capture PIPESTATUS[0] explicitly.
+# early close — a red suite could pass CI. Capture exit status explicitly.
 set +e
-swift test --no-parallel > "$CI_TMP_DIR/test.log" 2>&1
-tstatus=$?
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  echo "running host/CLI/server/quant/token/UI suites on GitHub Actions (skipping bare-metal Metal & golden suites)"
+  swift test --no-parallel \
+    --filter QWCoreTests \
+    --filter QWQuantTests \
+    --filter QWTokenTests \
+    --filter QWCliTests \
+    --filter QWServerTests \
+    --filter QWMenuBarTests \
+    > "$CI_TMP_DIR/test.log" 2>&1
+  tstatus=$?
+else
+  swift test --no-parallel > "$CI_TMP_DIR/test.log" 2>&1
+  tstatus=$?
+fi
 set -e
 if [ "$tstatus" -ne 0 ]; then
   echo "FAIL: swift test exit $tstatus"
