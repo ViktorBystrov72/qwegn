@@ -229,6 +229,16 @@ public struct ChoiceLogprobs: Codable, Sendable {
     }
 }
 
+public struct QWMetadataValidationError: Error, CustomStringConvertible, Sendable {
+    public let message: String
+
+    public init(_ message: String) {
+        self.message = message
+    }
+
+    public var description: String { message }
+}
+
 public struct ChatCompletionRequest: Codable, Sendable {
     public struct ChatTemplateKwargs: Codable, Sendable {
         public let enableThinking: Bool?
@@ -271,6 +281,14 @@ public struct ChatCompletionRequest: Codable, Sendable {
     public let reasoningEffort: String?
     public let reasoning: ReasoningConfig?
     public let chatTemplateKwargs: ChatTemplateKwargs?
+    public let metadata: [String: String]?
+    public let user: String?
+    public let sessionId: String?
+    public let promptCacheKey: String?
+    public let cacheSalt: String?
+    public let cachePrompt: Bool?
+    public let store: Bool?
+    public var httpHeaders: [String: String]? = nil
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -299,6 +317,13 @@ public struct ChatCompletionRequest: Codable, Sendable {
         case reasoningEffort = "reasoning_effort"
         case reasoning
         case chatTemplateKwargs = "chat_template_kwargs"
+        case metadata
+        case user
+        case sessionId = "session_id"
+        case promptCacheKey = "prompt_cache_key"
+        case cacheSalt = "cache_salt"
+        case cachePrompt = "cache_prompt"
+        case store
     }
 
     public init(from decoder: Decoder) throws {
@@ -328,12 +353,201 @@ public struct ChatCompletionRequest: Codable, Sendable {
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
         self.reasoning = try container.decodeIfPresent(ReasoningConfig.self, forKey: .reasoning)
         self.chatTemplateKwargs = try container.decodeIfPresent(ChatTemplateKwargs.self, forKey: .chatTemplateKwargs)
+        self.user = try container.decodeIfPresent(String.self, forKey: .user)
+        self.sessionId = try container.decodeIfPresent(String.self, forKey: .sessionId)
+        self.promptCacheKey = try container.decodeIfPresent(String.self, forKey: .promptCacheKey)
+        self.cacheSalt = try container.decodeIfPresent(String.self, forKey: .cacheSalt)
+        self.cachePrompt = try container.decodeIfPresent(Bool.self, forKey: .cachePrompt)
+        self.store = try container.decodeIfPresent(Bool.self, forKey: .store)
+
+        if container.contains(.metadata), (try? container.decodeNil(forKey: .metadata)) != true {
+            let rawMeta = try container.decode(QWJson.self, forKey: .metadata)
+            guard case .object(let pairs) = rawMeta else {
+                throw DecodingError.typeMismatch(
+                    [String: String].self,
+                    DecodingError.Context(
+                        codingPath: container.codingPath + [CodingKeys.metadata],
+                        debugDescription: "metadata must be a JSON object"
+                    )
+                )
+            }
+            var coerced: [String: String] = [:]
+            for (k, v) in pairs {
+                switch v {
+                case .string(let s):
+                    coerced[k] = s
+                case .bool(let b):
+                    coerced[k] = b ? "true" : "false"
+                case .int(let i):
+                    coerced[k] = String(i)
+                case .double(let d):
+                    if d.isFinite && d >= Double(Int64.min) && d < Double(Int64.max) && d.truncatingRemainder(dividingBy: 1) == 0 {
+                        coerced[k] = String(Int64(d))
+                    } else {
+                        coerced[k] = String(d)
+                    }
+                case .null, .undefined:
+                    break
+                case .array, .object:
+                    throw DecodingError.typeMismatch(
+                        String.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath + [CodingKeys.metadata],
+                            debugDescription: "metadata['\(k)'] must be a scalar string, number, or boolean"
+                        )
+                    )
+                }
+            }
+            self.metadata = coerced
+        } else {
+            self.metadata = nil
+        }
 
         if let singleStop = try? container.decode(String.self, forKey: .stop) {
             self.stop = [singleStop]
         } else {
             self.stop = try container.decodeIfPresent([String].self, forKey: .stop)
         }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(model, forKey: .model)
+        try container.encode(messages, forKey: .messages)
+        try container.encodeIfPresent(tools, forKey: .tools)
+        try container.encodeIfPresent(toolChoice, forKey: .toolChoice)
+        try container.encodeIfPresent(parallelToolCalls, forKey: .parallelToolCalls)
+        try container.encodeIfPresent(responseFormat, forKey: .responseFormat)
+        try container.encodeIfPresent(logprobs, forKey: .logprobs)
+        try container.encodeIfPresent(topLogprobs, forKey: .topLogprobs)
+        try container.encodeIfPresent(n, forKey: .n)
+        try container.encodeIfPresent(continueFinalMessage, forKey: .continueFinalMessage)
+        try container.encodeIfPresent(addGenerationPrompt, forKey: .addGenerationPrompt)
+        try container.encodeIfPresent(stream, forKey: .stream)
+        try container.encodeIfPresent(maxTokens, forKey: .maxTokens)
+        try container.encodeIfPresent(maxCompletionTokens, forKey: .maxCompletionTokens)
+        try container.encodeIfPresent(minTokens, forKey: .minTokens)
+        try container.encodeIfPresent(ignoreEos, forKey: .ignoreEos)
+        try container.encodeIfPresent(temperature, forKey: .temperature)
+        try container.encodeIfPresent(topP, forKey: .topP)
+        try container.encodeIfPresent(topK, forKey: .topK)
+        try container.encodeIfPresent(repetitionPenalty, forKey: .repetitionPenalty)
+        try container.encodeIfPresent(seed, forKey: .seed)
+        try container.encodeIfPresent(stop, forKey: .stop)
+        try container.encodeIfPresent(enableThinking, forKey: .enableThinking)
+        try container.encodeIfPresent(reasoningEffort, forKey: .reasoningEffort)
+        try container.encodeIfPresent(reasoning, forKey: .reasoning)
+        try container.encodeIfPresent(chatTemplateKwargs, forKey: .chatTemplateKwargs)
+        try container.encodeIfPresent(metadata, forKey: .metadata)
+        try container.encodeIfPresent(user, forKey: .user)
+        try container.encodeIfPresent(sessionId, forKey: .sessionId)
+        try container.encodeIfPresent(promptCacheKey, forKey: .promptCacheKey)
+        try container.encodeIfPresent(cacheSalt, forKey: .cacheSalt)
+        try container.encodeIfPresent(cachePrompt, forKey: .cachePrompt)
+        try container.encodeIfPresent(store, forKey: .store)
+    }
+
+    public func validateMetadata() throws {
+        guard let metadata else { return }
+        if metadata.count > 16 {
+            throw QWMetadataValidationError("metadata may contain at most 16 entries (got \(metadata.count))")
+        }
+        for (key, value) in metadata {
+            if key.isEmpty || key.count > 64 {
+                throw QWMetadataValidationError("metadata key '\(key)' must be 1...64 characters")
+            }
+            if value.count > 512 {
+                throw QWMetadataValidationError("metadata['\(key)'] exceeds 512 characters")
+            }
+        }
+    }
+
+    public func metadataValue(for key: String) -> String? {
+        guard let metadata else { return nil }
+        if let exact = metadata[key] {
+            let trimmed = exact.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        for (k, v) in metadata where k.caseInsensitiveCompare(key) == .orderedSame {
+            let trimmed = v.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return nil
+    }
+
+    private func headerValue(for name: String) -> String? {
+        guard let httpHeaders else { return nil }
+        if let exact = httpHeaders[name] {
+            let trimmed = exact.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        for (k, v) in httpHeaders where k.caseInsensitiveCompare(name) == .orderedSame {
+            let trimmed = v.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return nil
+    }
+
+    private static func parseMetadataBool(_ raw: String?) -> Bool? {
+        guard let lowered = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !lowered.isEmpty else { return nil }
+        switch lowered {
+        case "true", "1", "yes", "on": return true
+        case "false", "0", "no", "off": return false
+        default: return nil
+        }
+    }
+
+    private static func sanitizeIdentifier(_ raw: String?, maxLength: Int = 64) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else { return nil }
+        let filtered = String(trimmed.unicodeScalars.filter { s in
+            (s.value >= 0x30 && s.value <= 0x39)
+                || (s.value >= 0x41 && s.value <= 0x5A)
+                || (s.value >= 0x61 && s.value <= 0x7A)
+                || s == "." || s == "_" || s == ":" || s == "-"
+        }.prefix(maxLength))
+        return filtered.isEmpty ? nil : filtered
+    }
+
+    public var effectiveRequestId: String? {
+        Self.sanitizeIdentifier(headerValue(for: "x-request-id") ?? metadataValue(for: "request_id") ?? metadataValue(for: "x_request_id"))
+    }
+
+    public var effectiveSessionId: String? {
+        Self.sanitizeIdentifier(sessionId ?? headerValue(for: "x-session-id") ?? metadataValue(for: "session_id") ?? metadataValue(for: "conversation_id"))
+    }
+
+    public var effectiveUser: String? {
+        Self.sanitizeIdentifier(user ?? metadataValue(for: "user_id") ?? metadataValue(for: "user"))
+    }
+
+    public var effectivePresetId: String? {
+        Self.sanitizeIdentifier(metadataValue(for: "preset_id") ?? metadataValue(for: "preset"))
+    }
+
+    public var effectiveCachePrompt: Bool {
+        cachePrompt ?? Self.parseMetadataBool(metadataValue(for: "cache_prompt") ?? metadataValue(for: "use_prefix_cache")) ?? true
+    }
+
+    public var effectiveCacheSalt: String? {
+        Self.sanitizeIdentifier(cacheSalt ?? promptCacheKey ?? metadataValue(for: "cache_salt") ?? metadataValue(for: "prompt_cache_key"))
+    }
+
+    public var effectiveUseMemoryPack: Bool {
+        Self.parseMetadataBool(metadataValue(for: "use_memory_pack")) ?? true
+    }
+
+    public var effectiveWorkspacePath: String? {
+        metadataValue(for: "workspace_path") ?? metadataValue(for: "repo_path") ?? metadataValue(for: "cwd")
+    }
+
+    public var effectiveStore: Bool {
+        store ?? Self.parseMetadataBool(metadataValue(for: "store")) ?? true
+    }
+
+    public var effectiveExactSpeculation: Bool {
+        Self.parseMetadataBool(metadataValue(for: "exact_speculation") ?? metadataValue(for: "lossless_speculation")) ?? false
     }
 
     public var rawReasoningEffort: String? {

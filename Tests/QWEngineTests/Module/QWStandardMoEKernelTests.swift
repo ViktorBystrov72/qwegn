@@ -419,8 +419,47 @@ final class QWStandardMoEKernelTests: XCTestCase {
                        "the 27B has no MoE layer")
         let g = try Self.geometry(normTopKProb: true)
         XCTAssertGreaterThan(QWEngineDriver.moeBytesPerToken(geometry: g), 0)
-        // The dense prefill law excludes unreferenced prefill group-sum/f32 duplicates.
-        XCTAssertEqual(QWEngineDriver.prefillBytesPerToken(geometry: .qwen38_27b), 500_480)
+        // The dense prefill law aliases disjoint attn vs mlp transients and omits <=4096 WY slabs.
+        XCTAssertEqual(QWEngineDriver.prefillBytesPerToken(geometry: .qwen38_27b), 297_728)
+    }
+
+    func testPrefillScratchDisjointBranchAliasingAndCarveBudget() throws {
+        let dense = QWModelGeometry.qwen38_27b
+        let moeAll = try Self.geometry(normTopKProb: true)
+        let moeCold = moeAll.withResidentExperts(max(1, moeAll.numExperts / 2))
+        for (label, g) in [("dense", dense), ("moeAll", moeAll), ("moeCold", moeCold)] {
+            for maxT in [64, 512] {
+                let bpt = QWEngineDriver.prefillBytesPerToken(geometry: g, maxPrefillChunk: maxT, useGroupedNAX: true)
+                let actCap = maxT * bpt + QWEngineDriver.decodeAndMTPScratchBytes(
+                    geometry: g, prefillChunkRows: maxT, mtpDrafts: 0, maxTokens: 4096, useGroupedNAX: true)
+                let arena = try QWArena(hal: Self.hal, weights: 0, activations: actCap, kv: 0, gdnStates: 64 << 20)
+                let asub = arena.activationsRegion()
+                let gsub = arena.gdnRegion()
+                let pCarve = QWEngineDriver.partialsCarveBytes(geometry: g, maxTokens: 4096)
+                let pOff = try gsub.allocate(bytes: pCarve)
+                let (_, psc, pscStartOff) = try QWEngineDriver.makeDecodeAndPrefillScratch(
+                    asub: asub, gsub: gsub, geometry: g, maxPrefillChunk: maxT,
+                    pOff: pOff, pCarveBytes: pCarve, useGroupedNAX: true)
+                let carved = asub.usedBytes - pscStartOff
+                XCTAssertLessThanOrEqual(carved, maxT * bpt + (4 << 20), "\(label) T=\(maxT)")
+                XCTAssertEqual(psc.U.shape.elementCount, 1, "\(label) T=\(maxT) omits WY <=4096")
+                XCTAssertEqual(psc.gdnY.region.base + psc.gdnY.offset,
+                               psc.guRaw16.region.base + psc.guRaw16.offset,
+                               "\(label) aliases Attn and MLP transient start")
+                if let m = psc.moe, let gu16 = m.gu16 {
+                    let attnBase = psc.gdnY.region.base + psc.gdnY.offset
+                    XCTAssertLessThanOrEqual(m.shared.region.base + m.shared.offset + m.shared.bytes, attnBase,
+                                             "\(label) shared must stay strictly before transient base")
+                    XCTAssertLessThanOrEqual(m.gate.region.base + m.gate.offset + m.gate.bytes, attnBase,
+                                             "\(label) gate must stay strictly before transient base")
+                    if g.effectiveResidentExperts >= g.numExperts {
+                        XCTAssertEqual(gu16.offset, m.dnAcc.offset, "\(label) aliases gu16 and dnAcc")
+                    } else {
+                        XCTAssertNotEqual(gu16.offset, m.dnAcc.offset, "\(label) keeps cold gu16/dnAcc disjoint")
+                    }
+                }
+            }
+        }
     }
 
     func testGroupedNAXMoEScratchAllocationMatchesSuballocatorCarve() throws {

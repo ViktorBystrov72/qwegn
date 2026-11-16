@@ -44,11 +44,13 @@ extension QWEngineDriver {
         let draftedPairs: Int
     }
 
-    private func draftFullHistory(session: QWEngineSession, pending: Int) -> [Int] {
-        if session.tokenHistory.count > session.position, session.tokenHistory.last == pending {
-            return session.tokenHistory
+    func pendingHistoryContext(session: QWEngineSession, pending: Int) -> (extraPending: Int?, previousToken: Int?) {
+        let inHistory = session.tokenHistory.count > session.position && session.tokenHistory.last == pending
+        if inHistory {
+            let prev = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
+            return (nil, prev)
         }
-        return session.tokenHistory + [pending]
+        return (pending, session.tokenHistory.last)
     }
 
     private func adaptiveDraftCount(count: Int, defaultTrunkBits: Int) -> Int {
@@ -64,23 +66,45 @@ extension QWEngineDriver {
     }
 
     private func tryZeroCostContextDrafts(
-        fullHistory: [Int],
+        session: QWEngineSession,
+        pending: Int,
+        extraPending: Int?,
+        previousToken: Int?,
         count: Int,
         strategy: QWDraftStrategy
     ) -> [Int]? {
         if let pd = QWContextCopyDrafter.periodicDrafts(
-            history: fullHistory, maxCount: count, minRepeats: 3),
+            history: session.tokenHistory, extraToken: extraPending,
+            maxCount: count, minRepeats: 3),
            !pd.isEmpty {
             return pd
         }
-        let minMatch = (strategy == .ngram) ? 3 : 5
+        let isMoE = geometry.numExperts > 0
+        let minMatch = (strategy == .ngram) ? 3 : (isMoE ? 6 : 5)
         if let match = QWContextCopyDrafter.drafts(
-            history: fullHistory, maxCount: count, minMatchLen: minMatch),
+            history: session.tokenHistory, extraToken: extraPending,
+            maxCount: count, minMatchLen: minMatch),
            !match.tokens.isEmpty {
             let take = match.matchLen >= 6
                 ? count
                 : min(strategy == .ngram ? count : 2, match.tokens.count)
-            return Array(match.tokens.prefix(max(1, take)))
+            var out = Array(match.tokens.prefix(max(1, take)))
+            if strategy == .ngram, out.count < count {
+                session.tokenRecycler.appendDrafts(
+                    into: &out, maxCount: count,
+                    previousToken: previousToken, pendingToken: pending,
+                    maxUnigramFallbacks: isMoE ? 0 : 2)
+            }
+            return out
+        }
+        if strategy == .ngram {
+            var recycled: [Int] = []
+            recycled.reserveCapacity(count)
+            session.tokenRecycler.appendDrafts(
+                into: &recycled, maxCount: count,
+                previousToken: previousToken, pendingToken: pending,
+                maxUnigramFallbacks: isMoE ? 0 : 2)
+            if !recycled.isEmpty { return recycled }
         }
         return nil
     }
@@ -120,9 +144,13 @@ extension QWEngineDriver {
         owner: QWStochasticSession?,
         draftCompleted: ((any MTLCommandBuffer) throws -> Void)?
     ) throws -> MTPRoundProposal {
-        try proposeHybridRound(
+        let neuralCap = QWMTPAdaptiveDepth.hybridNextNNeuralDepthCap(
+            isStochastic: owner != nil, stageProfiling: mtpStageProfiling,
+            hasDeviceEmbedding: mtpDeviceEmbedding != nil, numExperts: geometry.numExperts)
+        return try proposeHybridRound(
             session: session, pending: pending, count: count,
             defaultTrunkBits: 4, owner: owner, traceTag: "[draft]",
+            maxHybridNeuralDepth: neuralCap,
             useFullNeuralDepth: { !($0 == .ngram && owner == nil && !mtpStageProfiling) },
             proposeNeural: { neuralCount, sampledToken, stopAfterDraft in
                 try QWMTPDraftChain.run(
@@ -147,6 +175,7 @@ extension QWEngineDriver {
         defaultTrunkBits: Int,
         owner: QWStochasticSession?,
         traceTag: String,
+        maxHybridNeuralDepth: Int? = nil,
         useFullNeuralDepth: (QWDraftStrategy) -> Bool,
         proposeNeural: (
             _ neuralCount: Int,
@@ -156,21 +185,26 @@ extension QWEngineDriver {
     ) throws -> MTPRoundProposal {
         let effectiveCount = adaptiveDraftCount(count: count, defaultTrunkBits: defaultTrunkBits)
         let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
-        let fullHistory = draftFullHistory(session: session, pending: pending)
+        let (extraPending, previousToken) = pendingHistoryContext(session: session, pending: pending)
         if owner == nil && !mtpStageProfiling && resolvedStrategy != .mtp,
-           let chosen = tryZeroCostContextDrafts(fullHistory: fullHistory, count: count, strategy: resolvedStrategy) {
+           let chosen = tryZeroCostContextDrafts(
+               session: session, pending: pending, extraPending: extraPending,
+               previousToken: previousToken, count: count, strategy: resolvedStrategy) {
             lastRoundUsedPLD = true
             lastDraftedPairs = 0
             mtpDraftProposals += chosen.count
             return MTPRoundProposal(drafts: chosen, proposals: [], draftedPairs: 0)
         }
 
-        let neuralCount = useFullNeuralDepth(resolvedStrategy) ? effectiveCount : 1
+        var neuralCount = useFullNeuralDepth(resolvedStrategy) ? effectiveCount : 1
+        if resolvedStrategy == .hybrid, owner == nil, !mtpStageProfiling, let maxHybridNeuralDepth {
+            neuralCount = min(neuralCount, max(1, maxHybridNeuralDepth))
+        }
         var proposals: [QWMTPGumbelProposal] = []
         if let owner {
             try owner.stream.beginGumbelRound(drafts: neuralCount, vocabulary: geometry.vocab)
         }
-        var draftHistory = fullHistory
+        var draftHistory = extraPending != nil ? (session.tokenHistory + [pending]) : (owner != nil ? session.tokenHistory : [])
         let sampledToken: ((QWTensorValue) throws -> Int)? = owner.map { owner in
             { logits in
                 let proposal = try owner.stream.sampleGumbelProposal(
@@ -197,14 +231,22 @@ extension QWEngineDriver {
         let tDraft0 = Self.decodeTraceEnabled ? Date() : nil
         var drafts = try proposeNeural(neuralCount, sampledToken, stopAfterDraft)
         let draftedPairs = drafts.count
-        if owner == nil, !mtpStageProfiling, resolvedStrategy != .mtp,
-           count > drafts.count, let lastDraft = drafts.last,
-           let cont = QWContextCopyDrafter.drafts(
-               history: fullHistory + drafts.dropLast(), appendedToken: lastDraft,
-               maxCount: count - drafts.count, minMatchLen: 4),
-           !cont.tokens.isEmpty {
-            let extra = cont.matchLen >= 6 ? (count - drafts.count) : 1
-            drafts.append(contentsOf: cont.tokens.prefix(max(1, extra)))
+        let isMoE = geometry.numExperts > 0
+        if owner == nil, !mtpStageProfiling, resolvedStrategy != .mtp, count > drafts.count {
+            let contMinMatch = (isMoE && resolvedStrategy != .ngram) ? 6 : 4
+            if let cont = QWContextCopyDrafter.drafts(
+                history: session.tokenHistory, extraToken: extraPending, trailingTokens: drafts,
+                maxCount: count - drafts.count, minMatchLen: contMinMatch),
+               !cont.tokens.isEmpty {
+                let extra = cont.matchLen >= 6 ? (count - drafts.count) : 1
+                drafts.append(contentsOf: cont.tokens.prefix(max(1, extra)))
+            }
+            if !isMoE || resolvedStrategy == .ngram, drafts.count < count {
+                session.tokenRecycler.appendDrafts(
+                    into: &drafts, maxCount: count,
+                    previousToken: previousToken, pendingToken: pending,
+                    maxUnigramFallbacks: isMoE ? 0 : 2)
+            }
         }
         if let tDraft0 {
             FileHandle.standardError.write(Data(String(

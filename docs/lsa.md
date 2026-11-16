@@ -138,8 +138,8 @@ Paired interleaved A/B measurements on the `qwegine` repository (`12` Tier-0/1 f
 #### Step-by-Step Usage Manual
 
 ```bash
-# 1. Build a repository LSA memory pack offline
-#    Automatically reads kvMode from ~/.qwg/profiles/<model>.json (fallback: q4)
+# 1. Build a repository LSA memory pack offline (or auto-delegate to a running `qwg serve` daemon when locked;
+#    automatically reads kvMode from ~/.qwg/profiles/<model>.json, fallback: q4)
 .build/release/qwg index /path/to/repo \
   --model ~/.qwg/models/Qwen3.8-Flash-Next-hq8g32-hq4g64 \
   --max-tokens 65536
@@ -160,7 +160,13 @@ cd /path/to/repo && .build/release/qwg repl --model Qwen3.8-Flash-Next-hq8g32-hq
 # 4. Coding-agent HTTP server (auto-discovers <repo>/.qwg/manifest.json from agent system prompts)
 .build/release/qwg serve ~/.qwg/models/Qwen3.8-Flash-Next-hq8g32-hq4g64 --port 8080 --no-lazy
 
-# Explicit REST mount / unmount for external harnesses:
+# Explicit REST inspect / live SSE index / mount / unmount for external harnesses:
+curl -X POST http://127.0.0.1:8080/v1/memory/inspect \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "/path/to/repo"}'
+curl -N -X POST http://127.0.0.1:8080/v1/memory/index \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "/path/to/repo", "kvMode": "q4", "lsaMode": "auto", "stream": true}'
 curl -X POST http://127.0.0.1:8080/v1/memory/mount \
   -H 'Content-Type: application/json' \
   -d '{"repoPath": "/path/to/repo"}'
@@ -174,3 +180,4 @@ curl -X POST http://127.0.0.1:8080/v1/memory/unmount
 - **Zero-Rebuild Live Working-Tree Delta (`<|memory_delta|>`):** When tracked files are edited or deleted on disk after `qwg index`, Qwegn keeps `0 ..< N_mem` frozen (`100%` base cache hit) and appends only the modified/deleted files inside `<|memory_delta|>` at `N_mem`.
 - **Automatic `kvMode` Enforcement & Settings Lock:** Mounting `.qwg/manifest.json` enforces the pack's `kvMode` (`q4` / `q8` / `f16`) across `qwg repl`, `qwg run`, `qwg serve`, and `qwg-menu` (locking the **KV Cache Mode** picker until unmounted).
 - **Two-Tier Hierarchical LSA Cortex + Sub-Millisecond Off-Context Vault (`QWMemoryVault`):** By default, `qwg index` packs a **`32,768`-token Resident Cortex `.qwcache`** (`~3.1%` of the 1M context window: `264.61 MiB` on `Qwen3.6-35B-A3B` `q4` and `464.54 MiB` on `Qwen3.8-Flash-Next` `q4` — **`23.7×` smaller** than a monolithic 1M pack) using **domain-agnostic structural depth ($\text{depth}(f) \ge 0$) and temporal stability ordering** (with zero hardcoded folder names) plus a universal **`[QWG REPOSITORY CORTEX MAP]`** indexing 100% of files and their multi-language declarations, data schema keys (SQL/JSON/YAML/TOML/CSV), and document headings (Markdown/LaTeX), while storing all remaining files in the **Off-Context LSA Vault** (`.qwg/manifest.json`). On each turn, `QWMemoryVault.recallVaultContext` pages matching Vault files in **`< 0.5 ms`** into `<|memory_vault_recall|>` attached to the current turn's user message—preserving **100% `[warm_ram]` prefix cache identity** across all prior turns (`0.12–0.24 s` Cortex TTFT, **`150.5–163.9 tok/s` decode (`+53%` faster than 1M monolithic prefix)**, and **`1,015,834` tokens (`96.9%`) free** for coding agents under the **Elastic Context Budget Guard**).
+- **Live Daemon Inspection, Streaming SSE Indexing & WebUI Modal (`POST /v1/memory/inspect`, `POST /v1/memory/index`, `#modal-memory-pack`):** When `QWServer` is already running and holds `QWEngineInstanceLock`, CLI `qwg index` automatically delegates indexing over `POST /v1/memory/index` and streams progress to `stderr`. Before mounting a repository from `/ui` Chat or Settings, `/v1/memory/inspect` evaluates strict model identity (`matchingCache(..., allowFallbackToAnyModel: false)`), git commit distance (`evaluateGitStaleness`), and working-tree delta (`computeDelta`), classifying the directory as `ready`, `stale`, `wrong_model`, or `missing` and opening `#modal-memory-pack` with `Switch & Mount`, `Update & Mount`, `Mount Existing with Live Delta`, and live per-file + Metal prefill SSE indexing progress (`KV Mode`, `LSA Mode`, `Scope`, `Include Tests`).

@@ -109,7 +109,17 @@ extension QWEngineTelemetryRegistry {
             if let used = hw.memoryUsedBytes {
                 out += "qwegine_hardware_memory_bytes{state=\"used\"} \(used)\n"
             }
-            out += "qwegine_hardware_memory_bytes{state=\"total\"} \(hw.memoryTotalBytes)\n"
+            out += "qwegine_hardware_memory_bytes{state=\"total\"} \(hw.memoryTotalBytes)\n\n"
+
+            out += Self.block(s, "qwegine_hardware_gpu_temperature_celsius",
+                              "AppleSMC GPU hotspot temperature in Celsius",
+                              [("kind", "gpu", nil, nil, hw.gpuTemperatureCelsius, .gpuTemperatureCelsius)])
+            out += Self.block(s, "qwegine_hardware_fan_rpm",
+                              "AppleSMC cooling fan speed in RPM",
+                              [("kind", "fan", nil, nil, hw.fanSpeedRPM, .fanSpeedRPM)])
+            out += Self.block(s, "qwegine_hardware_system_power_watts",
+                              "AppleSMC total system power draw in Watts",
+                              [("kind", "system", nil, nil, hw.systemPowerWatts, .systemPowerWatts)])
         }
 
         out += Self.block(s, "qwegine_gpu_busy_ratio",

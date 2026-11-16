@@ -77,7 +77,9 @@ public final class FNBatchJob: @unchecked Sendable {
                 onTokenLogprob: ((QWTokenLogprob) -> Void)? = nil,
                 constraint: (any QWTokenConstraint)? = nil,
                 retainPrefixLength: Int? = nil,
-                visualSpans: [QWVisualSpan] = []) {
+                visualSpans: [QWVisualSpan] = [],
+                usePrefixCache: Bool = true,
+                cacheSalt: String? = nil) {
         self.prompt = prompt
         self.maxNew = maxNew
         self.stopIDs = stopIDs
@@ -97,6 +99,8 @@ public final class FNBatchJob: @unchecked Sendable {
                                  constraint: constraint,
                                  retainPrefixLength: retainPrefixLength,
                                  visualSpans: visualSpans,
+                                 usePrefixCache: usePrefixCache,
+                                 cacheSalt: cacheSalt,
                                  onPrefillProgress: onPrefillProgress)
         s.draftMode = draftMode
         s.maxDrafts = max(1, min(FNGPUSessionData.draftCapacity, maxDrafts))

@@ -71,7 +71,7 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
         self.usesPlusOneRMSNorm = usesPlusOneRMSNorm ?? [.qwen38Dense, .qwen38MoE, .senseNovaLoop].contains(family)
         self.usesQwenChatTemplateIds = usesQwenChatTemplateIds
             ?? [.qwen38Dense, .qwen38MoE, .qwen38FlashNext, .senseNovaLoop].contains(family)
-        self.maxSpeculativeDrafts = maxSpeculativeDrafts ?? (family == .qwen38FlashNext ? 3 : 5)
+        self.maxSpeculativeDrafts = maxSpeculativeDrafts ?? (family == .qwen38FlashNext ? 3 : 7)
         self.supportsExpertStreaming = supportsExpertStreaming ?? (family != .qwen38FlashNext)
         self.isOfficialSupported = isOfficialSupported
     }

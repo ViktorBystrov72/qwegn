@@ -247,32 +247,96 @@ extension QWEngineDriver {
         let maxT = maxPrefillChunk
         let pscStartOff = asub.usedBytes
         let usesMLA = geometry.usesLatentOrCompressedAttention
+        let pX = try tv(maxT * H, .f16)
+        let pLn1 = try tv(maxT * H, .f16)
+        let pLn2 = try tv(maxT * H, .f16)
+        let pO16 = try tv(maxT * H, .f16)
+        let pDn32 = try tv(maxT * H, .f32)
+        let pDn16 = try tv(maxT * H, .f16)
+        let pMhcStream = try geometry.mhcConfig.map { try tv(maxT * $0.streams * H, .f32) }
+        let pMhcControls = try geometry.mhcConfig.map { try tv(maxT * ($0.streams + $0.streams * $0.streams), .f32) }
+
+        // Attention/GDN transients and MLP/MoE transients never overlap within a layer.
+        let aliasBranches = asub.regions.count == 1
+        let moePersistentBytes = geometry.numExperts > 0
+            ? (qwAlignUp(max(1, maxT * H) * 4) + qwAlignUp(max(1, maxT) * 4))
+            : 0
+        let moePersistentSub: QWSubAllocator?
+        if aliasBranches && moePersistentBytes > 0 {
+            let moeOff = try asub.allocate(bytes: moePersistentBytes)
+            moePersistentSub = QWSubAllocator(region: QWMRegion(
+                buffer: asub.region.buffer,
+                base: asub.region.base + moeOff,
+                length: moePersistentBytes))
+        } else {
+            moePersistentSub = nil
+        }
+        func moePersistentTv(_ n: Int, _ dt: QWDType) throws -> QWTensorValue {
+            guard let moePersistentSub else { return try tv(n, dt) }
+            return try moePersistentSub.allocate(QWTensorShape([max(1, n)], dt))
+        }
+        let transientBase = asub.usedBytes
+        let branchLen = asub.freeBytes
+        let attnSub: QWSubAllocator? = aliasBranches
+            ? QWSubAllocator(region: QWMRegion(buffer: asub.region.buffer,
+                                               base: asub.region.base + transientBase,
+                                               length: branchLen))
+            : nil
+        let mlpSub: QWSubAllocator? = aliasBranches
+            ? QWSubAllocator(region: QWMRegion(buffer: asub.region.buffer,
+                                               base: asub.region.base + transientBase,
+                                               length: branchLen))
+            : nil
+        func attnTv(_ n: Int, _ dt: QWDType) throws -> QWTensorValue {
+            guard let attnSub else { return try tv(n, dt) }
+            return try attnSub.allocate(QWTensorShape([max(1, n)], dt))
+        }
+        func mlpTv(_ n: Int, _ dt: QWDType) throws -> QWTensorValue {
+            guard let mlpSub else { return try tv(n, dt) }
+            return try mlpSub.allocate(QWTensorShape([max(1, n)], dt))
+        }
+
+        let wyElems = (!geometry.gdnVectorDecay && geometry.gdnLayerCount > 0 && maxT > 4096) ? (maxT * zC) : 0
+        let pGdnY = try attnTv(geometry.gdnVectorDecay ? 0 : maxT * geometry.gdnTotalN, .f32)
+        let pAttnY16 = try attnTv(usesMLA ? 0 : maxT * geometry.attnTotalN, .f16)
+        let pQkv16 = try attnTv(maxT * qkvC, .f16)
+        let pZ16 = try attnTv(maxT * zC, .f16)
+        let pBetas = try attnTv(maxT * gdnVH, .f32)
+        let pGlog = try attnTv(maxT * glogC, .f32)
+        let pConvY = try attnTv(maxT * qkvC, .f16)
+        let pOScr = try attnTv(maxT * zC, .f32)
+        let pOOut = try attnTv(maxT * zC, .f16)
+        let pAttOut = try attnTv(maxT * attOutCols, .f16)
+        let pAttV16 = try attnTv(usesMLA ? 0 : (maxT + QWAttnPrefill.padRows) * kvE, .f16)
+        let pAttQR16 = try attnTv(usesMLA ? 0 : (maxT + QWAttnPrefill.padRows) * qOut, .f16)
+        let pAttKR16 = try attnTv(usesMLA ? 0 : (maxT + QWAttnPrefill.padRows) * kvE, .f16)
+        let pU = try attnTv(wyElems, .f32)
+        let pW = try attnTv(wyElems, .f32)
+        let pA = try attnTv(wyElems, .f32)
+        let pB = try attnTv(wyElems, .f32)
+        let pFgb16 = geometry.gdnVectorDecay ? try attnTv(maxT * fgbC, .f16) : nil
+
+        let pGuRaw16 = try mlpTv(maxT * max(2 * I, 2 * H), .f16)
+        let pGu16 = try mlpTv(maxT * I, .f16)
+        let pMoe: MoEScratch? = geometry.numExperts > 0
+            ? try Self.makeMoEScratch(mlpTv, persistentAlloc: moePersistentTv, rows: maxT, geometry: geometry, useGroupedNAX: useGroupedNAX)
+            : nil
+        if let attnSub, let mlpSub {
+            let transientPeak = max(attnSub.usedBytes, mlpSub.usedBytes)
+            if transientPeak > 0 { try asub.allocate(bytes: transientPeak) }
+        }
         let psc = PrefillScratch(
             maxChunk: maxT,
-            x: try tv(maxT * H, .f16),
-            ln1: try tv(maxT * H, .f16),
-            ln2: try tv(maxT * H, .f16),
-            gdnY: try tv(geometry.gdnVectorDecay ? 0 : maxT * geometry.gdnTotalN, .f32),
-            attnY16: try tv(usesMLA ? 0 : maxT * geometry.attnTotalN, .f16),
-            qkv16: try tv(maxT * qkvC, .f16),
-            z16: try tv(maxT * zC, .f16),
-            betas: try tv(maxT * gdnVH, .f32), glog: try tv(maxT * glogC, .f32),
-            convY: try tv(maxT * qkvC, .f16), oScr: try tv(maxT * zC, .f32),
-            oOut: try tv(maxT * zC, .f16), attOut: try tv(maxT * attOutCols, .f16),
-            attV16: try tv(usesMLA ? 0 : (maxT + QWAttnPrefill.padRows) * kvE, .f16),
-            attQR16: try tv(usesMLA ? 0 : (maxT + QWAttnPrefill.padRows) * qOut, .f16),
-            attKR16: try tv(usesMLA ? 0 : (maxT + QWAttnPrefill.padRows) * kvE, .f16),
-            U: try tv(maxT * zC, .f32), W: try tv(maxT * zC, .f32),
-            A: try tv(maxT * zC, .f32), B: try tv(maxT * zC, .f32),
-            o16: try tv(maxT * H, .f16),
-            guRaw16: try tv(maxT * max(2 * I, 2 * H), .f16),
-            gu16: try tv(maxT * I, .f16), dn32: try tv(maxT * H, .f32), dn16: try tv(maxT * H, .f16),
-            moe: geometry.numExperts > 0
-                ? try Self.makeMoEScratch(tv, rows: maxT, geometry: geometry, useGroupedNAX: useGroupedNAX)
-                : nil,
-            mhcStream: try geometry.mhcConfig.map { try tv(maxT * $0.streams * H, .f32) },
-            mhcControls: try geometry.mhcConfig.map { try tv(maxT * ($0.streams + $0.streams * $0.streams), .f32) },
-            fgb16: geometry.gdnVectorDecay ? try tv(maxT * fgbC, .f16) : nil
+            x: pX, ln1: pLn1, ln2: pLn2,
+            gdnY: pGdnY, attnY16: pAttnY16,
+            qkv16: pQkv16, z16: pZ16,
+            betas: pBetas, glog: pGlog,
+            convY: pConvY, oScr: pOScr,
+            oOut: pOOut, attOut: pAttOut,
+            attV16: pAttV16, attQR16: pAttQR16, attKR16: pAttKR16,
+            U: pU, W: pW, A: pA, B: pB,
+            o16: pO16, guRaw16: pGuRaw16, gu16: pGu16, dn32: pDn32, dn16: pDn16,
+            moe: pMoe, mhcStream: pMhcStream, mhcControls: pMhcControls, fgb16: pFgb16
         )
         return (sc, psc, pscStartOff)
     }

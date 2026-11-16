@@ -295,9 +295,12 @@ final class QWTelemetryHonestyTests: XCTestCase {
             "Sources/Apps/QWServer/Resources/controlbar.html",
             "Sources/Apps/QWServer/Resources/css/base.css",
             "Sources/Apps/QWServer/Resources/css/panels.css",
+            "Sources/Apps/QWServer/Resources/css/chat.css",
             "Sources/Apps/QWServer/Resources/js/state.js",
             "Sources/Apps/QWServer/Resources/js/dashboard.js",
             "Sources/Apps/QWServer/Resources/js/markdown.js",
+            "Sources/Apps/QWServer/Resources/js/chat-presets.js",
+            "Sources/Apps/QWServer/Resources/js/chat.js",
             "Sources/Apps/QWServer/Resources/js/actions.js",
         ].map { try source($0) }.joined(separator: "\n")
         XCTAssertFalse(dashboard.contains("util.gpuUsagePercent || 0"),
@@ -428,5 +431,20 @@ final class QWTelemetryHonestyTests: XCTestCase {
         XCTAssertEqual(duringTurn2.prefillRateSeries.count, 2)
         XCTAssertNotNil(duringTurn2.prefillRateSeries[0])
         XCTAssertNil(duringTurn2.prefillRateSeries[1])
+    }
+
+    func testFlashNextAndLayerStageTelemetryHonesty() throws {
+        let fnEngine = try source("Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift")
+        XCTAssertFalse(fnEngine.contains("if self.pack == nil {"),
+                       "Flash-Next zero-copy pack slabs must never be skipped from standalone weight telemetry")
+        XCTAssertTrue(fnEngine.contains("standaloneWeightBytes("),
+                      "FNGPUEngine must compute non-arena weights via standaloneWeightBytes")
+
+        let denseKernel = try source("Sources/Runtime/QWEngine/Module/QWDenseLayerKernels.swift")
+        let hybridKernel = try source("Sources/Runtime/QWEngine/Module/QWHybridLayerKernels.swift")
+        XCTAssertTrue(denseKernel.contains("profileStage(\"mlp.dense\")"),
+                      "DenseLayerKernel must emit mlp.dense stage markers for non-mHC layers")
+        XCTAssertTrue(hybridKernel.contains("mark(\"attn.gqa\")") && hybridKernel.contains("profileStage(\"attn.gqa\")"),
+                      "FullAttentionLayerKernel must emit attn.gqa stage markers for GQA layers")
     }
 }

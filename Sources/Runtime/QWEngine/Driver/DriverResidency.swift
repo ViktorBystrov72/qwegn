@@ -36,21 +36,17 @@ extension QWEngineDriver {
         return min(physical, max(1 << 30, live - headroom))
     }
 
-    /// The geometry with as many resident experts per layer as fit the budget.
-    static func planResidentGeometry(
+    /// The geometry and prefill chunk size fitting resident weights inside the UMA budget.
+    static func planResidencyAndChunk(
         raw: QWModelGeometry, cfg: StartupConfig, hal: QWHal, format: QWWeightFormat, tuning: QWEngineTuning,
         osReserveGiB: Double?, prefillChunkSize: Int, maxTokens: Int, ropeRows: Int,
         mtpDrafts: Int, mtpWeightDrafts: Int, kvMode: QWKVMode
-    ) -> QWModelGeometry {
-        let maxMTP0 = cfg.mtpBackend == .dflash2 ? 15 : 5
+    ) -> (geometry: QWModelGeometry, prefillChunkSize: Int) {
+        let maxMTP0 = cfg.mtpBackend == .dflash2 ? 15 : 7
         let arenaCap0 = max(1 << 30, hal.caps.maxWorkingSetBytes - (64 << 20))
         let avail0 = Self.residencyBudgetBytes(policy: tuning.memoryPolicy, osReserveGiB: osReserveGiB, arenaCap: arenaCap0)
-        let chunk0 = max(32, min(4096, (prefillChunkSize / 32) * 32))
+        let chunk0 = max(32, min(QWPrefillLimits.maxRows, (prefillChunkSize / 32) * 32))
         let useNax0 = hal.caps.isMetal4TensorCapable
-        let bpt0 = Self.prefillBytesPerToken(geometry: raw, useGroupedNAX: useNax0)
-        let act0 = chunk0 * bpt0 + Self.decodeAndMTPScratchBytes(
-            geometry: raw, prefillChunkRows: chunk0, mtpDrafts: mtpDrafts,
-            maxTokens: maxTokens, useGroupedNAX: useNax0)
         let numV0 = raw.numVirtualLayers
         let attnCount0 = (0..<numV0).filter { raw.isVirtualLayerFullAttention($0) }.count
         let gdnCount0 = raw.gdnLayerCount
@@ -63,47 +59,75 @@ extension QWEngineDriver {
             + (mtpDrafts > 0 ? 2 * trunkHidB0 : 0)
             + (1 << 20)
         let activeAttn0 = attnCount0 + (mtpDrafts > 0 ? 1 : 0)
-        let mlaFixed0 = Self.mlaFixedScratchBytes(geometry: raw, prefillChunkRows: chunk0, activeAttnLayers: activeAttn0)
-            + Self.hcaFixedScratchBytes(geometry: raw, prefillChunkRows: chunk0)
-            + (mtpDrafts > 0 && raw.mtpSharedLastLayer ? (112 << 20) : 0)
-        let minFitTokens0 = max(16_384, min(maxTokens, 32_768))
+        let modelCap0 = raw.maxPositionEmbeddings > 0 ? min(maxTokens, raw.maxPositionEmbeddings) : maxTokens
+        let minFitTokens0 = min(modelCap0, max(16_384, min(maxTokens, 32_768)))
         let kv0 = Self.kvBudgetBytes(maxTokens: minFitTokens0, mtpDrafts: mtpDrafts, kvMode: kvMode, geometry: raw)
             + Self.hcaPerTokenBytes(geometry: raw) * minFitTokens0
         let devEmbedEnv = cfg.environment["QW_MTP_DEVICE_EMBEDDING"] ?? cfg.environment["QW_MTP_DEVICE_EMBED"]
         let forceDeviceEmbed = devEmbedEnv == "1"
         let disableDeviceEmbed = devEmbedEnv == "0"
-        let baseReserve = act0 + gdn0 + mlaFixed0 + kv0 + (1024 << 20)
-        let safeCapWithoutEmbed = max(1 << 30, avail0 - baseReserve)
         let fullWPlan = try? QWWeightAllocationPlan(
             geometry: raw, ropeRows: max(ropeRows, maxTokens),
             mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP0,
             format: format)
         let fullBytes0 = fullWPlan?.bytes ?? 0
         let embedBytes0 = raw.vocab * raw.hidden * 2
-        let canFitDeviceEmbed = fullBytes0 > 0 && (fullBytes0 + embedBytes0 <= safeCapWithoutEmbed)
-        let mtpEmbed0 = (!disableDeviceEmbed && mtpDrafts > 0
-            && (forceDeviceEmbed || (mtpDrafts > 1 && canFitDeviceEmbed))) ? embedBytes0 : 0
-        let nonWeightReserve = baseReserve + mtpEmbed0
-        let safeWeightCap = max(1 << 30, avail0 - nonWeightReserve)
-        if fullBytes0 > safeWeightCap {
-            let minE = max(8, raw.expertsPerTok)
-            var chosenE = minE
-            var cand = ((raw.numExperts - 2) / 2) * 2
-            while cand >= minE {
-                let candGeo = raw.withResidentExperts(cand)
-                if let p = try? QWWeightAllocationPlan(
-                    geometry: candGeo, ropeRows: max(ropeRows, maxTokens),
-                    mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP0,
-                    format: format),
-                   p.bytes <= safeWeightCap {
-                    chosenE = cand
-                    break
-                }
-                cand -= 2
-            }
-            return raw.withResidentExperts(chosenE)
+
+        func safeWeightCap(forChunk chunkRows: Int) -> Int {
+            let bpt = Self.prefillBytesPerToken(geometry: raw, maxPrefillChunk: chunkRows, useGroupedNAX: useNax0)
+            let act = chunkRows * bpt + Self.decodeAndMTPScratchBytes(
+                geometry: raw, prefillChunkRows: chunkRows, mtpDrafts: mtpDrafts,
+                maxTokens: maxTokens, useGroupedNAX: useNax0)
+            let mlaFixed = Self.mlaFixedScratchBytes(geometry: raw, prefillChunkRows: chunkRows, activeAttnLayers: activeAttn0)
+                + Self.hcaFixedScratchBytes(geometry: raw, prefillChunkRows: chunkRows)
+                + (mtpDrafts > 0 && raw.mtpSharedLastLayer ? (112 << 20) : 0)
+            let baseReserve = act + gdn0 + mlaFixed + kv0 + (256 << 20)
+            let safeCapWithoutEmbed = max(1 << 30, avail0 - baseReserve)
+            let canFitDeviceEmbed = fullBytes0 > 0 && (fullBytes0 + embedBytes0 + (1 << 30) <= safeCapWithoutEmbed)
+            let mtpEmbed = (!disableDeviceEmbed && mtpDrafts > 0
+                && (forceDeviceEmbed || (mtpDrafts > 1 && canFitDeviceEmbed))) ? embedBytes0 : 0
+            return max(1 << 30, avail0 - (baseReserve + mtpEmbed))
         }
-        return raw
+
+        if fullBytes0 <= safeWeightCap(forChunk: chunk0) {
+            return (raw, chunk0)
+        }
+        for candChunk in [3584, 3072, 2560, 2048, 1536, 1024, 512] where candChunk < chunk0 {
+            if fullBytes0 <= safeWeightCap(forChunk: candChunk) {
+                return (raw, candChunk)
+            }
+        }
+
+        let fallbackChunk = min(chunk0, 1024)
+        let fallbackCap = safeWeightCap(forChunk: fallbackChunk)
+        let minE = max(8, raw.expertsPerTok)
+        var chosenE = minE
+        var cand = ((raw.numExperts - 2) / 2) * 2
+        while cand >= minE {
+            let candGeo = raw.withResidentExperts(cand)
+            if let p = try? QWWeightAllocationPlan(
+                geometry: candGeo, ropeRows: max(ropeRows, maxTokens),
+                mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP0,
+                format: format),
+               p.bytes <= fallbackCap {
+                chosenE = cand
+                break
+            }
+            cand -= 2
+        }
+        return (raw.withResidentExperts(chosenE), fallbackChunk)
+    }
+
+    static func planResidentGeometry(
+        raw: QWModelGeometry, cfg: StartupConfig, hal: QWHal, format: QWWeightFormat, tuning: QWEngineTuning,
+        osReserveGiB: Double?, prefillChunkSize: Int, maxTokens: Int, ropeRows: Int,
+        mtpDrafts: Int, mtpWeightDrafts: Int, kvMode: QWKVMode
+    ) -> QWModelGeometry {
+        planResidencyAndChunk(
+            raw: raw, cfg: cfg, hal: hal, format: format, tuning: tuning,
+            osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize, maxTokens: maxTokens,
+            ropeRows: ropeRows, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts, kvMode: kvMode
+        ).geometry
     }
 
     /// Predicts the GPU memory footprint (weights, KV cache, activations/GDN scratch) and
@@ -141,7 +165,7 @@ extension QWEngineDriver {
         let clampedContext = max(64, min(1_048_576, contextTokens))
         let rawGeometry = QWModelGeometry(descriptor: descriptor).withResidentExperts(tuning.residentExpertsPerLayer)
         let effDrafts = max(0, mtpDrafts)
-        let maxMTP = ["dflash2", "dflash", "dspine"].contains(mtpBackend.lowercased()) ? 15 : 5
+        let maxMTP = ["dflash2", "dflash", "dspine"].contains(mtpBackend.lowercased()) ? 15 : 7
         let mtpWeightDrafts = descriptor.mtpLayers > 0 ? min(effDrafts, maxMTP) : 0
         let format: QWWeightFormat = {
             if let path = packPath, !path.isEmpty {
@@ -162,8 +186,8 @@ extension QWEngineDriver {
             }
             return .hq4G32
         }()
-        let chunkRows = max(32, min(4096, (prefillChunkSize / 32) * 32))
-        let bpt = Self.prefillBytesPerToken(geometry: rawGeometry)
+        let chunkRows = max(32, min(QWPrefillLimits.maxRows, (prefillChunkSize / 32) * 32))
+        let bpt = Self.prefillBytesPerToken(geometry: rawGeometry, maxPrefillChunk: chunkRows)
         let actBytes = chunkRows * bpt + Self.decodeAndMTPScratchBytes(
             geometry: rawGeometry, prefillChunkRows: chunkRows, mtpDrafts: effDrafts, maxTokens: clampedContext)
         let numV = rawGeometry.numVirtualLayers
@@ -190,9 +214,14 @@ extension QWEngineDriver {
         let availBytes = max(0, (physicalMemoryBytes ?? 0) - max(0, Int((reserveGiB * Double(1 << 30)).rounded())))
         let geometry = { () -> QWModelGeometry in
             guard isMoE, tuning.residentExpertsPerLayer == nil, availBytes > 0 else { return rawGeometry }
-            let minFitKV = Self.kvBudgetBytes(maxTokens: max(16_384, min(clampedContext, 32_768)),
+            let modelCap = rawGeometry.maxPositionEmbeddings > 0
+                ? min(clampedContext, rawGeometry.maxPositionEmbeddings)
+                : clampedContext
+            let minFitTokens = min(modelCap, max(16_384, min(clampedContext, 32_768)))
+            let minFitKV = Self.kvBudgetBytes(maxTokens: minFitTokens,
                                               mtpDrafts: effDrafts, kvMode: kvMode, geometry: rawGeometry)
-            let safeWeightCap = max(1 << 30, availBytes - (actBytes + gdnBytes + mlaFixedBytes + minFitKV + (1024 << 20)))
+                + Self.hcaPerTokenBytes(geometry: rawGeometry) * minFitTokens
+            let safeWeightCap = max(1 << 30, availBytes - (actBytes + gdnBytes + mlaFixedBytes + minFitKV + (256 << 20)))
             let fullPlan = try? QWWeightAllocationPlan(geometry: rawGeometry, ropeRows: ropeRows, mtpDrafts: mtpWeightDrafts,
                                                        headQ4g: true, maxMTPDrafts: maxMTP, format: format)
             guard let fullBytes = fullPlan?.bytes, fullBytes > safeWeightCap else { return rawGeometry }

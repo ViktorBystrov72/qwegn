@@ -221,7 +221,7 @@ public enum QWGemmAQ {
         blocks.bind(enc, index: 0)
         x.bind(enc, index: 1)
         y.bind(enc, index: 3)
-        let useMultiRow = !f32Activations && rows >= 2 && rows <= 4 && n < (1 << 24)
+        let useMultiRow = !f32Activations && rows >= 2 && rows <= 8 && n < (1 << 24)
         let useRows4 = !f32Activations && n < (1 << 30)
         var n32: UInt32
         if useMultiRow {

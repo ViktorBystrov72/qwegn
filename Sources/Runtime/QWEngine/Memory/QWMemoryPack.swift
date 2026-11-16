@@ -21,6 +21,21 @@ public enum QWMemoryPack {
         public var vaultFileCount: Int { fileEntries.filter { !$0.inCortex }.count }
     }
 
+    /// Per-file tokenization and packing progress emitted by `buildEnvelope`.
+    public struct FileProgressUpdate: Sendable, Equatable {
+        public let processedFiles: Int
+        public let totalFiles: Int
+        public let currentFile: String
+        public let tokenizedTokens: Int
+
+        public init(processedFiles: Int, totalFiles: Int, currentFile: String, tokenizedTokens: Int) {
+            self.processedFiles = processedFiles
+            self.totalFiles = totalFiles
+            self.currentFile = currentFile
+            self.tokenizedTokens = tokenizedTokens
+        }
+    }
+
     public struct DeltaOverlay: Sendable, Equatable {
         public let deltaBlock: String
         public let modifiedFiles: [String]
@@ -140,6 +155,29 @@ public enum QWMemoryPack {
         maxTokens: Int? = nil,
         tokenCounter: (String) throws -> Int
     ) rethrows -> BuiltEnvelope {
+        try buildEnvelope(
+            packName: packName,
+            rootPath: rootPath,
+            files: files,
+            clusterBlockTokens: clusterBlockTokens,
+            kvMode: kvMode,
+            maxTokens: maxTokens,
+            onFileProgress: nil,
+            tokenCounter: tokenCounter
+        )
+    }
+
+    /// Packs discovered files into the `<|memory|>...</|memory|>` envelope and emits per-file progress.
+    public static func buildEnvelope(
+        packName: String,
+        rootPath: String,
+        files: [DiscoveredFile],
+        clusterBlockTokens: Int = 512,
+        kvMode: String = "q4",
+        maxTokens: Int? = nil,
+        onFileProgress: ((FileProgressUpdate) -> Void)?,
+        tokenCounter: (String) throws -> Int
+    ) rethrows -> BuiltEnvelope {
         let headerPrefix = "Memory<|memory|>\n[QWG MEMORY PACK: \(packName) | root: \(rootPath)]\n"
         var body = ""
         var runningTokens = try tokenCounter(headerPrefix)
@@ -157,13 +195,21 @@ public enum QWMemoryPack {
         }
         var prepared: [PreparedSection] = []
         var totalRawTokens = runningTokens
-        for file in files {
+        for (index, file) in files.enumerated() {
             let symbols = QWMemoryVault.extractSymbols(from: file.content, relativePath: file.relativePath)
             let normalizedBody = file.content.hasSuffix("\n") ? file.content : (file.content + "\n")
             let section = "\n[FILE: \(file.relativePath)]\n" + normalizedBody
             let sectionTokens = try tokenCounter(section)
             prepared.append(PreparedSection(file: file, symbols: symbols, section: section, sectionTokens: sectionTokens))
             totalRawTokens += sectionTokens
+            onFileProgress?(
+                FileProgressUpdate(
+                    processedFiles: index + 1,
+                    totalFiles: files.count,
+                    currentFile: file.relativePath,
+                    tokenizedTokens: totalRawTokens
+                )
+            )
         }
 
         let needsTwoTierVault = tokenCap != nil && (totalRawTokens + 96 > tokenCap!)

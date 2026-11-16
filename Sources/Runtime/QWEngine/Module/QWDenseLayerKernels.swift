@@ -36,6 +36,9 @@ class DenseLayerKernel: @unchecked Sendable {
     /// layer overrides it — the rest of the layer is shared.
     func encodeMLP(_ context: QWLayerDecodeContext) throws {
         let driver = context.driver
+        if context.weights.mhc == nil {
+            driver.profileStage("mlp.dense")
+        }
         let enc = context.enc
         let sc = driver.sc
         let geometry = driver.geometry
@@ -54,6 +57,9 @@ class DenseLayerKernel: @unchecked Sendable {
     /// The layer's MLP for one prefill chunk: the dense SwiGLU.
     func encodeMLPPrefill(_ context: QWLayerPrefillContext) throws {
         let driver = context.driver
+        if context.weights.mhc == nil {
+            driver.profileStage("mlp.dense")
+        }
         let enc = context.enc
         let psc = driver.psc
         let geometry = driver.geometry

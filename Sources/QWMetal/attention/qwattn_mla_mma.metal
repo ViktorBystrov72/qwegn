@@ -19,7 +19,7 @@ static inline uint qw_mla_col(uint l) { return ((l >> 3) & 1u) * 4u + (l & 1u) *
 #define MLA_ABS_TK 32u
 
 template <bool SUB2>
-static inline void qwg_mla_absorb_q_mma_impl(
+METAL_FUNC void qwg_mla_absorb_q_mma_impl(
     device const half*       mlaQFull,
     device const char*       kvBBlocks,
     device half*             qAbsOut,
@@ -316,7 +316,7 @@ kernel void qwg_mla_sparse_attn_mma(
 // 6b. Value up-projection on simdgroup MMA for HQ4_G32, SHVQ, and AQ/HQ (rank 512, v 256).
 // Grid: (qHeads, (T + 31) / 32, vHeadDim / 128), Threadgroup: (128, 1, 1).
 template <bool SUB2>
-static inline void qwg_mla_proj_uv_mma_impl(
+METAL_FUNC void qwg_mla_proj_uv_mma_impl(
     device const half*       uLat,
     device const char*       kvBBlocks,
     device half*             attOut,

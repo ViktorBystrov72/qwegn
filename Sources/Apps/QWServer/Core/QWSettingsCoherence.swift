@@ -141,6 +141,7 @@ public enum QWSettingsCoherence {
         "ssdCacheLimitGB": "Cold SSD limit",
         "cacheDir": "Cache directory",
         "logLevel": "Log level",
+        "coolingPolicy": "Cooling & fan policy",
         "keepServerRunningAfterQuit": "Keep server running after quit",
     ]
 
@@ -152,6 +153,7 @@ public enum QWSettingsCoherence {
         "modelAlias": "The name the active model answers to.",
         "modelAliases": "The names the installed models answer to.",
         "loadVision": "Loads or unloads the vision tower in place without restarting the engine or resetting the KV cache.",
+        "coolingPolicy": "Changes AppleSMC cooling policy immediately (System Auto, Proactive Pre-Spin during active inference, or Max Blast). Direct fan RPM override requires root SMC write privilege.",
         "logDir": "Where the app writes its log file.",
         "logFileName": "The app's log file name.",
     ]

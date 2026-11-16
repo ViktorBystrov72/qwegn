@@ -35,9 +35,9 @@ final class QWMTPBackendTests: XCTestCase {
             XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 2), backend)
             XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 3), backend)
             XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 5), backend)
+            XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 6), backend)
+            XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 7), backend)
             if backend == .dflash2 {
-                XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 6), backend)
-                XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 7), backend)
                 XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 11), backend)
                 XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 15), backend)
             }
@@ -47,7 +47,7 @@ final class QWMTPBackendTests: XCTestCase {
             }
         }
         // Invalid drafts are rejected with the historical error.
-        for drafts in [-1, 6, Int.max] {
+        for drafts in [-1, 8, Int.max] {
             for backend in [nil, QWMTPBackend.standard, QWMTPBackend.variational] {
                 XCTAssertThrowsError(try QWMTPBackend.resolveSelection(backend, drafts: drafts))
             }

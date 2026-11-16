@@ -329,7 +329,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         if let moeW = layer.moe, let moeSc = self.moe {
             try QWMoEChain.encode(enc: &enc, hal: driver.hal, moe: moeW, s: moeSc,
                                   x16: ln2, dn32: dn32, dn16: dn16,
-                                  rows: 1, geometry: geometry, driver: driver)
+                                  rows: 1, geometry: geometry, driver: driver, skipOut32: true)
         } else {
             driver.mlpSiluPairH16(enc, x: ln2, gs: driver.sc.gs, wQ4: layer.gu.view,
                                   h16: mlpInter, fuseFwht32: true)

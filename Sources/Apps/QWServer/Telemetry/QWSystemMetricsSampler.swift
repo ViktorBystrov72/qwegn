@@ -39,6 +39,22 @@ public struct QWSystemHardwareUtilization: Sendable, Codable, Equatable {
     public var memoryPressurePercent: Double?
     public var metalAllocatedBytes: UInt64
     public var metalMaxWorkingSetBytes: UInt64
+    /// Host GPU die hotspot temperature in Celsius, or nil if unavailable.
+    public var gpuTemperatureCelsius: Double?
+    public var gpuTemperatureUnavailableReason: String?
+    /// Host CPU cluster temperature in Celsius, or nil if unavailable.
+    public var cpuTemperatureCelsius: Double?
+    /// Host memory cluster temperature in Celsius, or nil if unavailable.
+    public var memoryTemperatureCelsius: Double?
+    /// Active cooling fan speed in RPM, or nil if fan telemetry is absent.
+    public var fanSpeedRPM: Double?
+    public var fanSpeedUnavailableReason: String?
+    public var fanControlStatus: String?
+    /// Host total system power draw in Watts (`PSTR`), or nil if unavailable.
+    public var systemPowerWatts: Double?
+    public var systemPowerUnavailableReason: String?
+    /// ProcessInfo thermal pressure state (`Nominal`, `Fair`, `Serious`, `Critical`).
+    public var thermalStateLevel: String?
     /// When the reading was taken. A cached reading says how old it is.
     public var sampledAt: Date
 
@@ -59,6 +75,16 @@ public struct QWSystemHardwareUtilization: Sendable, Codable, Equatable {
         memoryPressurePercent: Double? = nil,
         metalAllocatedBytes: UInt64 = 0,
         metalMaxWorkingSetBytes: UInt64 = 0,
+        gpuTemperatureCelsius: Double? = nil,
+        gpuTemperatureUnavailableReason: String? = nil,
+        cpuTemperatureCelsius: Double? = nil,
+        memoryTemperatureCelsius: Double? = nil,
+        fanSpeedRPM: Double? = nil,
+        fanSpeedUnavailableReason: String? = nil,
+        fanControlStatus: String? = nil,
+        systemPowerWatts: Double? = nil,
+        systemPowerUnavailableReason: String? = nil,
+        thermalStateLevel: String? = nil,
         sampledAt: Date = Date()
     ) {
         self.cpuUsagePercent = cpuUsagePercent
@@ -77,6 +103,16 @@ public struct QWSystemHardwareUtilization: Sendable, Codable, Equatable {
         self.memoryPressurePercent = memoryPressurePercent
         self.metalAllocatedBytes = metalAllocatedBytes
         self.metalMaxWorkingSetBytes = metalMaxWorkingSetBytes
+        self.gpuTemperatureCelsius = gpuTemperatureCelsius
+        self.gpuTemperatureUnavailableReason = gpuTemperatureUnavailableReason
+        self.cpuTemperatureCelsius = cpuTemperatureCelsius
+        self.memoryTemperatureCelsius = memoryTemperatureCelsius
+        self.fanSpeedRPM = fanSpeedRPM
+        self.fanSpeedUnavailableReason = fanSpeedUnavailableReason
+        self.fanControlStatus = fanControlStatus
+        self.systemPowerWatts = systemPowerWatts
+        self.systemPowerUnavailableReason = systemPowerUnavailableReason
+        self.thermalStateLevel = thermalStateLevel
         self.sampledAt = sampledAt
     }
 
@@ -101,6 +137,16 @@ public struct QWSystemHardwareUtilization: Sendable, Codable, Equatable {
             memoryPressurePercent: try c.decodeIfPresent(Double.self, forKey: .memoryPressurePercent),
             metalAllocatedBytes: try c.decodeIfPresent(UInt64.self, forKey: .metalAllocatedBytes) ?? 0,
             metalMaxWorkingSetBytes: try c.decodeIfPresent(UInt64.self, forKey: .metalMaxWorkingSetBytes) ?? 0,
+            gpuTemperatureCelsius: try c.decodeIfPresent(Double.self, forKey: .gpuTemperatureCelsius),
+            gpuTemperatureUnavailableReason: try c.decodeIfPresent(String.self, forKey: .gpuTemperatureUnavailableReason),
+            cpuTemperatureCelsius: try c.decodeIfPresent(Double.self, forKey: .cpuTemperatureCelsius),
+            memoryTemperatureCelsius: try c.decodeIfPresent(Double.self, forKey: .memoryTemperatureCelsius),
+            fanSpeedRPM: try c.decodeIfPresent(Double.self, forKey: .fanSpeedRPM),
+            fanSpeedUnavailableReason: try c.decodeIfPresent(String.self, forKey: .fanSpeedUnavailableReason),
+            fanControlStatus: try c.decodeIfPresent(String.self, forKey: .fanControlStatus),
+            systemPowerWatts: try c.decodeIfPresent(Double.self, forKey: .systemPowerWatts),
+            systemPowerUnavailableReason: try c.decodeIfPresent(String.self, forKey: .systemPowerUnavailableReason),
+            thermalStateLevel: try c.decodeIfPresent(String.self, forKey: .thermalStateLevel),
             sampledAt: try c.decodeIfPresent(Date.self, forKey: .sampledAt) ?? Date())
     }
 }
@@ -148,6 +194,7 @@ public final class QWSystemMetricsSampler: @unchecked Sendable {
         let cpu = sampleCPULoad()
         let mem = sampleMemoryAndPressure()
         let gpu = sampleGPU(memTotal: mem.totalBytes)
+        let smc = QWFanController.shared.sampleAndReconcile()
         let reading = QWSystemHardwareUtilization(
             cpuUsagePercent: cpu.percent,
             cpuUsageUnavailableReason: cpu.reason,
@@ -165,6 +212,16 @@ public final class QWSystemMetricsSampler: @unchecked Sendable {
             memoryPressurePercent: mem.pressurePercent,
             metalAllocatedBytes: gpu.allocatedBytes,
             metalMaxWorkingSetBytes: gpu.maxWorkingSetBytes,
+            gpuTemperatureCelsius: smc.gpuTemperatureCelsius,
+            gpuTemperatureUnavailableReason: smc.gpuTemperatureUnavailableReason,
+            cpuTemperatureCelsius: smc.cpuTemperatureCelsius,
+            memoryTemperatureCelsius: smc.memoryTemperatureCelsius,
+            fanSpeedRPM: smc.fanSpeedRPM,
+            fanSpeedUnavailableReason: smc.fanSpeedUnavailableReason,
+            fanControlStatus: smc.fanControlStatus,
+            systemPowerWatts: smc.systemPowerWatts,
+            systemPowerUnavailableReason: smc.systemPowerUnavailableReason,
+            thermalStateLevel: smc.thermalStateLevel,
             sampledAt: Date())
         cached = reading
         return reading

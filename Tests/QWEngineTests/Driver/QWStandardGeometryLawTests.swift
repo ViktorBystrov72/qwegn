@@ -161,8 +161,8 @@ final class QWStandardGeometryLawTests: XCTestCase {
             XCTAssertNotEqual(bytes, QWEngineDriver.prefillBytesPerToken(geometry: Self.b27),
                 "\(s.name): the footprint must not be the 27B's")
         }
-        // The 27B's own live prefill scratch: 145_408 f16 + 52_416 f32 elements.
-        XCTAssertEqual(QWEngineDriver.prefillBytesPerToken(geometry: Self.b27), 500_480)
+        // 27B live prefill scratch: persistent + max(attn, mlp) without dead <=4096 WY slabs.
+        XCTAssertEqual(QWEngineDriver.prefillBytesPerToken(geometry: Self.b27), 297_728)
     }
 
     func testAdaptivePrefillChunkCapHonorsSubquadraticAttention() {

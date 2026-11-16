@@ -22,11 +22,14 @@ final class DashboardRendererParityTests: XCTestCase {
     private static let stylesheetPaths = [
         "Sources/Apps/QWServer/Resources/css/base.css",
         "Sources/Apps/QWServer/Resources/css/panels.css",
+        "Sources/Apps/QWServer/Resources/css/chat.css",
     ]
     private static let scriptPaths = [
         "Sources/Apps/QWServer/Resources/js/state.js",
         "Sources/Apps/QWServer/Resources/js/dashboard.js",
         "Sources/Apps/QWServer/Resources/js/markdown.js",
+        "Sources/Apps/QWServer/Resources/js/chat-presets.js",
+        "Sources/Apps/QWServer/Resources/js/chat.js",
         "Sources/Apps/QWServer/Resources/js/actions.js",
     ]
 
@@ -432,9 +435,12 @@ final class DashboardRendererParityTests: XCTestCase {
             ("/ui/logo.svg", "image/svg+xml", "Sources/Apps/QWServer/Resources/logo.svg"),
             ("/ui/css/base.css", "text/css", "Sources/Apps/QWServer/Resources/css/base.css"),
             ("/ui/css/panels.css", "text/css", "Sources/Apps/QWServer/Resources/css/panels.css"),
+            ("/ui/css/chat.css", "text/css", "Sources/Apps/QWServer/Resources/css/chat.css"),
             ("/ui/js/state.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/state.js"),
             ("/ui/js/dashboard.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/dashboard.js"),
             ("/ui/js/markdown.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/markdown.js"),
+            ("/ui/js/chat-presets.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/chat-presets.js"),
+            ("/ui/js/chat.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/chat.js"),
             ("/ui/js/actions.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/actions.js"),
         ]
         for spec in assetSpecs {
@@ -548,6 +554,176 @@ final class DashboardRendererParityTests: XCTestCase {
         let disconnectFn = try XCTUnwrap(Self.function("renderDisconnected", in: script))
         XCTAssertTrue(disconnectFn.contains("dataset.sig"),
                       "disconnect must clear hero signature so reconnect re-renders cleanly")
+    }
+
+    func testChatTabAndWorkbenchControlsExistInMarkup() throws {
+        let doc = try html()
+        for required in [
+            "id=\"nav-tab-chat\"",
+            "id=\"view-chat\"",
+            "id=\"probe-open-chat-btn\"",
+            "/ui/css/chat.css",
+            "/ui/js/chat-presets.js",
+            "/ui/js/chat.js",
+            "id=\"chat-mempack-badge\"",
+            "id=\"chat-workspace-path\"",
+            "id=\"chat-mempack-mount-btn\"",
+            "id=\"chat-harness-bar\"",
+            "id=\"chat-system-drawer\"",
+            "id=\"chat-params-drawer\"",
+            "id=\"chat-param-cache-prompt\"",
+            "id=\"chat-param-cache-key\"",
+            "id=\"chat-param-store\"",
+            "id=\"chat-param-exact-spec\"",
+            "id=\"chat-param-metadata\"",
+            "id=\"chat-tools-json\"",
+            "id=\"chat-attach-btn\"",
+            "id=\"chat-stop-btn\"",
+        ] {
+            XCTAssertTrue(doc.contains(required), "missing chat workbench markup: \(required)")
+        }
+
+        let stateScript = try Self.read("Sources/Apps/QWServer/Resources/js/state.js")
+        let switchFn = try XCTUnwrap(Self.function("switchTab", in: stateScript), "missing switchTab")
+        XCTAssertTrue(switchFn.contains("\"chat\""), "switchTab must accept chat tab")
+    }
+
+    func testChatWorkbenchPayloadSSEThinkingAndToolHelpersInJSContext() throws {
+        let ctx = try XCTUnwrap(JSContext())
+        var jsError: String?
+        ctx.exceptionHandler = { _, exc in
+            jsError = exc?.toString() ?? "unknown JS error"
+        }
+
+        let allScript = try script()
+        for name in ["escapeHtml", "formatTokenCount", "sanitizeMarkdownUrl", "splitMarkdownTableCells",
+                     "isMarkdownTableDelimiter", "applyInlineMarkdownEmphasis", "renderInlineMarkdown",
+                     "renderSmokeProbeMarkdown"] {
+            let fnBody = try XCTUnwrap(Self.function(name, in: allScript), "missing \(name)")
+            ctx.evaluateScript("function \(name)\(fnBody)")
+            XCTAssertNil(jsError, "JS error evaluating \(name): \(jsError ?? "")")
+        }
+
+        let presetsScript = try Self.read("Sources/Apps/QWServer/Resources/js/chat-presets.js")
+        ctx.evaluateScript(presetsScript)
+        XCTAssertNil(jsError, "JS error evaluating chat-presets.js: \(jsError ?? "")")
+
+        let chatScript = try Self.read("Sources/Apps/QWServer/Resources/js/chat.js")
+        ctx.evaluateScript(chatScript)
+        XCTAssertNil(jsError, "JS error evaluating chat.js: \(jsError ?? "")")
+
+        let presetCount = ctx.evaluateScript("getAllSystemPresets().length")?.toInt32() ?? 0
+        XCTAssertGreaterThanOrEqual(presetCount, 5)
+
+        let harnessCheck = ctx.evaluateScript("""
+        (() => {
+          const s = createBlankChatSession("H", "server-default", "");
+          applyPresetHarnessToSession(s, "coding-agent");
+          const coding = Object.assign({}, s.params);
+          applyPresetHarnessToSession(s, "deep-reasoning");
+          const deep = Object.assign({}, s.params);
+          applyPresetHarnessToSession(s, "concise-technical");
+          const concise = Object.assign({}, s.params);
+          applyPresetHarnessToSession(s, "json-extractor");
+          const jsonEx = Object.assign({}, s.params);
+          const detected = detectWorkspacePathInSystemPrompt("Working in /Users/dev/Developer/ai/qwegine.");
+          s.presetId = "coding-agent";
+          s.systemPrompt = getPresetById("coding-agent").prompt;
+          s.workspacePath = detected;
+          s.messages.push({ id: "u1", role: "user", content: "Explain QWMemoryPack" });
+          globalThis.publishedModel = { facts: { mountedMemoryPack: "qwegine (Q4)", mountedMemoryPackRoot: detected, mountedMemoryPackKV: "q4" } };
+          const builtPrompt = buildHarnessedSystemPrompt(s);
+          const builtPayload = buildChatCompletionPayload(s, {});
+          delete globalThis.publishedModel;
+          return {
+            coding, deep, concise, jsonEx, detected, builtPrompt,
+            sysRole: builtPayload.messages[0].role,
+            sysContent: builtPayload.messages[0].content,
+            validOk: validateJsonTurnContent('{"ok":true}').valid,
+            fencedOk: validateJsonTurnContent('```json\\n{}\\n```').valid
+          };
+        })()
+        """)?.toDictionary()
+        XCTAssertNil(jsError, "harness check threw: \(jsError ?? "")")
+        let codingP = try XCTUnwrap(harnessCheck?["coding"] as? [String: Any])
+        XCTAssertEqual(codingP["enableThinking"] as? String, "true")
+        XCTAssertEqual(codingP["reasoningEffort"] as? String, "high")
+        XCTAssertEqual(codingP["temperature"] as? Double ?? -1, 0.2, accuracy: 0.001)
+        let deepP = try XCTUnwrap(harnessCheck?["deep"] as? [String: Any])
+        XCTAssertEqual(deepP["temperature"] as? Double ?? -1, 0.6, accuracy: 0.001)
+        XCTAssertEqual(deepP["enableThinking"] as? String, "true")
+        let conciseP = try XCTUnwrap(harnessCheck?["concise"] as? [String: Any])
+        XCTAssertEqual(conciseP["enableThinking"] as? String, "false")
+        XCTAssertEqual(conciseP["reasoningEffort"] as? String, "low")
+        let jsonP = try XCTUnwrap(harnessCheck?["jsonEx"] as? [String: Any])
+        XCTAssertEqual(jsonP["responseFormat"] as? String, "json_object")
+        XCTAssertEqual(jsonP["temperature"] as? Double ?? -1, 0.0, accuracy: 0.001)
+        XCTAssertEqual(harnessCheck?["detected"] as? String, "/Users/dev/Developer/ai/qwegine")
+        let builtSys = try XCTUnwrap(harnessCheck?["sysContent"] as? String)
+        XCTAssertTrue(builtSys.contains("<workspace_context>"))
+        XCTAssertTrue(builtSys.contains("Workspace directory: /Users/dev/Developer/ai/qwegine"))
+        XCTAssertTrue(builtSys.contains("<memory_pack_harness>"))
+        XCTAssertEqual(harnessCheck?["validOk"] as? Bool, true)
+        XCTAssertEqual(harnessCheck?["fencedOk"] as? Bool, false)
+
+        let payloadCheck = ctx.evaluateScript("""
+        (() => {
+          const baseSession = createBlankChatSession("Test", "server-default", "");
+          baseSession.messages.push({
+            id: "u1", role: "user", content: "Inspect this",
+            images: [{ dataUrl: "data:image/png;base64,AAAA" }]
+          });
+          const p1 = buildChatCompletionPayload(baseSession, {});
+          baseSession.systemPrompt = "Be strict";
+          baseSession.params.enableThinking = "true";
+          baseSession.params.reasoningEffort = "xhigh";
+          baseSession.params.responseFormat = "json_object";
+          baseSession.params.toolsJson = '[{"type":"function","function":{"name":"ping"}}]';
+          baseSession.messages.push({ id: "a1", role: "assistant", content: "Partial" });
+          const p2 = buildChatCompletionPayload(baseSession, { continueLastAssistant: true });
+          return { p1, p2 };
+        })()
+        """)?.toDictionary()
+        XCTAssertNil(jsError, "payload builder threw: \(jsError ?? "")")
+        let p1 = try XCTUnwrap(payloadCheck?["p1"] as? [String: Any])
+        let p1Msgs = try XCTUnwrap(p1["messages"] as? [[String: Any]])
+        XCTAssertEqual(p1Msgs.count, 1, "empty systemPrompt should omit leading system turn")
+        let firstParts = p1Msgs[0]["content"] as? [[String: Any]]
+        XCTAssertEqual(firstParts?.count, 2, "multimodal turn should preserve text and image_url")
+
+        let p2 = try XCTUnwrap(payloadCheck?["p2"] as? [String: Any])
+        let p2Msgs = try XCTUnwrap(p2["messages"] as? [[String: Any]])
+        XCTAssertEqual(p2Msgs.first?["role"] as? String, "system")
+        XCTAssertEqual(p2["enable_thinking"] as? Bool, true)
+        XCTAssertEqual(p2["reasoning_effort"] as? String, "xhigh")
+        XCTAssertEqual((p2["response_format"] as? [String: Any])?["type"] as? String, "json_object")
+        XCTAssertEqual((p2["tools"] as? [[String: Any]])?.count, 1)
+        XCTAssertEqual(p2["continue_final_message"] as? Bool, true)
+        XCTAssertNil(p2["add_generation_prompt"])
+
+        let sseDone = ctx.evaluateScript("parseChatSSELine('data: [DONE]')")?.toDictionary()
+        XCTAssertEqual(sseDone?["done"] as? Bool, true)
+
+        let sseErr = ctx.evaluateScript(#"parseChatSSELine('data: {"type":"server_error","message":"boom"}')"#)?.toDictionary()
+        XCTAssertEqual(sseErr?["error"] as? String, "boom")
+
+        let mergedToolName = ctx.evaluateScript("""
+        (() => {
+          let calls = mergeToolCallChunks([], [{ index: 0, id: "call_1", type: "function", function: { name: "read_", arguments: '{"path":' } }]);
+          calls = mergeToolCallChunks(calls, [{ index: 0, function: { name: "file", arguments: '"a.swift"}' } }]);
+          return calls[0].function.name + "|" + calls[0].function.arguments;
+        })()
+        """)?.toString()
+        XCTAssertEqual(mergedToolName, #"read_file|{"path":"a.swift"}"#)
+
+        let thinkSplit = ctx.evaluateScript(#"splitInlineThinkTags("<think>step 1</think>\nFinal answer", "", false)"#)?.toDictionary()
+        XCTAssertEqual(thinkSplit?["reasoning"] as? String, "step 1")
+        XCTAssertEqual(thinkSplit?["answer"] as? String, "Final answer")
+
+        let mdFn = try XCTUnwrap(ctx.objectForKeyedSubscript("renderSmokeProbeMarkdown"))
+        let mdRendered = try XCTUnwrap(mdFn.call(withArguments: ["```swift\nlet x = 1\n```"])?.toString())
+        XCTAssertTrue(mdRendered.contains("md-code-copy-btn"))
+        XCTAssertTrue(mdRendered.contains("<pre class=\"mono\"><code>let x = 1</code></pre>"))
     }
 
     private static func rawLoopbackHTTP(port: UInt16, requestLine: String) -> String {

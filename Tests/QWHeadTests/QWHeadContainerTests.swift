@@ -131,4 +131,31 @@ final class QWHeadContainerTests: XCTestCase {
         XCTAssertNoThrow(try QWHead.encodeQ4g(enc, hal: Self.hal, weight: weight,
                                                x: x, y: y))
     }
+
+    func testBatchedHeadM6AndM9MatchHost() throws {
+        let bytes = bank(bits: 3, group: 64)
+        let arena = try arena(weights: bytes.count)
+        let w = try arena.weightsRegion().allocate(QWTensorShape([bytes.count / 2], .f16))
+        arena.copyIn(w, from: bytes)
+        let view = try XCTUnwrap(QWWeightView(blocks: w, n: rows, k: k,
+                                              bits: 3, groupSize: 64, isRotated: false))
+        let act = arena.activationsRegion()
+        for m in [6, 9] {
+            let x = try act.allocate(QWTensorShape([m * k], .f16))
+            let y = try act.allocate(QWTensorShape([m * rows], .f32))
+            let xs = (0..<m).map { activation(row: $0) }
+            let xp = arena.cpuPointer(of: x).assumingMemoryBound(to: Float16.self)
+            for (r, row) in xs.enumerated() { for (i, v) in row.enumerated() { xp[r * k + i] = v } }
+            let cb = try XCTUnwrap(Self.hal.queue.makeCommandBuffer())
+            let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
+            try QWHead.encodeBatched(enc, hal: Self.hal, view: view, x: x, y: y, m: m)
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            let yp = arena.cpuPointer(of: y).assumingMemoryBound(to: Float.self)
+            for r in 0..<m {
+                assertLogits(yp + r * rows, reference(bytes, bits: 3, group: 64, x: xs[r]), "m=\(m) row \(r)")
+            }
+        }
+    }
 }

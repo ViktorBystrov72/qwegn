@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2">
   <img src="https://img.shields.io/badge/platform-macOS%2026%20(Apple%20Silicon)-lightgrey.svg" alt="macOS 26, Apple Silicon">
   <a href="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml"><img src="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.21.6-green.svg" alt="Release v0.21.6"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.23.0-green.svg" alt="Release v0.23.0"></a>
 </p>
 
 **Qwegn** (`qwg`) is a from-scratch LLM/VLM inference engine for Apple Silicon,
@@ -72,9 +72,9 @@ Pre-quantized official Qwegn model packs are hosted under [`huggingface.co/qwegn
 | Qwen3.6-35B-A3B (`HQ4_G32`) | 6,419 tok/s (`6,142` @64K) | 233.4 tok/s | **2,317 / 105.6 tok/s** @1M (`136.8` @64K `e-means`) | **0.12 s** `.qwcache` (`54.4×` vs 6.53 s) |
 | Qwen3.8-Flash-Next (`HQ8+HQ4` + `VQ2` PLE) | **3,035 tok/s** (`2,947` @4K) | **145.4 tok/s** (`95.1` novel) | **1,888 / 63.7 tok/s** @1M (`e-means` · `1,350 / 41.1` QSA) | **0.24 s** `.qwcache` (`74.3×` vs 17.84 s) |
 | Edge0-145B (`145B`, `HQ8+HQ4` + `VQ2` PLE 83.1 GiB) | **2,568–2,572 tok/s** | **116.4 tok/s** (`80.9` novel · `102.6` 4-stream · `67.6` CLI) | **1,886 tok/s** @300K (`3/3` · 1M `69.7 GiB` `q4` / `103.0 GiB` `q8` UMA) | **8 ms** warm cache (`119.8×`) |
-| Qwen3.8-27B (+ `DSpine-b16`) | 1,035 tok/s (`914` @64K) | **134.5 tok/s** (`4.19×`) | **831 / 36.5 tok/s** @1M (`e-means` / `Ward`) | 6 ms warm cache (`307×`) |
+| Qwen3.8-27B (+ `DSpine-b16`) | 1,043 tok/s (`914` @64K) | **148.0 tok/s** (`144.1` serve · `4.19×`) | **831 / 36.5 tok/s** @1M (`e-means` / `Ward`) | 6–29 ms warm cache (`2.33M` tok/s @65.5K) |
 | GLM-5.3-Flash (`321B`, `SHVQ4/2/3` 100.6 GiB) | **1,014 tok/s** (`1,006` @5.2K · `869` serve) | **50.7–53.6 tok/s** (`46.0` novel · `81/100` code) | **743 / 45.0 tok/s** @242.5K (`e-means`) · 1M UMA | **10–18 ms** warm cache (`96–193×`) |
-| ERNIE-5.5-Flash-Base (`280B`, `HQ8+SHVQ15/3` 81.6 GiB) | **989 tok/s** (`992` pk · `909` @16K) | **40.2–42.6 tok/s** (ECHO `d=1`, `+28.1%`) | **303 / 16.3 tok/s** @300K (`e-means`) · 1M `87.6 GiB` UMA | **0.29 s** `.qwcache` (`78.6×` vs 22.79 s) |
+| ERNIE-5.5-Flash-Base (`280B`, `HQ8+SHVQ15/3` 81.6 GiB) | **1,137 tok/s** (`1,015` serve · `909` @16K) | **64.2 tok/s** (`d=5` code · `40.2–42.6` ECHO `d=1`) | **303 / 16.3 tok/s** @300K (`e-means`) · 1M `87.6 GiB` UMA | **0.29 s** `.qwcache` (`78.6×` vs 22.79 s) |
 
 <p align="center">
   <img src="assets/qwegn_lsa_emeans_overview.svg" alt="Qwegn 64K to 1M Long-Context Scaling Overview" width="100%">
@@ -140,7 +140,8 @@ Standard `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5_text` and `mistral` ch
 Index any git repository into `<repo>/.qwg/` (`manifest.json` + `.qwcache`) to give `qwg repl`, `qwg run`, and `qwg serve` instant whole-codebase visibility without cold prefill or exploratory grep loops:
 
 ```bash
-# 1. Build repository memory pack offline (auto-selects kvMode from ~/.qwg/profiles/<model>.json)
+# 1. Build repository memory pack offline (or auto-delegate to a running `qwg serve` daemon when locked;
+#    auto-selects kvMode from ~/.qwg/profiles/<model>.json)
 .build/release/qwg index /path/to/repo --model ~/.qwg/models/Qwen3.8-Flash-Next-hq8g32-hq4g64
 
 # 2. Interactive REPL (auto-mounts .qwg/manifest.json in cwd; slash commands: /memory, /memory mount|unmount)
@@ -166,7 +167,7 @@ OpenAI-, Anthropic-, and Ollama-compatible HTTP server (auto-discovers `<repo>/.
 | **OpenAI API** | `POST /v1/chat/completions` · `GET /v1/models`<br>`POST /v1/models/load` · `POST /v1/models/unload` | Streaming SSE (`stream: true`), multimodal `image_url`, constrained JSON & tool calling, `reasoning_content`, runtime model switching |
 | **Anthropic API** | `POST /v1/messages` | Streaming SSE events, system prompts, thinking blocks, tool use |
 | **Ollama API** | `POST /api/chat` · `POST /api/generate` · `GET /api/tags`<br>`GET /api/ps` · `POST /api/show` · `POST /api/load` · `POST /api/unload` | NDJSON streaming, model status and residency management |
-| **Memory & Telemetry** | `POST /v1/memory/mount` · `POST /v1/memory/unmount`<br>`GET /v1/engine/info` · `GET /ui` · `GET /v1/dashboard` · `GET /metrics` | Live `.qwcache` repo memory mount/unmount & `kvMode` lock, built-in web UI (`http://127.0.0.1:8080/ui`), live token/s and cache telemetry |
+| **Memory & Telemetry** | `POST /v1/memory/inspect` · `POST /v1/memory/index` (SSE)<br>`POST /v1/memory/mount` · `POST /v1/memory/unmount`<br>`GET /v1/engine/info` · `GET /ui` · `GET /v1/dashboard` · `GET /metrics` | Live `.qwcache` inspection, streaming SSE indexing, and `#modal-memory-pack` in `/ui`, hot mount/unmount & `kvMode` lock, built-in web UI (`http://127.0.0.1:8080/ui`), live token/s and cache telemetry |
 
 Example OpenAI request:
 
@@ -191,7 +192,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `qwg pull` | Downloads a Hugging Face checkpoint (`org/model`) into a local directory using parallel HTTP range requests. |
 | `qwg quantize` | Converts a BF16 safetensors checkpoint into a page-aligned quantized `.qwp` pack. |
 | `qwg inspect` | Validates a pack's header, provenance, quantization descriptors, and tensor geometry (`--dequant` exports `.npy`). |
-| `qwg index` | Builds an offline 3-tier LSA codebase memory pack (`<repo>/.qwg/manifest.json` + `.qwcache`). |
+| `qwg index` | Builds a 3-tier LSA codebase memory pack (`<repo>/.qwg/manifest.json` + `.qwcache`), auto-delegating to a running `qwg serve` daemon if the engine lock is held. |
 | `qwg run` | Executes single-turn generation from a prompt string or file (`--repo <path>` mounts `.qwcache`). |
 | `qwg repl` | Launches an interactive multi-turn terminal chat session with automatic `.qwg/` memory & prefix caching. |
 | `qwg serve` | Runs the multi-protocol HTTP inference server (OpenAI, Anthropic, Ollama, Memory API, and Web UI). |

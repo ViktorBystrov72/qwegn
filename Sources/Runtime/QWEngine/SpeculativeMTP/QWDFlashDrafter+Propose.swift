@@ -31,16 +31,17 @@ extension QWDFlashDrafter {
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }
 
-    private func encodeQ4Matmul(_ enc: any MTLComputeCommandEncoder,
-                                weight: QWWeightView,
-                                input: QWTensorValue,
-                                output: QWTensorValue,
-                                rows: Int) {
+    func encodeQ4Matmul(_ enc: any MTLComputeCommandEncoder,
+                        weight: QWWeightView,
+                        input: QWTensorValue,
+                        output: QWTensorValue,
+                        rows: Int) {
         if !QWMTPBatchedMLP.usesQ4GMKernel(weight) {
             encodeAQMatmul(enc, weight: weight, input: input, output: output, rows: rows)
             return
         }
         let n = weight.n, k = weight.k
+        let useNaxSmall = isMetal4TensorCapable && rows >= 9 && n % 64 == 0 && k % 64 == 0
         if rows == 1 {
             enc.setComputePipelineState(psoGemvT4)
             weight.blocks.bind(enc, index: 0)
@@ -52,39 +53,32 @@ extension QWDFlashDrafter {
             output.bind(enc, index: 8)
             enc.dispatchThreadgroups(MTLSize(width: (n + 3) / 4, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-        } else if let pso = psoDownBatched[rows] {
-            let rowPairedPSO = QWMTPBatchedMLP.usesRowPairs(weight, activeRows: rows) ? psoDownRowPaired[rows] : nil
-            enc.setComputePipelineState(rowPairedPSO ?? pso)
+        } else if !useNaxSmall, let pso = psoDownBatched[rows] {
+            let isAQ4 = !weight.isIncumbentContainer
+            let rowPaired = QWMTPBatchedMLP.usesRowPairs(weight, activeRows: rows)
+            let resolved = isAQ4
+                ? (rowPaired ? (psoDownRowPairedAQ4[rows] ?? pso) : (psoDownBatchedAQ4[rows] ?? pso))
+                : ((rowPaired ? psoDownRowPaired[rows] : nil) ?? pso)
+            enc.setComputePipelineState(resolved)
             weight.blocks.bind(enc, index: 0)
             input.bind(enc, index: 1)
             output.bind(enc, index: 3)
-            var nU = UInt32(n) | (weight.isIncumbentContainer ? 0 : 0x8000_0000), kU = UInt32(k)
+            var nU = UInt32(n) | (isAQ4 ? 0x8000_0000 : 0), kU = UInt32(k)
             enc.setBytes(&nU, length: 4, index: 4)
             enc.setBytes(&kU, length: 4, index: 5)
-            let tptg = rowPairedPSO == nil ? 128 : 64
+            let tptg = rowPaired && (isAQ4 ? psoDownRowPairedAQ4[rows] != nil : psoDownRowPaired[rows] != nil) ? 64 : 128
             enc.dispatchThreadgroups(MTLSize(width: (n + 3) / 4, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: tptg, height: 1, depth: 1))
-        } else if (9...16).contains(rows) {
+        } else if !useNaxSmall && (9...16).contains(rows) {
             let c0 = rows / 2, c1 = rows - c0
             encodeQ4Matmul(enc, weight: weight, input: input.slice(byteOffset: 0, count: c0 * k),
                            output: output.slice(byteOffset: 0, count: c0 * n), rows: c0)
             encodeQ4Matmul(enc, weight: weight, input: input.slice(byteOffset: c0 * k * 2, count: c1 * k),
                            output: output.slice(byteOffset: c0 * n * 2, count: c1 * n), rows: c1)
+        } else if !weight.isIncumbentContainer {
+            encodeAQMatmul(enc, weight: weight, input: input, output: output, rows: rows)
         } else {
-            enc.setComputePipelineState(psoGemmBatched)
-            weight.blocks.bind(enc, index: 0)
-            input.bind(enc, index: 1)
-            output.bind(enc, index: 2)
-            output.bind(enc, index: 3)
-            var mU = UInt32(rows), nU = UInt32(n), kU = UInt32(k)
-            enc.setBytes(&mU, length: 4, index: 4)
-            enc.setBytes(&nU, length: 4, index: 5)
-            enc.setBytes(&kU, length: 4, index: 6)
-            var xs = UInt32(k), ys = UInt32(n)
-            enc.setBytes(&xs, length: 4, index: 9)
-            enc.setBytes(&ys, length: 4, index: 10)
-            enc.dispatchThreadgroups(MTLSize(width: (n + 63) / 64, height: (rows + 63) / 64, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            encodeSmallTileNAX(enc, pso: psoGemmBatched, weight: weight, input: input, output: output, rows: rows)
         }
     }
 
@@ -303,8 +297,15 @@ extension QWDFlashDrafter {
             }
         } else {
             switch headStorage {
-            case .q4g:
-                try head.encode(enc, storage: headStorage, x: propRotSlice, y: logitsSlice, M: D)
+            case .q4g(let hw):
+                if isMetal4TensorCapable && D >= 9 && hw.view.n % 64 == 0 && hw.view.k % 64 == 0 {
+                    try QWGemm.encodeNaxF32(
+                        enc, hal: hal, weight: hw.view,
+                        x16: propRotSlice, y16: propRotSlice, y32: logitsSlice, rows: D
+                    )
+                } else {
+                    try head.encode(enc, storage: headStorage, x: propRotSlice, y: logitsSlice, M: D)
+                }
             case .f16:
                 try head.encode(enc, storage: headStorage, x: propNormSlice, y: logitsSlice, M: D)
             }

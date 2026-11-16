@@ -24,7 +24,7 @@ public enum QWMTP {
                                                   targetDistributions: [QWSamplingDistribution],
                                                   seed: UInt64,
                                                   offset: UInt64 = 0,
-                                                  maxDrafts: Int = 5) throws -> GumbelRoundResult {
+                                                  maxDrafts: Int = 7) throws -> GumbelRoundResult {
         let n = draftDistributions.count
         guard maxDrafts >= 1, (1...maxDrafts).contains(n), targetDistributions.count == n + 1,
               let vocabulary = targetDistributions.first?.vocabulary,
@@ -80,7 +80,7 @@ public enum QWMTP {
     public static func checkedGumbelCouplingRound(winnerPairs: [[Int]],
                                                   bonusTarget: Int,
                                                   vocabulary: Int,
-                                                  maxDrafts: Int = 5) throws -> GumbelRoundResult {
+                                                  maxDrafts: Int = 7) throws -> GumbelRoundResult {
         guard maxDrafts >= 1, (1...maxDrafts).contains(winnerPairs.count), vocabulary > 0,
               (0..<vocabulary).contains(bonusTarget),
               winnerPairs.allSatisfy({

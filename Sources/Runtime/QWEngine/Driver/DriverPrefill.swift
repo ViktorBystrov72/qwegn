@@ -200,6 +200,11 @@ extension QWEngineDriver {
                 .assumingMemoryBound(to: Int32.self).pointee)
             nextId = try selectConstrainedToken(session: session, rawArgmax: rawId)
             session.generated += 1    // M2: committed only after the cb landed (the head ran once)
+            if activeConstraint == nil, count >= 1 {
+                let tailCur = tokens[start + count - 1]
+                let tailPrev = count >= 2 ? tokens[start + count - 2] : (start > 0 ? tokens[start - 1] : nil)
+                session.tokenRecycler.recordTransition(previous: tailPrev, current: tailCur, next: nextId)
+            }
             session.tokenHistory.append(nextId)
         }
 
@@ -241,6 +246,8 @@ extension QWEngineDriver {
     func prefill(_ session: QWEngineSession, tokens: [Int],
                          mode: GDNPrefillMode?, permit: QWGenerationPermit) throws -> Int {
         guard !tokens.isEmpty else { return 0 }
+        if session.position == 0 { session.tokenRecycler.reset() }
+        session.tokenRecycler.ingestSequence(tokens)
         session.tokenHistory = tokens
         emitPrefillProgress(session, done: 0, promptCount: tokens.count)
         let effectiveMode = mode ?? gdnPrefillMode

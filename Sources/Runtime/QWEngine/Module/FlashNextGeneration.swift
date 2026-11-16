@@ -131,7 +131,9 @@ extension FlashNextModule {
             onTokenLogprob: request.onTokenLogprob,
             constraint: request.constraint,
             retainPrefixLength: request.retainPrefixLength,
-            visualSpans: request.visualSpans
+            visualSpans: request.visualSpans,
+            usePrefixCache: request.usePrefixCache,
+            cacheSalt: request.cacheSalt
         )
         let out: FNBatchJobOutput
         do {

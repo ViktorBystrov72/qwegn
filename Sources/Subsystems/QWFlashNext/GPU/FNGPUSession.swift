@@ -145,6 +145,10 @@ public struct FNGPUSessionData {
     public var retainPrefixLength: Int?
     /// Merged visual feature spans sorted by `tokenOffset` in the expanded prompt.
     public var visualSpans: [QWVisualSpan]
+    /// Controls per-request prefix-cache lookup and saving (`cache_prompt: false` disables both).
+    public var usePrefixCache: Bool
+    /// Optional per-request prefix-cache isolation namespace (`prompt_cache_key` / `cache_salt`).
+    public var cacheSalt: String?
     /// Optional prefill progress callback invoked with `(completedComputedTokens, totalComputedTokens)`.
     public var onPrefillProgress: (@Sendable (Int, Int) -> Void)?
     /// Starting prefill position after prefix-cache restoration so progress excludes reused tokens.
@@ -155,12 +159,16 @@ public struct FNGPUSessionData {
                 constraint: (any QWTokenConstraint)? = nil,
                 retainPrefixLength: Int? = nil,
                 visualSpans: [QWVisualSpan] = [],
+                usePrefixCache: Bool = true,
+                cacheSalt: String? = nil,
                 onPrefillProgress: (@Sendable (Int, Int) -> Void)? = nil) {
         self.history = history
         self.sampler = sampler
         self.constraint = constraint
         self.retainPrefixLength = retainPrefixLength
         self.visualSpans = visualSpans.sorted { $0.tokenOffset < $1.tokenOffset }
+        self.usePrefixCache = usePrefixCache
+        self.cacheSalt = cacheSalt
         self.onPrefillProgress = onPrefillProgress
         self.useSpec = useSpec && !collectLogprobs && (constraint?.allowsSpeculation ?? true)
         prefillPos = 0

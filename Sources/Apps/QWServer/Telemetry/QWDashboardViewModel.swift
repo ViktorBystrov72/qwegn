@@ -75,11 +75,32 @@ public struct QWDashboardFacts: Sendable, Codable, Equatable {
     public let lsaMode: String?
     /// Mounted codebase memory pack summary, when active.
     public let mountedMemoryPack: String?
+    /// Mounted codebase memory pack root directory path, when active.
+    public let mountedMemoryPackRoot: String?
+    /// Number of indexed files in the mounted codebase memory pack, when active.
+    public let mountedMemoryPackFiles: Int?
+    /// Resident Cortex token count in the mounted codebase memory pack, when active.
+    public let mountedMemoryPackTokens: Int?
+    /// Live modified/deleted file delta count since `.qwcache` snapshot, when active.
+    public let mountedMemoryPackDelta: Int?
+    /// Enforced KV mode of the mounted codebase memory pack (`q4`, `q8`, `f16`), when active.
+    public let mountedMemoryPackKV: String?
+    /// Configured AppleSMC cooling policy (`auto`, `proactive`, `max`).
+    public let coolingPolicy: String?
+    /// Active fan control status reported by `QWFanController`.
+    public let fanControlStatus: String?
 
     public init(quantization: String? = nil, hostLogicalCores: Int? = nil,
                 gdnPrefillMode: String? = nil, gpuName: String? = nil,
                 metalFamily: String? = nil, physicalMemoryGB: Double? = nil,
-                lsaMode: String? = nil, mountedMemoryPack: String? = nil) {
+                lsaMode: String? = nil, mountedMemoryPack: String? = nil,
+                mountedMemoryPackRoot: String? = nil,
+                mountedMemoryPackFiles: Int? = nil,
+                mountedMemoryPackTokens: Int? = nil,
+                mountedMemoryPackDelta: Int? = nil,
+                mountedMemoryPackKV: String? = nil,
+                coolingPolicy: String? = nil,
+                fanControlStatus: String? = nil) {
         self.quantization = quantization
         self.hostLogicalCores = hostLogicalCores
         self.gdnPrefillMode = gdnPrefillMode
@@ -88,6 +109,13 @@ public struct QWDashboardFacts: Sendable, Codable, Equatable {
         self.physicalMemoryGB = physicalMemoryGB
         self.lsaMode = lsaMode
         self.mountedMemoryPack = mountedMemoryPack
+        self.mountedMemoryPackRoot = mountedMemoryPackRoot
+        self.mountedMemoryPackFiles = mountedMemoryPackFiles
+        self.mountedMemoryPackTokens = mountedMemoryPackTokens
+        self.mountedMemoryPackDelta = mountedMemoryPackDelta
+        self.mountedMemoryPackKV = mountedMemoryPackKV
+        self.coolingPolicy = coolingPolicy
+        self.fanControlStatus = fanControlStatus
     }
 }
 

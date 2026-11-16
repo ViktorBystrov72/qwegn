@@ -20,6 +20,10 @@ public enum QWTelemetryMetric: String, Sendable, CaseIterable {
     case gpuPercent = "hardware.gpu_percent"
     case memoryPercent = "hardware.memory_percent"
     case memoryPressure = "hardware.memory_pressure"
+    case gpuTemperatureCelsius = "hardware.gpu_temp_celsius"
+    case fanSpeedRPM = "hardware.fan_rpm"
+    case systemPowerWatts = "hardware.system_power_watts"
+    case thermalState = "hardware.thermal_state"
     case gpuBusyRatio = "gpu.busy_ratio"
     /// The last turn's prompt was served entirely from the prefix
     /// cache: the engine ran no prefill phase, so it has no prefill speed.

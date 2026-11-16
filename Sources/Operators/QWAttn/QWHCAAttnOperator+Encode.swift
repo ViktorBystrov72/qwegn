@@ -144,7 +144,10 @@ extension QWHCAAttnOperator {
         let useSplit = attnSplits > 1 && rows <= Self.splitMaxRows && approxSlots >= 64
         let nSplit = useSplit ? attnSplits : 1
         let useNAX = psoAttnNAX != nil && headDim == 512 && qHeads % 16 == 0
-        if let naxPSO = psoAttnNAX, useNAX {
+        let useNAXPrefill = useNAX && !useSplit && rows >= 16 && psoAttnNAXPrefill != nil
+        if let naxPrefillPSO = psoAttnNAXPrefill, useNAXPrefill {
+            enc.setComputePipelineState(naxPrefillPSO)
+        } else if let naxPSO = psoAttnNAX, useNAX {
             enc.setComputePipelineState(naxPSO)
         } else {
             enc.setComputePipelineState(psoAttnMMA)
@@ -160,7 +163,10 @@ extension QWHCAAttnOperator {
         enc.setBytes(&attP, length: MemoryLayout<AttnParams>.stride, index: 8)
         let hgPerTG = useNAX ? 32 : 16
         let tgThreads = useNAX ? 256 : 128
-        enc.dispatchThreadgroups(MTLSize(width: rows, height: (qHeads + hgPerTG - 1) / hgPerTG, depth: nSplit),
+        let gridSize = useNAXPrefill
+            ? MTLSize(width: (qHeads + hgPerTG - 1) / hgPerTG, height: rows, depth: 1)
+            : MTLSize(width: rows, height: (qHeads + hgPerTG - 1) / hgPerTG, depth: nSplit)
+        enc.dispatchThreadgroups(gridSize,
                                  threadsPerThreadgroup: MTLSize(width: tgThreads, height: 1, depth: 1))
         if useSplit {
             QWCoarsePoolIndex.barrierIfConcurrent(enc)

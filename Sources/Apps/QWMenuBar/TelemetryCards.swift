@@ -383,6 +383,10 @@ extension CupertinoTelemetryView {
         let reusedCard = card("cache.tokens_reused_total")
         let memCard = card("hardware.memory_percent")
         let pressureCard = card("hardware.memory_pressure_level")
+        let gpuTempCard = card("hardware.gpu_temp_celsius")
+        let fanCard = card("hardware.fan_rpm")
+        let powerCard = card("hardware.system_power_watts")
+        let thermalCard = card("hardware.thermal_state")
 
         return VStack(spacing: 0) {
             HStack(spacing: 0) {
@@ -447,6 +451,43 @@ extension CupertinoTelemetryView {
                 )
             }
             .padding(.vertical, 8)
+
+            horizontalHairline
+
+            HStack(spacing: 0) {
+                inlineMetricCell(
+                    label: "GPU Temp",
+                    valueText: formattedCardValue(gpuTempCard),
+                    isAvailable: gpuTempCard?.value != nil,
+                    tint: tempTint(gpuTempCard),
+                    help: gpuTempCard?.reason ?? "AppleSMC GPU hotspot temperature"
+                )
+                verticalHairline
+                inlineMetricCell(
+                    label: "Fans",
+                    valueText: formattedCardValue(fanCard),
+                    isAvailable: fanCard?.value != nil,
+                    tint: TelemetryTheme.cool,
+                    help: fanCard?.reason ?? telemetry.dashboard?.facts?.fanControlStatus ?? "Cooling fan speed"
+                )
+                verticalHairline
+                inlineMetricCell(
+                    label: "Power",
+                    valueText: formattedCardValue(powerCard),
+                    isAvailable: powerCard?.value != nil,
+                    tint: TelemetryTheme.secondary(increasedContrast: contrast == .increased),
+                    help: powerCard?.reason ?? "AppleSMC system power draw"
+                )
+                verticalHairline
+                inlineMetricCell(
+                    label: "Thermal",
+                    valueText: formattedCardValue(thermalCard),
+                    isAvailable: thermalCard?.value != nil,
+                    tint: thermalStateTint(thermalCard),
+                    help: thermalCard?.reason ?? "macOS thermal pressure state"
+                )
+            }
+            .padding(.vertical, 8)
         }
         .background(TelemetryTheme.substrate)
         .clipShape(.rect(cornerRadius: TelemetryTheme.Radius.large))
@@ -475,6 +516,21 @@ extension CupertinoTelemetryView {
 
     private func action(_ id: String) -> QWDashboardAction? {
         telemetry.dashboard?.actions.first { $0.id == id }
+    }
+
+    private func tempTint(_ tempCard: QWDashboardCard?) -> Color {
+        guard let c = tempCard?.number else { return TelemetryTheme.secondary(increasedContrast: contrast == .increased) }
+        if c >= 85 { return TelemetryTheme.failure }
+        if c >= 72 { return TelemetryTheme.warning }
+        return TelemetryTheme.prefill
+    }
+
+    private func thermalStateTint(_ stateCard: QWDashboardCard?) -> Color {
+        switch stateCard?.value?.lowercased() {
+        case "critical", "serious": return TelemetryTheme.failure
+        case "fair": return TelemetryTheme.warning
+        default: return TelemetryTheme.active
+        }
     }
 
     private func prefillProgressBarRow(

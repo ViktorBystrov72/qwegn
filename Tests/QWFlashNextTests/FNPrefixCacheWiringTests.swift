@@ -80,7 +80,9 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     /// directory happens to be there.
     func testTheEngineRunsItsCacheWhenATierIsOn() throws {
         let source = try Self.read(Self.engineSources)
-        XCTAssertTrue(source.contains("if hasPrefixCacheTier,"),
+        XCTAssertTrue(source.contains("let canUsePrefixCache = hasPrefixCacheTier && session.usePrefixCache"),
+                      "the cache gate must combine tier availability with session opt-in")
+        XCTAssertTrue(source.contains("if canUsePrefixCache,"),
                       "the lookup must run when a tier is on")
         XCTAssertFalse(source.contains("if let cacheDir = prefixCacheDirectory,\n               let restored"),
                        "the lookup must not wait for a cache directory")

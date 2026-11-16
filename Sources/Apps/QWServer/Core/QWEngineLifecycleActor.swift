@@ -224,6 +224,7 @@ public actor QWEngineLifecycleActor {
     var loadGeneration: UInt64 = 0
     struct CachedTokenPrefixEntry {
         let packPath: String
+        let cacheSalt: String
         let prefixWire: String
         let prefixTokens: [Int]
         let systemTokenCount: Int?

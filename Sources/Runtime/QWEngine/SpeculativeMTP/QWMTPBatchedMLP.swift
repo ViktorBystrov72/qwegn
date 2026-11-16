@@ -141,10 +141,9 @@ struct QWMTPBatchedMLP {
             try encodeProjection(enc, input: in1, weight: weight, output: out1, activeRows: c1, preparedSums: preparedSums)
             return
         }
+        let isAQ4 = !weight.isIncumbentContainer
         let rowPaired = Self.usesRowPairs(weight, activeRows: count)
-        guard let pipeline = (rowPaired ? downRowPaired : down)[count] else {
-            throw QWEngineDriverError.state("unsupported batched MLP active row count")
-        }
+        let pipeline = try pipelineDown(count: count, rowPaired: rowPaired, isAQ4: isAQ4)
         try encode(enc, input: input, weight: weight, output: output, pipeline: pipeline,
                    n: weight.n, k: weight.k, paired: false, activeRows: count,
                    preparedSums: preparedSums, rowPaired: rowPaired)
@@ -205,8 +204,9 @@ struct QWMTPBatchedMLP {
             try encodeGDNProjection(enc, input: in1, weight: weight, output: out1, controls: ctrl1, trunk: trunk, activeRows: c1)
             return
         }
+        let isAQ4 = !weight.isIncumbentContainer
         let rowPaired = Self.usesRowPairs(weight, activeRows: count)
-        let pipeline = try trunk.gdnPipeline(forActiveRows: count, rowPaired: rowPaired)
+        let pipeline = try trunk.gdnPipeline(forActiveRows: count, rowPaired: rowPaired, isAQ4: isAQ4)
         try encode(enc, input: input, weight: weight, output: output, pipeline: pipeline,
                    n: geometry.gdnTotalN, k: geometry.hidden, paired: false,
                    activeRows: count, controls: controls, rowPaired: rowPaired)
@@ -238,10 +238,9 @@ struct QWMTPBatchedMLP {
             try encodeGateUp(enc, input: in1, weight: weight, output: out1, activeRows: c1, fuseFwht32: fuseFwht32)
             return
         }
+        let isAQ4 = !weight.isIncumbentContainer
         let rowPaired = !useFwht && Self.usesRowPairs(weight, activeRows: count)
-        guard let pipeline = (useFwht ? gateUpFwht32[count] : (rowPaired ? gateUpRowPaired : gateUp)[count]) else {
-            throw QWEngineDriverError.state("unsupported batched MLP active row count")
-        }
+        let pipeline = try pipelineGateUp(count: count, useFwht: useFwht, rowPaired: rowPaired, isAQ4: isAQ4)
         try encode(enc, input: input, weight: weight, output: output, pipeline: pipeline,
                    n: 2 * geometry.intermediate, k: geometry.hidden, paired: true,
                    fwht32: useFwht, activeRows: count, rowPaired: rowPaired)
@@ -255,6 +254,7 @@ struct QWMTPBatchedMLP {
                                  n: geometry.hidden, k: geometry.intermediate, activeRows: count)
             return
         }
+        let isAQ4 = !weight.isIncumbentContainer
         if count > 8 && count <= rows,
            input.shape.dtype == .f16, input.shape.dims == [count * geometry.intermediate],
            valid(input, alignment: 8), !overlaps(downRows, input), !overlaps(sums, input) {
@@ -266,10 +266,8 @@ struct QWMTPBatchedMLP {
             let out1 = downRows.slice(byteOffset: c0 * geometry.hidden * 2, count: c1 * geometry.hidden)
             let rp0 = Self.usesRowPairs(weight, activeRows: c0)
             let rp1 = Self.usesRowPairs(weight, activeRows: c1)
-            guard let p0 = (rp0 ? downRowPaired : down)[c0],
-                  let p1 = (rp1 ? downRowPaired : down)[c1] else {
-                throw QWEngineDriverError.state("unsupported batched MLP active row count")
-            }
+            let p0 = try pipelineDown(count: c0, rowPaired: rp0, isAQ4: isAQ4)
+            let p1 = try pipelineDown(count: c1, rowPaired: rp1, isAQ4: isAQ4)
             try encode(enc, input: in0, weight: weight, output: out0, pipeline: p0,
                        n: geometry.hidden, k: geometry.intermediate, paired: false,
                        activeRows: c0, rowPaired: rp0)
@@ -279,9 +277,7 @@ struct QWMTPBatchedMLP {
             return
         }
         let rowPaired = Self.usesRowPairs(weight, activeRows: count)
-        guard let pipeline = (rowPaired ? downRowPaired : down)[count] else {
-            throw QWEngineDriverError.state("unsupported batched MLP active row count")
-        }
+        let pipeline = try pipelineDown(count: count, rowPaired: rowPaired, isAQ4: isAQ4)
         try encode(enc, input: input, weight: weight, output: downRows, pipeline: pipeline,
                    n: geometry.hidden, k: geometry.intermediate, paired: false,
                    activeRows: count, rowPaired: rowPaired)
@@ -315,7 +311,7 @@ struct QWMTPBatchedMLP {
         var r0 = 0
         while r0 < activeRows {
             let rem = activeRows - r0
-            let chunkRows = (rem > 4 && rem - 4 == 1) ? 3 : min(4, rem)
+            let chunkRows = (rem > 8 && rem - 8 == 1) ? 5 : min(8, rem)
             let xChunk = input.slice(byteOffset: r0 * k * 2, count: chunkRows * k)
             let yChunk = activeOutput.slice(byteOffset: r0 * n * 2, count: chunkRows * n)
             xChunk.bind(enc, index: 1)
@@ -360,7 +356,7 @@ struct QWMTPBatchedMLP {
         var r0 = 0
         while r0 < activeRows {
             let rem = activeRows - r0
-            let chunkRows = (rem > 4 && rem - 4 == 1) ? 3 : min(4, rem)
+            let chunkRows = (rem > 8 && rem - 8 == 1) ? 5 : min(8, rem)
             let xChunk = input.slice(byteOffset: r0 * k * 2, count: chunkRows * k)
             let yChunk = activeOutput.slice(byteOffset: r0 * intermediate * 2, count: chunkRows * intermediate)
             xChunk.bind(enc, index: 1)
@@ -394,7 +390,7 @@ struct QWMTPBatchedMLP {
         var r0 = 0
         while r0 < activeRows {
             let rem = activeRows - r0
-            let chunkRows = (rem > 4 && rem - 4 == 1) ? 3 : min(4, rem)
+            let chunkRows = (rem > 8 && rem - 8 == 1) ? 5 : min(8, rem)
             let xChunk = input.slice(byteOffset: r0 * k * 2, count: chunkRows * k)
             let yChunk = output.slice(byteOffset: r0 * n * 2, count: chunkRows * n)
             let cChunk = controls.output.slice(byteOffset: r0 * ctrlStride * 4, count: chunkRows * ctrlStride)
@@ -410,6 +406,29 @@ struct QWMTPBatchedMLP {
             r0 += chunkRows
         }
         enc.memoryBarrier(scope: .buffers)
+    }
+
+    private func pipelineGateUp(count: Int, useFwht: Bool, rowPaired: Bool, isAQ4: Bool) throws -> any MTLComputePipelineState {
+        if isAQ4 {
+            let name = useFwht ? "qwm_mlp_gate_up_fwht32_m\(count)"
+                : (rowPaired ? "qwm_mlp_gate_up_rp_m\(count)" : "qwm_mlp_gate_up_m\(count)")
+            return try hal.pipeline(name, isAQ4: true)
+        }
+        guard let pipeline = (useFwht ? gateUpFwht32[count] : (rowPaired ? gateUpRowPaired : gateUp)[count]) else {
+            throw QWEngineDriverError.state("unsupported batched MLP active row count")
+        }
+        return pipeline
+    }
+
+    private func pipelineDown(count: Int, rowPaired: Bool, isAQ4: Bool) throws -> any MTLComputePipelineState {
+        if isAQ4 {
+            let name = rowPaired ? "qwm_mlp_down_rp_m\(count)" : "qwm_mlp_down_m\(count)"
+            return try hal.pipeline(name, isAQ4: true)
+        }
+        guard let pipeline = (rowPaired ? downRowPaired : down)[count] else {
+            throw QWEngineDriverError.state("unsupported batched MLP active row count")
+        }
+        return pipeline
     }
 
     private func encode(_ enc: any MTLComputeCommandEncoder, input: QWTensorValue,

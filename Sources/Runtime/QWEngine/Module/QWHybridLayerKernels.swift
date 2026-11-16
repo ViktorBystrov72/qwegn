@@ -32,6 +32,7 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
         let H = geometry.hidden
         if geometry.gdnVectorDecay, let fgbProj = w.fgbProj, let fgb16 = sc.fgb16,
            let fB = w.fB, let gB = w.gB {
+            if context.weights.mhc == nil { mark("kda.in_proj") }
             try driver.gemvH16T4(enc, n: geometry.gdnQKVChannels, k: H, x: sc.ln1, gs: sc.gs,
                                  wQ4: w.inProj, y16: sc.qkv16)
             mark("kda.fgb_proj")
@@ -42,6 +43,7 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
                 enc, fgb: fgb16, fB: fB, gB: gB, aLog: w.aLog, dtBias: w.dtBias,
                 betas: sc.betas, glog: sc.glog, zOut: sc.z16, rows: 1)
         } else {
+            if context.weights.mhc == nil { mark("gdn.in_proj") }
             try driver.gemvH16GdnInProjT4(enc, n: geometry.gdnTotalN, k: H, x: sc.ln1, gs: sc.gs, wQ4: w.inProj,
                                    y16: sc.gdnY16, y32: sc.gdnY,
                                    aLog: w.aLog, dtBias: w.dtBias, betas: sc.betas, glog: sc.glog)
@@ -110,10 +112,12 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
                 stOut: context.session.ring[gi],
                 T: T)
         } else {
+            if context.weights.mhc == nil { mark("gdn.in_proj") }
             driver.gemmBatchedH16GdnInProj(enc, m: T, n: geometry.gdnTotalN, k: H,
                                     x: driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16),
                                     wQ4: w.inProj,
                                     qkv16: psc.qkv16, z16: psc.z16, y32: psc.gdnY)
+            if context.weights.mhc == nil { mark("gdn.conv") }
             try driver.gdnConv.encodePrefillWithHeadnorm(enc,
                                                           x: driver.prefixRows(psc.qkv16, rows: T, cols: qkvC, dt: .f16),
                                                           w: w.conv, bias: nil,
@@ -128,7 +132,7 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
         mark("gdn.recurrence")
         switch context.mode {
         case .chunked:
-            if T <= 4096 {
+            if T <= 4096 || geometry.gdnVectorDecay || psc.U.shape.elementCount < T * zC {
                 try driver.gdnPrefill.encodeRegRes(enc,
                                                    y: driver.prefixRows(psc.convY, rows: T, cols: qkvC, dt: .f16),
                                                    betas: driver.prefixRows(psc.betas, rows: T, cols: gdnVH, dt: .f32),
@@ -212,6 +216,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             let latRow = driver.prefixRows(mla.mlaLatentScratch, rows: 1, cols: mla.latentStride, dt: .f16)
             let qResRow = driver.prefixRows(mla.qResidScratch, rows: 1, cols: geometry.qLoraRank, dt: .f16)
             let qFullRow = driver.prefixRows(mla.mlaQFullScratch, rows: 1, cols: mla.qFullStride, dt: .f16)
+            mark("mla.qkv_a_proj")
             try driver.gemvH16T4(enc, n: w.qkvProj.n, k: H, x: sc.ln1, gs: sc.gs, wQ4: w.qkvProj, y16: latRow)
             mark("mla.latent_prep")
             mla.encodeLatentPrepAndPool(
@@ -231,6 +236,9 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             try driver.gemvH16T4(enc, n: H, k: geometry.qHeads * geometry.vHeadDim,
                           x: sc.attOut, gs: sc.gs48, wQ4: w.o, y16: sc.o16)
             return
+        }
+        if context.weights.mhc == nil {
+            mark("attn.gqa")
         }
         try driver.gemvH16T4(enc, n: geometry.attnTotalN, k: H, x: sc.ln1, gs: sc.gs, wQ4: w.qkvProj, y16: sc.attnY16)
         // C07 fused per-head norm + partial rope (position [pos]).
@@ -274,7 +282,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
 
     override func encodeAttentionPrefill(_ context: QWLayerPrefillContext) throws {
         let driver = context.driver
-        let enc = context.enc
+        var enc = context.enc
         let psc = driver.psc
         let geometry = driver.geometry
         let l = context.layer
@@ -319,6 +327,10 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                            wQ4: w.o,
                            y16: driver.prefixRows(psc.o16, rows: T, cols: H, dt: .f16))
             return
+        }
+        if context.weights.mhc == nil {
+            driver.profileStage("attn.gqa")
+            enc = driver.activeEnc ?? enc
         }
         driver.gemmBatchedH16(enc, m: T, n: geometry.attnTotalN, k: H,
                        x: driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16),

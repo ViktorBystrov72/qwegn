@@ -357,7 +357,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
         if let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelType) {
             return spec.maxSpeculativeDrafts
         }
-        return family == .qwen38FlashNext ? 3 : 5
+        return family == .qwen38FlashNext ? 3 : 7
     }
 
     /// True when physical layer `l` uses a sparse MoE block rather than a dense MLP.

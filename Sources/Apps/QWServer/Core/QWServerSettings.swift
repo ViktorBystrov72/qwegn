@@ -79,6 +79,9 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
     public var logFileName: String
     public var logLevel: String // "debug", "info", "warn", "error"
 
+    // MARK: - Thermal & Cooling
+    public var coolingPolicy: String // "auto", "proactive", "max"
+
     public struct DiscoveredModel: Identifiable, Hashable, Codable, Sendable {
         public var id: String { name }
         public let name: String
@@ -94,7 +97,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
 
         public init(name: String, packPath: String, family: String? = nil, nativeWindow: Int? = nil,
                     supported: Bool = true, reason: String? = nil,
-                    capabilities: [String] = [], maxSpeculativeDrafts: Int = 5,
+                    capabilities: [String] = [], maxSpeculativeDrafts: Int = 7,
                     hasLSASidecar: Bool = false, lsaSidecarPath: String? = nil) {
             self.name = name
             self.packPath = packPath
@@ -164,7 +167,8 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         cacheDir: String = "~/.qwg/cache",
         logDir: String = "~/.qwg/logs",
         logFileName: String = "qwg.log",
-        logLevel: String = "info"
+        logLevel: String = "info",
+        coolingPolicy: String = "auto"
     ) {
         self.runAtStartup = runAtStartup
         self.autoStartServer = autoStartServer
@@ -226,6 +230,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.logDir = logDir
         self.logFileName = logFileName
         self.logLevel = logLevel
+        self.coolingPolicy = QWCoolingPolicy(rawValue: coolingPolicy)?.rawValue ?? "auto"
     }
 
     public init(from decoder: Decoder) throws {
@@ -298,6 +303,8 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.logDir = try c.decodeIfPresent(String.self, forKey: .logDir) ?? "~/.qwg/logs"
         self.logFileName = try c.decodeIfPresent(String.self, forKey: .logFileName) ?? "qwg.log"
         self.logLevel = try c.decodeIfPresent(String.self, forKey: .logLevel) ?? "info"
+        let rawCooling = try c.decodeIfPresent(String.self, forKey: .coolingPolicy) ?? "auto"
+        self.coolingPolicy = QWCoolingPolicy(rawValue: rawCooling)?.rawValue ?? "auto"
     }
 
     /// Full expanded path to the log file
@@ -378,6 +385,25 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         }
     }
 
+    /// Returns the hardware-scaled default prefill chunk size for a model descriptor.
+    public static func recommendedPrefillChunkSize(
+        for descriptor: QWModelDescriptor?,
+        physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory
+    ) -> Int {
+        guard let descriptor else { return QWPrefillLimits.chunkRows }
+        let isMoE = (descriptor.numExperts ?? 0) > 0
+            || descriptor.family == .qwen38FlashNext
+            || descriptor.capabilities.contains(.moe)
+        let ramGB = Double(physicalMemory) / 1_000_000_000.0
+        if isMoE && ramGB > 36.5 {
+            return 4096
+        }
+        if ramGB > 90.0 {
+            return 2048
+        }
+        return QWPrefillLimits.chunkRows
+    }
+
     /// Reinstates the engine's top-performance default settings while preserving
     /// the currently selected model, model aliases, and host/port configuration.
     public mutating func resetToTopPerformanceDefaults(for descriptor: QWModelDescriptor? = nil) {
@@ -403,9 +429,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         lsaClusterBlock = QWLSAConfig.defaultClusterBlock
         lsaSidecarPath = ""
         engineTuning = [:]
-        let isMoE = (resolvedDescriptor?.numExperts ?? 0) > 0 || resolvedDescriptor?.family == .qwen38FlashNext
-        let hasLargeUnifiedMemory = Double(ProcessInfo.processInfo.physicalMemory) / 1_000_000_000.0 > 36.5
-        prefillChunkSize = (isMoE && hasLargeUnifiedMemory) ? 4096 : QWPrefillLimits.chunkRows
+        prefillChunkSize = Self.recommendedPrefillChunkSize(for: resolvedDescriptor)
         maxConcurrentSessions = QWCacheConfig.defaultMaxConcurrentSessions
         warmRAMLimitGB = 4.0
     }

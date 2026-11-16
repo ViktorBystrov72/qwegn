@@ -298,7 +298,9 @@ struct Run: ParsableCommand {
         }
 
         let effSettings = cliCfg.effectiveSettings
-        let configuredChunk = QWPrefillLimits.clampedRows(knobs.prefillChunkSize ?? effSettings.prefillChunkSize)
+        let configuredChunk = QWPrefillLimits.clampedRows(
+            cliCfg.defaultPrefillChunkSize(explicitChunkSize: knobs.prefillChunkSize)
+        )
         let minChunkRows = cliCfg.memoryPack != nil ? 1024 : 64
         let promptAlignedChunk = max(minChunkRows, ((promptIds.count + 63) / 64) * 64)
         let effectiveChunkSize = knobs.prefillChunkSize != nil
@@ -354,7 +356,7 @@ struct Run: ParsableCommand {
                     maxTokens: QWMemoryVault.defaultCortexTokenBudget,
                     tokenCounter: { try tok.encode($0).count }
                 )
-                let envWire = try Index.renderMemoryEnvelopeWire(
+                let envWire = try QWEngineLifecycleActor.renderMemoryEnvelopeWire(
                     systemContent: built.systemMessageContent,
                     chatTemplate: runtimeAssets.chatTemplate
                 )

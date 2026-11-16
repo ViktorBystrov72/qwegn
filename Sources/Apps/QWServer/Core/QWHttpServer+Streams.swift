@@ -9,15 +9,20 @@ public final class QWStreamKeepaliveGate: @unchecked Sendable {
     public init() {}
 
     public func stop() {
-        lock.lock()
-        stopped = true
-        lock.unlock()
+        lock.withLock { stopped = true }
+    }
+
+    @discardableResult
+    public func stopIfRunning() -> Bool {
+        lock.withLock {
+            if stopped { return false }
+            stopped = true
+            return true
+        }
     }
 
     public func isStopped() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return stopped
+        lock.withLock { stopped }
     }
 }
 
@@ -66,8 +71,12 @@ extension QWHttpServer {
         )
     }
 
-    func sendSSEHeaders(_ connection: NWConnection) {
-        let sseHeaders = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\(corsHeaderLines(for: connection))\r\n"
+    func sendSSEHeaders(_ connection: NWConnection, extraHeaders: [String] = []) {
+        var sseHeaders = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n"
+        for line in extraHeaders {
+            sseHeaders += "\(line)\r\n"
+        }
+        sseHeaders += "\(corsHeaderLines(for: connection))\r\n"
         connection.send(content: Data(sseHeaders.utf8), isComplete: false, completion: .contentProcessed({ _ in }))
     }
 

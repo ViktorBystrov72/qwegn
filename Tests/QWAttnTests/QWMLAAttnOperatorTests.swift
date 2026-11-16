@@ -458,4 +458,72 @@ final class QWMLAAttnOperatorTests: XCTestCase {
             XCTAssertLessThan(maxErr, 2e-3 * maxRef, "rows=\(rows)")
         }
     }
+
+    func testSparseAttnNAXH32BitExactMatchesH16AcrossKVModes() throws {
+        let hal = try QWHal(geometry: try Self.mlaGeometry())
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable, "Metal 4 NAX tensor required")
+        let pMLAH16 = try hal.pipeline("qwg_mla_sparse_attn_nax")
+        let pMLAH32 = try hal.pipeline("qwg_mla_sparse_attn_nax_h32")
+        let rows = 33, pos0 = 260, qHeads = 64, headDim = 192, rank = 512, nPages = 2
+        let halfRank = rank / 2
+        var s: UInt64 = 0x5EED_9876_1234_ABCD
+        func nextF(_ scale: Float) -> Float {
+            s = s &* 6364136223846793005 &+ 1442695040888963407
+            return Float(Int32(truncatingIfNeeded: s >> 33)) / Float(Int32.max) * scale
+        }
+        let qAbsBuf = Self.makeBuffer((0..<(rows * qHeads * rank)).map { _ in QWQuant.f32tof16Bits(nextF(0.3)) }, device: hal.device)
+        let tableBuf = Self.makeBuffer([Int32(0), Int32(1)], device: hal.device)
+        let poolStride = 32
+        let mlaBlk = Self.makeBuffer((0..<(rows * poolStride)).map { Int32($0 % 60) }, device: hal.device)
+        func makePool(mode: Int) -> any MTLBuffer {
+            let pBytes = mode == 0 ? 256 * halfRank * 2 : (mode == 1 ? 66048 : 34816)
+            var bytes = [UInt8](repeating: 0, count: nPages * pBytes)
+            for p in 0..<nPages {
+                let base = p * pBytes
+                if mode == 0 {
+                    for i in 0..<(256 * halfRank) {
+                        let w = QWQuant.f32tof16Bits(nextF(0.35))
+                        bytes[base + i * 2] = UInt8(w & 0xFF); bytes[base + i * 2 + 1] = UInt8(w >> 8)
+                    }
+                } else if mode == 1 {
+                    for i in 0..<65536 { s = s &* 1664525 &+ 1013904223; bytes[base + i] = UInt8((s >> 16) & 0xFF) }
+                    for r in 0..<256 {
+                        let w = QWQuant.f32tof16Bits(0.015)
+                        bytes[base + 65536 + r * 2] = UInt8(w & 0xFF); bytes[base + 65536 + r * 2 + 1] = UInt8(w >> 8)
+                    }
+                } else {
+                    for i in 0..<32768 { s = s &* 1664525 &+ 1013904223; bytes[base + i] = UInt8((s >> 16) & 0xFF) }
+                    for r in 0..<512 {
+                        let sc = QWQuant.f32tof16Bits(0.03125), bi = QWQuant.f32tof16Bits(-0.25)
+                        let off = base + 32768 + r * 4
+                        bytes[off] = UInt8(sc & 0xFF); bytes[off + 1] = UInt8(sc >> 8)
+                        bytes[off + 2] = UInt8(bi & 0xFF); bytes[off + 3] = UInt8(bi >> 8)
+                    }
+                }
+            }
+            return Self.makeBuffer(bytes, device: hal.device)
+        }
+        for kvMode in 0...2 {
+            let kPool = makePool(mode: kvMode), vPool = makePool(mode: kvMode)
+            let outCount = rows * qHeads * halfRank
+            var mlaP = QWMLAAttnOperator.SparseAttnParams(
+                T: UInt32(rows), pos0: UInt32(pos0), qHeads: UInt32(qHeads), headDim: UInt32(headDim),
+                kvLoraRank: UInt32(rank), topKPools: UInt32(poolStride), listStride: UInt32(poolStride),
+                kvMode: UInt32(kvMode))
+            func runMLA(_ pso: any MTLComputePipelineState, grid: MTLSize, tg: Int) -> [UInt16] {
+                let out = hal.device.makeBuffer(length: outCount * 2, options: .storageModeShared)!
+                guard let (cb, enc) = hal.begin() else { XCTFail("hal.begin"); return [] }
+                enc.setComputePipelineState(pso)
+                for (i, b) in [qAbsBuf, kPool, vPool, tableBuf, tableBuf, mlaBlk, out].enumerated() { enc.setBuffer(b, offset: 0, index: i) }
+                enc.setBytes(&mlaP, length: MemoryLayout<QWMLAAttnOperator.SparseAttnParams>.stride, index: 7)
+                enc.dispatchThreadgroups(grid, threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
+                hal.end(cb, enc); cb.waitUntilCompleted(); XCTAssertNil(cb.error)
+                let p = out.contents().bindMemory(to: UInt16.self, capacity: outCount)
+                return Array(UnsafeBufferPointer(start: p, count: outCount))
+            }
+            let mlaRef = runMLA(pMLAH16, grid: MTLSize(width: rows, height: qHeads / 16, depth: 1), tg: 128)
+            let mlaH32 = runMLA(pMLAH32, grid: MTLSize(width: qHeads / 32, height: rows, depth: 1), tg: 256)
+            XCTAssertEqual(mlaH32, mlaRef, "MLA h32 vs h16 must be bit-exact kvMode=\(kvMode)")
+        }
+    }
 }

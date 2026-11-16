@@ -11,16 +11,16 @@ using namespace metal;
 template<uint M>
 static inline void qwhead_q4g_batched(
         device const Block_HQ4_G32* blocks,
-        constant const half* x,
+        device const half* x,
         device float* y, uint N, uint K, uint tg, uint ti, uint tptg = 32u) {
-    const bool isAQ4 = (N & 0x80000000u) != 0u;
     const uint realN = N & 0x7FFFFFFFu;
     const uint simd_id = ti >> 5u;
     const uint lane = ti & 31u;
     const uint row = tg * max(1u, tptg >> 5u) + simd_id;
     if (row >= realN) return;
     float acc[M];
-    qwg_gemv_hq4_row_m<M>(blocks, x, row, K, lane, acc, isAQ4);
+    if (QW_IS_AQ4) qwg_gemv_hq4_row_m_t<M, true>(blocks, x, row, K, lane, acc);
+    else qwg_gemv_hq4_row_m_t<M, false>(blocks, x, row, K, lane, acc);
     if (lane == 0u) {
         #pragma unroll
         for (uint r = 0; r < M; r++) y[(size_t)r * realN + row] = acc[r];
@@ -31,9 +31,8 @@ static inline void qwhead_q4g_batched(
 template<uint M>
 static inline void qwhead_q4g_batched_rp(
         device const Block_HQ4_G32* blocks,
-        constant const half* x,
+        device const half* x,
         device float* y, uint N, uint K, uint tg, uint ti, uint tptg) {
-    const bool isAQ4 = (N & 0x80000000u) != 0u;
     const uint realN = N & 0x7FFFFFFFu;
     const uint row0 = (tg * (tptg >> 5u) + (ti >> 5u)) * 2u;
     if (row0 >= realN) return;
@@ -41,7 +40,8 @@ static inline void qwhead_q4g_batched_rp(
     device const Block_HQ4_G32* rows[2] = {blocks + (size_t)row0 * nBlocks,
                                            blocks + (size_t)min(row0 + 1u, realN - 1u) * nBlocks};
     float v[2][M];
-    qwg_gemv_hq4_rows_r_m<M, 2>(rows, x, K, ti & 31u, v, isAQ4);
+    if (QW_IS_AQ4) qwg_gemv_hq4_rows_r_m_t<M, 2, true>(rows, x, K, ti & 31u, v);
+    else qwg_gemv_hq4_rows_r_m_t<M, 2, false>(rows, x, K, ti & 31u, v);
     if ((ti & 31u) != 0u) return;
     #pragma unroll
     for (uint r = 0; r < M; r++) {
@@ -53,7 +53,7 @@ static inline void qwhead_q4g_batched_rp(
 #define QW_Q4G_RP_ENTRY(M) \
 kernel void qwg_head_q4g_rp_m##M( \
         device const Block_HQ4_G32* blocks [[buffer(0)]], \
-        constant const half* x [[buffer(1)]], \
+        device const half* x [[buffer(1)]], \
         device float* y [[buffer(3)]], \
         constant uint& N [[buffer(4)]], \
         constant uint& K [[buffer(5)]], \
@@ -71,7 +71,7 @@ QW_Q4G_RP_ENTRY(8)
 #define QW_Q4G_ENTRY(M) \
 kernel void qwg_head_q4g_m##M( \
         device const Block_HQ4_G32* blocks [[buffer(0)]], \
-        constant const half* x [[buffer(1)]], \
+        device const half* x [[buffer(1)]], \
         device float* y [[buffer(3)]], \
         constant uint& N [[buffer(4)]], \
         constant uint& K [[buffer(5)]], \

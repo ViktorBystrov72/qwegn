@@ -411,8 +411,8 @@ kernel void qwg_router_gemm(device const float* W [[buffer(0)]],
                             uint  lid [[thread_index_in_threadgroup]],
                             uint2 tpg [[threads_per_threadgroup]]) {
     device const ushort* W16 = (device const ushort*)W;
-    if (M <= 4u) {
-        // Decode / MTP verify (M = 1..4): one expert per simdgroup (same lane-strided sum, so bit-identical to M=1)
+    if (M <= 8u) {
+        // Decode / MTP verify (M = 1..8): one expert per simdgroup (same lane-strided sum, so bit-identical to M=1)
         // reading W once across all M rows to fill every GPU core with zero threadgroup barriers.
         const uint sgi = lid >> 5u;
         const uint lane = lid & 31u;
@@ -422,48 +422,82 @@ kernel void qwg_router_gemm(device const float* W [[buffer(0)]],
         const bool computeSh = (hasShGate != 0u && e == N);
         device const float4* shW4 = (device const float4*)shGateW;
         if (e < N) {
-            float4 acc = float4(0.0f);
+            float4 acc0 = float4(0.0f);
+            float4 acc1 = float4(0.0f);
             if (isBF16 != 0u) {
                 device const ushort4* w4p = (device const ushort4*)(W16 + (size_t)e * K);
                 for (uint k4 = lane; k4 < K4; k4 += 32u) {
                     const float4 wv = as_type<float4>(uint4(w4p[k4]) << 16u);
-                    acc.x += dot(wv, X4[k4]);
-                    if (M > 1u) acc.y += dot(wv, X4[K4 + k4]);
-                    if (M > 2u) acc.z += dot(wv, X4[2u * K4 + k4]);
-                    if (M > 3u) acc.w += dot(wv, X4[3u * K4 + k4]);
+                    acc0.x += dot(wv, X4[k4]);
+                    if (M > 1u) acc0.y += dot(wv, X4[K4 + k4]);
+                    if (M > 2u) acc0.z += dot(wv, X4[2u * K4 + k4]);
+                    if (M > 3u) acc0.w += dot(wv, X4[3u * K4 + k4]);
+                    if (M > 4u) {
+                        acc1.x += dot(wv, X4[4u * K4 + k4]);
+                        if (M > 5u) acc1.y += dot(wv, X4[5u * K4 + k4]);
+                        if (M > 6u) acc1.z += dot(wv, X4[6u * K4 + k4]);
+                        if (M > 7u) acc1.w += dot(wv, X4[7u * K4 + k4]);
+                    }
                 }
             } else {
                 device const float4* w4p = (device const float4*)(W + (size_t)e * K);
                 for (uint k4 = lane; k4 < K4; k4 += 32u) {
                     const float4 wv = w4p[k4];
-                    acc.x += dot(wv, X4[k4]);
-                    if (M > 1u) acc.y += dot(wv, X4[K4 + k4]);
-                    if (M > 2u) acc.z += dot(wv, X4[2u * K4 + k4]);
-                    if (M > 3u) acc.w += dot(wv, X4[3u * K4 + k4]);
+                    acc0.x += dot(wv, X4[k4]);
+                    if (M > 1u) acc0.y += dot(wv, X4[K4 + k4]);
+                    if (M > 2u) acc0.z += dot(wv, X4[2u * K4 + k4]);
+                    if (M > 3u) acc0.w += dot(wv, X4[3u * K4 + k4]);
+                    if (M > 4u) {
+                        acc1.x += dot(wv, X4[4u * K4 + k4]);
+                        if (M > 5u) acc1.y += dot(wv, X4[5u * K4 + k4]);
+                        if (M > 6u) acc1.z += dot(wv, X4[6u * K4 + k4]);
+                        if (M > 7u) acc1.w += dot(wv, X4[7u * K4 + k4]);
+                    }
                 }
             }
-            acc = simd_sum(acc);
+            acc0 = simd_sum(acc0);
+            if (M > 4u) acc1 = simd_sum(acc1);
             if (lane == 0u) {
-                Y[e] = acc.x;
-                if (M > 1u) Y[N + e] = acc.y;
-                if (M > 2u) Y[2u * N + e] = acc.z;
-                if (M > 3u) Y[3u * N + e] = acc.w;
+                Y[e] = acc0.x;
+                if (M > 1u) Y[N + e] = acc0.y;
+                if (M > 2u) Y[2u * N + e] = acc0.z;
+                if (M > 3u) Y[3u * N + e] = acc0.w;
+                if (M > 4u) {
+                    Y[4u * N + e] = acc1.x;
+                    if (M > 5u) Y[5u * N + e] = acc1.y;
+                    if (M > 6u) Y[6u * N + e] = acc1.z;
+                    if (M > 7u) Y[7u * N + e] = acc1.w;
+                }
             }
         } else if (computeSh) {
-            float4 shAcc = float4(0.0f);
+            float4 sh0 = float4(0.0f);
+            float4 sh1 = float4(0.0f);
             for (uint k4 = lane; k4 < K4; k4 += 32u) {
                 const float4 wv = shW4[k4];
-                shAcc.x += dot(wv, X4[k4]);
-                if (M > 1u) shAcc.y += dot(wv, X4[K4 + k4]);
-                if (M > 2u) shAcc.z += dot(wv, X4[2u * K4 + k4]);
-                if (M > 3u) shAcc.w += dot(wv, X4[3u * K4 + k4]);
+                sh0.x += dot(wv, X4[k4]);
+                if (M > 1u) sh0.y += dot(wv, X4[K4 + k4]);
+                if (M > 2u) sh0.z += dot(wv, X4[2u * K4 + k4]);
+                if (M > 3u) sh0.w += dot(wv, X4[3u * K4 + k4]);
+                if (M > 4u) {
+                    sh1.x += dot(wv, X4[4u * K4 + k4]);
+                    if (M > 5u) sh1.y += dot(wv, X4[5u * K4 + k4]);
+                    if (M > 6u) sh1.z += dot(wv, X4[6u * K4 + k4]);
+                    if (M > 7u) sh1.w += dot(wv, X4[7u * K4 + k4]);
+                }
             }
-            shAcc = simd_sum(shAcc);
+            sh0 = simd_sum(sh0);
+            if (M > 4u) sh1 = simd_sum(sh1);
             if (lane == 0u) {
-                shGateOut[0] = 1.0f / (1.0f + exp(-shAcc.x));
-                if (M > 1u) shGateOut[1] = 1.0f / (1.0f + exp(-shAcc.y));
-                if (M > 2u) shGateOut[2] = 1.0f / (1.0f + exp(-shAcc.z));
-                if (M > 3u) shGateOut[3] = 1.0f / (1.0f + exp(-shAcc.w));
+                shGateOut[0] = 1.0f / (1.0f + exp(-sh0.x));
+                if (M > 1u) shGateOut[1] = 1.0f / (1.0f + exp(-sh0.y));
+                if (M > 2u) shGateOut[2] = 1.0f / (1.0f + exp(-sh0.z));
+                if (M > 3u) shGateOut[3] = 1.0f / (1.0f + exp(-sh0.w));
+                if (M > 4u) {
+                    shGateOut[4] = 1.0f / (1.0f + exp(-sh1.x));
+                    if (M > 5u) shGateOut[5] = 1.0f / (1.0f + exp(-sh1.y));
+                    if (M > 6u) shGateOut[6] = 1.0f / (1.0f + exp(-sh1.z));
+                    if (M > 7u) shGateOut[7] = 1.0f / (1.0f + exp(-sh1.w));
+                }
             }
         }
         return;

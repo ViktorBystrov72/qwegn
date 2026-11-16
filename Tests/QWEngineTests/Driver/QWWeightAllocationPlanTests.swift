@@ -81,7 +81,8 @@ final class QWWeightAllocationPlanTests: XCTestCase {
 
     func testInvalidMTPDraftsAreRefused() {
         XCTAssertThrowsError(try QWWeightAllocationPlan(geometry: try Self.geometry27B(), ropeRows: 8192, mtpDrafts: -1))
-        XCTAssertThrowsError(try QWWeightAllocationPlan(geometry: try Self.geometry27B(), ropeRows: 8192, mtpDrafts: 6))
+        XCTAssertNoThrow(try QWWeightAllocationPlan(geometry: try Self.geometry27B(), ropeRows: 8192, mtpDrafts: 7))
+        XCTAssertThrowsError(try QWWeightAllocationPlan(geometry: try Self.geometry27B(), ropeRows: 8192, mtpDrafts: 8))
     }
 
     func testRoundRecordInitialization() {

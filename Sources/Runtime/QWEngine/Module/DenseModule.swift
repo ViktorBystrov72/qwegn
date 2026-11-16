@@ -144,11 +144,21 @@ open class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendabl
         return try engine.generate(request: request, onToken: onToken)
     }
 
-    public func buildStandalonePrefixCache(tokens: [Int], outputURL: URL, pinAsSharedBase: Bool = true) throws -> Int {
+    public func buildStandalonePrefixCache(
+        tokens: [Int],
+        outputURL: URL,
+        pinAsSharedBase: Bool = true,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
+    ) throws -> Int {
         guard let engine else {
             throw QWModuleError.notImplemented("DenseModule has no engine yet")
         }
-        return try engine.buildStandalonePrefixCache(tokens: tokens, outputURL: outputURL, pinAsSharedBase: pinAsSharedBase)
+        return try engine.buildStandalonePrefixCache(
+            tokens: tokens,
+            outputURL: outputURL,
+            pinAsSharedBase: pinAsSharedBase,
+            onPrefillProgress: onPrefillProgress
+        )
     }
 
     public func mountStandalonePrefixCache(from fileURL: URL) throws -> (tokens: [Int], byteCount: Int) {
@@ -264,6 +274,9 @@ open class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendabl
         // once, and the head runs on the last one. The engine's own chunking
         // is the same size, so one seam chunk is one engine chunk — a longer
         // one is split, never dropped.
+        if chunk.lowerBound == 0 { engineSession.tokenRecycler.reset() }
+        engineSession.tokenRecycler.ingestSequence(
+            tokens[chunk], previousToken: chunk.lowerBound > 0 ? tokens[chunk.lowerBound - 1] : nil)
         engineSession.tokenHistory = tokens
         var offset = chunk.lowerBound
         var token = 0

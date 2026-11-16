@@ -80,6 +80,7 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
     internal let psoIndexerSplit: (score: any MTLComputePipelineState, select: any MTLComputePipelineState)?
     internal let psoSparseAttnNAX: (any MTLComputePipelineState)?
     internal let psoDSASparseAttnNAX: (any MTLComputePipelineState)?
+    internal let psoSparseAttnNAXH32: (any MTLComputePipelineState)?
     internal let psoSparseAttnSplit: (attend: any MTLComputePipelineState, combine: any MTLComputePipelineState)?
     internal let psoDSASparseAttnSplit: (attend: any MTLComputePipelineState, combine: any MTLComputePipelineState)?
     public static let splitMaxRows = 15
@@ -282,6 +283,7 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
             && ProcessInfo.processInfo.environment["QW_MLA_ATTN_NAX"] != "0"
         self.psoSparseAttnNAX = naxOK ? try hal.pipeline("qwg_mla_sparse_attn_nax") : nil
         self.psoDSASparseAttnNAX = naxOK ? try hal.pipeline("qwg_mla_dsa_sparse_attn_nax") : nil
+        self.psoSparseAttnNAXH32 = naxOK ? try hal.pipeline("qwg_mla_sparse_attn_nax_h32") : nil
         let splits = Int(ProcessInfo.processInfo.environment["QW_MLA_ATTN_SPLIT"] ?? "") ?? 16
         self.attnSplits = (naxOK && self.kvLoraRank == 512) ? max(0, min(64, splits)) : 0
         self.psoSparseAttnSplit = self.attnSplits > 1

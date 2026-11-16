@@ -4,7 +4,8 @@ description: >-
   Use when designing, modifying, or visually validating Qwegn.app (QWMenuBar:
   CupertinoTelemetryView, TelemetryCards, SettingsView, LogViewerWindow,
   QGProcessorLogoView), the offline QWServer WebUI (/ui, controlbar.html,
-  QWDashboardViewModel), or menu bar / dashboard parity and honesty tests.
+  Chat, #modal-memory-pack, QWDashboardViewModel), or menu bar / dashboard parity
+  and honesty tests.
 ---
 
 # Qwegn Menu Bar (`Qwegn.app`) & Offline WebUI (`/ui`) Runbook
@@ -24,9 +25,13 @@ description: >-
 ## 3. Telemetry Catalogue & Honesty Gates (`QWServerTests`)
 
 1. **Catalogue Registration:** Register every `card("<id>")` read in `QWMenuBar` inside `MenuBarCardCatalogue.ids` (`QWDashboardViewModel.swift`), and every `/ui` `data-card="<id>"` inside `QWDashboardBuilder.specs`.
-2. **Zero Client-Invented Telemetry & Emblem Parity:** Derive all UI values from `QWDashboardViewModel` (`QWMenuBarStatusFormatter` for selectable menu bar metrics). Keep `TelemetryCards.swift`, `TelemetryObservable.swift`, and the modular `/ui` assets (`Sources/Apps/QWServer/Resources/{controlbar.html,css/{base,panels}.css},js/{state,dashboard,markdown,actions}.js}`) free of `engineInfo` / `settings.modelName` UI reads, hardcoded chip/model/bandwidth literals, `"https://"` CDN references, or `"Idle"` / `"Stopped"` fallback strings (`MenuBarRendererParityTests`, `DashboardRendererParityTests`, `QWTelemetryHonestyTests`). Keep all WebUI files `<= 800` lines, copy nested `css/` and `js/` directories via `Package.swift`, and keep all 4 `QWG` vector emblem files (`QGProcessorLogoView.swift`, `gen_app_icon.swift`, `logo.svg`, `controlbar.html`) synchronized (`x2="106"` left bus pins).
+2. **Zero Client-Invented Telemetry & Emblem Parity:** Derive all UI values from `QWDashboardViewModel` (`QWMenuBarStatusFormatter` for selectable menu bar metrics). Keep `TelemetryCards.swift`, `TelemetryObservable.swift`, and the modular `/ui` assets (`Sources/Apps/QWServer/Resources/{controlbar.html,css/{base,panels,chat}.css},js/{state,dashboard,markdown,chat-presets,chat,actions}.js}`) free of `engineInfo` / `settings.modelName` UI reads, hardcoded chip/model/bandwidth literals, `"https://"` CDN references, or `"Idle"` / `"Stopped"` fallback strings (`MenuBarRendererParityTests`, `DashboardRendererParityTests`, `QWTelemetryHonestyTests`). Keep all WebUI files `<= 800` lines (including parity test suites in `Tests/`), copy nested `css/` and `js/` directories via `Package.swift`, and keep all 4 `QWG` vector emblem files (`QGProcessorLogoView.swift`, `gen_app_icon.swift`, `logo.svg`, `controlbar.html`) synchronized (`x2="106"` left bus pins).
 
 ## 4. Mandatory `2×` Retina Offscreen & Live `/ui` Verification
 
 1. **TCC-Safe `2×` Retina `NSHostingView` Snapshots:** Because macOS TCC blocks headless `screencapture`, compile a scratch Swift AppKit renderer against `.build/out/Intermediates.noindex/qwegine.build/Debug/qwg-menu-p.build/Objects-normal/arm64/qwg-menu.LinkFileList` (filtering out `QWMenuBarMain.o`, expanding `${=OBJ_LIST}` in `zsh`), set `telemetry.isDaemonTransitioning = false` after `TelemetryObservable()`, rasterize idle + active `CupertinoTelemetryView` (`880px` wide) and touched `SettingsView` / `LogViewerWindow` tabs at `2×` Retina via `bitmapImageRepForCachingDisplay` + `cacheDisplay`, inspect every PNG with `read_file` for invisible controls, `...` truncation, or hairline gaps, and remove scratch artifacts before finishing.
-2. **Live `/ui` Verification:** When `controlbar.html` or `QWServer` endpoints change, validate `http://127.0.0.1:8080/ui` with the `browser` subagent at desktop (`1440×900`) and narrow (`900×800`) viewports, confirming zero console/page errors.
+2. **Live `/ui` & `.qwcache` Modal Verification:** When `/ui` assets (`controlbar.html`, `css/*`, `js/*`) or `QWServer` endpoints change, validate `http://127.0.0.1:8080/ui` with the `browser` subagent across all 5 tabs (`Monitor`, `Chat`, `Models`, `Live Logs`, `Settings`) at desktop (`1440×900`) and narrow (`900×800`) viewports, confirming zero console/page/HTTP>=400 errors and `scrollWidth <= clientWidth`.
+3. **Deterministic `.qwcache` Fixtures & Rendered State Checks:** When testing `computeDelta` or `#modal-memory-pack` (`missing`, `wrong_model`, `stale`, `ready`):
+   - Change file byte count and advance `modificationDate` by `>= 2 s` in staleness tests so same-second `(mtimeEpochSec, byteCount)` fast-paths never flake.
+   - Seed scratch `manifest.json` `CacheArtifact` entries with `createdAtEpochSec` (`Int64`, not ISO-8601 strings) so `QWMemoryManifest.load` succeeds.
+   - Verify every modal branch by checking the live rendered DOM badge (`No .qwcache`, `Different Model`, `Stale Index`, `Ready`) and `BROWSER_HOST_FACTS` screenshots rather than accepting source-inspection fallback claims.

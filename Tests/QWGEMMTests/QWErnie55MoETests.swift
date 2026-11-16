@@ -524,7 +524,7 @@ final class QWErnie55MoETests: XCTestCase {
             return arena.read(out32, as: Float.self, count: T * H)
         }
 
-        for T in [1, 3, 64] {
+        for T in [1, 3, 6, 64] {
             let ref = cpuRef(rows: T)
             let gotF32 = try runMoE(rows: T, groupedNax: false)
             var diffSq = 0.0, refSq = 0.0

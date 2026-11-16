@@ -23,6 +23,7 @@ extension QWMoEOperator {
         input: Input,
         out32: QWTensorValue,
         out16: QWTensorValue?,
+        skipOut32: Bool = false,
         rows T: Int,
         supportsGroupedNaxPrefill: Bool,
         concurrentBarriers: Bool,
@@ -188,7 +189,8 @@ extension QWMoEOperator {
                                                          weights: s.wts, shared: s.shared, gate: s.gate,
                                                          out: out32, hidden: H, routes: K, tokens: T,
                                                          out16: out16, skipShared: ISh == 0,
-                                                         unweightedSingle: true)
+                                                         unweightedSingle: true,
+                                                         skipOut32: skipOut32 && out16 != nil)
             }
             barrier()
             return
@@ -285,7 +287,8 @@ extension QWMoEOperator {
                                                      weights: s.wts, shared: s.shared, gate: s.gate,
                                                      out: out32, hidden: H, routes: K, tokens: T,
                                                      out16: out16, skipShared: ISh == 0,
-                                                     unweightedSingle: true)
+                                                     unweightedSingle: true,
+                                                     skipOut32: skipOut32 && out16 != nil)
         }
         barrier()
     }

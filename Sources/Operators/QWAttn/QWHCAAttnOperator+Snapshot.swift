@@ -150,7 +150,7 @@ extension QWHCAAttnOperator {
         } else {
             return
         }
-        var woP = GroupedWoAParams(
+        let woP = GroupedWoAParams(
             T: UInt32(rows),
             oGroups: UInt32(oGroups),
             oLoraRank: UInt32(oLoraRank),
@@ -161,25 +161,67 @@ extension QWHCAAttnOperator {
             group: group,
             isIncumbent: baseInc | (skipExitRotation ? 0x10000 : 0)
         )
-        let useMMA = rows >= 16 && (oLoraRank % 128 == 0) && (groupIn % 32 == 0)
-        enc.setComputePipelineState(useMMA ? psoGroupedWoAMMA : psoGroupedWoAGemv)
-        zVhaScratch.bind(enc, index: 0)
-        if let w = hcaW.woA {
-            w.blocks.bind(enc, index: 1)
-        } else if let raw = hcaW.woARawF16 {
-            raw.bind(enc, index: 1)
-        }
-        qUpGateScratch.bind(enc, index: 2)
-        zGatedOut.bind(enc, index: 3)
-        enc.setBytes(&woP, length: MemoryLayout<GroupedWoAParams>.stride, index: 4)
-        if useMMA {
-            enc.dispatchThreadgroups(
-                MTLSize(width: oGroups, height: (rows + 31) / 32, depth: oLoraRank / 128),
-                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-        } else {
-            enc.dispatchThreadgroups(
-                MTLSize(width: oLoraRank / 32, height: oGroups, depth: rows),
-                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        let useNax0 = rows >= 16 && psoGroupedWoANAX != nil && (oLoraRank % 64 == 0) && (groupIn % 32 == 0)
+        let useMma0 = !useNax0 && rows >= 16 && (oLoraRank % 128 == 0) && (groupIn % 32 == 0)
+        let slcBytes = max(1, (qHeads * headDim + oGroups * oLoraRank) * 2)
+        let slcRows = max(64, ((24 << 20) / slcBytes) & ~63)
+        let chunkRows = (useNax0 || useMma0) && rows > slcRows ? slcRows : rows
+
+        var rowStart = 0
+        var activeMode = -1
+        while rowStart < rows {
+            let chunk = min(chunkRows, rows - rowStart)
+            let useNAX = chunk >= 16 && psoGroupedWoANAX != nil && (oLoraRank % 64 == 0) && (groupIn % 32 == 0)
+            let useMMA = !useNAX && chunk >= 16 && (oLoraRank % 128 == 0) && (groupIn % 32 == 0)
+            let useMR = !useNAX && !useMMA && chunk > 1 && chunk <= 8 && (oLoraRank % 32 == 0) && (groupIn % 32 == 0)
+            let mode = useNAX ? 0 : (useMMA ? 1 : (useMR ? 2 : 3))
+            if mode != activeMode {
+                activeMode = mode
+                if let naxPSO = psoGroupedWoANAX, useNAX {
+                    enc.setComputePipelineState(naxPSO)
+                } else if useMMA {
+                    enc.setComputePipelineState(psoGroupedWoAMMA)
+                } else if useMR {
+                    enc.setComputePipelineState(psoGroupedWoAGemvMR)
+                } else {
+                    enc.setComputePipelineState(psoGroupedWoAGemv)
+                }
+            }
+            let zVhaSub = rowStart == 0 && chunk == rows ? zVhaScratch
+                : zVhaScratch.slice(byteOffset: rowStart * oGroups * groupIn * 2, count: chunk * oGroups * groupIn, dtype: .f16)
+            let qUpSub = rowStart == 0 && chunk == rows ? qUpGateScratch
+                : qUpGateScratch.slice(byteOffset: rowStart * qUpStride * 2, count: chunk * qUpStride, dtype: .f16)
+            let zOutSub = rowStart == 0 && chunk == rows ? zGatedOut
+                : zGatedOut.slice(byteOffset: rowStart * oGroups * oLoraRank * 2, count: chunk * oGroups * oLoraRank, dtype: .f16)
+            var subP = woP
+            subP.T = UInt32(chunk)
+            zVhaSub.bind(enc, index: 0)
+            if let w = hcaW.woA {
+                w.blocks.bind(enc, index: 1)
+            } else if let raw = hcaW.woARawF16 {
+                raw.bind(enc, index: 1)
+            }
+            qUpSub.bind(enc, index: 2)
+            zOutSub.bind(enc, index: 3)
+            enc.setBytes(&subP, length: MemoryLayout<GroupedWoAParams>.stride, index: 4)
+            if useNAX {
+                enc.dispatchThreadgroups(
+                    MTLSize(width: oLoraRank / 64, height: (chunk + 63) / 64, depth: oGroups),
+                    threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            } else if useMMA {
+                enc.dispatchThreadgroups(
+                    MTLSize(width: oGroups, height: (chunk + 31) / 32, depth: oLoraRank / 128),
+                    threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            } else if useMR {
+                enc.dispatchThreadgroups(
+                    MTLSize(width: oLoraRank / 32, height: oGroups, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            } else {
+                enc.dispatchThreadgroups(
+                    MTLSize(width: oLoraRank / 32, height: oGroups, depth: chunk),
+                    threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
+            rowStart += chunk
         }
     }
 

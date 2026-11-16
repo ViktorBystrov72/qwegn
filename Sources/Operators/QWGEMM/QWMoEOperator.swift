@@ -200,6 +200,7 @@ public enum QWMoEOperator {
         input: Input,
         out32: QWTensorValue,
         out16: QWTensorValue? = nil,
+        skipOut32: Bool = false,
         rows T: Int,
         supportsGroupedNaxPrefill: Bool = true,
         concurrentBarriers: Bool = false,
@@ -209,7 +210,7 @@ public enum QWMoEOperator {
         if let latent = w.latent {
             try encodeResidentLatent(
                 &enc, hal: hal, weights: w, latent: latent, scratch: s, input: input,
-                out32: out32, out16: out16, rows: T,
+                out32: out32, out16: out16, skipOut32: skipOut32, rows: T,
                 supportsGroupedNaxPrefill: supportsGroupedNaxPrefill,
                 concurrentBarriers: concurrentBarriers,
                 rotateEncoder: rotateEncoder, profileStage: profileStage
@@ -219,7 +220,7 @@ public enum QWMoEOperator {
         if w.numLatentGroups > 0 && w.latentDim > 0 && w.latentD != nil && w.latentU != nil && w.latentLabels != nil {
             try encodeResidentGroupLatent(
                 &enc, hal: hal, weights: w, scratch: s, input: input,
-                out32: out32, out16: out16, rows: T,
+                out32: out32, out16: out16, skipOut32: skipOut32, rows: T,
                 supportsGroupedNaxPrefill: supportsGroupedNaxPrefill,
                 concurrentBarriers: concurrentBarriers,
                 rotateEncoder: rotateEncoder, profileStage: profileStage
@@ -333,7 +334,7 @@ public enum QWMoEOperator {
             try QWGemm.encodeMoEDownReduceCombineF32(enc, hal: hal, dnAcc: dnAcc16, invPerm: invPerm,
                                                      weights: s.wts, shared: s.shared, gate: s.gate,
                                                      out: out32, hidden: H, routes: K, tokens: T,
-                                                     out16: out16)
+                                                     out16: out16, skipOut32: skipOut32 && out16 != nil)
             barrier()
             return
         }

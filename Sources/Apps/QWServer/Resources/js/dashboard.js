@@ -632,6 +632,7 @@ function renderDisconnected() {
   if (age) age.textContent = "Not connected";
   renderRecentRequestsTable();
   updateStatusIndicators(null, null, null);
+  if (typeof syncChatHeaderWithDashboard === "function") syncChatHeaderWithDashboard();
 }
 
 function renderDashboard(model) {
@@ -649,6 +650,7 @@ function renderDashboard(model) {
   renderModelAge(model);
   renderActions(model);
   renderRecentRequestsTable();
+  if (typeof syncChatHeaderWithDashboard === "function") syncChatHeaderWithDashboard();
 }
 
 function toggleRequestInspector(requestId) {

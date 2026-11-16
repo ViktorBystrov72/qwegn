@@ -9,6 +9,7 @@ public enum QWMenuBarMetric: String, CaseIterable, Codable, Sendable, Hashable, 
     case prefillSpeed
     case engineMemory
     case contextSize
+    case gpuTemperature
 
     public var id: String { rawValue }
 
@@ -18,6 +19,7 @@ public enum QWMenuBarMetric: String, CaseIterable, Codable, Sendable, Hashable, 
         case .prefillSpeed: return "Prefill speed"
         case .engineMemory: return "Engine memory"
         case .contextSize: return "Context size"
+        case .gpuTemperature: return "GPU temp"
         }
     }
 
@@ -27,6 +29,7 @@ public enum QWMenuBarMetric: String, CaseIterable, Codable, Sendable, Hashable, 
         case .prefillSpeed: return "Prompt rate or cache hit"
         case .engineMemory: return "Arena / resident RAM"
         case .contextSize: return "Active / context limit"
+        case .gpuTemperature: return "Die hotspot (°C)"
         }
     }
 
@@ -36,6 +39,7 @@ public enum QWMenuBarMetric: String, CaseIterable, Codable, Sendable, Hashable, 
         case .prefillSpeed: return "bolt.horizontal.fill"
         case .engineMemory: return "memorychip"
         case .contextSize: return "text.alignleft"
+        case .gpuTemperature: return "thermometer.medium"
         }
     }
 }
@@ -96,6 +100,11 @@ public enum QWMenuBarStatusFormatter {
             parts.append(ctxSegment)
         }
 
+        if enabledMetrics.contains(.gpuTemperature),
+           let tempSegment = formatTemperatureSegment(dashboard: dashboard) {
+            parts.append(tempSegment)
+        }
+
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
@@ -122,6 +131,9 @@ public enum QWMenuBarStatusFormatter {
         }
         if enabledMetrics.contains(.contextSize) {
             parts.append("38/256k")
+        }
+        if enabledMetrics.contains(.gpuTemperature) {
+            parts.append("54°C")
         }
         if parts.isEmpty && hideSpeedsWhenIdle && (wantDecode || wantPrefill) {
             return wantDecode && wantPrefill ? "↓91.9 · ↑93.3 tok/s (active)" : "91.9 tok/s (active)"
@@ -196,5 +208,15 @@ public enum QWMenuBarStatusFormatter {
 
     private static func card(_ id: String, in dashboard: QWDashboardViewModel) -> QWDashboardCard? {
         dashboard.cards.first { $0.id == id }
+    }
+
+    private static func formatTemperatureSegment(dashboard: QWDashboardViewModel) -> String? {
+        guard let tempCard = card("hardware.gpu_temp_celsius", in: dashboard),
+              tempCard.value != nil,
+              let num = tempCard.number,
+              num > 0 else {
+            return nil
+        }
+        return String(format: "%.0f°C", num.rounded())
     }
 }

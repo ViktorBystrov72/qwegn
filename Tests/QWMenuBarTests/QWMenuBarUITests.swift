@@ -188,4 +188,119 @@ final class QWMenuBarUITests: XCTestCase {
         XCTAssertLessThanOrEqual(rightPt, 13.0, "Card right gutter must not double beyond 10pt outer inset")
         XCTAssertLessThanOrEqual(abs(leftPt - rightPt), 1.5, "Card left/right outer gutters must stay symmetric")
     }
+
+    @MainActor
+    func testThermalCardsAndPerformanceSettingsRenderWithoutOverflowAt2x() throws {
+        let telemetry = TelemetryObservable(
+            startServices: false,
+            enableAutoLifecycle: false,
+            initialSettings: QWServerSettings(coolingPolicy: "proactive")
+        )
+        let now = Date()
+        func card(_ id: String, _ title: String, _ val: String, _ unit: String?, _ num: Double?) -> QWDashboardCard {
+            QWDashboardCard(
+                id: id, title: title, value: val, unit: unit, number: num,
+                provenance: .measured, sampledAt: now, age: 0.2, isStale: false, reason: nil, series: []
+            )
+        }
+        telemetry.connection = .connected
+        telemetry.engineState = .serverUp(isLoaded: true)
+        telemetry.isDaemonTransitioning = false
+        telemetry.dashboard = QWDashboardViewModel(
+            sampledAt: now,
+            lifecycle: .init(phase: .loaded, since: now, model: "Qwen3.8-27B-q4", detail: nil),
+            modelId: "Qwen3.8-27B-q4",
+            capabilities: ["prefixCache"],
+            generation: .decode,
+            facts: QWDashboardFacts(
+                quantization: "HQ4_G32 (native, GPU)",
+                hostLogicalCores: 18,
+                gdnPrefillMode: "chunked",
+                gpuName: "Apple M5 Max",
+                metalFamily: "Metal 4",
+                physicalMemoryGB: 128,
+                lsaMode: "auto",
+                coolingPolicy: "proactive",
+                fanControlStatus: "System Auto (SMC write requires root)"
+            ),
+            cards: [
+                card("throughput.display_decode_tokens_per_sec", "Decode", "92.4", "tok/s", 92.4),
+                card("throughput.display_prefill_tokens_per_sec", "Prefill", "610.0", "tok/s", 610.0),
+                card("gpu.busy_ratio", "Engine GPU", "94.1", "%", 94.1),
+                card("gpu.device", "Device GPU", "95.0", "%", 95.0),
+                card("hardware.cpu_percent", "CPU", "18.5", "%", 18.5),
+                card("hardware.memory_percent", "Memory", "64.2", "%", 64.2),
+                card("hardware.memory_pressure_level", "Memory pressure", "Normal", nil, nil),
+                card("hardware.gpu_temp_celsius", "GPU Temp", "68.4", "°C", 68.4),
+                card("hardware.fan_rpm", "Fans", "2450", "rpm", 2450),
+                card("hardware.system_power_watts", "System Power", "78.2", "W", 78.2),
+                card("hardware.thermal_state", "Thermal State", "Nominal", nil, nil),
+                card("memory.arena_reserved_bytes", "Metal arena", "24.10", "GiB", 24.10),
+                card("memory.resident_bytes", "Resident weights", "22.50", "GiB", 22.50),
+                card("context.active_tokens", "Last turn tokens", "4096", "tok", 4096),
+            ],
+            actions: [],
+            knobs: ["kvMode": .string("q4"), "contextTokens": .int(131_072)],
+            knobSources: [:]
+        )
+
+        let popoverHost = NSHostingView(
+            rootView: CupertinoTelemetryView(telemetry: telemetry).background(TelemetryTheme.surface)
+        )
+        popoverHost.appearance = NSAppearance(named: .darkAqua)
+        popoverHost.wantsLayer = true
+        let popoverSize = popoverHost.fittingSize
+        popoverHost.frame = NSRect(origin: .zero, size: popoverSize)
+        popoverHost.layoutSubtreeIfNeeded()
+        XCTAssertEqual(popoverSize.width, 440, accuracy: 0.5)
+        XCTAssertGreaterThan(popoverSize.height, 340)
+
+        let settingsHost = NSHostingView(
+            rootView: SettingsView(telemetry: telemetry, initialTab: .performance)
+                .frame(width: 780, height: 960)
+                .background(TelemetryTheme.surface)
+        )
+        settingsHost.appearance = NSAppearance(named: .darkAqua)
+        settingsHost.wantsLayer = true
+        let settingsWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 960),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        settingsWindow.appearance = NSAppearance(named: .darkAqua)
+        settingsWindow.isReleasedWhenClosed = false
+        settingsWindow.contentView = settingsHost
+        settingsWindow.layoutIfNeeded()
+        settingsHost.layoutSubtreeIfNeeded()
+        XCTAssertEqual(settingsHost.bounds.width, 780, accuracy: 2.0)
+
+        if let dir = ProcessInfo.processInfo.environment["QWG_SNAPSHOT_DIR"], !dir.isEmpty {
+            let dirURL = URL(fileURLWithPath: dir, isDirectory: true)
+            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+            try write2xPNG(of: popoverHost, size: popoverSize, to: dirURL.appendingPathComponent("menubar_popover_2x.png"))
+            try write2xPNG(of: settingsHost, size: NSSize(width: 780, height: 960), to: dirURL.appendingPathComponent("menubar_settings_perf_2x.png"))
+        }
+    }
+
+    @MainActor
+    private func write2xPNG(of view: NSView, size: NSSize, to url: URL) throws {
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int((size.width * 2).rounded()),
+            pixelsHigh: Int((size.height * 2).rounded()),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return }
+        rep.size = size
+        view.cacheDisplay(in: view.bounds, to: rep)
+        if let png = rep.representation(using: .png, properties: [:]) {
+            try png.write(to: url)
+        }
+    }
 }

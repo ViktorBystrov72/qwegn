@@ -8,6 +8,7 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 600 600'%3E%3Crect width='600' height='600' rx='136' fill='%230d1117'/%3E%3Cg fill='none' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M272 132H178Q132 132 132 178V272M328 132H422Q468 132 468 178V272M132 328V422Q132 468 178 468H272M468 328V422Q468 468 422 468H328' stroke='%23e6edf3' stroke-width='32'/%3E%3Cpath d='M164 206L232 414L300 264L368 414L436 206' stroke='%2356d4ff' stroke-opacity='0.52' stroke-width='30'/%3E%3Crect x='172' y='182' width='106' height='232' rx='38' stroke='%23ffffff' stroke-width='34'/%3E%3Cpath d='M238 350L294 426M426 226Q426 182 382 182H366Q322 182 322 226V370Q322 414 366 414H386Q428 414 428 372V310H372' stroke='%23ffffff' stroke-width='34'/%3E%3C/g%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/ui/css/base.css" />
   <link rel="stylesheet" href="/ui/css/panels.css" />
+  <link rel="stylesheet" href="/ui/css/chat.css" />
 </head>
 <body>
   <a href="#main-content" class="skip-link">Skip to dashboard</a>
@@ -55,6 +56,7 @@
 
       <nav class="nav-tabs" aria-label="Dashboard sections">
         <button id="nav-tab-monitor" type="button" class="tab-btn is-active" onclick="switchTab('monitor')">Monitor</button>
+        <button id="nav-tab-chat" type="button" class="tab-btn" onclick="switchTab('chat')">Chat</button>
         <button id="nav-tab-models" type="button" class="tab-btn" onclick="switchTab('models')">Models</button>
         <button id="nav-tab-logs" type="button" class="tab-btn" onclick="switchTab('logs')">Live Logs</button>
         <button id="nav-tab-settings" type="button" class="tab-btn" onclick="switchTab('settings')">Settings</button>
@@ -310,6 +312,7 @@
                 <button id="probe-run-btn" type="button" class="btn btn-primary btn-sm" onclick="runBrowserSmokeProbe()">Run Smoke Probe</button>
                 <span id="probe-timing" class="mono panel-sub">—</span>
                 <div class="probe-actions">
+                  <button id="probe-open-chat-btn" type="button" class="btn btn-sm" onclick="openSmokeProbeInChat()">Open in Chat →</button>
                   <button id="probe-mode-btn" type="button" class="btn btn-sm" onclick="toggleSmokeProbeMode()" hidden>Raw</button>
                   <button id="probe-copy-btn" type="button" class="btn btn-sm" onclick="copySmokeProbeOutput()" hidden>Copy</button>
                 </div>
@@ -321,7 +324,234 @@
       </div>
     </section>
 
-    <!-- TAB 2: MODELS -->
+    <!-- TAB 2: CHAT -->
+    <section id="view-chat" class="tab-pane hidden">
+      <div id="chat-layout" class="chat-layout">
+        <aside id="chat-sidebar" class="card-panel chat-sidebar" aria-label="Chat sessions">
+          <div class="chat-sidebar-head">
+            <h2 class="panel-title">Sessions</h2>
+            <div class="chat-sidebar-head-actions">
+              <button type="button" class="btn btn-primary btn-sm" onclick="createNewChatSession()">+ New Chat</button>
+              <button type="button" class="btn btn-sm chat-icon-btn" onclick="toggleChatSidebar()" aria-label="Collapse sessions sidebar" title="Collapse sessions">‹</button>
+            </div>
+          </div>
+          <div class="chat-search-wrap">
+            <label for="chat-session-search" class="sr-only">Filter sessions</label>
+            <input id="chat-session-search" name="chat-session-search" type="search" autocomplete="off" class="input select-sm" placeholder="Filter sessions…" oninput="renderChatSessionList()" />
+          </div>
+          <div id="chat-session-list" class="chat-session-list" role="list"></div>
+          <div class="chat-sidebar-foot">
+            <button type="button" class="btn btn-sm" onclick="exportActiveChatJson()">Export JSON</button>
+            <button type="button" class="btn btn-sm" onclick="exportActiveChatMarkdown()">Export MD</button>
+            <button type="button" class="btn btn-danger btn-sm" onclick="clearAllChatSessions()">Clear All</button>
+          </div>
+        </aside>
+
+        <div id="chat-main" class="card-panel chat-main">
+          <div class="chat-header">
+            <div class="chat-header-left">
+              <button id="chat-expand-sidebar-btn" type="button" class="btn btn-sm chat-icon-btn" onclick="toggleChatSidebar()" aria-label="Show sessions sidebar" title="Show sessions" hidden>☰</button>
+              <label for="chat-title-input" class="sr-only">Session title</label>
+              <input id="chat-title-input" name="chat-title-input" autocomplete="off" class="chat-title-input" value="New Chat" placeholder="Session title…" onchange="renameActiveChatSession(this.value)" />
+            </div>
+            <div class="chat-header-right">
+              <span id="chat-model-badge" class="knob-pill mono" title="Resident model">—</span>
+              <span id="chat-vision-badge" class="knob-pill mono" title="Vision tower status">—</span>
+              <button id="chat-mempack-badge" type="button" class="knob-pill chat-mempack-pill mono" onclick="toggleChatDrawer('system')" title="Codebase &amp; Knowledge Memory Pack (.qwcache)">MemPack: —</button>
+              <span id="chat-preset-badge" class="knob-pill mono" title="Active system prompt preset">Server Default</span>
+              <button id="chat-toggle-system-btn" type="button" class="btn btn-sm" onclick="toggleChatDrawer('system')" aria-expanded="false">System Prompt</button>
+              <button id="chat-toggle-params-btn" type="button" class="btn btn-sm" onclick="toggleChatDrawer('params')" aria-expanded="false">Agent &amp; Knobs</button>
+              <button type="button" class="btn btn-sm" onclick="resetActiveChatMessages()">Clear Turns</button>
+            </div>
+          </div>
+
+          <!-- System Prompt & Memory Pack Conditioning Drawer -->
+          <div id="chat-system-drawer" class="chat-drawer" hidden>
+            <div class="chat-drawer-head">
+              <div class="chat-drawer-controls">
+                <label for="chat-preset-select" class="chat-field-label">Role Preset</label>
+                <select id="chat-preset-select" name="chat-preset-select" class="select select-sm" onchange="selectChatSystemPreset(this.value)"></select>
+                <button type="button" class="btn btn-sm" onclick="saveCustomSystemPreset()">Save Preset…</button>
+                <button id="chat-delete-preset-btn" type="button" class="btn btn-sm" onclick="deleteCustomSystemPreset()" hidden>Delete Preset</button>
+              </div>
+              <button type="button" class="btn btn-sm" onclick="saveSystemPromptToServerDefault()">Save as Server Default</button>
+            </div>
+            <div id="chat-harness-bar" class="chat-harness-bar">
+              <label class="chat-inline-check">
+                <input id="chat-harness-toggle" name="chat-harness-toggle" type="checkbox" checked onchange="toggleChatPresetHarness(this.checked)" />
+                <span>Auto Harness</span>
+              </label>
+              <span id="chat-harness-summary" class="panel-sub mono">Inherits server defaults.</span>
+              <button type="button" class="btn btn-sm" onclick="reapplyActivePresetHarness()">Re-apply Harness</button>
+            </div>
+            <div id="chat-mempack-bar" class="chat-mempack-bar">
+              <div class="chat-mempack-controls">
+                <label for="chat-workspace-path" class="chat-field-label">Workspace / .qwcache Root</label>
+                <input id="chat-workspace-path" name="chat-workspace-path" autocomplete="off" class="input mono select-sm chat-workspace-input" placeholder="/Users/.../repo (auto-mounts .qwg/manifest.json + .qwcache)…" oninput="updateActiveChatWorkspacePath(this.value)" />
+                <button id="chat-mempack-mount-btn" type="button" class="btn btn-sm" onclick="mountChatMemoryPack()">Mount .qwcache</button>
+                <button id="chat-mempack-index-btn" type="button" class="btn btn-sm" onclick="openChatMemoryPackModal()">Index / Update…</button>
+                <button id="chat-mempack-unmount-btn" type="button" class="btn btn-sm" onclick="unmountChatMemoryPack()" hidden>Unmount</button>
+              </div>
+              <div class="chat-mempack-meta-row">
+                <label class="chat-inline-check">
+                  <input id="chat-mempack-harness-toggle" name="chat-mempack-harness-toggle" type="checkbox" checked onchange="toggleChatMemoryPackHarness(this.checked)" />
+                  <span>Inject LSA Memory Notice</span>
+                </label>
+                <div id="chat-mempack-status" class="panel-sub mono">Set a workspace path or include a repo path in System Prompt so the engine auto-mounts &lt;root&gt;/.qwg/*.qwcache.</div>
+              </div>
+              <div id="chat-mempack-detect" class="panel-sub mono chat-mempack-detect" hidden></div>
+            </div>
+            <label for="chat-system-prompt" class="sr-only">System prompt</label>
+            <textarea id="chat-system-prompt" name="chat-system-prompt" autocomplete="off" rows="4" class="input chat-textarea mono" placeholder="Enter system instructions for this session (leave empty to inherit ~/.qwg/settings.json default)…" oninput="updateActiveChatSystemPrompt(this.value)"></textarea>
+            <div id="chat-system-hint" class="panel-sub">Prepended as the leading <code>system</code> message for Warm RAM prefix-cache reuse.</div>
+          </div>
+
+          <!-- Per-Session Agent & Sampling Knobs Drawer -->
+          <div id="chat-params-drawer" class="chat-drawer" hidden>
+            <div class="chat-drawer-head">
+              <strong class="panel-title">Per-Session Agent &amp; Sampling Overrides</strong>
+              <button type="button" class="btn btn-sm" onclick="resetChatParamsToDefault()">Reset Overrides</button>
+            </div>
+            <div class="chat-params-grid">
+              <div class="chat-param-item">
+                <label for="chat-param-temp">Temperature</label>
+                <input id="chat-param-temp" name="chat-param-temp" autocomplete="off" class="input mono select-sm" type="number" step="0.05" min="0" max="2" placeholder="Server default…" oninput="updateChatParam('temperature', this.value, 'float')" />
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-top-p">Top-P</label>
+                <input id="chat-param-top-p" name="chat-param-top-p" autocomplete="off" class="input mono select-sm" type="number" step="0.05" min="0" max="1" placeholder="Server default…" oninput="updateChatParam('topP', this.value, 'float')" />
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-top-k">Top-K</label>
+                <input id="chat-param-top-k" name="chat-param-top-k" autocomplete="off" class="input mono select-sm" type="number" step="1" min="0" placeholder="Server default…" oninput="updateChatParam('topK', this.value, 'int')" />
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-max-tokens">Max Tokens</label>
+                <input id="chat-param-max-tokens" name="chat-param-max-tokens" autocomplete="off" class="input mono select-sm" type="number" step="1" min="1" placeholder="Server default…" oninput="updateChatParam('maxTokens', this.value, 'int')" />
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-rep-pen">Repetition Penalty</label>
+                <input id="chat-param-rep-pen" name="chat-param-rep-pen" autocomplete="off" class="input mono select-sm" type="number" step="0.01" min="1" placeholder="Server default…" oninput="updateChatParam('repetitionPenalty', this.value, 'float')" />
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-seed">Seed</label>
+                <input id="chat-param-seed" name="chat-param-seed" autocomplete="off" class="input mono select-sm" type="number" step="1" placeholder="-1 (random)…" oninput="updateChatParam('seed', this.value, 'int')" />
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-thinking">Thinking Mode</label>
+                <select id="chat-param-thinking" name="chat-param-thinking" class="select select-sm" onchange="updateChatParam('enableThinking', this.value, 'string')">
+                  <option value="inherit">Server Default</option>
+                  <option value="true">Enabled</option>
+                  <option value="false">Disabled</option>
+                </select>
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-effort">Reasoning Effort</label>
+                <select id="chat-param-effort" name="chat-param-effort" class="select select-sm" onchange="updateChatParam('reasoningEffort', this.value, 'string')">
+                  <option value="inherit">Server Default</option>
+                  <option value="xhigh">Extra High (xhigh)</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                </select>
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-stream">Response Stream</label>
+                <select id="chat-param-stream" name="chat-param-stream" class="select select-sm" onchange="updateChatParam('stream', this.value === 'true', 'bool')">
+                  <option value="true">SSE Streaming (On)</option>
+                  <option value="false">Non-Streaming (Off)</option>
+                </select>
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-format">Response Format</label>
+                <select id="chat-param-format" name="chat-param-format" class="select select-sm" onchange="updateChatParam('responseFormat', this.value, 'string')">
+                  <option value="text">Text (Default)</option>
+                  <option value="json_object">JSON Object</option>
+                  <option value="json_schema">JSON Schema</option>
+                </select>
+              </div>
+              <div class="chat-param-item chat-param-span-2">
+                <label for="chat-param-stop">Stop Sequences</label>
+                <input id="chat-param-stop" name="chat-param-stop" autocomplete="off" class="input mono select-sm" type="text" placeholder="Comma-separated stop strings…" oninput="updateChatParam('stop', this.value, 'string')" />
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-cache-prompt">Prefix Cache Mode</label>
+                <select id="chat-param-cache-prompt" name="chat-param-cache-prompt" class="select select-sm" onchange="updateChatParam('cachePrompt', this.value === 'true', 'bool')">
+                  <option value="true">Enabled (Warm RAM / SSD)</option>
+                  <option value="false">Bypass (Stateless Turn)</option>
+                </select>
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-cache-key">Cache Namespace / Salt</label>
+                <input id="chat-param-cache-key" name="chat-param-cache-key" autocomplete="off" class="input mono select-sm" type="text" placeholder="Auto (session ID) or custom key…" oninput="updateChatParam('promptCacheKey', this.value, 'string')" />
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-store">Ledger Recording</label>
+                <select id="chat-param-store" name="chat-param-store" class="select select-sm" onchange="updateChatParam('store', this.value === 'true', 'bool')">
+                  <option value="true">Record in Monitor Ledger</option>
+                  <option value="false">Do Not Store (Private Turn)</option>
+                </select>
+              </div>
+              <div class="chat-param-item">
+                <label for="chat-param-exact-spec">Speculative Precision</label>
+                <select id="chat-param-exact-spec" name="chat-param-exact-spec" class="select select-sm" onchange="updateChatParam('exactSpeculation', this.value, 'string')">
+                  <option value="inherit">Auto (Preset / Tool / Seed)</option>
+                  <option value="true">Force Lossless Target Verify</option>
+                  <option value="false">Standard Speculative</option>
+                </select>
+              </div>
+              <div class="chat-param-item chat-param-span-2">
+                <label for="chat-param-metadata">Custom Request Metadata (JSON Object or <code>key=val</code>)</label>
+                <input id="chat-param-metadata" name="chat-param-metadata" autocomplete="off" class="input mono select-sm" type="text" placeholder='{"agent":"qwegn-webui","env":"local"} or key=value, …' oninput="updateChatParam('customMetadata', this.value, 'string')" />
+              </div>
+            </div>
+
+            <div id="chat-json-schema-wrap" class="chat-tools-block" hidden>
+              <div class="chat-drawer-head">
+                <label for="chat-json-schema" class="chat-field-label">JSON Schema Definition (<code>response_format.json_schema</code>)</label>
+                <button type="button" class="btn btn-sm" onclick="loadSampleExtractionSchema()">Load Sample Schema</button>
+              </div>
+              <textarea id="chat-json-schema" name="chat-json-schema" autocomplete="off" rows="3" class="input chat-textarea mono" placeholder='{"name":"answer","strict":true,"schema":{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}}…' oninput="updateChatParam('jsonSchema', this.value, 'string')"></textarea>
+            </div>
+
+            <div class="chat-tools-block">
+              <div class="chat-drawer-head">
+                <label for="chat-tools-json" class="chat-field-label">Agent Tool Definitions (OpenAI <code>tools</code> JSON)</label>
+                <div class="chat-drawer-controls">
+                  <button type="button" class="btn btn-sm" onclick="loadSampleChatTool()">Load Sample Tool</button>
+                  <button type="button" class="btn btn-sm" onclick="clearChatToolsJson()">Clear Tools</button>
+                </div>
+              </div>
+              <textarea id="chat-tools-json" name="chat-tools-json" autocomplete="off" rows="3" class="input chat-textarea mono" placeholder='[{"type":"function","function":{"name":"read_file","description":"Read a file…","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]…' oninput="updateChatParam('toolsJson', this.value, 'string')"></textarea>
+              <div id="chat-tools-error" class="ink-error panel-sub" hidden></div>
+            </div>
+          </div>
+
+          <!-- Transcript Area -->
+          <div id="chat-transcript" class="chat-transcript" aria-live="polite"></div>
+
+          <!-- Composer -->
+          <div id="chat-composer" class="chat-composer" ondragover="handleChatDragOver(event)" ondragleave="handleChatDragLeave(event)" ondrop="handleChatDrop(event)">
+            <div id="chat-attachments-strip" class="chat-attachments-strip" hidden></div>
+            <label for="chat-input" class="sr-only">Message input</label>
+            <textarea id="chat-input" name="chat-input" autocomplete="off" rows="3" class="input chat-composer-input" placeholder="Message resident model… (Enter to send, Shift+Enter for newline)" onkeydown="handleChatInputKeyDown(event)" onpaste="handleChatPaste(event)" oninput="autoResizeChatInput(this)"></textarea>
+            <div class="chat-composer-bar">
+              <div class="chat-composer-left">
+                <input id="chat-file-input" name="chat-file-input" type="file" accept="image/*" multiple hidden onchange="handleChatFileInputChange(event)" />
+                <button id="chat-attach-btn" type="button" class="btn btn-sm" onclick="triggerChatImagePicker()">Attach Image</button>
+                <span id="chat-composer-status" class="panel-sub mono">Ready</span>
+              </div>
+              <div class="chat-composer-right">
+                <button id="chat-stop-btn" type="button" class="btn btn-danger btn-sm" onclick="stopActiveChatGeneration()" hidden>Stop</button>
+                <button id="chat-send-btn" type="button" class="btn btn-primary btn-sm" onclick="sendChatTurn()">Send</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: MODELS -->
     <section id="view-models" class="tab-pane hidden">
       <article class="card-panel">
         <div class="panel-head">
@@ -397,11 +627,89 @@
     <div id="modal-model-options" style="display:flex;flex-direction:column;gap:8px;max-height:360px;overflow:auto;"></div>
   </dialog>
 
+  <dialog id="modal-memory-pack" aria-labelledby="mempack-dialog-title">
+    <div class="mempack-modal-head">
+      <div class="mempack-modal-title-group">
+        <h3 id="mempack-dialog-title" class="mempack-modal-title">Codebase Memory Pack (.qwcache)</h3>
+        <span id="mempack-status-badge" class="mempack-badge is-missing">Missing</span>
+      </div>
+      <button id="mempack-close-btn" type="button" class="btn btn-sm" onclick="closeMemoryPackModal()">Close</button>
+    </div>
+
+    <div class="mempack-summary-card">
+      <div class="mempack-path-row">
+        <span class="chat-field-label">Workspace</span>
+        <code id="mempack-root-path" class="mono mempack-root-code">—</code>
+      </div>
+      <p id="mempack-status-summary" class="mempack-status-summary">Inspecting repository state…</p>
+      <div id="mempack-git-summary" class="panel-sub mono mempack-git-summary" hidden></div>
+    </div>
+
+    <div id="mempack-artifacts-section" class="mempack-artifacts-section" hidden>
+      <div class="mempack-section-label">Existing .qwcache Artifacts in Repository</div>
+      <div id="mempack-artifacts-list" class="mempack-artifacts-list"></div>
+    </div>
+
+    <div id="mempack-options-section" class="mempack-options-section">
+      <div class="mempack-section-label">Indexing Configuration</div>
+      <div class="mempack-options-grid">
+        <label class="mempack-option-field">
+          <span>KV Mode</span>
+          <select id="mempack-opt-kv" class="select select-sm mono">
+            <option value="q4">q4 (compact, recommended)</option>
+            <option value="q8">q8 (balanced)</option>
+            <option value="f16">f16 (uncompressed)</option>
+          </select>
+        </label>
+        <label class="mempack-option-field">
+          <span>LSA Mode</span>
+          <select id="mempack-opt-lsa" class="select select-sm mono">
+            <option value="auto">auto</option>
+            <option value="sidecar">sidecar</option>
+            <option value="svd">svd</option>
+            <option value="qsa-cluster">qsa-cluster</option>
+            <option value="off">off</option>
+          </select>
+        </label>
+        <label class="mempack-option-field">
+          <span>Scope</span>
+          <select id="mempack-opt-scope" class="select select-sm">
+            <option value="cortex_vault">32K Cortex + LSA Vault (Recommended)</option>
+            <option value="full_prefix">Full Linear Prefix</option>
+          </select>
+        </label>
+        <label class="mempack-option-field mempack-check-field">
+          <input id="mempack-opt-tests" type="checkbox" />
+          <span>Include Tier 2 tests &amp; scripts</span>
+        </label>
+      </div>
+    </div>
+
+    <div id="mempack-progress-box" class="mempack-progress-box" aria-live="polite" hidden>
+      <div class="mempack-progress-head">
+        <span id="mempack-progress-phase" class="mono">Preparing…</span>
+        <span id="mempack-progress-pct" class="mono num">0%</span>
+      </div>
+      <div id="mempack-progress-track" class="bar-bg mempack-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="mempack-progress-fill" class="bar-fg" style="width:0%;background:var(--accent);"></div>
+      </div>
+      <div class="mempack-progress-stats mono num">
+        <span id="mempack-progress-files">0 / 0 files</span>
+        <span id="mempack-progress-tokens">0 tokens</span>
+      </div>
+      <div id="mempack-progress-current-file" class="panel-sub mono mempack-current-file">—</div>
+    </div>
+
+    <div id="mempack-actions-bar" class="mempack-modal-actions"></div>
+  </dialog>
+
   <div id="toast-region" aria-live="polite"></div>
 
   <script src="/ui/js/state.js" defer></script>
   <script src="/ui/js/dashboard.js" defer></script>
   <script src="/ui/js/markdown.js" defer></script>
+  <script src="/ui/js/chat-presets.js" defer></script>
+  <script src="/ui/js/chat.js" defer></script>
   <script src="/ui/js/actions.js" defer></script>
 </body>
 </html>

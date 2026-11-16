@@ -267,13 +267,16 @@ final class QWGDNReplayCheckpoint {
             throw QWEngineDriverError.state("GPU replay requires the checkpoint's original recurrent slab")
         }
         let qkvC = geometry.gdnQKVChannels, gdnVH = geometry.gdnVHeads, glogC = geometry.gdnGlogChannels
-        for layer in 0..<layers {
-            let state = view(rec, index: layer, count: QWSlotGeometry.recElems(geometry: geometry))
-            for row in 0..<count {
+        for row in 0..<count {
+            if row > 0 {
+                enc.memoryBarrier(scope: .buffers)
+            }
+            for layer in 0..<layers {
+                let state = view(rec, index: layer, count: QWSlotGeometry.recElems(geometry: geometry))
                 let index = layer * rows + row
                 try decoder.encodeStateReplay(enc, y: view(normalized, index: index, count: qkvC),
-                                               betas: view(betas, index: index, count: gdnVH),
-                                               glog: view(glog, index: index, count: glogC), state: state)
+                                              betas: view(betas, index: index, count: gdnVH),
+                                              glog: view(glog, index: index, count: glogC), state: state)
             }
         }
     }
@@ -297,19 +300,30 @@ final class QWGDNReplayCheckpoint {
         let glogC = geometry.gdnGlogChannels
         let vPerQK = gdnVH / geometry.gdnQKHeads
         for layer in 0..<layers {
-            for row in count..<verifiedRows {
-                let rowIndex = layer * rows + row
-                for head in 0..<gdnVH {
-                    if geometry.gdnVectorDecay {
-                        let decayBase = rowIndex * glogC + head * gdnHD
-                        for channel in 0..<gdnHD {
-                            let decay = decayValues[decayBase + channel]
-                            guard decay >= 1.0e-3 && decay <= 1.0e38 else { return false }
+            for head in 0..<gdnVH {
+                if geometry.gdnVectorDecay {
+                    for channel in 0..<gdnHD {
+                        var cumDecay: Float = 1.0
+                        for row in count..<verifiedRows {
+                            let rowIndex = layer * rows + row
+                            let decay = decayValues[rowIndex * glogC + head * gdnHD + channel]
+                            guard decay.isFinite && decay >= 1.0e-3 && decay <= 1.0e38 else { return false }
+                            cumDecay *= decay
+                            guard cumDecay.isFinite && cumDecay >= 1.0e-3 && cumDecay <= 1.0e38 else { return false }
                         }
-                    } else {
-                        let decay = decayValues[rowIndex * glogC + head]
-                        guard decay >= -6.907755 && decay <= 88.0 else { return false }
                     }
+                } else {
+                    var cumLogDecay: Float = 0.0
+                    for row in count..<verifiedRows {
+                        let rowIndex = layer * rows + row
+                        let decay = decayValues[rowIndex * glogC + head]
+                        guard decay.isFinite && decay >= -6.907755 && decay <= 88.0 else { return false }
+                        cumLogDecay += decay
+                        guard cumLogDecay.isFinite && cumLogDecay >= -6.907755 else { return false }
+                    }
+                }
+                for row in count..<verifiedRows {
+                    let rowIndex = layer * rows + row
                     let innovationStart = rowIndex * zC + head * gdnHD
                     for channel in 0..<gdnHD where !innovationValues[innovationStart + channel].isFinite {
                         return false
@@ -365,7 +379,7 @@ final class QWGDNReplayCheckpoint {
         }
     }
 
-    /// A 3-row raw-input ring needs no convolution to reconstruct its history.
+    /// Coalesces each layer's 3-row history copy into 1 blit (count==0 or count>=3) or 2 blits (count==1..2).
     func encodeReplayRings(_ enc: any MTLBlitCommandEncoder,
                            ring: QWTensorValue, retaining count: Int) throws {
         if layers == 0 {
@@ -377,14 +391,21 @@ final class QWGDNReplayCheckpoint {
         guard sameStorage(ring, sourceRing) else {
             throw QWEngineDriverError.state("GPU replay requires the checkpoint's original ring slab")
         }
+        if count == 0 {
+            copy(enc, rings, ring)
+            return
+        }
         let qkvC = geometry.gdnQKVChannels
         for layer in 0..<layers {
-            for age in 0..<3 {
-                let destination = view(ring, index: layer * 3 + age, count: qkvC)
-                let source = age + count < 3
-                    ? view(rings, index: layer * 3 + age + count, count: qkvC)
-                    : view(raw, index: layer * rows + age + count - 3, count: qkvC)
-                copy(enc, source, destination)
+            if count >= 3 {
+                copy(enc, slice(raw, startRow: layer * rows + count - 3, rowCount: 3, rowWidth: qkvC),
+                     slice(ring, startRow: layer * 3, rowCount: 3, rowWidth: qkvC))
+            } else {
+                let fromRings = 3 - count
+                copy(enc, slice(rings, startRow: layer * 3 + count, rowCount: fromRings, rowWidth: qkvC),
+                     slice(ring, startRow: layer * 3, rowCount: fromRings, rowWidth: qkvC))
+                copy(enc, slice(raw, startRow: layer * rows, rowCount: count, rowWidth: qkvC),
+                     slice(ring, startRow: layer * 3 + fromRings, rowCount: count, rowWidth: qkvC))
             }
         }
     }

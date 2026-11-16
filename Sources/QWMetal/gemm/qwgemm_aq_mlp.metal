@@ -89,8 +89,9 @@ static inline void qwg_aq_silu_pair_rows4_m(device const char* blocks,
         device const char* u1 = (r0 + 1u < I) ? (u0 + rowBytes) : u0;
         device const char* u2 = (r0 + 2u < I) ? (u0 + 2u * rowBytes) : u0;
         device const char* u3 = (r0 + 3u < I) ? (u0 + 3u * rowBytes) : u0;
-        float4 gate0 = float4(0.0f), gate1 = float4(0.0f), gate2 = float4(0.0f), gate3 = float4(0.0f);
-        float4 up0 = float4(0.0f), up1 = float4(0.0f), up2 = float4(0.0f), up3 = float4(0.0f);
+        float4 gate[8], up[8];
+        #pragma unroll
+        for (uint m = 0u; m < 8u; ++m) { gate[m] = float4(0.0f); up[m] = float4(0.0f); }
         for (uint g = lane; g < nBlocks; g += 32u) {
             const uint col = g << 5u;
             const size_t groupOff = size_t(col / GROUP) * groupBytes;
@@ -103,86 +104,59 @@ static inline void qwg_aq_silu_pair_rows4_m(device const char* blocks,
             device const char* up_p1 = u1 + groupOff;
             device const char* up_p2 = u2 + groupOff;
             device const char* up_p3 = u3 + groupOff;
-            {
-                half4 xlo0[4], xhi0[4], xlo1[4], xhi1[4];
-                const float2 sumX01 = float2(
-                    qwg_aq_load_prescaled32<BITS>(x + col, xlo0, xhi0),
-                    qwg_aq_load_prescaled32<BITS>(x + (size_t)K + col, xlo1, xhi1));
-                const float2 dg0 = qwg_aq_slice_dot2<BITS>(gp0, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX01);
-                const float2 dg1 = qwg_aq_slice_dot2<BITS>(gp1, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX01);
-                const float2 dg2 = qwg_aq_slice_dot2<BITS>(gp2, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX01);
-                const float2 dg3 = qwg_aq_slice_dot2<BITS>(gp3, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX01);
-                const float2 du0 = qwg_aq_slice_dot2<BITS>(up_p0, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX01);
-                const float2 du1 = qwg_aq_slice_dot2<BITS>(up_p1, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX01);
-                const float2 du2 = qwg_aq_slice_dot2<BITS>(up_p2, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX01);
-                const float2 du3 = qwg_aq_slice_dot2<BITS>(up_p3, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX01);
-                gate0 += float4(dg0.x, dg1.x, dg2.x, dg3.x);
-                gate1 += float4(dg0.y, dg1.y, dg2.y, dg3.y);
-                up0 += float4(du0.x, du1.x, du2.x, du3.x);
-                up1 += float4(du0.y, du1.y, du2.y, du3.y);
-            }
-            if (mRows == 3u) {
-                half4 xlo2[4], xhi2[4];
-                const float sumX2 = qwg_aq_load_prescaled32<BITS>(x + (size_t)2u * K + col, xlo2, xhi2);
-                gate2.x += qwg_aq_slice_dot<BITS>(gp0, byteInGroup, xlo2, xhi2, sumX2);
-                gate2.y += qwg_aq_slice_dot<BITS>(gp1, byteInGroup, xlo2, xhi2, sumX2);
-                gate2.z += qwg_aq_slice_dot<BITS>(gp2, byteInGroup, xlo2, xhi2, sumX2);
-                gate2.w += qwg_aq_slice_dot<BITS>(gp3, byteInGroup, xlo2, xhi2, sumX2);
-                up2.x += qwg_aq_slice_dot<BITS>(up_p0, byteInGroup, xlo2, xhi2, sumX2);
-                up2.y += qwg_aq_slice_dot<BITS>(up_p1, byteInGroup, xlo2, xhi2, sumX2);
-                up2.z += qwg_aq_slice_dot<BITS>(up_p2, byteInGroup, xlo2, xhi2, sumX2);
-                up2.w += qwg_aq_slice_dot<BITS>(up_p3, byteInGroup, xlo2, xhi2, sumX2);
-            } else if (mRows >= 4u) {
-                half4 xlo2[4], xhi2[4], xlo3[4], xhi3[4];
-                const float2 sumX23 = float2(
-                    qwg_aq_load_prescaled32<BITS>(x + (size_t)2u * K + col, xlo2, xhi2),
-                    qwg_aq_load_prescaled32<BITS>(x + (size_t)3u * K + col, xlo3, xhi3));
-                const float2 dg0 = qwg_aq_slice_dot2<BITS>(gp0, byteInGroup, xlo2, xhi2, xlo3, xhi3, sumX23);
-                const float2 dg1 = qwg_aq_slice_dot2<BITS>(gp1, byteInGroup, xlo2, xhi2, xlo3, xhi3, sumX23);
-                const float2 dg2 = qwg_aq_slice_dot2<BITS>(gp2, byteInGroup, xlo2, xhi2, xlo3, xhi3, sumX23);
-                const float2 dg3 = qwg_aq_slice_dot2<BITS>(gp3, byteInGroup, xlo2, xhi2, xlo3, xhi3, sumX23);
-                const float2 du0 = qwg_aq_slice_dot2<BITS>(up_p0, byteInGroup, xlo2, xhi2, xlo3, xhi3, sumX23);
-                const float2 du1 = qwg_aq_slice_dot2<BITS>(up_p1, byteInGroup, xlo2, xhi2, xlo3, xhi3, sumX23);
-                const float2 du2 = qwg_aq_slice_dot2<BITS>(up_p2, byteInGroup, xlo2, xhi2, xlo3, xhi3, sumX23);
-                const float2 du3 = qwg_aq_slice_dot2<BITS>(up_p3, byteInGroup, xlo2, xhi2, xlo3, xhi3, sumX23);
-                gate2 += float4(dg0.x, dg1.x, dg2.x, dg3.x);
-                gate3 += float4(dg0.y, dg1.y, dg2.y, dg3.y);
-                up2 += float4(du0.x, du1.x, du2.x, du3.x);
-                up3 += float4(du0.y, du1.y, du2.y, du3.y);
+            #pragma unroll
+            for (uint p = 0u; p < 8u; p += 2u) {
+                if (p + 1u < mRows) {
+                    half4 xlo0[4], xhi0[4], xlo1[4], xhi1[4];
+                    const float2 sumX = float2(
+                        qwg_aq_load_prescaled32<BITS>(x + (size_t)p * K + col, xlo0, xhi0),
+                        qwg_aq_load_prescaled32<BITS>(x + (size_t)(p + 1u) * K + col, xlo1, xhi1));
+                    const float2 dg0 = qwg_aq_slice_dot2<BITS>(gp0, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX);
+                    const float2 dg1 = qwg_aq_slice_dot2<BITS>(gp1, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX);
+                    const float2 dg2 = qwg_aq_slice_dot2<BITS>(gp2, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX);
+                    const float2 dg3 = qwg_aq_slice_dot2<BITS>(gp3, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX);
+                    const float2 du0 = qwg_aq_slice_dot2<BITS>(up_p0, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX);
+                    const float2 du1 = qwg_aq_slice_dot2<BITS>(up_p1, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX);
+                    const float2 du2 = qwg_aq_slice_dot2<BITS>(up_p2, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX);
+                    const float2 du3 = qwg_aq_slice_dot2<BITS>(up_p3, byteInGroup, xlo0, xhi0, xlo1, xhi1, sumX);
+                    gate[p] += float4(dg0.x, dg1.x, dg2.x, dg3.x);
+                    gate[p + 1u] += float4(dg0.y, dg1.y, dg2.y, dg3.y);
+                    up[p] += float4(du0.x, du1.x, du2.x, du3.x);
+                    up[p + 1u] += float4(du0.y, du1.y, du2.y, du3.y);
+                } else if (p < mRows) {
+                    half4 xlo0[4], xhi0[4];
+                    const float sumX = qwg_aq_load_prescaled32<BITS>(x + (size_t)p * K + col, xlo0, xhi0);
+                    gate[p].x += qwg_aq_slice_dot<BITS>(gp0, byteInGroup, xlo0, xhi0, sumX);
+                    gate[p].y += qwg_aq_slice_dot<BITS>(gp1, byteInGroup, xlo0, xhi0, sumX);
+                    gate[p].z += qwg_aq_slice_dot<BITS>(gp2, byteInGroup, xlo0, xhi0, sumX);
+                    gate[p].w += qwg_aq_slice_dot<BITS>(gp3, byteInGroup, xlo0, xhi0, sumX);
+                    up[p].x += qwg_aq_slice_dot<BITS>(up_p0, byteInGroup, xlo0, xhi0, sumX);
+                    up[p].y += qwg_aq_slice_dot<BITS>(up_p1, byteInGroup, xlo0, xhi0, sumX);
+                    up[p].z += qwg_aq_slice_dot<BITS>(up_p2, byteInGroup, xlo0, xhi0, sumX);
+                    up[p].w += qwg_aq_slice_dot<BITS>(up_p3, byteInGroup, xlo0, xhi0, sumX);
+                }
             }
         }
-        gate0 += simd_shuffle_down(gate0, 16); gate1 += simd_shuffle_down(gate1, 16);
-        gate0 += simd_shuffle_down(gate0, 8);  gate1 += simd_shuffle_down(gate1, 8);
-        gate0 += simd_shuffle_down(gate0, 4);  gate1 += simd_shuffle_down(gate1, 4);
-        gate0 += simd_shuffle_down(gate0, 2);  gate1 += simd_shuffle_down(gate1, 2);
-        gate0 += simd_shuffle_down(gate0, 1);  gate1 += simd_shuffle_down(gate1, 1);
-        up0 += simd_shuffle_down(up0, 16); up1 += simd_shuffle_down(up1, 16);
-        up0 += simd_shuffle_down(up0, 8);  up1 += simd_shuffle_down(up1, 8);
-        up0 += simd_shuffle_down(up0, 4);  up1 += simd_shuffle_down(up1, 4);
-        up0 += simd_shuffle_down(up0, 2);  up1 += simd_shuffle_down(up1, 2);
-        up0 += simd_shuffle_down(up0, 1);  up1 += simd_shuffle_down(up1, 1);
-        if (mRows >= 3u) {
-            gate2 += simd_shuffle_down(gate2, 16); up2 += simd_shuffle_down(up2, 16);
-            gate2 += simd_shuffle_down(gate2, 8);  up2 += simd_shuffle_down(up2, 8);
-            gate2 += simd_shuffle_down(gate2, 4);  up2 += simd_shuffle_down(up2, 4);
-            gate2 += simd_shuffle_down(gate2, 2);  up2 += simd_shuffle_down(up2, 2);
-            gate2 += simd_shuffle_down(gate2, 1);  up2 += simd_shuffle_down(up2, 1);
-        }
-        if (mRows >= 4u) {
-            gate3 += simd_shuffle_down(gate3, 16); up3 += simd_shuffle_down(up3, 16);
-            gate3 += simd_shuffle_down(gate3, 8);  up3 += simd_shuffle_down(up3, 8);
-            gate3 += simd_shuffle_down(gate3, 4);  up3 += simd_shuffle_down(up3, 4);
-            gate3 += simd_shuffle_down(gate3, 2);  up3 += simd_shuffle_down(up3, 2);
-            gate3 += simd_shuffle_down(gate3, 1);  up3 += simd_shuffle_down(up3, 1);
+        #pragma unroll
+        for (uint m = 0u; m < 8u; ++m) {
+            if (m < mRows) {
+                gate[m] += simd_shuffle_down(gate[m], 16); up[m] += simd_shuffle_down(up[m], 16);
+                gate[m] += simd_shuffle_down(gate[m], 8);  up[m] += simd_shuffle_down(up[m], 8);
+                gate[m] += simd_shuffle_down(gate[m], 4);  up[m] += simd_shuffle_down(up[m], 4);
+                gate[m] += simd_shuffle_down(gate[m], 2);  up[m] += simd_shuffle_down(up[m], 2);
+                gate[m] += simd_shuffle_down(gate[m], 1);  up[m] += simd_shuffle_down(up[m], 1);
+            }
         }
         if (lane == 0u) {
             const uint c = sgi * 4u;
             #pragma unroll
-            for (uint r = 0u; r < 4u; ++r) {
-                tgAct[0u * 32u + c + r] = half(qwg_swiglu_mul(gate0[r], up0[r]));
-                tgAct[1u * 32u + c + r] = half(qwg_swiglu_mul(gate1[r], up1[r]));
-                if (mRows >= 3u) tgAct[2u * 32u + c + r] = half(qwg_swiglu_mul(gate2[r], up2[r]));
-                if (mRows >= 4u) tgAct[3u * 32u + c + r] = half(qwg_swiglu_mul(gate3[r], up3[r]));
+            for (uint m = 0u; m < 8u; ++m) {
+                if (m < mRows) {
+                    #pragma unroll
+                    for (uint r = 0u; r < 4u; ++r) {
+                        tgAct[m * 32u + c + r] = half(qwg_swiglu_mul(gate[m][r], up[m][r]));
+                    }
+                }
             }
         }
     }
@@ -272,7 +246,7 @@ static inline float2 qwg_aq_silu_pair_row1(device const char* blocks,
             const bool fuseFwht = (N & 0x80000000u) != 0u;                   \
             const uint mRows = (N >> 24u) & 0x3Fu;                           \
             if (mRows >= 2u) {                                               \
-                threadgroup half tgActM[4 * 32];                             \
+                threadgroup half tgActM[8 * 32];                             \
                 const uint realN = N & 0x00FFFFFFu;                          \
                 const uint I = realN >> 1u;                                  \
                 qwg_aq_silu_pair_rows4_m<BITS, GROUP>(                       \

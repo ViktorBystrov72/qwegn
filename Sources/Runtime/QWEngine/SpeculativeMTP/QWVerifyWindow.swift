@@ -47,7 +47,7 @@ struct QWVerifyWindow {
             aligned(rows * effInter * 2) : 0) +
             moeExtra +
             mhcExtra +
-            aligned(geometry.hidden / 128 * 4) +
+            aligned(rows * geometry.hidden / 128 * 4) +
             (gpuTargets ? QWMTPGreedySelector.allocationBytes(geometry: geometry, vocabulary: vocabulary) + 256 : 0) +
             (q4Head ? aligned(rows * geometry.hidden / 128 * 4) : 0)
     }
@@ -67,7 +67,7 @@ struct QWVerifyWindow {
         hidden = try allocator.allocate(QWTensorShape([rows * geometry.hidden], .f16))
         logits = try allocator.allocate(QWTensorShape([rows * vocabulary], .f32))
         gsHead = q4Head ? try allocator.allocate(QWTensorShape([rows * geometry.hidden / 128], .f32)) : nil
-        headGroupSums = try allocator.allocate(QWTensorShape([geometry.hidden / 128], .f32))
+        headGroupSums = try allocator.allocate(QWTensorShape([rows * geometry.hidden / 128], .f32))
         normalized = layerMajor ? try allocator.allocate(QWTensorShape([rows * geometry.hidden], .f16)) : nil
         mlpRows = layerMajor ? try allocator.allocate(QWTensorShape([rows * effInter], .f16)) : nil
         if layerMajor && geometry.numExperts > 0 {
@@ -235,24 +235,40 @@ struct QWVerifyWindow {
     func greedyDecision(drafts: [Int], maxNew: Int, stopIDs: Set<Int> = [],
                         activeRows: Int? = nil, relaxedMargin: Float = 0,
                         relaxedMinProb: Float = 0) throws -> QWGreedyRoundDecision {
+        try greedyDecisionWithTargets(
+            drafts: drafts, maxNew: maxNew, stopIDs: stopIDs,
+            activeRows: activeRows, relaxedMargin: relaxedMargin,
+            relaxedMinProb: relaxedMinProb
+        ).decision
+    }
+
+    /// Computes both the accepted prefix decision and the unrelaxed target argmax
+    /// vector across every active verification row in a single logit pass.
+    func greedyDecisionWithTargets(
+        drafts: [Int], maxNew: Int, stopIDs: Set<Int> = [],
+        activeRows: Int? = nil, relaxedMargin: Float = 0,
+        relaxedMinProb: Float = 0
+    ) throws -> (decision: QWGreedyRoundDecision, targets: [Int]) {
         let count = activeRows ?? rows
         guard drafts.count + 1 == count else { throw QWEngineDriverError.state("greedy verify draft count mismatch") }
         let p = logits.region.pointer.advanced(by: logits.offset).assumingMemoryBound(to: Float.self)
-        var targets: [Int]
+        var rawTargets: [Int]
         if targetTokens != nil {
-            targets = try completedTargets(activeRows: count)
+            rawTargets = try completedTargets(activeRows: count)
         } else {
-            targets = []
-            targets.reserveCapacity(count)
+            rawTargets = []
+            rawTargets.reserveCapacity(count)
             for row in 0..<count {
-                targets.append(try Self.greedyToken(UnsafeBufferPointer(start: p + row * vocabulary, count: vocabulary),
-                                                   ordering: .shippingTarget))
+                rawTargets.append(try Self.greedyToken(
+                    UnsafeBufferPointer(start: p + row * vocabulary, count: vocabulary),
+                    ordering: .shippingTarget))
             }
         }
+        var acceptedTargets = rawTargets
         if relaxedMargin > 0 {
             for row in 0..<drafts.count {
                 let draftId = drafts[row]
-                let targetId = targets[row]
+                let targetId = acceptedTargets[row]
                 if draftId != targetId {
                     guard (0..<vocabulary).contains(draftId), (0..<vocabulary).contains(targetId) else { break }
                     let rowLogits = p + row * vocabulary
@@ -262,14 +278,17 @@ struct QWVerifyWindow {
                        Self.clearsProbabilityFloor(UnsafeBufferPointer(start: rowLogits, count: vocabulary),
                                                    draftScore: draftScore, maxScore: targetScore,
                                                    minProbability: relaxedMinProb) {
-                        targets[row] = draftId
+                        acceptedTargets[row] = draftId
                     } else {
                         break
                     }
                 }
             }
         }
-        return try QWGreedyRoundDecision.make(geometry: geometry, drafts: drafts, targetTokens: targets, maxNew: maxNew, stopIDs: stopIDs)
+        let decision = try QWGreedyRoundDecision.make(
+            geometry: geometry, drafts: drafts, targetTokens: acceptedTargets,
+            maxNew: maxNew, stopIDs: stopIDs)
+        return (decision: decision, targets: rawTargets)
     }
 
     /// Variational fidelity floor: a relaxed draft also needs

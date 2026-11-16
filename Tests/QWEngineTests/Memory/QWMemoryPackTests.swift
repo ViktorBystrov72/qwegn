@@ -327,4 +327,110 @@ final class QWMemoryPackTests: XCTestCase {
         XCTAssertTrue(rescueGuard.prefixTokens.isEmpty)
         XCTAssertGreaterThan(rescueGuard.availableVaultTokenBudget, 0)
     }
+
+    func testMatchingCacheRefusesWrongModelByDefaultAndBuildEnvelopeStreamsPerFileProgress() throws {
+        let a1 = QWMemoryManifest.CacheArtifact(
+            modelName: "Qwen3.8-27B",
+            geometryDigest: "deadbeef",
+            kvMode: "q4",
+            lsaMode: "auto",
+            tokenCount: 1000,
+            cacheFileName: "a.qwcache",
+            cacheFileBytes: 1024
+        )
+        let manifest = QWMemoryManifest(
+            packName: "repo",
+            rootPath: "/tmp/repo",
+            files: [],
+            caches: [a1]
+        )
+        XCTAssertNil(manifest.matchingCache(modelName: "Other-Model", geometryDigest: "cafe0000"))
+        XCTAssertNotNil(manifest.matchingCache(modelName: "Other-Model", geometryDigest: "cafe0000", allowFallbackToAnyModel: true))
+        XCTAssertEqual(manifest.matchingCache(modelName: "qwen3.8-27b")?.cacheFileName, "a.qwcache")
+
+        let aSlug = QWMemoryManifest.CacheArtifact(
+            modelName: "Qwen3.8:27B",
+            geometryDigest: "bead1234",
+            kvMode: "q4",
+            lsaMode: "auto",
+            tokenCount: 500,
+            cacheFileName: "slug.qwcache",
+            cacheFileBytes: 512
+        )
+        let slugManifest = QWMemoryManifest(packName: "repo", rootPath: "/tmp/repo", files: [], caches: [a1, aSlug])
+        XCTAssertEqual(slugManifest.matchingCache(modelName: "Qwen3.8/27B")?.cacheFileName, "slug.qwcache")
+
+        let files = [
+            QWMemoryPack.DiscoveredFile(relativePath: "README.md", tier: 0, sha256: "h1", mtimeEpochSec: 1, byteCount: 12, content: "# Hello\n"),
+            QWMemoryPack.DiscoveredFile(relativePath: "Sources/A.swift", tier: 1, sha256: "h2", mtimeEpochSec: 1, byteCount: 18, content: "struct Alpha {}\n"),
+            QWMemoryPack.DiscoveredFile(relativePath: "Sources/B.swift", tier: 1, sha256: "h3", mtimeEpochSec: 1, byteCount: 17, content: "struct Beta {}\n")
+        ]
+        var updates: [QWMemoryPack.FileProgressUpdate] = []
+        _ = QWMemoryPack.buildEnvelope(
+            packName: "prog-repo",
+            rootPath: "/tmp/prog-repo",
+            files: files,
+            clusterBlockTokens: 64,
+            kvMode: "q4",
+            maxTokens: nil,
+            onFileProgress: { updates.append($0) },
+            tokenCounter: { max(1, $0.count / 4) }
+        )
+        XCTAssertEqual(updates.map(\.processedFiles), [1, 2, 3])
+        XCTAssertEqual(updates.map(\.totalFiles), [3, 3, 3])
+        XCTAssertEqual(updates.map(\.currentFile), ["README.md", "Sources/A.swift", "Sources/B.swift"])
+        XCTAssertTrue(updates[0].tokenizedTokens <= updates[1].tokenizedTokens && updates[1].tokenizedTokens <= updates[2].tokenizedTokens)
+    }
+
+    func testEvaluateGitStalenessDetectsCommitsBehindAndDivergedBaseline() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("qwg_git_stale_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let nonGit = QWMemoryPack.evaluateGitStaleness(manifestSHA: "abc", in: tempDir)
+        XCTAssertFalse(nonGit.isGitRepo)
+        XCTAssertEqual(nonGit.commitsBehind, 0)
+
+        func git(_ args: [String]) throws -> String {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            p.arguments = ["-C", tempDir.path] + args
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            try p.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            XCTAssertEqual(p.terminationStatus, 0, "git \(args.joined(separator: " ")) failed")
+            return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        _ = try git(["init"])
+        _ = try git(["config", "user.email", "ci@qwegine.local"])
+        _ = try git(["config", "user.name", "Qwegn CI"])
+        try "v1\n".write(to: tempDir.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        _ = try git(["add", "a.txt"])
+        _ = try git(["commit", "-m", "init"])
+        let sha1 = try git(["rev-parse", "HEAD"])
+
+        try "v2\n".write(to: tempDir.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        _ = try git(["add", "a.txt"])
+        _ = try git(["commit", "-m", "second"])
+        let sha2 = try git(["rev-parse", "HEAD"])
+
+        let fresh = QWMemoryPack.evaluateGitStaleness(manifestSHA: sha2, in: tempDir)
+        XCTAssertTrue(fresh.isGitRepo)
+        XCTAssertEqual(fresh.commitsBehind, 0)
+        XCTAssertFalse(fresh.diverged)
+
+        let stale = QWMemoryPack.evaluateGitStaleness(manifestSHA: sha1, in: tempDir)
+        XCTAssertTrue(stale.isGitRepo)
+        XCTAssertEqual(stale.commitsBehind, 1)
+        XCTAssertFalse(stale.diverged)
+
+        let diverged = QWMemoryPack.evaluateGitStaleness(manifestSHA: "00000000deadbeef", in: tempDir)
+        XCTAssertTrue(diverged.isGitRepo)
+        XCTAssertTrue(diverged.diverged)
+    }
 }

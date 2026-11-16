@@ -83,4 +83,24 @@ final class QWMTPAdaptiveDepthTests: XCTestCase {
         XCTAssertLessThan(budget3, 3 * kTop)
         XCTAssertEqual(explicit, kTop + 4)
     }
+
+    func testHybridNextNNeuralDepthCapCapsSparseMoEAndHostEmbedOnly() {
+        XCTAssertEqual(
+            QWMTPAdaptiveDepth.hybridNextNNeuralDepthCap(
+                isStochastic: false, stageProfiling: false, hasDeviceEmbedding: true, numExperts: 288),
+            1)
+        XCTAssertNil(
+            QWMTPAdaptiveDepth.hybridNextNNeuralDepthCap(
+                isStochastic: false, stageProfiling: false, hasDeviceEmbedding: true, numExperts: 0))
+        XCTAssertEqual(
+            QWMTPAdaptiveDepth.hybridNextNNeuralDepthCap(
+                isStochastic: false, stageProfiling: false, hasDeviceEmbedding: false, numExperts: 0),
+            1)
+        XCTAssertNil(
+            QWMTPAdaptiveDepth.hybridNextNNeuralDepthCap(
+                isStochastic: true, stageProfiling: false, hasDeviceEmbedding: true, numExperts: 288))
+        XCTAssertNil(
+            QWMTPAdaptiveDepth.hybridNextNNeuralDepthCap(
+                isStochastic: false, stageProfiling: true, hasDeviceEmbedding: true, numExperts: 288))
+    }
 }

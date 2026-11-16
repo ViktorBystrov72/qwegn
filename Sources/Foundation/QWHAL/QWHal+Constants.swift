@@ -3,7 +3,7 @@ import Metal
 import QWCore
 
 extension QWHal {
-    public static func makeFunctionConstants(geometry: QWModelGeometry) -> MTLFunctionConstantValues {
+    public static func makeFunctionConstants(geometry: QWModelGeometry, isAQ4: Bool = false) -> MTLFunctionConstantValues {
         let fc = MTLFunctionConstantValues()
         func setU32(_ v: Int, at idx: Int) {
             var u = UInt32(v)
@@ -77,6 +77,8 @@ extension QWHal {
         fc.setConstantValue(&mhcAdditiveEps, type: .bool, index: 230)
         var mhcHcEps = geometry.mhcConfig?.hcEps ?? (geometry.mhcConfig?.streams == 4 ? Float(1e-6) : Float(0.0))
         fc.setConstantValue(&mhcHcEps, type: .float, index: 231)
+        var aq4 = isAQ4
+        fc.setConstantValue(&aq4, type: .bool, index: 232)
         // The activation basis is NOT a function constant. It is a build-time
         // property of the metallib — see `QWWeightBasis.metallibFileName` —
         // because the rotation is a chain of `simd_shuffle_xor` calls and a

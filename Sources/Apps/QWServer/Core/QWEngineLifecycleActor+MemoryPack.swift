@@ -261,8 +261,9 @@ extension QWEngineLifecycleActor {
         guard let artifact = manifest.matchingCache(
             modelName: config.modelName,
             geometryDigest: geometryDigest,
-            kvMode: nil
-        ) ?? manifest.caches.first else {
+            kvMode: nil,
+            allowFallbackToAnyModel: false
+        ) else {
             throw QWMemoryPackError.noMatchingCacheArtifact(modelName: config.modelName, kvMode: nil)
         }
         let cacheURL = manifest.cacheFileURL(for: artifact, rootURL: rootURL)
@@ -389,8 +390,16 @@ extension QWEngineLifecycleActor {
     func autoMountAndPrepareMemoryState(
         for request: ChatCompletionRequest
     ) async -> (mountedTokens: [Int], deltaTokens: [Int], manifest: QWMemoryManifest?) {
+        guard request.effectiveUseMemoryPack else {
+            return ([], [], nil)
+        }
         var discoveredRoot: URL? = nil
-        if let rawModel = request.model,
+        if let explicitWs = request.effectiveWorkspacePath {
+            let candidateURL = URL(fileURLWithPath: explicitWs.expandingTildePath).standardizedFileURL
+            discoveredRoot = QWMemoryPack.discoverManifestRoot(walkingUpFrom: candidateURL)
+        }
+        if discoveredRoot == nil,
+           let rawModel = request.model,
            let atIdx = rawModel.firstIndex(of: "@") {
             let repoSpec = String(rawModel[rawModel.index(after: atIdx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
             if !repoSpec.isEmpty {

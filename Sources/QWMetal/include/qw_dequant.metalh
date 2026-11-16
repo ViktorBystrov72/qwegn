@@ -13,6 +13,12 @@ using namespace metal;
 // header is gated on it.
 #include "include/qw_weight_basis.metalh"
 
+#ifndef QW_FC_IS_AQ4_DEFINED
+#define QW_FC_IS_AQ4_DEFINED
+constant bool QW_FC_IS_AQ4_RAW [[function_constant(232)]];
+constant bool QW_IS_AQ4 = is_function_constant_defined(QW_FC_IS_AQ4_RAW) ? QW_FC_IS_AQ4_RAW : false;
+#endif
+
 struct Block_HQ4_G32 {
     union { half scale; half d; };
     union { half bias;  half m; };
@@ -198,22 +204,20 @@ METAL_FUNC float4 qwg_gemv_hq4_rows4(device const Block_HQ4_G32* blocks,
     return acc;
 }
 
-/// Multi-row (M) 32-lane SIMD-collaborative dot product with identical per-row FMA tree
-/// to qwg_gemv_hq4_row (guarantees M=1 vs M=K+1 bit-exact verification parity).
-template <uint M, typename PtrT>
-METAL_FUNC void qwg_gemv_hq4_row_m(device const Block_HQ4_G32* blocks,
-                                   PtrT x,
-                                   uint row,
-                                   uint K,
-                                   uint lane,
-                                   thread float (&out)[M],
-                                   bool isAQ4 = false) {
+/// Multi-row (M) 32-lane SIMD-collaborative dot product specialized at compile time for HQ4 or AQ4.
+template <uint M, bool IS_AQ4, typename PtrT>
+METAL_FUNC void qwg_gemv_hq4_row_m_t(device const Block_HQ4_G32* blocks,
+                                     PtrT x,
+                                     uint row,
+                                     uint K,
+                                     uint lane,
+                                     thread float (&out)[M]) {
     const uint nBlocks = K >> 5u;
     device const Block_HQ4_G32* rowBlocks = blocks + (size_t)row * nBlocks;
     float acc[M];
     #pragma unroll
     for (uint m = 0; m < M; ++m) acc[m] = 0.0f;
-    if (isAQ4) {
+    if (IS_AQ4) {
         for (uint g = lane; g < nBlocks; g += 32u) {
             const Block_HQ4_G32 blk = rowBlocks[g];
             const size_t colOff = (size_t)(g << 5u);
@@ -302,15 +306,21 @@ METAL_FUNC void qwg_gemv_hq4_row_m(device const Block_HQ4_G32* blocks,
     }
 }
 
-/// Batched M-input, R-weight-row HQ4/AQ4 dot product: each x load serves R rows.
-/// Every row keeps qwg_gemv_hq4_row_m's per-row FMA order, so outputs are bit-identical.
-template <uint M, uint R, typename PtrT>
-METAL_FUNC void qwg_gemv_hq4_rows_r_m(device const Block_HQ4_G32* const (&rows)[R],
-                                      PtrT x,
-                                      uint K,
-                                      uint lane,
-                                      thread float (&out)[R][M],
-                                      bool isAQ4 = false) {
+template <uint M, typename PtrT>
+METAL_FUNC void qwg_gemv_hq4_row_m(device const Block_HQ4_G32* blocks,
+                                   PtrT x, uint row, uint K, uint lane,
+                                   thread float (&out)[M], bool isAQ4 = false) {
+    if (isAQ4) qwg_gemv_hq4_row_m_t<M, true>(blocks, x, row, K, lane, out);
+    else qwg_gemv_hq4_row_m_t<M, false>(blocks, x, row, K, lane, out);
+}
+
+/// Batched M-input, R-weight-row HQ4/AQ4 dot product specialized at compile time for HQ4 or AQ4.
+template <uint M, uint R, bool IS_AQ4, typename PtrT>
+METAL_FUNC void qwg_gemv_hq4_rows_r_m_t(device const Block_HQ4_G32* const (&rows)[R],
+                                        PtrT x,
+                                        uint K,
+                                        uint lane,
+                                        thread float (&out)[R][M]) {
     const uint nBlocks = K >> 5u;
     float acc[R][M];
     #pragma unroll
@@ -318,7 +328,7 @@ METAL_FUNC void qwg_gemv_hq4_rows_r_m(device const Block_HQ4_G32* const (&rows)[
         #pragma unroll
         for (uint m = 0; m < M; ++m) acc[r][m] = 0.0f;
     }
-    if (isAQ4) {
+    if (IS_AQ4) {
         for (uint g = lane; g < nBlocks; g += 32u) {
             Block_HQ4_G32 blk[R];
             #pragma unroll
@@ -436,24 +446,31 @@ METAL_FUNC void qwg_gemv_hq4_rows_r_m(device const Block_HQ4_G32* const (&rows)[
     }
 }
 
-/// Batched M-input, 2-weight-row dot product reusing x across both weight rows.
-template <uint M, typename PtrT>
-METAL_FUNC void qwg_gemv_hq4_rows2_m(device const Block_HQ4_G32* blocks,
-                                     PtrT x,
-                                     uint row0,
-                                     uint N,
-                                     uint K,
-                                     uint lane,
-                                     thread float (&out0)[M],
-                                     thread float (&out1)[M],
-                                     bool isAQ4 = false) {
+template <uint M, uint R, typename PtrT>
+METAL_FUNC void qwg_gemv_hq4_rows_r_m(device const Block_HQ4_G32* const (&rows)[R],
+                                      PtrT x, uint K, uint lane,
+                                      thread float (&out)[R][M], bool isAQ4 = false) {
+    if (isAQ4) qwg_gemv_hq4_rows_r_m_t<M, R, true>(rows, x, K, lane, out);
+    else qwg_gemv_hq4_rows_r_m_t<M, R, false>(rows, x, K, lane, out);
+}
+
+/// Batched M-input, 2-weight-row dot product specialized at compile time for HQ4 or AQ4.
+template <uint M, bool IS_AQ4, typename PtrT>
+METAL_FUNC void qwg_gemv_hq4_rows2_m_t(device const Block_HQ4_G32* blocks,
+                                       PtrT x,
+                                       uint row0,
+                                       uint N,
+                                       uint K,
+                                       uint lane,
+                                       thread float (&out0)[M],
+                                       thread float (&out1)[M]) {
     const uint nBlocks = K >> 5u;
     device const Block_HQ4_G32* r0 = blocks + (size_t)row0 * nBlocks;
     device const Block_HQ4_G32* r1 = (row0 + 1u < N) ? (r0 + nBlocks) : r0;
     float acc0[M], acc1[M];
     #pragma unroll
     for (uint m = 0; m < M; ++m) { acc0[m] = 0.0f; acc1[m] = 0.0f; }
-    if (isAQ4) {
+    if (IS_AQ4) {
         for (uint g = lane; g < nBlocks; g += 32u) {
             const Block_HQ4_G32 blk0 = r0[g];
             const Block_HQ4_G32 blk1 = r1[g];
@@ -568,6 +585,15 @@ METAL_FUNC void qwg_gemv_hq4_rows2_m(device const Block_HQ4_G32* blocks,
         out0[m] = v.x;
         out1[m] = v.y;
     }
+}
+
+template <uint M, typename PtrT>
+METAL_FUNC void qwg_gemv_hq4_rows2_m(device const Block_HQ4_G32* blocks,
+                                     PtrT x, uint row0, uint N, uint K, uint lane,
+                                     thread float (&out0)[M], thread float (&out1)[M],
+                                     bool isAQ4 = false) {
+    if (isAQ4) qwg_gemv_hq4_rows2_m_t<M, true>(blocks, x, row0, N, K, lane, out0, out1);
+    else qwg_gemv_hq4_rows2_m_t<M, false>(blocks, x, row0, N, K, lane, out0, out1);
 }
 
 /// Register-only 32-point normalized Fast Walsh-Hadamard Transform across 32 SIMD lanes

@@ -393,6 +393,8 @@ extension QWEngineDriver {
                 first = try sampleStochasticTarget(session, permit: permit)
             }
             session.tokenHistory = prompt + [first]
+            session.tokenRecycler.reset()
+            session.tokenRecycler.ingestSequence(session.tokenHistory)
             let firstTokenSec = Date().timeIntervalSince(started)
             let prefillSec = computePrefillSec ?? firstTokenSec
             var emittedFirst = false
@@ -495,12 +497,21 @@ extension QWEngineDriver {
     public func buildStandalonePrefixCache(
         tokens: [Int],
         outputURL: URL,
-        pinAsSharedBase: Bool = true
+        pinAsSharedBase: Bool = true,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
     ) throws -> Int {
         try requestGate.withRequest(flight: flight) { permit in
             guard !tokens.isEmpty, tokens.count <= ropeRows,
                   tokens.allSatisfy({ (0..<geometry.vocab).contains($0) }) else {
                 throw QWEngineDriverError.state("invalid standalone prefix tokens")
+            }
+            activePrefillProgress = onPrefillProgress
+            activePrefillTotalTokens = nil
+            activePrefillBasePosition = 0
+            defer {
+                activePrefillProgress = nil
+                activePrefillTotalTokens = nil
+                activePrefillBasePosition = 0
             }
             let mode = gdnPrefillMode
             let session = try admitSession(promptTokens: tokens.count)

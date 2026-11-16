@@ -13,7 +13,7 @@ struct QWWeightAllocationPlan {
     let bytes: Int
 
     init(geometry: QWModelGeometry, ropeRows: Int, mtpDrafts: Int = 0, headQ4g: Bool = false,
-         maxMTPDrafts: Int = 5, format: QWWeightFormat = .hq4G32) throws {
+         maxMTPDrafts: Int = 7, format: QWWeightFormat = .hq4G32) throws {
         guard ropeRows > 0, ropeRows <= Int.max / 256 - 1 else {
             throw QWEngineDriverError.state("invalid RoPE row count: \(ropeRows)")
         }

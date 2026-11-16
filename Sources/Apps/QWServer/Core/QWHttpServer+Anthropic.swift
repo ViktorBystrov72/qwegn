@@ -8,7 +8,7 @@ import QWVision
 /// like the Messages API answer: blocks, stop_reason, usage.
 extension QWHttpServer {
 
-    func handleMessages(connection: NWConnection, body: Data) async throws {
+    func handleMessages(connection: NWConnection, headers: [String: String] = [:], body: Data) async throws {
         guard let parsed = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
             sendAnthropicError(connection, status: 400, type: "invalid_request_error",
                                message: "request body must be a JSON object")
@@ -62,6 +62,16 @@ extension QWHttpServer {
         if let tp = (parsed["top_p"] as? NSNumber)?.doubleValue { payload["top_p"] = tp }
         if let k = (parsed["top_k"] as? NSNumber)?.intValue { payload["top_k"] = k }
         if let stop = parsed["stop_sequences"] as? [String], !stop.isEmpty { payload["stop"] = stop }
+        if let meta = parsed["metadata"] {
+            payload["metadata"] = meta
+            if let metaDict = meta as? [String: Any], let uid = metaDict["user_id"] as? String, !uid.isEmpty {
+                payload["user"] = uid
+            }
+        }
+        if let usr = parsed["user"] as? String, !usr.isEmpty { payload["user"] = usr }
+        for optKey in ["session_id", "prompt_cache_key", "cache_salt", "cache_prompt", "store"] {
+            if let v = parsed[optKey] { payload[optKey] = v }
+        }
 
         if let rawTools = parsed["tools"] as? [[String: Any]], !rawTools.isEmpty {
             let oaiTools: [[String: Any]] = rawTools.compactMap { t in
@@ -93,17 +103,23 @@ extension QWHttpServer {
             }
         }
 
-        let req: ChatCompletionRequest
+        var req: ChatCompletionRequest
         do {
             req = try JSONDecoder().decode(ChatCompletionRequest.self,
                                            from: JSONSerialization.data(withJSONObject: payload))
+            req.httpHeaders = headers
+            try req.validateMetadata()
         } catch {
             sendAnthropicError(connection, status: 400, type: "invalid_request_error",
-                               message: "body: \(error.localizedDescription)")
+                               message: "body: \(error)")
             return
         }
 
-        let msgId = "msg_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let msgId = req.effectiveRequestId ?? ("msg_" + UUID().uuidString.replacingOccurrences(of: "-", with: ""))
+        var extraHeaders = ["x-request-id: \(msgId)"]
+        if let sid = req.effectiveSessionId {
+            extraHeaders.append("x-session-id: \(sid)")
+        }
         let hasActiveTools = !(req.tools?.isEmpty ?? true) && !req.isToolChoiceNone
         let shouldThink = req.effectiveEnableThinking(defaultValue: thinkingEnabled)
         let shouldStop = generationShouldStop(for: connection)
@@ -116,7 +132,7 @@ extension QWHttpServer {
         }
 
         if (payload["stream"] as? Bool) == true {
-            sendSSEHeaders(connection)
+            sendSSEHeaders(connection, extraHeaders: extraHeaders)
 
             func sendEvent(_ event: String, _ json: [String: Any]) {
                 guard let data = try? JSONSerialization.data(withJSONObject: json) else { return }
@@ -332,7 +348,7 @@ extension QWHttpServer {
                 "usage": usageDict,
             ]
             if let data = try? JSONSerialization.data(withJSONObject: response) {
-                sendRawData(connection, status: 200, contentType: "application/json", data: data)
+                sendRawData(connection, status: 200, contentType: "application/json", data: data, extraHeaders: extraHeaders)
             } else {
                 sendAnthropicError(connection, status: 500, type: "api_error",
                                    message: "the answer could not be encoded")

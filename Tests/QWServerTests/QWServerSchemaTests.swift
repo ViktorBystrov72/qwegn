@@ -418,7 +418,8 @@ final class QWServerSchemaTests: XCTestCase {
 
         let gate = QWStreamKeepaliveGate()
         XCTAssertFalse(gate.isStopped())
-        gate.stop()
+        XCTAssertTrue(gate.stopIfRunning())
+        XCTAssertFalse(gate.stopIfRunning())
         XCTAssertTrue(gate.isStopped())
     }
 

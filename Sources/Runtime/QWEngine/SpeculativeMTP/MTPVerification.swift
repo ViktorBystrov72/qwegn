@@ -261,7 +261,7 @@ extension QWEngineDriver {
                     x16: prefixRows(normalized, rows: activeRows, cols: h, dt: .f16),
                     dn32: prefixRows(moeDn32, rows: activeRows, cols: h, dt: .f32),
                     dn16: prefixRows(mtpBatchedMLP.downRows, rows: activeRows, cols: h, dt: .f16),
-                    rows: activeRows, geometry: geometry, driver: self)
+                    rows: activeRows, geometry: geometry, driver: self, skipOut32: true)
                 if let active = self.activeEnc { enc = active }
                 if let activeBuf = self.activeCB { currentCB = activeBuf }
                 enc.memoryBarrier(scope: .buffers)

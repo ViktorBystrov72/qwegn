@@ -59,6 +59,7 @@ kernel void qwg_moe_down_reduce_combine_f32(device const float* dnAcc [[buffer(0
     const bool skipShared = numGroups > 0u || (hasOut16 & 8u) != 0u;
     const bool unweightedSingle = (hasOut16 & 16u) != 0u;
     const bool hasIdsFilter = numGroups > 0u || (hasOut16 & 32u) != 0u;
+    const bool skipOut32 = writeOut16 && ((hasOut16 & 128u) != 0u);
     const float g = skipShared ? 0.0f : gate[t];
     device const half* dnAcc16 = (device const half*)dnAcc;
     if (h + 4u <= N) {
@@ -93,7 +94,7 @@ kernel void qwg_moe_down_reduce_combine_f32(device const float* dnAcc [[buffer(0
         const uint outRow = (numGroups > 0u) ? tg.y : t;
         const size_t idx = size_t(outRow) * N + h;
         const float4 y4 = skipShared ? acc : (acc + g * (*(device const float4*)(shared + idx)));
-        *(device float4*)(out + idx) = y4;
+        if (!skipOut32) *(device float4*)(out + idx) = y4;
         if (writeOut16) *(device half4*)(out16 + idx) = half4(y4);
     } else {
         for (uint i = 0u; h + i < N; ++i) {
@@ -116,7 +117,7 @@ kernel void qwg_moe_down_reduce_combine_f32(device const float* dnAcc [[buffer(0
                 }
             }
             const float y = skipShared ? acc : (acc + g * shared[idx]);
-            out[idx] = y;
+            if (!skipOut32) out[idx] = y;
             if (writeOut16) out16[idx] = half(y);
         }
     }

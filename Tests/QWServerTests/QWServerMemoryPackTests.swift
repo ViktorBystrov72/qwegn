@@ -2,6 +2,7 @@
 // agent system-prompt auto-discovery, and kvMode enforcement/restoration.
 
 import Foundation
+import JavaScriptCore
 import QWCore
 import QWEngine
 import QWHAL
@@ -23,6 +24,8 @@ private final class MockMemoryBackend: QWModelBackend, @unchecked Sendable {
     let capabilities: Set<QWKnobCapability> = [.lsa]
     var mountedURLs: [URL] = []
     var unmountCount: Int = 0
+    var builtTokenCounts: [Int] = []
+    var builtOutputURLs: [URL] = []
     let stubTokens: [Int]
     let stubBytes: Int
 
@@ -63,6 +66,25 @@ private final class MockMemoryBackend: QWModelBackend, @unchecked Sendable {
             warmCacheBytes: stubBytes,
             ssdCacheBytes: 0
         )
+    }
+
+    func buildStandalonePrefixCache(
+        tokens: [Int],
+        outputURL: URL,
+        pinAsSharedBase: Bool,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
+    ) throws -> Int {
+        builtTokenCounts.append(tokens.count)
+        builtOutputURLs.append(outputURL)
+        try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        onPrefillProgress?(max(1, tokens.count / 2), tokens.count)
+        onPrefillProgress?(tokens.count, tokens.count)
+        let payload = Data(repeating: 0x42, count: max(64, stubBytes))
+        try payload.write(to: outputURL)
+        if pinAsSharedBase {
+            mountedURLs.append(outputURL)
+        }
+        return payload.count
     }
 
     func mountStandalonePrefixCache(from fileURL: URL) throws -> (tokens: [Int], byteCount: Int) {
@@ -483,5 +505,192 @@ final class QWServerMemoryPackTests: XCTestCase {
         )
         XCTAssertTrue(prepared.wire.contains("[VAULT FILE: Sources/DriverResidency.swift]"))
         XCTAssertEqual(prepared.messages.last?.get("tool_call_id"), .string("call_grep"))
+    }
+
+    func testInspectAndLiveIndexStreamsProgressAndMountsOverHTTP() async throws {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory.appendingPathComponent("qwg_live_idx_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        try "# Demo\nDocs line.\n".write(to: tempRoot.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        let srcDir = tempRoot.appendingPathComponent("Sources", isDirectory: true)
+        try fm.createDirectory(at: srcDir, withIntermediateDirectories: true)
+        try "public struct LiveItem { public let id = 1 }\n".write(to: srcDir.appendingPathComponent("LiveItem.swift"), atomically: true, encoding: .utf8)
+
+        let (tok, tpl) = try makeMinimalTokenizerAndTemplate()
+        let stubTokens = Array(repeating: 2, count: 512)
+        let config = QWEngineLifecycleActor.Config(
+            packPath: "/dummy/ModelA.qwp",
+            modelName: "model-alpha",
+            maxContext: 16384,
+            kvMode: .q4,
+            host: "127.0.0.1",
+            port: 0
+        )
+        let actor = QWEngineLifecycleActor(
+            config: config,
+            logger: QWServerLogger(level: .none),
+            load: { cfg, _, _ in
+                let backend = MockMemoryBackend(config: cfg, stubTokens: stubTokens, stubBytes: 2048)
+                return QWEngineLifecycleActor.LoadedState(modelBackend: backend, tokenizer: tok, chatTemplate: tpl)
+            }
+        )
+        let server = QWHttpServer(actor: actor, host: "127.0.0.1", port: 0, logger: QWServerLogger(level: .none))
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let port = try XCTUnwrap(server.listener?.port?.rawValue)
+        let baseURL = URL(string: "http://127.0.0.1:\(port)")!
+        let session = URLSession.shared
+
+        // 1. Missing `.qwcache` -> status == "missing"
+        var inspectReq = URLRequest(url: baseURL.appendingPathComponent("v1/memory/inspect"))
+        inspectReq.httpMethod = "POST"
+        inspectReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        inspectReq.httpBody = try JSONSerialization.data(withJSONObject: ["path": tempRoot.path])
+        let (inspData1, inspResp1) = try await session.data(for: inspectReq)
+        XCTAssertEqual((inspResp1 as? HTTPURLResponse)?.statusCode, 200)
+        let insp1 = try JSONDecoder().decode(QWMemoryInspectResponse.self, from: inspData1)
+        XCTAssertEqual(insp1.status, "missing")
+        XCTAssertFalse(insp1.manifestExists)
+        XCTAssertEqual(insp1.candidateFileCount, 2)
+
+        // 2. Stream indexing via POST /v1/memory/index
+        var indexReq = URLRequest(url: baseURL.appendingPathComponent("v1/memory/index"))
+        indexReq.httpMethod = "POST"
+        indexReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        indexReq.httpBody = try JSONEncoder().encode(QWMemoryIndexRequest(
+            path: tempRoot.path,
+            kvMode: "q4",
+            lsaMode: "auto",
+            scope: "cortex_vault",
+            includeTests: false,
+            mountAfterIndex: true,
+            stream: true
+        ))
+        let (streamBytes, streamResp) = try await session.bytes(for: indexReq)
+        XCTAssertEqual((streamResp as? HTTPURLResponse)?.statusCode, 200)
+        var events: [QWMemoryIndexProgressEvent] = []
+        for try await line in streamBytes.lines {
+            guard line.hasPrefix("data: ") else { continue }
+            let payload = String(line.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if payload == "[DONE]" { break }
+            if let data = payload.data(using: .utf8),
+               let ev = try? JSONDecoder().decode(QWMemoryIndexProgressEvent.self, from: data) {
+                events.append(ev)
+            }
+        }
+        let phases = events.map(\.phase)
+        XCTAssertTrue(phases.contains("discovering"))
+        XCTAssertTrue(phases.contains("tokenizing"))
+        XCTAssertTrue(phases.contains("prefilling"))
+        XCTAssertTrue(phases.contains("completed"))
+        let tokenEvents = events.filter { $0.phase == "tokenizing" }
+        XCTAssertEqual(tokenEvents.map(\.processedFiles), [1, 2])
+        XCTAssertEqual(events.last?.result?.fileCount, 2)
+        XCTAssertNotNil(events.last?.result?.mounted)
+        XCTAssertEqual(actor.getMountedMemoryPackInfo()?.rootPath, tempRoot.standardizedFileURL.path)
+
+        // 3. Re-inspect -> status == "ready"
+        let (inspData2, _) = try await session.data(for: inspectReq)
+        let insp2 = try JSONDecoder().decode(QWMemoryInspectResponse.self, from: inspData2)
+        XCTAssertEqual(insp2.status, "ready")
+        XCTAssertTrue(insp2.manifestExists)
+        XCTAssertNotNil(insp2.matchingArtifact)
+
+        // 4. Modify a file -> status == "stale"
+        let liveItemURL = srcDir.appendingPathComponent("LiveItem.swift")
+        try "public struct LiveItem { public let id = 2026; public let updated = true }\n".write(
+            to: liveItemURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(2)],
+            ofItemAtPath: liveItemURL.path
+        )
+        let (inspData3, _) = try await session.data(for: inspectReq)
+        let insp3 = try JSONDecoder().decode(QWMemoryInspectResponse.self, from: inspData3)
+        XCTAssertEqual(insp3.status, "stale")
+        XCTAssertEqual(insp3.modifiedFiles, ["Sources/LiveItem.swift"])
+
+        // 5. Wrong-model inspection & strict mount refusal
+        let otherActor = QWEngineLifecycleActor(
+            config: QWEngineLifecycleActor.Config(
+                packPath: "/dummy/ModelB.qwp",
+                modelName: "model-beta",
+                maxContext: 16384,
+                kvMode: .q4,
+                host: "127.0.0.1",
+                port: 0
+            ),
+            logger: QWServerLogger(level: .none)
+        )
+        let insp4 = try await otherActor.inspectMemoryPack(at: tempRoot.path)
+        XCTAssertEqual(insp4.status, "wrong_model")
+        XCTAssertEqual(insp4.availableArtifacts.count, 1)
+        do {
+            _ = try await otherActor.mountMemoryPack(at: tempRoot.path)
+            XCTFail("Expected wrong-model mount refusal")
+        } catch let err as QWMemoryPackError {
+            if case .noMatchingCacheArtifact = err {
+                XCTAssertTrue(true)
+            } else {
+                XCTFail("Unexpected QWMemoryPackError: \(err)")
+            }
+        }
+    }
+
+    func testMemoryPackModalMarkupAndStateHelpersInJSContext() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let doc = try String(contentsOf: root.appendingPathComponent("Sources/Apps/QWServer/Resources/controlbar.html"), encoding: .utf8)
+        for required in [
+            "id=\"chat-mempack-index-btn\"",
+            "id=\"modal-memory-pack\"",
+            "id=\"mempack-status-badge\"",
+            "id=\"mempack-root-path\"",
+            "id=\"mempack-status-summary\"",
+            "id=\"mempack-artifacts-list\"",
+            "id=\"mempack-opt-kv\"",
+            "id=\"mempack-opt-lsa\"",
+            "id=\"mempack-opt-scope\"",
+            "id=\"mempack-opt-tests\"",
+            "id=\"mempack-progress-box\"",
+            "id=\"mempack-progress-track\"",
+            "id=\"mempack-progress-current-file\"",
+            "id=\"mempack-actions-bar\"",
+        ] {
+            XCTAssertTrue(doc.contains(required), "missing memory pack modal markup: \(required)")
+        }
+
+        let ctx = try XCTUnwrap(JSContext())
+        var jsError: String?
+        ctx.exceptionHandler = { _, exc in
+            jsError = exc?.toString() ?? "unknown JS error"
+        }
+        let stateScript = try String(contentsOf: root.appendingPathComponent("Sources/Apps/QWServer/Resources/js/state.js"), encoding: .utf8)
+        ctx.evaluateScript(stateScript)
+        XCTAssertNil(jsError, "JS error evaluating state.js: \(jsError ?? "")")
+
+        let summaryCheck = ctx.evaluateScript("""
+        (() => {
+          return {
+            missing: describeInspectionSummary({ status: "missing", activeModelName: "Qwen3.8-27B", candidateFileCount: 376 }),
+            wrong: describeInspectionSummary({ status: "wrong_model", activeModelName: "Qwen3.8-27B", candidateFileCount: 376 }),
+            stale: describeInspectionSummary({ status: "stale", activeModelName: "Qwen3.8-27B", commitsBehind: 3, modifiedFiles: ["a.swift"], deletedFiles: [] }),
+            ready: describeInspectionSummary({ status: "ready", activeModelName: "Qwen3.8-27B", candidateFileCount: 376 })
+          };
+        })()
+        """)?.toDictionary()
+        XCTAssertNil(jsError, "describeInspectionSummary threw: \(jsError ?? "")")
+        XCTAssertTrue((summaryCheck?["missing"] as? String)?.contains("376") == true)
+        XCTAssertTrue((summaryCheck?["wrong"] as? String)?.contains("different model") == true)
+        XCTAssertTrue((summaryCheck?["stale"] as? String)?.contains("3 commit(s)") == true)
+        XCTAssertTrue((summaryCheck?["ready"] as? String)?.contains("ready to mount") == true)
     }
 }

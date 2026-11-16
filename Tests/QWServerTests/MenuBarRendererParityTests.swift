@@ -72,6 +72,10 @@ final class MenuBarRendererParityTests: XCTestCase {
         "hardware.cpu_percent",
         "hardware.memory_percent",
         "hardware.memory_pressure_level",
+        "hardware.gpu_temp_celsius",
+        "hardware.fan_rpm",
+        "hardware.system_power_watts",
+        "hardware.thermal_state",
         "throughput.display_prefill_tokens_per_sec",
         "throughput.display_decode_tokens_per_sec",
         "prefill.progress_tokens",
@@ -291,6 +295,7 @@ final class MenuBarRendererParityTests: XCTestCase {
                 makeCard("memory.arena_reserved_bytes", value: "25.01", unit: "GiB", number: 25.01),
                 makeCard("memory.resident_bytes", value: "24.20", unit: "GiB", number: 24.20),
                 makeCard("context.active_tokens", value: "38", unit: "tok", number: 38),
+                makeCard("hardware.gpu_temp_celsius", value: "54.2", unit: "°C", number: 54.2),
             ],
             actions: [],
             knobs: ["contextTokens": .int(262_144)],
@@ -325,15 +330,18 @@ final class MenuBarRendererParityTests: XCTestCase {
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.contextSize], hideSpeedsWhenIdle: false
         ), "38/256k")
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
+            dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.gpuTemperature], hideSpeedsWhenIdle: false
+        ), "54°C")
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: Set(QWMenuBarMetric.allCases),
             hideSpeedsWhenIdle: false
-        ), "↓91.9 · ↑93.3 tok/s · 25.01 GiB · 38/256k")
+        ), "↓91.9 · ↑93.3 tok/s · 25.01 GiB · 38/256k · 54°C")
 
         // Idle speed hiding keeps non-speed metrics and resumes speeds on decode/prefill.
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: Set(QWMenuBarMetric.allCases),
             hideSpeedsWhenIdle: true
-        ), "25.01 GiB · 38/256k")
+        ), "25.01 GiB · 38/256k · 54°C")
 
         let activeDecode = QWDashboardViewModel(
             sampledAt: Date(), lifecycle: loadedDashboard.lifecycle, modelId: "m",
@@ -343,7 +351,7 @@ final class MenuBarRendererParityTests: XCTestCase {
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: activeDecode, isConnected: true, enabledMetrics: Set(QWMenuBarMetric.allCases),
             hideSpeedsWhenIdle: true
-        ), "↓91.9 · ↑93.3 tok/s · 25.01 GiB · 38/256k")
+        ), "↓91.9 · ↑93.3 tok/s · 25.01 GiB · 38/256k · 54°C")
 
         // Cached prefill + missing active_tokens + absent memory honesty checks.
         let unmeasured = QWDashboardViewModel(
@@ -537,5 +545,35 @@ final class MenuBarRendererParityTests: XCTestCase {
             .deletingLastPathComponent()   // package root
         let url = root.appendingPathComponent(relativePath)
         return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    func testSMCAbiLayoutAndCoolingPolicyCoherence() throws {
+        XCTAssertEqual(MemoryLayout<QWSMCClient.SMCKeyData>.stride, 80, "AppleSMC ABI struct must remain 80 bytes")
+        let fltBytes: QWSMCClient.SMCBytes32 = (
+            0x00, 0x00, 0x58, 0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        )
+        let decodedTemp = QWSMCClient.decode(bytes: fltBytes, size: 4, type: QWSMCClient.fourCC("flt "))
+        XCTAssertEqual(decodedTemp ?? 0, 54.0, accuracy: 0.001)
+
+        XCTAssertEqual(QWSettingsCoherence.scope(of: "coolingPolicy"), .live)
+        XCTAssertFalse(QWSettingsCoherence.needsServerRestart("coolingPolicy"))
+
+        let settings = QWServerSettings(coolingPolicy: "proactive")
+        let encoded = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(QWServerSettings.self, from: encoded)
+        XCTAssertEqual(decoded.coolingPolicy, "proactive")
+
+        let legacyJSON = Data("{}".utf8)
+        let legacyDecoded = try JSONDecoder().decode(QWServerSettings.self, from: legacyJSON)
+        XCTAssertEqual(legacyDecoded.coolingPolicy, "auto")
+
+        if ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true" {
+            let smc = QWFanController.shared.sampleAndReconcile()
+            XCTAssertNotNil(smc.gpuTemperatureCelsius, "Expected live AppleSMC GPU temperature on bare-metal Apple Silicon")
+            XCTAssertGreaterThan(smc.gpuTemperatureCelsius ?? 0, 15.0)
+            XCTAssertNotNil(smc.fanSpeedRPM, "Expected live AppleSMC fan telemetry on bare-metal Apple Silicon")
+            XCTAssertNotNil(smc.systemPowerWatts, "Expected live AppleSMC PSTR power telemetry on bare-metal Apple Silicon")
+        }
     }
 }

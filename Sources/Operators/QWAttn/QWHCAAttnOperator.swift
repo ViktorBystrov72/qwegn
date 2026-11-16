@@ -74,10 +74,13 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
     internal let psoLsaQPrep: any MTLComputePipelineState
     internal let psoAttnMMA: any MTLComputePipelineState
     internal let psoAttnNAX: (any MTLComputePipelineState)?
+    internal let psoAttnNAXPrefill: (any MTLComputePipelineState)?
     internal let psoAttnCombine: any MTLComputePipelineState
     internal let psoVhaInvRope: any MTLComputePipelineState
     internal let psoGroupedWoAGemv: any MTLComputePipelineState
+    internal let psoGroupedWoAGemvMR: any MTLComputePipelineState
     internal let psoGroupedWoAMMA: any MTLComputePipelineState
+    internal let psoGroupedWoANAX: (any MTLComputePipelineState)?
     internal let coarsePipelines: QWCoarsePoolIndex.Pipelines?
     internal let psoEmeansLsa: (
         scoreCoarse: any MTLComputePipelineState,
@@ -260,10 +263,14 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
         self.psoLsaQPrep = try hal.pipeline("qwg_hca_lsa_q_prep")
         self.psoAttnMMA = try hal.pipeline("qwg_hca_attn_mma")
         self.psoAttnNAX = hal.caps.isMetal4TensorCapable ? try hal.pipeline("qwg_hca_attn_nax") : nil
+        self.psoAttnNAXPrefill = hal.caps.isMetal4TensorCapable ? try hal.pipeline("qwg_hca_attn_nax_prefill") : nil
         self.psoAttnCombine = try hal.pipeline("qwg_hca_attn_combine")
         self.psoVhaInvRope = try hal.pipeline("qwg_hca_vha_invrope")
         self.psoGroupedWoAGemv = try hal.pipeline("qwg_hca_grouped_wo_a_gemv")
+        self.psoGroupedWoAGemvMR = try hal.pipeline("qwg_hca_grouped_wo_a_gemv_mr")
         self.psoGroupedWoAMMA = try hal.pipeline("qwg_hca_grouped_wo_a_mma")
+        self.psoGroupedWoANAX = hal.caps.isMetal4TensorCapable
+            ? try hal.pipeline("qwg_hca_grouped_wo_a_nax") : nil
 
         let needLsa = (lsaConfig.mode != .off)
             && (self.compressRatio.nonzeroBitCount == 1)

@@ -74,8 +74,8 @@ extension QWGemm {
             enc.dispatchThreadgroups(MTLSize(width: 1, height: rows, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         } else {
-            enc.dispatchThreadgroups(MTLSize(width: latent / 32, height: rows, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.dispatchThreadgroups(MTLSize(width: (latent + 255) / 256, height: rows, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
     }
 
@@ -90,7 +90,7 @@ extension QWGemm {
         (act16 ?? act).bind(enc, index: 4)
         enc.setUInt32s(act16 != nil ? 1 : 0, startIndex: 5)
         enc.dispatchThreads(MTLSize(width: intermediate / 8, height: rows, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
     /// silu(gate) * up in f32 + 32-point WHT, emitting hi/lo f16 split halves (outHi + outLo).

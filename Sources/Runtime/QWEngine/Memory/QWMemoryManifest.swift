@@ -172,23 +172,36 @@ public struct QWMemoryManifest: Codable, Sendable, Equatable {
     public func matchingCache(
         modelName: String? = nil,
         geometryDigest: String? = nil,
-        kvMode: String? = nil
+        kvMode: String? = nil,
+        allowFallbackToAnyModel: Bool = false
     ) -> CacheArtifact? {
-        let filteredByKV: [CacheArtifact]
-        if let kv = kvMode?.lowercased(), !kv.isEmpty {
-            let exactKV = caches.filter { $0.kvMode.lowercased() == kv }
-            filteredByKV = exactKV.isEmpty ? caches : exactKV
-        } else {
-            filteredByKV = caches
+        let trimmedDigest = geometryDigest?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmedName = modelName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasIdentityConstraint = !trimmedDigest.isEmpty || !trimmedName.isEmpty
+
+        var candidates: [CacheArtifact] = []
+        if !trimmedDigest.isEmpty {
+            candidates = caches.filter {
+                !$0.geometryDigest.isEmpty &&
+                    $0.geometryDigest.caseInsensitiveCompare(trimmedDigest) == .orderedSame
+            }
         }
-        if let digest = geometryDigest, !digest.isEmpty,
-           let match = filteredByKV.first(where: { $0.geometryDigest == digest }) {
-            return match
+        if candidates.isEmpty, !trimmedName.isEmpty {
+            let targetSlug = QWMemoryPack.safeSlug(trimmedName)
+            candidates = caches.filter {
+                $0.modelName.caseInsensitiveCompare(trimmedName) == .orderedSame ||
+                    (!targetSlug.isEmpty && QWMemoryPack.safeSlug($0.modelName) == targetSlug)
+            }
         }
-        if let name = modelName, !name.isEmpty,
-           let match = filteredByKV.first(where: { $0.modelName.caseInsensitiveCompare(name) == .orderedSame }) {
-            return match
+        if candidates.isEmpty {
+            guard !hasIdentityConstraint || allowFallbackToAnyModel else {
+                return nil
+            }
+            candidates = caches
         }
-        return filteredByKV.first
+        if let kv = kvMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !kv.isEmpty {
+            return candidates.first(where: { $0.kvMode.lowercased() == kv }) ?? candidates.first
+        }
+        return candidates.first
     }
 }

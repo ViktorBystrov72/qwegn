@@ -133,7 +133,7 @@ function renderSmokeProbeMarkdown(rawMarkdown) {
         codeLines.push(lines[i]);
         i += 1;
       }
-      const langHeader = lang ? `<div class="md-code-lang mono">${escapeHtml(lang)}</div>` : "";
+      const langHeader = `<div class="md-code-lang mono"><span>${lang ? escapeHtml(lang) : "text"}</span><button type="button" class="md-code-copy-btn" onclick="copyMarkdownCodeBlock(this)" aria-label="Copy code snippet">Copy</button></div>`;
       blocks.push(`<div class="md-code-block">${langHeader}<pre class="mono"><code>${escapeHtml(codeLines.join("\n"))}</code></pre></div>`);
       continue;
     }
@@ -425,5 +425,27 @@ async function runBrowserSmokeProbe() {
     showToast("Smoke probe failed: " + err.message, true);
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+function copyMarkdownCodeBlock(btn) {
+  if (!btn || !btn.closest) return;
+  const block = btn.closest(".md-code-block");
+  const code = block ? block.querySelector("pre code") : null;
+  const text = code ? code.textContent || "" : "";
+  if (!text) return;
+  const restoreLabel = () => {
+    btn.textContent = "Copy";
+  };
+  if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = "Copied";
+      setTimeout(restoreLabel, 1400);
+      showToast("Code snippet copied.");
+    }).catch(() => {
+      showToast("Clipboard unavailable.", true);
+    });
+  } else {
+    showToast("Clipboard unavailable.", true);
   }
 }

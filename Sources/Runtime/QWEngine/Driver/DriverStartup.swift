@@ -50,7 +50,7 @@ extension QWEngineDriver {
         guard FileManager.default.fileExists(atPath: packPath) else {
             throw QWEngineDriverError.packMissing(packPath)
         }
-        let maxDrafts = mtpBackend == .dflash2 ? 15 : 5
+        let maxDrafts = mtpBackend == .dflash2 ? 15 : 7
         guard mtpDrafts >= 0 && mtpDrafts <= maxDrafts else {
             throw QWEngineDriverError.badMTPDrafts(mtpDrafts)
         }

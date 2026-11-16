@@ -146,6 +146,46 @@ struct Index: ParsableCommand {
             throw ExitCode(2)
         }
 
+        let sidecarURL = QWLSAConfig.resolveSidecarURL(
+            packPath: resolvedModelPack,
+            explicitSidecarPath: effectivePair.settings.lsaSidecarPath.isEmpty ? nil : effectivePair.settings.lsaSidecarPath
+        )
+        let defaultLSAMode: String
+        if sidecarURL != nil {
+            defaultLSAMode = "sidecar"
+        } else if effectivePair.settings.lsaMode.lowercased() != "off" {
+            defaultLSAMode = effectivePair.settings.lsaMode
+        } else {
+            defaultLSAMode = "auto"
+        }
+        let resolvedLSAModeStr = lsaMode ?? defaultLSAMode
+        guard let resolvedLSAMode = QWLSAMode.resolve(resolvedLSAModeStr) else {
+            FileHandle.standardError.write("qwg index: error: invalid --lsa-mode '\(resolvedLSAModeStr)'\n".data(using: .utf8)!)
+            throw ExitCode(2)
+        }
+
+        if !manifestOnly, let runningPID = QWEngineInstanceLock.runningEnginePID() {
+            let delegatedReq = QWMemoryIndexRequest(
+                path: rootURL.path,
+                packName: resolvedPackName,
+                model: modelOption,
+                kvMode: kvModeName,
+                lsaMode: resolvedLSAMode.rawValue,
+                scope: fullPrefix ? "full_prefix" : "cortex_vault",
+                maxCortexTokens: maxTokens > 0 ? maxTokens : nil,
+                includeTests: includeTests,
+                mountAfterIndex: false,
+                stream: true
+            )
+            if try Self.delegateIndexToRunningServer(
+                request: delegatedReq,
+                settings: settings,
+                runningPID: runningPID
+            ) {
+                return
+            }
+        }
+
         let location = try QWModelLocation(url: URL(fileURLWithPath: resolvedModelPack), assetsOverride: nil)
         let runtimeAssets = try QWModelRuntimeAssets.load(packPath: resolvedModelPack, assetsOverride: location.assets)
         let tok = try QWTokenizer(json: runtimeAssets.tokenizerJSON)
@@ -170,7 +210,7 @@ struct Index: ParsableCommand {
             maxTokens: effectiveMaxTokens,
             tokenCounter: { try tok.encode($0).count }
         )
-        let wire = try Self.renderMemoryEnvelopeWire(
+        let wire = try QWEngineLifecycleActor.renderMemoryEnvelopeWire(
             systemContent: built.systemMessageContent,
             chatTemplate: runtimeAssets.chatTemplate
         )
@@ -201,23 +241,6 @@ struct Index: ParsableCommand {
             return
         }
 
-        let sidecarURL = QWLSAConfig.resolveSidecarURL(
-            packPath: resolvedModelPack,
-            explicitSidecarPath: effectivePair.settings.lsaSidecarPath.isEmpty ? nil : effectivePair.settings.lsaSidecarPath
-        )
-        let defaultLSAMode: String
-        if sidecarURL != nil {
-            defaultLSAMode = "sidecar"
-        } else if effectivePair.settings.lsaMode.lowercased() != "off" {
-            defaultLSAMode = effectivePair.settings.lsaMode
-        } else {
-            defaultLSAMode = "auto"
-        }
-        let resolvedLSAModeStr = lsaMode ?? defaultLSAMode
-        guard let resolvedLSAMode = QWLSAMode.resolve(resolvedLSAModeStr) else {
-            FileHandle.standardError.write("qwg index: error: invalid --lsa-mode '\(resolvedLSAModeStr)'\n".data(using: .utf8)!)
-            throw ExitCode(2)
-        }
         let lsaConfig = QWLSAConfig(
             mode: resolvedLSAMode,
             budget: effectivePair.settings.lsaBudget,
@@ -285,23 +308,124 @@ struct Index: ParsableCommand {
         ))
     }
 
-    static func renderMemoryEnvelopeWire(
-        systemContent: String,
-        chatTemplate: QWChatTemplate
-    ) throws -> String {
-        var opts = QWChatTemplateOptions()
-        opts.addGenerationPrompt = false
-        opts.enableThinking = .bool(false)
-        let sentinel = "__QWG_MEMORY_USER_SENTINEL__"
-        let sysMsg: QWJson = .object([
-            ("role", .string("system")),
-            ("content", .string(systemContent))
-        ])
-        let userMsg: QWJson = .object([
-            ("role", .string("user")),
-            ("content", .string(sentinel))
-        ])
-        let fullWire = try chatTemplate.render(messages: [sysMsg, userMsg], options: opts)
-        return QWMemoryPack.sliceBeforeSentinelUserTurn(fullWire: fullWire, sentinel: sentinel)
+    private static func delegateIndexToRunningServer(
+        request: QWMemoryIndexRequest,
+        settings: QWServerSettings,
+        runningPID: Int32
+    ) throws -> Bool {
+        let rawHost = settings.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let connectHost = (rawHost.isEmpty || rawHost == "0.0.0.0" || rawHost == "::") ? "127.0.0.1" : rawHost
+        let port = settings.port > 0 ? settings.port : 8080
+        guard let url = URL(string: "http://\(connectHost):\(port)/v1/memory/index") else {
+            return false
+        }
+        var urlRequest = URLRequest(url: url, timeoutInterval: 3600)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        let envKey = ProcessInfo.processInfo.environment["QWG_API_KEY"]
+            ?? ProcessInfo.processInfo.environment["QW_API_KEY"]
+        let bearerKey = (envKey?.isEmpty == false ? envKey : nil)
+            ?? (settings.apiKey.isEmpty ? nil : settings.apiKey)
+        if let bearerKey {
+            urlRequest.setValue("Bearer \(bearerKey)", forHTTPHeaderField: "Authorization")
+        }
+        urlRequest.httpBody = try JSONEncoder().encode(request)
+
+        final class OutcomeBox: @unchecked Sendable {
+            var reachable = false
+            var result: QWMemoryIndexResult? = nil
+            var failureMessage: String? = nil
+        }
+
+        let box = OutcomeBox()
+        let sem = DispatchSemaphore(value: 0)
+        let reqCopy = urlRequest
+        let isTTY = isatty(STDERR_FILENO) != 0
+
+        FileHandle.standardError.write(
+            "qwg index: delegating to running server (PID \(runningPID), \(connectHost):\(port))...\n".data(using: .utf8)!
+        )
+
+        Task {
+            defer { sem.signal() }
+            do {
+                let config = URLSessionConfiguration.ephemeral
+                config.timeoutIntervalForRequest = 3600
+                config.timeoutIntervalForResource = 3600
+                let session = URLSession(configuration: config)
+                let (bytes, response) = try await session.bytes(for: reqCopy)
+                guard let http = response as? HTTPURLResponse else {
+                    box.failureMessage = "Invalid HTTP response from local server."
+                    return
+                }
+                box.reachable = true
+                if http.statusCode != 200 {
+                    var bodyBytes: [UInt8] = []
+                    for try await byte in bytes { bodyBytes.append(byte) }
+                    let text = String(bytes: bodyBytes, encoding: .utf8) ?? "HTTP \(http.statusCode)"
+                    box.failureMessage = "Server rejected index request (HTTP \(http.statusCode)): \(text)"
+                    return
+                }
+
+                var lastPrintedBucket = -1
+                for try await line in bytes.lines {
+                    guard line.hasPrefix("data: ") else { continue }
+                    let payloadStr = String(line.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if payloadStr == "[DONE]" { break }
+                    guard let data = payloadStr.data(using: .utf8),
+                          let ev = try? JSONDecoder().decode(QWMemoryIndexProgressEvent.self, from: data) else {
+                        continue
+                    }
+                    if ev.phase == "error" {
+                        box.failureMessage = ev.error ?? ev.message
+                        break
+                    }
+                    if let res = ev.result {
+                        box.result = res
+                    }
+                    let pct = Int((ev.progressFraction * 100.0).rounded())
+                    if isTTY {
+                        let lineMsg = String(format: "\r\u{1B}[Kqwg index [%3d%%]: %@", pct, ev.message)
+                        FileHandle.standardError.write(lineMsg.data(using: .utf8)!)
+                    } else {
+                        let bucket = pct / 10
+                        if ev.phase == "loading_model" || ev.phase == "saving" || ev.phase == "completed" || bucket > lastPrintedBucket {
+                            lastPrintedBucket = max(lastPrintedBucket, bucket)
+                            let lineMsg = String(format: "qwg index [%3d%%]: %@\n", pct, ev.message)
+                            FileHandle.standardError.write(lineMsg.data(using: .utf8)!)
+                        }
+                    }
+                }
+                if isTTY {
+                    FileHandle.standardError.write("\n".data(using: .utf8)!)
+                }
+            } catch {
+                if !box.reachable {
+                    return
+                }
+                box.failureMessage = error.localizedDescription
+            }
+        }
+
+        sem.wait()
+        if !box.reachable {
+            return false
+        }
+        if let err = box.failureMessage {
+            FileHandle.standardError.write("qwg index: error: \(err)\n".data(using: .utf8)!)
+            throw ExitCode(1)
+        }
+        guard let result = box.result else {
+            FileHandle.standardError.write("qwg index: error: server stream ended without completion result.\n".data(using: .utf8)!)
+            throw ExitCode(1)
+        }
+        let mib = Double(result.cacheBytes) / 1_048_576.0
+        print(String(
+            format: "wrote %@ (%.2f MiB, %d tokens, %d files, kv=%@, lsa=%@ in %.1f s)",
+            result.cacheFilePath, mib, result.tokenCount, result.fileCount,
+            result.kvMode, result.lsaMode, result.elapsedSeconds
+        ))
+        return true
     }
 }

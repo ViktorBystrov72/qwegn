@@ -100,7 +100,7 @@ extension QWGemm {
         (shGateWeight ?? weight).bind(enc, index: 7)
         (shGateOut ?? y).bind(enc, index: 8)
         enc.setUInt32s(hasShGate, startIndex: 9)
-        if rows <= 4 {
+        if rows <= 8 {
             let tpg = 64
             let sgs = n + hasShGate
             let sgPerTG = tpg / 32

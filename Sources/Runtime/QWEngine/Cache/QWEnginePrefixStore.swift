@@ -43,9 +43,15 @@ final class QWEnginePrefixStore<Value: Sendable> {
     var evictions: Int { core.evictions }
     var hasSharedBase: Bool { core.hasSharedBase }
 
+    static func baseMode(of mode: String) -> String {
+        guard let range = mode.range(of: "|salt=") else { return mode }
+        return String(mode[..<range.lowerBound])
+    }
+
     func sharedBasePrefix(matching tokens: [Int], mode: String) -> Hit? {
+        let base = Self.baseMode(of: mode)
         var best: Key?
-        for key in core.sharedBaseKeys where key.mode == mode &&
+        for key in core.sharedBaseKeys where (key.mode == mode || key.mode == base) &&
             key.tokens.count <= tokens.count && key.tokens.count > (best?.tokens.count ?? 0) {
             if core.entries[key] != nil && tokens.starts(with: key.tokens) {
                 best = key
@@ -73,13 +79,22 @@ final class QWEnginePrefixStore<Value: Sendable> {
         if let entry = core.value(for: exact, touchOnHit: true) {
             return Hit(value: entry.value, tokenCount: tokens.count)
         }
+        let base = Self.baseMode(of: mode)
+        if base != mode {
+            let sharedExact = Key(tokens: tokens, mode: base)
+            if core.isSharedBaseKey(sharedExact), let entry = core.value(for: sharedExact, touchOnHit: true) {
+                return Hit(value: entry.value, tokenCount: tokens.count)
+            }
+        }
         let queryRootHash: UInt64? = tokens.count >= 64
             ? QWPrefixHash.fnv1a64(tokens: Array(tokens.prefix(64)), mode: mode)
             : nil
         var best: Key?
-        for (key, entry) in core.entries where entry.allowsSuffix && key.mode == mode &&
+        for (key, entry) in core.entries where entry.allowsSuffix &&
+            (key.mode == mode || (base != mode && key.mode == base && core.isSharedBaseKey(key))) &&
             key.tokens.count < tokens.count && key.tokens.count > (best?.tokens.count ?? 0) {
-            if key.tokens.count >= 64, let qHash = queryRootHash, let eHash = entry.rootHash, qHash != eHash {
+            if key.mode == mode, key.tokens.count >= 64, let qHash = queryRootHash,
+               let eHash = entry.rootHash, qHash != eHash {
                 continue
             }
             if tokens.starts(with: key.tokens) { best = key }

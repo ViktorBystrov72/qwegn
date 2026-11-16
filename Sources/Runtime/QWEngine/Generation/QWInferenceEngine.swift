@@ -44,7 +44,12 @@ public protocol QWInferenceEngine: AnyObject, Sendable {
     func generate(request: QWGenerationRequest, onToken: ((Int) -> Bool)?) throws -> QWGenerationResult
 
     /// Prefills `tokens`, writes a standalone `.qwcache` file at `outputURL`, and optionally pins it in warm RAM.
-    func buildStandalonePrefixCache(tokens: [Int], outputURL: URL, pinAsSharedBase: Bool) throws -> Int
+    func buildStandalonePrefixCache(
+        tokens: [Int],
+        outputURL: URL,
+        pinAsSharedBase: Bool,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
+    ) throws -> Int
 
     /// Mounts a standalone `.qwcache` file from `fileURL` into warm RAM as a pinned shared base prefix.
     func mountStandalonePrefixCache(from fileURL: URL) throws -> (tokens: [Int], byteCount: Int)
@@ -56,7 +61,25 @@ public protocol QWInferenceEngine: AnyObject, Sendable {
 extension QWInferenceEngine {
     public var supportsTokenConstraints: Bool { false }
 
-    public func buildStandalonePrefixCache(tokens: [Int], outputURL: URL, pinAsSharedBase: Bool = true) throws -> Int {
+    public func buildStandalonePrefixCache(
+        tokens: [Int],
+        outputURL: URL,
+        pinAsSharedBase: Bool = true
+    ) throws -> Int {
+        try buildStandalonePrefixCache(
+            tokens: tokens,
+            outputURL: outputURL,
+            pinAsSharedBase: pinAsSharedBase,
+            onPrefillProgress: nil
+        )
+    }
+
+    public func buildStandalonePrefixCache(
+        tokens: [Int],
+        outputURL: URL,
+        pinAsSharedBase: Bool,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
+    ) throws -> Int {
         throw QWModuleError.notImplemented("buildStandalonePrefixCache")
     }
 

@@ -119,6 +119,7 @@ public final class QWEngineDriver: @unchecked Sendable {
     var activeCollectLogprobs: Bool = false
     var activeConstraint: (constraint: any QWTokenConstraint, sampler: QWSampler)? = nil
     var activeVisualSpans: [QWVisualSpan] = []
+    var activeCacheSalt: String? = nil
     public var mtpRelaxedMinProb: Double = QWSpeculativeParameters.defaultRelaxedMinProb
 
     /// Effective log-probability / logit margin for Variational MTP verification.
@@ -189,8 +190,12 @@ public final class QWEngineDriver: @unchecked Sendable {
     /// backend's numerical identity: a Standard and a Lightening run are
     /// never admitted to each other's cached prefixes, even while the L1
     static func prefixPolicyKey(backend: QWMTPBackend, drafts: Int,
-                                mode: GDNPrefillMode) -> String {
-        drafts > 0 ? "\(backend.rawValue)+\(mode.rawValue)" : mode.rawValue
+                                mode: GDNPrefillMode, cacheSalt: String? = nil) -> String {
+        let base = drafts > 0 ? "\(backend.rawValue)+\(mode.rawValue)" : mode.rawValue
+        if let salt = cacheSalt?.trimmingCharacters(in: .whitespacesAndNewlines), !salt.isEmpty {
+            return "\(base)|salt=\(salt)"
+        }
+        return base
     }
 
     let sc: Scratch
@@ -262,12 +267,12 @@ public final class QWEngineDriver: @unchecked Sendable {
                                           mtpQuadraticSeeding: mtpQuadraticSeeding,
                                           dflashDraftPackPath: dflashDraftPackPath,
                                           dflashSelectorTopK: dflashSelectorTopK)
-        let chunkRows = max(32, min(4096, (prefillChunkSize / 32) * 32))
         let startup = try Self.prepareContainersAndGeometry(
             packPath: packPath, maxTokens: maxTokens, ropeRows: ropeRows, kvMode: kvMode,
             prefillChunkSize: prefillChunkSize, mtpDrafts: mtpDrafts,
             residentExpertsPerLayer: residentExpertsPerLayer, osReserveGiB: osReserveGiB,
             cfg: cfg, baseTuning: tuning)
+        let chunkRows = startup.prefillChunkSize
         let geometry = startup.geometry
         let prelimHal = startup.hal
         let stContainer = startup.stContainer

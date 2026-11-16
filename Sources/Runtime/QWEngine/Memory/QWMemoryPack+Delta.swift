@@ -140,10 +140,81 @@ extension QWMemoryPack {
         }
     }
 
+    /// Git commit comparison between a manifest baseline SHA and repository `HEAD`.
+    public struct GitStalenessInfo: Sendable, Equatable {
+        public let isGitRepo: Bool
+        public let headSHA: String?
+        public let manifestSHA: String?
+        public let commitsBehind: Int
+        public let diverged: Bool
+
+        public init(isGitRepo: Bool, headSHA: String?, manifestSHA: String?, commitsBehind: Int, diverged: Bool) {
+            self.isGitRepo = isGitRepo
+            self.headSHA = headSHA
+            self.manifestSHA = manifestSHA
+            self.commitsBehind = commitsBehind
+            self.diverged = diverged
+        }
+    }
+
     /// Queries the current `HEAD` commit SHA for a repository root, or nil if not a git checkout.
     public static func currentGitHeadSHA(in rootURL: URL) -> String? {
         runGit(in: rootURL, args: ["rev-parse", "HEAD"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Evaluates how many commits `HEAD` has moved since `manifestSHA`.
+    public static func evaluateGitStaleness(manifestSHA: String?, in rootURL: URL) -> GitStalenessInfo {
+        guard let head = currentGitHeadSHA(in: rootURL), !head.isEmpty else {
+            return GitStalenessInfo(
+                isGitRepo: false,
+                headSHA: nil,
+                manifestSHA: manifestSHA,
+                commitsBehind: 0,
+                diverged: false
+            )
+        }
+        let baseline = manifestSHA?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let baseline, !baseline.isEmpty else {
+            return GitStalenessInfo(
+                isGitRepo: true,
+                headSHA: head,
+                manifestSHA: nil,
+                commitsBehind: 0,
+                diverged: false
+            )
+        }
+        if head.caseInsensitiveCompare(baseline) == .orderedSame {
+            return GitStalenessInfo(
+                isGitRepo: true,
+                headSHA: head,
+                manifestSHA: baseline,
+                commitsBehind: 0,
+                diverged: false
+            )
+        }
+        if let revOut = runGit(in: rootURL, args: ["rev-list", "--left-right", "--count", "\(baseline)...HEAD"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines) {
+            let parts = revOut.split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
+            if parts.count == 2 {
+                let aheadOfHead = max(0, parts[0])
+                let behindHead = max(0, parts[1])
+                return GitStalenessInfo(
+                    isGitRepo: true,
+                    headSHA: head,
+                    manifestSHA: baseline,
+                    commitsBehind: behindHead,
+                    diverged: aheadOfHead > 0
+                )
+            }
+        }
+        return GitStalenessInfo(
+            isGitRepo: true,
+            headSHA: head,
+            manifestSHA: baseline,
+            commitsBehind: 0,
+            diverged: true
+        )
     }
 
     /// Produces a filesystem-safe slug for a model or pack name.

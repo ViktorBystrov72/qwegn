@@ -386,19 +386,14 @@ public final class FNGPUEngine: @unchecked Sendable {
         } else {
             self.lsaClusterRegion = nil
         }
-        let mainWBuf = arena.weightsRegion().region.buffer
-        var standaloneBytes = 0
-        if self.pack == nil {
-            for rec in records {
-                if rec.weights.moe.gateUp.blocks.region.buffer !== mainWBuf { standaloneBytes += rec.weights.moe.gateUp.blocks.region.length }
-                if rec.weights.moe.down.blocks.region.buffer !== mainWBuf { standaloneBytes += rec.weights.moe.down.blocks.region.length }
-            }
-            if let mtp = self.mtp {
-                if mtp.layer.moe.gateUp.blocks.region.buffer !== mainWBuf { standaloneBytes += mtp.layer.moe.gateUp.blocks.region.length }
-                if mtp.layer.moe.down.blocks.region.buffer !== mainWBuf { standaloneBytes += mtp.layer.moe.down.blocks.region.length }
-            }
-        }
-        self.extraWeightBytes = standaloneBytes
+        self.extraWeightBytes = Self.standaloneWeightBytes(
+            arenaBuffers: arena.allBuffers,
+            layers: self.layerRecords.map(\.weights),
+            head: self.head,
+            embedTable: self.embedTable,
+            gpuPLETable: self.gpuPLETable,
+            mtp: self.mtp
+        )
         loader.st?.adviseDontNeed()
         hal.adoptPendingResidency()
         if let vStack = self.verifyStack {

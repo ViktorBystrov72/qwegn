@@ -8,7 +8,6 @@ template <uint M>
 static inline void qwm_mlp_gate_up(device const Block_HQ4_G32* blocks, device const half* x,
                                    device half* output, uint N, uint K,
                                    uint tg, uint ti, threadgroup float* paired, uint tptg = 64u) {
-    const bool isAQ4 = (N & 0x80000000u) != 0u;
     const uint realN = N & 0x7FFFFFFFu;
     const uint I = realN / 2;
     const uint pairs_per_tg = max(1u, tptg >> 6u);
@@ -19,7 +18,8 @@ static inline void qwm_mlp_gate_up(device const Block_HQ4_G32* blocks, device co
     if (row < I) {
         const uint weightRow = row + sub * I;
         float value[M];
-        qwg_gemv_hq4_row_m<M>(blocks, x, weightRow, K, lane, value, isAQ4);
+        if (QW_IS_AQ4) qwg_gemv_hq4_row_m_t<M, true>(blocks, x, weightRow, K, lane, value);
+        else qwg_gemv_hq4_row_m_t<M, false>(blocks, x, weightRow, K, lane, value);
         if (lane == 0u) {
             #pragma unroll
             for (uint m = 0; m < M; ++m) {
@@ -42,7 +42,6 @@ template <uint M>
 static inline void qwm_mlp_gate_up_fwht32(device const Block_HQ4_G32* blocks, device const half* x,
                                           device half* output, uint N, uint K,
                                           uint tg, uint ti, threadgroup half* s_h16) {
-    const bool isAQ4 = (N & 0x80000000u) != 0u;
     const uint realN = N & 0x7FFFFFFFu;
     const uint I = realN >> 1u;
     const uint rowBase = tg << 5u;
@@ -55,8 +54,13 @@ static inline void qwm_mlp_gate_up_fwht32(device const Block_HQ4_G32* blocks, de
         const uint p0 = pBase + (s << 1u);
         const uint r0 = rowBase + p0;
         float g0[M], g1[M], u0[M], u1[M];
-        qwg_gemv_hq4_rows2_m<M>(blocks, x, r0, realN, K, lane, g0, g1, isAQ4);
-        qwg_gemv_hq4_rows2_m<M>(blocks, x, I + r0, realN, K, lane, u0, u1, isAQ4);
+        if (QW_IS_AQ4) {
+            qwg_gemv_hq4_rows2_m_t<M, true>(blocks, x, r0, realN, K, lane, g0, g1);
+            qwg_gemv_hq4_rows2_m_t<M, true>(blocks, x, I + r0, realN, K, lane, u0, u1);
+        } else {
+            qwg_gemv_hq4_rows2_m_t<M, false>(blocks, x, r0, realN, K, lane, g0, g1);
+            qwg_gemv_hq4_rows2_m_t<M, false>(blocks, x, I + r0, realN, K, lane, u0, u1);
+        }
         if (lane == 0u) {
             #pragma unroll
             for (uint m = 0; m < M; ++m) {
@@ -75,16 +79,16 @@ static inline void qwm_mlp_gate_up_fwht32(device const Block_HQ4_G32* blocks, de
 template <uint M>
 static inline void qwm_t4_dot(device const Block_HQ4_G32* blocks, device const half* x,
                               thread float (&result)[M], uint N, uint K,
-                              uint row, uint lane, bool isAQ4 = false) {
+                              uint row, uint lane) {
     if (row >= N) return;
-    qwg_gemv_hq4_row_m<M>(blocks, x, row, K, lane, result, isAQ4);
+    if (QW_IS_AQ4) qwg_gemv_hq4_row_m_t<M, true>(blocks, x, row, K, lane, result);
+    else qwg_gemv_hq4_row_m_t<M, false>(blocks, x, row, K, lane, result);
 }
 
 template <uint M>
 static inline void qwm_mlp_down(device const Block_HQ4_G32* blocks, device const half* x,
                                 device half* output, uint N, uint K,
                                 uint tg, uint ti, uint tptg = 32u) {
-    const bool isAQ4 = (N & 0x80000000u) != 0u;
     const uint realN = N & 0x7FFFFFFFu;
     const uint rows_per_tg = max(1u, tptg >> 5u);
     const uint simd_id = ti >> 5u;
@@ -92,14 +96,13 @@ static inline void qwm_mlp_down(device const Block_HQ4_G32* blocks, device const
     const uint row = tg * rows_per_tg + simd_id;
     if (row >= realN) return;
     float result[M];
-    qwm_t4_dot<M>(blocks, x, result, realN, K, row, lane, isAQ4);
+    qwm_t4_dot<M>(blocks, x, result, realN, K, row, lane);
     if (lane == 0u) {
         #pragma unroll
         for (uint m = 0; m < M; ++m) output[(size_t)m * realN + row] = half(result[m]);
     }
 }
 
-template <uint M>
 static inline void qwm_gdn_store_row(uint row, uint N, float value, uint m,
                                      device half* output, device const float* aLog,
                                      device const float* bias, device float* controls) {
@@ -123,7 +126,6 @@ static inline void qwm_gdn_projection(device const Block_HQ4_G32* blocks, device
                                       uint tg, uint ti,
                                       device const float* aLog, device const float* bias, device float* controls,
                                       uint tptg = 32u) {
-    const bool isAQ4 = (N & 0x80000000u) != 0u;
     const uint realN = N & 0x7FFFFFFFu;
     const uint rows_per_tg = max(1u, tptg >> 5u);
     const uint simd_id = ti >> 5u;
@@ -131,11 +133,11 @@ static inline void qwm_gdn_projection(device const Block_HQ4_G32* blocks, device
     const uint row = tg * rows_per_tg + simd_id;
     if (row >= realN) return;
     float result[M];
-    qwm_t4_dot<M>(blocks, x, result, realN, K, row, lane, isAQ4);
+    qwm_t4_dot<M>(blocks, x, result, realN, K, row, lane);
     if (lane == 0u) {
         #pragma unroll
         for (uint m = 0; m < M; ++m) {
-            qwm_gdn_store_row<M>(row, realN, result[m], m, output, aLog, bias, controls);
+            qwm_gdn_store_row(row, realN, result[m], m, output, aLog, bias, controls);
         }
     }
 }
@@ -145,7 +147,6 @@ static inline void qwm_gdn_projection(device const Block_HQ4_G32* blocks, device
 template <uint M>
 static inline void qwm_mlp_gate_up_rp(device const Block_HQ4_G32* blocks, device const half* x,
                                       device half* output, uint N, uint K, uint tg, uint ti, uint tptg) {
-    const bool isAQ4 = (N & 0x80000000u) != 0u;
     const uint realN = N & 0x7FFFFFFFu;
     const uint I = realN >> 1u;
     const uint nBlocks = K >> 5u;
@@ -154,7 +155,8 @@ static inline void qwm_mlp_gate_up_rp(device const Block_HQ4_G32* blocks, device
     if (row >= I) return;
     device const Block_HQ4_G32* rows[2] = {blocks + (size_t)row * nBlocks, blocks + (size_t)(I + row) * nBlocks};
     float v[2][M];
-    qwg_gemv_hq4_rows_r_m<M, 2>(rows, x, K, lane, v, isAQ4);
+    if (QW_IS_AQ4) qwg_gemv_hq4_rows_r_m_t<M, 2, true>(rows, x, K, lane, v);
+    else qwg_gemv_hq4_rows_r_m_t<M, 2, false>(rows, x, K, lane, v);
     if (lane == 0u) {
         #pragma unroll
         for (uint m = 0; m < M; ++m) {
@@ -167,14 +169,14 @@ template <uint M>
 static inline void qwm_rows_rp(device const Block_HQ4_G32* blocks, device const half* x,
                                uint N, uint K, uint tg, uint ti, uint tptg,
                                thread uint& row0, thread uint& realN, thread float (&v)[2][M]) {
-    const bool isAQ4 = (N & 0x80000000u) != 0u;
     realN = N & 0x7FFFFFFFu;
     const uint nBlocks = K >> 5u;
     row0 = (tg * (tptg >> 5u) + (ti >> 5u)) * 2u;
     if (row0 >= realN) return;
     device const Block_HQ4_G32* rows[2] = {blocks + (size_t)row0 * nBlocks,
                                            blocks + (size_t)min(row0 + 1u, realN - 1u) * nBlocks};
-    qwg_gemv_hq4_rows_r_m<M, 2>(rows, x, K, ti & 31u, v, isAQ4);
+    if (QW_IS_AQ4) qwg_gemv_hq4_rows_r_m_t<M, 2, true>(rows, x, K, ti & 31u, v);
+    else qwg_gemv_hq4_rows_r_m_t<M, 2, false>(rows, x, K, ti & 31u, v);
 }
 
 template <uint M>
@@ -201,8 +203,8 @@ static inline void qwm_gdn_projection_rp(device const Block_HQ4_G32* blocks, dev
     if (row0 >= realN || (ti & 31u) != 0u) return;
     #pragma unroll
     for (uint m = 0; m < M; ++m) {
-        qwm_gdn_store_row<M>(row0, realN, v[0][m], m, output, aLog, bias, controls);
-        if (row0 + 1u < realN) qwm_gdn_store_row<M>(row0 + 1u, realN, v[1][m], m, output, aLog, bias, controls);
+        qwm_gdn_store_row(row0, realN, v[0][m], m, output, aLog, bias, controls);
+        if (row0 + 1u < realN) qwm_gdn_store_row(row0 + 1u, realN, v[1][m], m, output, aLog, bias, controls);
     }
 }
 

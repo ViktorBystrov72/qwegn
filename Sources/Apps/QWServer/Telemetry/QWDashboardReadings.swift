@@ -211,6 +211,17 @@ extension QWDashboardViewModel {
         putText("hardware.memory_pressure_level", hardware?.memoryPressureLevel, hardwareAt,
                 hardware?.memoryPressureUnavailableReason,
                 registry: QWTelemetryMetric.memoryPressure.rawValue)
+        put("hardware.gpu_temp_celsius", hardware?.gpuTemperatureCelsius, hardwareAt,
+            hardware?.gpuTemperatureUnavailableReason,
+            registry: QWTelemetryMetric.gpuTemperatureCelsius.rawValue)
+        put("hardware.fan_rpm", hardware?.fanSpeedRPM, hardwareAt,
+            hardware?.fanSpeedUnavailableReason,
+            registry: QWTelemetryMetric.fanSpeedRPM.rawValue)
+        put("hardware.system_power_watts", hardware?.systemPowerWatts, hardwareAt,
+            hardware?.systemPowerUnavailableReason,
+            registry: QWTelemetryMetric.systemPowerWatts.rawValue)
+        putText("hardware.thermal_state", hardware?.thermalStateLevel, hardwareAt, nil,
+                registry: QWTelemetryMetric.thermalState.rawValue)
         return out
     }
 

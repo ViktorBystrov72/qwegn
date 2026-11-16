@@ -114,6 +114,8 @@ public struct QWGenerationRequest: Sendable {
     public var constraint: (any QWTokenConstraint)?
     /// Merged visual feature spans to inject at `<|image|>` / `<|video|>` positions during prefill.
     public var visualSpans: [QWVisualSpan]
+    /// Optional per-request prefix-cache isolation namespace (`prompt_cache_key` / `cache_salt`).
+    public var cacheSalt: String?
 
     public init(
         prompt: [Int],
@@ -129,6 +131,7 @@ public struct QWGenerationRequest: Sendable {
         onTokenLogprob: (@Sendable (QWTokenLogprob) -> Void)? = nil,
         constraint: (any QWTokenConstraint)? = nil,
         visualSpans: [QWVisualSpan] = [],
+        cacheSalt: String? = nil,
         onPrefillProgress: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         self.constraint = constraint
@@ -145,5 +148,6 @@ public struct QWGenerationRequest: Sendable {
         self.onTokenLogprob = onTokenLogprob
         self.onPrefillProgress = onPrefillProgress
         self.visualSpans = visualSpans
+        self.cacheSalt = cacheSalt
     }
 }

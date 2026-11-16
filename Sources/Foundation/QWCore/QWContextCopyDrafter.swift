@@ -1,7 +1,28 @@
-// QWContextCopyDrafter.swift — Model-free suffix-matching & periodic drafter (Prompt Lookup Decoding).
-// Shared across all model families in QWEngine for .ngram and .hybrid speculative decoding.
+// QWContextCopyDrafter.swift — Zero-copy suffix-matching & periodic drafter (PLD)
+// shared across all model families for .ngram and .hybrid speculative decoding.
 
 import Foundation
+
+private struct VirtualIntSequence<T: FixedWidthInteger> {
+    let base: UnsafeBufferPointer<T>
+    let extraFirst: T?
+    let trailing: UnsafeBufferPointer<Int>
+
+    var count: Int {
+        base.count + (extraFirst != nil ? 1 : 0) + trailing.count
+    }
+
+    @inline(__always)
+    subscript(index: Int) -> Int {
+        let baseCount = base.count
+        if index < baseCount { return Int(base[index]) }
+        let rem = index - baseCount
+        if let extraFirst {
+            return rem == 0 ? Int(extraFirst) : trailing[rem - 1]
+        }
+        return trailing[rem]
+    }
+}
 
 public enum QWContextCopyDrafter {
     /// Draft proposal result from the unified hybrid/ngram/mtp draft selector.
@@ -23,10 +44,70 @@ public enum QWContextCopyDrafter {
     }
 
     /// Returns up to `maxCount` next tokens when the tail of `history` is a repeating periodic cycle of
-    /// period `1...maxPeriod` repeated at least `minRepeats` times (e.g. `[A, B, C, D, A, B, C, D]`).
+    /// period `1...maxPeriod` repeated at least `minRepeats` times.
     public static func periodicDrafts(history: [Int64], maxCount: Int = 3,
                                       maxPeriod: Int = 8, minRepeats: Int = 2) -> [Int]? {
-        let count = history.count
+        history.withUnsafeBufferPointer { base in
+            [].withUnsafeBufferPointer { empty in
+                periodicCore(VirtualIntSequence(base: base, extraFirst: nil, trailing: empty),
+                             maxCount: maxCount, maxPeriod: maxPeriod, minRepeats: minRepeats)
+            }
+        }
+    }
+
+    public static func periodicDrafts(history: [Int], maxCount: Int = 3,
+                                      maxPeriod: Int = 8, minRepeats: Int = 2) -> [Int]? {
+        periodicDrafts(history: history, extraToken: nil,
+                       maxCount: maxCount, maxPeriod: maxPeriod, minRepeats: minRepeats)
+    }
+
+    public static func periodicDrafts(history: [Int], extraToken: Int?, maxCount: Int = 3,
+                                      maxPeriod: Int = 8, minRepeats: Int = 2) -> [Int]? {
+        history.withUnsafeBufferPointer { base in
+            [].withUnsafeBufferPointer { empty in
+                periodicCore(VirtualIntSequence(base: base, extraFirst: extraToken, trailing: empty),
+                             maxCount: maxCount, maxPeriod: maxPeriod, minRepeats: minRepeats)
+            }
+        }
+    }
+
+    /// Single-pass suffix matcher returning up to `maxCount` continuation tokens and the matched suffix length.
+    /// When `appendedToken` is supplied, matches against `history + [appendedToken]` without copying `history`.
+    public static func drafts(history: [Int64], appendedToken: Int64? = nil, maxCount: Int = 3,
+                              minMatchLen: Int = 3, maxMatchLen: Int = 20) -> (tokens: [Int], matchLen: Int)? {
+        history.withUnsafeBufferPointer { base in
+            [].withUnsafeBufferPointer { empty in
+                draftsCore(VirtualIntSequence(base: base, extraFirst: appendedToken, trailing: empty),
+                           maxCount: maxCount, minMatchLen: minMatchLen, maxMatchLen: maxMatchLen)
+            }
+        }
+    }
+
+    public static func drafts(history: [Int], appendedToken: Int? = nil, maxCount: Int = 3,
+                              minMatchLen: Int = 3, maxMatchLen: Int = 20) -> (tokens: [Int], matchLen: Int)? {
+        drafts(history: history, extraToken: appendedToken, trailingTokens: [],
+               maxCount: maxCount, minMatchLen: minMatchLen, maxMatchLen: maxMatchLen)
+    }
+
+    public static func drafts(history: [Int], extraToken: Int? = nil, trailingTokens: [Int] = [],
+                              maxCount: Int = 3, minMatchLen: Int = 3,
+                              maxMatchLen: Int = 20) -> (tokens: [Int], matchLen: Int)? {
+        history.withUnsafeBufferPointer { base in
+            trailingTokens.withUnsafeBufferPointer { trail in
+                draftsCore(VirtualIntSequence(base: base, extraFirst: extraToken, trailing: trail),
+                           maxCount: maxCount, minMatchLen: minMatchLen, maxMatchLen: maxMatchLen)
+            }
+        }
+    }
+
+    public static func draft(history: [Int64], minMatchLen: Int = 6, maxMatchLen: Int = 20) -> Int? {
+        drafts(history: history, maxCount: 1, minMatchLen: minMatchLen, maxMatchLen: maxMatchLen)?.tokens.first
+    }
+
+    private static func periodicCore<T: FixedWidthInteger>(
+        _ seq: VirtualIntSequence<T>, maxCount: Int, maxPeriod: Int, minRepeats: Int
+    ) -> [Int]? {
+        let count = seq.count
         guard maxCount > 0 else { return nil }
         for p in 1...maxPeriod {
             guard count >= p * minRepeats else { continue }
@@ -34,96 +115,79 @@ public enum QWContextCopyDrafter {
             let base = count - p
             for r in 1..<minRepeats {
                 let off = count - (r + 1) * p
-                for i in 0..<p where history[off + i] != history[base + i] {
+                for i in 0..<p where seq[off + i] != seq[base + i] {
                     match = false
                     break
                 }
                 if !match { break }
             }
             if match {
-                return (0..<maxCount).map { Int(history[base + ($0 % p)]) }
+                var out: [Int] = []
+                out.reserveCapacity(maxCount)
+                for idx in 0..<maxCount {
+                    out.append(seq[base + (idx % p)])
+                }
+                return out
             }
         }
         return nil
     }
 
-    public static func periodicDrafts(history: [Int], maxCount: Int = 3,
-                                      maxPeriod: Int = 8, minRepeats: Int = 2) -> [Int]? {
-        periodicDrafts(history: history.map(Int64.init), maxCount: maxCount,
-                       maxPeriod: maxPeriod, minRepeats: minRepeats)
-    }
-
-    /// Single-pass suffix matcher returning up to `maxCount` continuation tokens and the matched suffix length.
-    /// When `appendedToken` is supplied, matches against `history + [appendedToken]` without copying `history`.
-    public static func drafts(history: [Int64], appendedToken: Int64? = nil, maxCount: Int = 3,
-                              minMatchLen: Int = 3, maxMatchLen: Int = 20) -> (tokens: [Int], matchLen: Int)? {
-        let baseCount = history.count
-        let count = baseCount + (appendedToken != nil ? 1 : 0)
+    private static func draftsCore<T: FixedWidthInteger>(
+        _ seq: VirtualIntSequence<T>, maxCount: Int, minMatchLen: Int, maxMatchLen: Int
+    ) -> (tokens: [Int], matchLen: Int)? {
+        let count = seq.count
         guard maxCount > 0, count > minMatchLen else { return nil }
         let maxN = min(maxMatchLen, count - 1)
         guard maxN >= minMatchLen else { return nil }
-        return history.withUnsafeBufferPointer { buf in
-            guard let base = buf.baseAddress else { return nil }
-            let lastTok = appendedToken ?? base[count - 1]
-            let minEnd = max(minMatchLen - 1, count - 1 - 32768)
-            var bestLen = 0
-            var bestEnd = -1
-            for endPos in stride(from: count - 2, through: minEnd, by: -1) {
-                guard base[endPos] == lastTok else { continue }
-                let limit = min(maxN, endPos + 1)
-                if limit <= bestLen { break }
-                var m = 1
-                while m < limit && base[endPos - m] == base[count - 1 - m] {
-                    m += 1
-                }
-                if m >= minMatchLen && m > bestLen {
-                    bestLen = m
-                    bestEnd = endPos
-                    if bestLen == maxN { break }
-                }
+        let lastTok = seq[count - 1]
+        let minEnd = max(minMatchLen - 1, count - 1 - 32768)
+        var bestLen = 0
+        var bestEnd = -1
+        for endPos in stride(from: count - 2, through: minEnd, by: -1) {
+            guard seq[endPos] == lastTok else { continue }
+            let limit = min(maxN, endPos + 1)
+            if limit <= bestLen { break }
+            var m = 1
+            while m < limit && seq[endPos - m] == seq[count - 1 - m] {
+                m += 1
             }
-            guard bestLen >= minMatchLen, bestEnd >= 0 else { return nil }
-            let avail = min(maxCount, count - 1 - bestEnd)
-            guard avail > 0 else { return nil }
-            if count > 2048 && bestLen <= 3 {
-                let nextTok = (bestEnd + 1 < baseCount) ? base[bestEnd + 1] : appendedToken!
-                let checkMin = max(bestLen - 1, bestEnd - 512)
-                var confirmed = false
-                if bestEnd > checkMin {
-                    for prevEnd in stride(from: bestEnd - 1, through: checkMin, by: -1) {
-                        guard base[prevEnd] == lastTok else { continue }
-                        var same = true
-                        for m in 1..<bestLen where base[prevEnd - m] != base[count - 1 - m] {
-                            same = false
-                            break
-                        }
-                        if same {
-                            if base[prevEnd + 1] != nextTok { return nil }
-                            confirmed = true
-                            break
-                        }
+            if m >= minMatchLen && m > bestLen {
+                bestLen = m
+                bestEnd = endPos
+                if bestLen == maxN { break }
+            }
+        }
+        guard bestLen >= minMatchLen, bestEnd >= 0 else { return nil }
+        let avail = min(maxCount, count - 1 - bestEnd)
+        guard avail > 0 else { return nil }
+        if count > 2048 && bestLen <= 3 {
+            let nextTok = seq[bestEnd + 1]
+            let checkMin = max(bestLen - 1, bestEnd - 512)
+            var confirmed = false
+            if bestEnd > checkMin {
+                for prevEnd in stride(from: bestEnd - 1, through: checkMin, by: -1) {
+                    guard seq[prevEnd] == lastTok else { continue }
+                    var same = true
+                    for m in 1..<bestLen where seq[prevEnd - m] != seq[count - 1 - m] {
+                        same = false
+                        break
+                    }
+                    if same {
+                        if seq[prevEnd + 1] != nextTok { return nil }
+                        confirmed = true
+                        break
                     }
                 }
-                if bestLen == 2 && !confirmed { return nil }
             }
-            var out: [Int] = []
-            out.reserveCapacity(avail)
-            for k in 1...avail {
-                let idx = bestEnd + k
-                out.append(Int(idx < baseCount ? base[idx] : appendedToken!))
-            }
-            return (tokens: out, matchLen: bestLen)
+            if bestLen == 2 && !confirmed { return nil }
         }
-    }
-
-    public static func drafts(history: [Int], appendedToken: Int? = nil, maxCount: Int = 3,
-                              minMatchLen: Int = 3, maxMatchLen: Int = 20) -> (tokens: [Int], matchLen: Int)? {
-        drafts(history: history.map(Int64.init), appendedToken: appendedToken.map(Int64.init),
-               maxCount: maxCount, minMatchLen: minMatchLen, maxMatchLen: maxMatchLen)
-    }
-
-    public static func draft(history: [Int64], minMatchLen: Int = 6, maxMatchLen: Int = 20) -> Int? {
-        drafts(history: history, maxCount: 1, minMatchLen: minMatchLen, maxMatchLen: maxMatchLen)?.tokens.first
+        var out: [Int] = []
+        out.reserveCapacity(avail)
+        for k in 1...avail {
+            out.append(seq[bestEnd + k])
+        }
+        return (tokens: out, matchLen: bestLen)
     }
 
     /// Selects 1..draftCapacity speculative tokens combining periodic cycles, suffix PLD, and neural MTP drafts.

@@ -125,25 +125,70 @@ extension QWEngineDriver {
                 { try accumulator.record($0) }
             }
             if let dflashDrafter, let dSlot = session.dflashSlot {
-                if let owner {
-                    try owner.stream.beginGumbelRound(drafts: count, vocabulary: geometry.vocab, maxDrafts: 15)
+                let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
+                let canAdapt = (owner == nil && !mtpStageProfiling && resolvedStrategy != .mtp)
+                var usedPLD = false
+                if canAdapt && activeConstraint == nil {
+                    let ctx = pendingHistoryContext(session: session, pending: pending)
+                    let minPldTokens = resolvedStrategy == .ngram ? min(4, count) : min(7, count)
+                    var cand: [Int] = []
+                    if let pld = QWContextCopyDrafter.periodicDrafts(
+                        history: session.tokenHistory, extraToken: ctx.extraPending,
+                        maxCount: count, minRepeats: 3),
+                       pld.count >= minPldTokens {
+                        cand = Array(pld.prefix(count))
+                    } else if let match = QWContextCopyDrafter.drafts(
+                        history: session.tokenHistory, extraToken: ctx.extraPending,
+                        maxCount: count, minMatchLen: 6),
+                        !match.tokens.isEmpty {
+                        var extended = Array(match.tokens.prefix(count))
+                        if extended.count < count {
+                            session.tokenRecycler.appendDrafts(
+                                into: &extended, maxCount: count,
+                                previousToken: ctx.previousToken, pendingToken: pending,
+                                maxUnigramFallbacks: 0)
+                        }
+                        if extended.count >= minPldTokens {
+                            cand = extended
+                        }
+                    }
+                    if cand.count > 7 && cand.count < 12 {
+                        cand = Array(cand.prefix(7))
+                    }
+                    if !cand.isEmpty {
+                        drafts = cand
+                        proposals = []
+                        draftedPairs = drafts.count
+                        lastRoundUsedPLD = true
+                        mtpDraftProposals += drafts.count
+                        usedPLD = true
+                    }
                 }
-                let proposed: (drafts: [Int], proposals: [QWMTPGumbelProposal])
-                do {
-                    proposed = try dflashDrafter.propose(
-                        hal: hal, slot: dSlot, cacheOffset: session.dflashCacheOffset,
-                        pendingToken: pending, draftCount: count, head: head,
-                        headStorage: headStorage, draftHead: mtpDraftHead,
-                        embedding: { try self.copyEmbedRow($0, to: $1) },
-                        stochasticOwner: owner, completed: draftCompleted)
-                } catch {
-                    commandBufferErrors += 1
-                    throw error
+                if usedPLD {
+                    session.dflashRoundStartNs = nil
+                } else {
+                    let activeCount = canAdapt ? session.dflashPolicy.selectDraftCount(maxDrafts: count) : count
+                    session.dflashRoundStartNs = canAdapt ? DispatchTime.now().uptimeNanoseconds : nil
+                    if let owner {
+                        try owner.stream.beginGumbelRound(drafts: activeCount, vocabulary: geometry.vocab, maxDrafts: 15)
+                    }
+                    let proposed: (drafts: [Int], proposals: [QWMTPGumbelProposal])
+                    do {
+                        proposed = try dflashDrafter.propose(
+                            hal: hal, slot: dSlot, cacheOffset: session.dflashCacheOffset,
+                            pendingToken: pending, draftCount: activeCount, head: head,
+                            headStorage: headStorage, draftHead: mtpDraftHead,
+                            embedding: { try self.copyEmbedRow($0, to: $1) },
+                            stochasticOwner: owner, completed: draftCompleted)
+                    } catch {
+                        commandBufferErrors += 1
+                        throw error
+                    }
+                    drafts = proposed.drafts
+                    proposals = proposed.proposals
+                    draftedPairs = drafts.count
+                    mtpDraftProposals += drafts.count
                 }
-                drafts = proposed.drafts
-                proposals = proposed.proposals
-                draftedPairs = drafts.count
-                mtpDraftProposals += drafts.count
             } else if let echoDrafter {
                 let proposed = try proposeEchoOrPLDRound(
                     session: session, echoDrafter: echoDrafter, hidden: hidden,
@@ -191,7 +236,7 @@ extension QWEngineDriver {
                                                           targetDistributions: targets)
                 decision = try QWGreedyRoundDecision.sampled(geometry: geometry, 
                     proposals: proposals, result: result, maxNew: maxNew, stopIDs: stopIDs,
-                    maxDrafts: dflashDrafter != nil ? 15 : 5)
+                    maxDrafts: dflashDrafter != nil ? 15 : 7)
                 preparedStochasticWitness = QWStochasticRoundWitness(owner: owner,
                     drawEnd: owner.stream.drawsConsumed)
                 evidence = QWStochasticRoundEvidence(proposals: proposals, targets: targets, result: result,
@@ -261,14 +306,25 @@ extension QWEngineDriver {
         let decision = round.decision
         let drafts = Array(verifiedInputs.dropFirst())
         if !stochastic {
-            let full = try verifyWindow.greedyDecision(drafts: drafts, maxNew: verifiedInputs.count,
-                                                       activeRows: verifiedInputs.count,
-                                                       relaxedMargin: effectiveRelaxedMargin,
-                                                       relaxedMinProb: effectiveRelaxedMinProb)
+            let (full, rawTargets) = try verifyWindow.greedyDecisionWithTargets(
+                drafts: drafts, maxNew: verifiedInputs.count, activeRows: verifiedInputs.count,
+                relaxedMargin: effectiveRelaxedMargin, relaxedMinProb: effectiveRelaxedMinProb)
             guard decision.acceptedDrafts == full.acceptedDrafts,
                   decision.tokens == Array(full.tokens.prefix(decision.tokens.count)),
                   decision.tokens.count <= full.tokens.count else {
                 throw QWEngineDriverError.state("greedy commit decision does not match verified target rows")
+            }
+            if effectiveRelaxedMargin == 0, activeConstraint == nil {
+                let pendingInHistory = session.tokenHistory.count > session.position
+                    && session.tokenHistory.last == verifiedInputs[0]
+                let prevBeforePending: Int? = pendingInHistory
+                    ? (session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil)
+                    : session.tokenHistory.last
+                for row in (0..<min(verifiedInputs.count, rawTargets.count)).reversed() {
+                    let prev = (row == 0) ? prevBeforePending : verifiedInputs[row - 1]
+                    session.tokenRecycler.recordTransition(
+                        previous: prev, current: verifiedInputs[row], next: rawTargets[row])
+                }
             }
         }
         guard session.generated <= Int.max - decision.tokens.count else {
@@ -346,6 +402,7 @@ extension QWEngineDriver {
                 throw QWEngineDriverError.state("greedy commit GPU failure: \(String(describing: cb.error))")
             }
         }
+        let usedPLDThisRound = lastRoundUsedPLD
         let resolutionGPU: Double?
         do {
             resolutionGPU = mtpStageProfiling ? try QWMTPStageTiming.gpuDurationMs(cb) : nil
@@ -410,6 +467,16 @@ extension QWEngineDriver {
         session.roundRecord.outputCount = session.generated
         session.roundRecord.mtpPhysicalRows = basePairs + retainedPairs
         mtpDraftAccepted += decision.acceptedDrafts
+        if dflashDrafter != nil {
+            if !stochastic && !mtpStageProfiling && !usedPLDThisRound {
+                let roundMs = session.dflashRoundStartNs.map {
+                    Double(DispatchTime.now().uptimeNanoseconds - $0) / 1_000_000
+                }
+                session.dflashPolicy.observeRound(
+                    draftCount: drafts.count, accepted: decision.acceptedDrafts, roundMs: roundMs)
+            }
+            session.dflashRoundStartNs = nil
+        }
     
 
         session.tokenHistory.append(contentsOf: decision.tokens)

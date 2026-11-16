@@ -48,6 +48,10 @@ extension QWEngineTelemetryRegistry {
         map[QWTelemetryMetric.gpuPercent.rawValue] = hw.gpuUsagePercent == nil ? .unavailable : (hwStale ? .stale : .measured)
         map[QWTelemetryMetric.memoryPercent.rawValue] = hw.memoryUsagePercent == nil ? .unavailable : (hwStale ? .stale : .measured)
         map[QWTelemetryMetric.memoryPressure.rawValue] = hw.memoryPressureLevel == nil ? .unavailable : (hwStale ? .stale : .measured)
+        map[QWTelemetryMetric.gpuTemperatureCelsius.rawValue] = hw.gpuTemperatureCelsius == nil ? .unavailable : (hwStale ? .stale : .measured)
+        map[QWTelemetryMetric.fanSpeedRPM.rawValue] = hw.fanSpeedRPM == nil ? .unavailable : (hwStale ? .stale : .measured)
+        map[QWTelemetryMetric.systemPowerWatts.rawValue] = hw.systemPowerWatts == nil ? .unavailable : (hwStale ? .stale : .measured)
+        map[QWTelemetryMetric.thermalState.rawValue] = hw.thermalStateLevel == nil ? .unavailable : (hwStale ? .stale : .measured)
         map[QWTelemetryMetric.gpuBusyRatio.rawValue] = busyRatio == nil ? .unavailable : (busyStale ? .stale : .measured)
         map[QWTelemetryMetric.prefillFromCache.rawValue] = prefillFromCache ? .derived : .unavailable
         return map
@@ -82,6 +86,10 @@ extension QWEngineTelemetryRegistry {
         map[QWTelemetryMetric.gpuPercent.rawValue] = hw.sampledAt
         map[QWTelemetryMetric.memoryPercent.rawValue] = hw.sampledAt
         map[QWTelemetryMetric.memoryPressure.rawValue] = hw.sampledAt
+        if hw.gpuTemperatureCelsius != nil { map[QWTelemetryMetric.gpuTemperatureCelsius.rawValue] = hw.sampledAt }
+        if hw.fanSpeedRPM != nil { map[QWTelemetryMetric.fanSpeedRPM.rawValue] = hw.sampledAt }
+        if hw.systemPowerWatts != nil { map[QWTelemetryMetric.systemPowerWatts.rawValue] = hw.sampledAt }
+        if hw.thermalStateLevel != nil { map[QWTelemetryMetric.thermalState.rawValue] = hw.sampledAt }
         if let at = busy?.sampledAt { map[QWTelemetryMetric.gpuBusyRatio.rawValue] = at }
         if prefillFromCache { map[QWTelemetryMetric.prefillFromCache.rawValue] = lastTurnAt }
         return map
@@ -159,6 +167,32 @@ extension QWEngineTelemetryRegistry {
             map[QWTelemetryMetric.memoryPressure.rawValue] = reason
         } else if hwStale {
             map[QWTelemetryMetric.memoryPressure.rawValue] = "the reading is older than the freshness bound"
+        }
+        if let reason = hw.gpuTemperatureUnavailableReason {
+            map[QWTelemetryMetric.gpuTemperatureCelsius.rawValue] = reason
+        } else if hw.gpuTemperatureCelsius == nil {
+            map[QWTelemetryMetric.gpuTemperatureCelsius.rawValue] = "GPU temperature not available"
+        } else if hwStale {
+            map[QWTelemetryMetric.gpuTemperatureCelsius.rawValue] = "the reading is older than the freshness bound"
+        }
+        if let reason = hw.fanSpeedUnavailableReason {
+            map[QWTelemetryMetric.fanSpeedRPM.rawValue] = reason
+        } else if hw.fanSpeedRPM == nil {
+            map[QWTelemetryMetric.fanSpeedRPM.rawValue] = "fan telemetry not available"
+        } else if hwStale {
+            map[QWTelemetryMetric.fanSpeedRPM.rawValue] = "the reading is older than the freshness bound"
+        }
+        if let reason = hw.systemPowerUnavailableReason {
+            map[QWTelemetryMetric.systemPowerWatts.rawValue] = reason
+        } else if hw.systemPowerWatts == nil {
+            map[QWTelemetryMetric.systemPowerWatts.rawValue] = "system power not available"
+        } else if hwStale {
+            map[QWTelemetryMetric.systemPowerWatts.rawValue] = "the reading is older than the freshness bound"
+        }
+        if hw.thermalStateLevel == nil {
+            map[QWTelemetryMetric.thermalState.rawValue] = "thermal state not available"
+        } else if hwStale {
+            map[QWTelemetryMetric.thermalState.rawValue] = "the reading is older than the freshness bound"
         }
         if busyRatio == nil {
             map[QWTelemetryMetric.gpuBusyRatio.rawValue] =

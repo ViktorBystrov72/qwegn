@@ -94,8 +94,11 @@ extension QWEngineLifecycleActor {
         let isConstrainedJson = prepared.isConstrainedJson
         let wire = prepared.wire
 
+        let usePrefixCache = request.effectiveCachePrompt
+        let cacheSalt = request.effectiveCacheSalt
         let encodedWire = try await encodeWireIncrementallyWithSystemPrefix(
-            wire: wire, tokenizer: tok, packPath: config.packPath
+            wire: wire, tokenizer: tok, packPath: config.packPath,
+            cachePrompt: usePrefixCache, cacheSalt: cacheSalt
         )
         let promptTokens = encodedWire.tokens
         let systemPrefixTokenCount = encodedWire.systemPrefixTokenCount
@@ -169,9 +172,11 @@ extension QWEngineLifecycleActor {
         let activeGenConstraint = heal.constraint
 
         final class StreamCapture: @unchecked Sendable {
+            private static let endThinkUTF8 = Array("</think>".utf8)
             let tok: QWTokenizer
             var streamDecoder: QWStreamDecoder
             var fullText: String
+            var fullUTF8: [UInt8]
             var emittedUTF8Count: Int = 0
             var pendingPrefix: String
             var remainingHealUTF8: Int
@@ -193,6 +198,7 @@ extension QWEngineLifecycleActor {
                 self.tok = tok
                 self.streamDecoder = QWStreamDecoder(tok)
                 self.fullText = initialPrefix
+                self.fullUTF8 = Array(initialPrefix.utf8)
                 self.pendingPrefix = initialPrefix
                 self.remainingHealUTF8 = initialHealUTF8
                 self.inThinking = startsInThinking
@@ -201,16 +207,40 @@ extension QWEngineLifecycleActor {
                 self.modelBackend = modelBackend
             }
 
+            func appendPiece(_ piece: String) {
+                fullText += piece
+                fullUTF8.append(contentsOf: piece.utf8)
+            }
+
+            func truncateFullText(to endIndex: String.Index) {
+                fullText = String(fullText[..<endIndex])
+                fullUTF8 = Array(fullText.utf8)
+            }
+
+            func containsEndThinkNearTail(lastPieceUTF8Count: Int) -> Bool {
+                let needle = Self.endThinkUTF8
+                guard fullUTF8.count >= needle.count else { return false }
+                let start = max(0, fullUTF8.count - lastPieceUTF8Count - needle.count)
+                let lastStart = fullUTF8.count - needle.count
+                guard start <= lastStart else { return false }
+                for i in start...lastStart where fullUTF8[i] == needle[0] {
+                    var match = true
+                    for j in 1..<needle.count where fullUTF8[i + j] != needle[j] {
+                        match = false
+                        break
+                    }
+                    if match { return true }
+                }
+                return false
+            }
+
             func emitUpTo(_ utf8Limit: Int) {
                 guard let onToken else {
                     emittedUTF8Count = utf8Limit
                     return
                 }
-                let views = fullText.utf8
-                guard utf8Limit > emittedUTF8Count, utf8Limit <= views.count else { return }
-                let startIdx = views.index(views.startIndex, offsetBy: emittedUTF8Count)
-                let endIdx = views.index(views.startIndex, offsetBy: utf8Limit)
-                if let str = String(views[startIdx..<endIdx]) {
+                guard utf8Limit > emittedUTF8Count, utf8Limit <= fullUTF8.count else { return }
+                if let str = String(bytes: fullUTF8[emittedUTF8Count..<utf8Limit], encoding: .utf8) {
                     emittedUTF8Count = utf8Limit
                     if !str.isEmpty { onToken(str) }
                 }
@@ -301,8 +331,8 @@ extension QWEngineLifecycleActor {
                     }
                 }
             }
-            capture.fullText += piece
-            if capture.inThinking && capture.fullText.contains("</think>") {
+            capture.appendPiece(piece)
+            if capture.inThinking && capture.containsEndThinkNearTail(lastPieceUTF8Count: piece.utf8.count) {
                 capture.inThinking = false
             }
 
@@ -319,37 +349,37 @@ extension QWEngineLifecycleActor {
                 if let range = earliestRange, let matchedStop {
                     capture.matchedStopSequence = matchedStop
                     capture.stoppedByCustomRule = true
-                    capture.fullText = String(capture.fullText[..<range.lowerBound])
-                    capture.emitUpTo(capture.fullText.utf8.count)
+                    capture.truncateFullText(to: range.lowerBound)
+                    capture.emitUpTo(capture.fullUTF8.count)
                     return false
                 }
             }
 
             if let jsonConstraint, jsonConstraint.isComplete {
                 capture.stoppedByCustomRule = true
-                capture.emitUpTo(capture.fullText.utf8.count)
+                capture.emitUpTo(capture.fullUTF8.count)
                 return false
             }
 
             if isConstrainedJson, let jsonEnd = Self.firstCompleteJsonObjectEnd(in: capture.fullText) {
-                capture.fullText = String(capture.fullText[..<jsonEnd])
+                capture.truncateFullText(to: jsonEnd)
                 capture.stoppedByCustomRule = true
-                capture.emitUpTo(capture.fullText.utf8.count)
+                capture.emitUpTo(capture.fullUTF8.count)
                 return false
             }
 
             if stopOnSingleTool, let closeEnd = QWToolCallParser.firstCompleteToolCallEnd(in: capture.fullText) {
-                capture.fullText = String(capture.fullText[..<closeEnd])
+                capture.truncateFullText(to: closeEnd)
                 capture.stoppedByCustomRule = true
-                capture.emitUpTo(capture.fullText.utf8.count)
+                capture.emitUpTo(capture.fullUTF8.count)
                 return false
             }
 
             if customStopStrings.isEmpty {
-                capture.emitUpTo(capture.fullText.utf8.count)
+                capture.emitUpTo(capture.fullUTF8.count)
             } else {
                 let hold = Self.heldStopSuffixUTF8(capture.fullText, stops: customStopStrings)
-                let safeUTF8 = max(0, capture.fullText.utf8.count - hold)
+                let safeUTF8 = max(0, capture.fullUTF8.count - hold)
                 capture.emitUpTo(safeUTF8)
             }
             return true
@@ -376,7 +406,8 @@ extension QWEngineLifecycleActor {
                 : Self.samplingParamsSourceLabel(config.sourceSummary)))
 
         let firstVisualOffset = visualSpans.map(\.tokenOffset).min() ?? genPromptTokens.count
-        let retainPrefixLen: Int? = ((effectiveSystemPrefixTokenCount ?? 0) >= 128
+        let retainPrefixLen: Int? = (usePrefixCache
+            && (effectiveSystemPrefixTokenCount ?? 0) >= 128
             && (effectiveSystemPrefixTokenCount ?? 0) < firstVisualOffset)
             ? effectiveSystemPrefixTokenCount
             : nil
@@ -394,7 +425,9 @@ extension QWEngineLifecycleActor {
             topLogprobsCount: topLPCount,
             onTokenLogprob: logprobCallback,
             constraint: activeGenConstraint,
-            exactSpeculation: isConstrainedJson || sampling.hasExplicitSeed,
+            exactSpeculation: isConstrainedJson || sampling.hasExplicitSeed || request.effectiveExactSpeculation,
+            usePrefixCache: usePrefixCache,
+            cacheSalt: cacheSalt,
             visualSpans: visualSpans,
             onPrefillProgress: prefillProgressCallback
         )
@@ -427,32 +460,37 @@ extension QWEngineLifecycleActor {
             )
         } catch {
             telemetry.resetToIdle()
-            QWRequestRecordStore.shared.append(QWRequestRecord(
-                id: QWRequestRecordStore.shared.nextId(),
-                time: Date(),
-                modelId: config.packName,
-                promptTokens: effectivePromptTokens.count,
-                generatedTokens: 0,
-                outcome: "failed"
-            ))
+            if request.effectiveStore {
+                QWRequestRecordStore.shared.append(QWRequestRecord(
+                    id: request.effectiveRequestId ?? QWRequestRecordStore.shared.nextId(),
+                    time: Date(),
+                    modelId: config.packName,
+                    promptTokens: effectivePromptTokens.count,
+                    generatedTokens: 0,
+                    config: Self.buildLedgerConfig(
+                        request: request, config: config, hasMountedManifest: memState.manifest != nil
+                    ),
+                    outcome: "failed"
+                ))
+            }
             throw error
         }
 
         let flushTail = capture.streamDecoder.flush()
         if !flushTail.isEmpty && !capture.stoppedByCustomRule {
-            capture.fullText += flushTail
+            capture.appendPiece(flushTail)
         }
         if !customStopStrings.isEmpty && capture.matchedStopSequence == nil {
             for stopStr in customStopStrings {
                 if let r = capture.fullText.range(of: stopStr) {
                     capture.matchedStopSequence = stopStr
                     capture.stoppedByCustomRule = true
-                    capture.fullText = String(capture.fullText[..<r.lowerBound])
+                    capture.truncateFullText(to: r.lowerBound)
                     break
                 }
             }
         }
-        capture.emitUpTo(capture.fullText.utf8.count)
+        capture.emitUpTo(capture.fullUTF8.count)
 
         var fullText = capture.fullText
         if let fmtType, (fmtType == "json_schema" || fmtType == "json_object"),
@@ -501,26 +539,26 @@ extension QWEngineLifecycleActor {
             ttftMs: ttftMs, decodeTokPerSec: decodeTokPerSec, totalSec: totalDuration
         )
 
-        QWRequestRecordStore.shared.append(QWRequestRecord(
-            id: QWRequestRecordStore.shared.nextId(),
-            time: Date(),
-            modelId: config.packName,
-            promptTokens: effectivePromptTokens.count,
-            generatedTokens: metrics.tokens.count,
-            cachedTokens: metrics.cacheHitTokens,
-            cacheHitTier: metrics.cacheTier,
-            ttftMs: ttftMs,
-            prefillMs: metrics.prefillSec.map { $0 * 1000.0 },
-            decodeMs: metrics.decodeSec.map { $0 * 1000.0 },
-            decodeTps: decodeTokPerSec,
-            stageGPU: metrics.stageGPU,
-            config: [
-                "kvMode": String(describing: config.kvMode),
-                "mtpDrafts": String(config.mtpDrafts),
-                "speculative": config.speculativeDecodingEnabled ? "on" : "off"
-            ],
-            outcome: "ok"
-        ))
+        if request.effectiveStore {
+            QWRequestRecordStore.shared.append(QWRequestRecord(
+                id: request.effectiveRequestId ?? QWRequestRecordStore.shared.nextId(),
+                time: Date(),
+                modelId: config.packName,
+                promptTokens: effectivePromptTokens.count,
+                generatedTokens: metrics.tokens.count,
+                cachedTokens: metrics.cacheHitTokens,
+                cacheHitTier: metrics.cacheTier,
+                ttftMs: ttftMs,
+                prefillMs: metrics.prefillSec.map { $0 * 1000.0 },
+                decodeMs: metrics.decodeSec.map { $0 * 1000.0 },
+                decodeTps: decodeTokPerSec,
+                stageGPU: metrics.stageGPU,
+                config: Self.buildLedgerConfig(
+                    request: request, config: config, hasMountedManifest: memState.manifest != nil
+                ),
+                outcome: "ok"
+            ))
+        }
 
         let reportedCompletionTokens = max(0, metrics.tokens.count - capture.healedConsumedTokens)
         let truncated = !capture.stoppedByCustomRule
@@ -546,4 +584,23 @@ extension QWEngineLifecycleActor {
         )
     }
 
+    private static func buildLedgerConfig(
+        request: ChatCompletionRequest,
+        config: QWEngineLifecycleActor.Config,
+        hasMountedManifest: Bool
+    ) -> [String: String] {
+        var out: [String: String] = [
+            "kvMode": String(describing: config.kvMode),
+            "mtpDrafts": String(config.mtpDrafts),
+            "speculative": config.speculativeDecodingEnabled ? "on" : "off",
+            "cachePrompt": request.effectiveCachePrompt ? "on" : "off",
+            "memPack": hasMountedManifest ? "mounted" : (request.effectiveUseMemoryPack ? "auto" : "off")
+        ]
+        if let sid = request.effectiveSessionId { out["sessionId"] = sid }
+        if let preset = request.effectivePresetId { out["preset"] = preset }
+        if let salt = request.effectiveCacheSalt { out["cacheKey"] = salt }
+        if request.effectiveExactSpeculation { out["exactSpec"] = "on" }
+        if let user = request.effectiveUser { out["user"] = user }
+        return out
+    }
 }

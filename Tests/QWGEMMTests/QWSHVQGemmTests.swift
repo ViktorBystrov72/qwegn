@@ -113,27 +113,28 @@ final class QWSHVQGemmTests: XCTestCase {
                 XCTAssertLessThan(rel, 1.5e-3, "decodeT4 SHVQ\(bits)_G\(group) r=\(r): got \(gotT4[r]) want \(ref.val)")
             }
 
-            // 2. Test QWGemmAQ.encode (_v4 multi-row f32 output, m=3)
-            let m = 3
-            let xRaw = makeActivations(count: m * k, seedInit: UInt32(m * 97 + bits))
-            let x32 = try act.allocate(QWTensorShape([m * k], .f32))
-            let x16 = try act.allocate(QWTensorShape([m * k], .f16))
-            let y32 = try act.allocate(QWTensorShape([m * n], .f32))
-            arena.write(x32, from: xRaw)
-            try step { enc in
-                try QWGemm.encodeCast(enc, hal: Self.hal, x32: x32, y16: x16, count: m * k)
-                try QWGemmAQ.encode(enc, hal: Self.hal, blocks: wBuf, x: x16, y: y32,
-                                    n: n, k: k, bits: bits, group: group, rows: m, isSHVQ: true)
-            }
-            let got = arena.read(y32, as: Float.self, count: m * n)
-            for t in 0..<m {
-                let xSlice = xRaw[(t * k)..<((t + 1) * k)].map { Float(Float16($0)) }[...]
-                for r in 0..<n {
-                    let ref = dotRef(w: wRows[r], x: xSlice)
-                    let denom = max(Double(abs(ref.val)), Double(ref.mag), 1e-5)
-                    let rel = abs(Double(got[t * n + r]) - Double(ref.val)) / denom
-                    XCTAssertLessThan(rel, 1e-4,
-                                      "SHVQ\(bits)_G\(group) m=\(m) t=\(t) r=\(r): got \(got[t * n + r]) want \(ref.val)")
+            // 2. Test QWGemmAQ.encode (_v4 multi-row f32 output, m in [3, 6])
+            for m in [3, 6] {
+                let xRaw = makeActivations(count: m * k, seedInit: UInt32(m * 97 + bits))
+                let x32 = try act.allocate(QWTensorShape([m * k], .f32))
+                let x16 = try act.allocate(QWTensorShape([m * k], .f16))
+                let y32 = try act.allocate(QWTensorShape([m * n], .f32))
+                arena.write(x32, from: xRaw)
+                try step { enc in
+                    try QWGemm.encodeCast(enc, hal: Self.hal, x32: x32, y16: x16, count: m * k)
+                    try QWGemmAQ.encode(enc, hal: Self.hal, blocks: wBuf, x: x16, y: y32,
+                                        n: n, k: k, bits: bits, group: group, rows: m, isSHVQ: true)
+                }
+                let got = arena.read(y32, as: Float.self, count: m * n)
+                for t in 0..<m {
+                    let xSlice = xRaw[(t * k)..<((t + 1) * k)].map { Float(Float16($0)) }[...]
+                    for r in 0..<n {
+                        let ref = dotRef(w: wRows[r], x: xSlice)
+                        let denom = max(Double(abs(ref.val)), Double(ref.mag), 1e-5)
+                        let rel = abs(Double(got[t * n + r]) - Double(ref.val)) / denom
+                        XCTAssertLessThan(rel, 1e-4,
+                                          "SHVQ\(bits)_G\(group) m=\(m) t=\(t) r=\(r): got \(got[t * n + r]) want \(ref.val)")
+                    }
                 }
             }
         }

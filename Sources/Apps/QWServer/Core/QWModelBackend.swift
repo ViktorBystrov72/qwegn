@@ -26,6 +26,10 @@ public struct QWModelGenerationRequest: Sendable {
     public let constraint: (any QWTokenConstraint)?
     /// Forces exact target-model speculative verification (`mtpRelaxedMargin = 0`) for tool-calling turns.
     public let exactSpeculation: Bool
+    /// Controls per-request prefix-cache lookup and retention (`cache_prompt: false` bypasses caches).
+    public let usePrefixCache: Bool
+    /// Optional per-request prefix-cache isolation namespace (`prompt_cache_key` / `cache_salt`).
+    public let cacheSalt: String?
     /// Merged visual feature spans for multimodal prompts.
     public let visualSpans: [QWVisualSpan]
     /// Optional prefill progress callback invoked with `(completedComputedTokens, totalComputedTokens)`.
@@ -43,11 +47,15 @@ public struct QWModelGenerationRequest: Sendable {
         onTokenLogprob: (@Sendable (QWTokenLogprob) -> Void)? = nil,
         constraint: (any QWTokenConstraint)? = nil,
         exactSpeculation: Bool = false,
+        usePrefixCache: Bool = true,
+        cacheSalt: String? = nil,
         visualSpans: [QWVisualSpan] = [],
         onPrefillProgress: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         self.constraint = constraint
         self.exactSpeculation = exactSpeculation
+        self.usePrefixCache = usePrefixCache
+        self.cacheSalt = cacheSalt
         self.promptTokens = promptTokens
         self.maxNewTokens = maxNewTokens
         self.sampling = sampling
@@ -132,6 +140,12 @@ public protocol QWModelBackend: Sendable {
         onToken: ((Int) -> Bool)?
     ) throws -> QWModelCompletionMetrics
 
+    func buildStandalonePrefixCache(
+        tokens: [Int],
+        outputURL: URL,
+        pinAsSharedBase: Bool,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
+    ) throws -> Int
     func mountStandalonePrefixCache(from fileURL: URL) throws -> (tokens: [Int], byteCount: Int)
     func unmountSharedBasePrefixes()
 }
@@ -139,6 +153,14 @@ public protocol QWModelBackend: Sendable {
 /// The builder that makes a `QWModelBackend` for a module.
 extension QWModelBackend {
     public var supportsTokenConstraints: Bool { false }
+    public func buildStandalonePrefixCache(
+        tokens: [Int],
+        outputURL: URL,
+        pinAsSharedBase: Bool,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
+    ) throws -> Int {
+        throw QWModuleError.notImplemented("buildStandalonePrefixCache")
+    }
     public func mountStandalonePrefixCache(from fileURL: URL) throws -> (tokens: [Int], byteCount: Int) {
         ([], 0)
     }
@@ -386,7 +408,7 @@ public struct QWUnifiedModelBackend: QWModelBackend {
         config: QWEngineLifecycleActor.Config,
         onToken: ((Int) -> Bool)?
     ) throws -> QWModelCompletionMetrics {
-        let cacheActive = engine.hasPrefixCache
+        let cacheActive = engine.hasPrefixCache && request.usePrefixCache
         let samplerConfig = QWSamplerConfig(request.sampling, vocabulary: descriptor.vocab)
         // The server says what it wants; the engine decides whether it
         // can serve it and which path it takes.
@@ -401,13 +423,14 @@ public struct QWUnifiedModelBackend: QWModelBackend {
             sampling: samplerConfig,
             usePrefixCache: cacheActive,
             speculative: speculation,
-            retainPrefixLength: request.retainPrefixLength,
+            retainPrefixLength: cacheActive ? request.retainPrefixLength : nil,
             collectTimings: true,
             collectLogprobs: request.collectLogprobs,
             topLogprobsCount: request.topLogprobsCount,
             onTokenLogprob: request.onTokenLogprob,
             constraint: request.constraint,
             visualSpans: request.visualSpans,
+            cacheSalt: request.cacheSalt,
             onPrefillProgress: request.onPrefillProgress
         )
         let result = try engine.generate(request: engineRequest, onToken: onToken)
@@ -427,6 +450,20 @@ public struct QWUnifiedModelBackend: QWModelBackend {
             speculativeSummary: result.speculativeSummary,
             stageGPU: stageGPU,
             tokenLogprobs: result.tokenLogprobs
+        )
+    }
+
+    public func buildStandalonePrefixCache(
+        tokens: [Int],
+        outputURL: URL,
+        pinAsSharedBase: Bool,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
+    ) throws -> Int {
+        try engine.buildStandalonePrefixCache(
+            tokens: tokens,
+            outputURL: outputURL,
+            pinAsSharedBase: pinAsSharedBase,
+            onPrefillProgress: onPrefillProgress
         )
     }
 

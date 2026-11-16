@@ -42,6 +42,8 @@ public final class QWHttpServer: @unchecked Sendable {
     }
 
     public func start() throws {
+        let startupPolicy = QWCoolingPolicy(rawValue: QWSettingsManager.shared.loadSettings().coolingPolicy) ?? .auto
+        QWFanController.shared.setPolicy(startupPolicy)
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedHost.isEmpty, !trimmedHost.contains(where: \.isWhitespace) else {
             throw QWHttpServerError.invalidListenHost(host)
@@ -244,7 +246,8 @@ public final class QWHttpServer: @unchecked Sendable {
             var corsHeader = "HTTP/1.1 204 No Content\r\n"
             corsHeader += corsHeaderLines(for: connection)
             corsHeader += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            corsHeader += "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key\r\n"
+            corsHeader += "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, x-request-id, x-session-id\r\n"
+            corsHeader += "Access-Control-Expose-Headers: x-request-id, x-session-id\r\n"
             corsHeader += "Access-Control-Max-Age: 86400\r\n"
             corsHeader += "Content-Length: 0\r\nConnection: close\r\n\r\n"
             connection.send(content: Data(corsHeader.utf8), completion: .contentProcessed({ _ in connection.cancel() }))
@@ -266,7 +269,7 @@ public final class QWHttpServer: @unchecked Sendable {
             do {
                 switch (method, cleanPath) {
                 case ("POST", "/v1/chat/completions"):
-                    try await self.handleChatCompletions(connection: connection, body: body)
+                    try await self.handleChatCompletions(connection: connection, headers: headers, body: body)
 
                 case ("POST", "/api/chat"):
                     try await self.handleOllamaChat(connection: connection, body: body)
@@ -275,7 +278,7 @@ public final class QWHttpServer: @unchecked Sendable {
                     try await self.handleOllamaGenerate(connection: connection, body: body)
 
                 case ("POST", "/v1/messages"):
-                    try await self.handleMessages(connection: connection, body: body)
+                    try await self.handleMessages(connection: connection, headers: headers, body: body)
 
                 case ("POST", "/v1/models/load"), ("POST", "/api/load"):
                     if !body.isEmpty,
@@ -462,6 +465,7 @@ public final class QWHttpServer: @unchecked Sendable {
                         }
                         try newSettings.validateBeforeLaunch()
                         try QWSettingsManager.shared.saveSettings(newSettings)
+                        QWFanController.shared.setPolicy(QWCoolingPolicy(rawValue: newSettings.coolingPolicy) ?? .auto)
                         if !modelChanged {
                             try await self.actor.setVisionLoaded(newSettings.loadVision)
                         }
@@ -470,6 +474,12 @@ public final class QWHttpServer: @unchecked Sendable {
                         let err = ServerErrorPayload(message: "Failed to parse or save settings: \(error.localizedDescription)", code: 400)
                         self.sendJsonResponse(connection, status: 400, object: err)
                     }
+
+                case ("POST", "/v1/memory/inspect"), ("POST", "/api/memory/inspect"):
+                    try await self.handleMemoryInspectRoute(connection: connection, body: body)
+
+                case ("POST", "/v1/memory/index"), ("POST", "/api/memory/index"):
+                    try await self.handleMemoryIndexRoute(connection: connection, body: body)
 
                 case ("POST", "/v1/memory/mount"), ("POST", "/api/memory/mount"):
                     guard !body.isEmpty,
@@ -574,6 +584,17 @@ public final class QWHttpServer: @unchecked Sendable {
                     let err = ServerErrorPayload(message: "Not found: \(method) \(cleanPath)", type: "invalid_request_error", code: 404)
                     self.sendJsonResponse(connection, status: 404, object: err)
                 }
+            } catch let memError as QWMemoryPackError {
+                let code: Int
+                switch memError {
+                case .directoryNotFound, .cacheFileMissing:
+                    code = 404
+                case .noMatchingCacheArtifact:
+                    code = 400
+                }
+                let err = ServerErrorPayload(message: memError.localizedDescription, type: "invalid_request_error", code: code)
+                self.logger.log(.warn, "HTTP \(method) \(cleanPath) memory pack error: \(memError.localizedDescription)")
+                self.sendJsonResponse(connection, status: code, object: err)
             } catch let mmError as QWMultimodalError {
                 let err = ServerErrorPayload(message: "\(mmError)", type: "invalid_request_error", code: 400)
                 self.logger.log(.warn, "HTTP \(method) \(cleanPath) bad multimodal request: \(mmError)")

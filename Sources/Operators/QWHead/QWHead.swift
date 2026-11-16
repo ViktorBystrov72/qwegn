@@ -164,7 +164,8 @@ public final class QWHead {
         if !view.isIncumbentContainer && (view.isSHVQ || !(view.bits == 4 && view.groupSize == 32)) {
             var r0 = 0
             while r0 < m {
-                let chunk = min(4, m - r0)
+                let rem = m - r0
+                let chunk = (rem > 8 && rem - 8 == 1) ? 5 : min(8, rem)
                 let xSlice = QWTensorValue(region: x.region,
                                            offset: x.offset + r0 * view.k * 2,
                                            shape: QWTensorShape([chunk, view.k], .f16))
@@ -197,13 +198,15 @@ public final class QWHead {
             try encodeBatchedQ4GKernel(enc, hal: hal, view: view, x: x1, y: y1, m: c1)
             return
         }
+        let isAQ4 = !view.isIncumbentContainer
         let rowPaired = (view.isIncumbentContainer || (view.bits == 4 && view.groupSize == 32)) && m >= 4
-        let pso = try hal.pipeline(rowPaired ? "qwg_head_q4g_rp_m\(m)" : "qwg_head_q4g_m\(m)")
+        let name = rowPaired ? "qwg_head_q4g_rp_m\(m)" : "qwg_head_q4g_m\(m)"
+        let pso = try hal.pipeline(name, isAQ4: isAQ4)
         enc.setComputePipelineState(pso)
         view.blocks.bind(enc, index: 0)
         x.bind(enc, index: 1)
         y.bind(enc, index: 3)
-        var n = UInt32(view.n) | (view.isIncumbentContainer ? 0 : 0x8000_0000), k = UInt32(view.k)
+        var n = UInt32(view.n) | (isAQ4 ? 0x8000_0000 : 0), k = UInt32(view.k)
         enc.setBytes(&n, length: 4, index: 4)
         enc.setBytes(&k, length: 4, index: 5)
         enc.dispatchThreadgroups(MTLSize(width: (view.n + 7) / 8, height: 1, depth: 1),

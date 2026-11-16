@@ -311,7 +311,15 @@ function collectSettingsDraftPayload() {
   if (!loadedSettingsObj) return null;
   const payload = Object.assign({}, loadedSettingsObj);
   document.querySelectorAll("[data-setting]").forEach((el) => {
-    if (!el.readOnly) payload[el.getAttribute("data-setting")] = el.value;
+    if (el.readOnly) return;
+    const key = el.getAttribute("data-setting");
+    if (el.hasAttribute("data-setting-nullable") && el.value === "") {
+      if (loadedSettingsObj[key] === undefined) delete payload[key];
+      else if (loadedSettingsObj[key] === null) payload[key] = null;
+      else payload[key] = "";
+    } else {
+      payload[key] = el.value;
+    }
   });
   document.querySelectorAll("[data-setting-int]").forEach((el) => {
     const val = parseInt(el.value, 10);
@@ -322,7 +330,13 @@ function collectSettingsDraftPayload() {
     if (Number.isFinite(val)) payload[el.getAttribute("data-setting-float")] = val;
   });
   document.querySelectorAll("[data-setting-bool]").forEach((el) => {
-    payload[el.getAttribute("data-setting-bool")] = el.value === "true";
+    const key = el.getAttribute("data-setting-bool");
+    if (el.value === "") {
+      if (loadedSettingsObj[key] === undefined) delete payload[key];
+      else payload[key] = null;
+    } else {
+      payload[key] = el.value === "true";
+    }
   });
   return payload;
 }
@@ -353,16 +367,24 @@ function discardLiveSettings() {
 function renderSettingsForm(s) {
   const host = document.getElementById("settings-form-host");
   if (!host || !s) return;
+  const memFacts = typeof publishedModel !== "undefined" && publishedModel && publishedModel.facts ? publishedModel.facts : null;
+  const mountedMem = memFacts && memFacts.mountedMemoryPack ? memFacts : null;
+  const kvEnforced = Boolean(mountedMem && mountedMem.mountedMemoryPackKV);
+  const activeKV = kvEnforced ? mountedMem.mountedMemoryPackKV : s.kvMode;
+  const fanStatusText = memFacts && memFacts.fanControlStatus ? memFacts.fanControlStatus : "";
+  const memStatusText = mountedMem
+    ? `Mounted: ${mountedMem.mountedMemoryPack}${mountedMem.mountedMemoryPackRoot ? " · " + mountedMem.mountedMemoryPackRoot : ""}`
+    : "No .qwcache mounted. Enter a repo root or auto-discover via agent system prompts.";
   host.innerHTML = `
     <div class="metric-cell" style="padding:14px;">
       <h3 style="margin:0 0 10px;font-size:13px;">Model &amp; Context</h3>
       <div class="form-field"><label>Active Model</label><input class="input mono" data-setting="modelName" value="${escapeHtml(s.modelName)}" readonly /></div>
       <div class="form-field"><label>Max Context Tokens <span class="restart-tag">[restart]</span></label><input class="input mono" type="number" data-setting-int="maxContext" value="${s.maxContext}" /></div>
-      <div class="form-field"><label>KV Mode <span class="restart-tag">[restart]</span></label>
-        <select class="select" data-setting="kvMode">
-          <option value="f16" ${s.kvMode === "f16" ? "selected" : ""}>FP16</option>
-          <option value="q8" ${s.kvMode === "q8" ? "selected" : ""}>Q8_0</option>
-          <option value="q4" ${s.kvMode === "q4" ? "selected" : ""}>Q4_0</option>
+      <div class="form-field"><label>KV Mode <span class="restart-tag">${kvEnforced ? "[memory-pack]" : "[restart]"}</span></label>
+        <select class="select" data-setting="kvMode" ${kvEnforced ? "disabled" : ""}>
+          <option value="f16" ${activeKV === "f16" ? "selected" : ""}>FP16</option>
+          <option value="q8" ${activeKV === "q8" ? "selected" : ""}>Q8_0</option>
+          <option value="q4" ${activeKV === "q4" ? "selected" : ""}>Q4_0</option>
         </select>
       </div>
       <div class="form-field"><label>Load Vision Tower</label>
@@ -378,9 +400,28 @@ function renderSettingsForm(s) {
       <div class="form-field"><label>Top-P</label><input class="input mono" type="number" step="0.05" data-setting-float="topP" value="${s.topP}" /></div>
       <div class="form-field"><label>Top-K</label><input class="input mono" type="number" data-setting-int="topK" value="${s.topK}" /></div>
       <div class="form-field"><label>Max Tokens</label><input class="input mono" type="number" data-setting-int="maxTokens" value="${s.maxTokens}" /></div>
+      <div class="form-field"><label>Repetition Penalty</label><input class="input mono" type="number" step="0.01" min="1" data-setting-float="repetitionPenalty" value="${s.repetitionPenalty !== undefined && s.repetitionPenalty !== null ? s.repetitionPenalty : ""}" placeholder="1.0" /></div>
+      <div class="form-field"><label>Seed</label><input class="input mono" type="number" step="1" data-setting-int="seed" value="${s.seed !== undefined && s.seed !== null ? s.seed : ""}" placeholder="-1" /></div>
+      <div class="form-field"><label>Thinking Mode</label>
+        <select class="select" data-setting-bool="enableThinking">
+          <option value="" ${(s.enableThinking === null || s.enableThinking === undefined) ? "selected" : ""}>Server Default</option>
+          <option value="true" ${s.enableThinking === true ? "selected" : ""}>Enabled</option>
+          <option value="false" ${s.enableThinking === false ? "selected" : ""}>Disabled</option>
+        </select>
+      </div>
+      <div class="form-field"><label>Reasoning Effort</label>
+        <select class="select" data-setting="reasoningEffort" data-setting-nullable="true">
+          <option value="" ${!s.reasoningEffort ? "selected" : ""}>Server Default</option>
+          <option value="xhigh" ${s.reasoningEffort === "xhigh" ? "selected" : ""}>Extra High (xhigh)</option>
+          <option value="high" ${s.reasoningEffort === "high" ? "selected" : ""}>High</option>
+          <option value="medium" ${s.reasoningEffort === "medium" ? "selected" : ""}>Medium</option>
+          <option value="low" ${s.reasoningEffort === "low" ? "selected" : ""}>Low</option>
+        </select>
+      </div>
+      <div class="form-field"><label>Default System Prompt</label><textarea class="input mono" rows="3" style="min-height:68px;resize:vertical;font-size:12px;" data-setting="systemPrompt" data-setting-nullable="true" placeholder="Default system prompt for requests without a system turn…">${escapeHtml(s.systemPrompt !== undefined && s.systemPrompt !== null ? s.systemPrompt : "")}</textarea></div>
     </div>
     <div class="metric-cell" style="padding:14px;">
-      <h3 style="margin:0 0 10px;font-size:13px;">Speculative &amp; LSA</h3>
+      <h3 style="margin:0 0 10px;font-size:13px;">Speculative, LSA &amp; Cooling</h3>
       <div class="form-field"><label>Speculative Decoding <span class="restart-tag">[restart]</span></label>
         <select class="select" data-setting-bool="speculativeDecodingEnabled">
           <option value="true" ${s.speculativeDecodingEnabled ? "selected" : ""}>Enabled</option>
@@ -405,6 +446,24 @@ function renderSettingsForm(s) {
         </select>
       </div>
       <div class="form-field"><label>Warm RAM Cache Limit (GB) <span class="restart-tag">[restart]</span></label><input class="input mono" type="number" step="0.5" data-setting-float="warmRAMLimitGB" value="${s.warmRAMLimitGB}" /></div>
+      <div class="form-field"><label>Cooling &amp; Fan Policy</label>
+        <select class="select" data-setting="coolingPolicy">
+          <option value="auto" ${(s.coolingPolicy || "auto") === "auto" ? "selected" : ""}>System Auto (macOS SMC)</option>
+          <option value="proactive" ${s.coolingPolicy === "proactive" ? "selected" : ""}>Proactive Pre-Spin (Inference Ramp)</option>
+          <option value="max" ${s.coolingPolicy === "max" ? "selected" : ""}>Max Blast (100% RPM Ceiling)</option>
+        </select>
+        ${fanStatusText ? `<div class="panel-sub mono" style="margin-top:4px;">Status: ${escapeHtml(fanStatusText)}</div>` : ""}
+      </div>
+      <div class="form-field">
+        <label>Codebase &amp; Knowledge Memory Pack (.qwg)</label>
+        <div id="settings-mempack-status" class="panel-sub mono" style="margin-bottom:6px;">${escapeHtml(memStatusText)}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+          <input id="settings-mempack-path" autocomplete="off" class="input mono select-sm" style="flex:1;min-width:160px;" value="${escapeHtml(mountedMem && mountedMem.mountedMemoryPackRoot ? mountedMem.mountedMemoryPackRoot : "")}" placeholder="/Users/.../repo" />
+          <button type="button" class="btn btn-sm" onclick="mountMemoryPackFromSettings()">Mount .qwcache</button>
+          <button type="button" class="btn btn-sm" onclick="openSettingsMemoryPackModal()">Index / Update…</button>
+          <button type="button" class="btn btn-sm" onclick="unmountMemoryPackFromSettings()" ${mountedMem ? "" : "hidden"}>Unmount</button>
+        </div>
+      </div>
     </div>
     <div class="metric-cell" style="padding:14px;">
       <h3 style="margin:0 0 10px;font-size:13px;">Logging</h3>
@@ -441,10 +500,54 @@ async function saveLiveSettings() {
     updateSettingsDirtyState();
     if (status) status.textContent = "Saved";
     showToast("Settings saved to ~/.qwg/settings.json.");
+    if (typeof syncChatWithServerSettings === "function") syncChatWithServerSettings(payload);
     fetchDashboard();
   } catch (err) {
     if (status) status.textContent = "Save failed";
     showToast("Failed to save settings: " + err.message, true);
+  }
+}
+
+async function mountMemoryPackFromSettings() {
+  const input = document.getElementById("settings-mempack-path");
+  const repoPath = input ? input.value.trim() : "";
+  if (!repoPath) {
+    showToast("Enter a workspace directory containing .qwg/manifest.json.", true);
+    return;
+  }
+  if (typeof inspectMemoryPackAndMount === "function") {
+    await inspectMemoryPackAndMount(repoPath, { forceModal: false, fromSettings: true });
+    return;
+  }
+  if (typeof performDirectMemoryPackMount === "function") {
+    await performDirectMemoryPackMount(repoPath, true);
+  }
+}
+
+async function openSettingsMemoryPackModal() {
+  const input = document.getElementById("settings-mempack-path");
+  const chatInput = document.getElementById("chat-workspace-path");
+  const repoPath = (input ? input.value.trim() : "") || (chatInput ? chatInput.value.trim() : "");
+  if (!repoPath) {
+    showToast("Enter a workspace directory path first.", true);
+    if (input) input.focus();
+    return;
+  }
+  if (typeof inspectMemoryPackAndMount === "function") {
+    await inspectMemoryPackAndMount(repoPath, { forceModal: true, fromSettings: true });
+  }
+}
+
+async function unmountMemoryPackFromSettings() {
+  try {
+    const res = await fetch(`${API_BASE}/v1/memory/unmount`, { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
+    showToast("Unmounted active .qwcache Memory Pack.");
+    await fetchDashboard();
+    await loadLiveSettings();
+  } catch (err) {
+    showToast("Memory Pack unmount failed: " + err.message, true);
   }
 }
 

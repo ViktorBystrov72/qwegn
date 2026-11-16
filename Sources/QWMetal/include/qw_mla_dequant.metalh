@@ -333,19 +333,36 @@ METAL_FUNC void qw_mla_unpack_slice32_reg(device const char* kvBBlocks,
         const float sc = float(*(device const half*)gp);
         const float bi = float(*(device const half*)(gp + 2));
         device const uchar* pay = (device const uchar*)(gp + 4);
-        #pragma unroll
-        for (uint w = 0u; w < 4u; ++w) {
-            const uint base = inGroup + w * 8u;
-            wLo[w] = float4(
-                fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 0u))), sc, bi),
-                fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 1u))), sc, bi),
-                fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 2u))), sc, bi),
-                fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 3u))), sc, bi));
-            wHi[w] = float4(
-                fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 4u))), sc, bi),
-                fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 5u))), sc, bi),
-                fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 6u))), sc, bi),
-                fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 7u))), sc, bi));
+        if (p.bits == 8u) {
+            device const uchar4* p4 = (device const uchar4*)(pay + inGroup);
+            #pragma unroll
+            for (uint w = 0u; w < 4u; ++w) {
+                wLo[w] = fma(float4(p4[2u * w + 0u]), sc, bi);
+                wHi[w] = fma(float4(p4[2u * w + 1u]), sc, bi);
+            }
+        } else if (p.bits == 4u) {
+            device const uchar* bPtr = pay + (inGroup >> 1u);
+            #pragma unroll
+            for (uint w = 0u; w < 4u; ++w) {
+                const uchar4 b = *(device const uchar4*)(bPtr + w * 4u);
+                wLo[w] = fma(float4(uchar4(b.x & 0x0Fu, b.x >> 4u, b.y & 0x0Fu, b.y >> 4u)), sc, bi);
+                wHi[w] = fma(float4(uchar4(b.z & 0x0Fu, b.z >> 4u, b.w & 0x0Fu, b.w >> 4u)), sc, bi);
+            }
+        } else {
+            #pragma unroll
+            for (uint w = 0u; w < 4u; ++w) {
+                const uint base = inGroup + w * 8u;
+                wLo[w] = float4(
+                    fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 0u))), sc, bi),
+                    fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 1u))), sc, bi),
+                    fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 2u))), sc, bi),
+                    fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 3u))), sc, bi));
+                wHi[w] = float4(
+                    fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 4u))), sc, bi),
+                    fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 5u))), sc, bi),
+                    fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 6u))), sc, bi),
+                    fma(float(qwg_aq_read_bits(pay, int(p.bits), int(base + 7u))), sc, bi));
+            }
         }
     }
 }

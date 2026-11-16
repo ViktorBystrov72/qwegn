@@ -221,7 +221,9 @@ extension QWMLAAttnOperator {
             && kvLoraRank == 512 && qHeads % 16 == 0
         let split = (sparseAttnMMAEnabled && !useMMA && attnP.kvMode <= 2 && rows <= Self.splitMaxRows
             && qHeads % 16 == 0) ? psoSparseAttnSplit : nil
-        enc.setComputePipelineState(split?.attend ?? (useMMA ? (psoSparseAttnNAX ?? psoSparseAttnMMA) : psoSparseAttn))
+        let useH32 = split == nil && useMMA && qHeads % 32 == 0 && psoSparseAttnNAXH32 != nil
+        let naxPSO = useH32 ? psoSparseAttnNAXH32 : psoSparseAttnNAX
+        enc.setComputePipelineState(split?.attend ?? (useMMA ? (naxPSO ?? psoSparseAttnMMA) : psoSparseAttn))
         qAbsScratch.bind(enc, index: 0)
         kv.k.pool.bindTo(enc, index: 1)
         kv.v.pool.bindTo(enc, index: 2)
@@ -244,8 +246,12 @@ extension QWMLAAttnOperator {
             enc.dispatchThreadgroups(MTLSize(width: rows * qHeads, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
         } else if useMMA {
-            enc.dispatchThreadgroups(MTLSize(width: rows, height: qHeads / 16, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            let gridSize = useH32
+                ? MTLSize(width: qHeads / 32, height: rows, depth: 1)
+                : MTLSize(width: rows, height: qHeads / 16, depth: 1)
+            let tgThreads = useH32 ? 256 : 128
+            enc.dispatchThreadgroups(gridSize,
+                                     threadsPerThreadgroup: MTLSize(width: tgThreads, height: 1, depth: 1))
         } else {
             enc.dispatchThreadgroups(MTLSize(width: qHeads * rows, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))

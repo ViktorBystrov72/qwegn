@@ -97,6 +97,7 @@ public final class QWHal: @unchecked Sendable {
     public let metallib: any MTLLibrary
     public let geometry: QWModelGeometry
     private let functionConstants: MTLFunctionConstantValues
+    private let aq4FunctionConstants: MTLFunctionConstantValues
 
     /// Immutable snapshot published atomically so post-freeze hits take no lock.
     final class FrozenPSOSnapshot: @unchecked Sendable {
@@ -175,7 +176,8 @@ public final class QWHal: @unchecked Sendable {
                 weightBasis: QWWeightBasis = .rotated) throws {
         self.geometry = geometry
         self.weightBasis = weightBasis
-        self.functionConstants = Self.makeFunctionConstants(geometry: geometry)
+        self.functionConstants = Self.makeFunctionConstants(geometry: geometry, isAQ4: false)
+        self.aq4FunctionConstants = Self.makeFunctionConstants(geometry: geometry, isAQ4: true)
         guard let dev = MTLCreateSystemDefaultDevice() else { throw QWHalError.noDevice }
         device = dev
         // Cold-expert decode commits ~2 CBs per MoE layer; the default cap of 64 would block encode.
@@ -264,26 +266,33 @@ public final class QWHal: @unchecked Sendable {
 
     /// Cached pipeline state. First use pays creation; post-freeze hits take no lock.
     public func pipeline(_ name: String) throws -> any MTLComputePipelineState {
+        try pipeline(name, isAQ4: false)
+    }
+
+    /// Cached pipeline state specialized for HQ4 (`isAQ4 == false`) or AQ4 (`isAQ4 == true`).
+    public func pipeline(_ name: String, isAQ4: Bool) throws -> any MTLComputePipelineState {
+        let key = isAQ4 ? "\(name)#aq4" : name
         if let raw = frozenSnapshotPtr.load(ordering: .acquiring),
-           let hit = Unmanaged<FrozenPSOSnapshot>.fromOpaque(raw).takeUnretainedValue().map[name] {
+           let hit = Unmanaged<FrozenPSOSnapshot>.fromOpaque(raw).takeUnretainedValue().map[key] {
             return hit
         }
         return try psoState.withLock { state in
             state.lockCount += 1
-            if let p = state.map[name] {
+            if let p = state.map[key] {
                 if state.frozen { publishFrozenSnapshotLocked(&state) }
                 return p
             }
             let fn: any MTLFunction
             do {
-                fn = try metallib.makeFunction(name: name, constantValues: functionConstants)
+                let constants = isAQ4 ? aq4FunctionConstants : functionConstants
+                fn = try metallib.makeFunction(name: name, constantValues: constants)
             } catch {
                 throw QWHalError.kernelMissing(name)
             }
             let psoT0 = CFAbsoluteTimeGetCurrent()
             let p = try device.makeComputePipelineState(function: fn)
             QWHalPSOStats.add(CFAbsoluteTimeGetCurrent() - psoT0)
-            state.map[name] = p
+            state.map[key] = p
             if state.frozen { publishFrozenSnapshotLocked(&state) }
             return p
         }

@@ -119,7 +119,7 @@ extension SettingsView {
         if let disc = discoveredModels.first(where: { $0.name == draftSettings.modelName }), disc.maxSpeculativeDrafts > 0 {
             return disc.maxSpeculativeDrafts
         }
-        return 5
+        return 7
     }
 
     var selectedModelHasLSASidecar: Bool {

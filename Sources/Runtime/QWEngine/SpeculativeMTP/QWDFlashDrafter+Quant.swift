@@ -142,6 +142,64 @@ extension QWDFlashDrafter {
         return map
     }
 
+    func encodeSmallTileNAX(
+        _ enc: any MTLComputeCommandEncoder,
+        pso: any MTLComputePipelineState,
+        weight: QWWeightView,
+        input: QWTensorValue,
+        output: QWTensorValue,
+        rows: Int
+    ) {
+        let n = weight.n, k = weight.k
+        enc.setComputePipelineState(pso)
+        weight.blocks.bind(enc, index: 0)
+        var nU = UInt32(n), kU = UInt32(k)
+        enc.setBytes(&nU, length: 4, index: 5)
+        enc.setBytes(&kU, length: 4, index: 6)
+        var xs = UInt32(k), ys = UInt32(n)
+        enc.setBytes(&xs, length: 4, index: 9)
+        enc.setBytes(&ys, length: 4, index: 10)
+        let chunk = QWGemm.naxRowChunk(rows: rows, k: k)
+        var r0 = 0
+        while r0 < rows {
+            let r = min(chunk, rows - r0)
+            let bm = isMetal4TensorCapable ? (r <= 16 ? 16 : (r <= 32 ? 32 : 64)) : 64
+            let bn = (isMetal4TensorCapable && r <= 16) ? 128 : 64
+            let modeBits = isMetal4TensorCapable ? (r <= 16 ? 0x2000_0000 : (r <= 32 ? 0x4000_0000 : 0)) : 0
+            let xSlice = r0 == 0 ? input : input.slice(byteOffset: r0 * k * 2, count: r * k)
+            let ySlice = r0 == 0 ? output : output.slice(byteOffset: r0 * n * 2, count: r * n)
+            xSlice.bind(enc, index: 1)
+            ySlice.bind(enc, index: 2)
+            ySlice.bind(enc, index: 3)
+            var mU = UInt32(r | modeBits)
+            enc.setBytes(&mU, length: 4, index: 4)
+            enc.dispatchThreadgroups(MTLSize(width: (n + bn - 1) / bn, height: (r + bm - 1) / bm, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            r0 += r
+        }
+    }
+
+    func encodeSiluMulF16(
+        _ enc: any MTLComputeCommandEncoder,
+        gu: QWTensorValue,
+        out: QWTensorValue,
+        rows: Int,
+        i: Int
+    ) {
+        enc.setComputePipelineState(psoSiluMulF16)
+        gu.bind(enc, index: 0)
+        out.bind(enc, index: 1)
+        var mU = UInt32(rows), iU = UInt32(i)
+        enc.setBytes(&mU, length: 4, index: 2)
+        enc.setBytes(&iU, length: 4, index: 3)
+        enc.dispatchThreadgroups(MTLSize(width: QWEngineDriver.siluThreadgroups(i: i), height: rows, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    }
+
+    func canUseNAXGateUpScratch(rows: Int, h: Int, i: Int) -> Bool {
+        (2 * i) % 64 == 0 && h % 64 == 0 && draftLogits.bytes >= rows * 2 * i * 2
+    }
+
     func encodeAQMatmul(
         _ enc: any MTLComputeCommandEncoder,
         weight: QWWeightView,
@@ -152,6 +210,7 @@ extension QWDFlashDrafter {
         let key = DrafterQuantKey(bits: weight.bits, group: weight.groupSize, isSHVQ: weight.isSHVQ)
         guard let qps = quantPSOs[key] else { return }
         let n = weight.n, k = weight.k
+        let useNaxSmall = isMetal4TensorCapable && rows >= 8 && n % 64 == 0 && k % 64 == 0
         if rows == 1 {
             enc.setComputePipelineState(qps.decodeT4)
             weight.blocks.bind(enc, index: 0)
@@ -163,7 +222,7 @@ extension QWDFlashDrafter {
             output.bind(enc, index: 8)
             enc.dispatchThreadgroups(MTLSize(width: (n + 15) / 16, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-        } else if (2...16).contains(rows) {
+        } else if !useNaxSmall && (2...16).contains(rows) {
             enc.setComputePipelineState(qps.decodeT4)
             weight.blocks.bind(enc, index: 0)
             var kU = UInt32(k)
@@ -184,20 +243,7 @@ extension QWDFlashDrafter {
                 r0 += chunkRows
             }
         } else {
-            enc.setComputePipelineState(qps.gemmBatched)
-            weight.blocks.bind(enc, index: 0)
-            input.bind(enc, index: 1)
-            output.bind(enc, index: 2)
-            output.bind(enc, index: 3)
-            var mU = UInt32(rows), nU = UInt32(n), kU = UInt32(k)
-            enc.setBytes(&mU, length: 4, index: 4)
-            enc.setBytes(&nU, length: 4, index: 5)
-            enc.setBytes(&kU, length: 4, index: 6)
-            var xs = UInt32(k), ys = UInt32(n)
-            enc.setBytes(&xs, length: 4, index: 9)
-            enc.setBytes(&ys, length: 4, index: 10)
-            enc.dispatchThreadgroups(MTLSize(width: (n + 63) / 64, height: (rows + 63) / 64, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            encodeSmallTileNAX(enc, pso: qps.gemmBatched, weight: weight, input: input, output: output, rows: rows)
         }
     }
 
@@ -212,6 +258,13 @@ extension QWDFlashDrafter {
         guard let qps = quantPSOs[key] else { return }
         let H = config.hiddenSize
         let I = config.intermediateSize
+        if isMetal4TensorCapable && rows >= 8 && canUseNAXGateUpScratch(rows: rows, h: H, i: I) {
+            let guScratch = QWTensorValue(region: draftLogits.region, offset: draftLogits.offset,
+                                          shape: QWTensorShape([rows * 2 * I], .f16))
+            encodeAQMatmul(enc, weight: weight, input: input, output: guScratch, rows: rows)
+            encodeSiluMulF16(enc, gu: guScratch, out: output, rows: rows, i: I)
+            return
+        }
         let fuseFwht = !weight.isIncumbentContainer && (I % 32 == 0)
         enc.setComputePipelineState(qps.siluPair)
         weight.blocks.bind(enc, index: 0)

@@ -153,27 +153,30 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
     // MARK: - Live Phase Transitions
 
     public func beginPrefill(promptTokens: Int, at date: Date? = nil) {
-        lock.lock()
-        defer { lock.unlock() }
-        let now = date ?? Date()
-        phase = .prefill
-        itlDecodeTokPerSec = 0.0
-        itlFifo.removeAll(keepingCapacity: true)
-        itlFifoHead = 0
-        currentRoundMs = 0.0
-        currentRoundTokens = 0
-        itlSorted.removeAll(keepingCapacity: true)
-        lastTokenAt = nil
-        prefillComputedDone = 0
-        prefillComputedTotal = promptTokens
-        livePrefillTokPerSec = 0.0
-        livePrefillSampledAt = nil
-        prefillChunkAnchorTokens = 0
-        prefillChunkAnchorAt = now
-        nextTraceTickAt = now.addingTimeInterval(Self.traceTickIntervalSec)
-        turnStartSeriesSeq = seriesTotalAppended
-        turnPrefillSamplesCommitted = 0
-        turnDecodeSamplesCommitted = 0
+        lock.withLock {
+            let now = date ?? Date()
+            phase = .prefill
+            itlDecodeTokPerSec = 0.0
+            itlFifo.removeAll(keepingCapacity: true)
+            itlFifoHead = 0
+            currentRoundMs = 0.0
+            currentRoundTokens = 0
+            itlSorted.removeAll(keepingCapacity: true)
+            lastTokenAt = nil
+            prefillComputedDone = 0
+            prefillComputedTotal = promptTokens
+            livePrefillTokPerSec = 0.0
+            livePrefillSampledAt = nil
+            prefillChunkAnchorTokens = 0
+            prefillChunkAnchorAt = now
+            nextTraceTickAt = now.addingTimeInterval(Self.traceTickIntervalSec)
+            turnStartSeriesSeq = seriesTotalAppended
+            turnPrefillSamplesCommitted = 0
+            turnDecodeSamplesCommitted = 0
+        }
+        if self === Self.shared {
+            QWFanController.shared.updateInferencePhase("prefill")
+        }
     }
 
     /// Updates incremental prefill progress for the turn currently in prefill.
@@ -205,33 +208,36 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
     /// here: the time to the first token is not the prefill's duration, and
     /// a fully cached prompt has no prefill phase at all.
     public func beginDecode(promptTokens: Int, at date: Date? = nil) {
-        lock.lock()
-        defer { lock.unlock() }
-        let now = date ?? Date()
-        if phase == .prefill && livePrefillTokPerSec > 0 {
-            advanceActiveTraceIfNeeded(now: now)
-        } else if phase == .idle {
-            turnStartSeriesSeq = seriesTotalAppended
-            turnPrefillSamplesCommitted = 0
-            turnDecodeSamplesCommitted = 0
+        lock.withLock {
+            let now = date ?? Date()
+            if phase == .prefill && livePrefillTokPerSec > 0 {
+                advanceActiveTraceIfNeeded(now: now)
+            } else if phase == .idle {
+                turnStartSeriesSeq = seriesTotalAppended
+                turnPrefillSamplesCommitted = 0
+                turnDecodeSamplesCommitted = 0
+            }
+            phase = .decode
+            prefillComputedDone = promptTokens
+            prefillComputedTotal = promptTokens
+            livePrefillTokPerSec = 0.0
+            livePrefillSampledAt = nil
+            prefillChunkAnchorTokens = 0
+            prefillChunkAnchorAt = nil
+            itlDecodeTokPerSec = 0.0
+            itlFifo.removeAll(keepingCapacity: true)
+            itlFifoHead = 0
+            currentRoundMs = 0.0
+            currentRoundTokens = 0
+            itlSorted.removeAll(keepingCapacity: true)
+            // The first token has arrived, so the gap to the next one is a
+            // measurement: the rate exists once the turn has two tokens.
+            lastTokenAt = now
+            nextTraceTickAt = now.addingTimeInterval(Self.traceTickIntervalSec)
         }
-        phase = .decode
-        prefillComputedDone = promptTokens
-        prefillComputedTotal = promptTokens
-        livePrefillTokPerSec = 0.0
-        livePrefillSampledAt = nil
-        prefillChunkAnchorTokens = 0
-        prefillChunkAnchorAt = nil
-        itlDecodeTokPerSec = 0.0
-        itlFifo.removeAll(keepingCapacity: true)
-        itlFifoHead = 0
-        currentRoundMs = 0.0
-        currentRoundTokens = 0
-        itlSorted.removeAll(keepingCapacity: true)
-        // The first token has arrived, so the gap to the next one is a
-        // measurement: the rate exists once the turn has two tokens.
-        lastTokenAt = now
-        nextTraceTickAt = now.addingTimeInterval(Self.traceTickIntervalSec)
+        if self === Self.shared {
+            QWFanController.shared.updateInferencePhase("decode")
+        }
     }
 
     /// `at` exists for tests only: macOS Thread.sleep overshoots by 3-5x under
@@ -322,87 +328,90 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
     public func endRequest(tokensIn: Int, tokensOut: Int, cachedTokens: Int = 0,
                            prefillSec: Double?, decodeSec: Double?, ttftSec: Double?,
                            at date: Date? = nil) {
-        lock.lock()
-        defer { lock.unlock() }
-        let now = date ?? Date()
-        if phase == .prefill || phase == .decode {
-            advanceActiveTraceIfNeeded(now: now)
-        }
-        let hadLiveDecodeTail = phase == .decode && itlDecodeTokPerSec > 0
-        let trailingDecodeRate = itlDecodeTokPerSec
-        let committedPrefill = turnPrefillSamplesCommitted
-        let committedDecode = turnDecodeSamplesCommitted
-        let startSeq = turnStartSeriesSeq
-
-        phase = .idle
-        itlDecodeTokPerSec = 0.0
-        itlFifo.removeAll(keepingCapacity: true)
-        itlFifoHead = 0
-        currentRoundMs = 0.0
-        currentRoundTokens = 0
-        itlSorted.removeAll(keepingCapacity: true)
-        lastTokenAt = nil
-        prefillComputedDone = 0
-        prefillComputedTotal = 0
-        livePrefillTokPerSec = 0.0
-        livePrefillSampledAt = nil
-        prefillChunkAnchorTokens = 0
-        prefillChunkAnchorAt = nil
-        nextTraceTickAt = nil
-        turnPrefillSamplesCommitted = 0
-        turnDecodeSamplesCommitted = 0
-
-        tokensInTotal += tokensIn
-        tokensOutTotal += tokensOut
-
-        // Prefill speed is computed tokens / time; cache-served tokens cost nothing.
-        let computed = max(0, tokensIn - cachedTokens)
-        lastTurnPrefillFromCache = tokensIn > 0 && computed == 0
-        var instPrefill: Double? = nil
-        if let prefillSec, prefillSec > 0 && computed > 0 {
-            let rate = Double(computed) / prefillSec
-            instPrefill = rate
-            lastPrefillTokPerSec = rate
-            totalPrefillComputedTokens += Double(computed)
-            totalPrefillSeconds += prefillSec
-            ema1mPrefillTokPerSec = ema1mPrefillTokPerSec == 0 ? rate : (0.2 * rate + 0.8 * ema1mPrefillTokPerSec)
-            lastPrefillSampledAt = now
-        }
-        // The first generated token comes from prefill, so decode counts remaining tokens.
-        let decoded = tokensOut > 1 ? tokensOut - 1 : tokensOut
-        var instDecode: Double? = nil
-        if let decodeSec, decodeSec > 0 && decoded > 0 {
-            let rate = Double(decoded) / decodeSec
-            instDecode = rate
-            lastDecodeTokPerSec = rate
-            totalDecodeTokens += Double(decoded)
-            totalDecodeSeconds += decodeSec
-            ema1mDecodeTokPerSec = ema1mDecodeTokPerSec == 0 ? rate : (0.2 * rate + 0.8 * ema1mDecodeTokPerSec)
-            lastDecodeSampledAt = now
-        }
-
-        if committedPrefill == 0 && committedDecode == 0 {
-            appendTraceSample(prefill: instPrefill, decode: instDecode)
-        } else {
-            if hadLiveDecodeTail || (committedDecode == 0 && instDecode != nil) {
-                appendTraceSample(prefill: nil, decode: instDecode ?? (hadLiveDecodeTail ? trailingDecodeRate : nil))
+        lock.withLock {
+            let now = date ?? Date()
+            if phase == .prefill || phase == .decode {
+                advanceActiveTraceIfNeeded(now: now)
             }
-            if committedPrefill == 0, let instPrefill {
-                let ageSlots = seriesTotalAppended - startSeq
-                if ageSlots >= 1 && ageSlots <= prefillRateSeries.count {
-                    prefillRateSeries[prefillRateSeries.count - ageSlots] = instPrefill
+            let hadLiveDecodeTail = phase == .decode && itlDecodeTokPerSec > 0
+            let trailingDecodeRate = itlDecodeTokPerSec
+            let committedPrefill = turnPrefillSamplesCommitted
+            let committedDecode = turnDecodeSamplesCommitted
+            let startSeq = turnStartSeriesSeq
+
+            phase = .idle
+            itlDecodeTokPerSec = 0.0
+            itlFifo.removeAll(keepingCapacity: true)
+            itlFifoHead = 0
+            currentRoundMs = 0.0
+            currentRoundTokens = 0
+            itlSorted.removeAll(keepingCapacity: true)
+            lastTokenAt = nil
+            prefillComputedDone = 0
+            prefillComputedTotal = 0
+            livePrefillTokPerSec = 0.0
+            livePrefillSampledAt = nil
+            prefillChunkAnchorTokens = 0
+            prefillChunkAnchorAt = nil
+            nextTraceTickAt = nil
+            turnPrefillSamplesCommitted = 0
+            turnDecodeSamplesCommitted = 0
+
+            tokensInTotal += tokensIn
+            tokensOutTotal += tokensOut
+
+            // Prefill speed is computed tokens / time; cache-served tokens cost nothing.
+            let computed = max(0, tokensIn - cachedTokens)
+            lastTurnPrefillFromCache = tokensIn > 0 && computed == 0
+            var instPrefill: Double? = nil
+            if let prefillSec, prefillSec > 0 && computed > 0 {
+                let rate = Double(computed) / prefillSec
+                instPrefill = rate
+                lastPrefillTokPerSec = rate
+                totalPrefillComputedTokens += Double(computed)
+                totalPrefillSeconds += prefillSec
+                ema1mPrefillTokPerSec = ema1mPrefillTokPerSec == 0 ? rate : (0.2 * rate + 0.8 * ema1mPrefillTokPerSec)
+                lastPrefillSampledAt = now
+            }
+            // The first generated token comes from prefill, so decode counts remaining tokens.
+            let decoded = tokensOut > 1 ? tokensOut - 1 : tokensOut
+            var instDecode: Double? = nil
+            if let decodeSec, decodeSec > 0 && decoded > 0 {
+                let rate = Double(decoded) / decodeSec
+                instDecode = rate
+                lastDecodeTokPerSec = rate
+                totalDecodeTokens += Double(decoded)
+                totalDecodeSeconds += decodeSec
+                ema1mDecodeTokPerSec = ema1mDecodeTokPerSec == 0 ? rate : (0.2 * rate + 0.8 * ema1mDecodeTokPerSec)
+                lastDecodeSampledAt = now
+            }
+
+            if committedPrefill == 0 && committedDecode == 0 {
+                appendTraceSample(prefill: instPrefill, decode: instDecode)
+            } else {
+                if hadLiveDecodeTail || (committedDecode == 0 && instDecode != nil) {
+                    appendTraceSample(prefill: nil, decode: instDecode ?? (hadLiveDecodeTail ? trailingDecodeRate : nil))
+                }
+                if committedPrefill == 0, let instPrefill {
+                    let ageSlots = seriesTotalAppended - startSeq
+                    if ageSlots >= 1 && ageSlots <= prefillRateSeries.count {
+                        prefillRateSeries[prefillRateSeries.count - ageSlots] = instPrefill
+                    }
                 }
             }
+            // The time to the first token, when the engine reported one.
+            if let ttftSec {
+                let ttft = ttftSec * 1000.0
+                lastTtftMs = ttft
+                totalTtftMs += ttft
+                totalRequestsWithTtft += 1
+                lastTtftSampledAt = now
+            }
+            lastTurnSampledAt = now
         }
-        // The time to the first token, when the engine reported one.
-        if let ttftSec {
-            let ttft = ttftSec * 1000.0
-            lastTtftMs = ttft
-            totalTtftMs += ttft
-            totalRequestsWithTtft += 1
-            lastTtftSampledAt = now
+        if self === Self.shared {
+            QWFanController.shared.updateInferencePhase("idle")
         }
-        lastTurnSampledAt = now
     }
 
     /// Appends paired trace samples to the rolling 60-second series while advancing sequence count.
@@ -446,43 +455,46 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
     }
 
     public func resetToIdle() {
-        lock.lock()
-        defer { lock.unlock() }
-        phase = .idle
-        // The cache counters belong to the model that filled the cache: a
-        // new model starts with its own counters.
-        cacheLookupsTotal = 0
-        cacheHitsWarmTotal = 0
-        cacheHitsSSDTotal = 0
-        cacheHitsUnclassifiedTotal = 0
-        cacheMissesTotal = 0
-        cacheTokensReusedTotal = 0
-        cacheEvictionsWarmTotal = 0
-        cacheEvictionsSSDTotal = 0
-        itlDecodeTokPerSec = 0.0
-        itlFifo.removeAll(keepingCapacity: true)
-        itlFifoHead = 0
-        currentRoundMs = 0.0
-        currentRoundTokens = 0
-        itlSorted.removeAll(keepingCapacity: true)
-        lastTokenAt = nil
-        prefillComputedDone = 0
-        prefillComputedTotal = 0
-        livePrefillTokPerSec = 0.0
-        livePrefillSampledAt = nil
-        prefillChunkAnchorTokens = 0
-        prefillChunkAnchorAt = nil
-        nextTraceTickAt = nil
-        seriesTotalAppended = 0
-        turnStartSeriesSeq = 0
-        turnPrefillSamplesCommitted = 0
-        turnDecodeSamplesCommitted = 0
-        // Clear trace series on reset; last rate stays with its measurement timestamp.
-        prefillRateSeries.removeAll()
-        decodeRateSeries.removeAll()
-        // The state belongs to the model that ran the turn: a new model
-        // starts with its own.
-        lastTurnPrefillFromCache = false
+        lock.withLock {
+            phase = .idle
+            // The cache counters belong to the model that filled the cache: a
+            // new model starts with its own counters.
+            cacheLookupsTotal = 0
+            cacheHitsWarmTotal = 0
+            cacheHitsSSDTotal = 0
+            cacheHitsUnclassifiedTotal = 0
+            cacheMissesTotal = 0
+            cacheTokensReusedTotal = 0
+            cacheEvictionsWarmTotal = 0
+            cacheEvictionsSSDTotal = 0
+            itlDecodeTokPerSec = 0.0
+            itlFifo.removeAll(keepingCapacity: true)
+            itlFifoHead = 0
+            currentRoundMs = 0.0
+            currentRoundTokens = 0
+            itlSorted.removeAll(keepingCapacity: true)
+            lastTokenAt = nil
+            prefillComputedDone = 0
+            prefillComputedTotal = 0
+            livePrefillTokPerSec = 0.0
+            livePrefillSampledAt = nil
+            prefillChunkAnchorTokens = 0
+            prefillChunkAnchorAt = nil
+            nextTraceTickAt = nil
+            seriesTotalAppended = 0
+            turnStartSeriesSeq = 0
+            turnPrefillSamplesCommitted = 0
+            turnDecodeSamplesCommitted = 0
+            // Clear trace series on reset; last rate stays with its measurement timestamp.
+            prefillRateSeries.removeAll()
+            decodeRateSeries.removeAll()
+            // The state belongs to the model that ran the turn: a new model
+            // starts with its own.
+            lastTurnPrefillFromCache = false
+        }
+        if self === Self.shared {
+            QWFanController.shared.updateInferencePhase("idle")
+        }
     }
 
     public func updateContext(active: Int?, capacity: Int) {

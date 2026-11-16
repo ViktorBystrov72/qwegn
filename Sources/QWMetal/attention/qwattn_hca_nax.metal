@@ -32,32 +32,28 @@ struct HCAAttnParams {
 typedef BaseNAXFrag::dtype_frag_t<half>  hca_hfrag;
 typedef BaseNAXFrag::dtype_frag_t<float> hca_ffrag;
 
-// Grid: (T, (qHeads + 31) / 32, nSplit), Threadgroup: (256, 1, 1).
-kernel void qwg_hca_attn_nax(
-    device const half*     qUpGate    [[buffer(0)]],
-    device const half*     compKV     [[buffer(1)]],
-    device const half*     swaKV      [[buffer(2)]],
-    device const int*      blockList  [[buffer(3)]],
-    device const int*      blockCount [[buffer(4)]],
-    device const float*    attnSink   [[buffer(5)]],
-    device half*           outBuf     [[buffer(6)]],
-    device float2*         partML     [[buffer(7)]],
-    constant HCAAttnParams& p         [[buffer(8)]],
-    uint3                  tg         [[threadgroup_position_in_grid]],
-    uint3                  ntg        [[threadgroups_per_grid]],
-    uint                   sg         [[simdgroup_index_in_threadgroup]],
-    uint                   lane       [[thread_index_in_simdgroup]]
+// Grid: (T, (qHeads + 31) / 32, nSplit) or prefill ((qHeads + 31) / 32, T, 1), TG: (256, 1, 1).
+METAL_FUNC void qw_hca_attn_nax_run(
+    device const half*     qUpGate,
+    device const half*     compKV,
+    device const half*     swaKV,
+    device const int*      blockList,
+    device const int*      blockCount,
+    device const float*    attnSink,
+    device half*           outBuf,
+    device float2*         partML,
+    constant HCAAttnParams& p,
+    uint                   t,
+    uint                   hGroup0,
+    uint                   z,
+    uint                   nSplit,
+    uint                   sg,
+    uint                   lane,
+    threadgroup float*     sPart
 ) {
-    const uint t = tg.x;
-    const uint hGroup0 = tg.y * 32u;
-    const uint z = tg.z;
-    const uint nSplit = ntg.z;
-    if (t >= p.T || hGroup0 >= p.qHeads) return;
-
     const uint sg_h = sg >> 2u;
     const uint sg_d = sg & 3u;
     const uint h0 = hGroup0 + sg_h * 16u;
-    threadgroup float sPart[2u * 4u * 16u * 32u];
     threadgroup float* part = sPart + sg_h * (4u * 16u * 32u);
 
     const uint pos = p.pos0 + t;
@@ -238,4 +234,47 @@ kernel void qwg_hca_attn_nax(
                 half(oacc[d][i * 4 + 2] * inv), half(oacc[d][i * 4 + 3] * inv));
         }
     }
+}
+
+kernel void qwg_hca_attn_nax(
+    device const half*     qUpGate    [[buffer(0)]],
+    device const half*     compKV     [[buffer(1)]],
+    device const half*     swaKV      [[buffer(2)]],
+    device const int*      blockList  [[buffer(3)]],
+    device const int*      blockCount [[buffer(4)]],
+    device const float*    attnSink   [[buffer(5)]],
+    device half*           outBuf     [[buffer(6)]],
+    device float2*         partML     [[buffer(7)]],
+    constant HCAAttnParams& p         [[buffer(8)]],
+    uint3                  tg         [[threadgroup_position_in_grid]],
+    uint3                  ntg        [[threadgroups_per_grid]],
+    uint                   sg         [[simdgroup_index_in_threadgroup]],
+    uint                   lane       [[thread_index_in_simdgroup]]
+) {
+    if (tg.x >= p.T || tg.y * 32u >= p.qHeads) return;
+    threadgroup float sPart[2u * 4u * 16u * 32u];
+    qw_hca_attn_nax_run(qUpGate, compKV, swaKV, blockList, blockCount, attnSink, outBuf, partML, p,
+                        tg.x, tg.y * 32u, tg.z, ntg.z, sg, lane, sPart);
+}
+
+// Head-major + heavy-first prefill grid: ((qHeads + 31) / 32, T, 1), TG: (256, 1, 1).
+kernel void qwg_hca_attn_nax_prefill(
+    device const half*     qUpGate    [[buffer(0)]],
+    device const half*     compKV     [[buffer(1)]],
+    device const half*     swaKV      [[buffer(2)]],
+    device const int*      blockList  [[buffer(3)]],
+    device const int*      blockCount [[buffer(4)]],
+    device const float*    attnSink   [[buffer(5)]],
+    device half*           outBuf     [[buffer(6)]],
+    device float2*         partML     [[buffer(7)]],
+    constant HCAAttnParams& p         [[buffer(8)]],
+    uint2                  tg         [[threadgroup_position_in_grid]],
+    uint                   sg         [[simdgroup_index_in_threadgroup]],
+    uint                   lane       [[thread_index_in_simdgroup]]
+) {
+    if (tg.y >= p.T || tg.x * 32u >= p.qHeads) return;
+    threadgroup float sPart[2u * 4u * 16u * 32u];
+    const uint t = p.T - 1u - tg.y;
+    qw_hca_attn_nax_run(qUpGate, compKV, swaKV, blockList, blockCount, attnSink, outBuf, partML, p,
+                        t, tg.x * 32u, 0u, 1u, sg, lane, sPart);
 }

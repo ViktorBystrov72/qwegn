@@ -6,11 +6,12 @@ import QWVision
 
 extension QWHttpServer {
 
-    func handleChatCompletions(connection: NWConnection, body: Data) async throws {
+    func handleChatCompletions(connection: NWConnection, headers: [String: String] = [:], body: Data) async throws {
         let decoder = JSONDecoder()
-        let req: ChatCompletionRequest
+        var req: ChatCompletionRequest
         do {
             req = try decoder.decode(ChatCompletionRequest.self, from: body)
+            req.httpHeaders = headers
         } catch {
             let err = ServerErrorPayload(
                 message: "Malformed JSON payload: \(error.localizedDescription)",
@@ -42,6 +43,7 @@ extension QWHttpServer {
         }
 
         do {
+            try req.validateMetadata()
             _ = try QWStructuredOutput.grammar(for: req)
             try self.actor.validateRequestCapabilities(req)
         } catch {
@@ -51,7 +53,11 @@ extension QWHttpServer {
         }
 
         let returnModelName = resolveReplyModelName(requested: req.model, strictNotFound: false) ?? self.actor.getModelName()
-        let reqId = "chatcmpl-\(UUID().uuidString.prefix(12))"
+        let reqId = req.effectiveRequestId ?? "chatcmpl-\(UUID().uuidString.prefix(12))"
+        var extraHeaders = ["x-request-id: \(reqId)"]
+        if let sid = req.effectiveSessionId {
+            extraHeaders.append("x-session-id: \(sid)")
+        }
 
         let hasActiveTools = !(req.tools?.isEmpty ?? true) && !req.isToolChoiceNone
         let isConstrainedJson = (req.responseFormatType == "json_schema" || req.responseFormatType == "json_object")
@@ -61,7 +67,7 @@ extension QWHttpServer {
         let shouldStop = generationShouldStop(for: connection)
 
         if req.isStreaming {
-            sendSSEHeaders(connection)
+            sendSSEHeaders(connection, extraHeaders: extraHeaders)
 
             let sseEncoder = JSONEncoder()
             let ssePrefix = Data("data: ".utf8)
@@ -108,8 +114,9 @@ extension QWHttpServer {
                 result = try await self.actor.handleChatCompletion(
                     request: req,
                     onToken: { tokenPiece in
-                        keepaliveGate.stop()
-                        keepaliveTask.cancel()
+                        if keepaliveGate.stopIfRunning() {
+                            keepaliveTask.cancel()
+                        }
                         let deltas = streamParser.feed(tokenPiece)
                         for delta in deltas {
                             let chunkLP = lpBox.drain()
@@ -230,7 +237,7 @@ extension QWHttpServer {
                 reasoningTokens: result.reasoningTokens,
                 finishReason: parsed.finishReason
             )
-            self.sendJsonResponse(connection, status: 200, object: resp)
+            self.sendJsonResponse(connection, status: 200, object: resp, extraHeaders: extraHeaders)
         }
     }
 }

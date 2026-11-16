@@ -101,7 +101,7 @@ extension FNGPUEngine {
         let isLast = (pos + rows == history.count)
         let isCheckpointEnd = (targetEnd != nil && pos + rows == limitPos && limitPos < history.count)
         let runHeadNow = isLast || isCheckpointEnd
-        let runMTP = (session.useSpec || hasPrefixCacheTier) && mtp != nil
+        let runMTP = (session.useSpec || (hasPrefixCacheTier && session.usePrefixCache)) && mtp != nil
         session.lastRows = rows
         if rows == 1 {
             // Same single-row staging: the id goes into head.token, the gather runs on-device.
@@ -233,8 +233,10 @@ extension FNGPUEngine {
     public func flushPendingPrefixCache(_ session: inout FNGPUSessionData) {
         guard session.pendingPrefixSave else { evictPrefillScratchIfNeeded(); return }
         session.pendingPrefixSave = false
-        if hasPrefixCacheTier {
-            let cacheHistory = QWVisualSpan.saltedCacheHistory(history: session.history, visualSpans: session.visualSpans)
+        if hasPrefixCacheTier && session.usePrefixCache {
+            let cacheHistory = QWVisualSpan.saltedCacheHistory(
+                history: session.history, visualSpans: session.visualSpans, cacheSalt: session.cacheSalt
+            )
             savePrefixCache(history: cacheHistory, lastChunkRows: session.lastRows, useSpec: session.useSpec,
                             lastArgmax: session.lastArgmax, mtpDraft: session.mtpDraft, cacheDir: prefixCacheDirectory)
         }
@@ -245,17 +247,19 @@ extension FNGPUEngine {
     public func encodePrefillChunk(_ session: inout FNGPUSessionData,
                                     chunk: Range<Int>, runsHead: Bool) throws -> Int {
         let history = session.history
-        let cacheHistory = QWVisualSpan.saltedCacheHistory(history: history, visualSpans: session.visualSpans)
+        let cacheHistory = QWVisualSpan.saltedCacheHistory(
+            history: history, visualSpans: session.visualSpans, cacheSalt: session.cacheSalt
+        )
         let activeCap = activeCapacity
         guard history.count < activeCap else {
             throw FNGPUError.contextDoesNotFit(requested: history.count + 1, maxFitting: activeCap - 1)
         }
         var gpuSec = session.prefillGPUSec
-        let canUsePrefixCache = hasPrefixCacheTier
+        let canUsePrefixCache = hasPrefixCacheTier && session.usePrefixCache
         if !session.restoreDone {
             session.restoreDone = true
             let prevWater = highWaterPos
-            if hasPrefixCacheTier, !cacheHistory.isEmpty,
+            if canUsePrefixCache, !cacheHistory.isEmpty,
                let restored = try lookupAndRestorePrefixCache(history: cacheHistory, rawHistory: history,
                                                               useSpec: session.useSpec,
                                                               cacheDir: prefixCacheDirectory, gpuSec: &gpuSec,
@@ -264,6 +268,10 @@ extension FNGPUEngine {
                 session.prefixCacheTier = restored.tier; session.prefillPos = restored.matched
                 session.lastArgmax = restored.lastArgmax; session.headToken = restored.lastArgmax
                 session.mtpDraft = restored.mtpDraft
+                if !cacheHistory.isEmpty, residentKVHistory.count == restored.matched,
+                   residentKVHistory[0] != cacheHistory[0] {
+                    residentKVHistory[0] = cacheHistory[0]
+                }
             } else {
                 highWaterPos = max(highWaterPos, prevWater)
                 wipeSessionState(overwriteTokens: history.count)
@@ -295,7 +303,8 @@ extension FNGPUEngine {
                 if session.prefillPos == retainLen {
                     savePrefixCache(history: Array(baseSlice), lastChunkRows: session.lastRows, useSpec: session.useSpec,
                                     lastArgmax: session.lastArgmax, mtpDraft: session.mtpDraft,
-                                    cacheDir: prefixCacheDirectory, isSharedBase: prefixCacheWarmStore?.hasSharedBase != true)
+                                    cacheDir: prefixCacheDirectory,
+                                    isSharedBase: session.cacheSalt == nil && prefixCacheWarmStore?.hasSharedBase != true)
                 }
             }
         }

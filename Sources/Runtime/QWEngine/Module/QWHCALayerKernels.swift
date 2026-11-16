@@ -125,7 +125,7 @@ final class HCAMoELayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Senda
         var active = driver.activeEnc ?? context.enc
         try QWMoEChain.encode(enc: &active, hal: driver.hal, moe: moe, s: s,
                               x16: sc.ln2, dn32: sc.dn32, dn16: sc.dn16,
-                              rows: 1, geometry: driver.geometry, driver: driver)
+                              rows: 1, geometry: driver.geometry, driver: driver, skipOut32: true)
     }
 
     override func encodeMLPPrefill(_ context: QWLayerPrefillContext) throws {
@@ -144,6 +144,6 @@ final class HCAMoELayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Senda
         try QWMoEChain.encode(enc: &active, hal: driver.hal, moe: moe, s: s,
                               x16: driver.prefixRows(psc.ln2, rows: T, cols: H, dt: .f16),
                               dn32: psc.dn32, dn16: psc.dn16,
-                              rows: T, geometry: geometry, driver: driver)
+                              rows: T, geometry: geometry, driver: driver, skipOut32: true)
     }
 }

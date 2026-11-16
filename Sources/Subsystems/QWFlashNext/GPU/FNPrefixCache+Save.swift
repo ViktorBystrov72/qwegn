@@ -285,7 +285,8 @@ extension FNGPUEngine {
     public func buildStandalonePrefixCache(
         tokens: [Int],
         outputURL: URL,
-        pinAsSharedBase: Bool = true
+        pinAsSharedBase: Bool = true,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
     ) throws -> Int {
         guard !tokens.isEmpty else {
             throw NSError(domain: "QWFlashNext", code: 1,
@@ -298,7 +299,8 @@ extension FNGPUEngine {
         var session = FNGPUSessionData(
             history: tokens.map(Int64.init),
             sampler: QWSampler(config: .greedy),
-            useSpec: mtp != nil
+            useSpec: mtp != nil,
+            onPrefillProgress: onPrefillProgress
         )
         session.restoreDone = true
         wipeSessionState(overwriteTokens: tokens.count)

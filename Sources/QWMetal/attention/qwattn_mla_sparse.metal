@@ -83,7 +83,7 @@ METAL_FUNC float qwg_mla_read_weight(device const char* blocks,
 // 4. Matrix-Absorbed Query Projection: q_abs[t, h, c] = sum_{r=0..255} q_nope[t, h, r] * W_{UK, h}[r, c].
 // Grid: (qHeads, (T + 7) / 8, 1), Threadgroup: (512, 1, 1).
 template <bool SUB2>
-static inline void qwg_mla_absorb_q_impl(
+METAL_FUNC void qwg_mla_absorb_q_impl(
     device const half*       mlaQFull,
     device const char*       kvBBlocks,
     device half*             qAbsOut,
@@ -503,7 +503,7 @@ kernel void qwg_mla_sparse_attn(
 //    attOut[t, h, r] = fwht32(sum_{c=0..511} uLat[t, h, c] * W_{UV, h}[r, c]).
 // Grid: (qHeads, (T + 7) / 8, 1), Threadgroup: (256, 1, 1).
 template <bool SUB2>
-static inline void qwg_mla_proj_uv_impl(
+METAL_FUNC void qwg_mla_proj_uv_impl(
     device const half*       uLat,
     device const char*       kvBBlocks,
     device half*             attOut,

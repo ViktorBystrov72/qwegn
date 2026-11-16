@@ -154,6 +154,7 @@ extension QWEngineDriver: QWSessionInferenceEngine {
         activeCollectLogprobs = request.collectLogprobs
         activeConstraint = request.constraint.map { ($0, QWSampler(config: request.sampling)) }
         activeVisualSpans = request.visualSpans
+        activeCacheSalt = request.cacheSalt
         activePrefillProgress = request.onPrefillProgress
         activePrefillTotalTokens = nil
         activePrefillBasePosition = 0
@@ -162,6 +163,7 @@ extension QWEngineDriver: QWSessionInferenceEngine {
             activePrefillTotalTokens = nil
             activePrefillBasePosition = 0
             activeVisualSpans = []
+            activeCacheSalt = nil
             activeConstraint = nil
             activeCollectLogprobs = false
             activeRelaxedMarginOverride = nil

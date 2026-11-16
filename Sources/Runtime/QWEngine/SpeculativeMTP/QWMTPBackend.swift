@@ -42,7 +42,7 @@ public enum QWMTPBackend: String, CaseIterable, Sendable, Codable {
     /// explicit backend selection": with drafts 0 this is N0, with positive
     /// drafts it resolves to Standard.
     public static func resolveSelection(_ backend: QWMTPBackend?, drafts: Int) throws -> QWMTPBackend {
-        let maxDrafts = backend == .dflash2 ? 15 : 5
+        let maxDrafts = backend == .dflash2 ? 15 : 7
         guard (0...maxDrafts).contains(drafts) else { throw QWEngineError.badMTPDrafts(drafts) }
         if let backend {
             guard drafts > 0 else {

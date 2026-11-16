@@ -146,6 +146,27 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
         return nil
     }
 
+    public func longestSharedBaseMatch(history: [Int64], kvMode: FNKVStorageMode,
+                                       hasMTP: Bool) -> (name: String, tokens: Int)? {
+        guard core.hasSharedBase else { return nil }
+        var candidates: [(name: String, tokens: Int)] = []
+        for name in core.sharedBaseKeys {
+            guard core.entries[name] != nil,
+                  let count = Self.tokenCount(in: name),
+                  count > 0, count < history.count else { continue }
+            candidates.append((name, count))
+        }
+        candidates.sort { $0.tokens > $1.tokens }
+        for cand in candidates {
+            let expected = FNGPUEngine.fnPrefixHash(tokens: history.prefix(cand.tokens),
+                                                     kvMode: kvMode, hasMTP: hasMTP)
+            if Self.hash(in: cand.name) == String(format: "%016llx", expected) {
+                return cand
+            }
+        }
+        return nil
+    }
+
     static func tokenCount(in name: String) -> Int? {
         let parts = entryParts(name)
         guard parts.count == 4 else { return nil }

@@ -73,12 +73,18 @@ extension QWEngineLifecycleActor {
     }
 
     /// Incrementally encodes a rendered chat wire string by caching tokenized prefixes up to
-    /// `<|im_start|>` turn boundaries across concurrent sessions.
+    /// `<|im_start|>` turn boundaries across concurrent sessions, isolated by `cacheSalt`.
     func encodeWireIncrementallyWithSystemPrefix(
         wire: String,
         tokenizer tok: QWTokenizer,
-        packPath: String
+        packPath: String,
+        cachePrompt: Bool = true,
+        cacheSalt: String? = nil
     ) throws -> (tokens: [Int], systemPrefixTokenCount: Int?) {
+        guard cachePrompt else {
+            return (try tok.encode(wire), nil)
+        }
+        let saltKey = cacheSalt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let marker = "<|im_start|>"
         guard tok.tokenId(for: marker) != nil,
               let lastRange = wire.range(of: marker, options: .backwards),
@@ -87,7 +93,9 @@ extension QWEngineLifecycleActor {
         }
         let maxEntries = max(12, config.maxConcurrentSessions * 2 + 4)
         func storePrefixEntry(_ entry: CachedTokenPrefixEntry) {
-            cachedTokenPrefixes.removeAll { $0.packPath == entry.packPath && $0.prefixWire == entry.prefixWire }
+            cachedTokenPrefixes.removeAll {
+                $0.packPath == entry.packPath && $0.cacheSalt == entry.cacheSalt && $0.prefixWire == entry.prefixWire
+            }
             cachedTokenPrefixes.append(entry)
             if cachedTokenPrefixes.count > maxEntries {
                 cachedTokenPrefixes.removeFirst(cachedTokenPrefixes.count - maxEntries)
@@ -110,7 +118,8 @@ extension QWEngineLifecycleActor {
 
         var bestIdx: Int? = nil
         var bestLen = 0
-        for (idx, entry) in cachedTokenPrefixes.enumerated() where entry.packPath == packPath && !entry.prefixWire.isEmpty {
+        for (idx, entry) in cachedTokenPrefixes.enumerated()
+        where entry.packPath == packPath && entry.cacheSalt == saltKey && !entry.prefixWire.isEmpty {
             let count = entry.prefixWire.utf8.count
             guard count > bestLen, count <= newUTF8Count,
                   newPrefixWire.utf8.starts(with: entry.prefixWire.utf8) else { continue }
@@ -138,7 +147,7 @@ extension QWEngineLifecycleActor {
                 let sysCount = matched.systemTokenCount
                     ?? (systemWire != nil && matched.prefixWire == systemWire ? matched.prefixTokens.count : nil)
                 storePrefixEntry(CachedTokenPrefixEntry(
-                    packPath: packPath, prefixWire: newPrefixWire,
+                    packPath: packPath, cacheSalt: saltKey, prefixWire: newPrefixWire,
                     prefixTokens: updatedPrefixTokens, systemTokenCount: sysCount))
                 let tailTokens = try tok.encode(tailWire)
                 return (updatedPrefixTokens + tailTokens, sysCount)
@@ -151,7 +160,8 @@ extension QWEngineLifecycleActor {
             let sysTokens = try tok.encode(sysW)
             resolvedSystemTokenCount = sysTokens.count
             storePrefixEntry(CachedTokenPrefixEntry(
-                packPath: packPath, prefixWire: sysW, prefixTokens: sysTokens, systemTokenCount: sysTokens.count))
+                packPath: packPath, cacheSalt: saltKey, prefixWire: sysW, prefixTokens: sysTokens,
+                systemTokenCount: sysTokens.count))
             let remStart = newPrefixWire.utf8.index(newPrefixWire.utf8.startIndex, offsetBy: sysW.utf8.count)
             let remTokens = try tok.encode(String(newPrefixWire[remStart...]))
             prefixTokens = sysTokens + remTokens
@@ -162,7 +172,7 @@ extension QWEngineLifecycleActor {
             }
         }
         storePrefixEntry(CachedTokenPrefixEntry(
-            packPath: packPath, prefixWire: newPrefixWire,
+            packPath: packPath, cacheSalt: saltKey, prefixWire: newPrefixWire,
             prefixTokens: prefixTokens, systemTokenCount: resolvedSystemTokenCount))
         let tailTokens = try tok.encode(tailWire)
         return (prefixTokens + tailTokens, resolvedSystemTokenCount)

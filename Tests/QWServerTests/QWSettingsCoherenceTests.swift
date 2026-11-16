@@ -12,6 +12,7 @@ private extension QWSettingsCoherence {
         "modelAlias", "modelAliases", "loadVision",
         "logDir", "logFileName",
         "telemetryPollIntervalMs", "runAtStartup", "autoStartServer",
+        "coolingPolicy",
     ]
 }
 
@@ -111,10 +112,11 @@ final class QWSettingsCoherenceTests: XCTestCase {
 
     func testTheSettingsReadOnDemandDoNotNeedARestart() {
         for key in ["modelAlias", "modelAliases", "loadVision", "logDir", "logFileName",
-                    "telemetryPollIntervalMs", "runAtStartup", "autoStartServer"] {
+                    "telemetryPollIntervalMs", "runAtStartup", "autoStartServer", "coolingPolicy"] {
             XCTAssertFalse(QWSettingsCoherence.needsServerRestart(key),
                            "\(key) is read when it is needed")
         }
+        XCTAssertNotNil(QWSettingsCoherence.effectNote(for: "coolingPolicy"))
     }
 
     func testTheSettingsWindowOffersLoadVisionInPlaceWithoutRestart() throws {

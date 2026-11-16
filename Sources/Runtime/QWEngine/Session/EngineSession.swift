@@ -23,6 +23,7 @@ public final class QWEngineSession: @unchecked Sendable {
     public internal(set) var generated: Int = 0
     public internal(set) var roundRecord: QWRoundRecord
     public var tokenHistory: [Int] = []
+    public let tokenRecycler = QWTokenRecycler()
     let kv: QWKVHandle
     let mtpKV: QWKVHandle?
     var rec: [QWTensorValue]                  // [gdnLayer] → [48·128·128] f32 (zeroed)
@@ -32,6 +33,8 @@ public final class QWEngineSession: @unchecked Sendable {
     let trunkHidden: QWTensorValue?
     let dflashSlot: QWDFlashSessionSlot?
     public internal(set) var dflashCacheOffset: Int = 0
+    var dflashPolicy = QWDFlashAdaptivePolicy()
+    var dflashRoundStartNs: UInt64?
     var trunkHiddenValid = false
     /// finishSession idempotence witness (static-analysis H1): the driver
     /// checks-and-sets it under the flight lock, so a double finish can

@@ -6,6 +6,7 @@ import QWGEMM
 import QWHAL
 
 struct QWMTPBatchedTrunk {
+    let hal: QWHal
     let geometry: QWModelGeometry
     let gdnProjection: QWTensorValue
     let attentionProjection: QWTensorValue
@@ -38,6 +39,7 @@ struct QWMTPBatchedTrunk {
     }
 
     init(geometry: QWModelGeometry, hal: QWHal, allocator: QWSubAllocator, rows: Int) throws {
+        self.hal = hal
         self.geometry = geometry
         guard (2...16).contains(rows) else { throw QWEngineDriverError.state("batched trunk requires B=2...16") }
         self.rows = rows
@@ -94,9 +96,15 @@ struct QWMTPBatchedTrunk {
                         count: outCols, dtype: .f16)
     }
 
-    func gdnPipeline(forActiveRows activeRows: Int, rowPaired: Bool = false) throws -> any MTLComputePipelineState {
-        guard (2...rows).contains(activeRows),
-              let pipeline = (rowPaired ? gdnRowPairedPipelines : gdnPipelines)[activeRows] else {
+    func gdnPipeline(forActiveRows activeRows: Int, rowPaired: Bool = false, isAQ4: Bool = false) throws -> any MTLComputePipelineState {
+        guard (2...rows).contains(activeRows) else {
+            throw QWEngineDriverError.state("invalid batched trunk active row count")
+        }
+        if isAQ4 {
+            let name = rowPaired ? "qwm_gdn_projection_rp_m\(activeRows)" : "qwm_gdn_projection_m\(activeRows)"
+            return try hal.pipeline(name, isAQ4: true)
+        }
+        guard let pipeline = (rowPaired ? gdnRowPairedPipelines : gdnPipelines)[activeRows] else {
             throw QWEngineDriverError.state("invalid batched trunk active row count")
         }
         return pipeline

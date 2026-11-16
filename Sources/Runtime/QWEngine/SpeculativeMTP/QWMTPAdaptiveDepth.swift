@@ -173,9 +173,20 @@ enum QWMTPAdaptiveDepth {
         guard normalizedEntropy.isFinite, (0...1).contains(normalizedEntropy),
               threshold.isFinite, (0...1).contains(threshold),
               completedDrafts >= 1, completedDrafts <= maximumDrafts,
-              (1...5).contains(maximumDrafts) else {
+              (1...7).contains(maximumDrafts) else {
             throw QWEngineDriverError.state("adaptive draft-depth policy received invalid input")
         }
         return completedDrafts < maximumDrafts && normalizedEntropy >= threshold
+    }
+
+    /// Caps greedy `.hybrid` NextN neural chain depth to 1 when host-embedding gather is active
+    /// or on sparse MoE (`numExperts > 0`), where step-1+ routed-expert union outweighs ~50% conditional accept.
+    static func hybridNextNNeuralDepthCap(
+        isStochastic: Bool,
+        stageProfiling: Bool,
+        hasDeviceEmbedding: Bool,
+        numExperts: Int
+    ) -> Int? {
+        (!isStochastic && !stageProfiling && (!hasDeviceEmbedding || numExperts > 0)) ? 1 : nil
     }
 }

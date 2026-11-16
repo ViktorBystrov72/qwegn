@@ -73,7 +73,9 @@ struct Repl: ParsableCommand {
         var conversation: QWConversation? = nil
 
         let effSettings = cliCfg.effectiveSettings
-        let effectiveChunkSize = QWPrefillLimits.clampedRows(knobs.prefillChunkSize ?? effSettings.prefillChunkSize)
+        let effectiveChunkSize = QWPrefillLimits.clampedRows(
+            cliCfg.defaultPrefillChunkSize(explicitChunkSize: knobs.prefillChunkSize)
+        )
         let resolvedCacheDirURL = cliCfg.resolvedCacheDirURL
         let warmBytes = Int((knobs.warmCacheLimit ?? 4.0) * 1024 * 1024 * 1024)
         let ssdEnabled = knobs.ssdCacheLimit.map { $0 > 0 } ?? effSettings.ssdCacheEnabled
@@ -447,7 +449,7 @@ struct Serve: AsyncParsableCommand {
             cliIgnoreProfile: noProfile
         )
         let isDFlash2 = ["dflash2", "dflash", "dspine"].contains(resolved.mtpBackend?.lowercased() ?? "")
-        let maxDrafts = isDFlash2 ? 15 : 5
+        let maxDrafts = isDFlash2 ? 15 : 7
         guard resolved.mtpDrafts >= 0 && resolved.mtpDrafts <= maxDrafts else {
             FileHandle.standardError.write("qwg serve: error: --mtp-drafts must be 0...\(maxDrafts) (got \(resolved.mtpDrafts))\n".data(using: .utf8)!)
             throw ExitCode(2)

@@ -121,11 +121,43 @@ final class QWVerifyWindowTests: XCTestCase {
         for index in 0..<(2 * vocabulary) { XCTAssertEqual(scores[index], 0) }
     }
 
+    func testMultiRowQ4gHeadSizesGroupSumsForEightAndSixteenRows() throws {
+        let hal = try QWHal(geometry: .qwen38_27b), hidden = QWModelGeometry.qwen38_27b.hidden, vocabulary = 33
+        let blocks = vocabulary * (hidden / 32)
+        let head = try QWHead(hal: hal, geometry: .qwen38_27b)
+        for rows in [8, 16] {
+            let arena = try QWArena(hal: hal, weights: (blocks * 20) + 4096,
+                                    activations: 2 << 20, kv: 0, gdnStates: 0)
+            let blk = try arena.weightsRegion().allocate(QWTensorShape([blocks * 10], .f16))
+            memset(blk.region.pointer.advanced(by: blk.offset), 0, blk.bytes)
+            let weight = try XCTUnwrap(QWHeadWeight(blocks: blk, n: vocabulary, k: hidden, isRotated: true))
+            let expectedSumsBytes = ((rows * hidden / 128 * 4 + 255) / 256) * 256
+            let before = arena.activationsRegion().usedBytes
+            let window = try QWVerifyWindow(geometry: QWTestGeometry.g27,
+                                            allocator: arena.activationsRegion(),
+                                            rows: rows, vocabulary: vocabulary)
+            XCTAssertEqual(window.headGroupSums.shape.elementCount, rows * hidden / 128)
+            XCTAssertGreaterThanOrEqual(arena.activationsRegion().usedBytes - before,
+                                        expectedSumsBytes)
+            memset(window.hidden.region.pointer.advanced(by: window.hidden.offset), 0, window.hidden.bytes)
+            arena.activationsRegion().markSteadyState()
+            let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+            let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
+            do { try window.encodeHead(enc, hal: hal, head: head, storage: .q4g(weight)) }
+            catch { enc.endEncoding(); throw error }
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            XCTAssertEqual(cb.status, .completed, "\(String(describing: cb.error))")
+            XCTAssertEqual(arena.activationsRegion().steadyStateAllocs, 0)
+        }
+    }
+
     func testOrderedRowsRetainAllHiddenAndFullHeadLogits() throws {
         let hal = try QWHal(geometry: .qwen38_27b)
         let h = QWModelGeometry.qwen38_27b.hidden, v = 257
-        XCTAssertEqual(QWVerifyWindow.allocationBytes(geometry: QWTestGeometry.g27, rows: 2), 2_027_776)
-        XCTAssertEqual(QWVerifyWindow.allocationBytes(geometry: QWTestGeometry.g27, rows: 3), 3_041_536)
+        XCTAssertEqual(QWVerifyWindow.allocationBytes(geometry: QWTestGeometry.g27, rows: 2), 2_028_032)
+        XCTAssertEqual(QWVerifyWindow.allocationBytes(geometry: QWTestGeometry.g27, rows: 3), 3_041_792)
         for b in [2, 3] {
             let arena = try QWArena(hal: hal, weights: v * h * 2 + 256,
                                     activations: 1 << 20, kv: 256, gdnStates: 8 << 20)

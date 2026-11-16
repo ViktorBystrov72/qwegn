@@ -411,11 +411,21 @@ extension FlashNextModule: QWInferenceEngine {
         return try runGeneration(request: request, onToken: onToken, onStopToken: nil)
     }
 
-    public func buildStandalonePrefixCache(tokens: [Int], outputURL: URL, pinAsSharedBase: Bool = true) throws -> Int {
+    public func buildStandalonePrefixCache(
+        tokens: [Int],
+        outputURL: URL,
+        pinAsSharedBase: Bool = true,
+        onPrefillProgress: (@Sendable (Int, Int) -> Void)?
+    ) throws -> Int {
         guard let engine else {
             throw QWEngineError.state("FlashNextModule has no engine yet")
         }
-        return try engine.buildStandalonePrefixCache(tokens: tokens, outputURL: outputURL, pinAsSharedBase: pinAsSharedBase)
+        return try engine.buildStandalonePrefixCache(
+            tokens: tokens,
+            outputURL: outputURL,
+            pinAsSharedBase: pinAsSharedBase,
+            onPrefillProgress: onPrefillProgress
+        )
     }
 
     public func mountStandalonePrefixCache(from fileURL: URL) throws -> (tokens: [Int], byteCount: Int) {

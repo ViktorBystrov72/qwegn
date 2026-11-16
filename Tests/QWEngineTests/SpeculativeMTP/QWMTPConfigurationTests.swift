@@ -17,7 +17,7 @@ final class QWMTPConfigurationTests: XCTestCase {
                      "QW_MTP_PROFILE", "QW_MTP_BATCHED_MLP", "QW_MTP_BATCHED_TRUNK",
                      "QW_MTP_SHARED_PREFIX_ATTN",
                      "QW_MTP_DRAFT_HEAD", "QW_MTP_VERIFY_HEAD_Q4", "QW_MTP_ADAPTIVE_DEPTH"] {
-            for drafts in 0...5 {
+            for drafts in 0...7 {
                 XCTAssertFalse(try QWEngineDriver.resolveMTPFlag(name: name, value: nil, drafts: drafts))
                 XCTAssertFalse(try QWEngineDriver.resolveMTPFlag(name: name, value: "0", drafts: drafts))
                 XCTAssertEqual(try QWEngineDriver.resolveMTPFlag(name: name, value: "1", drafts: drafts), drafts > 0)
@@ -27,7 +27,7 @@ final class QWMTPConfigurationTests: XCTestCase {
                     }
                 }
             }
-            for drafts in [-1, 6, Int.max] {
+            for drafts in [-1, 8, Int.max] {
                 XCTAssertThrowsError(try QWEngineDriver.resolveMTPFlag(name: name, value: "1", drafts: drafts))
             }
         }
@@ -36,7 +36,7 @@ final class QWMTPConfigurationTests: XCTestCase {
     func testResolveMTPFlagDefaultValue() throws {
         for name in ["QW_MTP_DEVICE_EMBEDDING", "QW_MTP_LAYER_MAJOR", "QW_MTP_BATCHED_MLP",
                      "QW_MTP_BATCHED_TRUNK", "QW_MTP_SHARED_PREFIX_ATTN", "QW_MTP_DRAFT_HEAD"] {
-            for drafts in 0...5 {
+            for drafts in 0...7 {
                 let expectedUnset = (drafts > 0)
                 XCTAssertEqual(try QWEngineDriver.resolveMTPFlag(name: name, value: nil, drafts: drafts, defaultValue: true),
                                expectedUnset)

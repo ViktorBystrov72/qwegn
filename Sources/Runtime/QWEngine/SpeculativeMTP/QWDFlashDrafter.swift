@@ -82,9 +82,14 @@ final class QWDFlashDrafter: @unchecked Sendable {
     let psoSelectorGreedy: any MTLComputePipelineState
     let psoGemvT4: any MTLComputePipelineState
     let psoGemmBatched: any MTLComputePipelineState
+    let psoSiluMulF16: any MTLComputePipelineState
+    let isMetal4TensorCapable: Bool
     let psoDownBatched: [Int: any MTLComputePipelineState]
     let psoDownRowPaired: [Int: any MTLComputePipelineState]
+    let psoDownBatchedAQ4: [Int: any MTLComputePipelineState]
+    let psoDownRowPairedAQ4: [Int: any MTLComputePipelineState]
     let psoGateUpFwht32Batched: [Int: any MTLComputePipelineState]
+    let psoGateUpFwht32BatchedAQ4: [Int: any MTLComputePipelineState]
     let dspinePSO: DSpinePipelines
     let quantPSOs: [DrafterQuantKey: DrafterQuantPipelines]
 
@@ -320,21 +325,43 @@ final class QWDFlashDrafter: @unchecked Sendable {
         self.psoSelectorGreedy = try hal.pipeline("qwg_dflash_selector_greedy")
         self.psoGemvT4 = try hal.pipeline("qwg_gemv_q4g_dx_h16_t4")
         self.psoGemmBatched = try hal.pipeline("qwg_gemm_q4g_h16")
+        self.psoSiluMulF16 = try hal.pipeline("qwg_silu_mul_f16")
+        self.isMetal4TensorCapable = hal.caps.isMetal4TensorCapable
         self.dspinePSO = try DSpinePipelines(hal: hal)
 
         var downMap: [Int: any MTLComputePipelineState] = [:]
         var guMap: [Int: any MTLComputePipelineState] = [:]
+        var guAQ4Map: [Int: any MTLComputePipelineState] = [:]
         var downRowPairedMap: [Int: any MTLComputePipelineState] = [:]
+        var downAQ4Map: [Int: any MTLComputePipelineState] = [:]
+        var downRowPairedAQ4Map: [Int: any MTLComputePipelineState] = [:]
+        let needsAQ4 = (!self.fc.isIncumbentContainer && !self.fc.isSHVQ && self.fc.bits == 4 && self.fc.groupSize == 32)
+            || loadedLayers.contains { w in
+                (!w.qkvProj.isIncumbentContainer && !w.qkvProj.isSHVQ && w.qkvProj.bits == 4 && w.qkvProj.groupSize == 32)
+                || (!w.oProj.isIncumbentContainer && !w.oProj.isSHVQ && w.oProj.bits == 4 && w.oProj.groupSize == 32)
+                || (!w.gateUpProj.isIncumbentContainer && !w.gateUpProj.isSHVQ && w.gateUpProj.bits == 4 && w.gateUpProj.groupSize == 32)
+                || (!w.downProj.isIncumbentContainer && !w.downProj.isSHVQ && w.downProj.bits == 4 && w.downProj.groupSize == 32)
+            }
         for m in 2...8 {
             downMap[m] = try hal.pipeline("qwm_mlp_down_m\(m)")
             guMap[m] = try hal.pipeline("qwm_mlp_gate_up_fwht32_m\(m)")
+            if needsAQ4 {
+                downAQ4Map[m] = try hal.pipeline("qwm_mlp_down_m\(m)", isAQ4: true)
+                guAQ4Map[m] = try hal.pipeline("qwm_mlp_gate_up_fwht32_m\(m)", isAQ4: true)
+            }
             if m >= QWMTPBatchedMLP.rowPairedMinimumRows {
                 downRowPairedMap[m] = try hal.pipeline("qwm_mlp_down_rp_m\(m)")
+                if needsAQ4 {
+                    downRowPairedAQ4Map[m] = try hal.pipeline("qwm_mlp_down_rp_m\(m)", isAQ4: true)
+                }
             }
         }
         self.psoDownBatched = downMap
         self.psoDownRowPaired = downRowPairedMap
+        self.psoDownBatchedAQ4 = downAQ4Map
+        self.psoDownRowPairedAQ4 = downRowPairedAQ4Map
         self.psoGateUpFwht32Batched = guMap
+        self.psoGateUpFwht32BatchedAQ4 = guAQ4Map
         self.quantPSOs = try Self.loadQuantPipelines(hal: hal, fc: self.fc, layers: loadedLayers)
     }
 

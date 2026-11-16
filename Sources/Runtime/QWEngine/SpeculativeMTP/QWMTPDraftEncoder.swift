@@ -345,7 +345,7 @@ final class QWMTPDraftEncoder {
             var mEnc = enc
             try QWMoEChain.encode(enc: &mEnc, hal: hal, moe: moe, s: moeScratch,
                                   x16: s.ln2, dn32: s.fcOut32, dn16: s.downOut,
-                                  rows: 1, geometry: geometry)
+                                  rows: 1, geometry: geometry, skipOut32: true)
         } else {
             try project(enc, x: s.ln2, gs: s.gsHidden, w: w.gu.view,
                         plan: guPlan, y32: s.mlp32, y16: s.mlpIntermediate)

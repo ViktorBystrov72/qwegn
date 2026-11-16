@@ -87,6 +87,33 @@ extension SettingsView {
                              value: $draftSettings.prefillChunkSize)
             }
 
+            settingsGroup(title: "Thermal & Cooling", icon: "fanblades") {
+                formRow(label: "Cooling Policy:", key: "coolingPolicy") {
+                    Picker("", selection: $draftSettings.coolingPolicy) {
+                        Text("System Auto").tag("auto")
+                        Text("Proactive Pre-Spin").tag("proactive")
+                        Text("Max Blast").tag("max")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                }
+                if let fanStatus = telemetry.dashboard?.facts?.fanControlStatus, !fanStatus.isEmpty {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(fanStatus.contains("requires root") ? TelemetryTheme.warning : TelemetryTheme.active)
+                            .frame(width: 6, height: 6)
+                        Text("Hardware Status: \(fanStatus)")
+                            .font(TelemetryTheme.numeric(11))
+                            .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Text("System Auto defers to macOS SMC. Proactive Pre-Spin ramps fans on prefill/decode; Max Blast targets 100% RPM. Direct SMC fan writes require root or /var/run/qwg-smc.sock.")
+                    .font(TelemetryTheme.ui(11))
+                    .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             settingsGroup(title: "Latent Sparse Attention (LSA — arXiv:2610.42147)", icon: "point.3.connected.trianglepath.dotted") {
                 formRow(label: "LSA Mode:", key: "lsaMode") {
                     Picker("", selection: $draftSettings.lsaMode) {

@@ -33,6 +33,10 @@ extension QWEngineDriver {
         guard let next = try forwardStep(session, token: token) else {
             throw QWEngineDriverError.state("ordinary forward did not produce a token")
         }
+        if activeConstraint == nil, let prev1 = session.tokenHistory.last {
+            let prev2 = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
+            session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: next)
+        }
         session.tokenHistory.append(next)
         return next
     }

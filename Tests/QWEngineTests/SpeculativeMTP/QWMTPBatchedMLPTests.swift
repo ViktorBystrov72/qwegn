@@ -265,55 +265,57 @@ final class QWMTPBatchedMLPTests: XCTestCase {
             XCTAssertFalse(QWMTPBatchedMLP.usesRowPairs(gu, activeRows: 2))
             XCTAssertTrue(QWMTPBatchedMLP.usesRowPairs(gu, activeRows: 4))
 
-            let arena = try QWArena(hal: hal, weights: 256, activations: 8 << 20, kv: 256, gdnStates: 256)
+            let arena = try QWArena(hal: hal, weights: 256, activations: 24 << 20, kv: 256, gdnStates: 256)
             let alloc = arena.activationsRegion()
-            let batch = try QWMTPBatchedMLP(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 5)
-            let vals = (0..<(5 * geom.hidden)).map { Float16(Float(($0 * 17 + 11) % 61 - 30) / 32) }
-            let input5 = try tensor(vals.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
-            let input2 = QWTensorValue(region: input5.region, offset: 0, shape: QWTensorShape([2 * geom.hidden], .f16))
-            let h5 = try alloc.allocate(QWTensorShape([5 * geom.intermediate], .f16))
+            let batch = try QWMTPBatchedMLP(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 16)
+            let vals = (0..<(16 * geom.hidden)).map { Float16(Float(($0 * 17 + 11) % 61 - 30) / 32) }
+            let input16 = try tensor(vals.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
+            let input2 = QWTensorValue(region: input16.region, offset: 0, shape: QWTensorShape([2 * geom.hidden], .f16))
             let h2 = try alloc.allocate(QWTensorShape([2 * geom.intermediate], .f16))
-            let hFwht5 = try alloc.allocate(QWTensorShape([5 * geom.intermediate], .f16))
             let down2Ref = try alloc.allocate(QWTensorShape([2 * geom.hidden], .f16))
 
-            let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
-            let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
-            // Non-row-paired M=2 vs row-paired M=5 must be bit-identical on the first 2 rows.
-            try batch.encodeGateUp(enc, input: input2, weight: gu, output: h2, activeRows: 2, fuseFwht32: false)
-            try batch.encodeGateUp(enc, input: input5, weight: gu, output: h5, activeRows: 5, fuseFwht32: false)
-            try batch.encodeDown(enc, input: h2, weight: dn, activeRows: 2)
-            // Fused fwht32 on M=5 must equal unfused M=5 followed by qwg_fwht32_f16.
-            try batch.encodeGateUp(enc, input: input5, weight: gu, output: hFwht5, activeRows: 5, fuseFwht32: true)
-            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-            XCTAssertEqual(cb.status, .completed)
-
+            let cbRef = try XCTUnwrap(hal.queue.makeCommandBuffer())
+            let encRef = try XCTUnwrap(cbRef.makeComputeCommandEncoder())
+            try batch.encodeGateUp(encRef, input: input2, weight: gu, output: h2, activeRows: 2, fuseFwht32: false)
+            try batch.encodeDown(encRef, input: h2, weight: dn, activeRows: 2)
+            encRef.endEncoding(); cbRef.commit(); cbRef.waitUntilCompleted()
+            XCTAssertEqual(cbRef.status, .completed)
             let gotH2 = Data(bytes: h2.region.pointer.advanced(by: h2.offset), count: h2.bytes)
-            let gotH5First2 = Data(bytes: h5.region.pointer.advanced(by: h5.offset), count: h2.bytes)
-            XCTAssertEqual(gotH2, gotH5First2, "row-paired gateUp M=5 vs M=2 parity failed for isRotated=\(isRotated)")
-
-            // Save M=2 down output before running M=5 down on unmutated h5.
             memcpy(down2Ref.region.pointer.advanced(by: down2Ref.offset),
                    batch.downRows.region.pointer.advanced(by: batch.downRows.offset), down2Ref.bytes)
-            let cb2 = try XCTUnwrap(hal.queue.makeCommandBuffer())
-            let enc2 = try XCTUnwrap(cb2.makeComputeCommandEncoder())
-            try batch.encodeDown(enc2, input: h5, weight: dn, activeRows: 5)
-            let copyPso = try hal.pipeline("qwg_fwht32_f16")
-            enc2.setComputePipelineState(copyPso)
-            h5.bind(enc2, index: 0)
-            var countU = UInt32(5 * geom.intermediate)
-            enc2.setBytes(&countU, length: 4, index: 1)
-            enc2.dispatchThreadgroups(MTLSize(width: Int(countU) / 32, height: 1, depth: 1),
-                                      threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-            enc2.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
-
             let gotDown2 = Data(bytes: down2Ref.region.pointer.advanced(by: down2Ref.offset), count: down2Ref.bytes)
-            let gotDown5First2 = Data(bytes: batch.downRows.region.pointer.advanced(by: batch.downRows.offset),
-                                      count: down2Ref.bytes)
-            XCTAssertEqual(gotDown2, gotDown5First2, "row-paired down M=5 vs M=2 parity failed for isRotated=\(isRotated)")
 
-            let gotFwht5 = Data(bytes: hFwht5.region.pointer.advanced(by: hFwht5.offset), count: hFwht5.bytes)
-            let refFwht5 = Data(bytes: h5.region.pointer.advanced(by: h5.offset), count: h5.bytes)
-            XCTAssertEqual(gotFwht5, refFwht5, "4-row gateUpFwht32 parity failed for isRotated=\(isRotated)")
+            for rows in [5, 12, 16] {
+                let inR = QWTensorValue(region: input16.region, offset: 0, shape: QWTensorShape([rows * geom.hidden], .f16))
+                let hR = try alloc.allocate(QWTensorShape([rows * geom.intermediate], .f16))
+                let hFwhtR = try alloc.allocate(QWTensorShape([rows * geom.intermediate], .f16))
+                let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+                let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
+                try batch.encodeGateUp(enc, input: inR, weight: gu, output: hR, activeRows: rows, fuseFwht32: false)
+                try batch.encodeGateUp(enc, input: inR, weight: gu, output: hFwhtR, activeRows: rows, fuseFwht32: true)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                XCTAssertEqual(cb.status, .completed)
+                let gotFirst2 = Data(bytes: hR.region.pointer.advanced(by: hR.offset), count: h2.bytes)
+                XCTAssertEqual(gotH2, gotFirst2, "AQ4 gateUp M=\(rows) vs M=2 parity failed for isRotated=\(isRotated)")
+
+                let cb2 = try XCTUnwrap(hal.queue.makeCommandBuffer())
+                let enc2 = try XCTUnwrap(cb2.makeComputeCommandEncoder())
+                try batch.encodeDown(enc2, input: hR, weight: dn, activeRows: rows)
+                let copyPso = try hal.pipeline("qwg_fwht32_f16")
+                enc2.setComputePipelineState(copyPso)
+                hR.bind(enc2, index: 0)
+                var countU = UInt32(rows * geom.intermediate)
+                enc2.setBytes(&countU, length: 4, index: 1)
+                enc2.dispatchThreadgroups(MTLSize(width: Int(countU) / 32, height: 1, depth: 1),
+                                          threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc2.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
+                let gotDownFirst2 = Data(bytes: batch.downRows.region.pointer.advanced(by: batch.downRows.offset),
+                                           count: down2Ref.bytes)
+                XCTAssertEqual(gotDown2, gotDownFirst2, "AQ4 down M=\(rows) vs M=2 parity failed for isRotated=\(isRotated)")
+                let gotFwht = Data(bytes: hFwhtR.region.pointer.advanced(by: hFwhtR.offset), count: hFwhtR.bytes)
+                let refFwht = Data(bytes: hR.region.pointer.advanced(by: hR.offset), count: hR.bytes)
+                XCTAssertEqual(gotFwht, refFwht, "AQ4 gateUpFwht32 M=\(rows) parity failed for isRotated=\(isRotated)")
+            }
         }
     }
 
@@ -338,24 +340,24 @@ final class QWMTPBatchedMLPTests: XCTestCase {
         let rawBlocks = try tensor(fullData)
         let arena = try QWArena(hal: hal, weights: 256, activations: 16 << 20, kv: 256, gdnStates: 256)
         let alloc = arena.activationsRegion()
-        let batch = try QWMTPBatchedMLP(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 4)
-        let trunk = try QWMTPBatchedTrunk(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 4)
-        let vals = (0..<(4 * geom.hidden)).map { Float16(Float(($0 * 17 + 11) % 61 - 30) / 32) }
-        let input4 = try tensor(vals.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
+        let batch = try QWMTPBatchedMLP(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 8)
+        let trunk = try QWMTPBatchedTrunk(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 8)
+        let vals = (0..<(8 * geom.hidden)).map { Float16(Float(($0 * 17 + 11) % 61 - 30) / 32) }
+        let input8 = try tensor(vals.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
         let aLog = try alloc.allocate(QWTensorShape([48], .f32))
         let bias = try alloc.allocate(aLog.shape)
         let aPtr = aLog.region.pointer.advanced(by: aLog.offset).assumingMemoryBound(to: Float.self)
         let bPtr = bias.region.pointer.advanced(by: bias.offset).assumingMemoryBound(to: Float.self)
         for i in 0..<48 { aPtr[i] = Float(i % 7) / 3 - 2; bPtr[i] = Float(i % 5) / 10 - 0.2 }
 
-        let outProjBuf = try alloc.allocate(QWTensorShape([4 * geom.attnTotalN], .f16))
-        let refProjBuf = try alloc.allocate(QWTensorShape([4 * geom.attnTotalN], .f16))
-        let outGuBuf = try alloc.allocate(QWTensorShape([4 * geom.intermediate], .f16))
-        let refGuBuf = try alloc.allocate(QWTensorShape([4 * geom.intermediate], .f16))
-        let outGdnBuf = try alloc.allocate(QWTensorShape([4 * geom.gdnTotalN], .f16))
-        let refGdnBuf = try alloc.allocate(QWTensorShape([4 * geom.gdnTotalN], .f16))
-        let outCtrlBuf = try alloc.allocate(QWTensorShape([4 * 96], .f32))
-        let refCtrlBuf = try alloc.allocate(QWTensorShape([4 * 96], .f32))
+        let outProjBuf = try alloc.allocate(QWTensorShape([8 * geom.attnTotalN], .f16))
+        let refProjBuf = try alloc.allocate(QWTensorShape([8 * geom.attnTotalN], .f16))
+        let outGuBuf = try alloc.allocate(QWTensorShape([8 * geom.intermediate], .f16))
+        let refGuBuf = try alloc.allocate(QWTensorShape([8 * geom.intermediate], .f16))
+        let outGdnBuf = try alloc.allocate(QWTensorShape([8 * geom.gdnTotalN], .f16))
+        let refGdnBuf = try alloc.allocate(QWTensorShape([8 * geom.gdnTotalN], .f16))
+        let outCtrlBuf = try alloc.allocate(QWTensorShape([8 * 96], .f32))
+        let refCtrlBuf = try alloc.allocate(QWTensorShape([8 * 96], .f32))
 
         let gs = try alloc.allocate(QWTensorShape([geom.hidden / 128], .f32))
         let y32 = try alloc.allocate(QWTensorShape([geom.gdnTotalN], .f32))
@@ -374,8 +376,8 @@ final class QWMTPBatchedMLPTests: XCTestCase {
             let psoGu1 = try hal.pipeline("qwg_gemv_aq\(bits)_g\(group)_silu_pair_dx_h16")
             let psoGdn1 = try hal.pipeline("qwg_gemv_aq\(bits)_g\(group)_dx_h16_gdn_inproj_t4")
             let psoFwht = try hal.pipeline("qwg_fwht32_f16")
-            for m in [2, 3, 4] {
-                let inM = QWTensorValue(region: input4.region, offset: 0, shape: QWTensorShape([m * geom.hidden], .f16))
+            for m in [2, 3, 4, 5, 6, 7, 8] {
+                let inM = QWTensorValue(region: input8.region, offset: 0, shape: QWTensorShape([m * geom.hidden], .f16))
                 let outProjM = QWTensorValue(region: outProjBuf.region, offset: outProjBuf.offset, shape: QWTensorShape([m * geom.attnTotalN], .f16))
                 let refProjM = QWTensorValue(region: refProjBuf.region, offset: refProjBuf.offset, shape: QWTensorShape([m * geom.attnTotalN], .f16))
                 let outGuM = QWTensorValue(region: outGuBuf.region, offset: outGuBuf.offset, shape: QWTensorShape([m * geom.intermediate], .f16))
@@ -397,7 +399,7 @@ final class QWMTPBatchedMLPTests: XCTestCase {
 
                     // Compare against m separate single-row launches (M = 1).
                     for r in 0..<m {
-                        let in1 = QWTensorValue(region: input4.region, offset: r * geom.hidden * 2,
+                        let in1 = QWTensorValue(region: input8.region, offset: r * geom.hidden * 2,
                                                 shape: QWTensorShape([geom.hidden], .f16))
                         let refP1 = QWTensorValue(region: refProjM.region, offset: refProjM.offset + r * geom.attnTotalN * 2,
                                                   shape: QWTensorShape([geom.attnTotalN], .f16))

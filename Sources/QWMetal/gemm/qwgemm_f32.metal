@@ -528,15 +528,16 @@ kernel void qwg_latent_norm_h32_f32(device const float* x     [[buffer(0)]],
                                     constant float&     eps   [[buffer(5)]],
                                     constant uint&      flags [[buffer(6)]],
                                     uint2 tg   [[threadgroup_position_in_grid]],
+                                    uint2 gid  [[thread_position_in_grid]],
                                     uint  sg   [[simdgroup_index_in_threadgroup]],
                                     uint  lane [[thread_index_in_simdgroup]]) {
     const bool hasNorm = (flags & 1u) != 0u;
     const bool write16 = (flags & 2u) != 0u;
     const bool skip32 = (flags & 4u) != 0u;
     if (!hasNorm) {
-        const uint col = tg.x * 32u + lane;
+        const uint col = gid.x;
         if (col >= L) return;
-        const size_t idx = (size_t)tg.y * L + col;
+        const size_t idx = (size_t)gid.y * L + col;
         const float v = qwg_fwht32_lane_f32(x[idx], lane);
         if (!skip32) out32[idx] = v;
         if (write16) out16[idx] = half(v);

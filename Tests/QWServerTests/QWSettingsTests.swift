@@ -648,4 +648,52 @@ final class QWSettingsTests: XCTestCase {
         XCTAssertEqual(effectiveA.maxContext, 16384)
         XCTAssertFalse(effectiveA.speculativeDecodingEnabled)
     }
+
+    func testRecommendedPrefillChunkSizeScalesByArchitectureAndRAM() throws {
+        XCTAssertEqual(
+            QWServerSettings.recommendedPrefillChunkSize(for: nil, physicalMemory: 128_000_000_000),
+            QWPrefillLimits.chunkRows
+        )
+        XCTAssertEqual(
+            QWServerSettings.recommendedPrefillChunkSize(for: .qwen38_27b, physicalMemory: 16_000_000_000),
+            512
+        )
+        XCTAssertEqual(
+            QWServerSettings.recommendedPrefillChunkSize(for: .qwen38_27b, physicalMemory: 64_000_000_000),
+            512
+        )
+        XCTAssertEqual(
+            QWServerSettings.recommendedPrefillChunkSize(for: .qwen38_27b, physicalMemory: 128_000_000_000),
+            2048
+        )
+
+        let moeConfig = Data("""
+        {
+          "model_type": "qwen3_moe",
+          "hidden_size": 4096,
+          "intermediate_size": 12288,
+          "moe_intermediate_size": 1024,
+          "num_hidden_layers": 32,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 4,
+          "head_dim": 128,
+          "num_experts": 128,
+          "num_experts_per_tok": 8,
+          "vocab_size": 151936,
+          "max_position_embeddings": 32768,
+          "rms_norm_eps": 1e-6,
+          "rope_theta": 1000000.0,
+          "eos_token_id": 151645
+        }
+        """.utf8)
+        let moeDesc = try QWModelDescriptor.decode(configJSON: moeConfig)
+        XCTAssertEqual(
+            QWServerSettings.recommendedPrefillChunkSize(for: moeDesc, physicalMemory: 16_000_000_000),
+            512
+        )
+        XCTAssertEqual(
+            QWServerSettings.recommendedPrefillChunkSize(for: moeDesc, physicalMemory: 64_000_000_000),
+            4096
+        )
+    }
 }

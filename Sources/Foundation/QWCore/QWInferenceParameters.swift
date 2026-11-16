@@ -273,10 +273,20 @@ public struct QWVisualSpan: Sendable, Equatable {
         return h
     }
 
-    /// Replaces visual-span token slots with deterministic hash-salted `Int64` IDs for prefix cache identity.
-    public static func saltedCacheHistory(history: [Int64], visualSpans: [QWVisualSpan]) -> [Int64] {
-        guard !visualSpans.isEmpty else { return history }
+    /// Replaces visual-span token slots (and optionally position 0 when `cacheSalt` is set) with salted `Int64` IDs.
+    public static func saltedCacheHistory(
+        history: [Int64],
+        visualSpans: [QWVisualSpan],
+        cacheSalt: String? = nil
+    ) -> [Int64] {
+        let trimmedSalt = cacheSalt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasSalt = trimmedSalt.map { !$0.isEmpty } ?? false
+        guard !visualSpans.isEmpty || hasSalt else { return history }
         var out = history
+        if let salt = trimmedSalt, !salt.isEmpty, !out.isEmpty {
+            let saltHash = QWPrefixHash.fnv1a64(tokens: [Int(truncatingIfNeeded: out[0])], mode: salt)
+            out[0] = Int64(bitPattern: 0x2000_0000_0000_0000 | (saltHash & 0x1FFF_FFFF_FFFF_FFFF))
+        }
         for span in visualSpans {
             let h = span.contentHash64
             let upper = min(out.count, span.tokenOffset + span.tokenCount)

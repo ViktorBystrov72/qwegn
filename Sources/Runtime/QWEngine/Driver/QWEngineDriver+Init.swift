@@ -29,6 +29,7 @@ extension QWEngineDriver {
         let weightFormatDeclineReason: String?
         let mtpDrafts: Int
         let mtpWeightDrafts: Int
+        let prefillChunkSize: Int
     }
 
     struct CorePipelines {
@@ -98,7 +99,7 @@ extension QWEngineDriver {
     }
 
     func prefixPolicyKey(mode: GDNPrefillMode) -> String {
-        Self.prefixPolicyKey(backend: mtpBackend, drafts: mtpDrafts, mode: mode)
+        Self.prefixPolicyKey(backend: mtpBackend, drafts: mtpDrafts, mode: mode, cacheSalt: activeCacheSalt)
     }
 
     func flushPendingColdUnloads() {
@@ -154,8 +155,10 @@ extension QWEngineDriver {
         let choice = try Self.weightFormatChoice(for: root, quantization: rawGeometry.descriptor.quantization,
                                                  geometry: rawGeometry, mtpDrafts: mtpDrafts, pack: pack)
         let prelimHal = try QWHal(geometry: rawGeometry, weightBasis: choice.format.basis)
-        let geometry = explicitResE != nil || rawGeometry.numExperts == 0 ? rawGeometry
-            : Self.planResidentGeometry(
+        let clampedChunk = max(32, min(QWPrefillLimits.maxRows, (prefillChunkSize / 32) * 32))
+        let (geometry, plannedChunk) = (explicitResE != nil || rawGeometry.numExperts == 0)
+            ? (rawGeometry, clampedChunk)
+            : Self.planResidencyAndChunk(
                 raw: rawGeometry, cfg: cfg, hal: prelimHal, format: choice.format, tuning: tuning,
                 osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize, maxTokens: maxTokens,
                 ropeRows: ropeRows, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts, kvMode: kvMode)
@@ -163,7 +166,8 @@ extension QWEngineDriver {
             tuning: tuning, osReserveGiB: osReserveGiB, geometry: geometry, hal: prelimHal,
             pack: pack, stContainer: stContainer, weightFormat: choice.format,
             weightFormatDeclineReason: choice.declineReason,
-            mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts)
+            mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts,
+            prefillChunkSize: plannedChunk)
     }
 
     static func resolveCorePipelines(
@@ -225,7 +229,8 @@ extension QWEngineDriver {
         mtpDrafts: Int, mtpWeightDrafts: Int
     ) throws -> ArenaBudgetPlan {
         let useGroupedNAX = hal.caps.isMetal4TensorCapable
-        let bytesPerToken = Self.prefillBytesPerToken(geometry: geometry, useGroupedNAX: useGroupedNAX)
+        let bytesPerToken = Self.prefillBytesPerToken(
+            geometry: geometry, maxPrefillChunk: prefillChunkSize, useGroupedNAX: useGroupedNAX)
         let pscBytes = prefillChunkSize * bytesPerToken
         let decodeActBytes = Self.decodeAndMTPScratchBytes(
             geometry: geometry, prefillChunkRows: prefillChunkSize,
@@ -257,7 +262,7 @@ extension QWEngineDriver {
             + (mtpDrafts > 0 && geometry.mtpSharedLastLayer ? (112 << 20) : 0)
         let perTokBytes = 2 * activeAttnLayers * (QWKVCache.pageBytes(mode: kvMode, geometry: geometry) / QWKVCache.pageTokens)
             + mlaPerTokBytes + hcaPerTokBytes
-        let maxMTP = cfg.mtpBackend == .dflash2 ? 15 : 5
+        let maxMTP = cfg.mtpBackend == .dflash2 ? 15 : 7
         let prelimPlan = try QWWeightAllocationPlan(geometry: geometry, ropeRows: max(ropeRows, maxTokens),
                                                     mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP,
                                                     format: weightFormat)
@@ -320,7 +325,7 @@ extension QWEngineDriver {
             devEmbedEnv == "1"
             || (mtpDrafts > 1
                 && geometry.effectiveResidentExperts == geometry.numExperts
-                && fixedBytes + budget.trunkKVBytes + budget.mtpKVBytes + embedBytes <= budget.availBytes)
+                && fixedBytes + budget.trunkKVBytes + budget.mtpKVBytes + embedBytes + (1 << 30) <= budget.availBytes)
         )
         let embedRawOff: Int
         let embedReader: QWSafeTensorsReader?
@@ -469,10 +474,11 @@ extension QWEngineDriver {
         } else {
             echoDrafter = nil
         }
-        for m in ["m2", "m3", "m5", "m6", "m7", "m8"] { _ = try hal.pipeline("qwg_head_f16_\(m)") }
+        let headAQ4 = (hal.weightBasis == .standard) || (layersW.first.map { !$0.gu.view.isIncumbentContainer } ?? false)
+        for m in ["m2", "m3", "m4", "m5", "m6", "m7", "m8"] { _ = try hal.pipeline("qwg_head_f16_\(m)") }
         for m in 2...8 {
-            _ = try hal.pipeline("qwg_head_q4g_m\(m)")
-            if m >= 4 { _ = try hal.pipeline("qwg_head_q4g_rp_m\(m)") }
+            _ = try hal.pipeline("qwg_head_q4g_m\(m)", isAQ4: headAQ4)
+            if m >= 4 { _ = try hal.pipeline("qwg_head_q4g_rp_m\(m)", isAQ4: headAQ4) }
         }
         return MTPVerificationResources(
             gdnReplayCheckpoint: gdnReplayCheckpoint, verifyWindow: verifyWindow,

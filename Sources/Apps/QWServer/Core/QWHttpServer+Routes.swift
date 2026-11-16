@@ -93,6 +93,8 @@ extension QWHttpServer {
                 "metrics_stream": "GET /v1/metrics/stream",
                 "logs_stream": "GET /v1/logs/stream",
                 "engine_info": "GET /v1/engine/info",
+                "memory_inspect": "POST /v1/memory/inspect",
+                "memory_index": "POST /v1/memory/index",
                 "memory_mount": "POST /v1/memory/mount",
                 "memory_unmount": "POST /v1/memory/unmount",
                 "restart": "POST /v1/engine/restart",
@@ -142,6 +144,7 @@ extension QWHttpServer {
             nil
         }
         let mounted = self.actor.getMountedMemoryPackInfo()
+        let currentHW = QWSystemMetricsSampler.shared.current()
         return QWDashboardFacts(
             quantization: params?.headStorage,
             hostLogicalCores: hw.logicalCores,
@@ -150,7 +153,14 @@ extension QWHttpServer {
             metalFamily: metalFamily,
             physicalMemoryGB: hw.physicalMemoryBytes > 0 ? hw.physicalMemoryGB : nil,
             lsaMode: config.lsaConfig.mode.rawValue,
-            mountedMemoryPack: mounted.map { "\($0.packName) (\($0.enforcedKVMode.uppercased()))" })
+            mountedMemoryPack: mounted.map { "\($0.packName) (\($0.enforcedKVMode.uppercased()))" },
+            mountedMemoryPackRoot: mounted?.rootPath,
+            mountedMemoryPackFiles: mounted?.fileCount,
+            mountedMemoryPackTokens: mounted?.tokenCount,
+            mountedMemoryPackDelta: mounted?.modifiedFileCount,
+            mountedMemoryPackKV: mounted?.enforcedKVMode,
+            coolingPolicy: QWFanController.shared.currentPolicy.rawValue,
+            fanControlStatus: currentHW.fanControlStatus)
     }
 
     /// A response whose dates are ISO-8601 instants, so a client in any
@@ -166,10 +176,10 @@ extension QWHttpServer {
         }
     }
 
-    func sendJsonResponse<T: Encodable>(_ connection: NWConnection, status: Int, object: T) {
+    func sendJsonResponse<T: Encodable>(_ connection: NWConnection, status: Int, object: T, extraHeaders: [String] = []) {
         do {
             let data = try JSONEncoder().encode(object)
-            sendRawData(connection, status: status, contentType: "application/json", data: data)
+            sendRawData(connection, status: status, contentType: "application/json", data: data, extraHeaders: extraHeaders)
         } catch {
             sendSimpleResponse(connection, status: 500, body: "{\"error\": \"JSON encoding error\"}\n")
         }
@@ -194,5 +204,71 @@ extension QWHttpServer {
 
     func sendSimpleResponse(_ connection: NWConnection, status: Int, body: String) {
         sendRawData(connection, status: status, contentType: "text/plain", data: Data(body.utf8))
+    }
+
+    func handleMemoryInspectRoute(connection: NWConnection, body: Data) async throws {
+        guard !body.isEmpty,
+              let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let repoPath = payload["path"] as? String,
+              !repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let err = ServerErrorPayload(message: "Missing 'path' in memory inspect request.", code: 400)
+            sendJsonResponse(connection, status: 400, object: err)
+            return
+        }
+        let info = try await actor.inspectMemoryPack(at: repoPath)
+        sendJsonResponse(connection, status: 200, object: info)
+    }
+
+    func handleMemoryIndexRoute(connection: NWConnection, body: Data) async throws {
+        guard !body.isEmpty,
+              let req = try? JSONDecoder().decode(QWMemoryIndexRequest.self, from: body),
+              !req.path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let err = ServerErrorPayload(message: "Missing or invalid JSON payload ('path' required) in memory index request.", code: 400)
+            sendJsonResponse(connection, status: 400, object: err)
+            return
+        }
+        guard req.stream ?? true else {
+            let result = try await actor.indexMemoryPack(request: req)
+            sendJsonResponse(connection, status: 200, object: result)
+            return
+        }
+
+        sendSSEHeaders(connection)
+        let keepalive = startSSEKeepalive(connection: connection)
+        defer {
+            keepalive.gate.stop()
+            keepalive.task.cancel()
+        }
+        let lock = NSLock()
+        let sendProgress: @Sendable (QWMemoryIndexProgressEvent) -> Void = { [weak self] event in
+            guard let self, !self.isPeerGone(connection) else { return }
+            let encoder = JSONEncoder()
+            guard let jsonData = try? encoder.encode(event),
+                  let jsonStr = String(data: jsonData, encoding: .utf8) else {
+                return
+            }
+            let frame = Data("data: \(jsonStr)\n\n".utf8)
+            lock.withLock {
+                connection.send(content: frame, isComplete: false, completion: .contentProcessed({ err in
+                    if err != nil { connection.cancel() }
+                }))
+            }
+        }
+
+        do {
+            _ = try await actor.indexMemoryPack(request: req, onProgress: sendProgress)
+        } catch {
+            sendProgress(QWMemoryIndexProgressEvent(
+                phase: "error",
+                progressFraction: 0,
+                message: error.localizedDescription,
+                error: "\(error)"
+            ))
+        }
+        lock.withLock {
+            connection.send(content: Data("data: [DONE]\n\n".utf8), isComplete: true, completion: .contentProcessed({ _ in
+                connection.cancel()
+            }))
+        }
     }
 }

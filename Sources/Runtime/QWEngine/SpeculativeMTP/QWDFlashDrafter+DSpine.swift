@@ -230,7 +230,16 @@ extension QWDFlashDrafter {
         }
         let H = config.hiddenSize
         let I = config.intermediateSize
-        if let guPSO = psoGateUpFwht32Batched[rows] {
+        if isMetal4TensorCapable && rows >= 9 && canUseNAXGateUpScratch(rows: rows, h: H, i: I) {
+            let guScratch = QWTensorValue(region: draftLogits.region, offset: draftLogits.offset,
+                                          shape: QWTensorShape([rows * 2 * I], .f16))
+            encodeQ4Matmul(enc, weight: weight, input: input, output: guScratch, rows: rows)
+            encodeSiluMulF16(enc, gu: guScratch, out: output, rows: rows, i: I)
+            return
+        }
+        if let guPSO = weight.isIncumbentContainer
+            ? psoGateUpFwht32Batched[rows]
+            : (psoGateUpFwht32BatchedAQ4[rows] ?? psoGateUpFwht32Batched[rows]) {
             enc.setComputePipelineState(guPSO)
             weight.blocks.bind(enc, index: 0)
             input.bind(enc, index: 1)

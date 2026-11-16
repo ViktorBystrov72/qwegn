@@ -176,6 +176,18 @@ extension QWDashboardViewModel {
               capability: nil),
         .init(id: "hardware.memory_pressure_level", title: "Memory pressure", unit: nil,
               scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.hardwareStaleAfter,
+              capability: nil),
+        .init(id: "hardware.gpu_temp_celsius", title: "GPU Temp", unit: "°C",
+              scale: 1, digits: 1, staleAfter: QWTelemetryFreshness.hardwareStaleAfter,
+              capability: nil),
+        .init(id: "hardware.fan_rpm", title: "Fans", unit: "rpm",
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.hardwareStaleAfter,
+              capability: nil),
+        .init(id: "hardware.system_power_watts", title: "System Power", unit: "W",
+              scale: 1, digits: 1, staleAfter: QWTelemetryFreshness.hardwareStaleAfter,
+              capability: nil),
+        .init(id: "hardware.thermal_state", title: "Thermal State", unit: nil,
+              scale: 1, digits: 0, staleAfter: QWTelemetryFreshness.hardwareStaleAfter,
               capability: nil)
     ]
 

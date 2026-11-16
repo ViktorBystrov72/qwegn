@@ -89,23 +89,36 @@ extension FNGPUEngine {
         }
         if let warm = prefixCacheWarmStore {
             // A longer prompt may extend a prefix the RAM holds.
-            var bestWarmMatch: (name: String, tokens: Int, hasMTP: Bool)?
+            var bestWarmMatch: (name: String, tokens: Int, hasMTP: Bool, isUnsaltedSharedBase: Bool)?
             for hasMTP in candidateMTPFlags {
                 if let match = warm.longestMatch(history: history, kvMode: kvMode, hasMTP: hasMTP) {
                     if bestWarmMatch == nil || match.tokens > bestWarmMatch!.tokens {
-                        bestWarmMatch = (match.name, match.tokens, hasMTP)
+                        bestWarmMatch = (match.name, match.tokens, hasMTP, false)
+                    }
+                }
+            }
+            if bestWarmMatch == nil, rawHist.first != history.first, warm.hasSharedBase {
+                for hasMTP in candidateMTPFlags {
+                    if let shared = warm.longestSharedBaseMatch(history: rawHist, kvMode: kvMode, hasMTP: hasMTP) {
+                        if bestWarmMatch == nil || shared.tokens > bestWarmMatch!.tokens {
+                            bestWarmMatch = (shared.name, shared.tokens, hasMTP, true)
+                        }
                     }
                 }
             }
             if let match = bestWarmMatch,
-               let blob = warm.blob(name: match.name),
-               let restored = try? restorePrefix(data: blob, expectedTokens: history.prefix(match.tokens),
-                                                 hasMTP: match.hasMTP, isExact: false,
-                                                 nextTokenAfterPrefix: Int32(rawHist[match.tokens]),
-                                                 gpuSec: &gpuSec) {
-                var warmHit = restored
-                warmHit.tier = .warmRAM
-                return warmHit
+               let blob = warm.blob(name: match.name) {
+                let expectedToks = match.isUnsaltedSharedBase
+                    ? rawHist.prefix(match.tokens)
+                    : history.prefix(match.tokens)
+                if let restored = try? restorePrefix(data: blob, expectedTokens: expectedToks,
+                                                     hasMTP: match.hasMTP, isExact: false,
+                                                     nextTokenAfterPrefix: Int32(rawHist[match.tokens]),
+                                                     gpuSec: &gpuSec) {
+                    var warmHit = restored
+                    warmHit.tier = .warmRAM
+                    return warmHit
+                }
             }
         }
 

@@ -140,7 +140,7 @@ struct QWResolvedCliEngineConfig {
             FileHandle.standardError.write("\(verb): error: \(error)\n".data(using: .utf8)!)
             throw ExitCode(2)
         }
-        let maxDrafts = (resolvedBackend == .dflash2) ? 15 : 5
+        let maxDrafts = (resolvedBackend == .dflash2) ? 15 : 7
         if resolvedBackend == .dflash2, knobs.mtpDrafts == nil, dflashWindow == nil {
             let inferred = QWDFlashConfig.inferBackendAndMaxDrafts(
                 packPath: knobs.dflashDraftPack
@@ -251,6 +251,16 @@ struct QWResolvedCliEngineConfig {
             resolvedCacheDirURL: resolvedCacheDirURL,
             memoryPack: memoryPack
         )
+    }
+
+    func defaultPrefillChunkSize(explicitChunkSize: Int?) -> Int {
+        if let explicitChunkSize {
+            return explicitChunkSize
+        }
+        if !profileApplied && effectiveSettings.prefillChunkSize == QWPrefillLimits.chunkRows {
+            return QWServerSettings.recommendedPrefillChunkSize(for: runtimeAssets.descriptor)
+        }
+        return effectiveSettings.prefillChunkSize
     }
 
     func makeBuildOptions(

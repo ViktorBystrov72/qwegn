@@ -167,6 +167,10 @@ extension QWEngineDriver {
             mlaOperator?.truncatePosition(snapshot.position)
             hcaOperator?.truncatePosition(snapshot.position)
         }
+        session.tokenRecycler.reset()
+        if !session.tokenHistory.isEmpty {
+            session.tokenRecycler.ingestSequence(session.tokenHistory)
+        }
     }
 
     func capturePrivatePrefix(_ session: QWEngineSession, maxBytes: Int) throws -> QWEnginePrivatePrefix {
