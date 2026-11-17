@@ -122,4 +122,16 @@ final class FNPrefixCacheWiringTests: XCTestCase {
         XCTAssertEqual(evictedRecords.first?.0, 1024)
         XCTAssertEqual(evictedRecords.first?.1, 60)
     }
+
+    func testSerialMountCanReuseDFlashPrefixCacheWhileDFlashRequiresBlob() throws {
+        let restoreSource = try Self.read("Sources/Subsystems/QWFlashNext/GPU/FNPrefixCache.swift")
+        XCTAssertTrue(restoreSource.contains("(!wantDFlash || fileHasDFlash)"),
+                      "serial mounts (wantDFlash == false) must accept DFlash-enabled .qwcache")
+
+        let mountSource = try Self.read("Sources/Subsystems/QWFlashNext/GPU/FNPrefixCache+Save.swift")
+        XCTAssertTrue(mountSource.contains("rebuild with qwg index --mtp-backend dflash2"),
+                      "DFlash mount failure should direct users to qwg index --mtp-backend dflash2")
+        XCTAssertTrue(mountSource.contains("if fileHasDFlash, let dflash = self.dflash"),
+                      "non-DFlash engines must skip DFlash payload check so --mtp-drafts 0 can mount a DFlash .qwcache")
+    }
 }

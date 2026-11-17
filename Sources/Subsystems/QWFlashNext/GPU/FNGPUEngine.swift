@@ -7,6 +7,7 @@ import QWCore
 import QWGEMM
 import QWHAL
 import QWHead
+import QWMTP
 import QWQuant
 
 public final class FNGPUEngine: @unchecked Sendable {
@@ -71,6 +72,10 @@ public final class FNGPUEngine: @unchecked Sendable {
     let decodeStack: FNGPUDecodeStack
     let verifyStack: FNGPUDecodeStack?
     let mtp: FNGPUMTP?
+    public let dflash: QWDFlashDrafter?
+    let dflashPrefixMarker: String?
+    let dflashHeadStorage: QWHeadStorage?
+    public let dflashMaxDrafts: Int
     let head: FNGPUHead
     let layerRecords: [LayerRecord]
     let maxPLEDim: Int
@@ -118,7 +123,12 @@ public final class FNGPUEngine: @unchecked Sendable {
         arena.weightsRegion().steadyStateAllocs + arena.activationsRegion().steadyStateAllocs
             + arena.gdnRegion().steadyStateAllocs
     }
-    public var supportsSpeculativeDecode: Bool { verifyStack != nil && mtp != nil }
+    public var supportsSpeculativeDecode: Bool { verifyStack != nil && (mtp != nil || dflash != nil) }
+    public var dflashReportLine: String {
+        guard let dflash else { return "" }
+        let kind = dflash.config.isDSpine ? "dspine" : "dflash2"
+        return "dflash:                   \(kind) layers=\(dflash.config.numLayers) win=\(dflash.config.slidingWindow) block<=\(dflashMaxDrafts)\n"
+    }
 
     /// The L1 cache in front of the PLE n-gram table, in bytes.
     public static let ngramRowCacheBytes = 64 << 20
@@ -145,7 +155,13 @@ public final class FNGPUEngine: @unchecked Sendable {
                 prewarmDoors: [String] = [],
                 lsaConfig: QWLSAConfig = QWLSAConfig(),
                 streamNgrams: Bool = false,
-                ropeYarnFactor: Double? = nil) throws {
+                ropeYarnFactor: Double? = nil,
+                mtpBackend: String? = nil,
+                mtpDrafts: Int = 0,
+                dflashDraftPackPath: String? = nil,
+                dflashSelectorTopK: Int? = nil,
+                mtpDraftStrategy: String = "hybrid") throws {
+        _ = mtpDraftStrategy
         self.evictPrefillScratch = evictPrefillScratch
         self.lsaConfig = lsaConfig
         self.prefixCacheDirectory = prefixCacheDirectory
@@ -175,11 +191,22 @@ public final class FNGPUEngine: @unchecked Sendable {
         let hal = try QWHal(geometry: QWModelGeometry(descriptor: desc),
                             weightBasis: useStandardBasis ? .standard : .rotated)
         self.hal = hal
-        let perTokBytes = resolvedKVMode.perTokenBytes
-        let fnWeightsEstimate = Self.estimateWeightBytes(loader: loader, useStandardBasis: useStandardBasis)
-        let packDiskBytes = (location.kind == .qwp1)
+        let useDFlash = FNGPUDFlash.isDFlashName(mtpBackend) && mtpDrafts > 0
+        let perTokBytes = FNGPUDFlash.adjustedPerTokenKVBytes(resolvedKVMode.perTokenBytes, usesDFlash: useDFlash)
+        let dflashFootprint = FNGPUDFlash.estimateFootprint(
+            targetDescriptor: desc, targetPackPath: expanded,
+            dflashPackPath: dflashDraftPackPath, isDFlash: useDFlash)
+        let rawWeightsEstimate = Self.estimateWeightBytes(loader: loader, useStandardBasis: useStandardBasis)
+        let fnWeightsEstimate = useDFlash
+            ? max(512 << 20, rawWeightsEstimate - dflashFootprint.nativeMTPWeightBytes + dflashFootprint.dflashWeightBytes)
+            : rawWeightsEstimate
+        let rawPackDiskBytes = (location.kind == .qwp1)
             ? ((try? FileManager.default.attributesOfItem(atPath: location.weights.path)[.size] as? Int) ?? 0) : 0
+        let packDiskBytes = (useDFlash && rawPackDiskBytes > 0)
+            ? max(512 << 20, rawPackDiskBytes - dflashFootprint.nativeMTPWeightBytes + dflashFootprint.dflashWeightBytes)
+            : rawPackDiskBytes
         let fnFixedScratchEstimate = (1408 << 20) + (836 << 20)
+            + (useDFlash ? max(0, dflashFootprint.dflashScratchBytes - (112 << 20)) : 0)
         let retainedPrefillBytes = (!evictPrefillScratch && resolvedChunk > 1024)
             ? Self.prefillActivationBytes(maxRows: resolvedChunk, capacity: min(maxTokens, desc.maxPositionEmbeddings)) : 0
         let availBytes = QWCapacityBudget.availableBytes(osReserveGiB: osReserveGiB)
@@ -241,7 +268,9 @@ public final class FNGPUEngine: @unchecked Sendable {
         let prefix = "model.language_model."
         defer { FNGPULoader.releaseRepackStageBuffer() }
         let hasHiBitDense = self.pack?.tensors.values.contains(where: { $0.shape.count == 2 && $0.hqBits > 4 }) ?? false
-        let weightsArenaBytes = (self.pack != nil) ? ((hasHiBitDense ? 3584 : 2560) << 20) : (6 << 30)
+        let weightsArenaBytes = (self.pack != nil)
+            ? ((useDFlash ? (hasHiBitDense ? 3328 : 2304) : (hasHiBitDense ? 3584 : 2560)) << 20)
+            : (6 << 30)
         let baseScratchBytes = 1344 << 20
         let combinedActBytes = kvCap * perTokBytes + baseScratchBytes
         let maxBuf = Int(hal.device.maxBufferLength)
@@ -328,7 +357,8 @@ public final class FNGPUEngine: @unchecked Sendable {
         self.head = try FNGPUHead(arena: arena, hal: hal, head: headBank, mixerDown: mixerDown, mixerUp: mixerUp,
                                   normWeight: mixerNorm, eps: desc.rmsEps, hidden: H, hc: C, lowrank: lowrank, maxRows: 8)
 
-        if FNGPUMTP.isAvailable(in: loader) {
+        let loadVerifyStack = useDFlash || FNGPUMTP.isAvailable(in: loader)
+        if loadVerifyStack {
             var vSlots: [FNGPUDecodeStack.Slot] = []
             var sharedQSAScores2: QWTensorValue?
             let sharedVerifyScr: FNGPUScratch? = try records.first.map { firstRec in
@@ -357,16 +387,44 @@ public final class FNGPUEngine: @unchecked Sendable {
             }
             self.verifyStack = try FNGPUDecodeStack(arena: arena, ctx: ctx, slots: vSlots, hidden: H, hc: C, rows: 8,
                                                     gpuPLETable: gpuPLE)
-            self.mtp = try FNGPUMTP(arena: arena, ctx: ctx, loader: loader, embedTable: embedTable,
-                                    headWeight: headBank, capacity: kvCap,
-                                    maxPrefillRows: max(resolvedChunk, QWPrefillLimits.maxRows),
-                                    kvMode: resolvedKVMode,
-                                    sharedRope: sharedRope, sharedQSAScores1: sharedQSAScores1,
-                                    sharedQSAScores2: sharedQSAScores2, staging: staging,
-                                    yarnFactor: yarnFactor)
+            if useDFlash {
+                let resolvedDFlashPack = FNGPUDFlash.resolveDrafterPackPath(
+                    targetDescriptor: desc, explicitPath: dflashDraftPackPath)
+                let drafter = try QWDFlashDrafter(
+                    geometry: QWModelGeometry(descriptor: desc), hal: hal,
+                    packPath: resolvedDFlashPack,
+                    drafts: max(1, min(FNGPUDFlash.maxDrafts, mtpDrafts)),
+                    selectorTopK: dflashSelectorTopK)
+                self.dflash = drafter
+                self.dflashPrefixMarker = FNGPUDFlash.dflashGeometryMarker(config: drafter.config)
+                self.dflashMaxDrafts = min(FNGPUDFlash.maxDrafts, max(1, drafter.config.blockSize - 1))
+                self.dflashHeadStorage = QWHeadWeight(
+                    blocks: headBank.blocks, n: headBank.n, k: headBank.k,
+                    bits: headBank.bits, groupSize: headBank.groupSize,
+                    isRotated: headBank.isRotated, isIncumbentContainer: headBank.isIncumbentContainer,
+                    isSHVQ: headBank.isSHVQ
+                ).map { .q4g($0) }
+                self.mtp = nil
+            } else {
+                self.dflash = nil
+                self.dflashPrefixMarker = nil
+                self.dflashMaxDrafts = 0
+                self.dflashHeadStorage = nil
+                self.mtp = try FNGPUMTP(arena: arena, ctx: ctx, loader: loader, embedTable: embedTable,
+                                        headWeight: headBank, capacity: kvCap,
+                                        maxPrefillRows: max(resolvedChunk, QWPrefillLimits.maxRows),
+                                        kvMode: resolvedKVMode,
+                                        sharedRope: sharedRope, sharedQSAScores1: sharedQSAScores1,
+                                        sharedQSAScores2: sharedQSAScores2, staging: staging,
+                                        yarnFactor: yarnFactor)
+            }
         } else {
             self.verifyStack = nil
             self.mtp = nil
+            self.dflash = nil
+            self.dflashPrefixMarker = nil
+            self.dflashMaxDrafts = 0
+            self.dflashHeadStorage = nil
         }
         // Native flat QSA wins <= 262K; above 262K, auto mode engages e-means-4096 coarse clustering.
         let useQSACluster = lsaConfig.mode == .qsaCluster
@@ -386,6 +444,7 @@ public final class FNGPUEngine: @unchecked Sendable {
         } else {
             self.lsaClusterRegion = nil
         }
+        let dflashBytes = self.dflash.map { FNGPUDFlash.drafterWeightBytes(packPath: $0.packPath, isDSpine: $0.config.isDSpine) } ?? 0
         self.extraWeightBytes = Self.standaloneWeightBytes(
             arenaBuffers: arena.allBuffers,
             layers: self.layerRecords.map(\.weights),
@@ -393,12 +452,13 @@ public final class FNGPUEngine: @unchecked Sendable {
             embedTable: self.embedTable,
             gpuPLETable: self.gpuPLETable,
             mtp: self.mtp
-        )
+        ) + dflashBytes
         loader.st?.adviseDontNeed()
         hal.adoptPendingResidency()
         if let vStack = self.verifyStack {
             _ = try? vStack.forwardRows(history: [0, 0], embedTable: embedTable, head: head,
-                                        readStream: false, verifyAllRows: true, mtp: self.mtp, activeRows: 2)
+                                        readStream: false, verifyAllRows: true, mtp: self.mtp,
+                                        activeRows: 2, dflash: self.dflash)
             highWaterPos = 2
             wipeSessionState()
         }

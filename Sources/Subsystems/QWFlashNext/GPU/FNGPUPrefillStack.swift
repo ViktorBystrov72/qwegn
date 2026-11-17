@@ -4,6 +4,7 @@ import QWAlloc
 import QWGEMM
 import QWHAL
 import QWCore
+import QWMTP
 
 /// Batched prefill: the whole prompt runs through the stack in one command buffer per layer, with T rows per layer.
 /// The weights are read once per layer for all T tokens, so prefill costs a single pass over the model instead of
@@ -101,6 +102,8 @@ public final class FNGPUPrefillStack {
     public func forward(history: [Int64], streamIn: [Float], head: FNGPUHead, startPos: Int = 0,
                         readStream: Bool = true, runHead: Bool = true,
                         mtp: FNGPUMTP? = nil, projectMTP: Bool = false,
+                        dflash: QWDFlashDrafter? = nil, dflashSlot: QWDFlashSessionSlot? = nil,
+                        dflashWindowEnd: Int? = nil,
                         pleParity: Int = 0, plePrecomputed: Bool = false,
                         nextChunkStartPos: Int? = nil,
                         nextChunkCount: Int? = nil) throws -> (token: Int, stream: [Float]) {
@@ -108,6 +111,7 @@ public final class FNGPUPrefillStack {
         return try runPrefill(history: history, stage: .host(streamIn), head: head, startPos: startPos,
                               readStream: readStream, runHead: runHead,
                               mtp: mtp, projectMTP: projectMTP,
+                              dflash: dflash, dflashSlot: dflashSlot, dflashWindowEnd: dflashWindowEnd,
                               pleParity: pleParity, plePrecomputed: plePrecomputed,
                               nextChunkStartPos: nextChunkStartPos,
                               nextChunkCount: nextChunkCount)
@@ -117,6 +121,8 @@ public final class FNGPUPrefillStack {
     public func forward(history: [Int64], embedTable: FNGPUEmbedTable, head: FNGPUHead, startPos: Int = 0,
                         readStream: Bool = false, runHead: Bool = true,
                         mtp: FNGPUMTP? = nil, projectMTP: Bool = false,
+                        dflash: QWDFlashDrafter? = nil, dflashSlot: QWDFlashSessionSlot? = nil,
+                        dflashWindowEnd: Int? = nil,
                         pleParity: Int = 0, plePrecomputed: Bool = false,
                         nextChunkStartPos: Int? = nil,
                         nextChunkCount: Int? = nil) throws -> (token: Int, stream: [Float]) {
@@ -124,6 +130,7 @@ public final class FNGPUPrefillStack {
         return try runPrefill(history: history, stage: .gathered(embedTable), head: head, startPos: startPos,
                               readStream: readStream, runHead: runHead,
                               mtp: mtp, projectMTP: projectMTP,
+                              dflash: dflash, dflashSlot: dflashSlot, dflashWindowEnd: dflashWindowEnd,
                               pleParity: pleParity, plePrecomputed: plePrecomputed,
                               nextChunkStartPos: nextChunkStartPos,
                               nextChunkCount: nextChunkCount)
@@ -159,9 +166,18 @@ public final class FNGPUPrefillStack {
     private func runPrefill(history: [Int64], stage: StreamStage, head: FNGPUHead, startPos: Int,
                             readStream: Bool, runHead: Bool,
                             mtp: FNGPUMTP?, projectMTP: Bool,
+                            dflash: QWDFlashDrafter? = nil, dflashSlot: QWDFlashSessionSlot? = nil,
+                            dflashWindowEnd: Int? = nil,
                             pleParity: Int, plePrecomputed: Bool,
                             nextChunkStartPos: Int?,
                             nextChunkCount: Int? = nil) throws -> (token: Int, stream: [Float]) {
+        let dflashCapture = dflash.flatMap { df in
+            FNGPUDFlash.prefillCaptureSlice(
+                startPos: startPos, rows: rows,
+                historyCount: dflashWindowEnd ?? history.count,
+                maxCacheSize: df.config.maxCacheSize
+            )
+        }
         let trace = FNGPUExecutionTrace.enabled ? FNGPUExecutionTrace() : nil
         if let gple = gpuPLE {
             let idPtr = arena.cpuPointer(of: gple.rowIds).assumingMemoryBound(to: UInt32.self)
@@ -247,6 +263,13 @@ public final class FNGPUPrefillStack {
                                                   attnState: slot.attn, pos: startPos, pleEmbed: pleBuf,
                                                   inInject: inInj, deferOutInject: deferOut)
                 swap(&cur, &nxt)
+                if let dflash, let cap = dflashCapture {
+                    FNGPUDFlash.encodeLayerCapture(
+                        enc, dflash: dflash, layerIndex: i, deferOut: deferOut,
+                        base: slot.scratch.h2, src: slot.scratch.moeOut, inj: slot.scratch.injB,
+                        cur: cur, srcRowOffset: cap.localStart, dstRowOffset: 0,
+                        rows: cap.captureRows, hc: slot.scratch.hc)
+                }
             }
             if isLastChunk {
                 lastStreamTensor = cur
@@ -259,6 +282,14 @@ public final class FNGPUPrefillStack {
                                 s.scratch.injB.slice(byteOffset: r * c * 4, count: c, dtype: .f32))
                     }
                     try head.encode(enc, hal: ctx.hal, stream: last, inInject: tailInj)
+                }
+                if let dflash, let cap = dflashCapture {
+                    let ctxSlot = dflashSlot ?? dflash.sessionSlots.first
+                    if let ctxSlot {
+                        enc.memoryBarrier(scope: .buffers)
+                        dflash.encodeContextUpdate(enc, slot: ctxSlot, startPosition: cap.ctxStartPos,
+                                                   totalCount: cap.captureRows)
+                    }
                 }
                 if let mtp, let lastSlot = slots.last {
                     let nextToks = (0..<rows).map { i -> Int32 in

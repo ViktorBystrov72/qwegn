@@ -34,12 +34,19 @@ extension SettingsView {
             draftSettings.modelAlias = draftSettings.alias(for: draftSettings.modelName)
         }
         discoveredDrafterModels = QWServerSettings.scanDrafterModelsDirectory()
-        if !draftSettings.dflashDraftPackPath.isEmpty
-            && !discoveredDrafterModels.contains(where: { $0.packPath == draftSettings.dflashDraftPackPath }) {
-            let name = QWModelRoot.canonicalModelName(for: URL(fileURLWithPath: draftSettings.dflashDraftPackPath))
-            discoveredDrafterModels.insert(DiscoveredModel(name: name, packPath: draftSettings.dflashDraftPackPath), at: 0)
-        } else if isExternalDrafterSelected, draftSettings.dflashDraftPackPath.isEmpty, let first = discoveredDrafterModels.first {
-            draftSettings.dflashDraftPackPath = first.packPath
+        let trimmedDraft = draftSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedDraft.isEmpty
+            && !discoveredDrafterModels.contains(where: { $0.packPath == trimmedDraft }) {
+            let name = QWModelRoot.canonicalModelName(for: URL(fileURLWithPath: trimmedDraft))
+            discoveredDrafterModels.insert(DiscoveredModel(name: name, packPath: trimmedDraft), at: 0)
+        } else if isExternalDrafterSelected, trimmedDraft.isEmpty,
+                  let match = QWServerSettings.resolveDefaultDrafterPack(
+                      for: selectedPrimaryDescriptor,
+                      preferredBackend: draftSettings.mtpBackend,
+                      drafters: discoveredDrafterModels,
+                      targetModelName: draftSettings.modelName
+                  ) {
+            draftSettings.dflashDraftPackPath = match.packPath
         }
     }
 
@@ -93,14 +100,99 @@ extension SettingsView {
         return true
     }
 
+    var selectedPrimaryDescriptor: QWModelDescriptor? {
+        let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ref = draftSettings.resolveModelReference(
+            rawPath.isEmpty ? draftSettings.modelName : rawPath,
+            discovered: discoveredModels
+        )
+        let candidate = ref.packPath.isEmpty ? rawPath : ref.packPath
+        return QWServerSettings.loadPrimaryDescriptor(packPath: candidate)
+    }
+
     var selectedModelSupportsDFlash2: Bool {
-        if let desc = try? draftSettings.validatePrimaryModel() {
-            return desc.hcCount == nil && desc.numExperts == nil
+        Self.supportsDFlash2(
+            for: draftSettings,
+            descriptor: selectedPrimaryDescriptor,
+            discoveredModels: discoveredModels,
+            discoveredDrafters: discoveredDrafterModels
+        )
+    }
+
+    var selectedModelSupportsDFlash2Backend: Bool {
+        Self.supportsExternalDrafter(
+            backend: "dflash2",
+            for: draftSettings,
+            descriptor: selectedPrimaryDescriptor,
+            discoveredModels: discoveredModels,
+            discoveredDrafters: discoveredDrafterModels
+        )
+    }
+
+    var selectedModelSupportsDSpineBackend: Bool {
+        Self.supportsExternalDrafter(
+            backend: "dspine",
+            for: draftSettings,
+            descriptor: selectedPrimaryDescriptor,
+            discoveredModels: discoveredModels,
+            discoveredDrafters: discoveredDrafterModels
+        )
+    }
+
+    static func supportsDFlash2(
+        for settings: QWServerSettings,
+        descriptor: QWModelDescriptor?,
+        discoveredModels: [DiscoveredModel],
+        discoveredDrafters: [DiscoveredModel]
+    ) -> Bool {
+        let disc = discoveredModels.first(where: { $0.name == settings.modelName })
+        return QWServerSettings.supportsDFlash2(
+            descriptor: descriptor,
+            discoveredModel: disc,
+            drafters: discoveredDrafters
+        )
+    }
+
+    static func supportsExternalDrafter(
+        backend: String,
+        for settings: QWServerSettings,
+        descriptor: QWModelDescriptor?,
+        discoveredModels: [DiscoveredModel],
+        discoveredDrafters: [DiscoveredModel]
+    ) -> Bool {
+        let disc = discoveredModels.first(where: { $0.name == settings.modelName })
+        return QWServerSettings.supportsExternalDrafter(
+            backend: backend,
+            descriptor: descriptor,
+            discoveredModel: disc,
+            drafters: discoveredDrafters,
+            configuredPackPath: settings.dflashDraftPackPath
+        )
+    }
+
+    var selectableDrafterModels: [DiscoveredModel] {
+        Self.selectableDrafterModels(
+            for: draftSettings,
+            descriptor: selectedPrimaryDescriptor,
+            discoveredDrafters: discoveredDrafterModels
+        )
+    }
+
+    static func selectableDrafterModels(
+        for settings: QWServerSettings,
+        descriptor: QWModelDescriptor?,
+        discoveredDrafters: [DiscoveredModel]
+    ) -> [DiscoveredModel] {
+        guard let descriptor else { return discoveredDrafters }
+        let compatible = QWServerSettings.compatibleDrafterModels(for: descriptor, in: discoveredDrafters)
+        guard !compatible.isEmpty else { return discoveredDrafters }
+        let current = settings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty,
+           !compatible.contains(where: { $0.packPath == current }),
+           let custom = discoveredDrafters.first(where: { $0.packPath == current }) {
+            return [custom] + compatible
         }
-        if let disc = discoveredModels.first(where: { $0.name == draftSettings.modelName }) {
-            return !disc.capabilities.contains("moe") && !disc.capabilities.contains("hyperConnection")
-        }
-        return true
+        return compatible
     }
 
     var isExternalDrafterSelected: Bool {
@@ -110,10 +202,18 @@ extension SettingsView {
 
     var selectedModelMaxDrafts: Int {
         if isExternalDrafterSelected {
-            let inferred = QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: draftSettings.dflashDraftPackPath)
+            let effPath = QWServerSettings.effectiveDrafterPackPath(
+                configuredPath: draftSettings.dflashDraftPackPath,
+                for: selectedPrimaryDescriptor,
+                preferredBackend: draftSettings.mtpBackend,
+                drafters: discoveredDrafterModels,
+                targetModelName: draftSettings.modelName
+            ) ?? draftSettings.dflashDraftPackPath
+            let inferred = QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: effPath)
             return draftSettings.mtpBackend.lowercased() == "dspine" ? max(15, inferred.maxDrafts) : inferred.maxDrafts
         }
-        if let desc = try? draftSettings.validatePrimaryModel(), desc.maxSpeculativeDrafts > 0 {
+        if let desc = selectedPrimaryDescriptor ?? (try? draftSettings.validatePrimaryModel()),
+           desc.maxSpeculativeDrafts > 0 {
             return desc.maxSpeculativeDrafts
         }
         if let disc = discoveredModels.first(where: { $0.name == draftSettings.modelName }), disc.maxSpeculativeDrafts > 0 {
@@ -279,12 +379,44 @@ extension SettingsView {
             if !(desc.visDepth > 0 && desc.capabilities.contains(.vision)) {
                 draftSettings.loadVision = false
             }
-            let supportsDFlash = desc.hcCount == nil && desc.numExperts == nil
+            let supportsDFlash = Self.supportsDFlash2(
+                for: draftSettings,
+                descriptor: desc,
+                discoveredModels: discoveredModels,
+                discoveredDrafters: discoveredDrafterModels
+            )
             if !supportsDFlash && isExternalDrafterSelected {
                 draftSettings.mtpBackend = "variational"
+            } else if isExternalDrafterSelected,
+                      !Self.supportsExternalDrafter(
+                          backend: draftSettings.mtpBackend,
+                          for: draftSettings,
+                          descriptor: desc,
+                          discoveredModels: discoveredModels,
+                          discoveredDrafters: discoveredDrafterModels
+                      ),
+                      draftSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                draftSettings.reconcileStaleDrafterSelection(for: desc, drafters: discoveredDrafterModels)
             }
+            if isExternalDrafterSelected,
+               draftSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let match = QWServerSettings.resolveDefaultDrafterPack(
+                   for: desc,
+                   preferredBackend: draftSettings.mtpBackend,
+                   drafters: discoveredDrafterModels,
+                   targetModelName: draftSettings.modelName
+               ) {
+                draftSettings.dflashDraftPackPath = match.packPath
+            }
+            let effPath = QWServerSettings.effectiveDrafterPackPath(
+                configuredPath: draftSettings.dflashDraftPackPath,
+                for: desc,
+                preferredBackend: draftSettings.mtpBackend,
+                drafters: discoveredDrafterModels,
+                targetModelName: draftSettings.modelName
+            ) ?? draftSettings.dflashDraftPackPath
             let maxD = isExternalDrafterSelected
-                ? QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: draftSettings.dflashDraftPackPath).maxDrafts
+                ? QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: effPath).maxDrafts
                 : max(1, desc.maxSpeculativeDrafts)
             if draftSettings.mtpDrafts > maxD {
                 draftSettings.mtpDrafts = maxD
@@ -477,7 +609,7 @@ extension SettingsView {
                                 @ViewBuilder content: () -> Content) -> some View {
         HStack(alignment: .center, spacing: 12) {
             SettingsRowLabel(text: label, key: key)
-                .frame(width: 210, alignment: .leading)
+                .frame(width: 195, alignment: .leading)
             content()
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -488,7 +620,8 @@ extension SettingsView {
             Text(title)
                 .font(TelemetryTheme.ui(11.5, .medium))
                 .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
-                .lineLimit(1)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             SettingsRestartBadge(key: key)
             Spacer(minLength: 8)
             Toggle("", isOn: isOn)

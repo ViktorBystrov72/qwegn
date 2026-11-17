@@ -57,8 +57,16 @@ extension QWServerConfigurationResolver {
         cliMTPDraftStrategy: String?, cliMTPQuadraticSeeding: Bool?,
         cliLoadVision: Bool?, cliMemoryPolicy: String?,
         cliOSReserveGiB: Double?, cliResidentExpertsPerLayer: Int?,
-        cliMoESpecBudget: Int?, cliStreamNgrams: Bool?
+        cliMoESpecBudget: Int?, cliStreamNgrams: Bool?,
+        drafters: [QWServerSettings.DiscoveredModel]? = nil
     ) -> ExtraResolvedConfig {
+        let requestedMTPBackend: String? = {
+            if let b = cliMTPBackend, !b.isEmpty { return b }
+            if let b = environment["QWG_MTP_BACKEND"], !b.isEmpty { return b }
+            if !fileSettings.mtpBackend.isEmpty { return fileSettings.mtpBackend }
+            return nil
+        }()
+        let targetDescriptor = QWServerSettings.loadPrimaryDescriptor(packPath: resolvedPack)
         let resolvedDFlashDraftPackPath: String = {
             if let p = cliDFlashDraftPack, !p.isEmpty { sources["dflashDraftPackPath"] = "cli"; return p.canonicalPath }
             if let p = environment["QW_DFLASH_DRAFT_PACK"] ?? environment["QWG_DFLASH_DRAFT_PACK"], !p.isEmpty {
@@ -67,18 +75,30 @@ extension QWServerConfigurationResolver {
             if !fileSettings.dflashDraftPackPath.isEmpty {
                 sources["dflashDraftPackPath"] = "config-file"; return fileSettings.dflashDraftPackPath.canonicalPath
             }
-            if let first = QWServerSettings.scanDrafterModelsDirectory().first(where: { !$0.packPath.isEmpty }) {
-                sources["dflashDraftPackPath"] = "discovered (~/.qwg/models/\(first.name))"; return first.packPath
+            let availableDrafters = drafters ?? QWServerSettings.scanDrafterModelsDirectory()
+            if let match = QWServerSettings.resolveDefaultDrafterPack(
+                for: targetDescriptor,
+                preferredBackend: requestedMTPBackend,
+                drafters: availableDrafters,
+                targetModelName: fileSettings.modelName
+            ) {
+                sources["dflashDraftPackPath"] = "discovered (~/.qwg/models/\(match.name))"
+                return match.packPath
             }
             sources["dflashDraftPackPath"] = "default"
-            return QWDFlashConfig.defaultPackPath
+            if targetDescriptor != nil {
+                return ""
+            }
+            return QWServerSettings.normalizeExternalDrafterBackend(requestedMTPBackend) == "dspine"
+                ? QWDFlashConfig.defaultDSpinePackPath
+                : QWDFlashConfig.defaultPackPath
         }()
 
         let resolvedMTPBackend: String? = {
             if let b = cliMTPBackend, !b.isEmpty { sources["mtpBackend"] = "cli"; return b }
             if let bs = cliDFlashBlockSize, (2...16).contains(bs) {
                 sources["mtpBackend"] = "cli (--dflash-window)"
-                return QWDFlashConfig.inferBackendAndMaxDrafts(packPath: resolvedDFlashDraftPackPath).backend
+                return QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: resolvedDFlashDraftPackPath).backend
             }
             if let b = environment["QWG_MTP_BACKEND"], !b.isEmpty { sources["mtpBackend"] = "env"; return b }
             if !fileSettings.mtpBackend.isEmpty { sources["mtpBackend"] = "config-file"; return fileSettings.mtpBackend }

@@ -201,6 +201,26 @@ extension QWEngineLifecycleActor {
         statusBox.getLoadedParamsInfo()
     }
 
+    /// Resolves `config.dflashDraftPackPath` or selects a geometry-matched drafter pack for `targetDescriptor`.
+    static func resolveEffectiveDrafterPackPath(
+        for config: Config,
+        targetDescriptor: QWModelDescriptor,
+        drafters: [DiscoveredModel] = QWServerSettings.scanDrafterModelsDirectory()
+    ) -> String? {
+        if let resolved = QWServerSettings.effectiveDrafterPackPath(
+            configuredPath: config.dflashDraftPackPath,
+            for: targetDescriptor,
+            preferredBackend: config.mtpBackend,
+            drafters: drafters,
+            targetModelName: config.modelName
+        ) {
+            return resolved
+        }
+        return QWServerSettings.normalizeExternalDrafterBackend(config.mtpBackend) == "dspine"
+            ? QWDFlashConfig.defaultDSpinePackPath
+            : nil
+    }
+
     static func performLoad(
         config: Config,
         logger: QWServerLogger,
@@ -214,8 +234,10 @@ extension QWEngineLifecycleActor {
         if config.speculativeDecodingEnabled,
            config.mtpDrafts > 0,
            ["dflash2", "dflash", "dspine"].contains(config.mtpBackend?.lowercased() ?? "") {
-            let effDraftPack = config.dflashDraftPackPath
-                ?? (config.mtpBackend?.lowercased() == "dspine" ? QWDFlashConfig.defaultDSpinePackPath : nil)
+            let effDraftPack = resolveEffectiveDrafterPackPath(
+                for: config,
+                targetDescriptor: runtimeAssets.descriptor
+            )
             try QWDFlashConfig.validateDrafter(
                 targetDescriptor: runtimeAssets.descriptor,
                 packPath: effDraftPack,

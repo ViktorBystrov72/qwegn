@@ -102,16 +102,9 @@ extension FlashNextModule {
                                                 speculative: request.speculative,
                                                 engine: engine)
         let draftMode = try FNGPUSessionState.draftMode(for: request.speculative)
-        engine.batchScheduler.onCacheEvaluated = { [weak self, weak engine] sessionData in
-            guard let self, let engine else { return }
-            self.reportCacheEvent(engine: engine, sessionData: sessionData)
-        }
-        engine.batchScheduler.onSlot0CacheEvaluated = nil
-        engine.batchScheduler.onStepTiming = { gpuMs, wallMs in
-            if gpuMs > 0 && wallMs > 0 {
-                QWTelemetryRegistry.shared.record("gpu.busy_ratio", gpuMs / wallMs, provenance: .measured)
-            }
-        }
+        let specCap = engine.dflash != nil
+            ? min(FNGPUDFlash.maxDrafts, engine.dflashMaxDrafts)
+            : FNGPUSessionData.defaultMTPDrafts
         let job = FNBatchJob(
             prompt: request.prompt,
             maxNew: request.maxNew,
@@ -119,7 +112,7 @@ extension FlashNextModule {
             sampling: request.sampling,
             useSpec: useSpec && !request.collectLogprobs,
             draftMode: draftMode,
-            maxDrafts: max(1, min(FNGPUSessionData.defaultMTPDrafts, request.speculative.effectiveDrafts)),
+            maxDrafts: max(1, min(specCap, request.speculative.effectiveDrafts)),
             relaxedMargin: request.sampling.hasExplicitSeed ? 0 : request.speculative.effectiveRelaxedMargin,
             relaxedMinProb: request.speculative.effectiveRelaxedMinProb,
             quadraticSeeding: request.speculative.mtpQuadraticSeeding,
@@ -143,8 +136,6 @@ extension FlashNextModule {
         } catch let error as QWEngineError {
             throw QWModuleError.from(error)
         }
-        lastSpecProposals = out.specProposals
-        lastSpecAccepted = out.specAccepted
         var cache: QWCacheAnswer?
         if hasPrefixCache {
             cache = QWCacheAnswer(hit: out.prefixCacheHit,
@@ -156,8 +147,9 @@ extension FlashNextModule {
         if out.specProposals > 0 {
             let rounds = max(1, out.stepTokenCounts.count)
             let totalTok = out.stepTokenCounts.reduce(0, +)
-            specSummary = String(format: "mtp=%d/%d, rounds=%d, mean=%.2f tok/rnd",
-                                 out.specAccepted, out.specProposals,
+            let specLabel = engine.dflash.map { $0.config.isDSpine ? "dspine" : "dflash2" } ?? "mtp"
+            specSummary = String(format: "%@=%d/%d, rounds=%d, mean=%.2f tok/rnd",
+                                 specLabel, out.specAccepted, out.specProposals,
                                  rounds, Double(totalTok) / Double(rounds))
         }
         let finalResult = QWGenerationResult(
@@ -173,7 +165,7 @@ extension FlashNextModule {
             speculativeSummary: specSummary,
             tokenLogprobs: out.tokenLogprobs
         )
-        lastResult = finalResult
+        recordGenerationResult(finalResult, specProposals: out.specProposals, specAccepted: out.specAccepted)
         return finalResult
     }
 }

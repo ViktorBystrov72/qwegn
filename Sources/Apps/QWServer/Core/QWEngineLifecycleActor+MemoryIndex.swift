@@ -228,10 +228,29 @@ extension QWEngineLifecycleActor {
             sidecarPath: sidecarURL?.path ?? config.lsaConfig.sidecarPath
         )
 
+        let reqBackendRaw = request.mtpBackend?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let reqDraftPackRaw = request.dflashDraftPackPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reqDraftPack = (reqDraftPackRaw?.isEmpty == false) ? reqDraftPackRaw : nil
+        let requestedBackend: String? = (reqBackendRaw?.isEmpty == false)
+            ? reqBackendRaw
+            : reqDraftPack.map { QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: $0).backend }
+        if let requestedBackend {
+            _ = try QWMTPBackend.resolve(name: requestedBackend)
+        }
+        let targetBackend = requestedBackend ?? config.mtpBackend
+        let targetDraftPack = reqDraftPack ?? config.dflashDraftPackPath
+        let targetIsDFlash = QWServerSettings.normalizeExternalDrafterBackend(targetBackend) != nil
+        let targetSpecEnabled = (requestedBackend != nil && targetIsDFlash) ? true : config.speculativeDecodingEnabled
+        let targetDrafts = (requestedBackend != nil && targetIsDFlash) ? max(1, config.mtpDrafts) : config.mtpDrafts
+
         let savedPreConfig = config
         let needsConfigReload = config.kvMode != requestedKVMode
             || config.maxContext < requiredCapacity
             || config.lsaConfig.mode != resolvedLSAMode
+            || targetBackend != config.mtpBackend
+            || targetDraftPack != config.dflashDraftPackPath
+            || targetSpecEnabled != config.speculativeDecodingEnabled
+            || targetDrafts != config.mtpDrafts
 
         if needsConfigReload {
             if mountAfterIndex {
@@ -254,6 +273,10 @@ extension QWEngineLifecycleActor {
             let indexConfig = config.updating(
                 maxContext: max(config.maxContext, requiredCapacity),
                 kvMode: requestedKVMode,
+                speculativeDecodingEnabled: targetSpecEnabled,
+                mtpDrafts: targetDrafts,
+                mtpBackend: targetBackend,
+                dflashDraftPackPath: targetDraftPack,
                 lsaConfig: updatedLSA,
                 sourceSummary: updatedSources
             )

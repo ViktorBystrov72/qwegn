@@ -165,8 +165,9 @@ extension QWEngineDriver {
         let clampedContext = max(64, min(1_048_576, contextTokens))
         let rawGeometry = QWModelGeometry(descriptor: descriptor).withResidentExperts(tuning.residentExpertsPerLayer)
         let effDrafts = max(0, mtpDrafts)
-        let maxMTP = ["dflash2", "dflash", "dspine"].contains(mtpBackend.lowercased()) ? 15 : 7
-        let mtpWeightDrafts = descriptor.mtpLayers > 0 ? min(effDrafts, maxMTP) : 0
+        let isDFlash = ["dflash2", "dflash", "dspine"].contains(mtpBackend.lowercased())
+        let maxMTP = isDFlash ? 15 : 7
+        let mtpWeightDrafts = (descriptor.mtpLayers > 0 && !isDFlash) ? min(effDrafts, maxMTP) : 0
         let format: QWWeightFormat = {
             if let path = packPath, !path.isEmpty {
                 if let hit = cachedPackFormats.withLock({ $0[path] }) { return hit }

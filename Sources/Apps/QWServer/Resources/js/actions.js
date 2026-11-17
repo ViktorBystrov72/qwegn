@@ -3,7 +3,8 @@ async function loadDiscoveredModels() {
     const res = await fetch(`${API_BASE}/v1/models/discovered`);
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
-    discoveredModelsList = data.models || [];
+    discoveredModelsList = Array.isArray(data.models) ? data.models : [];
+    discoveredDraftersList = Array.isArray(data.drafters) ? data.drafters : [];
     renderModelsCards();
   } catch (err) {
     showToast("Failed to list models: " + err.message, true);
@@ -74,6 +75,7 @@ async function selectAndApplyModel(name, packPath) {
     showToast(`Switched active model to ${name}.`);
     fetchDashboard();
     fetchEngineInfo();
+    if (document.getElementById("settings-form-host")) loadLiveSettings();
   } catch (e) {
     showToast("Failed to switch model: " + e.message, true);
   }
@@ -295,6 +297,9 @@ async function loadLiveSettings() {
   const status = document.getElementById("settings-status-msg");
   if (status) status.textContent = "Loading…";
   try {
+    if (!Array.isArray(discoveredModelsList) || discoveredModelsList.length === 0) {
+      await loadDiscoveredModels();
+    }
     const res = await fetch(`${API_BASE}/v1/settings`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     loadedSettingsObj = await res.json();
@@ -364,6 +369,103 @@ function discardLiveSettings() {
   showToast("Reverted unsaved changes.");
 }
 
+function isExternalDrafterBackend(backend) {
+  const b = String(backend || "").toLowerCase();
+  return b === "dflash2" || b === "dflash" || b === "dspine";
+}
+
+function compatibleDraftersForModel(modelName) {
+  const list = Array.isArray(discoveredDraftersList) ? discoveredDraftersList : [];
+  if (!modelName) return list;
+  return list.filter((d) => Array.isArray(d.compatibleModels) && d.compatibleModels.includes(modelName));
+}
+
+function nativeMaxDraftsForModel(modelName) {
+  const match = (Array.isArray(discoveredModelsList) ? discoveredModelsList : []).find((m) => m.name === modelName);
+  return (match && typeof match.maxSpeculativeDrafts === "number" && match.maxSpeculativeDrafts > 0)
+    ? match.maxSpeculativeDrafts
+    : 7;
+}
+
+function updateMtpDraftsHint() {
+  const backendEl = document.getElementById("settings-mtp-backend");
+  const draftsEl = document.getElementById("settings-mtp-drafts");
+  const noteEl = document.getElementById("settings-mtp-drafts-note");
+  if (!draftsEl || !noteEl) return;
+  const isExt = backendEl ? isExternalDrafterBackend(backendEl.value) : false;
+  const count = parseInt(draftsEl.value, 10);
+  if (isExt && Number.isFinite(count) && count > 0) {
+    noteEl.textContent = `Block size B = ${count + 1}; sparse-MoE adaptive window trims automatically on high entropy.`;
+    noteEl.hidden = false;
+  } else {
+    noteEl.textContent = "";
+    noteEl.hidden = true;
+  }
+}
+
+function handleWebMTPDraftsInput() {
+  updateMtpDraftsHint();
+  updateSettingsDirtyState();
+}
+
+function handleWebMTPBackendChange(selectEl) {
+  const newBackend = String(selectEl && selectEl.value ? selectEl.value : "").toLowerCase();
+  const isExt = isExternalDrafterBackend(newBackend);
+  document.querySelectorAll(".spec-native-only").forEach((el) => { el.hidden = isExt; });
+  document.querySelectorAll(".spec-dflash-only").forEach((el) => { el.hidden = !isExt; });
+
+  const modelInput = document.querySelector("[data-setting='modelName']");
+  const modelName = modelInput ? modelInput.value : (loadedSettingsObj ? loadedSettingsObj.modelName : "");
+  const draftsEl = document.getElementById("settings-mtp-drafts");
+  const drafterSel = document.getElementById("settings-drafter-select");
+  const drafterPathEl = document.getElementById("settings-drafter-pack-path");
+  const compat = compatibleDraftersForModel(modelName);
+
+  if (isExt) {
+    const currentPath = drafterPathEl ? drafterPathEl.value.trim() : "";
+    const currentMatch = compat.find((d) => d.packPath === currentPath && d.backend === newBackend);
+    const targetDrafter = currentMatch || compat.find((d) => d.backend === newBackend) || compat[0] || null;
+    if (targetDrafter) {
+      if (drafterSel) drafterSel.value = targetDrafter.packPath;
+      if (drafterPathEl) drafterPathEl.value = targetDrafter.packPath;
+      if (draftsEl) {
+        const maxD = typeof targetDrafter.maxDrafts === "number" && targetDrafter.maxDrafts > 0 ? targetDrafter.maxDrafts : 7;
+        draftsEl.max = String(maxD);
+        draftsEl.value = String(maxD);
+      }
+    }
+  } else if (draftsEl) {
+    const nativeMax = nativeMaxDraftsForModel(modelName);
+    draftsEl.max = String(nativeMax);
+    const cur = parseInt(draftsEl.value, 10);
+    if (Number.isFinite(cur) && cur > nativeMax) {
+      draftsEl.value = String(Math.min(3, nativeMax));
+    }
+  }
+  updateMtpDraftsHint();
+  updateSettingsDirtyState();
+}
+
+function handleWebDrafterSelectChange(selectEl) {
+  const path = selectEl ? selectEl.value : "";
+  const drafterPathEl = document.getElementById("settings-drafter-pack-path");
+  const backendEl = document.getElementById("settings-mtp-backend");
+  const draftsEl = document.getElementById("settings-mtp-drafts");
+  if (drafterPathEl) drafterPathEl.value = path;
+  const match = (Array.isArray(discoveredDraftersList) ? discoveredDraftersList : []).find((d) => d.packPath === path);
+  if (match) {
+    if (backendEl && isExternalDrafterBackend(backendEl.value)) {
+      backendEl.value = match.backend;
+    }
+    if (draftsEl && typeof match.maxDrafts === "number" && match.maxDrafts > 0) {
+      draftsEl.max = String(match.maxDrafts);
+      draftsEl.value = String(match.maxDrafts);
+    }
+  }
+  updateMtpDraftsHint();
+  updateSettingsDirtyState();
+}
+
 function renderSettingsForm(s) {
   const host = document.getElementById("settings-form-host");
   if (!host || !s) return;
@@ -375,6 +477,33 @@ function renderSettingsForm(s) {
   const memStatusText = mountedMem
     ? `Mounted: ${mountedMem.mountedMemoryPack}${mountedMem.mountedMemoryPackRoot ? " · " + mountedMem.mountedMemoryPackRoot : ""}`
     : "No .qwcache mounted. Enter a repo root or auto-discover via agent system prompts.";
+  const isExt = isExternalDrafterBackend(s.mtpBackend);
+  const compatDrafters = compatibleDraftersForModel(s.modelName);
+  const dflashAvail = compatDrafters.some((d) => d.backend === "dflash2");
+  const dspineAvail = compatDrafters.some((d) => d.backend === "dspine");
+  const curPack = typeof s.dflashDraftPackPath === "string" ? s.dflashDraftPackPath.trim() : "";
+  const matchedDrafter = compatDrafters.find((d) => d.packPath === curPack) || null;
+  const nativeCap = nativeMaxDraftsForModel(s.modelName);
+  const maxDraftsLimit = isExt
+    ? (matchedDrafter && typeof matchedDrafter.maxDrafts === "number" ? matchedDrafter.maxDrafts : (String(s.mtpBackend || "").toLowerCase() === "dspine" ? 15 : 7))
+    : nativeCap;
+  const draftTokensVal = (typeof s.mtpDrafts === "number" && Number.isFinite(s.mtpDrafts)) ? s.mtpDrafts : 3;
+  const strategyVal = s.mtpDraftStrategy || "hybrid";
+  const topKVal = (typeof s.dflashSelectorTopK === "number" && Number.isFinite(s.dflashSelectorTopK)) ? s.dflashSelectorTopK : 16;
+  const drafterOptions = compatDrafters.map((d) =>
+    `<option value="${escapeHtml(d.packPath)}" ${curPack === d.packPath ? "selected" : ""}>${escapeHtml(d.name)}</option>`
+  );
+  if (curPack && !compatDrafters.some((d) => d.packPath === curPack)) {
+    const customLabel = curPack.split("/").filter(Boolean).pop() || curPack;
+    drafterOptions.unshift(`<option value="${escapeHtml(curPack)}" selected>${escapeHtml(customLabel)} (Custom Path)</option>`);
+  }
+  if (drafterOptions.length === 0) {
+    drafterOptions.push(`<option value="" selected>No compatible drafter pack installed</option>`);
+  }
+  const topKPresets = [1, 4, 8, 16];
+  const customTopKOpt = !topKPresets.includes(topKVal)
+    ? `<option value="${topKVal}" selected>${topKVal} (Custom)</option>`
+    : "";
   host.innerHTML = `
     <div class="metric-cell" style="padding:14px;">
       <h3 style="margin:0 0 10px;font-size:13px;">Model &amp; Context</h3>
@@ -429,11 +558,39 @@ function renderSettingsForm(s) {
         </select>
       </div>
       <div class="form-field"><label>MTP Backend <span class="restart-tag">[restart]</span></label>
-        <select class="select" data-setting="mtpBackend">
+        <select id="settings-mtp-backend" class="select" data-setting="mtpBackend" onchange="handleWebMTPBackendChange(this)">
           <option value="standard" ${s.mtpBackend === "standard" ? "selected" : ""}>Standard</option>
           <option value="variational" ${s.mtpBackend === "variational" ? "selected" : ""}>Variational</option>
-          <option value="dflash2" ${s.mtpBackend === "dflash2" ? "selected" : ""}>DFlash 2</option>
-          <option value="dspine" ${s.mtpBackend === "dspine" ? "selected" : ""}>DSpine</option>
+          <option value="dflash2" ${s.mtpBackend === "dflash2" ? "selected" : ""} ${(s.mtpBackend !== "dflash2" && !dflashAvail) ? "disabled" : ""}>DFlash 2${dflashAvail ? "" : " (No Pack Installed)"}</option>
+          <option value="dspine" ${s.mtpBackend === "dspine" ? "selected" : ""} ${(s.mtpBackend !== "dspine" && !dspineAvail) ? "disabled" : ""}>DSpine${dspineAvail ? "" : " (No Pack Installed)"}</option>
+        </select>
+      </div>
+      <div class="form-field"><label>MTP Draft Tokens <span class="restart-tag">[restart]</span></label>
+        <input id="settings-mtp-drafts" class="input mono" type="number" min="0" max="${maxDraftsLimit}" step="1" data-setting-int="mtpDrafts" value="${draftTokensVal}" oninput="handleWebMTPDraftsInput()" />
+        <div id="settings-mtp-drafts-note" class="panel-sub" style="margin-top:2px;" ${(isExt && draftTokensVal > 0) ? "" : "hidden"}>${(isExt && draftTokensVal > 0) ? `Block size B = ${draftTokensVal + 1}; sparse-MoE adaptive window trims automatically on high entropy.` : ""}</div>
+      </div>
+      <div class="form-field spec-native-only" ${isExt ? "hidden" : ""}><label>Draft Strategy <span class="restart-tag">[restart]</span></label>
+        <select class="select" data-setting="mtpDraftStrategy">
+          <option value="hybrid" ${strategyVal === "hybrid" ? "selected" : ""}>Hybrid (MTP + N-Gram)</option>
+          <option value="mtp" ${strategyVal === "mtp" ? "selected" : ""}>MTP Only</option>
+          <option value="ngram" ${strategyVal === "ngram" ? "selected" : ""}>N-Gram Only</option>
+        </select>
+      </div>
+      <div class="form-field spec-dflash-only" ${isExt ? "" : "hidden"}><label>Drafter Model <span class="restart-tag">[restart]</span></label>
+        <select id="settings-drafter-select" class="select" onchange="handleWebDrafterSelectChange(this)">
+          ${drafterOptions.join("")}
+        </select>
+      </div>
+      <div class="form-field spec-dflash-only" ${isExt ? "" : "hidden"}><label>Drafter Pack Path <span class="restart-tag">[restart]</span></label>
+        <input id="settings-drafter-pack-path" class="input mono" data-setting="dflashDraftPackPath" value="${escapeHtml(curPack)}" placeholder="~/.qwg/models/&lt;drafter-pack&gt;" />
+      </div>
+      <div class="form-field spec-dflash-only" ${isExt ? "" : "hidden"}><label>Selector Top-K <span class="restart-tag">[restart]</span></label>
+        <select class="select" data-setting-int="dflashSelectorTopK">
+          ${customTopKOpt}
+          <option value="1" ${topKVal === 1 ? "selected" : ""}>1 (Argmax)</option>
+          <option value="4" ${topKVal === 4 ? "selected" : ""}>4</option>
+          <option value="8" ${topKVal === 8 ? "selected" : ""}>8</option>
+          <option value="16" ${topKVal === 16 ? "selected" : ""}>16 (Default)</option>
         </select>
       </div>
       <div class="form-field"><label>LSA Mode <span class="restart-tag">[restart]</span></label>
@@ -496,11 +653,13 @@ async function saveLiveSettings() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
-    loadedSettingsObj = payload;
+    const verifyRes = await fetch(`${API_BASE}/v1/settings`).catch(() => null);
+    loadedSettingsObj = (verifyRes && verifyRes.ok) ? await verifyRes.json() : payload;
+    renderSettingsForm(loadedSettingsObj);
     updateSettingsDirtyState();
     if (status) status.textContent = "Saved";
     showToast("Settings saved to ~/.qwg/settings.json.");
-    if (typeof syncChatWithServerSettings === "function") syncChatWithServerSettings(payload);
+    if (typeof syncChatWithServerSettings === "function") syncChatWithServerSettings(loadedSettingsObj);
     fetchDashboard();
   } catch (err) {
     if (status) status.textContent = "Save failed";

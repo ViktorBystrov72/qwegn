@@ -1,6 +1,5 @@
-// QWDFlashDrafter.swift — DFlash 2 parallel block-diffusion drafter
-// for Qwen3.8-27B (5 sliding-window layers, 2-tap dynamic causal conv,
-// non-causal block attention, and rank-256 pairwise CandidateSelector).
+// QWDFlashDrafter.swift — DFlash 2 / DSpine parallel block-diffusion drafter
+// with sliding-window layers, dynamic causal conv, and rank-256 selector.
 import Darwin
 import Foundation
 import Metal
@@ -10,12 +9,24 @@ import QWGEMM
 import QWHead
 import QWHAL
 import QWLoad
-import QWMTP
 import QWQuant
 
-/// The drafter config and session slot types live in QWDFlashDrafter+Config.swift.
-final class QWDFlashDrafter: @unchecked Sendable {
-    let geometry: QWModelGeometry
+public final class QWDFlashDrafter: @unchecked Sendable {
+    public let geometry: QWModelGeometry
+    public static let rowPairedMinimumRows = 4
+
+    public static func usesQ4GMKernel(_ weight: QWWeightView) -> Bool {
+        weight.isIncumbentContainer || (!weight.isSHVQ && weight.bits == 4 && weight.groupSize == 32)
+    }
+
+    public static func usesRowPairs(_ weight: QWWeightView, activeRows: Int) -> Bool {
+        usesQ4GMKernel(weight) && activeRows >= rowPairedMinimumRows
+    }
+
+    public static func siluThreadgroups(i: Int) -> Int {
+        (i + 511) / 512
+    }
+
     struct LayerWeights {
         let ln1: QWTensorValue
         let ln2: QWTensorValue
@@ -32,11 +43,15 @@ final class QWDFlashDrafter: @unchecked Sendable {
         let downProj: QWWeightView
     }
 
-    static let defaultPackPath: String = QWDFlashConfig.defaultPackPath
+    public static let defaultPackPath: String = QWDFlashConfig.defaultPackPath
 
-    let config: QWDFlashConfig
-    let packPath: String
-    let targetLayerSlotMap: [Int]
+    public let config: QWDFlashConfig
+    public let packPath: String
+    public let targetLayerSlotMap: [Int]
+    public let sessionSlots: [QWDFlashSessionSlot]
+    public let targetHidden: QWTensorValue
+
+    let hal: QWHal
     let weightBuffer: any MTLBuffer
     let scratchBuffer: any MTLBuffer
 
@@ -50,12 +65,13 @@ final class QWDFlashDrafter: @unchecked Sendable {
     let invFreq: QWTensorValue
     let layers: [LayerWeights]
 
-    let targetHidden: QWTensorValue
     let hCtx: QWTensorValue
     let kvCtx: QWTensorValue
     let propX: QWTensorValue
     let propNorm: QWTensorValue
     let propRot: QWTensorValue
+    let propRot32: QWTensorValue
+    let propTokens: QWTensorValue
     let propDyn: QWTensorValue?
     let qkvProp: QWTensorValue
     let attnOut: QWTensorValue
@@ -71,6 +87,8 @@ final class QWDFlashDrafter: @unchecked Sendable {
     let dspineScratch: DSpineBridgeScratch?
 
     let psoCaptureTarget: any MTLComputePipelineState
+    let psoCaptureHC: any MTLComputePipelineState
+    let psoStagePropBF16: any MTLComputePipelineState
     let psoRMSNorm: any MTLComputePipelineState
     let psoF16GemvBatched: any MTLComputePipelineState
     let psoConvApply: any MTLComputePipelineState
@@ -93,9 +111,7 @@ final class QWDFlashDrafter: @unchecked Sendable {
     let dspinePSO: DSpinePipelines
     let quantPSOs: [DrafterQuantKey: DrafterQuantPipelines]
 
-    let sessionSlots: [QWDFlashSessionSlot]
-
-    init(geometry: QWModelGeometry, hal: QWHal, packPath: String, drafts: Int = 7, selectorTopK: Int? = nil) throws {
+    public init(geometry: QWModelGeometry, hal: QWHal, packPath: String, drafts: Int = 7, selectorTopK: Int? = nil) throws {
         try QWDFlashConfig.validateDrafter(
             targetDescriptor: geometry.descriptor,
             packPath: packPath,
@@ -103,9 +119,10 @@ final class QWDFlashDrafter: @unchecked Sendable {
             selectorTopK: selectorTopK
         )
         self.geometry = geometry
+        self.hal = hal
         let resolvedURL = packPath.canonicalFileURL
         guard FileManager.default.fileExists(atPath: resolvedURL.path) else {
-            throw QWEngineDriverError.packMissing(resolvedURL.path)
+            throw QWDFlashError.packMissing(resolvedURL.path)
         }
         self.packPath = resolvedURL.path
         self.config = QWDFlashConfig.load(from: resolvedURL, topKOverride: selectorTopK)
@@ -116,7 +133,7 @@ final class QWDFlashDrafter: @unchecked Sendable {
         self.targetLayerSlotMap = slotMap
 
         guard let drafterCfgURL = QWModelRoot(url: resolvedURL).configURL else {
-            throw QWEngineDriverError.state("DFlash2 drafter missing config.json at \(resolvedURL.path)")
+            throw QWDFlashError.state("DFlash2 drafter missing config.json at \(resolvedURL.path)")
         }
         let drafterDescriptor = try QWModelDescriptor.decodeDrafter(configJSON: Data(contentsOf: drafterCfgURL))
         let pack = try QWQuant.Pack(url: resolvedURL, descriptor: drafterDescriptor)
@@ -124,7 +141,7 @@ final class QWDFlashDrafter: @unchecked Sendable {
 
         let wCapacity = Self.computeWeightCapacity(pack: pack, isDSpine: config.isDSpine)
         guard let wBuf = hal.device.makeBuffer(length: wCapacity, options: .storageModeShared) else {
-            throw QWEngineDriverError.state("QWDFlashDrafter: failed to allocate weight buffer")
+            throw QWDFlashError.state("QWDFlashDrafter: failed to allocate weight buffer")
         }
         self.weightBuffer = wBuf
         let wSub = QWSubAllocator(region: QWMRegion(buffer: wBuf, base: 0, length: wCapacity))
@@ -138,13 +155,15 @@ final class QWDFlashDrafter: @unchecked Sendable {
         }
 
         let psoBf16F16 = try hal.pipeline("qwg_bf16_to_f16")
-        let cvtTmp = hal.device.makeBuffer(length: 16 * 1024 * 1024, options: .storageModeShared)!
+        guard let cvtTmp = hal.device.makeBuffer(length: 16 * 1024 * 1024, options: .storageModeShared) else {
+            throw QWDFlashError.state("QWDFlashDrafter: failed to allocate bf16 staging buffer")
+        }
 
         func loadF16(_ name: String, _ elems: Int) throws -> QWTensorValue {
             let e = try pack.entry(name)
             let total = e.shape.reduce(1, *)
             guard total == elems else {
-                throw QWEngineDriverError.weightMissing(name, "DFlash shape \(total) != \(elems)")
+                throw QWDFlashError.weightMissing(name, "DFlash shape \(total) != \(elems)")
             }
             let t = try wSub.allocate(QWTensorShape([elems], .f16))
             if elems >= 4096, e.rawOff != nil {
@@ -154,7 +173,7 @@ final class QWDFlashDrafter: @unchecked Sendable {
                     let n = min(chunk, elems - done)
                     try io.loadRaw(name, elemOffset: done, elems: n, into: cvtTmp.contents())
                     guard let (cb, enc) = hal.begin() else {
-                        throw QWEngineDriverError.state("DFlash bf16->f16 cmdbuffer")
+                        throw QWDFlashError.state("DFlash bf16->f16 cmdbuffer")
                     }
                     var start = UInt32(0), nn = UInt32(n)
                     enc.setComputePipelineState(psoBf16F16)
@@ -243,7 +262,7 @@ final class QWDFlashDrafter: @unchecked Sendable {
                                          offset: qkvBig.blocks.offset + kvBlockOffset,
                                          shape: QWTensorShape([kvByteCount / 2], .f16))
             guard let kvView = qkvBig.subview(blocks: kvBlocks, n: 2 * kvDim, k: H) else {
-                throw QWEngineDriverError.weightMissing(p + "self_attn.k_proj.weight", "invalid kvView")
+                throw QWDFlashError.weightMissing(p + "self_attn.k_proj.weight", "invalid kvView")
             }
             let oProj = try loadQ4(p + "self_attn.o_proj.weight", n: H, k: qDim)
             let (guBig, _) = try concatQ4([
@@ -263,15 +282,18 @@ final class QWDFlashDrafter: @unchecked Sendable {
         wSub.markSteadyState()
         pack.adviseDontNeed()
 
-        let sCapacity = config.maxCacheSize > 2048 ? 992_000_000 : 240_000_000
-        guard let sBuf = hal.device.makeBuffer(length: sCapacity, options: .storageModeShared) else {
-            throw QWEngineDriverError.state("QWDFlashDrafter: failed to allocate scratch buffer")
-        }
-        self.scratchBuffer = sBuf
-        let sSub = QWSubAllocator(region: QWMRegion(buffer: sBuf, base: 0, length: sCapacity))
         let maxCtx = config.maxCacheSize
         let maxB = max(8, config.blockSize)
         let maxD = maxB - 1
+        let sCapacity = Self.computeScratchCapacity(
+            config: config, maxCtx: maxCtx, maxB: maxB, maxD: maxD,
+            qDim: qDim, kvDim: kvDim, hasConv: hasConv, convProjDim: convProjDim
+        )
+        guard let sBuf = hal.device.makeBuffer(length: sCapacity, options: .storageModeShared) else {
+            throw QWDFlashError.state("QWDFlashDrafter: failed to allocate scratch buffer")
+        }
+        self.scratchBuffer = sBuf
+        let sSub = QWSubAllocator(region: QWMRegion(buffer: sBuf, base: 0, length: sCapacity))
 
         self.targetHidden = try sSub.allocate(QWTensorShape([maxCtx * config.targetLayerIds.count * H], .f16))
         self.hCtx = try sSub.allocate(QWTensorShape([maxCtx * H], .f16))
@@ -279,6 +301,8 @@ final class QWDFlashDrafter: @unchecked Sendable {
         self.propX = try sSub.allocate(QWTensorShape([maxB * H], .f32))
         self.propNorm = try sSub.allocate(QWTensorShape([maxB * H], .f16))
         self.propRot = try sSub.allocate(QWTensorShape([maxB * H], .f16))
+        self.propRot32 = try sSub.allocate(QWTensorShape([maxB * H], .f32))
+        self.propTokens = try sSub.allocate(QWTensorShape([maxB], .i32))
         self.propDyn = hasConv ? try sSub.allocate(QWTensorShape([maxB * convProjDim], .f32)) : nil
         self.qkvProp = try sSub.allocate(QWTensorShape([maxB * (qDim + 2 * kvDim)], .f16))
         self.attnOut = try sSub.allocate(QWTensorShape([maxB * qDim], .f16))
@@ -314,6 +338,8 @@ final class QWDFlashDrafter: @unchecked Sendable {
         sSub.markSteadyState()
 
         self.psoCaptureTarget = try hal.pipeline("qwg_dflash_capture_target_hidden")
+        self.psoCaptureHC = try hal.pipeline("qwg_dflash_capture_hc_hidden")
+        self.psoStagePropBF16 = try hal.pipeline("qwg_dflash_stage_prop_bf16")
         self.psoRMSNorm = try hal.pipeline("qwg_dflash_rmsnorm")
         self.psoF16GemvBatched = try hal.pipeline("qwg_dflash_f16_gemv_batched")
         self.psoConvApply = try hal.pipeline("qwg_dflash_conv_apply")
@@ -349,7 +375,7 @@ final class QWDFlashDrafter: @unchecked Sendable {
                 downAQ4Map[m] = try hal.pipeline("qwm_mlp_down_m\(m)", isAQ4: true)
                 guAQ4Map[m] = try hal.pipeline("qwm_mlp_gate_up_fwht32_m\(m)", isAQ4: true)
             }
-            if m >= QWMTPBatchedMLP.rowPairedMinimumRows {
+            if m >= Self.rowPairedMinimumRows {
                 downRowPairedMap[m] = try hal.pipeline("qwm_mlp_down_rp_m\(m)")
                 if needsAQ4 {
                     downRowPairedAQ4Map[m] = try hal.pipeline("qwm_mlp_down_rp_m\(m)", isAQ4: true)
@@ -365,4 +391,38 @@ final class QWDFlashDrafter: @unchecked Sendable {
         self.quantPSOs = try Self.loadQuantPipelines(hal: hal, fc: self.fc, layers: loadedLayers)
     }
 
+    private static func computeScratchCapacity(
+        config: QWDFlashConfig, maxCtx: Int, maxB: Int, maxD: Int,
+        qDim: Int, kvDim: Int, hasConv: Bool, convProjDim: Int
+    ) -> Int {
+        func aligned(_ bytes: Int) -> Int { ((bytes + 4095) / 4096) * 4096 }
+        let H = config.hiddenSize
+        let V = config.vocabSize
+        let I = config.intermediateSize
+        let R = config.selectorRank
+        var total = 0
+        total += aligned(maxCtx * config.targetLayerIds.count * H * 2)
+        total += aligned(maxCtx * H * 2)
+        total += aligned(maxCtx * 2 * kvDim * 2)
+        total += aligned(maxB * H * 4) * 2
+        total += aligned(maxB * H * 2) * 3
+        total += aligned(maxB * 4) * 2
+        if hasConv { total += aligned(maxB * convProjDim * 4) }
+        total += aligned(maxB * (qDim + 2 * kvDim) * 2)
+        total += aligned(maxB * qDim * 2)
+        total += aligned(maxB * I * 2)
+        total += aligned(maxD * V * 4)
+        total += aligned(maxD * 256 * 16 * 4) * 2
+        total += aligned(maxD * 16 * 4) * 2
+        if !config.isDSpine { total += aligned(maxD * R * 4) }
+        if config.isDSpine {
+            let bc = config.bridgeCodeSize, br = config.bridgeRank
+            total += aligned(maxB * 4) + aligned(maxD * bc * 4) + aligned(maxB * bc * 2)
+            total += aligned(maxB * 3 * br * 4) + aligned(maxD * br * 2) + aligned(maxD * H * 4)
+            total += aligned(maxD * 16 * br * 2) + aligned(maxD * 16 * H * 4)
+            total += aligned(maxD * 16 * H * 2) * 2 + aligned(maxD * 16 * 16 * 4)
+        }
+        total += 4 * aligned(config.numLayers * maxCtx * kvDim * 2)
+        return max(32 * 1024 * 1024, total + 16 * 1024 * 1024)
+    }
 }

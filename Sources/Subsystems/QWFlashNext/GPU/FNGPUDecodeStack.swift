@@ -4,6 +4,7 @@ import QWAlloc
 import QWGEMM
 import QWGDN
 import QWHAL
+import QWMTP
 
 /// Chains decoder layers token by token: GDN and PLE state, and per-attention-layer KV/index caches, persist across
 /// calls. Early submissions overlap CPU encoding with GPU execution. `history` is the whole token sequence so far.
@@ -94,7 +95,9 @@ public final class FNGPUDecodeStack {
                             readStream: Bool = false, verifyAllRows: Bool = false,
                             mtp: FNGPUMTP? = nil, activeRows: Int? = nil,
                             relaxedMargin: Float = 0, relaxedRows: Int? = nil,
-                            relaxedMinProb: Float = 0) throws -> (stream: [Float], token: Int) {
+                            relaxedMinProb: Float = 0,
+                            dflash: QWDFlashDrafter? = nil,
+                            preContextUpdate: (slot: QWDFlashSessionSlot, startPosition: Int, totalCount: Int)? = nil) throws -> (stream: [Float], token: Int) {
         let k = activeRows ?? rows
         precondition(k >= 1 && k <= rows && !history.isEmpty && history.count >= k && embedTable.hc * embedTable.hidden == width)
         precondition(!verifyAllRows || Self.supportsRollbackWindow(k),
@@ -103,7 +106,7 @@ public final class FNGPUDecodeStack {
         return try runRows(history: history, stage: .gatheredRows(embedTable, toks), head: head,
                            readStream: readStream, verifyAllRows: verifyAllRows, mtp: mtp,
                            activeRows: k, relaxedMargin: relaxedMargin, relaxedRows: relaxedRows,
-                           relaxedMinProb: relaxedMinProb)
+                           relaxedMinProb: relaxedMinProb, dflash: dflash, preContextUpdate: preContextUpdate)
     }
 
     /// Rolls back `rejectedCount` verify rows (`1 <= rejectedCount < rows`) after draft rejection,
@@ -147,7 +150,10 @@ public final class FNGPUDecodeStack {
                          readStream: Bool, verifyAllRows: Bool = false,
                          mtp: FNGPUMTP? = nil, activeRows: Int? = nil,
                          relaxedMargin: Float = 0, relaxedRows: Int? = nil,
-                         relaxedMinProb: Float = 0) throws -> (stream: [Float], token: Int) {
+                         relaxedMinProb: Float = 0,
+                         dflash: QWDFlashDrafter? = nil,
+                         dflashSlot: QWDFlashSessionSlot? = nil,
+                         preContextUpdate: (slot: QWDFlashSessionSlot, startPosition: Int, totalCount: Int)? = nil) throws -> (stream: [Float], token: Int) {
         let k = activeRows ?? rows
         // Rows at or beyond `relaxedRows` verify by exact argmax.
         let relaxedLimit = min(relaxedRows ?? k, k)
@@ -227,6 +233,10 @@ public final class FNGPUDecodeStack {
                                                     rowsPerTarget: k * gple.headCount,
                                                     numTargets: gple.embeddings.count)
                 }
+                if let pre = preContextUpdate, let dflash {
+                    dflash.encodeContextUpdate(enc, slot: pre.slot, startPosition: pre.startPosition,
+                                               totalCount: pre.totalCount)
+                }
                 enc.memoryBarrier(scope: .buffers)
             }
             for i in lo..<hi {
@@ -240,6 +250,12 @@ public final class FNGPUDecodeStack {
                 try FNGPULayerPasses.layer(enc, ctx: ctx, layer: slot.weights, s: slot.scratch, stream: cur, out: nxt,
                                            attnState: slot.attn, pos: pos, inInject: inInj, deferOutInject: deferOut)
                 swap(&cur, &nxt)
+                if let dflash {
+                    FNGPUDFlash.encodeLayerCapture(
+                        enc, dflash: dflash, layerIndex: i, deferOut: deferOut,
+                        base: slot.scratch.h2, src: slot.scratch.moeOut, inj: slot.scratch.injB,
+                        cur: cur, srcRowOffset: 0, dstRowOffset: 0, rows: k, hc: slot.scratch.hc)
+                }
             }
             if hi == slots.count {
                 if verifyAllRows {
@@ -268,6 +284,9 @@ public final class FNGPUDecodeStack {
                     if let mtp, k == 1 {
                         enc.memoryBarrier(scope: .buffers)
                         try mtp.encode(&enc, cb: cb, streamPrev: cur, tokens: head.token, pos: pos, rows: 1, projectRows: 1)
+                    } else if let dflash, let dflashSlot, k == 1 {
+                        enc.memoryBarrier(scope: .buffers)
+                        dflash.encodeContextUpdate(enc, slot: dflashSlot, startPosition: pos, totalCount: 1)
                     }
                 }
             }
@@ -329,17 +348,27 @@ public final class FNGPUDecodeStack {
     /// Runs all slots for the token at position history.count - 1, then the final mixer and the LM head.
     /// Residual stream is gathered on-device from the raw-bf16 table using `head.token` — no host staging.
     public func forwardToken(history: [Int64], embedTable: FNGPUEmbedTable, head: FNGPUHead,
-                             readStream: Bool = true, mtp: FNGPUMTP? = nil) throws -> (token: Int, stream: [Float]) {
+                             readStream: Bool = true, mtp: FNGPUMTP? = nil,
+                             dflash: QWDFlashDrafter? = nil,
+                             dflashSlot: QWDFlashSessionSlot? = nil,
+                             preContextUpdate: (slot: QWDFlashSessionSlot, startPosition: Int, totalCount: Int)? = nil) throws -> (token: Int, stream: [Float]) {
         precondition(!history.isEmpty && embedTable.hc * embedTable.hidden == width)
-        let r = try runRows(history: history, stage: .gathered(embedTable), head: head, readStream: readStream, mtp: mtp)
+        let r = try runRows(history: history, stage: .gathered(embedTable), head: head, readStream: readStream,
+                            mtp: mtp, dflash: dflash, dflashSlot: dflashSlot,
+                            preContextUpdate: preContextUpdate)
         return (r.token, r.stream)
     }
 
     /// Runs all slots for a single pre-expanded host stream row (`width = hc * hidden`).
     public func forwardToken(history: [Int64], streamIn: [Float], head: FNGPUHead,
-                             readStream: Bool = true, mtp: FNGPUMTP? = nil) throws -> (token: Int, stream: [Float]) {
+                             readStream: Bool = true, mtp: FNGPUMTP? = nil,
+                             dflash: QWDFlashDrafter? = nil,
+                             dflashSlot: QWDFlashSessionSlot? = nil,
+                             preContextUpdate: (slot: QWDFlashSessionSlot, startPosition: Int, totalCount: Int)? = nil) throws -> (token: Int, stream: [Float]) {
         precondition(!history.isEmpty && streamIn.count == width)
-        let r = try runRows(history: history, stage: .host(streamIn), head: head, readStream: readStream, mtp: mtp)
+        let r = try runRows(history: history, stage: .host(streamIn), head: head, readStream: readStream,
+                            mtp: mtp, dflash: dflash, dflashSlot: dflashSlot,
+                            preContextUpdate: preContextUpdate)
         return (r.token, r.stream)
     }
 

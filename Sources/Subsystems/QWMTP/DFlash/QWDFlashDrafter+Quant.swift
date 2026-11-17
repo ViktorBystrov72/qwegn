@@ -22,7 +22,7 @@ struct DrafterQuantPipelines {
 }
 
 extension QWDFlashDrafter {
-    static func computeWeightCapacity(pack: QWQuant.Pack, isDSpine: Bool) -> Int {
+    public static func computeWeightCapacity(pack: QWQuant.Pack, isDSpine: Bool) -> Int {
         let defaultCap = isDSpine ? 1_920_000_000 : 1_480_000_000
         let allIncumbent = pack.tensors.values.allSatisfy { !$0.quantized || $0.isIncumbentHQ4 }
         if allIncumbent {
@@ -52,7 +52,7 @@ extension QWDFlashDrafter {
     ) throws -> QWWeightView {
         let s = try QWCheckpointTensorLoader.span(pack, name)
         guard s.rows == n, s.cols == k else {
-            throw QWEngineDriverError.weightMissing(name, "DFlash quant shape [\(s.rows), \(s.cols)] != [\(n), \(k)]")
+            throw QWDFlashError.weightMissing(name, "DFlash quant shape [\(s.rows), \(s.cols)] != [\(n), \(k)]")
         }
         let t = try wSub.allocate(QWTensorShape([s.bytes / 2], .f16))
         let dst = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
@@ -62,7 +62,7 @@ extension QWDFlashDrafter {
             blocks: t, n: n, k: k, bits: s.bits, groupSize: s.group,
             isRotated: rot, isIncumbentContainer: rot && s.isIncumbent, isSHVQ: rot && s.isSHVQ
         ) else {
-            throw QWEngineDriverError.weightMissing(name, "invalid DFlash quant view")
+            throw QWDFlashError.weightMissing(name, "invalid DFlash quant view")
         }
         return v
     }
@@ -78,7 +78,7 @@ extension QWDFlashDrafter {
         let spans = try specs.map { spec -> (name: String, n: Int, span: QWCheckpointTensorLoader.PackSpan) in
             let s = try QWCheckpointTensorLoader.span(pack, spec.name)
             guard s.rows == spec.n, s.cols == k else {
-                throw QWEngineDriverError.weightMissing(spec.name, "DFlash concat shape mismatch")
+                throw QWDFlashError.weightMissing(spec.name, "DFlash concat shape mismatch")
             }
             return (spec.name, spec.n, s)
         }
@@ -87,7 +87,7 @@ extension QWDFlashDrafter {
                   $0.span.bits == first.bits && $0.span.group == first.group
                       && $0.span.isIncumbent == first.isIncumbent && $0.span.isSHVQ == first.isSHVQ
               }) else {
-            throw QWEngineDriverError.weightMissing(specs.first?.name ?? "concat", "mismatched DFlash concat formats")
+            throw QWDFlashError.weightMissing(specs.first?.name ?? "concat", "mismatched DFlash concat formats")
         }
         let totalN = specs.reduce(0) { $0 + $1.n }
         let totalBytes = spans.reduce(0) { $0 + $1.span.bytes }
@@ -98,7 +98,7 @@ extension QWDFlashDrafter {
             blocks: blocks, n: totalN, k: k, bits: first.bits, groupSize: first.group,
             isRotated: rot, isIncumbentContainer: rot && first.isIncumbent, isSHVQ: rot && first.isSHVQ
         ) else {
-            throw QWEngineDriverError.weightMissing(specs.first?.name ?? "concat", "invalid DFlash concat")
+            throw QWDFlashError.weightMissing(specs.first?.name ?? "concat", "invalid DFlash concat")
         }
         var byteOff = 0
         var subViews: [QWWeightView] = []
@@ -107,7 +107,7 @@ extension QWDFlashDrafter {
             let subT = QWTensorValue(region: blocks.region, offset: blocks.offset + byteOff,
                                      shape: QWTensorShape([item.span.bytes / 2], .f16))
             guard let sv = big.subview(blocks: subT, n: item.n, k: k) else {
-                throw QWEngineDriverError.weightMissing(item.name, "invalid DFlash subview")
+                throw QWDFlashError.weightMissing(item.name, "invalid DFlash subview")
             }
             subViews.append(sv)
             byteOff += item.span.bytes
@@ -125,13 +125,13 @@ extension QWDFlashDrafter {
             views.append(contentsOf: [lw.qkvProj, lw.kvProj, lw.oProj, lw.gateUpProj, lw.downProj])
         }
         var map: [DrafterQuantKey: DrafterQuantPipelines] = [:]
-        for w in views where !QWMTPBatchedMLP.usesQ4GMKernel(w) {
+        for w in views where !Self.usesQ4GMKernel(w) {
             let key = DrafterQuantKey(bits: w.bits, group: w.groupSize, isSHVQ: w.isSHVQ)
             if map[key] != nil { continue }
             guard let decName = QWGemmAQ.decodeKernelName(bits: w.bits, group: w.groupSize, isSHVQ: w.isSHVQ),
                   let siluName = QWGemmAQ.siluPairKernelName(bits: w.bits, group: w.groupSize, isSHVQ: w.isSHVQ),
                   let gemmName = QWGemmAQ.gemmKernelName(bits: w.bits, group: w.groupSize, bm128: false, isSHVQ: w.isSHVQ) else {
-                throw QWEngineDriverError.state("QWDFlashDrafter: unsupported quant format \(w.formatName)")
+                throw QWDFlashError.state("QWDFlashDrafter: unsupported quant format \(w.formatName)")
             }
             map[key] = DrafterQuantPipelines(
                 decodeT4: try hal.pipeline(decName),
@@ -192,7 +192,7 @@ extension QWDFlashDrafter {
         var mU = UInt32(rows), iU = UInt32(i)
         enc.setBytes(&mU, length: 4, index: 2)
         enc.setBytes(&iU, length: 4, index: 3)
-        enc.dispatchThreadgroups(MTLSize(width: QWEngineDriver.siluThreadgroups(i: i), height: rows, depth: 1),
+        enc.dispatchThreadgroups(MTLSize(width: Self.siluThreadgroups(i: i), height: rows, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
     }
 

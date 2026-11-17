@@ -3,11 +3,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
 
-from pack import GROUP, pack_file, sha256
+from pack import GROUP, pack_file, resolve_snapshot_dir, sha256
 from shvq import format_any_quant_spec, parse_any_quant_spec
 from verify import audit_pack
 
@@ -18,6 +19,12 @@ DFLASH_RAW_EXACT = {
     "candidate_selector.predecessor_codebook",
     "candidate_selector.successor_codebook",
 }
+
+DFLASH_MLP_SUFFIXES = (
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+)
 
 DSPINE_VERSION_TENSORS = {
     "draft_block_causal_version",
@@ -43,8 +50,50 @@ def is_dflash_raw_plane(name: str) -> bool:
     )
 
 
+def is_dflash_mlp_proj(name: str) -> bool:
+    """Return True for drafter MLP linear projection weights (gate, up, down)."""
+    return name in DFLASH_MLP_SUFFIXES or any(
+        name.endswith("." + suffix) for suffix in DFLASH_MLP_SUFFIXES
+    )
+
+
+def derive_dflash_model_id(config: dict, source: Path, is_dspine: bool) -> str:
+    """Derive provenance model_id with required dflash/dspine prefix from config or source."""
+    prefix = "dspine_" if is_dspine else "dflash2_"
+    dcfg = config.get("dflash_config") or {}
+    raw_name = ""
+    for candidate in (
+        config.get("_name_or_path"),
+        config.get("name_or_path"),
+        dcfg.get("target_model_name") if isinstance(dcfg, dict) else None,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            raw_name = candidate.strip().rstrip("/").split("/")[-1]
+            break
+    if not raw_name:
+        if source.parent.name == "snapshots" and source.parent.parent.name.startswith("models--"):
+            parts = source.parent.parent.name.split("--", 2)
+            raw_name = parts[2] if len(parts) >= 3 else parts[-1]
+        else:
+            raw_name = source.name
+    slug = re.sub(r"[^a-z0-9]+", "_", raw_name.lower()).strip("_")
+    for suffix in ("_dflash2", "_dflash", "_dspine"):
+        if slug.endswith(suffix) and len(slug) > len(suffix):
+            slug = slug[: -len(suffix)].strip("_")
+            break
+    if slug in ("dflash2", "dflash", "dspine"):
+        slug = ""
+    if not slug:
+        mt = str(config.get("model_type") or "drafter").lower()
+        slug = re.sub(r"[^a-z0-9]+", "_", mt).strip("_") or "drafter"
+    return f"{prefix}{slug}"
+
+
 def quantize_dflash_model(
-    source: Path, destination: Path, quant: str = "hq4_g32_m5"
+    source: Path,
+    destination: Path,
+    quant: str = "hq4_g32_m5",
+    mlp_quant: str | None = None,
 ) -> dict:
     """Pack a DFlash 2 or DSpine safetensors checkpoint into a QWP1 directory."""
     import torch
@@ -53,9 +102,16 @@ def quantize_dflash_model(
 
     spec = parse_any_quant_spec(quant)
     quant_canonical = format_any_quant_spec(*spec)
+    mlp_spec = parse_any_quant_spec(mlp_quant) if mlp_quant is not None else spec
+    mlp_canonical = format_any_quant_spec(*mlp_spec)
+    quant_recorded = (
+        quant_canonical
+        if mlp_canonical == quant_canonical
+        else f"{quant_canonical}__mlp_{mlp_canonical}"
+    )
     torch.set_num_threads(min(os.cpu_count() or 8, 16))
-    source = source.resolve(strict=True)
-    destination = destination.absolute()
+    source = resolve_snapshot_dir(source).resolve(strict=True)
+    destination = destination.expanduser().absolute()
     if destination.exists():
         raise FileExistsError(f"output already exists: {destination}")
     if destination.suffix == ".qwp":
@@ -90,6 +146,8 @@ def quantize_dflash_model(
     sha256_source_hex = h.hexdigest()
 
     stats = {quant_canonical: 0, "bf16": 0}
+    if mlp_canonical != quant_canonical:
+        stats[mlp_canonical] = 0
 
     def stream():
         for path in files:
@@ -102,8 +160,15 @@ def quantize_dflash_model(
                         raise ValueError(f"unsupported {name}={val} (expected 1)")
                     continue
                 raw = is_dflash_raw_plane(name) or arr.ndim != 2 or arr.shape[1] % GROUP != 0
-                stats["bf16" if raw else quant_canonical] += 1
-                yield name, arr, (True if raw else spec)
+                if raw:
+                    stats["bf16"] += 1
+                    yield name, arr, True
+                elif is_dflash_mlp_proj(name):
+                    stats[mlp_canonical] += 1
+                    yield name, arr, mlp_spec
+                else:
+                    stats[quant_canonical] += 1
+                    yield name, arr, spec
 
     dcfg = config.get("dflash_config", {})
     bridge_cfg = dcfg.get("selected_prefix_code_bridge") or config.get("selected_prefix_code_bridge")
@@ -119,7 +184,6 @@ def quantize_dflash_model(
             f"{config['head_dim']}|{config.get('block_size', dcfg.get('block_size', 16))}|"
             f"{code_size}|{rank}"
         )
-        model_id = "dspine_qwen3_5_27b"
     else:
         geo_str = (
             f"qwg-dflash2-v1:{config['hidden_size']}|{config['vocab_size']}|"
@@ -128,7 +192,7 @@ def quantize_dflash_model(
             f"{config['head_dim']}|{dcfg.get('block_size', 8)}|"
             f"{dcfg.get('selector_rank', 256)}|{dcfg.get('selector_top_k', 16)}"
         )
-        model_id = "dflash2_qwen3_5_27b"
+    model_id = derive_dflash_model_id(config, source, is_dspine)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{destination.name}-", dir=destination.parent) as temp:
@@ -156,7 +220,7 @@ def quantize_dflash_model(
                 "geometry_hash": hashlib.sha256(geo_str.encode()).hexdigest(),
                 "source": str(source),
                 "sha256_source": sha256_source_hex,
-                "quant_recorded": quant_canonical,
+                "quant_recorded": quant_recorded,
                 "assets_dir": "assets",
                 "assets_manifest_sha256": sha256(manifest_path),
             },
@@ -174,7 +238,10 @@ if __name__ == "__main__":
     ap.add_argument("--model", required=True, metavar="DIR")
     ap.add_argument("--out", required=True, metavar="DIR")
     ap.add_argument("--quant", default="hq4_g32_m5", metavar="SPEC")
+    ap.add_argument("--mlp-quant", default=None, metavar="SPEC")
     args = ap.parse_args()
-    q_key = format_any_quant_spec(*parse_any_quant_spec(args.quant))
-    res = quantize_dflash_model(Path(args.model), Path(args.out), quant=args.quant)
-    print(f"packed {res[q_key]} {q_key.upper()} + {res['bf16']} BF16 tensors -> {args.out}")
+    res = quantize_dflash_model(
+        Path(args.model), Path(args.out), quant=args.quant, mlp_quant=args.mlp_quant
+    )
+    q_parts = [f"{v} {k.upper()}" for k, v in res.items() if k != "bf16"]
+    print(f"packed {' + '.join(q_parts)} + {res['bf16']} BF16 tensors -> {args.out}")

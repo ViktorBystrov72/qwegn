@@ -1,9 +1,23 @@
-// QWDFlashDrafter+Config.swift — the DFlash 2 config and the session
-// slot types the drafter allocates.
+// QWDFlashConfig.swift — DFlash 2 / DSpine configuration, error type,
+// session KV slot layout, and model-matched pack discovery.
 import Foundation
 import QWAlloc
 import QWCore
 import QWQuant
+
+public enum QWDFlashError: Error, CustomStringConvertible, Sendable {
+    case packMissing(String)
+    case weightMissing(String, String)
+    case state(String)
+
+    public var description: String {
+        switch self {
+        case .packMissing(let p): return "QWDFlash: pack not found at \(p)"
+        case .weightMissing(let name, let detail): return "QWDFlash: weight \(name) invalid (\(detail))"
+        case .state(let msg): return msg
+        }
+    }
+}
 
 public struct QWDFlashConfig: Sendable, Equatable {
     public let hiddenSize: Int
@@ -67,6 +81,54 @@ public struct QWDFlashConfig: Sendable, Equatable {
         return dflash
     }()
 
+    /// Scans `~/.qwg/models` (or `defaultPackPath` if nil) for a compatible DFlash2/DSpine pack.
+    public static func defaultPackPath(for target: QWModelDescriptor?) -> String {
+        defaultPackPath(for: target, modelsDirectory: URL(fileURLWithPath: QWPaths.modelsDirectoryPath))
+    }
+
+    public static func defaultPackPath(for target: QWModelDescriptor?, modelsDirectory: URL) -> String {
+        guard let target else { return defaultPackPath }
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: modelsDirectory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        ) else {
+            return defaultPackPath
+        }
+        var dflashMatches: [String] = []
+        var dspineMatches: [String] = []
+        for url in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            guard isDir || url.pathExtension == "qwp", isDrafterPack(at: url) else { continue }
+            let cfg = load(from: url)
+            let compatible = cfg.hiddenSize == target.hidden
+                && cfg.vocabSize == target.vocab
+                && cfg.targetLayerIds.count == cfg.numLayers
+                && cfg.targetLayerIds.allSatisfy { (0..<target.numLayers).contains($0) }
+            guard compatible else { continue }
+            if cfg.isDSpine {
+                dspineMatches.append(url.path)
+            } else {
+                dflashMatches.append(url.path)
+            }
+        }
+        if dflashMatches.contains(defaultPackPath) { return defaultPackPath }
+        if let first = dflashMatches.sorted(by: { lhs, rhs in
+            let lr = Self.drafterQuantPreferenceRank(lhs)
+            let rr = Self.drafterQuantPreferenceRank(rhs)
+            return lr != rr ? lr > rr : lhs < rhs
+        }).first { return first }
+        if let first = dspineMatches.first { return first }
+        return defaultPackPath
+    }
+
+    /// Ranks compatible drafter packs so pure 4-bit SHVQ (`-0.8 GiB` UMA, top code tok/s) precedes HQ4 and mixed sub-4-bit packs.
+    public static func drafterQuantPreferenceRank(_ packPath: String) -> Int {
+        let lower = URL(fileURLWithPath: packPath).lastPathComponent.lowercased()
+        let hasSub4Bit = lower.contains("shvq3") || lower.contains("shvq2") || lower.contains("shvq15")
+        if lower.contains("shvq4") && !hasSub4Bit { return 2 }
+        return hasSub4Bit ? 0 : 1
+    }
+
     /// Validates that `targetDescriptor` is compatible with DFlash 2 / DSpine and that the drafter pack
     /// at `packPath` exists, has valid configuration, and contains the required weight tensors.
     public static func validateDrafter(
@@ -75,44 +137,46 @@ public struct QWDFlashConfig: Sendable, Equatable {
         drafts: Int = 7,
         selectorTopK: Int? = nil
     ) throws {
-        guard targetDescriptor.hcCount == nil && targetDescriptor.numExperts == nil else {
-            throw QWEngineDriverError.state(
-                "DFlash2 drafter is only compatible with dense single-stream target models (selected model is \(targetDescriptor.family.rawValue))"
-            )
-        }
         let rawPath = (packPath ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectivePath = (rawPath.isEmpty ? Self.defaultPackPath : rawPath).expandingTildePath
+        let defaultForTarget = Self.defaultPackPath(for: targetDescriptor)
+        let effectivePath = (rawPath.isEmpty ? defaultForTarget : rawPath).expandingTildePath
         let resolvedURL = effectivePath.canonicalFileURL
         guard FileManager.default.fileExists(atPath: resolvedURL.path) else {
-            throw QWEngineDriverError.packMissing(resolvedURL.path)
+            throw QWDFlashError.packMissing(resolvedURL.path)
         }
         let cfg = Self.load(from: resolvedURL, topKOverride: selectorTopK)
         let maxDrafts = max(7, cfg.blockSize - 1)
         guard (1...maxDrafts).contains(drafts) else {
-            throw QWEngineDriverError.state(
+            throw QWDFlashError.state(
                 "DFlash2 drafter requires mtpDrafts in 1...\(maxDrafts) (got \(drafts))"
             )
         }
         guard cfg.hiddenSize == targetDescriptor.hidden else {
-            throw QWEngineDriverError.state(
+            throw QWDFlashError.state(
                 "DFlash2 drafter hiddenSize (\(cfg.hiddenSize)) does not match target (\(targetDescriptor.hidden))"
             )
         }
         guard cfg.vocabSize == targetDescriptor.vocab else {
-            throw QWEngineDriverError.state(
+            throw QWDFlashError.state(
                 "DFlash2 drafter vocabSize (\(cfg.vocabSize)) does not match target (\(targetDescriptor.vocab))"
             )
         }
         guard cfg.targetLayerIds.count == cfg.numLayers,
               cfg.targetLayerIds.allSatisfy({ (0..<targetDescriptor.numLayers).contains($0) }) else {
-            throw QWEngineDriverError.state(
+            throw QWDFlashError.state(
                 "DFlash2 drafter targetLayerIds \(cfg.targetLayerIds) out of range for \(targetDescriptor.numLayers)-layer target"
             )
+        }
+        guard cfg.headDim == 128 else {
+            throw QWDFlashError.state("DFlash2 drafter headDim must be 128 (got \(cfg.headDim))")
+        }
+        guard cfg.vocabSize <= 393_216 else {
+            throw QWDFlashError.state("DFlash2 drafter vocabSize \(cfg.vocabSize) exceeds 393216")
         }
         guard let cfgURL = QWModelRoot(url: resolvedURL).configURL,
               let cfgData = try? Data(contentsOf: cfgURL),
               let drafterDesc = try? QWModelDescriptor.decodeDrafter(configJSON: cfgData) else {
-            throw QWEngineDriverError.state("DFlash2 drafter missing valid config.json at \(resolvedURL.path)")
+            throw QWDFlashError.state("DFlash2 drafter missing valid config.json at \(resolvedURL.path)")
         }
         let pack = try QWQuant.Pack(url: resolvedURL, descriptor: drafterDesc, skipIdentityCheck: true)
         var required = ["fc.weight", "hidden_norm.weight", "norm.weight", "layers.0.self_attn.q_proj.weight"]
@@ -201,10 +265,17 @@ public struct QWDFlashConfig: Sendable, Equatable {
     }
 }
 
-struct QWDFlashSessionSlot {
-    let kSlab: QWTensorValue
-    let vSlab: QWTensorValue
-    let kLayers: [QWTensorValue]
-    let vLayers: [QWTensorValue]
-}
+public struct QWDFlashSessionSlot: Sendable {
+    public let kSlab: QWTensorValue
+    public let vSlab: QWTensorValue
+    public let kLayers: [QWTensorValue]
+    public let vLayers: [QWTensorValue]
 
+    public init(kSlab: QWTensorValue, vSlab: QWTensorValue,
+                kLayers: [QWTensorValue], vLayers: [QWTensorValue]) {
+        self.kSlab = kSlab
+        self.vSlab = vSlab
+        self.kLayers = kLayers
+        self.vLayers = vLayers
+    }
+}

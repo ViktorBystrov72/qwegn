@@ -692,5 +692,21 @@ final class QWServerMemoryPackTests: XCTestCase {
         XCTAssertTrue((summaryCheck?["wrong"] as? String)?.contains("different model") == true)
         XCTAssertTrue((summaryCheck?["stale"] as? String)?.contains("3 commit(s)") == true)
         XCTAssertTrue((summaryCheck?["ready"] as? String)?.contains("ready to mount") == true)
+
+        // 5. QWMemoryIndexRequest backward-compatible decode and optional DFlash forwarding fields
+        let legacyJSON = Data(#"{"path":"/tmp/repo","kvMode":"q4"}"#.utf8)
+        let decodedLegacy = try JSONDecoder().decode(QWMemoryIndexRequest.self, from: legacyJSON)
+        XCTAssertNil(decodedLegacy.mtpBackend)
+        XCTAssertNil(decodedLegacy.dflashDraftPackPath)
+
+        let dflashReq = QWMemoryIndexRequest(
+            path: "/tmp/repo",
+            kvMode: "q4",
+            mtpBackend: "dflash2",
+            dflashDraftPackPath: "/tmp/dflash-pack"
+        )
+        let roundTrip = try JSONDecoder().decode(QWMemoryIndexRequest.self, from: JSONEncoder().encode(dflashReq))
+        XCTAssertEqual(roundTrip.mtpBackend, "dflash2")
+        XCTAssertEqual(roundTrip.dflashDraftPackPath, "/tmp/dflash-pack")
     }
 }

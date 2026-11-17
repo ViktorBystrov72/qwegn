@@ -59,11 +59,13 @@ extension QWEngineDriver {
         // unsupported-model error instead of the dense loader.
         let root = QWModelRoot(url: URL(fileURLWithPath: packPath))
         let isSafetensors = (root.kind == .safetensorsSingle || root.kind == .safetensorsSharded)
+        var targetDescriptor: QWModelDescriptor?
         if isSafetensors {
             guard let cfgURL = root.configURL else {
                 throw QWEngineDriverError.packMissing(packPath)
             }
             let desc = try QWModelDescriptor.decode(configJSON: Data(contentsOf: cfgURL))
+            targetDescriptor = desc
             let served = QWModuleRegistry.moduleType(for: desc.family)
             guard served is DenseModule.Type else {
                 throw QWEngineDriverError.unsupportedModel(desc.family.rawValue)
@@ -71,6 +73,7 @@ extension QWEngineDriver {
         } else {
             if let cfgURL = root.configURL {
                 let desc = try QWModelDescriptor.decode(configJSON: Data(contentsOf: cfgURL))
+                targetDescriptor = desc
                 let served = QWModuleRegistry.moduleType(for: desc.family)
                 guard served is DenseModule.Type else {
                     throw QWEngineDriverError.unsupportedModel(desc.family.rawValue)
@@ -140,7 +143,7 @@ extension QWEngineDriver {
             if let envPath = environment["QW_DFLASH_DRAFT_PACK"]?.trimmingCharacters(in: .whitespacesAndNewlines), !envPath.isEmpty {
                 return envPath
             }
-            return QWDFlashDrafter.defaultPackPath
+            return QWDFlashConfig.defaultPackPath(for: targetDescriptor)
         }()
         let resolvedDFlashTopK: Int? = {
             if let dflashSelectorTopK { return dflashSelectorTopK }

@@ -9,8 +9,7 @@
   <img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2">
   <img src="https://img.shields.io/badge/platform-macOS%2026%20(Apple%20Silicon)-lightgrey.svg" alt="macOS 26, Apple Silicon">
   <a href="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml"><img src="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.23.0-green.svg" alt="Release v0.23.0"></a>
-  <a href="https://gitgem.org/github/qwegnai/qwegn"><img src="https://gitgem.org/api/badge/github/qwegnai/qwegn.svg" alt="GitGem"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.24.1-green.svg" alt="Release v0.24.1"></a>
 </p>
 
 **Qwegn** (`qwg`) is a from-scratch LLM/VLM inference engine for Apple Silicon,
@@ -71,7 +70,7 @@ Pre-quantized official Qwegn model packs are hosted under [`huggingface.co/qwegn
 | Model | Prefill (peak) | Decode (spec) | Long-ctx / 1M prefill / decode (LSA · `e-means`) | Repo `.qwcache` / Warm Cache TTFT |
 | :--- | :---: | :---: | :---: | :---: |
 | Qwen3.6-35B-A3B (`HQ4_G32`) | 6,419 tok/s (`6,142` @64K) | 233.4 tok/s | **2,317 / 105.6 tok/s** @1M (`136.8` @64K `e-means`) | **0.12 s** `.qwcache` (`54.4×` vs 6.53 s) |
-| Qwen3.8-Flash-Next (`HQ8+HQ4` + `VQ2` PLE) | **3,035 tok/s** (`2,947` @4K) | **145.4 tok/s** (`95.1` novel) | **1,888 / 63.7 tok/s** @1M (`e-means` · `1,350 / 41.1` QSA) | **0.24 s** `.qwcache` (`74.3×` vs 17.84 s) |
+| Qwen3.8-Flash-Next (`HQ8+HQ4` + `VQ2` PLE + `DFlash2-shvq4g32`) | **3,035 tok/s** (`2,947` @4K) | **175.1 tok/s** (`DFlash2` spec · `99.1` bench · `90.2` CLI code · `83/100` code) | **1,888 / 63.7 tok/s** @1M (`e-means` · `1,350 / 41.1` QSA) | **0.12–0.24 s** `.qwcache` (`74.3×` vs 17.84 s) |
 | Edge0-145B (`145B`, `HQ8+HQ4` + `VQ2` PLE 83.1 GiB) | **2,568–2,572 tok/s** | **116.4 tok/s** (`80.9` novel · `102.6` 4-stream · `67.6` CLI) | **1,886 tok/s** @300K (`3/3` · 1M `69.7 GiB` `q4` / `103.0 GiB` `q8` UMA) | **8 ms** warm cache (`119.8×`) |
 | Qwen3.8-27B (+ `DSpine-b16`) | 1,043 tok/s (`914` @64K) | **148.0 tok/s** (`144.1` serve · `4.19×`) | **831 / 36.5 tok/s** @1M (`e-means` / `Ward`) | 6–29 ms warm cache (`2.33M` tok/s @65.5K) |
 | GLM-5.3-Flash (`321B`, `SHVQ4/2/3` 100.6 GiB) | **1,014 tok/s** (`1,006` @5.2K · `869` serve) | **50.7–53.6 tok/s** (`46.0` novel · `81/100` code) | **743 / 45.0 tok/s** @242.5K (`e-means`) · 1M UMA | **10–18 ms** warm cache (`96–193×`) |
@@ -108,7 +107,7 @@ Full tables, paired A/B repository memory benchmarks, and thermal protocol: [doc
   <img src="assets/qwegn_model_flash_next.svg" alt="Qwen3.8-Flash-Next" width="100%">
 </p>
 
-**Qwen3.8-Flash-Next** · 48L MoE (512 experts, 10 + 1 active), 12 QSA + 36 GDN, 4-branch HC, `VQ2_G32` PLE (`27.1 GiB`), MTP-3, vision (`HQ8_G32 + HQ4_G64`, `71.3 GiB` — **`3,035 tok/s`** peak prefill, `79.9 tok/s` CLI MTP-3, `1,888 / 63.7 tok/s` @1M `e-means`)
+**Qwen3.8-Flash-Next** (+ `DFlash2-shvq4g32`) · 48L MoE (512 experts, 10 + 1 active), 12 QSA + 36 GDN, 4-branch HC, `VQ2_G32` PLE (`27.1 GiB`), MTP-3 & lossless 5L `DFlash 2` (`521.5 MiB` `SHVQ4_G32` — **`175.1 tok/s`** spec / `99.1` serve / `90.2` CLI code / `83/100` Code-100 / `191/191` API), vision (`HQ8_G32 + HQ4_G64`, `71.3 GiB` — **`3,035 tok/s`** peak prefill, `1,888 / 63.7 tok/s` @1M `e-means`)
 
 <p align="center">
   <img src="assets/qwegn_model_edge0_145b.svg" alt="Edge0-145B" width="100%">
@@ -209,7 +208,7 @@ Core flags for `run` / `repl` / `serve` (defaults come from `QWKnobRegistry`; pe
 | `--memory-policy` / `--os-reserve` | `maxResident` / `8` | Unified-memory residency policy (`maxResident` vs swap-free `safe`) and OS RAM reserve in GiB. |
 | `--load-vision` / `--no-load-vision` | `false` | Eagerly wire or omit multimodal ViT planes at startup (`-1.60 GiB` RSS when omitted; loads on demand). |
 | `--stream-ngrams` / `--no-stream-ngrams` | `false` | Stream external PLE N-gram tables (`ngram.bin`) from NVMe (`-27.30 GiB` GPU RAM) vs keeping `VQ2_G32` GPU-resident. |
-| `--dflash-draft-pack` / `--dflash-window` | — | External `DSpine` (`B=2..16`) or `DFlash 2` (`B=2..8`) block drafter (`config.json` auto-detected). |
+| `--dflash-draft-pack` / `--dflash-window` | auto | Generalized external `DFlash 2` (`B=2..8`, dense & `Qwen3.8-Flash-Next` sparse MoE; auto-prefers `SHVQ4_G32`, `98,304` draft vocab, `.qwcache` support) or `DSpine` (`B=2..16`) drafter (`config.json` auto-detected). |
 | `--repo` / `--no-memory-pack` | `cwd` | Mount `<repo>/.qwg/manifest.json` in `run`/`repl`/`serve`, or bypass automatic repository memory mounting. |
 | `--temperature` / `--top-p` / `--top-k` | `0.7` / `0.9` / `40` | Sampling (`0` selects greedy). `--enable-thinking` (`true`) toggles `<think>` blocks. |
 

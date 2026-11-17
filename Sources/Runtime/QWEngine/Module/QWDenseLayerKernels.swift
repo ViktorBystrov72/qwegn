@@ -17,6 +17,7 @@ import QWAttn
 import QWGDN
 import QWMLP
 import QWHead
+import QWMTP
 import QWQuant
 
 /// The part of a dense layer every kind shares: the residual norm and the
@@ -163,8 +164,19 @@ class DenseLayerKernel: @unchecked Sendable {
         if let dflashDrafter = driver.dflashDrafter, p < dflashDrafter.targetLayerSlotMap.count {
             let slot = dflashDrafter.targetLayerSlotMap[p]
             if slot >= 0 {
-                dflashDrafter.encodeCaptureTargetHidden(
-                    enc, source: sc.x, srcRowOffset: 0, dstRowOffset: 0, rows: 1, slot: slot)
+                if let _ = lw.mhc, let mhcCfg = geometry.mhcConfig,
+                   let mhcStream = sc.mhcStream, let mhcControls = sc.mhcControls {
+                    let isLeave = (p == mhcCfg.end - 1)
+                    let nextIsMHC = nextP.map { $0 >= mhcCfg.start && $0 < mhcCfg.end } ?? false
+                    let deferPostFFN = !isLeave && nextIsMHC && (nextP != mhcCfg.start)
+                    dflashDrafter.encodeCaptureHCTargetHidden(
+                        enc, base: mhcStream, srcRowOffset: 0, dstRowOffset: 0, rows: 1, slot: slot,
+                        hc: mhcCfg.streams,
+                        deferredInject: deferPostFFN ? (src: sc.dn16, inj: mhcControls, isMHC: true) : nil)
+                } else {
+                    dflashDrafter.encodeCaptureTargetHidden(
+                        enc, source: sc.x, srcRowOffset: 0, dstRowOffset: 0, rows: 1, slot: slot)
+                }
             }
         }
     }
@@ -261,8 +273,20 @@ class DenseLayerKernel: @unchecked Sendable {
             let slot = dflashDrafter.targetLayerSlotMap[p]
             if slot >= 0 {
                 let capRows = min(T, dflashDrafter.config.maxCacheSize)
-                dflashDrafter.encodeCaptureTargetHidden(
-                    enc, source: psc.x, srcRowOffset: T - capRows, dstRowOffset: 0, rows: capRows, slot: slot)
+                if let _ = lw.mhc, let mhcCfg = geometry.mhcConfig,
+                   let mhcStream = psc.mhcStream, let mhcControls = psc.mhcControls {
+                    let isLeave = (p == mhcCfg.end - 1)
+                    let nextIsMHC = nextP.map { $0 >= mhcCfg.start && $0 < mhcCfg.end } ?? false
+                    let deferPostFFN = !isLeave && nextIsMHC && (nextP != mhcCfg.start)
+                    let activeDn16 = driver.prefixRows(psc.dn16, rows: T, cols: H, dt: .f16)
+                    dflashDrafter.encodeCaptureHCTargetHidden(
+                        enc, base: mhcStream, srcRowOffset: T - capRows, dstRowOffset: 0, rows: capRows,
+                        slot: slot, hc: mhcCfg.streams,
+                        deferredInject: deferPostFFN ? (src: activeDn16, inj: mhcControls, isMHC: true) : nil)
+                } else {
+                    dflashDrafter.encodeCaptureTargetHidden(
+                        enc, source: psc.x, srcRowOffset: T - capRows, dstRowOffset: 0, rows: capRows, slot: slot)
+                }
             }
         }
     }

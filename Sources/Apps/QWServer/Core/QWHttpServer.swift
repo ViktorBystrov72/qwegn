@@ -327,8 +327,17 @@ public final class QWHttpServer: @unchecked Sendable {
                     self.sendJsonResponse(connection, status: 200, object: resp)
 
                 case ("GET", "/v1/models/discovered"):
+                    struct DiscoveredInventoryResponse: Encodable {
+                        let models: [QWServerSettings.DiscoveredModel]
+                        let drafters: [QWServerSettings.DiscoveredDrafter]
+                    }
                     let models = QWServerSettings.scanModelsDirectory()
-                    self.sendJsonResponse(connection, status: 200, object: ["models": models])
+                    let drafters = QWServerSettings.scanDrafterSummaries(primaryModels: models)
+                    self.sendJsonResponse(
+                        connection,
+                        status: 200,
+                        object: DiscoveredInventoryResponse(models: models, drafters: drafters)
+                    )
 
                 case ("GET", let path) where path.hasPrefix("/v1/models/") || path.hasPrefix("/models/"):
                     let prefix = path.hasPrefix("/v1/models/") ? "/v1/models/" : "/models/"
@@ -448,10 +457,12 @@ public final class QWHttpServer: @unchecked Sendable {
                         }
                         let modelChanged = (newSettings.modelPackPath != oldSettings.modelPackPath)
                             || (newSettings.modelName != oldSettings.modelName)
+                        let resolvedPackPath: String
                         if modelChanged {
                             let ref = newSettings.resolveModelReference(
                                 newSettings.modelPackPath.isEmpty ? newSettings.modelName : newSettings.modelPackPath
                             )
+                            resolvedPackPath = ref.packPath
                             let targetModelName = ref.modelName.isEmpty ? newSettings.modelName : ref.modelName
                             if let profile = QWSettingsManager.shared.loadProfile(forModel: targetModelName) {
                                 newSettings.applyModelConfigDefaults(packPath: ref.packPath)
@@ -459,6 +470,17 @@ public final class QWHttpServer: @unchecked Sendable {
                             } else if newSettings.maxContext == oldSettings.maxContext {
                                 newSettings.applyModelConfigDefaults(packPath: ref.packPath)
                             }
+                        } else {
+                            resolvedPackPath = newSettings.resolveModelReference(
+                                newSettings.modelPackPath.isEmpty ? newSettings.modelName : newSettings.modelPackPath
+                            ).packPath
+                        }
+                        let backendChanged = newSettings.mtpBackend.lowercased() != oldSettings.mtpBackend.lowercased()
+                        let packExplicitlyChanged = newSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                            != oldSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if modelChanged || (backendChanged && !packExplicitlyChanged) {
+                            let desc = QWServerSettings.loadPrimaryDescriptor(packPath: resolvedPackPath)
+                            newSettings.reconcileStaleDrafterSelection(for: desc)
                         }
                         if let mounted = self.actor.getMountedMemoryPackInfo(), mounted.enforcesKVMode {
                             newSettings.kvMode = mounted.enforcedKVMode

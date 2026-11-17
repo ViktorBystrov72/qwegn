@@ -22,6 +22,7 @@ extension FNGPUEngine {
     struct FNPrefixHeader {
         static let magic: UInt64 = 0x5157464E_43414348 // "QWFNCACH"
         static let version: UInt32 = 1
+        static let dflashBit: UInt32 = 4
         var magic: UInt64
         var version: UInt32
         var tokenCount: UInt32
@@ -39,12 +40,16 @@ extension FNGPUEngine {
         let matched: Int
         let lastArgmax: Int
         let mtpDraft: Int
+        let dflashCacheOffset: Int
         /// The tier that served the prefix: the RAM or the disk.
         var tier: FNPrefixCacheTier = .coldSSD
     }
 
-    static func fnPrefixHash(tokens: ArraySlice<Int64>, kvMode: FNKVStorageMode, hasMTP: Bool) -> UInt64 {
-        QWPrefixHash.fnv1a64(tokens: tokens, modeTag: kvMode.rawValue, hasMTP: hasMTP)
+    static func fnPrefixHash(
+        tokens: ArraySlice<Int64>, kvMode: FNKVStorageMode, hasMTP: Bool, dflashMarker: String? = nil
+    ) -> UInt64 {
+        let modeTag = dflashMarker.map { "\(kvMode.rawValue)|\($0)" } ?? kvMode.rawValue
+        return QWPrefixHash.fnv1a64(tokens: tokens, modeTag: modeTag, hasMTP: hasMTP)
     }
 
     func kvModeCode(_ mode: FNKVStorageMode) -> UInt32 {
@@ -76,7 +81,8 @@ extension FNGPUEngine {
         // and a hit there costs no disk at all.
         if allowExact {
             for hasMTP in candidateMTPFlags {
-                let exactHash = Self.fnPrefixHash(tokens: history[...], kvMode: kvMode, hasMTP: hasMTP)
+                let exactHash = Self.fnPrefixHash(tokens: history[...], kvMode: kvMode, hasMTP: hasMTP,
+                                                  dflashMarker: dflashPrefixMarker)
                 let exactName = String(format: "fn_entry_%016llx_%d.qwcache", exactHash, history.count)
                 if let warm = prefixCacheWarmStore, let blob = warm.blob(name: exactName),
                    let restored = try? restorePrefix(data: blob, expectedTokens: history[...], hasMTP: hasMTP,
@@ -91,7 +97,8 @@ extension FNGPUEngine {
             // A longer prompt may extend a prefix the RAM holds.
             var bestWarmMatch: (name: String, tokens: Int, hasMTP: Bool, isUnsaltedSharedBase: Bool)?
             for hasMTP in candidateMTPFlags {
-                if let match = warm.longestMatch(history: history, kvMode: kvMode, hasMTP: hasMTP) {
+                if let match = warm.longestMatch(history: history, kvMode: kvMode,
+                                                 hasMTP: hasMTP, dflashMarker: dflashPrefixMarker) {
                     if bestWarmMatch == nil || match.tokens > bestWarmMatch!.tokens {
                         bestWarmMatch = (match.name, match.tokens, hasMTP, false)
                     }
@@ -99,7 +106,8 @@ extension FNGPUEngine {
             }
             if bestWarmMatch == nil, rawHist.first != history.first, warm.hasSharedBase {
                 for hasMTP in candidateMTPFlags {
-                    if let shared = warm.longestSharedBaseMatch(history: rawHist, kvMode: kvMode, hasMTP: hasMTP) {
+                    if let shared = warm.longestSharedBaseMatch(history: rawHist, kvMode: kvMode,
+                                                                 hasMTP: hasMTP, dflashMarker: dflashPrefixMarker) {
                         if bestWarmMatch == nil || shared.tokens > bestWarmMatch!.tokens {
                             bestWarmMatch = (shared.name, shared.tokens, hasMTP, true)
                         }
@@ -127,7 +135,8 @@ extension FNGPUEngine {
         Self.ssdWriteQueue.sync {}
         if allowExact {
             for hasMTP in candidateMTPFlags {
-                let exactHash = Self.fnPrefixHash(tokens: history[...], kvMode: kvMode, hasMTP: hasMTP)
+                let exactHash = Self.fnPrefixHash(tokens: history[...], kvMode: kvMode, hasMTP: hasMTP,
+                                                  dflashMarker: dflashPrefixMarker)
                 let exactName = String(format: "fn_entry_%016llx_%d.qwcache", exactHash, history.count)
                 let exactURL = cacheDir.appendingPathComponent(exactName)
                 if fm.fileExists(atPath: exactURL.path),
@@ -156,7 +165,8 @@ extension FNGPUEngine {
         outerLoop: for cand in candidates {
             let prefixSlice = history.prefix(cand.len)
             for hasMTP in candidateMTPFlags {
-                let expectedHash = Self.fnPrefixHash(tokens: prefixSlice, kvMode: kvMode, hasMTP: hasMTP)
+                let expectedHash = Self.fnPrefixHash(tokens: prefixSlice, kvMode: kvMode, hasMTP: hasMTP,
+                                                     dflashMarker: dflashPrefixMarker)
                 let expectedHex = String(format: "%016llx", expectedHash)
                 if cand.hex == expectedHex {
                     bestLen = cand.len
@@ -200,8 +210,10 @@ extension FNGPUEngine {
                 warm.makeRoom(for: data.count, activeSlot: nil)
                 warm.store(name: url.lastPathComponent, blob: data, slot: nil, rootHash: nil, history: tokArray, isSharedBase: true)
             } else {
-                let rHash = FNPrefixWarmStore.rootHash(history: tokArray, kvMode: kvMode, hasMTP: hasMTP)
-                let slot = warm.resolveSlot(rootHash: rHash, history: tokArray, kvMode: kvMode, hasMTP: hasMTP)
+                let rHash = FNPrefixWarmStore.rootHash(history: tokArray, kvMode: kvMode,
+                                                       hasMTP: hasMTP, dflashMarker: dflashPrefixMarker)
+                let slot = warm.resolveSlot(rootHash: rHash, history: tokArray, kvMode: kvMode,
+                                            hasMTP: hasMTP, dflashMarker: dflashPrefixMarker)
                 warm.store(name: url.lastPathComponent, blob: data, slot: slot, rootHash: rHash, history: tokArray, isSharedBase: false)
             }
         }
@@ -236,11 +248,15 @@ extension FNGPUEngine {
 
             let N = Int(hdr.tokenCount)
             let isCompactInPlace = (hdr.hasMTP & 2) != 0
+            let wantDFlash = (dflash != nil && dflashPrefixMarker != nil)
+            let fileHasDFlash = (hdr.hasMTP & FNPrefixHeader.dflashBit) != 0
             guard hdr.magic == FNPrefixHeader.magic,
                   hdr.version == FNPrefixHeader.version,
                   N == expectedTokens.count,
                   hdr.kvModeCode == kvModeCode(kvMode),
                   (hdr.hasMTP & 1) == (hasMTP ? 1 : 0),
+                  // Serial mounts (wantDFlash == false) reuse trunk KV from a DFlash-enabled .qwcache.
+                  (!wantDFlash || fileHasDFlash),
                   Int(hdr.vocabCount) == vocab,
                   Int(hdr.hiddenSize) == hidden,
                   Int(hdr.widthSize) == width,
@@ -280,7 +296,8 @@ extension FNGPUEngine {
             // Tier-0 in-place check: if the GPU arena already holds the exact attention KV/index
             // prefix in `0..<N` from the previous turn, only wipe the tail above `N` and skip the
             // multi-gigabyte CPU->GPU KV memcpy.
-            let inPlaceKV = residentKVWatermark.canReuseInPlace(expectedTokens: expectedTokens, hasMTP: hasMTP)
+            let inPlaceKV = residentKVWatermark.canReuseInPlace(expectedTokens: expectedTokens,
+                                                                hasMTP: hasMTP || wantDFlash)
             if isCompactInPlace && !inPlaceKV { return nil }
             wipeSessionTail(from: N)
 
@@ -429,10 +446,22 @@ extension FNGPUEngine {
                 }
             }
 
-            residentKVWatermark.recordRestored(expectedTokens: expectedTokens, hasMTP: hasMTP, inPlace: inPlaceKV)
+            var restoredDFlashOffset = 0
+            if wantDFlash, let dflash = self.dflash, let marker = dflashPrefixMarker {
+                guard let off = FNGPUDFlash.restorePrefixPayload(
+                    from: base, dataCount: data.count, offset: &offset,
+                    dflash: dflash, expectedMarker: marker, expectedTokens: N) else {
+                    return nil
+                }
+                restoredDFlashOffset = off
+            }
+
+            residentKVWatermark.recordRestored(expectedTokens: expectedTokens,
+                                               hasMTP: hasMTP || wantDFlash, inPlace: inPlaceKV)
             highWaterPos = max(highWaterPos, N)
 
-            return FNRestoredPrefix(matched: N, lastArgmax: Int(hdr.lastArgmax), mtpDraft: Int(hdr.mtpDraft))
+            return FNRestoredPrefix(matched: N, lastArgmax: Int(hdr.lastArgmax), mtpDraft: Int(hdr.mtpDraft),
+                                    dflashCacheOffset: restoredDFlashOffset)
         }
     }
 

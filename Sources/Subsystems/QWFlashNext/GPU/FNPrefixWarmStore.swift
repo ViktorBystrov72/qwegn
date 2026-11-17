@@ -56,19 +56,30 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
         core.isSharedBaseKey(name)
     }
 
-    public static func rootHash(history: [Int64], kvMode: FNKVStorageMode, hasMTP: Bool) -> UInt64 {
+    public static func rootHash(history: [Int64], kvMode: FNKVStorageMode, hasMTP: Bool,
+                                dflashMarker: String? = nil) -> UInt64 {
         let n = min(rootPrefixTokenCount, history.count)
-        return FNGPUEngine.fnPrefixHash(tokens: history.prefix(n), kvMode: kvMode, hasMTP: hasMTP)
+        return FNGPUEngine.fnPrefixHash(tokens: history.prefix(n), kvMode: kvMode,
+                                        hasMTP: hasMTP, dflashMarker: dflashMarker)
     }
 
     public func sharedBranchPrefixLength(for history: [Int64]) -> Int? {
         core.sharedBranchPrefixLength(for: history)
     }
 
-    public func resolveSlot(rootHash: UInt64, history: [Int64], kvMode: FNKVStorageMode, hasMTP: Bool) -> Int {
+    private static func matchesEntry(
+        name: String, count: Int, history: [Int64], kvMode: FNKVStorageMode, hasMTP: Bool, dflashMarker: String?
+    ) -> Bool {
+        let expected = FNGPUEngine.fnPrefixHash(tokens: history.prefix(count), kvMode: kvMode,
+                                                hasMTP: hasMTP, dflashMarker: dflashMarker)
+        return Self.hash(in: name) == String(format: "%016llx", expected)
+    }
+
+    public func resolveSlot(rootHash: UInt64, history: [Int64], kvMode: FNKVStorageMode,
+                            hasMTP: Bool, dflashMarker: String? = nil) -> Int {
         core.resolveSlot(rootHash: rootHash, history: history) { name, count in
-            let expected = FNGPUEngine.fnPrefixHash(tokens: history.prefix(count), kvMode: kvMode, hasMTP: hasMTP)
-            return Self.hash(in: name) == String(format: "%016llx", expected)
+            Self.matchesEntry(name: name, count: count, history: history,
+                              kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker)
         }
     }
 
@@ -78,11 +89,12 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
         history: [Int64],
         incomingBytes: Int,
         kvMode: FNKVStorageMode,
-        hasMTP: Bool
+        hasMTP: Bool,
+        dflashMarker: String? = nil
     ) {
         core.prepareSlotForStore(slot: slot, history: history, incomingBytes: incomingBytes) { name, count in
-            let expected = FNGPUEngine.fnPrefixHash(tokens: history.prefix(count), kvMode: kvMode, hasMTP: hasMTP)
-            return Self.hash(in: name) == String(format: "%016llx", expected)
+            Self.matchesEntry(name: name, count: count, history: history,
+                              kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker)
         }
     }
 
@@ -118,9 +130,9 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
     }
 
     public func longestMatch(history: [Int64], kvMode: FNKVStorageMode,
-                             hasMTP: Bool) -> (name: String, tokens: Int)? {
+                             hasMTP: Bool, dflashMarker: String? = nil) -> (name: String, tokens: Int)? {
         let queryRootHash: UInt64? = history.count >= Self.rootPrefixTokenCount
-            ? Self.rootHash(history: history, kvMode: kvMode, hasMTP: hasMTP)
+            ? Self.rootHash(history: history, kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker)
             : nil
         var candidates: [(name: String, tokens: Int)] = []
         candidates.reserveCapacity(core.order.count)
@@ -136,9 +148,8 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
         }
         candidates.sort { $0.tokens > $1.tokens }
         for cand in candidates {
-            let expected = FNGPUEngine.fnPrefixHash(tokens: history.prefix(cand.tokens),
-                                                     kvMode: kvMode, hasMTP: hasMTP)
-            if Self.hash(in: cand.name) == String(format: "%016llx", expected) {
+            if Self.matchesEntry(name: cand.name, count: cand.tokens, history: history,
+                                 kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker) {
                 core.touchSlot(for: cand.name)
                 return cand
             }
@@ -147,7 +158,7 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
     }
 
     public func longestSharedBaseMatch(history: [Int64], kvMode: FNKVStorageMode,
-                                       hasMTP: Bool) -> (name: String, tokens: Int)? {
+                                       hasMTP: Bool, dflashMarker: String? = nil) -> (name: String, tokens: Int)? {
         guard core.hasSharedBase else { return nil }
         var candidates: [(name: String, tokens: Int)] = []
         for name in core.sharedBaseKeys {
@@ -158,9 +169,8 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
         }
         candidates.sort { $0.tokens > $1.tokens }
         for cand in candidates {
-            let expected = FNGPUEngine.fnPrefixHash(tokens: history.prefix(cand.tokens),
-                                                     kvMode: kvMode, hasMTP: hasMTP)
-            if Self.hash(in: cand.name) == String(format: "%016llx", expected) {
+            if Self.matchesEntry(name: cand.name, count: cand.tokens, history: history,
+                                 kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker) {
                 return cand
             }
         }

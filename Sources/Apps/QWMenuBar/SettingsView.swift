@@ -158,6 +158,7 @@ public struct SettingsView: View {
             bottomActionBar
         }
         .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
     }
 
     private var detailHeader: some View {
@@ -305,6 +306,7 @@ public struct SettingsView: View {
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .onChange(of: draftSettings.modelName) { _, newName in
                             if let match = discoveredModels.first(where: { $0.name == newName }), !match.packPath.isEmpty {
                                 draftSettings.modelPackPath = match.packPath
@@ -336,17 +338,18 @@ public struct SettingsView: View {
                     }
                 }
 
-                formRow(label: "Model Alias:", key: "modelAlias") {
-                    VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 4) {
+                    formRow(label: "Model Alias:", key: "modelAlias") {
                         TextField("e.g. qwen-27b (optional)", text: Binding(
                             get: { draftSettings.modelAlias },
                             set: { draftSettings.setAlias($0, for: draftSettings.modelName) }
                         ))
                         .textFieldStyle(.roundedBorder)
-                        Text("Persisted per model in ~/.qwg/settings.json and returned by /v1/models.")
-                            .font(TelemetryTheme.ui(11))
-                            .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
                     }
+                    Text("Persisted per model in ~/.qwg/settings.json and returned by /v1/models.")
+                        .font(TelemetryTheme.ui(11))
+                        .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -391,8 +394,8 @@ public struct SettingsView: View {
                     contrast: contrast
                 )
 
-                formRow(label: "KV Cache Mode:", key: "kvMode") {
-                    VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 4) {
+                    formRow(label: "KV Cache Mode:", key: "kvMode") {
                         Picker("", selection: Binding(
                             get: { mountedMemoryPack?.enforcedKVMode ?? draftSettings.kvMode },
                             set: { newVal in
@@ -407,23 +410,24 @@ public struct SettingsView: View {
                         }
                         .labelsHidden()
                         .pickerStyle(.segmented)
+                        .frame(maxWidth: .infinity)
                         .disabled(isKVModeLockedByMemoryPack)
+                    }
 
-                        if let mounted = mountedMemoryPack, mounted.enforcesKVMode {
-                            HStack(spacing: 6) {
-                                Image(systemName: "lock.fill")
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(TelemetryTheme.warning)
-                                Text("Locked by Memory Pack (\(mounted.packName) · \(mounted.enforcedKVMode.uppercased()))")
-                                    .font(TelemetryTheme.ui(10, .medium))
-                                    .foregroundStyle(TelemetryTheme.warning)
-                                Spacer()
-                                Button("Unmount") {
-                                    unmountActiveMemoryPack()
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.mini)
+                    if let mounted = mountedMemoryPack, mounted.enforcesKVMode {
+                        HStack(spacing: 6) {
+                            Image(systemName: "lock.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(TelemetryTheme.warning)
+                            Text("Locked by Memory Pack (\(mounted.packName) · \(mounted.enforcedKVMode.uppercased()))")
+                                .font(TelemetryTheme.ui(10, .medium))
+                                .foregroundStyle(TelemetryTheme.warning)
+                            Spacer()
+                            Button("Unmount") {
+                                unmountActiveMemoryPack()
                             }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
                         }
                     }
                 }

@@ -61,6 +61,15 @@ struct Index: ParsableCommand {
           help: "Write .qwg/manifest.json and print token statistics without running GPU prefill.")
     var manifestOnly: Bool = false
 
+    @Option(name: [.customLong("mtp-backend")],
+            help: "MTP execution backend for speculative prefix state: standard, variational, dflash2 or dspine.",
+            transform: { $0.lowercased() })
+    var mtpBackend: String? = nil
+
+    @Option(name: .customLong("dflash-draft-pack"),
+            help: "Path to the DFlash 2 / DSpine drafter model pack.")
+    var dflashDraftPack: String? = nil
+
     func run() throws {
         let rootURL = URL(fileURLWithPath: path.expandingTildePath, isDirectory: true).standardizedFileURL
         var isDir: ObjCBool = false
@@ -164,6 +173,19 @@ struct Index: ParsableCommand {
             throw ExitCode(2)
         }
 
+        let trimmedBackend = mtpBackend?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let explicitBackend = (trimmedBackend?.isEmpty == false) ? trimmedBackend : nil
+        if let explicitBackend {
+            do {
+                _ = try QWMTPBackend.resolve(name: explicitBackend)
+            } catch {
+                FileHandle.standardError.write("qwg index: error: \(error)\n".data(using: .utf8)!)
+                throw ExitCode(2)
+            }
+        }
+        let trimmedDraftPack = dflashDraftPack?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let explicitDraftPack = (trimmedDraftPack?.isEmpty == false) ? trimmedDraftPack : nil
+
         if !manifestOnly, let runningPID = QWEngineInstanceLock.runningEnginePID() {
             let delegatedReq = QWMemoryIndexRequest(
                 path: rootURL.path,
@@ -175,7 +197,9 @@ struct Index: ParsableCommand {
                 maxCortexTokens: maxTokens > 0 ? maxTokens : nil,
                 includeTests: includeTests,
                 mountAfterIndex: false,
-                stream: true
+                stream: true,
+                mtpBackend: explicitBackend,
+                dflashDraftPackPath: explicitDraftPack
             )
             if try Self.delegateIndexToRunningServer(
                 request: delegatedReq,
@@ -253,6 +277,12 @@ struct Index: ParsableCommand {
         let cacheFileName = "\(packSlug)_\(modelSlug)_\(kvModeName).qwcache"
         let cacheFileURL = QWMemoryManifest.qwgDirectoryURL(in: rootURL).appendingPathComponent(cacheFileName)
 
+        let indexSpec = try Self.resolveIndexSpeculation(
+            explicitBackend: explicitBackend,
+            explicitDraftPack: explicitDraftPack,
+            settings: effectivePair.settings,
+            descriptor: runtimeAssets.descriptor
+        )
         let requiredCapacity = min(hardCeiling, max(4096, ((memoryTokens.count + 4096 + 255) / 256) * 256))
         let configuredChunk = QWPrefillLimits.clampedRows(effectivePair.settings.prefillChunkSize)
         let options = QWEngineBuildOptions(
@@ -262,7 +292,9 @@ struct Index: ParsableCommand {
             prefillChunkSize: configuredChunk,
             prefixCacheDirectory: nil,
             cacheConfig: nil,
-            mtpDrafts: runtimeAssets.descriptor.capabilities.contains(.mtp) ? 1 : 0,
+            mtpDrafts: indexSpec.drafts,
+            mtpBackend: indexSpec.backend,
+            dflashDraftPackPath: indexSpec.dflashDraftPackPath,
             lsaConfig: lsaConfig
         )
 
@@ -427,5 +459,52 @@ struct Index: ParsableCommand {
             result.kvMode, result.lsaMode, result.elapsedSeconds
         ))
         return true
+    }
+
+    struct IndexSpeculation {
+        let drafts: Int
+        let backend: QWMTPBackend?
+        let dflashDraftPackPath: String?
+    }
+
+    /// Resolves speculative prefix-cache state options for `qwg index` from CLI flags, settings, and target capabilities.
+    static func resolveIndexSpeculation(
+        explicitBackend: String?,
+        explicitDraftPack: String?,
+        settings: QWServerSettings,
+        descriptor: QWModelDescriptor
+    ) throws -> IndexSpeculation {
+        let nativeDrafts = descriptor.capabilities.contains(.mtp) ? 1 : 0
+        let backendName: String? = if let explicitBackend {
+            explicitBackend
+        } else if let explicitDraftPack {
+            QWDFlashConfig.inferBackendAndMaxDrafts(packPath: explicitDraftPack).backend
+        } else {
+            settings.mtpBackend.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? nil : settings.mtpBackend.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        guard let resolvedBackend = try backendName.map({ try QWMTPBackend.resolve(name: $0) }) else {
+            return IndexSpeculation(drafts: nativeDrafts, backend: nil, dflashDraftPackPath: nil)
+        }
+        guard resolvedBackend == .dflash2 else {
+            return IndexSpeculation(drafts: nativeDrafts, backend: resolvedBackend, dflashDraftPackPath: nil)
+        }
+        let configuredPack = settings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidatePack: String? = explicitDraftPack
+            ?? (configuredPack.isEmpty ? nil : configuredPack)
+            ?? (backendName == "dspine" ? QWDFlashConfig.defaultDSpinePackPath : nil)
+        let explicitRequest = explicitBackend != nil || explicitDraftPack != nil
+        if explicitRequest {
+            do {
+                try QWDFlashConfig.validateDrafter(targetDescriptor: descriptor, packPath: candidatePack, drafts: 1)
+            } catch {
+                FileHandle.standardError.write("qwg index: error: \(error)\n".data(using: .utf8)!)
+                throw ExitCode(2)
+            }
+        } else if (try? QWDFlashConfig.validateDrafter(targetDescriptor: descriptor, packPath: candidatePack, drafts: 1)) == nil {
+            return IndexSpeculation(drafts: nativeDrafts, backend: nil, dflashDraftPackPath: nil)
+        }
+        let inferred = QWDFlashConfig.inferBackendAndMaxDrafts(packPath: candidatePack)
+        return IndexSpeculation(drafts: max(1, inferred.maxDrafts), backend: .dflash2, dflashDraftPackPath: candidatePack)
     }
 }

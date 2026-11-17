@@ -25,7 +25,9 @@ extension FNGPUEngine {
         }
         let fm = FileManager.default
         let hasMTP = (useSpec || hasPrefixCacheTier) && mtp != nil
-        let hash = Self.fnPrefixHash(tokens: history[...], kvMode: kvMode, hasMTP: hasMTP)
+        let hasDFlash = (useSpec || hasPrefixCacheTier) && dflash != nil && dflashPrefixMarker != nil
+        let hash = Self.fnPrefixHash(tokens: history[...], kvMode: kvMode, hasMTP: hasMTP,
+                                      dflashMarker: hasDFlash ? dflashPrefixMarker : nil)
         let filename = String(format: "fn_entry_%016llx_%d.qwcache", hash, N)
         if customOutputFileURL == nil, prefixCacheWarmStore?.contains(name: filename) == true { return }
         if customOutputFileURL == nil, prefixCacheSSDByteLimit > 0, let cacheDir, fm.fileExists(atPath: cacheDir.appendingPathComponent(filename).path) { return }
@@ -74,6 +76,11 @@ extension FNGPUEngine {
             fullTotalBytes += 2 * (kvRowStride * N) + 2 * (metaRowStride * N) + (idxRowStride * N) + poolBytes
             compactTotalBytes += 2 * kvRowStride + 2 * metaRowStride + idxRowStride + poolBlockStride
         }
+        if hasDFlash, let dflash = self.dflash {
+            let dflashBytes = FNGPUDFlash.prefixPayloadBytes(config: dflash.config, tokenCount: N)
+            fullTotalBytes += dflashBytes
+            compactTotalBytes += dflashBytes
+        }
 
         let fitsWarmFull = prefixCacheWarmStore?.canHold(bytes: fullTotalBytes) == true
         let fitsColdFull = prefixCacheSSDByteLimit > 0 && cacheDir != nil && fullTotalBytes <= prefixCacheSSDByteLimit && prefixCacheWarmStore?.hasSharedBase != true
@@ -92,7 +99,7 @@ extension FNGPUEngine {
             version: FNPrefixHeader.version,
             tokenCount: UInt32(N),
             kvModeCode: kvModeCode(kvMode),
-            hasMTP: (hasMTP ? 1 : 0) | (isCompactInPlace ? 2 : 0),
+            hasMTP: (hasMTP ? 1 : 0) | (isCompactInPlace ? 2 : 0) | (hasDFlash ? FNPrefixHeader.dflashBit : 0),
             lastArgmax: Int32(lastArgmax),
             mtpDraft: Int32(mtpDraft),
             vocabCount: UInt32(vocab),
@@ -125,16 +132,19 @@ extension FNGPUEngine {
         let mtpOffset = totalBytes
         totalBytes = isCompactInPlace ? compactTotalBytes : fullTotalBytes
 
-        let rootHash = FNPrefixWarmStore.rootHash(history: history, kvMode: kvMode, hasMTP: hasMTP)
+        let rootHash = FNPrefixWarmStore.rootHash(history: history, kvMode: kvMode,
+                                                  hasMTP: hasMTP, dflashMarker: dflashPrefixMarker)
         var resolvedSlot: Int? = nil
         if fitsWarm, let warm = prefixCacheWarmStore {
             if isSharedBase {
                 warm.makeRoom(for: totalBytes, activeSlot: nil)
             } else {
-                let slot = warm.resolveSlot(rootHash: rootHash, history: history, kvMode: kvMode, hasMTP: hasMTP)
+                let slot = warm.resolveSlot(rootHash: rootHash, history: history, kvMode: kvMode,
+                                            hasMTP: hasMTP, dflashMarker: dflashPrefixMarker)
                 resolvedSlot = slot
                 warm.prepareSlotForStore(slot: slot, rootHash: rootHash, history: history,
-                                         incomingBytes: totalBytes, kvMode: kvMode, hasMTP: hasMTP)
+                                         incomingBytes: totalBytes, kvMode: kvMode,
+                                         hasMTP: hasMTP, dflashMarker: dflashPrefixMarker)
             }
         }
 
@@ -248,6 +258,9 @@ extension FNGPUEngine {
                     appendRaw(arena.cpuPointer(of: a.pooled), poolBytes)
                 }
             }
+            if hasDFlash, let dflash = self.dflash, let marker = dflashPrefixMarker {
+                FNGPUDFlash.appendPrefixPayload(to: dstBase, at: &writeOffset, dflash: dflash, marker: marker, tokenCount: N)
+            }
         }
 
         // The cold tier holds the prefix for the next run; the warm tier
@@ -257,7 +270,8 @@ extension FNGPUEngine {
                 if isSharedBase {
                     warm.store(name: filename, blob: out, slot: nil, rootHash: nil, history: history, isSharedBase: true)
                 } else {
-                    let slot = resolvedSlot ?? warm.resolveSlot(rootHash: rootHash, history: history, kvMode: kvMode, hasMTP: hasMTP)
+                    let slot = resolvedSlot ?? warm.resolveSlot(rootHash: rootHash, history: history, kvMode: kvMode,
+                                                                hasMTP: hasMTP, dflashMarker: dflashPrefixMarker)
                     warm.store(name: filename, blob: out, slot: slot, rootHash: rootHash, history: history, isSharedBase: false)
                 }
                 onCacheRetained?(N, out.count, warm.state.bytes, warm.byteLimit)
@@ -299,19 +313,19 @@ extension FNGPUEngine {
         var session = FNGPUSessionData(
             history: tokens.map(Int64.init),
             sampler: QWSampler(config: .greedy),
-            useSpec: mtp != nil,
+            useSpec: mtp != nil || dflash != nil,
             onPrefillProgress: onPrefillProgress
         )
         session.restoreDone = true
         wipeSessionState(overwriteTokens: tokens.count)
-        residentKVHasMTP = mtp != nil
+        residentKVHasMTP = mtp != nil || dflash != nil
         highWaterPos = max(highWaterPos, min(activeCapacity, tokens.count + 4))
         beginSession(&session, maxNew: 1)
         let first = try encodePrefillChunk(&session, chunk: 0..<tokens.count, runsHead: true)
         savePrefixCache(
             history: session.history,
             lastChunkRows: max(1, session.lastRows),
-            useSpec: mtp != nil,
+            useSpec: mtp != nil || dflash != nil,
             lastArgmax: first,
             mtpDraft: session.mtpDraft,
             cacheDir: nil,
@@ -351,8 +365,19 @@ extension FNGPUEngine {
             let ptr = raw.baseAddress!.advanced(by: hdrSize).assumingMemoryBound(to: Int64.self)
             return Array(UnsafeBufferPointer(start: ptr, count: n))
         }
-        let hasMTP = hdr.hasMTP != 0
-        let hash = Self.fnPrefixHash(tokens: history[...], kvMode: kvMode, hasMTP: hasMTP)
+        let hasMTP = (hdr.hasMTP & 1) != 0
+        let fileHasDFlash = (hdr.hasMTP & FNPrefixHeader.dflashBit) != 0
+        if fileHasDFlash, let dflash = self.dflash, let marker = dflashPrefixMarker {
+            guard FNGPUDFlash.validatePrefixBlob(data: data, expectedMarker: marker, expectedTokens: n, config: dflash.config) else {
+                throw NSError(domain: "QWFlashNext", code: 3,
+                              userInfo: [NSLocalizedDescriptionKey: "FlashNext .qwcache DFlash state or drafter geometry mismatch"])
+            }
+        } else if !fileHasDFlash, self.dflash != nil {
+            throw NSError(domain: "QWFlashNext", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "FlashNext .qwcache lacks DFlash state; rebuild with qwg index --mtp-backend dflash2"])
+        }
+        let hash = Self.fnPrefixHash(tokens: history[...], kvMode: kvMode, hasMTP: hasMTP,
+                                      dflashMarker: fileHasDFlash ? dflashPrefixMarker : nil)
         let filename = String(format: "fn_entry_%016llx_%d.qwcache", hash, n)
         if let warm = prefixCacheWarmStore {
             warm.ensureByteLimit(atLeast: data.count + (256 << 20))

@@ -150,7 +150,7 @@ extension QWEngineDriver {
             hasMTPWeights = false
         }
         let mtpDrafts = (cfg.mtpBackend == .dflash2 || hasMTPWeights) ? requestedMTPDrafts : 0
-        let mtpWeightDrafts = hasMTPWeights ? mtpDrafts : 0
+        let mtpWeightDrafts = (cfg.mtpBackend == .dflash2) ? 0 : (hasMTPWeights ? mtpDrafts : 0)
         try Self.validateGeometry(rawGeometry, kvMode: kvMode)
         let choice = try Self.weightFormatChoice(for: root, quantization: rawGeometry.descriptor.quantization,
                                                  geometry: rawGeometry, mtpDrafts: mtpDrafts, pack: pack)

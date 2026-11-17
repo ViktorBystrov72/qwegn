@@ -284,6 +284,259 @@ final class QWMenuBarUITests: XCTestCase {
     }
 
     @MainActor
+    func testSelectedModelSupportsDFlash2AndDrafterSelection() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwg-menubar-dflash-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        func writeJSON(_ obj: [String: Any], to url: URL) throws {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]).write(to: url)
+        }
+
+        let fnLayerTypes = (0..<48).map { ($0 + 1) % 4 == 0 ? "full_attention" : "linear_attention" }
+        let fnConfig: [String: Any] = [
+            "model_type": "qwen4_exp",
+            "text_config": [
+                "model_type": "qwen4_exp_text",
+                "hidden_size": 2560, "vocab_size": 248320, "num_hidden_layers": 48,
+                "layer_types": fnLayerTypes, "full_attention_interval": 4,
+                "rms_norm_eps": 1e-6, "max_position_embeddings": 262144,
+                "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": ["rope_type": "default", "rope_theta": 1e7, "mrope_section": [11, 11, 10]],
+                "output_gate_type": "sigmoid",
+                "linear_num_key_heads": 16, "linear_num_value_heads": 48,
+                "linear_key_head_dim": 128, "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4,
+                "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
+                "shared_expert_intermediate_size": 640, "hc_count": 4, "hc_lowrank": 320,
+                "mtp_num_hidden_layers": 1, "eos_token_id": 248044,
+            ] as [String: Any],
+        ]
+        let q27LayerTypes = (0..<64).map { ($0 + 1) % 4 == 0 ? "full_attention" : "linear_attention" }
+        let q27Config: [String: Any] = [
+            "model_type": "qwen3_5",
+            "text_config": [
+                "model_type": "qwen3_5_text",
+                "hidden_size": 5120, "intermediate_size": 17408, "vocab_size": 248320, "num_hidden_layers": 64,
+                "layer_types": q27LayerTypes, "full_attention_interval": 4,
+                "rms_norm_eps": 1e-6, "max_position_embeddings": 262144,
+                "num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256,
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": ["rope_type": "default", "rope_theta": 1e7, "mrope_section": [11, 11, 10]],
+                "attn_output_gate": true,
+                "linear_num_key_heads": 16, "linear_num_value_heads": 48,
+                "linear_key_head_dim": 128, "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4,
+                "mtp_num_hidden_layers": 1, "eos_token_id": 248044,
+            ] as [String: Any],
+        ]
+
+        let fnDir = root.appendingPathComponent("Qwen3.8-Flash-Next-hq8g32-hq4g64")
+        let q27Dir = root.appendingPathComponent("Qwen3.8-27B-hq4g32")
+        let dfn = root.appendingPathComponent("Qwen3.8-Flash-Next-DFlash2-hq4g32")
+        let d27 = root.appendingPathComponent("Qwen3.8-27B-DFlash2-hq4g32")
+        let s27 = root.appendingPathComponent("Qwen3.8-27B-DSpine-b16-hq4g32")
+
+        try writeJSON(fnConfig, to: fnDir.appendingPathComponent("assets/config.json"))
+        try writeJSON(q27Config, to: q27Dir.appendingPathComponent("assets/config.json"))
+        try writeJSON([
+            "model_type": "qwen3", "hidden_size": 2560, "vocab_size": 248320, "num_hidden_layers": 5,
+            "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+            "dflash_config": ["block_size": 8, "target_layer_ids": [5, 15, 25, 35, 45]],
+        ], to: dfn.appendingPathComponent("config.json"))
+        try writeJSON([
+            "model_type": "qwen3", "hidden_size": 5120, "vocab_size": 248320, "num_hidden_layers": 5,
+            "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+            "dflash_config": ["block_size": 8, "target_layer_ids": [5, 19, 33, 47, 61]],
+        ], to: d27.appendingPathComponent("assets/config.json"))
+        try writeJSON([
+            "model_type": "qwen3", "hidden_size": 5120, "vocab_size": 248320, "num_hidden_layers": 5,
+            "block_size": 16, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+            "dflash_config": [
+                "target_layer_ids": [1, 16, 31, 46, 61],
+                "selected_prefix_code_bridge": ["code_size": 1024, "rank": 512, "eps": 1e-6],
+            ],
+        ], to: s27.appendingPathComponent("assets/config.json"))
+
+        let fnDesc = try XCTUnwrap(QWServerSettings.loadPrimaryDescriptor(packPath: fnDir.path))
+        let q27Desc = try XCTUnwrap(QWServerSettings.loadPrimaryDescriptor(packPath: q27Dir.path))
+        let drafters = QWServerSettings.scanDrafterModelsDirectory(in: root.path)
+
+        var fnSettings = QWServerSettings()
+        fnSettings.modelName = "Qwen3.8-Flash-Next-hq8g32-hq4g64"
+        fnSettings.modelPackPath = fnDir.path
+        fnSettings.dflashDraftPackPath = d27.path // stale incompatible path from 27B
+
+        XCTAssertTrue(SettingsView.supportsDFlash2(
+            for: fnSettings, descriptor: fnDesc, discoveredModels: [], discoveredDrafters: drafters
+        ))
+        XCTAssertTrue(SettingsView.supportsDFlash2(
+            for: QWServerSettings(modelName: "CapModel"),
+            descriptor: nil,
+            discoveredModels: [DiscoveredModel(name: "CapModel", packPath: "/tmp/c", capabilities: ["dflash"])],
+            discoveredDrafters: []
+        ))
+        XCTAssertFalse(SettingsView.supportsDFlash2(
+            for: QWServerSettings(modelName: "Llama"),
+            descriptor: nil,
+            discoveredModels: [DiscoveredModel(name: "Llama", packPath: "/tmp/l", family: "llama-dense", capabilities: [])],
+            discoveredDrafters: []
+        ))
+
+        let selectableFN = SettingsView.selectableDrafterModels(
+            for: fnSettings, descriptor: fnDesc, discoveredDrafters: drafters
+        )
+        XCTAssertEqual(Set(selectableFN.map(\.name)), ["Qwen3.8-27B-DFlash2-hq4g32", "Qwen3.8-Flash-Next-DFlash2-hq4g32"])
+        fnSettings.dflashDraftPackPath = ""
+        let cleanSelectableFN = SettingsView.selectableDrafterModels(
+            for: fnSettings, descriptor: fnDesc, discoveredDrafters: drafters
+        )
+        XCTAssertEqual(cleanSelectableFN.map(\.name), ["Qwen3.8-Flash-Next-DFlash2-hq4g32"])
+
+        SettingsView.stageExternalBackendSelection(
+            "dflash2", settings: &fnSettings, targetDescriptor: fnDesc, discoveredDrafters: drafters
+        )
+        XCTAssertEqual(fnSettings.dflashDraftPackPath, dfn.path)
+        XCTAssertEqual(fnSettings.mtpDrafts, 7)
+
+        var q27Settings = QWServerSettings()
+        q27Settings.modelName = "Qwen3.8-27B-hq4g32"
+        q27Settings.modelPackPath = q27Dir.path
+        SettingsView.stageExternalBackendSelection(
+            "dspine", settings: &q27Settings, targetDescriptor: q27Desc, discoveredDrafters: drafters
+        )
+        XCTAssertEqual(q27Settings.dflashDraftPackPath, s27.path)
+        XCTAssertEqual(q27Settings.mtpDrafts, 15)
+    }
+
+    @MainActor
+    func testSpeculativeSettingsTabRendersAndOmitsFalseDenseTag() throws {
+        let speculativePath = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/Apps/QWMenuBar/SettingsView+Speculative.swift")
+        let speculativeSource = try String(contentsOf: speculativePath, encoding: .utf8)
+        XCTAssertFalse(speculativeSource.contains("(Dense)"))
+
+        let telemetry = TelemetryObservable(
+            startServices: false,
+            enableAutoLifecycle: false,
+            initialSettings: QWServerSettings(
+                modelName: "Qwen3.8-Flash-Next",
+                mtpDrafts: 7,
+                mtpBackend: "dflash2",
+                dflashDraftPackPath: "/tmp/Qwen3.8-Flash-Next-DFlash2-hq4g32"
+            )
+        )
+        let host = NSHostingView(
+            rootView: SettingsView(telemetry: telemetry, initialTab: .speculative)
+                .frame(width: 780, height: 900)
+                .background(TelemetryTheme.surface)
+        )
+        host.appearance = NSAppearance(named: .darkAqua)
+        host.wantsLayer = true
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 900),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.layoutIfNeeded()
+        host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(host.bounds.width, 780, accuracy: 2.0)
+
+        if let dir = ProcessInfo.processInfo.environment["QWG_SNAPSHOT_DIR"], !dir.isEmpty {
+            let dirURL = URL(fileURLWithPath: dir, isDirectory: true)
+            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+            try write2xPNG(of: host, size: NSSize(width: 780, height: 900), to: dirURL.appendingPathComponent("menubar_settings_speculative_2x.png"))
+        }
+    }
+
+    @MainActor
+    func testAllSevenSettingsTabsRenderCleanlyAndGateBackends() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwg-menubar-settings-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let fnDisc = DiscoveredModel(
+            name: "Qwen3.8-Flash-Next-hq8g32-hq4g64",
+            packPath: "/tmp/fn",
+            family: QWModelDescriptor.Family.qwen38FlashNext.rawValue,
+            capabilities: ["dflash", "moe", "mtp", "ple", "qsaIndexer", "vision"]
+        )
+        let dfnURL = root.appendingPathComponent("Qwen3.8-Flash-Next-DFlash2-shvq4g32/assets/config.json")
+        try FileManager.default.createDirectory(at: dfnURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let drafterObj: [String: Any] = [
+            "model_type": "qwen3",
+            "hidden_size": 2560,
+            "vocab_size": 248320,
+            "num_hidden_layers": 5,
+            "num_target_layers": 48,
+            "dflash_config": ["target_layer_ids": [5, 15, 25, 35, 45], "block_size": 8],
+        ]
+        try JSONSerialization.data(withJSONObject: drafterObj, options: [.sortedKeys]).write(to: dfnURL)
+        let drafters = QWServerSettings.scanDrafterModelsDirectory(in: root.path)
+        var fnSettings = QWServerSettings(
+            modelPackPath: "/tmp/fn",
+            modelName: fnDisc.name,
+            mtpDrafts: 7,
+            mtpBackend: "dflash2",
+            dflashDraftPackPath: dfnURL.deletingLastPathComponent().deletingLastPathComponent().path
+        )
+        XCTAssertTrue(SettingsView.supportsExternalDrafter(
+            backend: "dflash2", for: fnSettings, descriptor: nil, discoveredModels: [fnDisc], discoveredDrafters: drafters
+        ))
+        XCTAssertFalse(SettingsView.supportsExternalDrafter(
+            backend: "dspine", for: fnSettings, descriptor: nil, discoveredModels: [fnDisc], discoveredDrafters: drafters
+        ))
+
+        let snapDir = ProcessInfo.processInfo.environment["QWG_SNAPSHOT_DIR"]
+        func renderTab(_ tab: SettingsView.SettingsTab, settings: QWServerSettings, size: NSSize, slug: String) throws {
+            let telemetry = TelemetryObservable(startServices: false, enableAutoLifecycle: false, initialSettings: settings)
+            let host = NSHostingView(
+                rootView: SettingsView(telemetry: telemetry, initialTab: tab)
+                    .frame(width: size.width, height: size.height)
+                    .background(TelemetryTheme.surface)
+            )
+            host.appearance = NSAppearance(named: .darkAqua)
+            host.wantsLayer = true
+            let window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: size),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.isReleasedWhenClosed = false
+            window.contentView = host
+            window.layoutIfNeeded()
+            host.layoutSubtreeIfNeeded()
+            XCTAssertEqual(host.bounds.width, size.width, accuracy: 2.0)
+            if let snapDir, !snapDir.isEmpty {
+                let dirURL = URL(fileURLWithPath: snapDir, isDirectory: true)
+                try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+                try write2xPNG(of: host, size: size, to: dirURL.appendingPathComponent("\(slug)_2x.png"))
+            }
+        }
+
+        let stdSize = NSSize(width: 740, height: 640)
+        for tab in SettingsView.SettingsTab.allCases {
+            try renderTab(tab, settings: fnSettings, size: stdSize, slug: "settings_\(tab.id.lowercased().replacingOccurrences(of: " ", with: "_"))")
+        }
+        try renderTab(.general, settings: fnSettings, size: NSSize(width: 740, height: 860), slug: "settings_general_tall")
+        try renderTab(.speculative, settings: fnSettings, size: NSSize(width: 660, height: 640), slug: "settings_speculative_narrow")
+        try renderTab(.performance, settings: fnSettings, size: NSSize(width: 740, height: 960), slug: "settings_performance_tall")
+        try renderTab(.performance, settings: fnSettings, size: NSSize(width: 660, height: 960), slug: "settings_performance_narrow")
+        fnSettings.mtpBackend = "variational"
+        fnSettings.mtpDrafts = 3
+        try renderTab(.speculative, settings: fnSettings, size: stdSize, slug: "settings_speculative_variational")
+    }
+
+    @MainActor
     private func write2xPNG(of view: NSView, size: NSSize, to url: URL) throws {
         guard let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil,

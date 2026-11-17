@@ -227,8 +227,8 @@ final class FlashNextModuleTests: XCTestCase {
 
     /// A Flash-Next-shaped descriptor, built in memory: a pack is a runtime
     /// artefact, never a test fixture.
-    private func flashNextPlan() throws -> QWEnginePlan {
-        let descriptor = QWModelDescriptor(
+    private func flashNextDescriptor() -> QWModelDescriptor {
+        QWModelDescriptor(
             family: .qwen38FlashNext, modelType: "qwen4_exp",
             capabilities: [.mtp],
             hidden: 2560, vocab: 248320,
@@ -249,9 +249,12 @@ final class FlashNextModuleTests: XCTestCase {
             ngramSize: nil, headsPerNgram: nil, ngramVocabSizeBase: nil,
             makeNgramVocabDivisibleBy: nil, splitNgramParts: nil,
             mtpLayers: 1, mtpUseDedicatedEmbeddings: false, eosTokenId: 248044)
-        return try QWEnginePlan(geometry: QWModelGeometry(descriptor: descriptor),
-                                modelId: "qwen3.8-flash-next", geometryDigest: "d",
-                                prefillChunkRows: 512, kvStorageMode: "f16")
+    }
+
+    private func flashNextPlan() throws -> QWEnginePlan {
+        try QWEnginePlan(geometry: QWModelGeometry(descriptor: flashNextDescriptor()),
+                         modelId: "qwen3.8-flash-next", geometryDigest: "d",
+                         prefillChunkRows: 512, kvStorageMode: "f16")
     }
 
     func testTheFNModuleFailsLoudWithoutAnEngine() throws {
@@ -289,6 +292,139 @@ final class FlashNextModuleTests: XCTestCase {
         XCTAssertTrue(FlashNextModule.supportedKVStorageModes.contains("f32"))
         XCTAssertTrue(FlashNextModule.capabilities.contains(.vision))
         XCTAssertTrue(FlashNextModule.capabilities.contains(.speculative))
+        XCTAssertTrue(FlashNextModule.capabilities.contains(.dflash))
+    }
+
+    func testEstimateContextMemoryReflectsDFlashSavings() {
+        let desc = QWModelDescriptor(
+            family: .qwen38FlashNext, modelType: "qwen4_exp",
+            capabilities: [.mtp, .vision],
+            hidden: 2560, vocab: 248_320,
+            denseIntermediate: nil, numLayers: 48,
+            layerTypes: (0..<48).map { ($0 + 1) % 4 == 0 ? "full_attention" : "linear_attention" },
+            fullAttentionInterval: 4, rmsEps: 1e-6, maxPositionEmbeddings: 262_144,
+            qHeads: 24, kvHeads: 2, headDim: 256,
+            attnOutputGate: false, partialRotaryFactor: 0.25, ropeTheta: 1e7,
+            indexerHeads: nil, indexerKvHeads: nil, indexerHeadDim: nil,
+            indexerBudget: nil, indexerCompressRatio: nil,
+            numExperts: 256, expertsPerTok: 8, moeIntermediate: 640,
+            sharedExpertIntermediate: 640, expertGateType: nil,
+            hcCount: 4, hcLowrank: 320, gdnQKHeads: 16, gdnVHeads: 48, gdnHeadDim: 128,
+            gdnQKVChannels: 10_240, gdnZChannels: 6_144, gdnConvKernel: 4,
+            pleLayerIds: nil, pleEmbedDim: nil, pleConvKernel: nil,
+            ngramSize: nil, headsPerNgram: nil, ngramVocabSizeBase: nil,
+            makeNgramVocabDivisibleBy: nil, splitNgramParts: nil,
+            mtpLayers: 1, mtpUseDedicatedEmbeddings: false, eosTokenId: 248_044
+        )
+        let missing = "/tmp/nonexistent-pack-\(UUID().uuidString)"
+        let nativeMTP = FlashNextModule.estimateContextMemory(
+            descriptor: desc, packPath: missing, contextTokens: 16_384, kvMode: .f16,
+            mtpDrafts: 3, mtpBackend: "variational", prefillChunkSize: 4096,
+            tuning: .default, physicalMemoryBytes: 24 << 30)
+        let dflash = FlashNextModule.estimateContextMemory(
+            descriptor: desc, packPath: missing, contextTokens: 16_384, kvMode: .f16,
+            mtpDrafts: 7, mtpBackend: "dflash2", prefillChunkSize: 4096,
+            tuning: .default, physicalMemoryBytes: 24 << 30)
+        XCTAssertLessThan(dflash.kvBytes, nativeMTP.kvBytes)
+        XCTAssertLessThan(dflash.weightsBytes, nativeMTP.weightsBytes)
+        XCTAssertGreaterThan(dflash.maxFittingContext, nativeMTP.maxFittingContext)
+    }
+
+    func testResolveSpeculationDFlash2DSpineAndIncompatibleFallback() throws {
+        let desc = flashNextDescriptor()
+        func writeSyntheticDrafter(blockSize: Int, isDSpine: Bool) throws -> URL {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("fn_dflash_spec_\(UUID().uuidString)", isDirectory: true)
+            let assets = dir.appendingPathComponent("assets")
+            try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+            let dflashDict: [String: Any] = [
+                "block_size": blockSize,
+                "target_layer_ids": [0],
+            ]
+            var cfg: [String: Any] = [
+                "model_type": "qwen3",
+                "hidden_size": desc.hidden, "num_hidden_layers": 1, "vocab_size": desc.vocab,
+                "num_attention_heads": 20, "num_key_value_heads": 8,
+                "head_dim": 128, "dflash_config": dflashDict
+            ]
+            if isDSpine { cfg["selected_prefix_code_bridge"] = ["code_size": 64, "rank": 32] }
+            try JSONSerialization.data(withJSONObject: cfg).write(to: assets.appendingPathComponent("config.json"))
+            var tensors: [String: Any] = [
+                "fc.weight": ["shape": [desc.hidden, desc.hidden], "hq4_off": 64],
+                "hidden_norm.weight": ["shape": [desc.hidden], "raw_off": 64],
+                "norm.weight": ["shape": [desc.hidden], "raw_off": 64],
+                "layers.0.self_attn.q_proj.weight": ["shape": [desc.hidden, desc.hidden], "hq4_off": 64],
+            ]
+            if isDSpine {
+                tensors["selected_prefix_bridge.codebook"] = ["shape": [64, 32], "raw_off": 64]
+                tensors["selected_prefix_bridge.read_weight"] = ["shape": [32, desc.hidden], "raw_off": 64]
+                tensors["selected_prefix_bridge.feature_write_weights"] = ["shape": [desc.hidden, 32], "raw_off": 64]
+            }
+            let hdrData = try JSONSerialization.data(withJSONObject: [
+                "provenance": ["source": "unit-test"],
+                "tensors": tensors,
+            ])
+            var qwp = Data("QWP1".utf8)
+            var len = UInt64(hdrData.count)
+            withUnsafeBytes(of: &len) { qwp.append(contentsOf: $0) }
+            qwp.append(Data(count: 64))
+            qwp.append(hdrData)
+            try qwp.write(to: dir.appendingPathComponent("model.qwp"))
+            return dir
+        }
+
+        let dflashDir = try writeSyntheticDrafter(blockSize: 8, isDSpine: false)
+        defer { try? FileManager.default.removeItem(at: dflashDir) }
+        var reqDFlash = QWSpeculativeParameters(mtpDrafts: 7, mtpBackend: "dflash2")
+        reqDFlash.dflashDraftPackPath = dflashDir.path
+        let resDF = try FlashNextModule.resolveSpeculation(reqDFlash, descriptor: desc, environment: [:], modelSwitch: true)
+        XCTAssertEqual(resDF.engineBackend, QWMTPBackend.dflash2)
+        XCTAssertEqual(resDF.engineDrafts, 7)
+        XCTAssertEqual(resDF.reportedBackend, "dflash2")
+
+        let dspineDir = try writeSyntheticDrafter(blockSize: 16, isDSpine: true)
+        defer { try? FileManager.default.removeItem(at: dspineDir) }
+        var reqDS = QWSpeculativeParameters(mtpDrafts: 12, mtpBackend: "dspine")
+        reqDS.dflashDraftPackPath = dspineDir.path
+        let resDS = try FlashNextModule.resolveSpeculation(reqDS, descriptor: desc, environment: [:], modelSwitch: true)
+        XCTAssertEqual(resDS.engineBackend, QWMTPBackend.dflash2)
+        XCTAssertEqual(resDS.engineDrafts, 7)
+        XCTAssertEqual(resDS.reportedBackend, "dspine")
+
+        // Model switch with incompatible/missing drafter falls back cleanly to variational (<= 3 drafts).
+        var reqMissing = QWSpeculativeParameters(mtpDrafts: 7, mtpBackend: "dflash2")
+        reqMissing.dflashDraftPackPath = "/tmp/nonexistent-dflash-\(UUID().uuidString)"
+        let fallback = try FlashNextModule.resolveSpeculation(reqMissing, descriptor: desc, environment: [:], modelSwitch: true)
+        XCTAssertEqual(fallback.parameters.mtpBackend, "variational")
+        XCTAssertNil(fallback.engineBackend)
+        XCTAssertLessThanOrEqual(fallback.reportedDrafts, 3)
+    }
+
+    func testConcurrentLastResultAndTelemetryUpdatesAreThreadSafe() throws {
+        let module = FlashNextModule(plan: try flashNextPlan())
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "fn.module.race.test", attributes: .concurrent)
+        for worker in 0..<8 {
+            group.enter()
+            queue.async {
+                for iter in 0..<250 {
+                    let result = QWGenerationResult(
+                        tokens: [worker, iter],
+                        stepMs: [12.5],
+                        stepTokenCounts: [2],
+                        cache: QWCacheAnswer(hit: iter % 2 == 0, matchedTokens: iter, totalTokens: 64, tier: "warm_ram"),
+                        speculativeSummary: "dflash2=\(iter)/\(iter + 1), rounds=1, mean=2.00 tok/rnd"
+                    )
+                    module.naxLogMessage = "Dense NAX mode \(worker)-\(iter)"
+                    module.recordGenerationResult(result, specProposals: iter + 1, specAccepted: iter)
+                    _ = module.lastTurn
+                    _ = module.report
+                }
+                group.leave()
+            }
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + 10), .success)
+        XCTAssertNotNil(module.lastTurn)
     }
 }
 

@@ -12,10 +12,12 @@ extension SettingsView {
         VStack(alignment: .leading, spacing: 14) {
             settingsGroup(title: "Memory & Residency", icon: "memorychip") {
                 HStack(spacing: 6) {
-                    Text("Stored per model · QW_* environment variables override")
+                    Text("Stored per model · QW_* env vars override")
                         .font(TelemetryTheme.ui(11))
                         .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
-                    Spacer()
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 6)
                     Button("Reset Performance Defaults") { resetPerformanceDefaults() }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -29,12 +31,14 @@ extension SettingsView {
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 Text(tuningString("memoryPolicy").wrappedValue == QWMemoryPolicy.maxResident.rawValue
                      ? "Sizes resident weights to physical RAM less the OS reserve. Fastest; other apps' memory may be swapped out."
                      : "Sizes resident weights to memory that is free or reclaimable at load, less 6 GiB headroom. Never swaps.")
                     .font(TelemetryTheme.ui(11))
                     .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                    .fixedSize(horizontal: false, vertical: true)
 
                 doubleSliderRow(label: "OS Reserve:", id: "osReserveGiB", range: 2...32, step: 1,
                                 readout: { String(format: "%.0f GiB", $0) })
@@ -47,6 +51,7 @@ extension SettingsView {
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
+                    .frame(maxWidth: .infinity)
                 }
 
                 if selectedModelSupportsPLE {
@@ -55,6 +60,7 @@ extension SettingsView {
                     Text("Streams external ngram.bin via a 64 MiB L1 cache instead of wiring into Metal RAM. Auto-engages when context exceeds UMA headroom.")
                         .font(TelemetryTheme.ui(11))
                         .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -90,12 +96,13 @@ extension SettingsView {
             settingsGroup(title: "Thermal & Cooling", icon: "fanblades") {
                 formRow(label: "Cooling Policy:", key: "coolingPolicy") {
                     Picker("", selection: $draftSettings.coolingPolicy) {
-                        Text("System Auto").tag("auto")
-                        Text("Proactive Pre-Spin").tag("proactive")
+                        Text("Auto").tag("auto")
+                        Text("Pre-Spin").tag("proactive")
                         Text("Max Blast").tag("max")
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
+                    .frame(maxWidth: .infinity)
                 }
                 if let fanStatus = telemetry.dashboard?.facts?.fanControlStatus, !fanStatus.isEmpty {
                     HStack(spacing: 6) {
@@ -108,7 +115,7 @@ extension SettingsView {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                Text("System Auto defers to macOS SMC. Proactive Pre-Spin ramps fans on prefill/decode; Max Blast targets 100% RPM. Direct SMC fan writes require root or /var/run/qwg-smc.sock.")
+                Text("Auto defers to macOS SMC. Pre-Spin ramps fans on prefill/decode; Max Blast targets 100% RPM. Direct SMC fan writes require root or /var/run/qwg-smc.sock.")
                     .font(TelemetryTheme.ui(11))
                     .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                     .fixedSize(horizontal: false, vertical: true)
@@ -125,6 +132,7 @@ extension SettingsView {
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .onChange(of: draftSettings.lsaMode) { _, _ in
                         validateModelAndDrafterOnSelection()
                     }
@@ -171,6 +179,7 @@ extension SettingsView {
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     formRow(label: "Cluster Block (L):", key: "lsaClusterBlock") {
@@ -182,6 +191,7 @@ extension SettingsView {
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
@@ -198,6 +208,7 @@ extension SettingsView {
                     Text("Auto selects .qlsa / Weight-SVD on GQA (<= k+516 runs exact dense), native flat QSA <= 262K + e-means-4096 > 262K on QSA, and < 41K flat bypass + >= 41K e-means coarse pruning on MLA.")
                         .font(TelemetryTheme.ui(11))
                         .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }

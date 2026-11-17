@@ -112,6 +112,8 @@ public struct QWMemoryIndexRequest: Codable, Sendable, Equatable {
     public let includeTests: Bool?
     public let mountAfterIndex: Bool?
     public let stream: Bool?
+    public let mtpBackend: String?
+    public let dflashDraftPackPath: String?
 
     public init(
         path: String,
@@ -123,7 +125,9 @@ public struct QWMemoryIndexRequest: Codable, Sendable, Equatable {
         maxCortexTokens: Int? = nil,
         includeTests: Bool? = nil,
         mountAfterIndex: Bool? = nil,
-        stream: Bool? = nil
+        stream: Bool? = nil,
+        mtpBackend: String? = nil,
+        dflashDraftPackPath: String? = nil
     ) {
         self.path = path
         self.packName = packName
@@ -135,6 +139,8 @@ public struct QWMemoryIndexRequest: Codable, Sendable, Equatable {
         self.includeTests = includeTests
         self.mountAfterIndex = mountAfterIndex
         self.stream = stream
+        self.mtpBackend = mtpBackend
+        self.dflashDraftPackPath = dflashDraftPackPath
     }
 }
 

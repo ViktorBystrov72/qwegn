@@ -98,7 +98,7 @@ var targets: [Target] = [
     // C16 draft chain: norms (enorm/hnorm/lns), the QWGEMM fc+seam, rope,
     // attn decode on its OWN kv slice, MLP, and the shared head. Grows with
     // the chain legs — each rung REUSES a shipped door (never a private copy).
-    T("QWMTP", ["QWCore", "QWHAL", "QWAlloc", "QWGEMM", "QWNorm", "QWRope", "QWKV", "QWAttn", "QWHead"]),
+    T("QWMTP", ["QWCore", "QWQuant", "QWHAL", "QWAlloc", "QWGEMM", "QWNorm", "QWRope", "QWKV", "QWAttn", "QWMLP", "QWHead", "QWLoad"]),
     T("QWMM", ["QWCore", "QWHAL", "QWAlloc", "QWToken", "QWVision"]),
     // Layer 7
     // The module registry maps a family to the module that serves it, so the
@@ -113,7 +113,7 @@ var targets: [Target] = [
     // Layer 7.8 — Server logic (library; HTTP 1.1 + SSE + OpenAI/Ollama schemas + lifecycle actor).
     .target(name: "QWServer",
             dependencies: ["QWCore", "QWHAL", "QWQuant", "QWKV", "QWToken", "QWVision", "QWMM",
-                           "QWEngine", "QWCli", "QWHead",
+                           "QWMTP", "QWEngine", "QWCli", "QWHead",
                            .product(name: "Jinja", package: "swift-jinja")],
             path: targetPaths["QWServer"],
             resources: [
@@ -125,7 +125,7 @@ var targets: [Target] = [
             swiftSettings: swiftWarningsAsErrors),
     // Layer 8 — CLI.
     .executableTarget(name: "qwg",
-                      dependencies: ["QWCore", "QWEngine", "QWToken", "QWCli", "QWKV", "QWServer",
+                      dependencies: ["QWCore", "QWMTP", "QWEngine", "QWToken", "QWCli", "QWKV", "QWServer",
                                      .product(name: "ArgumentParser", package: "swift-argument-parser")],
                       path: targetPaths["qwg"],
                       swiftSettings: swiftWarningsAsErrors),
@@ -151,7 +151,7 @@ var targets: [Target] = [
     // soak and the CPU-only reference soak. One schema, one producer.
     .executableTarget(name: "m1", dependencies: ["QWCore", "QWEngine", "QWToken", "QWQuant", "QWCli"],
                       path: "Scripts/m1", swiftSettings: swiftWarningsAsErrors),
-    T("QWFlashNext", ["QWCore", "QWQuant", "QWHAL", "QWAlloc", "QWGEMM", "QWGDN", "QWHead", "QWLoad"]),
+    T("QWFlashNext", ["QWCore", "QWQuant", "QWHAL", "QWAlloc", "QWGEMM", "QWGDN", "QWHead", "QWMTP", "QWLoad"]),
     .target(name: "QWMetalCounterSupport", path: targetPaths["QWMetalCounterSupport"],
             publicHeadersPath: "include"),
 ]
@@ -203,7 +203,7 @@ targets.append(.testTarget(
 // FlashNext Metal (GPU) goldens: the dense HQ4 kernels driven on FlashNext expert weights.
 targets.append(.testTarget(
     name: "QWFlashNextMetalTests",
-    dependencies: [.byName(name: "QWFlashNext"), .byName(name: "QWCore"), .byName(name: "QWQuant"),
+    dependencies: [.byName(name: "QWFlashNext"), .byName(name: "QWMTP"), .byName(name: "QWCore"), .byName(name: "QWQuant"),
                    .byName(name: "QWHAL"), .byName(name: "QWAlloc"), .byName(name: "QWGEMM"),
                    .byName(name: "QWGDN")],
     path: "Tests/QWFlashNextMetalTests",

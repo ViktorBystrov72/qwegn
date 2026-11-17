@@ -33,7 +33,7 @@ public final class QWEngineSession: @unchecked Sendable {
     let trunkHidden: QWTensorValue?
     let dflashSlot: QWDFlashSessionSlot?
     public internal(set) var dflashCacheOffset: Int = 0
-    var dflashPolicy = QWDFlashAdaptivePolicy()
+    var dflashPolicy: QWDFlashAdaptivePolicy
     var dflashRoundStartNs: UInt64?
     var trunkHiddenValid = false
     /// finishSession idempotence witness (static-analysis H1): the driver
@@ -52,11 +52,13 @@ public final class QWEngineSession: @unchecked Sendable {
 
     init(kv: QWKVHandle, mtpKV: QWKVHandle? = nil, rec: [QWTensorValue],
          ring: [QWTensorValue], recSlab: QWTensorValue, ringSlab: QWTensorValue,
-         trunkHidden: QWTensorValue? = nil, dflashSlot: QWDFlashSessionSlot? = nil) {
+         trunkHidden: QWTensorValue? = nil, dflashSlot: QWDFlashSessionSlot? = nil,
+         isSparseMoE: Bool = false) {
         self.kv = kv; self.mtpKV = mtpKV; self.rec = rec; self.ring = ring
         self.recSlab = recSlab; self.ringSlab = ringSlab
         self.trunkHidden = trunkHidden
         self.dflashSlot = dflashSlot
+        self.dflashPolicy = QWDFlashAdaptivePolicy(isSparseMoE: isSparseMoE)
         self.roundRecord = QWRoundRecord()
     }
 

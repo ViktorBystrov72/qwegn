@@ -66,16 +66,17 @@ extension SettingsView {
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                formRow(label: "Random Seed:", key: "seed") {
-                    VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 4) {
+                    formRow(label: "Random Seed:", key: "seed") {
                         TextField("-1 (Random)", value: $draftSettings.seed, formatter: plainNumberFormatter)
                             .textFieldStyle(.roundedBorder)
-                        Text("Set -1 for non-deterministic pseudorandom sampling")
-                            .font(TelemetryTheme.ui(11))
-                            .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
                     }
+                    Text("Set -1 for non-deterministic pseudorandom sampling")
+                        .font(TelemetryTheme.ui(11))
+                        .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
                 }
             }
 
@@ -94,6 +95,7 @@ extension SettingsView {
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -204,6 +206,7 @@ extension SettingsView {
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
+                    .frame(maxWidth: .infinity)
                 }
 
                 formRow(label: "Log File Name:", key: "logFileName") {

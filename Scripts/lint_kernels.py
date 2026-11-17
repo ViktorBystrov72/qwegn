@@ -254,10 +254,11 @@ NON_STANDARD_KERNEL_PREFIXES = (
 FLASH_NEXT_ENGINE_DIRS = ["Sources/Subsystems/QWFlashNext"]
 SHARED_OPERATOR_DIRS = ["Sources/Operators/QWAttn", "Sources/Operators/QWGDN",
                         "Sources/Operators/QWGEMM", "Sources/Operators/QWHead",
-                        "Sources/Operators/QWKV",
+                        "Sources/Operators/QWKV", "Sources/Subsystems/QWMTP",
                         "Sources/Operators/QWNorm", "Sources/Operators/QWRope",
                         "Sources/Foundation/QWQuant"]
 FLASH_NEXT_OPERATOR_DIRS = ["Sources/Operators/QWGDN", "Sources/Operators/QWGEMM",
+                            "Sources/Subsystems/QWMTP",
                             "Sources/Foundation/QWQuant"]
 
 

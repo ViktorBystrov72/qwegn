@@ -3,6 +3,7 @@ let isConnected = false;
 let publishedModel = null;
 let modelGeneration = 0;
 let discoveredModelsList = [];
+let discoveredDraftersList = [];
 let metricsEventSource = null;
 let logsEventSource = null;
 let expandedRequestId = null;

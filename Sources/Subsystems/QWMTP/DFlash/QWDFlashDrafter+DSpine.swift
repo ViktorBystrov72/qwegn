@@ -8,7 +8,6 @@ import QWGEMM
 import QWHAL
 import QWHead
 import QWLoad
-import QWMTP
 import QWQuant
 
 struct DSpineBridgeWeights {
@@ -224,7 +223,7 @@ extension QWDFlashDrafter {
         output: QWTensorValue,
         rows: Int
     ) {
-        if !QWMTPBatchedMLP.usesQ4GMKernel(weight) {
+        if !Self.usesQ4GMKernel(weight) {
             encodeAQGateUpMatmul(enc, weight: weight, input: input, output: output, rows: rows)
             return
         }
@@ -351,13 +350,13 @@ extension QWDFlashDrafter {
     }
 
     func selectDSpineStochastic(
-        owner: QWStochasticSession,
+        temperature: Float,
+        stream: QWMTPRandomStream,
         draftCount D: Int,
         topK: Int,
         bs: DSpineBridgeScratch
     ) throws -> (drafts: [Int], proposals: [QWMTPGumbelProposal]) {
         let V = config.vocabSize
-        let temp = max(Double(owner.config.temperature), 1e-6)
         let tablePtr = bs.refineTable.region.buffer.contents()
             .advanced(by: bs.refineTable.region.base + bs.refineTable.offset)
             .assumingMemoryBound(to: Float.self)
@@ -369,24 +368,20 @@ extension QWDFlashDrafter {
         var drafts: [Int] = []
         var proposals: [QWMTPGumbelProposal] = []
         for pos in 0..<D {
-            var scores = [Double](repeating: 0, count: topK)
-            var ids = [Int](repeating: 0, count: topK)
-            var maxScore = -Double.infinity
+            var scored: [(id: Int, score: Double)] = []
+            scored.reserveCapacity(topK)
             let rowBase = (pos * 16 + senderIdx) * 16
             for k in 0..<topK {
                 let cand = Int(cPtr[pos * 16 + k])
-                let s = Double(tablePtr[rowBase + k])
-                ids[k] = cand
-                scores[k] = s
-                if s > maxScore { maxScore = s }
+                scored.append((cand, Double(tablePtr[rowBase + k])))
             }
-            let weights = scores.map { exp(($0 - maxScore) / temp) }
-            let dist = try QWSamplingDistribution.sparse(vocabulary: V, ids: ids, weights: weights)
-            let proposal = try owner.stream.sampleGumbelProposal(dist)
-            if let chosenK = ids.firstIndex(of: proposal.token) {
+            let dist = try Self.buildSparseDistribution(vocab: V, candidates: scored, temperature: temperature)
+            let proposal = try stream.sampleGumbelProposal(dist)
+            let tok = Self.clampToken(proposal.token, vocab: V)
+            if let chosenK = (0..<topK).first(where: { Int(cPtr[pos * 16 + $0]) == tok }) {
                 senderIdx = chosenK
             }
-            drafts.append(proposal.token)
+            drafts.append(tok)
             proposals.append(proposal)
         }
         return (drafts, proposals)

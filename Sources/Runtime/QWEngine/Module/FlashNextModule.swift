@@ -32,7 +32,10 @@ final class FNGPUSessionState: QWModuleSessionState, @unchecked Sendable {
         data = FNGPUSessionData(history: [], sampler: QWSampler(config: sampling),
                                 useSpec: useSpec)
         data.draftMode = draftMode
-        data.maxDrafts = max(1, min(FNGPUSessionData.defaultMTPDrafts, speculative.effectiveDrafts))
+        let specCap = engine.dflash != nil
+            ? min(FNGPUDFlash.maxDrafts, engine.dflashMaxDrafts)
+            : FNGPUSessionData.defaultMTPDrafts
+        data.maxDrafts = max(1, min(specCap, speculative.effectiveDrafts))
         data.relaxedMargin = sampling.hasExplicitSeed ? 0 : speculative.effectiveRelaxedMargin
         data.relaxedMinProb = speculative.effectiveRelaxedMinProb
         data.quadraticSeeding = speculative.mtpQuadraticSeeding
@@ -72,13 +75,41 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
         environment: [String: String], modelSwitch: Bool
     ) throws -> QWResolvedSpeculation {
         var parameters = requested
+        let envPack = environment["QW_DFLASH_DRAFT_PACK"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reqPack = parameters.dflashDraftPackPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedPack = (reqPack?.isEmpty == false ? reqPack : nil)
+            ?? (envPack?.isEmpty == false ? envPack : nil)
+            ?? QWDFlashConfig.defaultPackPath(for: descriptor)
+        let inferred = QWDFlashConfig.inferBackendAndMaxDrafts(packPath: resolvedPack)
+        let dflashCap = min(FNGPUDFlash.maxDrafts, max(1, inferred.maxDrafts))
         if modelSwitch {
-            if ["dflash2", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "") { parameters.mtpBackend = "variational" }
-            parameters.mtpDrafts = min(parameters.mtpDrafts, max(1, descriptor.maxSpeculativeDrafts))
+            if FNGPUDFlash.isDFlashName(parameters.mtpBackend) {
+                let compatible = (try? QWDFlashConfig.validateDrafter(
+                    targetDescriptor: descriptor, packPath: resolvedPack,
+                    drafts: 1, selectorTopK: parameters.dflashSelectorTopK
+                )) != nil
+                if compatible {
+                    parameters.mtpBackend = inferred.backend
+                    parameters.mtpDrafts = max(1, min(dflashCap, parameters.mtpDrafts))
+                } else {
+                    parameters.mtpBackend = "variational"
+                    parameters.mtpDrafts = min(parameters.mtpDrafts, max(1, descriptor.maxSpeculativeDrafts))
+                }
+            } else {
+                parameters.mtpDrafts = min(parameters.mtpDrafts, max(1, descriptor.maxSpeculativeDrafts))
+            }
         }
         let mode = try FNGPUSessionState.draftMode(for: parameters, environment: environment)
         parameters.mtpDraftStrategy = mode.rawValue
         parameters.draftStrategyIsResolved = true
+        if FNGPUDFlash.isDFlashName(parameters.mtpBackend) {
+            let drafts = parameters.enabled ? max(0, min(dflashCap, parameters.mtpDrafts)) : 0
+            let backendName = parameters.mtpBackend?.lowercased() == "dspine" ? "dspine" : "dflash2"
+            return QWResolvedSpeculation(parameters: parameters, engineDrafts: drafts,
+                                         engineBackend: drafts > 0 ? .dflash2 : nil,
+                                         reportedDrafts: drafts,
+                                         reportedBackend: backendName)
+        }
         let engineDrafts = parameters.enabled && descriptor.capabilities.contains(.mtp) ? parameters.mtpDrafts : 0
         return QWResolvedSpeculation(parameters: parameters, engineDrafts: engineDrafts,
                                      engineBackend: nil,
@@ -92,16 +123,20 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
         physicalMemoryBytes: Int?
     ) -> QWContextMemoryEstimate {
         let clampedContext = max(64, min(1_048_576, contextTokens))
-        let perTokBytes: Int = switch kvMode {
+        let isDFlash = mtpDrafts > 0 && FNGPUDFlash.isDFlashName(mtpBackend)
+        let rawPerTokBytes: Int = switch kvMode {
         case .f16: 31_296
         case .q8:  18_096
         case .q4:  11_752
         }
+        let perTokBytes = FNGPUDFlash.adjustedPerTokenKVBytes(rawPerTokBytes, usesDFlash: isDFlash)
         let hiBit = (descriptor.quantization?.bits ?? 4) > 4
         let minWeights = (hiBit ? 3_408 : 2_384) << 20
         let onDisk = QWResidencyAdmission.flashNextOnDiskFootprint(packPath: packPath, minWeightsBytes: minWeights)
-        let weightsBytes = onDisk.weightsBytes + onDisk.pleBytes
-        let scratchBytes = (1408 << 20) + (836 << 20)
+        let dflashDelta = FNGPUDFlash.estimateFootprint(
+            targetDescriptor: descriptor, targetPackPath: packPath, dflashPackPath: nil, isDFlash: isDFlash)
+        let weightsBytes = max(512 << 20, onDisk.weightsBytes - dflashDelta.nativeMTPWeightBytes + dflashDelta.dflashWeightBytes) + onDisk.pleBytes
+        let scratchBytes = (1408 << 20) + (836 << 20) + (isDFlash ? max(0, dflashDelta.dflashScratchBytes - (112 << 20)) : 0)
         let fixedBytes = weightsBytes + scratchBytes
         let alignedCap = QWCapacityPlan.steppedCapacity(clampedContext)
         let kvCap = alignedCap >= 32_768 ? (alignedCap + 1024) : alignedCap
@@ -118,9 +153,9 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
             fits: availBytes == 0 || requiredBytes <= availBytes)
     }
 
-    /// Capabilities supported by Flash-Next (`qwen4_exp`), including the 27-block ViT vision tower.
+    /// Capabilities supported by Flash-Next (`qwen4_exp`), including the 27-block ViT vision tower and DFlash 2.
     public static let capabilities: Set<QWKnobCapability> = [
-        .vision, .prefixCache, .kvQuantQ8, .kvQuantQ4, .speculative, .lsa,
+        .vision, .prefixCache, .kvQuantQ8, .kvQuantQ4, .speculative, .lsa, .dflash,
     ]
 
     /// `FNKVStorageMode` keeps the legacy f32 path alongside f16/q8/q4.
@@ -133,26 +168,61 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
     public let engine: FNGPUEngine?
     /// The frozen numeric plan of the loaded model.
     public let plan: QWEnginePlan
+    private let stateLock = NSLock()
+    private var _onCacheEvent: (@Sendable (QWPrefixCacheEvent) -> Void)?
+    private var _prefixCacheHit: Bool = false
+    private var _prefixCacheMatchedTokens: Int = 0
+    private var _prefixCacheTier: FNPrefixCacheTier?
+    private var _naxLogMessage: String = ""
+    private var _lastResult: QWGenerationResult?
+    private var _lastSpecProposals: Int = 0
+    private var _lastSpecAccepted: Int = 0
+
     /// Where the module reports what its prefix cache did.
-    public var onCacheEvent: (@Sendable (QWPrefixCacheEvent) -> Void)?
+    public var onCacheEvent: (@Sendable (QWPrefixCacheEvent) -> Void)? {
+        get { stateLock.withLock { _onCacheEvent } }
+        set { stateLock.withLock { _onCacheEvent = newValue } }
+    }
     /// Whether the prefix cache served the last prompt this module ran.
-    public private(set) var prefixCacheHit: Bool = false
+    public var prefixCacheHit: Bool { stateLock.withLock { _prefixCacheHit } }
     /// How many tokens the last restore reused.
-    public private(set) var prefixCacheMatchedTokens: Int = 0
+    public var prefixCacheMatchedTokens: Int { stateLock.withLock { _prefixCacheMatchedTokens } }
     /// The tier that served the last restore: the RAM or the disk.
-    public private(set) var prefixCacheTier: FNPrefixCacheTier?
+    public var prefixCacheTier: FNPrefixCacheTier? { stateLock.withLock { _prefixCacheTier } }
     /// The NAX mode the last request chose, in the engine's own words.
-    public internal(set) var naxLogMessage: String = ""
+    public internal(set) var naxLogMessage: String {
+        get { stateLock.withLock { _naxLogMessage } }
+        set { stateLock.withLock { _naxLogMessage = newValue } }
+    }
     /// The result of the last turn this module ran.
-    public internal(set) var lastResult: QWGenerationResult?
+    public internal(set) var lastResult: QWGenerationResult? {
+        get { stateLock.withLock { _lastResult } }
+        set { stateLock.withLock { _lastResult = newValue } }
+    }
     /// Speculative draft proposals in the last turn.
-    public internal(set) var lastSpecProposals: Int = 0
+    public internal(set) var lastSpecProposals: Int {
+        get { stateLock.withLock { _lastSpecProposals } }
+        set { stateLock.withLock { _lastSpecProposals = newValue } }
+    }
     /// Speculative accepted drafts in the last turn.
-    public internal(set) var lastSpecAccepted: Int = 0
+    public internal(set) var lastSpecAccepted: Int {
+        get { stateLock.withLock { _lastSpecAccepted } }
+        set { stateLock.withLock { _lastSpecAccepted = newValue } }
+    }
 
     public init(engine: FNGPUEngine) {
         self.engine = engine
         self.plan = engine.plan
+        engine.batchScheduler.onCacheEvaluated = { [weak self, weak engine] sessionData in
+            guard let self, let engine else { return }
+            self.reportCacheEvent(engine: engine, sessionData: sessionData)
+        }
+        engine.batchScheduler.onSlot0CacheEvaluated = nil
+        engine.batchScheduler.onStepTiming = { gpuMs, wallMs in
+            if gpuMs > 0 && wallMs > 0 {
+                QWTelemetryRegistry.shared.record("gpu.busy_ratio", gpuMs / wallMs, provenance: .measured)
+            }
+        }
         engine.onCacheRetained = { [weak self] tokens, chargedBytes, storeTotalBytes, warmLimitBytes in
             self?.onCacheEvent?(.retained(tokens: tokens, chargedBytes: chargedBytes,
                                           storeTotalBytes: storeTotalBytes, warmLimitBytes: warmLimitBytes))
@@ -205,7 +275,7 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
             weightReservedBytes: engine.weightReservedBytes,
             steadyAllocations: engine.steadyStateAllocations,
             pipelineSeconds: QWHalPSOStats.seconds,
-            detailLines: naxLogMessage + engine.prefillStackNote,
+            detailLines: naxLogMessage + engine.prefillStackNote + engine.dflashReportLine,
             contextCapacity: engine.capacity,
             weightFormat: engine.headWeightFormatLabel
         )
@@ -230,7 +300,12 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
                 prewarmDoors: FlashNextModule.requiredDoors,
                 lsaConfig: options.lsaConfig,
                 streamNgrams: resolvedTuning.streamNgrams,
-                ropeYarnFactor: options.ropeYarnFactor
+                ropeYarnFactor: options.ropeYarnFactor,
+                mtpBackend: options.mtpBackend?.rawValue,
+                mtpDrafts: options.mtpDrafts,
+                dflashDraftPackPath: options.dflashDraftPackPath,
+                dflashSelectorTopK: options.dflashSelectorTopK,
+                mtpDraftStrategy: options.mtpDraftStrategy
             )
         }
         return FlashNextModule(engine: engine)
@@ -271,8 +346,10 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
     public func finish(_ state: any QWModuleSessionState) {
         if let session = state as? FNGPUSessionState {
             engine?.flushPendingPrefixCache(&session.data)
-            lastSpecProposals = session.data.specProposals
-            lastSpecAccepted = session.data.specAccepted
+            stateLock.withLock {
+                _lastSpecProposals = session.data.specProposals
+                _lastSpecAccepted = session.data.specAccepted
+            }
         }
     }
 
@@ -345,16 +422,27 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
         reportCacheEvent(engine: engine, sessionData: session.data)
     }
 
+    func recordGenerationResult(_ result: QWGenerationResult, specProposals: Int, specAccepted: Int) {
+        stateLock.withLock {
+            _lastSpecProposals = specProposals
+            _lastSpecAccepted = specAccepted
+            _lastResult = result
+        }
+    }
+
     func reportCacheEvent(engine: FNGPUEngine, sessionData: FNGPUSessionData) {
-        prefixCacheHit = sessionData.prefixCacheHit
-        prefixCacheMatchedTokens = sessionData.prefixCacheMatchedTokens
-        prefixCacheTier = sessionData.prefixCacheTier
-        guard let sink = onCacheEvent else { return }
-        if prefixCacheHit {
+        let (hit, matched, tier, sink) = stateLock.withLock {
+            _prefixCacheHit = sessionData.prefixCacheHit
+            _prefixCacheMatchedTokens = sessionData.prefixCacheMatchedTokens
+            _prefixCacheTier = sessionData.prefixCacheTier
+            return (_prefixCacheHit, _prefixCacheMatchedTokens, _prefixCacheTier, _onCacheEvent)
+        }
+        guard let sink else { return }
+        if hit {
             // The tier that served the prefix is the one it came from; a
             // tier the engine does not name is left unnamed, not guessed.
-            sink(.hit(tier: sessionData.prefixCacheTier?.rawValue ?? "",
-                      matchedTokens: prefixCacheMatchedTokens,
+            sink(.hit(tier: tier?.rawValue ?? "",
+                      matchedTokens: matched,
                       totalTokens: sessionData.history.count))
         } else if engine.hasPrefixCacheTier {
             sink(.miss(totalTokens: sessionData.history.count))
@@ -374,6 +462,7 @@ extension FlashNextModule: QWInferenceEngine {
         guard let engine else { return FlashNextModule.capabilities }
         var caps = FlashNextModule.capabilities
         if !engine.supportsSpeculativeDecode { caps.remove(.speculative) }
+        if engine.dflash == nil { caps.remove(.dflash) }
         return caps
     }
 

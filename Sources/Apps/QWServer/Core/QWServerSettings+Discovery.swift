@@ -167,21 +167,47 @@ extension QWServerSettings {
         let hub = QWModelCatalog.scanHuggingFaceHub(directory: QWPaths.hfHubCacheDirectoryURL.path)
         let localNames = Set(local.map(\.name))
         return (local + hub.filter { !localNames.contains($0.name) }).map { e in
-            DiscoveredModel(name: e.name, packPath: e.path, family: e.family?.rawValue,
-                            nativeWindow: e.nativeWindow, supported: e.supported, reason: e.reason,
-                            capabilities: e.capabilities.map(\.rawValue).sorted(),
-                            maxSpeculativeDrafts: e.maxSpeculativeDrafts,
-                            hasLSASidecar: e.hasLSASidecar, lsaSidecarPath: e.lsaSidecarPath)
+            var caps = Set(e.capabilities.map(\.rawValue))
+            if e.supported, let family = e.family,
+               QWModuleRegistry.capabilities(for: family).contains(.dflash) || family == .qwen38FlashNext {
+                caps.insert(QWKnobCapability.dflash.rawValue)
+            }
+            return DiscoveredModel(name: e.name, packPath: e.path, family: e.family?.rawValue,
+                                   nativeWindow: e.nativeWindow, supported: e.supported, reason: e.reason,
+                                   capabilities: caps.sorted(),
+                                   maxSpeculativeDrafts: e.maxSpeculativeDrafts,
+                                   hasLSASidecar: e.hasLSASidecar, lsaSidecarPath: e.lsaSidecarPath)
         }
     }
 
-    /// Scans ~/.qwg/models for installed DFlash 2 and DSpine drafter model packs via `config.json`.
-    public static func scanDrafterModelsDirectory() -> [DiscoveredModel] {
-        let dir = QWPaths.modelsDirectoryPath
+    /// Parsed `config.json` geometry and backend metadata for an installed DFlash 2 or DSpine drafter pack.
+    public struct DrafterMetadata: Sendable, Equatable {
+        public let hiddenSize: Int
+        public let vocabSize: Int
+        public let numLayers: Int
+        public let targetLayerIds: [Int]
+        public let numTargetLayers: Int?
+        public let backend: String
+        public let maxDrafts: Int
+    }
+
+    /// HTTP/WebUI summary of an installed DFlash 2 or DSpine drafter pack and compatible primary models.
+    public struct DiscoveredDrafter: Codable, Sendable, Equatable {
+        public let name: String
+        public let packPath: String
+        public let backend: String
+        public let maxDrafts: Int
+        public let compatibleModels: [String]
+    }
+
+    /// Scans `directory` (defaults to `~/.qwg/models`) for installed DFlash 2 and DSpine drafter packs.
+    public static func scanDrafterModelsDirectory(
+        in directory: String = QWPaths.modelsDirectoryPath
+    ) -> [DiscoveredModel] {
         var models: [DiscoveredModel] = []
-        if let items = try? FileManager.default.contentsOfDirectory(atPath: dir) {
+        if let items = try? FileManager.default.contentsOfDirectory(atPath: directory) {
             for item in items.sorted() where !item.hasPrefix(".") {
-                let itemPath = (dir as NSString).appendingPathComponent(item)
+                let itemPath = (directory as NSString).appendingPathComponent(item)
                 let url = URL(fileURLWithPath: itemPath)
                 guard QWDFlashConfig.isDrafterPack(at: url) else { continue }
                 models.append(DiscoveredModel(name: QWModelRoot.canonicalModelName(for: url), packPath: itemPath))
@@ -190,9 +216,364 @@ extension QWServerSettings {
         return models
     }
 
+    /// Reads drafter geometry and backend metadata from `packPath`'s `config.json`.
+    public static func drafterMetadata(atPackPath packPath: String) -> DrafterMetadata? {
+        let trimmed = packPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let resolvedURL = trimmed.expandingTildePath.canonicalFileURL
+        guard QWDFlashConfig.isDrafterPack(at: resolvedURL),
+              let cfgURL = QWModelRoot(url: resolvedURL).configURL,
+              let data = try? Data(contentsOf: cfgURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let tc = (root["text_config"] as? [String: Any]) ?? root
+        let dflash = (root["dflash_config"] as? [String: Any])
+            ?? (tc["dflash_config"] as? [String: Any])
+            ?? [:]
+        guard let hiddenSize = tc["hidden_size"] as? Int, hiddenSize > 0,
+              let vocabSize = tc["vocab_size"] as? Int, vocabSize > 0,
+              let numLayers = tc["num_hidden_layers"] as? Int, numLayers > 0 else {
+            return nil
+        }
+        let targetLayerIds = (dflash["target_layer_ids"] as? [Int])
+            ?? (tc["target_layer_ids"] as? [Int])
+            ?? (root["target_layer_ids"] as? [Int])
+            ?? []
+        let numTargetLayers = (tc["num_target_layers"] as? Int)
+            ?? (dflash["num_target_layers"] as? Int)
+            ?? (root["num_target_layers"] as? Int)
+        let bridgeObj = dflash["selected_prefix_code_bridge"]
+            ?? tc["selected_prefix_code_bridge"]
+            ?? root["selected_prefix_code_bridge"]
+        let modelTypeLower = ((tc["model_type"] as? String) ?? (root["model_type"] as? String) ?? "").lowercased()
+        let isDSpine = (bridgeObj != nil && !(bridgeObj is NSNull) && (bridgeObj as? Bool) != false)
+            || modelTypeLower.contains("dspine")
+        let blockSize = (dflash["block_size"] as? Int)
+            ?? (tc["block_size"] as? Int)
+            ?? (root["block_size"] as? Int)
+            ?? (isDSpine ? 16 : 8)
+        return DrafterMetadata(
+            hiddenSize: hiddenSize,
+            vocabSize: vocabSize,
+            numLayers: numLayers,
+            targetLayerIds: targetLayerIds,
+            numTargetLayers: numTargetLayers,
+            backend: isDSpine ? "dspine" : "dflash2",
+            maxDrafts: max(7, min(15, blockSize - 1))
+        )
+    }
+
     /// Infers `"dspine"` vs `"dflash2"` and maximum draft count (`blockSize - 1`) from the drafter pack's `config.json`.
     public static func inferDrafterBackendAndMaxDrafts(packPath: String?) -> (backend: String, maxDrafts: Int) {
-        QWDFlashConfig.inferBackendAndMaxDrafts(packPath: packPath)
+        if let packPath, let meta = drafterMetadata(atPackPath: packPath) {
+            return (meta.backend, meta.maxDrafts)
+        }
+        return QWDFlashConfig.inferBackendAndMaxDrafts(packPath: packPath)
+    }
+
+    /// Normalizes `"dflash"` / `"dflash2"` / `"dspine"` backend strings to canonical external drafter names.
+    public static func normalizeExternalDrafterBackend(_ backend: String?) -> String? {
+        guard let lower = backend?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !lower.isEmpty else {
+            return nil
+        }
+        if lower == "dspine" { return "dspine" }
+        if lower == "dflash2" || lower == "dflash" { return "dflash2" }
+        return nil
+    }
+
+    /// Decodes a primary model's `QWModelDescriptor` from its `config.json` without reading tokenizer assets.
+    public static func loadPrimaryDescriptor(packPath: String) -> QWModelDescriptor? {
+        let trimmed = packPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let root = QWModelRoot(url: URL(fileURLWithPath: trimmed.expandingTildePath))
+        guard let cfgURL = root.configURL,
+              let data = try? Data(contentsOf: cfgURL) else {
+            return nil
+        }
+        return try? QWModelDescriptor.decode(configJSON: data)
+    }
+
+    /// Returns true when drafter metadata matches target `hidden`, `vocab`, and `target_layer_ids` range/count.
+    public static func isDrafterCompatible(
+        metadata: DrafterMetadata,
+        with target: QWModelDescriptor
+    ) -> Bool {
+        guard metadata.hiddenSize == target.hidden,
+              metadata.vocabSize == target.vocab,
+              !metadata.targetLayerIds.isEmpty,
+              metadata.targetLayerIds.count == metadata.numLayers,
+              metadata.targetLayerIds.allSatisfy({ (0..<target.numLayers).contains($0) }) else {
+            return false
+        }
+        return true
+    }
+
+    /// Returns true when the drafter pack at `packPath` has `config.json` geometry matching `target`.
+    public static func isDrafterCompatible(packPath: String, with target: QWModelDescriptor) -> Bool {
+        guard let meta = drafterMetadata(atPackPath: packPath) else { return false }
+        return isDrafterCompatible(metadata: meta, with: target)
+    }
+
+    /// Filters `drafters` to packs whose `config.json` geometry matches `target`.
+    public static func compatibleDrafterModels(
+        for target: QWModelDescriptor,
+        in drafters: [DiscoveredModel] = scanDrafterModelsDirectory()
+    ) -> [DiscoveredModel] {
+        drafters.filter { !$0.packPath.isEmpty && isDrafterCompatible(packPath: $0.packPath, with: target) }
+    }
+
+    /// Selects the best geometry-matched drafter pack for `target`, preferring `preferredBackend`.
+    public static func resolveDefaultDrafterPack(
+        for target: QWModelDescriptor?,
+        preferredBackend: String? = nil,
+        drafters: [DiscoveredModel] = scanDrafterModelsDirectory(),
+        targetModelName: String? = nil
+    ) -> DiscoveredModel? {
+        let normalizedBackend = normalizeExternalDrafterBackend(preferredBackend)
+        guard let target else {
+            if let normalizedBackend,
+               let match = drafters.first(where: {
+                   !$0.packPath.isEmpty && inferDrafterBackendAndMaxDrafts(packPath: $0.packPath).backend == normalizedBackend
+               }) {
+                return match
+            }
+            return drafters.first(where: { !$0.packPath.isEmpty })
+        }
+
+        let affinityTokens = modelAffinityTokens(for: targetModelName)
+        let candidates: [(model: DiscoveredModel, meta: DrafterMetadata)] = drafters.compactMap { model in
+            guard !model.packPath.isEmpty,
+                  let meta = drafterMetadata(atPackPath: model.packPath),
+                  isDrafterCompatible(metadata: meta, with: target) else {
+                return nil
+            }
+            return (model, meta)
+        }
+        return candidates.sorted { lhs, rhs in
+            let lScore = drafterMatchScore(lhs, target: target, preferredBackend: normalizedBackend, affinityTokens: affinityTokens)
+            let rScore = drafterMatchScore(rhs, target: target, preferredBackend: normalizedBackend, affinityTokens: affinityTokens)
+            if lScore != rScore { return lScore > rScore }
+            return lhs.model.name < rhs.model.name
+        }.first?.model
+    }
+
+    /// Returns an explicit `configuredPath` or resolves a target-matched default drafter pack when empty.
+    public static func effectiveDrafterPackPath(
+        configuredPath: String?,
+        for target: QWModelDescriptor?,
+        preferredBackend: String?,
+        drafters: [DiscoveredModel] = scanDrafterModelsDirectory(),
+        targetModelName: String? = nil
+    ) -> String? {
+        let trimmed = (configuredPath ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+        return resolveDefaultDrafterPack(
+            for: target,
+            preferredBackend: preferredBackend,
+            drafters: drafters,
+            targetModelName: targetModelName
+        )?.packPath
+    }
+
+    /// Returns true when the target model supports DFlash 2 / DSpine speculative decoding.
+    public static func supportsDFlash2(
+        descriptor: QWModelDescriptor?,
+        discoveredModel: DiscoveredModel? = nil,
+        drafters: [DiscoveredModel] = []
+    ) -> Bool {
+        if let disc = discoveredModel, disc.capabilities.contains(QWKnobCapability.dflash.rawValue) {
+            return true
+        }
+        if let desc = descriptor {
+            if QWModuleRegistry.capabilities(for: desc.family).contains(.dflash)
+                || desc.family == .qwen38FlashNext {
+                return true
+            }
+            return !compatibleDrafterModels(for: desc, in: drafters).isEmpty
+        }
+        if let disc = discoveredModel {
+            if let famRaw = disc.family, let fam = QWModelDescriptor.Family(rawValue: famRaw) {
+                return QWModuleRegistry.capabilities(for: fam).contains(.dflash)
+                    || fam == .qwen38FlashNext
+            }
+            if !disc.capabilities.isEmpty {
+                return disc.capabilities.contains(QWKnobCapability.dflash.rawValue)
+            }
+        }
+        return true
+    }
+
+    /// Returns true when the target model supports `backend` (`"dflash2"` or `"dspine"`) and has
+    /// at least one matching drafter pack installed (or configured via `configuredPackPath`).
+    public static func supportsExternalDrafter(
+        backend: String,
+        descriptor: QWModelDescriptor?,
+        discoveredModel: DiscoveredModel? = nil,
+        drafters: [DiscoveredModel] = scanDrafterModelsDirectory(),
+        configuredPackPath: String? = nil
+    ) -> Bool {
+        guard let canonical = normalizeExternalDrafterBackend(backend) else { return false }
+        guard supportsDFlash2(descriptor: descriptor, discoveredModel: discoveredModel, drafters: drafters) else {
+            return false
+        }
+        var packPaths = drafters.map(\.packPath).filter { !$0.isEmpty }
+        if let trimmed = configuredPackPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !trimmed.isEmpty, !packPaths.contains(trimmed) {
+            packPaths.append(trimmed)
+        }
+        if let desc = descriptor {
+            return packPaths.contains { path in
+                guard let meta = drafterMetadata(atPackPath: path),
+                      isDrafterCompatible(metadata: meta, with: desc) else {
+                    return false
+                }
+                return meta.backend == canonical
+            }
+        }
+        if !packPaths.isEmpty {
+            return packPaths.contains { inferDrafterBackendAndMaxDrafts(packPath: $0).backend == canonical }
+        }
+        return false
+    }
+
+    /// Returns WebUI/HTTP drafter summaries paired with geometry-compatible installed primary model names.
+    public static func scanDrafterSummaries(
+        primaryModels: [DiscoveredModel] = scanModelsDirectory(),
+        drafters: [DiscoveredModel] = scanDrafterModelsDirectory()
+    ) -> [DiscoveredDrafter] {
+        var descriptors: [String: QWModelDescriptor] = [:]
+        for model in primaryModels where model.supported && !model.packPath.isEmpty {
+            if let desc = loadPrimaryDescriptor(packPath: model.packPath) {
+                descriptors[model.packPath] = desc
+            }
+        }
+        return drafters.compactMap { drafter in
+            guard !drafter.packPath.isEmpty,
+                  let meta = drafterMetadata(atPackPath: drafter.packPath) else {
+                return nil
+            }
+            let compat = primaryModels.compactMap { model -> String? in
+                guard model.supported,
+                      let desc = descriptors[model.packPath],
+                      isDrafterCompatible(metadata: meta, with: desc) else {
+                    return nil
+                }
+                return model.name
+            }
+            return DiscoveredDrafter(
+                name: drafter.name,
+                packPath: drafter.packPath,
+                backend: meta.backend,
+                maxDrafts: meta.maxDrafts,
+                compatibleModels: compat
+            )
+        }
+    }
+
+    /// Heals stale or cross-model `dflashDraftPackPath` and `mtpBackend` selections when switching
+    /// primary models or loading profiles whose referenced drafter pack is missing or incompatible.
+    @discardableResult
+    public mutating func reconcileStaleDrafterSelection(
+        for targetDescriptor: QWModelDescriptor?,
+        drafters: [DiscoveredModel] = scanDrafterModelsDirectory()
+    ) -> Bool {
+        let trimmedPack = dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let extBackend = Self.normalizeExternalDrafterBackend(mtpBackend)
+        let packMeta = trimmedPack.isEmpty ? nil : Self.drafterMetadata(atPackPath: trimmedPack)
+        let packValidForTarget: Bool
+        if let packMeta {
+            packValidForTarget = targetDescriptor.map { Self.isDrafterCompatible(metadata: packMeta, with: $0) } ?? true
+        } else {
+            packValidForTarget = false
+        }
+        let backendSatisfied = extBackend == nil || (packMeta?.backend == extBackend)
+        if (trimmedPack.isEmpty && extBackend == nil) || (packValidForTarget && backendSatisfied) {
+            return false
+        }
+
+        if let targetDescriptor,
+           let replacement = Self.resolveDefaultDrafterPack(
+               for: targetDescriptor,
+               preferredBackend: extBackend,
+               drafters: drafters,
+               targetModelName: modelName
+           ) {
+            var changed = false
+            if dflashDraftPackPath != replacement.packPath {
+                dflashDraftPackPath = replacement.packPath
+                changed = true
+            }
+            if extBackend != nil {
+                let inferred = Self.inferDrafterBackendAndMaxDrafts(packPath: replacement.packPath)
+                if mtpBackend != inferred.backend {
+                    mtpBackend = inferred.backend
+                    changed = true
+                }
+                if mtpDrafts > inferred.maxDrafts || mtpDrafts <= 0 {
+                    mtpDrafts = inferred.maxDrafts
+                    changed = true
+                }
+            }
+            return changed
+        }
+
+        var changed = false
+        if !trimmedPack.isEmpty {
+            dflashDraftPackPath = ""
+            changed = true
+        }
+        if extBackend != nil {
+            mtpBackend = "variational"
+            let nativeCap = max(1, targetDescriptor?.maxSpeculativeDrafts ?? 3)
+            if mtpDrafts > nativeCap {
+                mtpDrafts = min(3, nativeCap)
+            }
+            changed = true
+        }
+        return changed
+    }
+
+    private static func drafterMatchScore(
+        _ entry: (model: DiscoveredModel, meta: DrafterMetadata),
+        target: QWModelDescriptor,
+        preferredBackend: String?,
+        affinityTokens: Set<String>
+    ) -> (Int, Int, Int, Int) {
+        let backendMatch: Int = if let preferredBackend {
+            entry.meta.backend == preferredBackend ? 1 : 0
+        } else {
+            entry.meta.backend == "dflash2" ? 1 : 0
+        }
+        let targetLayersMatch: Int = if let ntl = entry.meta.numTargetLayers {
+            ntl == target.numLayers ? 2 : 0
+        } else {
+            1
+        }
+        let affinityScore = affinityTokens.isEmpty
+            ? 0
+            : modelAffinityTokens(for: entry.model.name).intersection(affinityTokens).count
+        let quantRank = QWDFlashConfig.drafterQuantPreferenceRank(entry.model.packPath)
+        return (backendMatch, targetLayersMatch, affinityScore, quantRank)
+    }
+
+    private static func modelAffinityTokens(for name: String?) -> Set<String> {
+        guard let raw = name?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return []
+        }
+        let ignored: Set<String> = ["dflash", "dflash2", "dspine", "b16", "qwen3", "8"]
+        let parts = raw.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        return Set(parts.filter { tok in
+            tok.count >= 2
+                && !ignored.contains(tok)
+                && !tok.hasPrefix("hq")
+                && !tok.hasPrefix("aq")
+                && !tok.hasPrefix("shvq")
+                && !tok.hasPrefix("vq")
+        })
     }
 
     /// Validates the currently selected primary model pack (fail-fast check before server launch or upon UI selection).
@@ -207,11 +588,18 @@ extension QWServerSettings {
     /// Validates the DFlash 2 / DSpine drafter model configuration against the selected primary model.
     public func validateDFlashConfiguration() throws {
         let descriptor = try validatePrimaryModel()
-        let maxD = QWDFlashConfig.inferBackendAndMaxDrafts(packPath: dflashDraftPackPath).maxDrafts
+        let fallbackPath = mtpBackend.lowercased() == "dspine" ? QWDFlashConfig.defaultDSpinePackPath : dflashDraftPackPath
+        let effPath = Self.effectiveDrafterPackPath(
+            configuredPath: dflashDraftPackPath,
+            for: descriptor,
+            preferredBackend: mtpBackend,
+            targetModelName: modelName
+        ) ?? fallbackPath
+        let maxD = Self.inferDrafterBackendAndMaxDrafts(packPath: effPath).maxDrafts
         let drafts = max(1, min(maxD, mtpDrafts))
         try QWDFlashConfig.validateDrafter(
             targetDescriptor: descriptor,
-            packPath: dflashDraftPackPath,
+            packPath: effPath,
             drafts: drafts,
             selectorTopK: dflashSelectorTopK
         )
@@ -226,7 +614,14 @@ extension QWServerSettings {
         let descriptor = try validatePrimaryModel()
         let isExternalDrafter = ["dflash2", "dflash", "dspine"].contains(mtpBackend.lowercased())
         if speculativeDecodingEnabled && isExternalDrafter && mtpDrafts > 0 {
-            try QWDFlashConfig.validateDrafter(targetDescriptor: descriptor, packPath: dflashDraftPackPath,
+            let fallbackPath = mtpBackend.lowercased() == "dspine" ? QWDFlashConfig.defaultDSpinePackPath : dflashDraftPackPath
+            let effPath = Self.effectiveDrafterPackPath(
+                configuredPath: dflashDraftPackPath,
+                for: descriptor,
+                preferredBackend: mtpBackend,
+                targetModelName: modelName
+            ) ?? fallbackPath
+            try QWDFlashConfig.validateDrafter(targetDescriptor: descriptor, packPath: effPath,
                                                drafts: mtpDrafts, selectorTopK: dflashSelectorTopK)
         }
         guard QWLSAMode.resolve(lsaMode) != nil else {

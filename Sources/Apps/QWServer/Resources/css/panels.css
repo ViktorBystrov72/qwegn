@@ -184,6 +184,17 @@ table.ledger tr.inspector-row td {
   gap: 14px;
   align-items: stretch;
 }
+.settings-grid .metric-cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.settings-grid .input,
+.settings-grid .select {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
 @media (max-width: 780px) {
   .settings-grid { grid-template-columns: 1fr; }
 }
@@ -203,6 +214,12 @@ table.ledger tr.inspector-row td {
   flex-direction: column;
   gap: 4px;
   margin-bottom: 10px;
+}
+.form-field:last-child {
+  margin-bottom: 0;
+}
+.form-field[hidden] {
+  display: none;
 }
 .form-field label {
   font-size: 11px;

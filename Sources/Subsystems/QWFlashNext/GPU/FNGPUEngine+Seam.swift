@@ -94,7 +94,7 @@ extension FNGPUEngine {
     private func prefillChunk(_ session: inout FNGPUSessionData, history: [Int64], cacheHistory: [Int64],
                               chunkSize: Int, targetEnd: Int? = nil, gpuSec: inout Double) throws {
         let pos = session.prefillPos
-        let limitPos = min(history.count, targetEnd ?? history.count)
+        let limitPos = FNGPUDFlash.prefillWindowEnd(historyCount: history.count, targetEnd: targetEnd)
         let subchunk = FNGPUPrefillStack.resolveSubchunk(pos: pos, limitPos: limitPos, chunkSize: chunkSize,
                                                          hidden: hidden, hc: hc, visualSpans: session.visualSpans)
         let rows = subchunk.rows
@@ -102,20 +102,29 @@ extension FNGPUEngine {
         let isCheckpointEnd = (targetEnd != nil && pos + rows == limitPos && limitPos < history.count)
         let runHeadNow = isLast || isCheckpointEnd
         let runMTP = (session.useSpec || (hasPrefixCacheTier && session.usePrefixCache)) && mtp != nil
+        let runDFlash = (session.useSpec || (hasPrefixCacheTier && session.usePrefixCache)) && dflash != nil
         session.lastRows = rows
         if rows == 1 {
             // Same single-row staging: the id goes into head.token, the gather runs on-device.
             arena.write(head.token, from: [Int32(history[pos])])
             session.headToken = Int(history[pos])
             let prefix = Array(history.prefix(pos + 1))
+            let df = runDFlash ? dflash : nil
+            let dfSlot = df?.sessionSlots.first
             if let streamIn = subchunk.visualStreamIn {
                 session.lastArgmax = try decodeStack.forwardToken(
-                    history: prefix, streamIn: streamIn, head: head, readStream: false
+                    history: prefix, streamIn: streamIn, head: head, readStream: false,
+                    dflash: df, dflashSlot: dfSlot
                 ).token
             } else {
                 session.lastArgmax = try decodeStack.forwardToken(
-                    history: prefix, embedTable: embedTable, head: head, readStream: false
+                    history: prefix, embedTable: embedTable, head: head, readStream: false,
+                    dflash: df, dflashSlot: dfSlot
                 ).token
+            }
+            if df != nil {
+                session.dflashCacheOffset = pos + 1
+                session.dflashPendingCtxCount = 0
             }
             session.headToken = session.lastArgmax
             gpuSec += decodeStack.lastGPUMillis / 1000.0
@@ -146,10 +155,14 @@ extension FNGPUEngine {
                                                          hidden: hidden, hc: hc, visualSpans: session.visualSpans).rows
         let nextChunkPos: Int? = (!isCheckpointEnd && nextRows > 1 && nextRows <= prefillStack.maxRows) ? (pos + rows) : nil
         let fusedMTP = runMTP ? mtp : nil
+        let fusedDFlash = runDFlash ? dflash : nil
+        let fusedDFlashSlot = fusedDFlash?.sessionSlots.first
         if let streamIn = subchunk.visualStreamIn {
             session.lastArgmax = try prefillStack.forward(history: history, streamIn: streamIn, head: head,
                                                           startPos: pos, readStream: false, runHead: runHeadNow,
                                                           mtp: fusedMTP, projectMTP: runHeadNow,
+                                                          dflash: fusedDFlash, dflashSlot: fusedDFlashSlot,
+                                                          dflashWindowEnd: limitPos,
                                                           pleParity: session.pleParity,
                                                           plePrecomputed: session.plePrecomputed,
                                                           nextChunkStartPos: nextChunkPos,
@@ -158,10 +171,16 @@ extension FNGPUEngine {
             session.lastArgmax = try prefillStack.forward(history: history, embedTable: embedTable, head: head,
                                                           startPos: pos, readStream: false, runHead: runHeadNow,
                                                           mtp: fusedMTP, projectMTP: runHeadNow,
+                                                          dflash: fusedDFlash, dflashSlot: fusedDFlashSlot,
+                                                          dflashWindowEnd: limitPos,
                                                           pleParity: session.pleParity,
                                                           plePrecomputed: session.plePrecomputed,
                                                           nextChunkStartPos: nextChunkPos,
                                                           nextChunkCount: nextRows).token
+        }
+        if fusedDFlash != nil {
+            session.dflashCacheOffset = pos + rows
+            session.dflashPendingCtxCount = 0
         }
         // The head wrote its argmax into `head.token`; the next step gathers
         // from it, so the session tracks what is on the device.
@@ -252,7 +271,8 @@ extension FNGPUEngine {
         )
         let activeCap = activeCapacity
         guard history.count < activeCap else {
-            throw FNGPUError.contextDoesNotFit(requested: history.count + 1, maxFitting: activeCap - 1)
+            throw FNGPUError.contextDoesNotFit(requested: history.count + 1,
+                                                maxFitting: FNGPUDFlash.maxFittingContext(activeCapacity: activeCap))
         }
         var gpuSec = session.prefillGPUSec
         let canUsePrefixCache = hasPrefixCacheTier && session.usePrefixCache
@@ -268,6 +288,9 @@ extension FNGPUEngine {
                 session.prefixCacheTier = restored.tier; session.prefillPos = restored.matched
                 session.lastArgmax = restored.lastArgmax; session.headToken = restored.lastArgmax
                 session.mtpDraft = restored.mtpDraft
+                session.dflashCacheOffset = restored.dflashCacheOffset
+                session.dflashPendingCtxPos = 0
+                session.dflashPendingCtxCount = 0
                 if !cacheHistory.isEmpty, residentKVHistory.count == restored.matched,
                    residentKVHistory[0] != cacheHistory[0] {
                     residentKVHistory[0] = cacheHistory[0]
@@ -275,7 +298,10 @@ extension FNGPUEngine {
             } else {
                 highWaterPos = max(highWaterPos, prevWater)
                 wipeSessionState(overwriteTokens: history.count)
-                residentKVHasMTP = (session.useSpec || canUsePrefixCache) && mtp != nil
+                session.dflashCacheOffset = 0
+                session.dflashPendingCtxPos = 0
+                session.dflashPendingCtxCount = 0
+                residentKVHasMTP = (session.useSpec || canUsePrefixCache) && (mtp != nil || dflash != nil)
             }
             session.prefillProgressBasePos = session.prefillPos
             highWaterPos = max(highWaterPos, min(activeCap, history.count + 8))
@@ -289,7 +315,8 @@ extension FNGPUEngine {
            retainLen < history.count, session.prefillPos < retainLen {
             let hasMTP = (session.useSpec || canUsePrefixCache) && mtp != nil
             let baseSlice = cacheHistory.prefix(retainLen)
-            let baseHash = Self.fnPrefixHash(tokens: baseSlice, kvMode: kvMode, hasMTP: hasMTP)
+            let baseHash = Self.fnPrefixHash(tokens: baseSlice, kvMode: kvMode, hasMTP: hasMTP,
+                                              dflashMarker: dflashPrefixMarker)
             let baseName = String(format: "fn_entry_%016llx_%d.qwcache", baseHash, retainLen)
             if prefixCacheWarmStore?.contains(name: baseName) != true {
                 let baseLimit = min(limit, retainLen)
@@ -349,12 +376,19 @@ extension FNGPUEngine {
             // The context is full: the request cannot be served in full, and
             // a truncated answer is not an answer the caller asked for.
             throw FNGPUError.contextDoesNotFit(requested: session.history.count + 1,
-                                                maxFitting: activeCap - 1)
+                                                maxFitting: FNGPUDFlash.maxFittingContext(activeCapacity: activeCap))
         }
-        if session.useSpec, let vStack = verifyStack, let mtp,
+        if session.useSpec, let vStack = verifyStack,
            session.history.count + 8 < activeCap {
-            return try speculativeStep(&session, token: token, vStack: vStack, mtp: mtp)
+            if let mtp {
+                return try speculativeStep(&session, token: token, vStack: vStack, mtp: mtp)
+            }
+            if let dflash {
+                return try FNGPUDFlash.step(self, session: &session, token: token, vStack: vStack, dflash: dflash)
+            }
         }
+        let dflashSlot = dflash?.sessionSlots.first
+        let preContextUpdate = FNGPUDFlash.consumePendingContextUpdate(&session, slot: dflashSlot)
         // The gather reads the token from the device, so the token to feed is
         // staged before the step runs.
         if session.headToken != token {
@@ -368,7 +402,12 @@ extension FNGPUEngine {
         if session.sampler.config.repetitionPenalty != 1.0 { session.recordSeenToken(token, vocab: vocab) }
         let stepT0 = Date()
         let r = try decodeStack.forwardToken(history: session.history, embedTable: embedTable,
-                                              head: head, readStream: false)
+                                              head: head, readStream: false,
+                                              dflash: dflash, dflashSlot: dflashSlot,
+                                              preContextUpdate: preContextUpdate)
+        if dflash != nil {
+            session.dflashCacheOffset = session.history.count
+        }
         session.stepMs = Date().timeIntervalSince(stepT0) * 1000.0
         session.lastStepGPUMillis = decodeStack.lastGPUMillis
         session.headToken = r.token

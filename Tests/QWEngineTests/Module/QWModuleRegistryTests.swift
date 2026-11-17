@@ -140,8 +140,8 @@ final class QWModuleRegistryTests: XCTestCase {
     func testCapabilitiesSayWhatEachEngineCanDo() {
         let dense = DenseModule.capabilities
         let flash = FlashNextModule.capabilities
-        XCTAssertTrue(dense.contains(.dflash), "the DFlash drafter is dense-only")
-        XCTAssertFalse(flash.contains(.dflash))
+        XCTAssertTrue(dense.contains(.dflash), "Dense supports DFlash drafters")
+        XCTAssertTrue(flash.contains(.dflash), "Flash-Next supports DFlash 2 drafters")
         XCTAssertTrue(dense.contains(.ropeYaRN))
         XCTAssertFalse(flash.contains(.ropeYaRN), "Flash-Next has no rope-YaRN path")
         XCTAssertFalse(flash.contains(.gdnPrefill),

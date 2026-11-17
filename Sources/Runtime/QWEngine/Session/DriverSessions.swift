@@ -81,7 +81,8 @@ extension QWEngineDriver {
             mtpHandle = mtpH
             let s = QWEngineSession(kv: h, mtpKV: mtpH, rec: slot.rec, ring: slot.ring,
                                     recSlab: slot.recSlab, ringSlab: slot.ringSlab,
-                                    trunkHidden: slot.trunkHidden, dflashSlot: slot.dflashSlot)
+                                    trunkHidden: slot.trunkHidden, dflashSlot: slot.dflashSlot,
+                                    isSparseMoE: geometry.numExperts > 1)
             s.attnKVViews = try kvCache.layerViewsAll(h, layers: attnLayers)
             if let mtpCache, let mtpH {
                 s.mtpKVViews = [try mtpCache.layerViews(mtpH, layer: 0)]

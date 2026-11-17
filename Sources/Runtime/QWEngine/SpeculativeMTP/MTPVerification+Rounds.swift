@@ -172,14 +172,49 @@ extension QWEngineDriver {
                     if let owner {
                         try owner.stream.beginGumbelRound(drafts: activeCount, vocabulary: geometry.vocab, maxDrafts: 15)
                     }
+                    let anchorMaskEmbed: ((any MTLComputeCommandEncoder, QWTensorValue, Int, Int, Int) throws -> Void)? =
+                        self.mtpDeviceEmbedding.map { devEmb in
+                            { enc, propX32, anchorToken, maskToken, rows in
+                                dflashDrafter.encodeStagePropBF16(
+                                    enc, tableBuffer: devEmb.buffer, byteOffset: devEmb.byteOffset,
+                                    propX: propX32, anchorToken: anchorToken, maskToken: maskToken, rows: rows
+                                )
+                            }
+                        }
                     let proposed: (drafts: [Int], proposals: [QWMTPGumbelProposal])
                     do {
                         proposed = try dflashDrafter.propose(
                             hal: hal, slot: dSlot, cacheOffset: session.dflashCacheOffset,
-                            pendingToken: pending, draftCount: activeCount, head: head,
-                            headStorage: headStorage, draftHead: mtpDraftHead,
+                            pendingToken: pending, draftCount: activeCount,
+                            headStorage: headStorage,
+                            encodeHeadLogits: { enc, xRot16, xNorm16, _, yLogits32, rows, vocabRows in
+                                if let draftHead = self.mtpDraftHead {
+                                    if rows == 1 {
+                                        try draftHead.encode(enc, hal: self.hal, x: xRot16, y: yLogits32)
+                                    } else {
+                                        try draftHead.encodeBatched(enc, hal: self.hal, x: xRot16, y: yLogits32, m: rows)
+                                    }
+                                } else {
+                                    switch self.headStorage {
+                                    case .q4g(let hw):
+                                        if self.hal.caps.isMetal4TensorCapable && rows >= 9
+                                            && vocabRows % 64 == 0 && hw.view.k % 64 == 0 {
+                                            try QWGemm.encodeNaxF32(
+                                                enc, hal: self.hal, weight: hw.view,
+                                                x16: xRot16, y16: xRot16, y32: yLogits32, rows: rows
+                                            )
+                                        } else {
+                                            try self.head.encode(enc, storage: self.headStorage, x: xRot16, y: yLogits32, M: rows)
+                                        }
+                                    case .f16:
+                                        try self.head.encode(enc, storage: self.headStorage, x: xNorm16, y: yLogits32, M: rows)
+                                    }
+                                }
+                            },
+                            encodeAnchorMaskEmbed: anchorMaskEmbed,
                             embedding: { try self.copyEmbedRow($0, to: $1) },
-                            stochasticOwner: owner, completed: draftCompleted)
+                            stochastic: owner.map { (Float($0.config.temperature), $0.stream) },
+                            completed: draftCompleted)
                     } catch {
                         commandBufferErrors += 1
                         throw error

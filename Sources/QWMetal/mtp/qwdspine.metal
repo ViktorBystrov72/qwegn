@@ -29,7 +29,8 @@ kernel void qwg_dspine_bridge_state(
         const float scale = sqrt(float(dim));
         device half* dst = outBuf + (size_t)tg * dim;
         if (tg == 0u) {
-            device const ushort* cb = codebookOrBias + (size_t)uint(anchorToken) * dim;
+            const uint safeAnchor = (anchorToken >= 0 && anchorToken != 0x7fffffff) ? uint(anchorToken) : 0u;
+            device const ushort* cb = codebookOrBias + (size_t)safeAnchor * dim;
             for (uint i = lane; i < dim; i += 32u) {
                 dst[i] = half(scale * dspine_bf16_to_f32(cb[i]));
             }
@@ -145,7 +146,8 @@ kernel void qwg_dspine_refine_code_to_msg(
         DSpineH8 pv8 = asDSpineH8(wPrev[c]);
         const uint colOff = c << 3u;
         for (uint k = 0; k < topK; ++k) {
-            uint sid = uint(predIds[k]);
+            int rawSid = predIds[k];
+            uint sid = (rawSid >= 0 && rawSid != 0x7fffffff) ? uint(rawSid) : 0u;
             device const ushort* cb = codebook + (size_t)sid * C + colOff;
             float sGp = 0.0f, sPv = 0.0f;
             #pragma unroll
@@ -228,7 +230,8 @@ static inline void qwg_dspine_refine_scores_impl(
     const uint d = tg.y;
     if (kCurr >= topK) return;
 
-    const uint cand = uint(candidates[d * 16u + kCurr]);
+    const int rawCand = candidates[d * 16u + kCurr];
+    const uint cand = (rawCand >= 0 && rawCand != 0x7fffffff) ? uint(rawCand) : 0u;
     device const half* xBase = refineAct + (size_t)d * 16u * H;
 
     if (headMode == 0u) {
@@ -346,8 +349,10 @@ kernel void qwg_dspine_refine_chain(
         constant uint& topK             [[buffer(4)]],
         uint lane [[thread_index_in_threadgroup]]) {
     uint sender = 0u;
+    const uint safeTopK = min(topK, 16u);
     for (uint d = 0u; d < draftCount; ++d) {
-        float val = (lane < topK) ? refineTable[(d * 16u + sender) * 16u + lane] : -INFINITY;
+        float rawVal = (lane < safeTopK) ? refineTable[(d * 16u + sender) * 16u + lane] : -INFINITY;
+        float val = (lane < safeTopK) ? (isfinite(rawVal) ? max(rawVal, -1e30f) : -1e30f) : -INFINITY;
         uint bestK = lane;
         for (ushort offset = 16; offset > 0; offset >>= 1) {
             float otherVal = simd_shuffle_down(val, offset);
@@ -359,7 +364,8 @@ kernel void qwg_dspine_refine_chain(
         }
         sender = simd_broadcast_first(bestK);
         if (lane == 0u) {
-            draftTokensOut[d] = candidates[d * 16u + sender];
+            int rawTok = candidates[d * 16u + sender];
+            draftTokensOut[d] = (rawTok >= 0 && rawTok != 0x7fffffff) ? rawTok : 0;
         }
     }
 }

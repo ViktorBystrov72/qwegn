@@ -78,20 +78,38 @@ final class QWDFlashTests: XCTestCase {
             mtpLayers: 1, mtpUseDedicatedEmbeddings: false, eosTokenId: 248044)
         let dense27BDesc = QWModelDescriptor.qwen38_27b
 
-        // 1. Incompatible primary model (Flash-Next) must fail fast with .state
+        // 1. Incompatible primary model (48-layer Flash-Next vs 5120/64-layer or mismatched pack) must fail with QWDFlashError.state
+        let mismatchPackPath: String
+        var cleanupMismatchDir: URL?
+        if FileManager.default.fileExists(atPath: QWDFlashDrafter.defaultPackPath) {
+            mismatchPackPath = QWDFlashDrafter.defaultPackPath
+        } else {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("qwdflash_mismatch_\(UUID().uuidString)")
+            let assets = tmp.appendingPathComponent("assets")
+            try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+            let cfg: [String: Any] = [
+                "hidden_size": 1024, "num_hidden_layers": 5, "vocab_size": 248320,
+                "dflash_config": ["block_size": 8, "target_layer_ids": [1, 5, 10, 15, 20]]
+            ]
+            try JSONSerialization.data(withJSONObject: cfg).write(to: assets.appendingPathComponent("config.json"))
+            FileManager.default.createFile(atPath: tmp.appendingPathComponent("model.qwp").path, contents: Data())
+            mismatchPackPath = tmp.path
+            cleanupMismatchDir = tmp
+        }
+        defer { if let dir = cleanupMismatchDir { try? FileManager.default.removeItem(at: dir) } }
         XCTAssertThrowsError(
             try QWDFlashConfig.validateDrafter(
                 targetDescriptor: flashNextDesc,
-                packPath: QWDFlashDrafter.defaultPackPath,
+                packPath: mismatchPackPath,
                 drafts: 4,
                 selectorTopK: 16
             )
         ) { error in
-            guard case QWEngineDriverError.state(let msg) = error else {
-                XCTFail("Expected QWEngineDriverError.state, got \(error)")
+            guard case QWDFlashError.state(let msg) = error else {
+                XCTFail("Expected QWDFlashError.state, got \(error)")
                 return
             }
-            XCTAssertTrue(msg.contains("only compatible with dense"))
+            XCTAssertTrue(msg.contains("does not match target") || msg.contains("out of range"), msg)
         }
 
         // 2. Non-existent drafter pack path must fail fast with .packMissing
@@ -103,8 +121,8 @@ final class QWDFlashTests: XCTestCase {
                 selectorTopK: 16
             )
         ) { error in
-            guard case QWEngineDriverError.packMissing = error else {
-                XCTFail("Expected packMissing, got \(error)")
+            guard case QWDFlashError.packMissing = error else {
+                XCTFail("Expected QWDFlashError.packMissing, got \(error)")
                 return
             }
         }
@@ -122,8 +140,8 @@ final class QWDFlashTests: XCTestCase {
                     selectorTopK: 16
                 )
             ) { error in
-                guard case QWEngineDriverError.state(let msg) = error else {
-                    XCTFail("Expected QWEngineDriverError.state, got \(error)")
+                guard case QWDFlashError.state(let msg) = error else {
+                    XCTFail("Expected QWDFlashError.state, got \(error)")
                     return
                 }
                 XCTAssertTrue(msg.contains("1...\(expectedMax)"))
@@ -237,7 +255,7 @@ final class QWDFlashTests: XCTestCase {
 
         let cb1 = hal.queue.makeCommandBuffer()!
         let enc1 = cb1.makeComputeCommandEncoder()!
-        var vEps = eps, vMode4: UInt32 = 4
+        var vEps = eps, vMode4: UInt32 = 4, vHidden = UInt32(H5120)
         enc1.setComputePipelineState(pRms)
         enc1.setBuffer(x5120Buf, offset: 0, index: 0)
         enc1.setBuffer(dOut5120Buf, offset: 0, index: 1)
@@ -245,6 +263,8 @@ final class QWDFlashTests: XCTestCase {
         enc1.setBuffer(rmsBuf, offset: 0, index: 3)
         enc1.setBytes(&vEps, length: 4, index: 4)
         enc1.setBytes(&vMode4, length: 4, index: 5)
+        enc1.setBytes(&vHidden, length: 4, index: 6)
+        enc1.setBuffer(rmsBuf, offset: 0, index: 7)
         enc1.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
                                   threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         enc1.endEncoding()

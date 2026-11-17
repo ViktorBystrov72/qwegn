@@ -8,6 +8,37 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.24.1] - 2026-11-17
+
+### Added
+- **WebUI `/ui` Speculative Controls & Drafter Inventory (`QWHttpServer`, `actions.js`, `state.js`)**:
+  - Extended `GET /v1/models/discovered` (`QWServerSettings.DiscoveredDrafter` / `scanDrafterSummaries`) with compatible `drafters` summaries (`name`, `packPath`, `backend`, `maxDrafts`, `compatibleModels`).
+  - Added `MTP Draft Tokens` (`mtpDrafts` + block-size hint), `Draft Strategy` (`mtpDraftStrategy`), `Drafter Model`, `Drafter Pack Path` (`dflashDraftPackPath`), and `Selector Top-K` (`dflashSelectorTopK`) to `/ui?tab=settings` (`handleWebMTPBackendChange`, `handleWebDrafterSelectChange`) with per-backend `dflash2` / `dspine` availability gating, post-save server reload sync, and even `.settings-grid` alignment (`panels.css`).
+
+### Fixed
+- **Stale Cross-Model Drafter Profile Healing & Per-Backend Gating (`QWServerSettings+Discovery`, `QWSettingsManager`, `QWHttpServer`)**:
+  - Added `QWServerSettings.supportsExternalDrafter(backend:descriptor:discoveredModel:drafters:configuredPackPath:)` to gate `DFlash 2` vs `DSpine` independently against geometry-compatible installed drafters while preserving strict fail-fast errors in `validateDFlashConfiguration()` and `validateBeforeLaunch()`.
+  - Added `reconcileStaleDrafterSelection(for:drafters:)` and wired it into `QWSettingsManager.effectiveSettings` and `POST /v1/settings` model/backend switches to heal deleted or cross-model `dflashDraftPackPath` / unsupported `dspine` selections.
+- **`Qwegn.app` 7-Tab Settings UI Alignment (`SettingsView*`)**:
+  - Fixed `Performance` horizontal overflow/sidebar bleed (`Cooling Policy` `Auto` | `Pre-Spin` | `Max Blast`, caption wrapping, `.clipped()` detail pane, `195pt` `formRow` label column), unnested helper/lock captions from `formRow` (`Model Alias:`, `KV Cache Mode:`, `Random Seed:`), left-aligned `.menu` `Picker` controls (`alignment: .leading`), allowed 2-line wrapping in `settingsToggleRow`, disabled external backends with no installed compatible pack (`.selectionDisabled`), and hid `Adaptive Draft Depth (Entropy Stop)` when an external drafter is selected; verified across all 7 tabs at `2×` Retina (`740×640` and `660×560+`).
+
+## [0.24.0] - 2026-11-17
+
+### Added
+- **Generalized `DFlash 2` / `DSpine` Support (`QWMTP` `L6.0`, `QWFlashNext`, `.qwcache`, Auto-Discovery & Packer)**:
+  - Generalized `QWDFlashDrafter` / `QWDFlashConfig` beyond fixed `Qwen3.8-27B` geometry via `QWMTP` `L6.0` Metal kernels (`conv_group_size`, general head counts, dynamic target layer capture, and `vocab` bounds) and wired `FNGPUDFlash` end-to-end inside `QWFlashNext` (`Qwen3.8-Flash-Next-hq8g32-hq4g64` + `incoai/Qwen3.8-Flash-Next-DFlash2`).
+  - Added `.qwcache` standalone repository prefix-cache support for `--mtp-backend dflash2` / `dspine` in `qwg index`, `QWMemoryIndexRequest`, `FNPrefixCache`, and `FNPrefixCache+Save` (`0.12 s` warm repo TTFT, `99,412` token hit, plus `--mtp-drafts 0` serial mount reuse of DFlash-enabled `.qwcache`).
+  - Added `pack_dflash.py --mlp-quant` and generalized `derive_dflash_model_id` for packing mixed-precision `DFlash 2` packs (`Qwen3.8-Flash-Next-DFlash2-shvq4g32` `521.51 MiB`, `hq4g32` `548.86 MiB`, and `shvq4g32-shvq3g64` `477.69 MiB`).
+- **Sparse-MoE `DFlash 2` Defaults & Adaptive Window Selector (`3110a1db`, `47c43a64`)**:
+  - Defaulted `FNGPUDFlash.resolveDraftVocab(fullVocab:)` to `98,304` when `fullVocab > 98,304` (`0` disables cap), and ranked compatible drafter packs (`QWDFlashConfig.drafterQuantPreferenceRank` & `QWServerSettings.drafterMatchScore`) to prefer pure `SHVQ4_G32` (`-0.80 GiB` UMA vs `HQ4_G32_M5`, `-0.79 GiB` planned vs native MTP-3).
+  - Extended `QWDFlashAdaptivePolicy(isSparseMoE:)` (`FNGPUSession` + `QWEngineSession`/`DriverSessions` gated on `geometry.numExperts > 1`) with `b2CostMs = 25.5`, sparse-MoE bucket priors `(30.5, 39.5, 46.5, 98.0)`, round-1 `min(3, cap)`, and monotonic step-up (`2 -> 3 -> 5 -> 7 -> cap` on `consecutiveFullAccepts >= 2 && reach >= 0.52`), eliminating the 80-expert `M=8` cliff (`p4k +13.2%` vs `master` MTP-3 at `76.25`, `p8k +12.8%` vs `47c43a64` at `65.92` vs `66.79` `master` MTP-3, `novel +13.0%` vs `47c43a64` at `84.40` vs `83.86` `master` MTP-3, `code +6.7%` vs `master` MTP-3 at `90.22`, `16K` 3-needle `+71.0%` vs `master` MTP-3 at `82.34 tok/s`, bit-exact `SHA-256`) while leaving `isSparseMoE == false` (`Qwen3.8-27B`) invariant.
+
+### Fixed
+- **`FlashNextModule` Concurrent Batch State Synchronization (`3c1cdf2e`)**:
+  - Guarded `FlashNextModule` shared turn/cache state (`_onCacheEvent`, `_prefixCache*`, `_naxLogMessage`, `_lastResult`, `_lastSpec*`) under `stateLock.withLock` and moved `batchScheduler` callback wiring into `FlashNextModule.init(engine:)`, resolving a `_CFRelease` `EXC_BREAKPOINT` race on `QWGenerationResult` destruction under concurrent HTTP bursts (`llmprobe --full` `191/191` conformance, `91.9%–100%` capability, `75/88` agentic, `100%` fidelity, `83/100` Code-100, `175.1` spec / `99.1` bench / `65.9` novel / `94.4 tok/s` `@65K` context scaling).
+- **8-Configuration `v0.24.0` M5 Max Qualification**:
+  - Verified paired `--strict` `d=0`, speculative A/B, vision/PLE residency toggles, `16K` 3-needle determinism, `61/61` (`100%`) API conformance, and `code-10` across all 8 fleet configurations (`Qwen3.8-Flash-Next + DFlash2-shvq4g32`, `Qwen3.8-27B` `DFlash2` & `DSpine-b16`, `Qwen3.6-35B-A3B`, `SenseNova-Loop-9B-Preview`, `GLM-5.3-Flash`, `ERNIE-5.5-Flash-Base`, and `Edge0-145B`).
+
 ## [0.23.0] - 2026-11-16
 
 ### Added

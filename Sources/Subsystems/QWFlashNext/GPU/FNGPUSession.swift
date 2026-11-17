@@ -7,6 +7,7 @@ import Foundation
 import QWAlloc
 import QWCore
 import QWHead
+import QWMTP
 
 extension FNGPUEngine {
     public struct GenerationResult: Sendable {
@@ -153,6 +154,18 @@ public struct FNGPUSessionData {
     public var onPrefillProgress: (@Sendable (Int, Int) -> Void)?
     /// Starting prefill position after prefix-cache restoration so progress excludes reused tokens.
     public var prefillProgressBasePos: Int
+    /// Online DFlash adaptive window selector (MoE-calibrated priors).
+    var dflashPolicy: QWDFlashAdaptivePolicy
+    /// Committed token position cached in the DFlash drafter's sliding-window KV.
+    public var dflashCacheOffset: Int
+    /// Deferred verify-row context update position (`vStack` captured into `targetHidden`).
+    var dflashPendingCtxPos: Int
+    /// Deferred verify-row context update count (`1 + accepted`).
+    var dflashPendingCtxCount: Int
+    /// Persistent random stream state for stochastic DFlash Gumbel coupling rounds.
+    var dflashStreamState: QWMTPRandomStream.State?
+    /// Online bigram/trigram recycler used alongside PLD context-copy bypass.
+    let tokenRecycler = QWTokenRecycler()
 
     public init(history: [Int64], sampler: QWSampler, useSpec: Bool = false,
                 collectLogprobs: Bool = false, topLogprobsCount: Int = 0,
@@ -210,6 +223,19 @@ public struct FNGPUSessionData {
         self.topLogprobsCount = topLogprobsCount
         self.tokenLogprobs = []
         self.prefillProgressBasePos = 0
+        self.dflashPolicy = QWDFlashAdaptivePolicy(isSparseMoE: true)
+        self.dflashCacheOffset = 0
+        self.dflashPendingCtxPos = 0
+        self.dflashPendingCtxCount = 0
+        self.dflashStreamState = nil
+    }
+
+    mutating func ensureDFlashStreamState() throws -> QWMTPRandomStream.State {
+        if let state = dflashStreamState { return state }
+        let seed = sampler.config.hasExplicitSeed ? sampler.config.seed : UInt64.random(in: 1...UInt64.max)
+        let state = try QWMTPRandomStream(seed: seed, drawIndex: 0).frozenState()
+        dflashStreamState = state
+        return state
     }
 
     /// Emits incremental prefill progress relative to `prefillProgressBasePos`.
@@ -370,6 +396,10 @@ extension FNGPUEngine {
     /// chunked, and the token must not be drawn twice.
     func drawFirstToken(_ session: inout FNGPUSessionData) throws -> Int {
         session.hasFirstToken = true
+        session.tokenRecycler.reset()
+        if dflash != nil, !session.history.isEmpty {
+            session.tokenRecycler.ingestSequence(session.history.map(Int.init))
+        }
         let tok = try sampleFromHead(argmaxToken: session.lastArgmax,
                                      seenTokens: session.seenTokens,
                                      seenTokenList: session.seenTokenList,

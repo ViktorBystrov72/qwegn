@@ -10,6 +10,7 @@ import Foundation
 import QWCore
 import QWHead
 import QWKV
+@_exported import QWMTP
 
 /// A module-owned session. The core allocates and recycles it; everything
 /// behind it belongs to the module.
@@ -119,8 +120,15 @@ extension QWInferenceModule {
         var parameters = requested
         let isDFlashFamily = ["dflash2", "dflash", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "")
         if modelSwitch {
-            if (descriptor.hcCount != nil || descriptor.numExperts != nil), isDFlashFamily {
-                parameters.mtpBackend = "variational"
+            if isDFlashFamily {
+                let envPack = environment["QW_DFLASH_DRAFT_PACK"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let packPath = (envPack?.isEmpty == false ? envPack : nil) ?? QWDFlashConfig.defaultPackPath(for: descriptor)
+                let compatible = (try? QWDFlashConfig.validateDrafter(
+                    targetDescriptor: descriptor, packPath: packPath, drafts: 1
+                )) != nil
+                if !compatible && (descriptor.hcCount != nil || descriptor.numExperts != nil) {
+                    parameters.mtpBackend = "variational"
+                }
             }
             let stillDFlash = ["dflash2", "dflash", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "")
             let maximum = stillDFlash ? 15 : max(1, descriptor.maxSpeculativeDrafts)

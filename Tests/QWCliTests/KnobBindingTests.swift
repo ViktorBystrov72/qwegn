@@ -5,11 +5,14 @@
 //  3. the generator reads the registry as the registry declares it,
 //  4. a value the registry refuses is refused at the command line.
 
+import ArgumentParser
 import Foundation
 import Testing
 @testable import qwg
 import QWCli
 import QWCore
+import QWEngine
+import QWServer
 
 // MARK: - The registry, as the generator reads it
 
@@ -374,4 +377,59 @@ func eachCommandHonoursExactlyWhatItReads() throws {
         #expect(read == honoured,
                 "\(command) reads \(read.sorted()) but honours \(honoured.sorted())")
     }
+}
+
+@Test("qwg index parses --mtp-backend / --dflash-draft-pack and resolves DFlash fallback policy")
+func qwgIndexSpeculationParsingAndResolution() throws {
+    let parsed = try Index.parse(["--mtp-backend", "DFlash2", "--dflash-draft-pack", "/tmp/df-pack", "."])
+    #expect(parsed.mtpBackend == "dflash2")
+    #expect(parsed.dflashDraftPack == "/tmp/df-pack")
+
+    let parsedDSpine = try Index.parse(["--mtp-backend", "DSpine", "."])
+    #expect(parsedDSpine.mtpBackend == "dspine")
+
+    let fxDesc = QWModelDescriptor(
+        family: .qwen38FlashNext, modelType: "qwen4_exp",
+        capabilities: [.mtp], hidden: 2560, vocab: 248_320,
+        denseIntermediate: nil, numLayers: 48, layerTypes: [], fullAttentionInterval: 4,
+        rmsEps: 1e-6, maxPositionEmbeddings: 262_144,
+        qHeads: 24, kvHeads: 2, headDim: 256, attnOutputGate: false,
+        partialRotaryFactor: 0.25, ropeTheta: 1e7,
+        indexerHeads: nil, indexerKvHeads: nil, indexerHeadDim: nil,
+        indexerBudget: nil, indexerCompressRatio: nil,
+        numExperts: 256, expertsPerTok: 8, moeIntermediate: 640,
+        sharedExpertIntermediate: 640, expertGateType: nil,
+        hcCount: 4, hcLowrank: 320,
+        gdnQKHeads: 16, gdnVHeads: 48, gdnHeadDim: 128,
+        gdnQKVChannels: 10_240, gdnZChannels: 6144, gdnConvKernel: 4,
+        pleLayerIds: nil, pleEmbedDim: nil, pleConvKernel: nil,
+        ngramSize: nil, headsPerNgram: nil, ngramVocabSizeBase: nil,
+        makeNgramVocabDivisibleBy: nil, splitNgramParts: nil,
+        mtpLayers: 1, mtpUseDedicatedEmbeddings: false, eosTokenId: 248_044
+    )
+
+    let defaultSpec = try Index.resolveIndexSpeculation(
+        explicitBackend: nil, explicitDraftPack: nil, settings: QWServerSettings(), descriptor: fxDesc
+    )
+    #expect(defaultSpec.backend == .variational)
+    #expect(defaultSpec.drafts == 1)
+    #expect(defaultSpec.dflashDraftPackPath == nil)
+
+    let missingPath = "/tmp/nonexistent-df-pack-\(UUID().uuidString)"
+    #expect(throws: ExitCode.self) {
+        _ = try Index.resolveIndexSpeculation(
+            explicitBackend: "dflash2", explicitDraftPack: missingPath,
+            settings: QWServerSettings(), descriptor: fxDesc
+        )
+    }
+
+    var dflashSettings = QWServerSettings()
+    dflashSettings.mtpBackend = "dflash2"
+    dflashSettings.dflashDraftPackPath = missingPath
+    let fallbackSpec = try Index.resolveIndexSpeculation(
+        explicitBackend: nil, explicitDraftPack: nil, settings: dflashSettings, descriptor: fxDesc
+    )
+    #expect(fallbackSpec.backend == nil)
+    #expect(fallbackSpec.drafts == 1)
+    #expect(fallbackSpec.dflashDraftPackPath == nil)
 }

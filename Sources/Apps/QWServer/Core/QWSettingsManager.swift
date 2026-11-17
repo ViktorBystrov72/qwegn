@@ -44,11 +44,19 @@ public final class QWSettingsManager: @unchecked Sendable {
         if !packPath.isEmpty { resolved.modelPackPath = packPath }
         resolved.modelAlias = resolved.alias(for: modelName)
         resolved.applyModelConfigDefaults(packPath: packPath)
+        let appliedProfile: QWKnobProfile?
         if !ignoreProfile, let profile = loadProfile(forModel: modelName, from: url) {
             resolved.apply(knobProfile: profile)
-            return (resolved, profile)
+            appliedProfile = profile
+        } else {
+            appliedProfile = nil
         }
-        return (resolved, nil)
+        let descPack = resolved.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetDescriptor = QWServerSettings.loadPrimaryDescriptor(
+            packPath: descPack.isEmpty ? packPath : descPack
+        )
+        resolved.reconcileStaleDrafterSelection(for: targetDescriptor)
+        return (resolved, appliedProfile)
     }
 
     /// Persists customized per-model knob values for `settings.modelName` into `profiles/`.
