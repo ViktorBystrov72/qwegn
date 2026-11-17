@@ -248,6 +248,7 @@ DENSE_ENGINE_DIRS = ["Sources/Runtime/QWEngine"]
 NON_STANDARD_KERNEL_PREFIXES = (
     "qwg_dflash_", "qwg_dspine_", "qwg_echo_", "qwg_mtp_",
     "qwg_gdn_", "qwg_kda_", "qwg_hca_", "qwg_mla_",
+    "qwg_mbsa_",
     "qwg_emeans_mla_", "qwg_mhc_", "qwg_moe_",
     "qwg_cold_event_", "qwg_router_gemm",
 )

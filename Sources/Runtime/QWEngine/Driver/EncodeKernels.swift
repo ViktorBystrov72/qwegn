@@ -311,21 +311,42 @@ extension QWEngineDriver {
         }
     }
 
+    func canFusePreMoENorm(weights: LayerW, rows: Int) -> Bool {
+        guard weights.moe != nil, weights.moe?.coldStreamer == nil, !QWMoEChain.coldTimingProxy else { return false }
+        if weights.mhc != nil {
+            return mhcSplit != nil && rows <= QWMHCSplitRouter.maxRows
+        }
+        return true
+    }
+
     func encodeRMSNormResidualFast(_ enc: any MTLComputeCommandEncoder,
                                            x: QWTensorValue, gamma: QWTensorValue,
                                            out: QWTensorValue, residual: QWTensorValue,
-                                           rows: Int = 1, rowParallel: Bool = true) throws {
+                                           rows: Int = 1, rowParallel: Bool = true,
+                                           moeBridge: (xRot32: QWTensorValue, xPlain32: QWTensorValue, skipRot32: Bool)? = nil) throws {
         try checkNormGeometry()
         let hiddenU4 = geometry.hidden / 8
         // Decode/verify use a threadgroup per row (not latency-bound, and verify matches serial
         // decode numerics); prefill fills the GPU anyway and keeps the simdgroup kernel
         // (`rowParallel: false`) so its output is unchanged.
         let wide = rowParallel && hiddenU4 % 32 == 0 && hiddenU4 <= 640
-        enc.setComputePipelineState(wide ? psoRMSNormResidualWide : psoRMSNormResidual)
+        let pso: any MTLComputePipelineState
+        if moeBridge != nil {
+            pso = wide ? psoRMSNormResidualMoEWide : psoRMSNormResidualMoE
+        } else {
+            pso = wide ? psoRMSNormResidualWide : psoRMSNormResidual
+        }
+        enc.setComputePipelineState(pso)
         enc.bindTensors(x, gamma, out, startIndex: 0)
-        enc.setUInt32s(hiddenU4, startIndex: 3)
+        var packedU4 = UInt32(hiddenU4)
+        if let moeBridge, moeBridge.skipRot32 { packedU4 |= 0x8000_0000 }
+        enc.setBytes(&packedU4, length: 4, index: 3)
         enc.setPod(geometry.rmsEps, index: 4)
         residual.bind(enc, index: 5)
+        if let moeBridge {
+            moeBridge.xRot32.bind(enc, index: 6)
+            moeBridge.xPlain32.bind(enc, index: 7)
+        }
         if wide {
             enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: hiddenU4, height: 1, depth: 1))

@@ -225,12 +225,19 @@ final class QWMTPDraftEncoder {
             throw QWEngineDriverError.state("MTP KV capacity or dtype is invalid")
         }
         let s = scratch, w = weights
-        try QWNorm.encode(enc, hal: hal, variant: .rmsnorm,
-                          x: embedding, gamma: w.preFcNormEmbedding, out: s.enorm,
-                          geometry: geometry)
-        try QWNorm.encode(enc, hal: hal, variant: .rmsnormFromRot,
-                          x: hidden, gamma: w.preFcNormHidden, out: s.hnorm,
-                          geometry: geometry)
+        if geometry.hidden % 256 == 0 {
+            try QWNorm.encodeMTPPreFcNorm(enc, hal: hal, embeddings: embedding, hidden: hidden,
+                                          previous: hidden, gammaEmb: w.preFcNormEmbedding,
+                                          gammaHid: w.preFcNormHidden, out: s.concat,
+                                          tStart: 0, pairs: 1, geometry: geometry)
+        } else {
+            try QWNorm.encode(enc, hal: hal, variant: .rmsnorm,
+                              x: embedding, gamma: w.preFcNormEmbedding, out: s.enorm,
+                              geometry: geometry)
+            try QWNorm.encode(enc, hal: hal, variant: .rmsnormFromRot,
+                              x: hidden, gamma: w.preFcNormHidden, out: s.hnorm,
+                              geometry: geometry)
+        }
         try project(enc, x: s.concat, gs: s.gsFc, w: w.fc,
                     plan: fcPlan, y32: s.fcOut32, y16: s.fcOut16)
         try QWNorm.encode(enc, hal: hal, variant: .rmsnorm,

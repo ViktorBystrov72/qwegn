@@ -134,7 +134,7 @@ public final class QWAttnDecode {
         self.psoCombine = try hal.pipeline(general ? "qwg_attn_decode_combine_general"
                                                      : "qwg_attn_decode_combine")
         self.sharedPrefixRows = sharedPrefixRows
-        if let sharedPrefixRows {
+        if !general, let sharedPrefixRows {
             var map: [Int: any MTLComputePipelineState] = [:]
             for r in 2...sharedPrefixRows {
                 map[r] = try hal.pipeline(Self.sharedKernelName(kvMode, r))
@@ -362,7 +362,7 @@ public final class QWAttnDecode {
 
         // A common split stride preserves the reference's 12-key fold boundaries.
         // At a stride transition, use the scalar reference instead of reordering.
-        if (!sharedPrefix && isGeneral) || (sharedPrefix && (cBase + splits) / splits != (cBase + T + splits - 1) / splits) {
+        if isGeneral || (sharedPrefix && (cBase + splits) / splits != (cBase + T + splits - 1) / splits) {
             func row(_ tensor: QWTensorValue, _ index: Int, _ columns: Int) -> QWTensorValue {
                 QWTensorValue(region: tensor.region, offset: tensor.offset + index * columns * 2,
                               shape: QWTensorShape([columns], .f16))

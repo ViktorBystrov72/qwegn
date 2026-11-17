@@ -65,5 +65,24 @@ final class QWMTPEmbeddingTableTests: XCTestCase {
                                                     vocabulary: Int(Int32.max) + 1, hidden: 1))
         XCTAssertThrowsError(try QWMTPEmbeddingTable(hal: hal, path: path, offset: 0,
                                                     vocabulary: 1, hidden: Int(UInt32.max) + 1))
+        let multiTokens = buffer.contents().assumingMemoryBound(to: Int32.self)
+        multiTokens[0] = 1
+        multiTokens[1] = 0
+        multiTokens[2] = -1
+        let multiOut = QWTensorValue(region: region, offset: 64, shape: QWTensorShape([3 * 8], .f16))
+        let cb2 = try XCTUnwrap(hal.queue.makeCommandBuffer())
+        let enc2 = try XCTUnwrap(cb2.makeComputeCommandEncoder())
+        try table.encodeRows(enc2, tokensBuffer: buffer, tokensByteOffset: 0, rows: 3, destination: multiOut)
+        enc2.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
+        XCTAssertEqual(cb2.status, .completed)
+        let mbits = multiOut.region.pointer.advanced(by: multiOut.offset).assumingMemoryBound(to: UInt16.self)
+        for (rowIdx, tokId) in [1, 0, -1].enumerated() {
+            for i in 0..<8 {
+                let expected = (0..<2).contains(tokId)
+                    ? QWQuant.f32tof16Bits(Float(bitPattern: UInt32(words[tokId * 8 + i]) << 16))
+                    : 0
+                XCTAssertEqual(mbits[rowIdx * 8 + i], expected, "multi row \(rowIdx) elem \(i)")
+            }
+        }
     }
 }

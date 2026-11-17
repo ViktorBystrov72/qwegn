@@ -117,7 +117,7 @@ kernel void qwg_extract_rope_qk_general(device const uint4* attnY   [[buffer(0)]
     const uint head = isQ ? (row * QW_Q_STRIDE) : row;
     const uint headU4 = flags.x;
 
-    const uint inRowU4 = (QW_QPROJ_OUT + 2u * QW_KV_HEADS * QW_HEAD_DIM) / 8u;
+    const uint inRowU4 = (flags.y != 0u) ? flags.y : ((QW_QPROJ_OUT + 2u * QW_KV_HEADS * QW_HEAD_DIM) / 8u);
     const size_t inRow = (size_t)s * inRowU4;
     const size_t srcOff = isQ ? (inRow + (size_t)head * headU4)
                               : (inRow + (size_t)QW_QPROJ_OUT / 8u + (size_t)row * headU4);

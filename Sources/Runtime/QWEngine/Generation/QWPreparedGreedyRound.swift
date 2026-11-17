@@ -32,10 +32,13 @@ struct QWGreedyRoundBoundary: Equatable {
 struct QWGreedyRoundLease {
     let boundary: QWGreedyRoundBoundary
     let prepared: QWPreparedGreedyRound
+    let rawTargets: [Int]?
 
     init(boundary: QWGreedyRoundBoundary, decision: QWGreedyRoundDecision,
-         stochasticEvidence: QWStochasticRoundEvidence? = nil) {
+         stochasticEvidence: QWStochasticRoundEvidence? = nil,
+         rawTargets: [Int]? = nil) {
         self.boundary = boundary
+        self.rawTargets = rawTargets
         prepared = QWPreparedGreedyRound(identity: UUID(), decision: decision,
                                        stochasticEvidence: stochasticEvidence)
     }

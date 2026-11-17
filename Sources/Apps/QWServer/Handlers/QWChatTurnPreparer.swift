@@ -176,7 +176,8 @@ public enum QWChatTurnPreparer {
         var stops: Set<Int> = specialTokens.defaultStopTokenIds
         let imEndTokenId = specialTokens.imEndTokenId
         let endThinkTokenId = specialTokens.endThinkTokenId
-        let userTextContainsImEnd = request.messages.contains { $0.extractTextContent().contains("<|im_end|>") }
+        let imEndMarker = tok.piece(imEndTokenId) ?? "<|im_end|>"
+        let userTextContainsImEnd = request.messages.contains { $0.extractTextContent().contains(imEndMarker) }
         if userTextContainsImEnd {
             stops.remove(imEndTokenId)
         }

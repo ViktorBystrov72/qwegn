@@ -42,6 +42,8 @@ extension QWEngineDriver {
         let psoRMSNorm: any MTLComputePipelineState
         let psoRMSNormResidual: any MTLComputePipelineState
         let psoRMSNormResidualWide: any MTLComputePipelineState
+        let psoRMSNormResidualMoE: any MTLComputePipelineState
+        let psoRMSNormResidualMoEWide: any MTLComputePipelineState
         let psoHeadF16: any MTLComputePipelineState
         let psoGemmBatchedH16: any MTLComputePipelineState
         let psoGemmBatchedH16GdnInProj: any MTLComputePipelineState
@@ -137,15 +139,21 @@ extension QWEngineDriver {
         let pack = isSafetensors ? nil : try QWQuant.Pack(url: URL(fileURLWithPath: packPath))
         let nextNMTPName = "model.language_model.layers.\(rawGeometry.numLayers).enorm.weight"
         let nextNMTPAltName = "model.layers.\(rawGeometry.numLayers).enorm.weight"
+        let maxwellMTPName = "mtp_layers.0.enorm.weight"
+        let maxwellMTPAltName = "model.mtp_layers.0.enorm.weight"
         let hasMTPWeights: Bool
         if let st = stContainer {
             hasMTPWeights = st.tensor("mtp.pre_fc_norm_embedding.weight") != nil
                 || st.tensor(nextNMTPName) != nil
                 || st.tensor(nextNMTPAltName) != nil
+                || st.tensor(maxwellMTPName) != nil
+                || st.tensor(maxwellMTPAltName) != nil
         } else if let pk = pack {
             hasMTPWeights = (try? pk.entry("mtp.pre_fc_norm_embedding.weight")) != nil
                 || (try? pk.entry(nextNMTPName)) != nil
                 || (try? pk.entry(nextNMTPAltName)) != nil
+                || (try? pk.entry(maxwellMTPName)) != nil
+                || (try? pk.entry(maxwellMTPAltName)) != nil
         } else {
             hasMTPWeights = false
         }
@@ -182,6 +190,8 @@ extension QWEngineDriver {
         let psoRMSNorm = try hal.pipeline("qwg_rmsnorm")
         let psoRMSNormResidual = try hal.pipeline("qwg_rmsnorm_residual")
         let psoRMSNormResidualWide = try hal.pipeline("qwg_rmsnorm_residual_wide")
+        let psoRMSNormResidualMoE = try hal.pipeline("qwg_rmsnorm_residual_moe")
+        let psoRMSNormResidualMoEWide = try hal.pipeline("qwg_rmsnorm_residual_moe_wide")
         let psoHeadF16 = try hal.pipeline("qwg_gemv_f16_v4")
         let psoGemmBatchedH16 = try hal.pipeline(Self.gemmKernelName(format: weightFormat, bm128: false))
         let psoGemmBatchedH16GdnInProj = try hal.pipeline(Self.gdnInProjPrefillKernelName(format: weightFormat))
@@ -211,7 +221,10 @@ extension QWEngineDriver {
             psoGEMVDxH16GdnInProjT4: psoGEMVDxH16GdnInProjT4,
             psoGEMVSiluPairH16: psoGEMVSiluPairH16, psoFwht32: psoFwht32,
             psoRMSNorm: psoRMSNorm, psoRMSNormResidual: psoRMSNormResidual,
-            psoRMSNormResidualWide: psoRMSNormResidualWide, psoHeadF16: psoHeadF16,
+            psoRMSNormResidualWide: psoRMSNormResidualWide,
+            psoRMSNormResidualMoE: psoRMSNormResidualMoE,
+            psoRMSNormResidualMoEWide: psoRMSNormResidualMoEWide,
+            psoHeadF16: psoHeadF16,
             psoGemmBatchedH16: psoGemmBatchedH16,
             psoGemmBatchedH16GdnInProj: psoGemmBatchedH16GdnInProj,
             psoSiluMulF16: psoSiluMulF16, psoKVPagedWrite: psoKVPagedWrite,
@@ -240,7 +253,7 @@ extension QWEngineDriver {
         let recB = QWSlotGeometry.recElems(geometry: geometry) * 4
         let ringB = QWSlotGeometry.ringElems(geometry: geometry) * 2
         let slotBytes = gdnLayerCount * (recB + ringB)
-        let trunkHidBytes = (geometry.mtpSharedLastLayer && geometry.mhcConfig != nil)
+        let trunkHidBytes = geometry.usesMultiStreamMTPHidden
             ? geometry.mhcConfig!.streams * geometry.hidden * 4 : geometry.hidden * 2
         let gdnBytes = slotCount * slotBytes + Self.partialsScratchBytes(geometry: geometry, mtpDrafts: mtpDrafts, maxTokens: maxTokens)
             + (mtpDrafts > 0 ? QWGDNReplayCheckpoint.allocationBytes(geometry: geometry, layers: gdnLayerCount, rows: mtpDrafts + 1) : 0)
@@ -256,13 +269,15 @@ extension QWEngineDriver {
             mlaPerTokBytes = 0
         }
         let hcaPerTokBytes = Self.hcaPerTokenBytes(geometry: geometry)
+        let mbsaPerTokBytes = Self.mbsaPerTokenBytes(geometry: geometry, attnLayerCount: attnLayerCount)
         let mlaFixedBytes = Self.mlaFixedScratchBytes(
             geometry: geometry, prefillChunkRows: prefillChunkSize, activeAttnLayers: activeAttnLayers)
         let extraFixedBytes = mlaFixedBytes
             + Self.hcaFixedScratchBytes(geometry: geometry, prefillChunkRows: prefillChunkSize)
-            + (mtpDrafts > 0 && geometry.mtpSharedLastLayer ? (112 << 20) : 0)
+            + Self.mbsaFixedScratchBytes(geometry: geometry, prefillChunkRows: prefillChunkSize, attnLayerCount: attnLayerCount)
+            + (mtpDrafts > 0 && (geometry.mtpSharedLastLayer || geometry.hasDedicatedMHCMTP) ? (112 << 20) : 0)
         let perTokBytes = 2 * activeAttnLayers * (QWKVCache.pageBytes(mode: kvMode, geometry: geometry) / QWKVCache.pageTokens)
-            + mlaPerTokBytes + hcaPerTokBytes
+            + mlaPerTokBytes + hcaPerTokBytes + mbsaPerTokBytes
         let maxMTP = cfg.mtpBackend == .dflash2 ? 15 : 7
         let prelimPlan = try QWWeightAllocationPlan(geometry: geometry, ropeRows: max(ropeRows, maxTokens),
                                                     mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP,
@@ -324,8 +339,7 @@ extension QWEngineDriver {
         let fixedBytes = budget.fixedBytes
         let allowDeviceEmbed = devEmbedEnv != "0" && mtpDrafts > 0 && (
             devEmbedEnv == "1"
-            || (mtpDrafts > 1
-                && geometry.effectiveResidentExperts == geometry.numExperts
+            || (geometry.effectiveResidentExperts == geometry.numExperts
                 && fixedBytes + budget.trunkKVBytes + budget.mtpKVBytes + embedBytes + (1 << 30) <= budget.availBytes)
         )
         let embedRawOff: Int
@@ -416,7 +430,7 @@ extension QWEngineDriver {
                          "QWEngineDriver: GDN rec state views ALIAS (per-layer state law)")
             precondition(ringViews.count == gdnLayerCount && disjoint(ringViews),
                          "QWEngineDriver: GDN ring views ALIAS (per-layer state law)")
-            let trunkHidShape = (geometry.mtpSharedLastLayer && geometry.mhcConfig != nil)
+            let trunkHidShape = geometry.usesMultiStreamMTPHidden
                 ? QWTensorShape([geometry.mhcConfig!.streams * H], .f32) : QWTensorShape([H], .f16)
             let dflashSlot = (dflashDrafter.map { slotIdx < $0.sessionSlots.count ? $0.sessionSlots[slotIdx] : nil }) ?? nil
             slots.append(GdnSlot(recSlab: recSlab, ringSlab: ringSlab,
@@ -575,10 +589,12 @@ extension QWEngineDriver {
                                   mlaOperator: mlaOperator, mlaLayerIndex: attnLayers.count)
         }
         let echoDrafter: QWEchoDraftEncoder?
-        if let ew = echoWeights, let mla = mlaOperator, let lastLayer = layersW.last {
+        if let ew = echoWeights, let draftLayer = ew.dedicatedLayer ?? layersW.last,
+           (mlaOperator != nil || ew.dedicatedLayer != nil) {
             echoDrafter = try QWEchoDraftEncoder(
-                geometry: geometry, hal: hal, weights: ew, trunkLayer: lastLayer,
-                mlaOperator: mla, mlaLayerIndex: attnLayers.count, maxSeedRows: maxT)
+                geometry: geometry, hal: hal, weights: ew, trunkLayer: draftLayer,
+                mlaOperator: mlaOperator, mlaLayerIndex: attnLayers.count,
+                maxSeedRows: maxT, kvMode: kvMode)
         } else {
             echoDrafter = nil
         }

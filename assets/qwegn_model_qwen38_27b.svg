@@ -41,7 +41,7 @@
   <g transform="translate(28, 24)">
     <rect x="0.0" y="0.0" width="266" height="28" rx="14.0" fill="#381b14" stroke="#f59e0b" stroke-width="1.2"/>
     <circle cx="15.0" cy="14.0" r="4.5" fill="#fbbf24"/>
-    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#fde68a" letter-spacing="0.25">QWEGN v0.25.0 · MODEL PROFILE</text>
+    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#fde68a" letter-spacing="0.25">QWEGN v0.26.0 · MODEL PROFILE</text>
     <rect x="276.0" y="0.0" width="420" height="28" rx="14.0" fill="#064e3b" stroke="#10b981" stroke-width="1.2"/>
     <text x="486.0" y="18.6" text-anchor="middle" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">1,035 TOK/S PREFILL · 3/3 NEEDLE (64K–1M)</text>
     <text x="0" y="64" fill="#f8fafc" class="title" font-size="27">Qwen3.8-27B (HQ4 + DSpine / DFlash 2 + LSA)</text>
@@ -66,7 +66,7 @@
     <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">DSpine 148.0 peak · 144.1 serve</text>
     <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13.5">12.70 tok/rd · DFlash2 154.2</text>
     <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
-    <text x="18" y="218" fill="#fbbf24" class="mono" font-size="13">9/10 Code (73/100) · 8/10 Core</text>
+    <text x="18" y="218" fill="#fbbf24" class="mono" font-size="13">9/10 Code (73/100) · 9/10 Core</text>
     <text x="18" y="238" fill="#fbbf24" class="mono" font-size="13">1.56 GiB DSpine sidecar</text>
   </g>
   <g transform="translate(336, 160)">
@@ -124,6 +124,6 @@
     <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
     <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
     <text x="122" y="27" class="mono" font-size="11.5" font-weight="700" fill="#e2e8f0">Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
-    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.25.0 · q4 KV · DSpine B=16 · Temp 0 · 0 Steady Allocs</text>
+    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.26.0 · q4 KV · DSpine B=16 · Temp 0 · 0 Steady Allocs</text>
   </g>
 </svg>

@@ -162,7 +162,7 @@ public enum QWServerConfigurationResolver {
                 && modelDescriptor != nil
             let isDefaultConfigWithoutProfile = ((resolvedConfigFileURL?.standardizedFileURL
                 == QWSettingsManager.defaultSettingsFileURL.standardizedFileURL)
-                || (ignoreProfile && resolvedConfigFileURL == nil))
+                || (resolvedConfigFileURL == nil))
                 && modelProfile == nil
                 && modelDescriptor != nil
 

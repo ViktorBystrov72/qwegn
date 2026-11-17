@@ -41,9 +41,9 @@
   <g transform="translate(28, 24)">
     <rect x="0.0" y="0.0" width="266" height="28" rx="14.0" fill="#0c2a3a" stroke="#0ea5e9" stroke-width="1.2"/>
     <circle cx="15.0" cy="14.0" r="4.5" fill="#38bdf8"/>
-    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#7dd3fc" letter-spacing="0.25">QWEGN v0.20.5 · MODEL PROFILE</text>
+    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#7dd3fc" letter-spacing="0.25">QWEGN v0.26.0 · MODEL PROFILE</text>
     <rect x="276.0" y="0.0" width="420" height="28" rx="14.0" fill="#064e3b" stroke="#10b981" stroke-width="1.2"/>
-    <text x="486.0" y="18.6" text-anchor="middle" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">6,419 TOK/S PREFILL · 1M NEEDLE RECALL: 3/3</text>
+    <text x="486.0" y="18.6" text-anchor="middle" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">6,462 TOK/S PREFILL · 382.8 SPEC · 3/3 1M</text>
     <text x="0" y="64" fill="#f8fafc" class="title" font-size="27">Qwen3.6-35B-A3B (HQ4_G32 + LSA)</text>
     <text x="0" y="92" fill="#cbd5e1" class="subtitle" font-size="14.5">40-Layer Sparse MoE (256 Experts · 8 Routed + 1 Shared · 10 Full-Attn w/ LSA + 30 GDN)</text>
     <text x="0" y="114" fill="#cbd5e1" class="subtitle" font-size="14.5">Variational MTP-3 Speculation · Multimodal Vision · Up to 1M Token Context</text>
@@ -60,10 +60,10 @@
     <rect width="288" height="268" rx="16" fill="url(#cardGrad)" stroke="#223352" stroke-width="1.4"/>
     <rect x="18.0" y="16.0" width="162" height="26" rx="13.0" fill="#0c2a3a" stroke="#0ea5e9" stroke-width="1.2"/>
 <text x="99.0" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#7dd3fc" letter-spacing="0.2">PROMPT INGESTION</text>
-    <text x="18" y="90" fill="url(#cyanGrad)" class="title mono" font-size="44">6,419</text>
+    <text x="18" y="90" fill="url(#cyanGrad)" class="title mono" font-size="44">6,462</text>
     <text x="164.5" y="88" fill="#38bdf8" class="title mono" font-size="17">tok/s</text>
-    <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">6,142 @64K · 2,317 @1M</text>
-    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">6,419 @4K · 6,307 @16K</text>
+    <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">6,316 @6.5K · 6,142 @64K</text>
+    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">5,136 @66K · 2,317 @1M LSA</text>
     <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13.5">13.88× Dense @524K (3,207/231)</text>
     <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
     <text x="18" y="218" fill="#38bdf8" class="mono" font-size="13">Apple10 NAX Sparse Prefill</text>
@@ -85,11 +85,11 @@
   <g transform="translate(644, 160)">
     <rect width="288" height="268" rx="16" fill="url(#cardGrad)" stroke="#223352" stroke-width="1.4"/>
     <rect x="18.0" y="16.0" width="169" height="26" rx="13.0" fill="#33230c" stroke="#f59e0b" stroke-width="1.2"/>
-<text x="102.5" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#fde68a" letter-spacing="0.2">VARIATIONAL MTP-3</text>
-    <text x="18" y="90" fill="url(#amberGrad)" class="title mono" font-size="44">233.4</text>
+<text x="102.5" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#fde68a" letter-spacing="0.2">ASYNC MTP-5 SPEC</text>
+    <text x="18" y="90" fill="url(#amberGrad)" class="title mono" font-size="44">382.8</text>
     <text x="164.5" y="88" fill="#fbbf24" class="title mono" font-size="17">tok/s</text>
-    <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">238.5 Peak · 105.6 @1M</text>
-    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">136.8 @64K e-means · 126.2 Ward</text>
+    <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">324.3 CLI d=5 · 182.0 Serve</text>
+    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">173.6 CLI d=1 · 143.7 @64K</text>
     <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13.5">4.48× faster than dense @524K</text>
     <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
     <text x="18" y="218" fill="#fbbf24" class="mono" font-size="13">LSA Sparse Decode</text>
@@ -110,9 +110,9 @@
     <rect width="904" height="214" rx="16" fill="url(#cardGrad)" stroke="#223352" stroke-width="1.4"/>
     <rect x="22.0" y="16.0" width="248" height="26" rx="13.0" fill="#17253b" stroke="#38bdf8" stroke-width="1.2"/>
 <text x="146.0" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#7dd3fc" letter-spacing="0.3">SMARTNESS &amp; NEEDLE FIDELITY</text>
-    <text x="22" y="68" fill="#f8fafc" class="title" font-size="18">9/10 Code-10 (72/100 Full) · 100% (3/3) 1M Needle Recall</text>
-    <text x="22" y="98" fill="#34d399" class="mono" font-size="14.5">• Needle (64K–1M)  : 3 / 3 (100%) retrieved w/ LSA vs 0/3 Dense</text>
-    <text x="22" y="122" fill="#34d399" class="mono" font-size="14.5">• HumanEval / MBPP : 41/50 (82%) HumanEval · 31/50 (62%) MBPP</text>
+    <text x="22" y="68" fill="#f8fafc" class="title" font-size="18">82% Code-50 · 83.3% Core-30 (10/10 Core-10) · 139/139 API Conf</text>
+    <text x="22" y="98" fill="#34d399" class="mono" font-size="14.5">• Needle (16K–1M)  : 3 / 3 (100%) retrieved w/ LSA vs 0/3 Dense</text>
+    <text x="22" y="122" fill="#34d399" class="mono" font-size="14.5">• Code-50 &amp; Core   : 25/25 HumanEval (100%) · 41/50 Code-50 · 16/16 MMLU</text>
     <text x="22" y="146" fill="#c084fc" class="mono" font-size="14.5">• LSA Selector     : 0.062 ms parallel radix top-k @ 1M tokens</text>
     <text x="22" y="170" fill="#fbbf24" class="mono" font-size="14.5">• Memory @ 1M Ctx  : 30.53 GiB RSS (22.18 GiB pack + q4 KV + LSA)</text>
     <text x="22" y="194" fill="#38bdf8" class="mono" font-size="14.5">• Steady Allocs    : 0 heap / 0 Metal buffer allocations</text>
@@ -124,6 +124,6 @@
     <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
     <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
     <text x="122" y="27" class="mono" font-size="11.5" font-weight="700" fill="#e2e8f0">Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
-    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.20.5 · q4 KV · Temp 0 · 0 Steady Allocs</text>
+    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.26.0 · q4 KV · Temp 0 · 0 Steady Allocs</text>
   </g>
 </svg>

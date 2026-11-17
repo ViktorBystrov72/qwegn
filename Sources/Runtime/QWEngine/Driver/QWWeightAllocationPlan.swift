@@ -43,6 +43,59 @@ struct QWWeightAllocationPlan {
             tensor(geometry.vocab * h, .f16)
         }
         var allocatedSharedCold = false
+        func appendMoEWeights() {
+            let resE = geometry.effectiveResidentExperts
+            let coldE = max(0, geometry.numExperts - resE)
+            let outDim = geometry.moeRoutedDim
+            let routerRows = geometry.moeSplitFeatureRouting ? (2 * geometry.numExperts) : geometry.numExperts
+            tensor(routerRows * h, .f32)
+            if geometry.hasBiasCorrectedRouter {
+                tensor(geometry.numExperts, .f32)
+            }
+            if geometry.routedScalingFactorLearnable {
+                tensor(geometry.numExperts, .f32)
+            }
+            q4Expert(resE * 2 * geometry.moeIntermediate, outDim)
+            q4ExpertDown(resE * outDim, geometry.moeIntermediate)
+            if coldE > 0 && !allocatedSharedCold {
+                allocatedSharedCold = true
+                q4Expert(coldE * 2 * geometry.moeIntermediate, outDim)
+                q4ExpertDown(coldE * outDim, geometry.moeIntermediate)
+            }
+            if let latL = geometry.moeLatentSize, latL > 0 {
+                q4(latL, h)
+                tensor(latL, .f16)
+                q4(h, latL)
+            }
+            if geometry.sharedExpertIntermediate > 0 {
+                q4(2 * geometry.sharedExpertIntermediate, h)
+                q4(h, geometry.sharedExpertIntermediate)
+                if geometry.sharedExpertHasGate {
+                    tensor(h, .f32)
+                }
+            }
+        }
+        func appendGQAWeights(includeMBSA: Bool) {
+            let hasMBSA = includeMBSA && geometry.blockSparseGQAConfig != nil
+            q4(hasMBSA ? geometry.attnProjTotalN : (geometry.qProjOut + 2 * kv), h)
+            q4(h, geometry.qHeads * geometry.headDim)
+            // The q/k norms only exist when the model has them.
+            if geometry.descriptor.hasQKNorm {
+                tensor(geometry.headDim, .f16)
+                tensor(kv, .f16)
+            }
+            if hasMBSA {
+                tensor(geometry.headDim, .f16)
+                tensor(geometry.headDim, .f16)
+            }
+        }
+        func appendMHCWeights(_ mhc: QWModelDescriptor.MHCConfig) {
+            let routerRows = 2 * mhc.streams + (mhc.fixedIdentity ? 0 : mhc.streams * mhc.streams)
+            tensor(routerRows * mhc.streams * h, .f32)
+            tensor(routerRows, .f32)
+            tensor(routerRows * mhc.streams * h, .f32)
+            tensor(routerRows, .f32)
+        }
         for layer in 0..<geometry.numLayers {
             tensor(h, .f16)
             tensor(h, .f16)
@@ -50,36 +103,7 @@ struct QWWeightAllocationPlan {
                 // A sparse MoE layer: the router (the pack's raw plane,
                 // widened to f32) and the two banks — ONE contiguous view
                 // each, the resident experts stacked in order (C119).
-                let resE = geometry.effectiveResidentExperts
-                let coldE = max(0, geometry.numExperts - resE)
-                let outDim = geometry.moeRoutedDim
-                let routerRows = geometry.moeSplitFeatureRouting ? (2 * geometry.numExperts) : geometry.numExperts
-                tensor(routerRows * h, .f32)
-                if geometry.hasBiasCorrectedRouter {
-                    tensor(geometry.numExperts, .f32)
-                }
-                if geometry.routedScalingFactorLearnable {
-                    tensor(geometry.numExperts, .f32)
-                }
-                q4Expert(resE * 2 * geometry.moeIntermediate, outDim)
-                q4ExpertDown(resE * outDim, geometry.moeIntermediate)
-                if coldE > 0 && !allocatedSharedCold {
-                    allocatedSharedCold = true
-                    q4Expert(coldE * 2 * geometry.moeIntermediate, outDim)
-                    q4ExpertDown(coldE * outDim, geometry.moeIntermediate)
-                }
-                if let latL = geometry.moeLatentSize, latL > 0 {
-                    q4(latL, h)
-                    tensor(latL, .f16)
-                    q4(h, latL)
-                }
-                if geometry.sharedExpertIntermediate > 0 {
-                    q4(2 * geometry.sharedExpertIntermediate, h)
-                    q4(h, geometry.sharedExpertIntermediate)
-                    if geometry.sharedExpertHasGate {
-                        tensor(h, .f32)
-                    }
-                }
+                appendMoEWeights()
             } else {
                 q4(2 * i, h)
                 q4(h, i)
@@ -150,13 +174,7 @@ struct QWWeightAllocationPlan {
                         tensor(qHeads, .f32)
                     }
                 } else {
-                    q4(geometry.qProjOut + 2 * kv, h)
-                    q4(h, geometry.qHeads * geometry.headDim)
-                    // The q/k norms only exist when the model has them.
-                    if geometry.descriptor.hasQKNorm {
-                        tensor(geometry.headDim, .f16)
-                        tensor(kv, .f16)
-                    }
+                    appendGQAWeights(includeMBSA: true)
                 }
             } else {
                 if geometry.gdnVectorDecay {
@@ -181,11 +199,7 @@ struct QWWeightAllocationPlan {
                 }
             }
             if let mhc = geometry.mhcConfig, layer >= mhc.start, layer < mhc.end {
-                let routerRows = 2 * mhc.streams + (mhc.fixedIdentity ? 0 : mhc.streams * mhc.streams)
-                tensor(routerRows * mhc.streams * h, .f32)
-                tensor(routerRows, .f32)
-                tensor(routerRows * mhc.streams * h, .f32)
-                tensor(routerRows, .f32)
+                appendMHCWeights(mhc)
             }
         }
         tensor(h, .f16)
@@ -210,6 +224,27 @@ struct QWWeightAllocationPlan {
             if geometry.hasBiasCorrectedRouter && geometry.numExperts > 0 {
                 tensor(geometry.numExperts, .f32)
             }
+        } else if mtpDrafts > 0 && geometry.hasDedicatedMHCMTP {
+            let c = geometry.mhcConfig?.streams ?? 4
+            tensor(h, .f16)
+            tensor(h, .f16)
+            q4(h, h)
+            q4(h, h)
+            tensor(h, .f16)
+            tensor(h, .f16)
+            if geometry.numExperts > 0 {
+                appendMoEWeights()
+            } else {
+                q4(2 * i, h)
+                q4(h, i)
+            }
+            appendGQAWeights(includeMBSA: false)
+            if let mhc = geometry.mhcConfig {
+                appendMHCWeights(mhc)
+            }
+            tensor(c * c * h, .f32)
+            tensor(c, .f32)
+            tensor(h, .f16)
         } else if mtpDrafts > 0 {
             // MTP Layer weights (Qwen3.5 mtp.* or NextN layers.<numLayers>.*):
             // 1. pre_fc_norm_embedding / enorm

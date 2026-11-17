@@ -50,7 +50,7 @@ final class QWModuleRegistryTests: XCTestCase {
             XCTAssertNotNil(QWModuleRegistry.moduleType(for: family), family.rawValue)
         }
 
-        XCTAssertEqual(QWModuleRegistry.supportedFamilies.count, 11)
+        XCTAssertEqual(QWModuleRegistry.supportedFamilies.count, 12)
         XCTAssertEqual(Set(QWModuleRegistry.supportedFamilies), Set(QWModelDescriptor.Family.allCases))
         // Each hybrid family resolves to its dedicated non-overloaded module class.
         XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen38Dense))),
@@ -63,6 +63,8 @@ final class QWModuleRegistryTests: XCTestCase {
                        ObjectIdentifier(Glm5NextModule.self))
         XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .ernie55MoE))),
                        ObjectIdentifier(Ernie55MoEModule.self))
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .maxwellMoE))),
+                       ObjectIdentifier(MaxwellMoEModule.self))
     }
 
     func testSpeculationPolicyForInitialLoadAndModelSwitch() throws {
@@ -284,6 +286,57 @@ final class QWModuleRegistryTests: XCTestCase {
         XCTAssertEqual(unified.plan.layers[3].attention, .qsaSparse)
         XCTAssertEqual(unified.batchScheduler.inFlightRequests, 0)
         XCTAssertTrue(unified.supportsTokenConstraints)
+    }
+
+    func testMaxwellWeightAllocationPlanMTPAndQuantFormats() throws {
+        let cfg = """
+        {
+          "model_type": "maxwell_moe",
+          "hidden_size": 2048,
+          "intermediate_size": 6144,
+          "vocab_size": 200704,
+          "num_hidden_layers": 6,
+          "mlp_only_layers": [0, 1, 2],
+          "num_experts": 16,
+          "num_experts_per_tok": 4,
+          "moe_intermediate_size": 512,
+          "shared_expert_intermediate_size": 1024,
+          "use_shared_expert_gate": false,
+          "moe_router_enable_expert_bias": true,
+          "router_score_function": "sigmoid",
+          "num_attention_heads": 32,
+          "num_key_value_heads": 4,
+          "attention_head_size": 128,
+          "qk_layernorm": true,
+          "attention_variant": "block_sparse_gqa",
+          "block_sparse_gqa_indexer_n_heads": 4,
+          "block_sparse_gqa_indexer_head_dim": 128,
+          "block_sparse_gqa_block_size": 128,
+          "block_sparse_gqa_prefix_window_size": 1024,
+          "block_sparse_gqa_local_window_size": 1024,
+          "block_sparse_gqa_num_remote_blocks": 16,
+          "enable_hyper_connections": true,
+          "num_residual_streams": 4,
+          "mhc_sinkhorn_iterations": 20,
+          "mtp_num_layers": 1,
+          "rms_norm_eps": 1e-6,
+          "rope_theta": 20000000,
+          "max_position_embeddings": 65536,
+          "eos_token_id": 2
+        }
+        """.data(using: .utf8)!
+        let desc = try QWModelDescriptor.decode(configJSON: cfg)
+        let geo = QWModelGeometry(descriptor: desc)
+        let plan0 = try QWWeightAllocationPlan(geometry: geo, ropeRows: 8192, mtpDrafts: 0, format: .hq4G32)
+        let plan1 = try QWWeightAllocationPlan(geometry: geo, ropeRows: 8192, mtpDrafts: 1, format: .hq4G32)
+        XCTAssertGreaterThan(plan1.bytes, plan0.bytes)
+        let shvqFormat = QWWeightFormat.hqBlock(
+            bits: 8, groupSize: 32, expertBits: 4, expertGroupSize: 64,
+            denseIncumbent: false, expertIncumbent: false,
+            expertDownBits: 4, expertDownGroupSize: 64, expertDownIncumbent: false,
+            denseSHVQ: false, expertSHVQ: true, expertDownSHVQ: true)
+        let planShvq = try QWWeightAllocationPlan(geometry: geo, ropeRows: 8192, mtpDrafts: 1, format: shvqFormat)
+        XCTAssertGreaterThan(planShvq.bytes, 0)
     }
 }
 

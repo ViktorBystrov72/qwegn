@@ -81,7 +81,16 @@ extension QWModelDescriptor {
             let num_attention_heads: Int
             let num_key_value_heads: Int
             var head_dim: Int? = nil
+            var attention_head_size: Int? = nil
             var qk_head_dim: Int? = nil
+            var attention_variant: String? = nil
+            var block_sparse_gqa_indexer_n_heads: Int? = nil
+            var block_sparse_gqa_indexer_head_dim: Int? = nil
+            var block_sparse_gqa_block_size: Int? = nil
+            var block_sparse_gqa_prefix_window_size: Int? = nil
+            var block_sparse_gqa_local_window_size: Int? = nil
+            var block_sparse_gqa_num_remote_blocks: Int? = nil
+            var qk_layernorm: Bool? = nil
             var qk_nope_head_dim: Int? = nil
             var qk_rope_head_dim: Int? = nil
             var v_head_dim: Int? = nil
@@ -132,12 +141,16 @@ extension QWModelDescriptor {
             let shared_expert_intermediate_size: Int?
             var n_shared_experts: Int? = nil
             var moe_shared_expert_gate: Bool? = nil
+            var use_shared_expert_gate: Bool? = nil
             var moe_split_feature_routing: Bool? = nil
+            var moe_router_enable_expert_bias: Bool? = nil
             var first_k_dense_replace: Int? = nil
+            var mlp_only_layers: [Int]? = nil
             var moe_layer_freq: Int? = nil
             var routed_scaling_factor: Float? = nil
             var routed_scaling_factor_learnable: Bool? = nil
             var scoring_func: String? = nil
+            var router_score_function: String? = nil
             var topk_method: String? = nil
             var mlp_clamp: Bool? = nil
             var swiglu_limit: Float? = nil
@@ -162,6 +175,8 @@ extension QWModelDescriptor {
             let hc_count: Int?
             let hc_lowrank: Int?
             var enable_hyper_connections: Bool? = nil
+            var num_residual_streams: Int? = nil
+            var mhc_sinkhorn_iterations: Int? = nil
             var hc_mult: Int? = nil
             var hc_sinkhorn_iters: Int? = nil
             var hc_eps: Float? = nil
@@ -175,6 +190,7 @@ extension QWModelDescriptor {
             let split_ngram_parts: Int?
             let mtp_num_hidden_layers: Int?
             var num_nextn_predict_layers: Int? = nil
+            var mtp_num_layers: Int? = nil
             let mtp_use_dedicated_embeddings: Bool?
             var mtp_shared_last_layer: Bool? = nil
             var multimax: String? = nil

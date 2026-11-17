@@ -428,6 +428,12 @@ def quantize_model(source: Path, destination: Path,
             source=source, destination=destination, flat_root=flat_root,
             quant=quant, group_size=group_size, dense_quant=dense_quant,
             expert_quant=expert_quant, expert_down_quant=expert_down_quant)
+    if tc0.get("model_type") == "maxwell_moe":
+        from maxwell_adapter import quantize_maxwell_model
+        return quantize_maxwell_model(
+            source=source, destination=destination, flat_root=flat_root,
+            quant=quant, group_size=group_size, dense_quant=dense_quant,
+            expert_quant=expert_quant, expert_down_quant=expert_down_quant)
     qcfg = config.get("quantization_config")
     fp8_block_size = 128
     if qcfg is not None:

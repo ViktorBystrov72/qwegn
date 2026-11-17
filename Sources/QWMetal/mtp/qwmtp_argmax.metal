@@ -5,10 +5,14 @@ using namespace metal;
 // the shared final reduction returns ~0 (invalid token) if any row is bad.
 static inline void qwg_mtp_argmax_checked_body(
         device const float* logits, device uint* keysHi, device uint* keysLo,
-        uint N, bool canonicalZero, uint tg, uint tid,
+        uint N, bool canonicalZero, uint3 tg, uint tid,
         threadgroup uint* sh, threadgroup uint* sl) {
-    const uint i = tg * 256u + tid;
-    const float v = i < N ? logits[i] : -INFINITY;
+    const uint nTG = (N + 255u) >> 8u;
+    device const float* rowLogits = logits + (size_t)tg.y * N;
+    device uint* rowHi = keysHi + (size_t)tg.y * nTG;
+    device uint* rowLo = keysLo + (size_t)tg.y * nTG;
+    const uint i = tg.x * 256u + tid;
+    const float v = i < N ? rowLogits[i] : -INFINITY;
     const uint raw = as_type<uint>(v);
     const bool invalid = i < N && (raw & 0x7f800000u) == 0x7f800000u;
     const uint bits = canonicalZero && (raw & 0x7fffffffu) == 0u ? 0u : raw;
@@ -23,8 +27,8 @@ static inline void qwg_mtp_argmax_checked_body(
         for (uint q = 1u; q < 8u; q++) {
             if (sh[q] > bh || (sh[q] == bh && sl[q] > bl)) { bh = sh[q]; bl = sl[q]; }
         }
-        keysHi[tg] = bh;
-        keysLo[tg] = bl;
+        rowHi[tg.x] = bh;
+        rowLo[tg.x] = bl;
     }
 }
 
@@ -36,7 +40,7 @@ kernel void qwg_mtp_argmax_checked(
         uint3 tg [[threadgroup_position_in_grid]],
         uint tid [[thread_index_in_threadgroup]]) {
     threadgroup uint sh[8], sl[8];
-    qwg_mtp_argmax_checked_body(logits, keysHi, keysLo, N, true, tg.x, tid, sh, sl);
+    qwg_mtp_argmax_checked_body(logits, keysHi, keysLo, N, true, tg, tid, sh, sl);
 }
 
 kernel void qwg_mtp_argmax_target_checked(
@@ -47,5 +51,5 @@ kernel void qwg_mtp_argmax_target_checked(
         uint3 tg [[threadgroup_position_in_grid]],
         uint tid [[thread_index_in_threadgroup]]) {
     threadgroup uint sh[8], sl[8];
-    qwg_mtp_argmax_checked_body(logits, keysHi, keysLo, N, false, tg.x, tid, sh, sl);
+    qwg_mtp_argmax_checked_body(logits, keysHi, keysLo, N, false, tg, tid, sh, sl);
 }

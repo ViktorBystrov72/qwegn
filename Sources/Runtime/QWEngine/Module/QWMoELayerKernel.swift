@@ -26,7 +26,8 @@ enum QWMoEChain {
                        rows: Int, geometry: QWModelGeometry,
                        driver: QWEngineDriver? = nil,
                        cb: (any MTLCommandBuffer)? = nil,
-                       skipOut32: Bool = false) throws {
+                       skipOut32: Bool = false,
+                       preBridgedF32: (plain: QWTensorValue, rotated: QWTensorValue)? = nil) throws {
         // QW_COLD_TIMING_PROXY=1 (benchmark only): skip SSD staging and read cold ids from the
         // stale cold bank (experts - K slots, so ids stay in bounds). Same bytes and dispatches
         // as an all-resident pack; the output is not meaningful.
@@ -75,9 +76,12 @@ enum QWMoEChain {
             } else {
                 rotateFn = nil
             }
+            let moeInput: QWMoEOperator.Input = preBridgedF32.map {
+                QWMoEOperator.Input.f32PreRotated(plain: $0.plain, rotated: $0.rotated, prefillPrecast16: x16)
+            } ?? .f16Normed(x16)
             try QWMoEOperator.encodeResident(
                 &enc, hal: hal, weights: weights, scratch: scratch,
-                input: .f16Normed(x16), out32: dn32, out16: dn16, skipOut32: skipOut32,
+                input: moeInput, out32: dn32, out16: dn16, skipOut32: skipOut32,
                 rows: rows, supportsGroupedNaxPrefill: geometry.supportsGroupedNAXMoEPrefill,
                 concurrentBarriers: false,
                 rotateEncoder: rotateFn,
@@ -480,9 +484,12 @@ final class GDNMoELayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Senda
             throw QWEngineDriverError.state("the decode scratch has no MoE tensors")
         }
         var active = driver.activeEnc ?? context.enc
+        let preBridged = driver.canFusePreMoENorm(weights: context.weights, rows: 1)
+            ? (plain: s.xPlain32, rotated: s.xRot32) : nil
         try QWMoEChain.encode(enc: &active, hal: driver.hal, moe: moe, s: s,
                               x16: sc.ln2, dn32: sc.dn32, dn16: sc.dn16,
-                              rows: 1, geometry: driver.geometry, driver: driver, skipOut32: true)
+                              rows: 1, geometry: driver.geometry, driver: driver, skipOut32: true,
+                              preBridgedF32: preBridged)
     }
 
     override func encodeMLPPrefill(_ context: QWLayerPrefillContext) throws {
@@ -498,10 +505,15 @@ final class GDNMoELayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Senda
             throw QWEngineDriverError.state("the prefill scratch has no MoE tensors")
         }
         var active = driver.activeEnc ?? context.enc
+        let preBridged = driver.canFusePreMoENorm(weights: context.weights, rows: T)
+            ? (plain: driver.prefixRows(s.xPlain32, rows: T, cols: H, dt: .f32),
+               rotated: driver.prefixRows(s.xRot32, rows: T, cols: H, dt: .f32))
+            : nil
         try QWMoEChain.encode(enc: &active, hal: driver.hal, moe: moe, s: s,
                               x16: driver.prefixRows(psc.ln2, rows: T, cols: H, dt: .f16),
                               dn32: psc.dn32, dn16: psc.dn16,
-                              rows: T, geometry: geometry, driver: driver, skipOut32: true)
+                              rows: T, geometry: geometry, driver: driver, skipOut32: true,
+                              preBridgedF32: preBridged)
     }
 }
 
@@ -532,9 +544,12 @@ final class MoELayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
             throw QWEngineDriverError.state("the decode scratch has no MoE tensors")
         }
         var active = driver.activeEnc ?? context.enc
+        let preBridged = driver.canFusePreMoENorm(weights: context.weights, rows: 1)
+            ? (plain: s.xPlain32, rotated: s.xRot32) : nil
         try QWMoEChain.encode(enc: &active, hal: driver.hal, moe: moe, s: s,
                               x16: sc.ln2, dn32: sc.dn32, dn16: sc.dn16,
-                              rows: 1, geometry: driver.geometry, driver: driver, skipOut32: true)
+                              rows: 1, geometry: driver.geometry, driver: driver, skipOut32: true,
+                              preBridgedF32: preBridged)
     }
 
     override func encodeMLPPrefill(_ context: QWLayerPrefillContext) throws {
@@ -550,9 +565,14 @@ final class MoELayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
             throw QWEngineDriverError.state("the prefill scratch has no MoE tensors")
         }
         var active = driver.activeEnc ?? context.enc
+        let preBridged = driver.canFusePreMoENorm(weights: context.weights, rows: T)
+            ? (plain: driver.prefixRows(s.xPlain32, rows: T, cols: H, dt: .f32),
+               rotated: driver.prefixRows(s.xRot32, rows: T, cols: H, dt: .f32))
+            : nil
         try QWMoEChain.encode(enc: &active, hal: driver.hal, moe: moe, s: s,
                               x16: driver.prefixRows(psc.ln2, rows: T, cols: H, dt: .f16),
                               dn32: psc.dn32, dn16: psc.dn16,
-                              rows: T, geometry: geometry, driver: driver, skipOut32: true)
+                              rows: T, geometry: geometry, driver: driver, skipOut32: true,
+                              preBridgedF32: preBridged)
     }
 }

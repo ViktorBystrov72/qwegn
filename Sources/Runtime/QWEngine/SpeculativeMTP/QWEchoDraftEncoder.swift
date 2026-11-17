@@ -18,8 +18,9 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
     let geometry: QWModelGeometry
     let weights: QWEngineDriver.EchoDraftWeights
     let layer: QWEngineDriver.LayerW
-    let mlaOperator: QWMLAAttnOperator
+    let mlaOperator: QWMLAAttnOperator?
     let mlaLayerIndex: Int
+    let attnDecode: QWAttnDecode?
     let maxSeedRows: Int
     let streams: Int
     let region: QWMRegion
@@ -36,6 +37,11 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
     let draftPong: QWTensorValue
     let controlsScratch: QWTensorValue
     let ln1: QWTensorValue
+    let qkvScratch: QWTensorValue?
+    let qRScratch: QWTensorValue?
+    let kRScratch: QWTensorValue?
+    let vScratch: QWTensorValue?
+    let gqaPartials: QWMRegion?
     let attOut: QWTensorValue
     let oOut16: QWTensorValue
     let ln2: QWTensorValue
@@ -55,19 +61,21 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
          hal: QWHal,
          weights: QWEngineDriver.EchoDraftWeights,
          trunkLayer: QWEngineDriver.LayerW,
-         mlaOperator: QWMLAAttnOperator,
+         mlaOperator: QWMLAAttnOperator?,
          mlaLayerIndex: Int,
-         maxSeedRows: Int) throws {
+         maxSeedRows: Int,
+         kvMode: QWKVMode = .f16) throws {
         guard let mhcCfg = geometry.mhcConfig,
               trunkLayer.mhc != nil,
               let attn = trunkLayer.attn,
-              attn.mla != nil else {
-            throw QWEngineDriverError.state("ECHO drafter requires mHC + MLA-DSA on the shared trunk layer")
+              (mlaOperator == nil || attn.mla != nil) else {
+            throw QWEngineDriverError.state("ECHO drafter requires mHC + compatible attention on the draft layer")
         }
         self.geometry = geometry
         self.weights = weights
         self.mlaOperator = mlaOperator
         self.mlaLayerIndex = mlaLayerIndex
+        self.attnDecode = mlaOperator == nil ? try QWAttnDecode(hal: hal, kvMode: kvMode, geometry: geometry) : nil
         self.maxSeedRows = max(16, min(512, maxSeedRows))
         self.streams = mhcCfg.streams
 
@@ -119,6 +127,15 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             ? QWEngineDriver.moeScratchAllocationBytes(rows: 1, geometry: geometry, useGroupedNAX: false)
             : 0
         func align256(_ x: Int) -> Int { (x + 255) & ~255 }
+        let gqaPartialsBytes = mlaOperator == nil
+            ? QWAttnDecode.decodePartialsBytes(geometry: geometry, maxSplits: QWAttnDecode.maxLongContextSplits)
+            : 0
+        let gqaScratchBytes = mlaOperator == nil
+            ? (align256(rows * geometry.attnTotalN * 2)
+                + align256(rows * geometry.qProjOut * 2)
+                + align256(rows * geometry.kvChannels * 2) * 2
+                + align256(gqaPartialsBytes))
+            : 0
         let estimatedBytes = align256(rows * h * 2) * 4
             + align256(rows * c * h * 4) * 2
             + align256(rows * c * h * 2) * 3
@@ -131,6 +148,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             + align256(vocab * 4)
             + partialBytes * 3
             + moeBytes
+            + gqaScratchBytes
             + (2 << 20)
 
         guard let buf = hal.device.makeBuffer(length: estimatedBytes, options: .storageModeShared) else {
@@ -157,6 +175,20 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         self.draftPong = try tv(c * h, .f32)
         self.controlsScratch = try tv(rows * ctrlWidth, .f32)
         self.ln1 = try tv(rows * h, .f16)
+        if mlaOperator == nil {
+            self.qkvScratch = try tv(rows * geometry.attnTotalN, .f16)
+            self.qRScratch = try tv(rows * geometry.qProjOut, .f16)
+            self.kRScratch = try tv(rows * geometry.kvChannels, .f16)
+            self.vScratch = try tv(rows * geometry.kvChannels, .f16)
+            let gpOff = try sub.allocate(bytes: gqaPartialsBytes)
+            self.gqaPartials = QWMRegion(buffer: buf, base: gpOff, length: gqaPartialsBytes)
+        } else {
+            self.qkvScratch = nil
+            self.qRScratch = nil
+            self.kRScratch = nil
+            self.vScratch = nil
+            self.gqaPartials = nil
+        }
         self.attOut = try tv(vCols, .f16)
         self.oOut16 = try tv(h, .f16)
         self.ln2 = try tv(h, .f16)
@@ -196,8 +228,9 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                                           outStream: QWTensorValue,
                                           kv: (k: QWKVLayerView, v: QWKVLayerView),
                                           cacheRows: Int,
-                                          rows: Int) throws {
-        guard let mhc = layer.mhc, let attn = layer.attn, let mlaW = attn.mla else {
+                                          rows: Int,
+                                          writeSeedKVOnly: Bool) throws {
+        guard let mhc = layer.mhc, let attn = layer.attn else {
             throw QWEngineDriverError.state("ECHO layer weights are incomplete")
         }
         let h = geometry.hidden
@@ -246,22 +279,48 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                                        gamma: layer.ln1, controls: ctrlSlice, out: ln1Slice, rows: rows)
         enc.memoryBarrier(scope: .buffers)
 
-        if rows == 1 {
-            let latent1 = QWTensorValue(region: mlaOperator.mlaLatentScratch.region,
-                                        offset: mlaOperator.mlaLatentScratch.offset,
-                                        shape: QWTensorShape([attn.qkvProj.n], .f16))
-            try driver.gemvH16T4(enc, n: attn.qkvProj.n, k: h, x: ln1Slice, gs: driver.sc.gs,
-                                 wQ4: attn.qkvProj, y16: latent1)
+        if let mla = mlaOperator, let mlaW = attn.mla {
+            if rows == 1 {
+                let latent1 = QWTensorValue(region: mla.mlaLatentScratch.region,
+                                            offset: mla.mlaLatentScratch.offset,
+                                            shape: QWTensorShape([attn.qkvProj.n], .f16))
+                try driver.gemvH16T4(enc, n: attn.qkvProj.n, k: h, x: ln1Slice, gs: driver.sc.gs,
+                                     wQ4: attn.qkvProj, y16: latent1)
+            } else {
+                driver.gemmBatchedH16(enc, m: rows, n: attn.qkvProj.n, k: h,
+                                      x: ln1Slice, wQ4: attn.qkvProj, y16: mla.mlaLatentScratch,
+                                      yStride: mla.latentStride)
+            }
+            enc.memoryBarrier(scope: .buffers)
+            mla.encodeLatentPrepAndPool(enc, ln1: ln1Slice, mlaW: mlaW,
+                                        kv: kv, fullAttnLayer: mlaLayerIndex,
+                                        pos0: cacheRows, rows: rows)
         } else {
-            driver.gemmBatchedH16(enc, m: rows, n: attn.qkvProj.n, k: h,
-                                  x: ln1Slice, wQ4: attn.qkvProj, y16: mlaOperator.mlaLatentScratch,
-                                  yStride: mlaOperator.latentStride)
+            guard let qkvAll = qkvScratch, let qRAll = qRScratch,
+                  let kRAll = kRScratch, let vAll = vScratch else {
+                throw QWEngineDriverError.state("ECHO GQA scratch missing")
+            }
+            let qkvSlice = qkvAll.slice(byteOffset: 0, count: rows * geometry.attnTotalN, dtype: .f16)
+            let qRSlice = qRAll.slice(byteOffset: 0, count: rows * geometry.qProjOut, dtype: .f16)
+            let kRSlice = kRAll.slice(byteOffset: 0, count: rows * geometry.kvChannels, dtype: .f16)
+            let vSlice = vAll.slice(byteOffset: 0, count: rows * geometry.kvChannels, dtype: .f16)
+            if rows == 1 {
+                try driver.gemvH16T4(enc, n: geometry.attnTotalN, k: h,
+                                     x: ln1Slice, gs: driver.sc.gs, wQ4: attn.qkvProj, y16: qkvSlice)
+            } else {
+                driver.gemmBatchedH16(enc, m: rows, n: geometry.attnTotalN, k: h,
+                                      x: ln1Slice, wQ4: attn.qkvProj, y16: qkvSlice)
+            }
+            enc.memoryBarrier(scope: .buffers)
+            try driver.ropeApply.encodeExtractQK(
+                enc, hal: driver.hal, attnY: qkvSlice,
+                qOut: qRSlice, kOut: kRSlice, vOut: vSlice,
+                wq: attn.wq, wk: attn.wkTiled, positionStart: cacheRows, count: rows)
+            if writeSeedKVOnly {
+                enc.memoryBarrier(scope: .buffers)
+                driver.encodePagedKVWrite(enc, kv: kv, k: kRSlice, v: vSlice, startPos: cacheRows, t: rows)
+            }
         }
-        enc.memoryBarrier(scope: .buffers)
-
-        mlaOperator.encodeLatentPrepAndPool(enc, ln1: ln1Slice, mlaW: mlaW,
-                                            kv: kv, fullAttnLayer: mlaLayerIndex,
-                                            pos0: cacheRows, rows: rows)
     }
 
     func encodeSeedChunk(_ enc: any MTLComputeCommandEncoder,
@@ -276,7 +335,8 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         }
         let outStream = streamScratch.slice(byteOffset: 0, count: rows * streams * geometry.hidden, dtype: .f32)
         try encodeEntryAndLatentPrep(enc, driver: driver, prevStream: prevStream, embeddings: embeddings,
-                                     outStream: outStream, kv: kv, cacheRows: cacheRows, rows: rows)
+                                     outStream: outStream, kv: kv, cacheRows: cacheRows, rows: rows,
+                                     writeSeedKVOnly: true)
     }
 
     func encodeStep(_ enc: inout any MTLComputeCommandEncoder,
@@ -290,8 +350,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                     selectGreedy: Bool) throws {
         guard let mhcCfg = geometry.mhcConfig,
               let mhc = layer.mhc,
-              let attn = layer.attn,
-              let mlaW = attn.mla else {
+              let attn = layer.attn else {
             throw QWEngineDriverError.state("ECHO layer weights are incomplete")
         }
         let h = geometry.hidden
@@ -299,22 +358,38 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         let ctrl1 = controlsScratch.slice(byteOffset: 0, count: c + c * c, dtype: .f32)
 
         try encodeEntryAndLatentPrep(enc, driver: driver, prevStream: prevStream, embeddings: embedding,
-                                     outStream: outStream, kv: kv, cacheRows: cacheRows, rows: 1)
+                                     outStream: outStream, kv: kv, cacheRows: cacheRows, rows: 1,
+                                     writeSeedKVOnly: false)
         enc.memoryBarrier(scope: .buffers)
 
-        let qResid1 = QWTensorValue(region: mlaOperator.qResidScratch.region,
-                                    offset: mlaOperator.qResidScratch.offset,
-                                    shape: QWTensorShape([mlaW.qBProj.k], .f16))
-        let qFull1 = QWTensorValue(region: mlaOperator.mlaQFullScratch.region,
-                                   offset: mlaOperator.mlaQFullScratch.offset,
-                                   shape: QWTensorShape([mlaW.qBProj.n], .f16))
-        try driver.gemvH16T4(enc, n: mlaW.qBProj.n, k: mlaW.qBProj.k,
-                             x: qResid1, gs: driver.sc.gs, wQ4: mlaW.qBProj, y16: qFull1)
-        enc.memoryBarrier(scope: .buffers)
+        if let mla = mlaOperator, let mlaW = attn.mla {
+            let qResid1 = QWTensorValue(region: mla.qResidScratch.region,
+                                        offset: mla.qResidScratch.offset,
+                                        shape: QWTensorShape([mlaW.qBProj.k], .f16))
+            let qFull1 = QWTensorValue(region: mla.mlaQFullScratch.region,
+                                       offset: mla.mlaQFullScratch.offset,
+                                       shape: QWTensorShape([mlaW.qBProj.n], .f16))
+            try driver.gemvH16T4(enc, n: mlaW.qBProj.n, k: mlaW.qBProj.k,
+                                 x: qResid1, gs: driver.sc.gs, wQ4: mlaW.qBProj, y16: qFull1)
+            enc.memoryBarrier(scope: .buffers)
 
-        mlaOperator.encodeScoreSelectAbsorbAttendAndProjUV(
-            enc, mlaW: mlaW, kv: kv, attOut: attOut,
-            fullAttnLayer: mlaLayerIndex, pos0: cacheRows, rows: 1)
+            mla.encodeScoreSelectAbsorbAttendAndProjUV(
+                enc, mlaW: mlaW, kv: kv, attOut: attOut,
+                fullAttnLayer: mlaLayerIndex, pos0: cacheRows, rows: 1)
+        } else {
+            guard let aDec = attnDecode,
+                  let qRAll = qRScratch, let kRAll = kRScratch,
+                  let vAll = vScratch, let gPart = gqaPartials else {
+                throw QWEngineDriverError.state("ECHO GQA decode state missing")
+            }
+            let qR1 = qRAll.slice(byteOffset: 0, count: geometry.qProjOut, dtype: .f16)
+            let kR1 = kRAll.slice(byteOffset: 0, count: geometry.kvChannels, dtype: .f16)
+            let v1 = vAll.slice(byteOffset: 0, count: geometry.kvChannels, dtype: .f16)
+            try aDec.encode(
+                enc, qgate: qR1, kv: kv, knew: kR1, vnew: v1,
+                partials: gPart, out: attOut, C: cacheRows,
+                splits: QWAttnDecode.splits(forKeys: cacheRows + 1))
+        }
         enc.memoryBarrier(scope: .buffers)
 
         try driver.gemvH16T4(enc, n: h, k: attn.o.k, x: attOut, gs: driver.sc.gs48,
@@ -397,16 +472,19 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         }
     }
 
-    private func proposeSingleCB(driver: QWEngineDriver,
-                                 table: QWMTPEmbeddingTable,
-                                 initialStream: QWTensorValue,
-                                 kv: (k: QWKVLayerView, v: QWKVLayerView),
-                                 pendingToken: Int,
-                                 cacheRows: Int,
-                                 drafts: Int,
-                                 writeLogitsOnFinalDraft: Bool,
-                                 completed: ((any MTLCommandBuffer) throws -> Void)?) throws -> [Int] {
+    func enqueueSingleCB(driver: QWEngineDriver,
+                       table: QWMTPEmbeddingTable,
+                       initialStream: QWTensorValue,
+                       kv: (k: QWKVLayerView, v: QWKVLayerView),
+                       pendingToken: Int,
+                       cacheRows: Int,
+                       drafts: Int,
+                       writeLogitsOnFinalDraft: Bool = false,
+                       journalTokenOffset: Int = 0) throws -> [any MTLCommandBuffer] {
         let h = geometry.hidden
+        guard drafts >= 1, journalTokenOffset >= 0, (journalTokenOffset + drafts) * 4 <= table.tokens.length else {
+            throw QWEngineDriverError.state("ECHO single-CB journal range is invalid")
+        }
         greedySelector.token.region.pointer.advanced(by: greedySelector.token.offset)
             .assumingMemoryBound(to: Int32.self).pointee = Int32(pendingToken)
         guard let cb = driver.hal.queue.makeCommandBuffer(),
@@ -414,7 +492,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             throw QWEngineDriverError.state("ECHO draft command buffer creation failed")
         }
         func bindEchoResources(_ targetEnc: any MTLComputeCommandEncoder) {
-            driver.bindResidentResources(targetEnc)
+            driver.hal.touchKeepAlive(targetEnc)
             targetEnc.useResource(region.buffer, usage: [.read, .write])
             targetEnc.useResource(table.tokens, usage: [.read, .write])
         }
@@ -445,7 +523,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                     boundEncID = ObjectIdentifier(enc)
                 }
                 let saved = QWTensorValue(region: QWMRegion(buffer: table.tokens, base: 0, length: 256),
-                                          offset: step * 4, shape: QWTensorShape([1], .i32))
+                                          offset: (journalTokenOffset + step) * 4, shape: QWTensorShape([1], .i32))
                 enc.memoryBarrier(scope: .buffers)
                 try QWVerifyWindow.encodeCopy(enc, hal: driver.hal, source: greedySelector.token, destination: saved)
                 if !isLast { enc.memoryBarrier(scope: .buffers) }
@@ -456,24 +534,34 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             enc.endEncoding()
             open = false
             finalCB.commit()
-            for sub in extraCBs {
-                sub.waitUntilCompleted()
-                guard sub.status == .completed else {
-                    driver.commandBufferErrors += 1
-                    throw QWEngineDriverError.state("ECHO draft GPU failure: \(String(describing: sub.error))")
-                }
-                try completed?(sub)
-            }
-            finalCB.waitUntilCompleted()
-            driver.flushPendingColdUnloads()
-            guard finalCB.status == .completed else {
-                driver.commandBufferErrors += 1
-                throw QWEngineDriverError.state("ECHO draft GPU failure: \(String(describing: finalCB.error))")
-            }
-            try completed?(finalCB)
+            return extraCBs + [finalCB]
         } catch {
             if open { enc.endEncoding() }
             throw error
+        }
+    }
+
+    private func proposeSingleCB(driver: QWEngineDriver,
+                                 table: QWMTPEmbeddingTable,
+                                 initialStream: QWTensorValue,
+                                 kv: (k: QWKVLayerView, v: QWKVLayerView),
+                                 pendingToken: Int,
+                                 cacheRows: Int,
+                                 drafts: Int,
+                                 writeLogitsOnFinalDraft: Bool,
+                                 completed: ((any MTLCommandBuffer) throws -> Void)?) throws -> [Int] {
+        let cbs = try enqueueSingleCB(
+            driver: driver, table: table, initialStream: initialStream, kv: kv,
+            pendingToken: pendingToken, cacheRows: cacheRows, drafts: drafts,
+            writeLogitsOnFinalDraft: writeLogitsOnFinalDraft)
+        for sub in cbs {
+            sub.waitUntilCompleted()
+            if sub === cbs.last { driver.flushPendingColdUnloads() }
+            guard sub.status == .completed else {
+                driver.commandBufferErrors += 1
+                throw QWEngineDriverError.state("ECHO draft GPU failure: \(String(describing: sub.error))")
+            }
+            try completed?(sub)
         }
         let ids = table.tokens.contents().assumingMemoryBound(to: Int32.self)
         var proposed: [Int] = []
@@ -500,7 +588,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                  completed: ((any MTLCommandBuffer) throws -> Void)? = nil) throws -> [Int] {
         guard drafts > 0 else { return [] }
         let h = geometry.hidden
-        if drafts > 1, sampledToken == nil, shouldStopAfterDraft == nil, drafts <= 64,
+        if drafts >= 1, sampledToken == nil, shouldStopAfterDraft == nil, drafts <= 64,
            let table = driver.mtpDeviceEmbedding,
            table.vocabulary == geometry.vocab, table.hidden == h {
             return try proposeSingleCB(
@@ -525,7 +613,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                   var enc = cb.makeComputeCommandEncoder() else {
                 throw QWEngineDriverError.state("ECHO draft command buffer creation failed")
             }
-            driver.bindResidentResources(enc)
+            driver.hal.touchKeepAlive(enc)
             enc.useResource(region.buffer, usage: [.read, .write])
             driver.activeCB = cb
             driver.activeEnc = enc

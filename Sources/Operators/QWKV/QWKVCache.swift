@@ -493,6 +493,21 @@ public final class QWKVCache: @unchecked Sendable {
         try prepareWritesLocked(st, handle: h, positions: positions, only: nil)
     }
 
+    /// Returns true if any shared copy-on-write page intersects `positions`.
+    public func hasSharedPages(_ h: QWKVHandle, positions: Range<Int>) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !sharedPageRefs.isEmpty, h.cache === self, !h.finished,
+              let st = seqs[h.seq], !positions.isEmpty else { return false }
+        let first = positions.lowerBound / Self.pageTokens
+        let last = (positions.upperBound - 1) / Self.pageTokens
+        for li in layers.indices {
+            for shared in [st.sharedK[li], st.sharedV[li]] where last < shared.count {
+                for index in first...last where shared[index] { return true }
+            }
+        }
+        return false
+    }
+
     /// Kernel-facing views for one layer (pool extent + this seq's device
     /// page table for exactly this (layer, kind)).
     public func layerViews(_ h: QWKVHandle, layer: Int) throws -> (k: QWKVLayerView, v: QWKVLayerView) {

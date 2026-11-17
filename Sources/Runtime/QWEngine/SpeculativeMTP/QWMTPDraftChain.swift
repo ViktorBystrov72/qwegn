@@ -37,36 +37,13 @@ enum QWMTPDraftChain {
         }
         var tokens: [Int] = []
         if let table = deviceEmbedding, shouldStopAfterDraft == nil {
-            guard sampledToken == nil,
-                  selection == .gpuChecked, table.vocabulary == vocabulary,
-                  table.hidden == draft.scratch.embedding.shape.elementCount else {
+            guard sampledToken == nil, selection == .gpuChecked else {
                 throw QWEngineDriverError.state("device draft embedding geometry/selection mismatch")
             }
-            let selector = draft.scratch.greedySelector
-            selector.token.region.pointer.advanced(by: selector.token.offset)
-                .assumingMemoryBound(to: Int32.self).pointee = Int32(pendingToken)
-            guard let cb = hal.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else {
-                throw QWEngineDriverError.state("device draft chain encoder")
-            }
-            do {
-                for row in 0..<drafts {
-                    try table.encode(enc, token: selector.token, destination: draft.scratch.embedding)
-                    try draft.encode(enc, embedding: draft.scratch.embedding,
-                        hidden: row == 0 ? hidden : draft.scratch.postNorm,
-                        kv: kv, cacheRows: cacheRows + row, absolutePosition: position + row)
-                    try draft.encodeHeadAndSelect(enc, storage: storage, draftHead: draftHead, writeLogits: false)
-                    enc.memoryBarrier(scope: .buffers)
-                    let saved = QWTensorValue(region: QWMRegion(buffer: table.tokens, base: 0, length: 256),
-                        offset: row * 4, shape: QWTensorShape([1], .i32))
-                    try QWVerifyWindow.encodeCopy(enc, hal: hal, source: selector.token, destination: saved)
-                    enc.memoryBarrier(scope: .buffers)
-                }
-            } catch {
-                enc.endEncoding()
-                throw error
-            }
-            enc.endEncoding()
-            cb.commit()
+            let cb = try enqueueDeviceChain(
+                hal: hal, draft: draft, headStorage: storage, draftHead: draftHead,
+                hidden: hidden, kv: kv, pendingToken: pendingToken, drafts: drafts,
+                position: position, cacheRows: cacheRows, table: table)
             cb.waitUntilCompleted()
             guard cb.status == .completed else {
                 gpuFailure()
@@ -103,6 +80,7 @@ enum QWMTPDraftChain {
                   let enc = cb.makeComputeCommandEncoder() else {
                 throw QWEngineDriverError.state("draft chain command encoder")
             }
+            hal.touchKeepAlive(enc)
             do {
                 if let table = deviceEmbedding {
                     try table.encode(enc, token: draft.scratch.greedySelector.token,
@@ -149,5 +127,50 @@ enum QWMTPDraftChain {
             }
         }
         return tokens
+    }
+
+    static func enqueueDeviceChain(
+        hal: QWHal, draft: QWMTPDraftEncoder, headStorage: QWHeadStorage,
+        draftHead: QWMTPTDraftHead? = nil, hidden: QWTensorValue,
+        kv: (k: QWKVLayerView, v: QWKVLayerView), pendingToken: Int,
+        drafts: Int, position: Int, cacheRows: Int,
+        table: QWMTPEmbeddingTable, journalTokenOffset: Int = 0
+    ) throws -> any MTLCommandBuffer {
+        let vocabulary = draft.scratch.draftLogits.shape.elementCount
+        guard (1...7).contains(drafts), (0..<vocabulary).contains(pendingToken),
+              position > 0, position <= draft.positionCapacity - drafts,
+              cacheRows >= 0, cacheRows <= QWKVCache.maxTokensPerSeq - drafts,
+              journalTokenOffset >= 0, (journalTokenOffset + drafts) * 4 <= table.tokens.length,
+              table.vocabulary == vocabulary,
+              table.hidden == draft.scratch.embedding.shape.elementCount else {
+            throw QWEngineDriverError.state("device draft embedding geometry/selection mismatch")
+        }
+        let selector = draft.scratch.greedySelector
+        selector.token.region.pointer.advanced(by: selector.token.offset)
+            .assumingMemoryBound(to: Int32.self).pointee = Int32(pendingToken)
+        guard let cb = hal.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else {
+            throw QWEngineDriverError.state("device draft chain encoder")
+        }
+        hal.touchKeepAlive(enc)
+        do {
+            for row in 0..<drafts {
+                try table.encode(enc, token: selector.token, destination: draft.scratch.embedding)
+                try draft.encode(enc, embedding: draft.scratch.embedding,
+                    hidden: row == 0 ? hidden : draft.scratch.postNorm,
+                    kv: kv, cacheRows: cacheRows + row, absolutePosition: position + row)
+                try draft.encodeHeadAndSelect(enc, storage: headStorage, draftHead: draftHead, writeLogits: false)
+                enc.memoryBarrier(scope: .buffers)
+                let saved = QWTensorValue(region: QWMRegion(buffer: table.tokens, base: 0, length: 256),
+                    offset: (journalTokenOffset + row) * 4, shape: QWTensorShape([1], .i32))
+                try QWVerifyWindow.encodeCopy(enc, hal: hal, source: selector.token, destination: saved)
+                enc.memoryBarrier(scope: .buffers)
+            }
+        } catch {
+            enc.endEncoding()
+            throw error
+        }
+        enc.endEncoding()
+        cb.commit()
+        return cb
     }
 }

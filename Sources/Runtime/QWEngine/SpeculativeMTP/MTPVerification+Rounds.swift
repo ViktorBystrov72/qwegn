@@ -71,14 +71,32 @@ extension QWEngineDriver {
             throw QWEngineDriverError.state("QW_MTP_ADAPTIVE_DEPTH currently supports greedy rounds only")
         }
         let profileStart = mtpStageProfiling ? DispatchTime.now().uptimeNanoseconds : nil
-        if (echoDrafter != nil || mtpDraftEncoder != nil || dflashDrafter != nil), let cb = session.lastCommitCB {
-            cb.waitUntilCompleted()
-            if cb.status != .completed {
+        let canOverlapPriorCommit = !stochastic && !mtpStageProfiling && !mtpVerificationProfiling
+            && coldEvents == nil && mtpDeviceEmbedding != nil
+            && (dflashDrafter != nil || echoDrafter != nil || mtpDraftEncoder != nil)
+        var pendingCommitCB: (any MTLCommandBuffer)?
+        if let cb = session.lastCommitCB {
+            session.lastCommitCB = nil
+            if canOverlapPriorCommit {
+                if cb.status == .error {
+                    commandBufferErrors += 1
+                    session.stateFailed = true
+                }
+                pendingCommitCB = cb
+            } else if echoDrafter != nil || mtpDraftEncoder != nil || dflashDrafter != nil {
+                cb.waitUntilCompleted()
+                if cb.status != .completed {
+                    session.stateFailed = true
+                }
+            } else if cb.status == .error {
                 session.stateFailed = true
             }
-            session.lastCommitCB = nil
-        } else if let cb = session.lastCommitCB, cb.status == .error {
-            session.stateFailed = true
+        }
+        func drainPendingCommitIfNeeded() throws {
+            if let cb = pendingCommitCB {
+                pendingCommitCB = nil
+                try waitForPriorCommitCB(cb, session: session)
+            }
         }
         let dflashReady = (dflashDrafter == nil) || (session.dflashSlot != nil && session.dflashCacheOffset == session.position)
         guard (session.stochastic != nil) == stochastic,
@@ -98,6 +116,7 @@ extension QWEngineDriver {
               maxNew > 0, session.generated <= Int.max - verifyWindow.rows,
               (0..<geometry.vocab).contains(pending),
               stopIDs.allSatisfy({ (0..<geometry.vocab).contains($0) }) else {
+            pendingCommitCB?.waitUntilCompleted()
             throw QWEngineDriverError.state("greedy round requires a seeded boundary and valid output budget")
         }
         let activeDraftEncoder = dflashDrafter == nil ? mtpDraftEncoder : nil
@@ -107,13 +126,29 @@ extension QWEngineDriver {
             ? min(verifyWindow.rows, max(count, (activeDraftEncoder?.positionCapacity ?? ropeRows) - session.position))
             : count
         let pairSlotsNeeded = echoDrafter != nil ? verifyWindow.rows : nextNMaxPairs
-        try kvCache.validate(session.kv)
-        try mtpCache.validate(handle)
+        do {
+            try kvCache.validate(session.kv)
+            try mtpCache.validate(handle)
+        } catch {
+            pendingCommitCB?.waitUntilCompleted()
+            throw error
+        }
         guard kvCache.written(session.kv) == session.position,
               mtpCache.written(handle) == basePairs,
               basePairs >= 0, basePairs <= QWKVCache.maxTokensPerSeq - pairSlotsNeeded,
               session.position <= (activeDraftEncoder?.positionCapacity ?? ropeRows) - count else {
+            pendingCommitCB?.waitUntilCompleted()
             throw QWEngineDriverError.state("greedy round cache or RoPE boundary mismatch")
+        }
+        let needsSparseClaim = (hcaOperator.map { $0.stateOwner !== session } ?? false)
+            || (mlaOperator.map { $0.stateOwner !== session } ?? false)
+            || (lsaOperator.map { $0.stateOwner !== session } ?? false)
+            || (mbsaOperator.map { $0.stateOwner !== session } ?? false)
+        if needsSparseClaim
+            || session.position + verifyWindow.rows > session.kv.tokenCapacity
+            || basePairs + pairSlotsNeeded > handle.tokenCapacity
+            || mtpCache.hasSharedPages(handle, positions: basePairs..<(basePairs + pairSlotsNeeded)) {
+            try drainPendingCommitIfNeeded()
         }
         try claimMLAIndexerState(session)
         // Reserve both windows before draft execution; never grow a cache while
@@ -155,140 +190,96 @@ extension QWEngineDriver {
             let draftCompleted: ((any MTLCommandBuffer) throws -> Void)? = draftAccumulator.map { accumulator in
                 { try accumulator.record($0) }
             }
-            if let dflashDrafter {
-                guard let dSlot = session.dflashSlot else {
-                    throw QWEngineDriverError.state("DFlash slot unavailable for speculative round")
-                }
-                let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
-                let canAdapt = (owner == nil && !mtpStageProfiling && resolvedStrategy != .mtp)
-                var usedPLD = false
-                if canAdapt && activeConstraint == nil {
-                    let ctx = pendingHistoryContext(session: session, pending: pending)
-                    let minPldTokens = resolvedStrategy == .ngram ? min(4, count) : min(7, count)
-                    var cand: [Int] = []
-                    if let pld = QWContextCopyDrafter.periodicDrafts(
-                        history: session.tokenHistory, extraToken: ctx.extraPending,
-                        maxCount: count, minRepeats: 3),
-                       pld.count >= minPldTokens {
-                        cand = Array(pld.prefix(count))
-                    } else if let match = QWContextCopyDrafter.drafts(
-                        history: session.tokenHistory, extraToken: ctx.extraPending,
-                        maxCount: count, minMatchLen: 6),
-                        !match.tokens.isEmpty {
-                        var extended = Array(match.tokens.prefix(count))
-                        if extended.count < count {
-                            session.tokenRecycler.appendDrafts(
-                                into: &extended, maxCount: count,
-                                previousToken: ctx.previousToken, pendingToken: pending,
-                                maxUnigramFallbacks: 0)
-                        }
-                        if extended.count >= minPldTokens {
-                            cand = extended
-                        }
-                    }
-                    if cand.count > 7 && cand.count < 12 {
-                        cand = Array(cand.prefix(7))
-                    }
-                    if !cand.isEmpty {
-                        drafts = cand
-                        proposals = []
-                        draftedPairs = drafts.count
-                        lastRoundUsedPLD = true
-                        mtpDraftProposals += drafts.count
-                        usedPLD = true
-                    }
-                }
-                if usedPLD {
-                    session.dflashRoundStartNs = nil
-                } else {
-                    let activeCount = canAdapt ? session.dflashPolicy.selectDraftCount(maxDrafts: count) : count
-                    session.dflashRoundStartNs = canAdapt ? DispatchTime.now().uptimeNanoseconds : nil
-                    if let owner {
-                        try owner.stream.beginGumbelRound(drafts: activeCount, vocabulary: geometry.vocab, maxDrafts: 15)
-                    }
-                    let anchorMaskEmbed: ((any MTLComputeCommandEncoder, QWTensorValue, Int, Int, Int) throws -> Void)? =
-                        self.mtpDeviceEmbedding.map { devEmb in
-                            { enc, propX32, anchorToken, maskToken, rows in
-                                dflashDrafter.encodeStagePropBF16(
-                                    enc, tableBuffer: devEmb.buffer, byteOffset: devEmb.byteOffset,
-                                    propX: propX32, anchorToken: anchorToken, maskToken: maskToken, rows: rows
-                                )
-                            }
-                        }
-                    let proposed: (drafts: [Int], proposals: [QWMTPGumbelProposal])
-                    do {
-                        proposed = try dflashDrafter.propose(
-                            hal: hal, slot: dSlot, cacheOffset: session.dflashCacheOffset,
-                            pendingToken: pending, draftCount: activeCount,
-                            headStorage: headStorage,
-                            encodeHeadLogits: { enc, xRot16, xNorm16, _, yLogits32, rows, vocabRows in
-                                if let draftHead = self.mtpDraftHead {
-                                    if rows == 1 {
-                                        try draftHead.encode(enc, hal: self.hal, x: xRot16, y: yLogits32)
-                                    } else {
-                                        try draftHead.encodeBatched(enc, hal: self.hal, x: xRot16, y: yLogits32, m: rows)
-                                    }
-                                } else {
-                                    switch self.headStorage {
-                                    case .q4g(let hw):
-                                        if self.hal.caps.isMetal4TensorCapable && rows >= 9
-                                            && vocabRows % 64 == 0 && hw.view.k % 64 == 0 {
-                                            try QWGemm.encodeNaxF32(
-                                                enc, hal: self.hal, weight: hw.view,
-                                                x16: xRot16, y16: xRot16, y32: yLogits32, rows: rows
-                                            )
-                                        } else {
-                                            try self.head.encode(enc, storage: self.headStorage, x: xRot16, y: yLogits32, M: rows)
-                                        }
-                                    case .f16:
-                                        try self.head.encode(enc, storage: self.headStorage, x: xNorm16, y: yLogits32, M: rows)
-                                    }
-                                }
-                            },
-                            encodeAnchorMaskEmbed: anchorMaskEmbed,
-                            embedding: { try self.copyEmbedRow($0, to: $1) },
-                            stochastic: owner.map { (Float($0.config.temperature), $0.stream) },
-                            completed: draftCompleted)
-                    } catch {
-                        commandBufferErrors += 1
-                        throw error
-                    }
-                    drafts = proposed.drafts
-                    proposals = proposed.proposals
-                    draftedPairs = drafts.count
-                    mtpDraftProposals += drafts.count
-                }
-            } else if let echoDrafter {
-                let proposed = try proposeEchoOrPLDRound(
-                    session: session, echoDrafter: echoDrafter, hidden: hidden,
-                    views: views, pending: pending, count: count, basePairs: basePairs,
-                    owner: owner, draftCompleted: draftCompleted)
-                drafts = proposed.drafts
-                proposals = proposed.proposals
-                draftedPairs = proposed.draftedPairs
-            } else {
-                guard let mtpDraftEncoder else {
-                    throw QWEngineDriverError.state("MTP draft encoder is absent")
-                }
-                let proposed = try proposeNextNOrPLDRound(
-                    session: session, draftEncoder: mtpDraftEncoder, hidden: hidden,
-                    views: views, pending: pending, count: count, basePairs: basePairs,
-                    owner: owner, draftCompleted: draftCompleted)
-                drafts = proposed.drafts
-                proposals = proposed.proposals
-                draftedPairs = proposed.draftedPairs
-            }
-        
-
-            mtpCache.markWritten(handle, upTo: basePairs + draftedPairs)
             let verifyStart = mtpStageProfiling ? DispatchTime.now().uptimeNanoseconds : nil
             let verifyAccumulator = verifyStart.map { _ in QWMTPStageAccumulator() }
             let verifyCompleted: ((any MTLCommandBuffer) throws -> Void)? = verifyAccumulator.map { accumulator in
                 { try accumulator.record($0) }
             }
-            let window = try verifyTokensLocked(session, tokens: [pending] + drafts, completed: verifyCompleted)
+            let window: QWVerifyWindow
+            if owner == nil, !mtpStageProfiling, !mtpVerificationProfiling, coldEvents == nil,
+               !mtpAdaptiveDepth, activeConstraint == nil, dflashDrafter == nil,
+               let table = mtpDeviceEmbedding,
+               let draftPlan = try prepareAsyncNeuralDraft(
+                   session: session, hidden: hidden, views: views, pending: pending,
+                   count: count, basePairs: basePairs, mtpCache: mtpCache, mtpHandle: handle,
+                   table: table) {
+                let commitCB = pendingCommitCB
+                pendingCommitCB = nil
+                switch draftPlan {
+                case .pld(let chosen):
+                    window = try verifyTokensCore(
+                        session, explicitTokens: [pending] + chosen, rowCount: 1 + chosen.count,
+                        pendingToken: nil, useDeviceEmbed: table, priorCommitCB: commitCB,
+                        inFlightDraftCBs: []).window
+                    drafts = chosen
+                    draftedPairs = 0
+                    lastRoundUsedPLD = true
+                    lastDraftedPairs = 0
+                    mtpDraftProposals += chosen.count
+                case .asyncNeural(let draftCBs, let neuralCount):
+                    let (verifiedWindow, resolvedTokens) = try verifyTokensCore(
+                        session, explicitTokens: nil, rowCount: 1 + neuralCount,
+                        pendingToken: pending, useDeviceEmbed: table,
+                        priorCommitCB: commitCB, inFlightDraftCBs: draftCBs)
+                    window = verifiedWindow
+                    drafts = Array(resolvedTokens.dropFirst())
+                    draftedPairs = neuralCount
+                    lastRoundUsedPLD = false
+                    lastDraftedPairs = neuralCount
+                    mtpDraftProposals += drafts.count
+                }
+            } else {
+                if owner != nil || mtpAdaptiveDepth || mtpDeviceEmbedding == nil || coldEvents != nil {
+                    try drainPendingCommitIfNeeded()
+                }
+                if let dflashDrafter {
+                    guard let dSlot = session.dflashSlot else {
+                        try? drainPendingCommitIfNeeded()
+                        throw QWEngineDriverError.state("DFlash slot unavailable for speculative round")
+                    }
+                    let proposed = try proposeDFlashOrPLDRound(
+                        session: session, dflashDrafter: dflashDrafter, dSlot: dSlot,
+                        pending: pending, count: count, owner: owner, draftCompleted: draftCompleted)
+                    drafts = proposed.drafts
+                    proposals = proposed.proposals
+                    draftedPairs = proposed.draftedPairs
+                } else if let echoDrafter {
+                    let proposed = try proposeEchoOrPLDRound(
+                        session: session, echoDrafter: echoDrafter, hidden: hidden,
+                        views: views, pending: pending, count: count, basePairs: basePairs,
+                        owner: owner, draftCompleted: draftCompleted)
+                    drafts = proposed.drafts
+                    proposals = proposed.proposals
+                    draftedPairs = proposed.draftedPairs
+                } else {
+                    guard let mtpDraftEncoder else {
+                        throw QWEngineDriverError.state("MTP draft encoder is absent")
+                    }
+                    let proposed = try proposeNextNOrPLDRound(
+                        session: session, draftEncoder: mtpDraftEncoder, hidden: hidden,
+                        views: views, pending: pending, count: count, basePairs: basePairs,
+                        owner: owner, draftCompleted: draftCompleted)
+                    drafts = proposed.drafts
+                    proposals = proposed.proposals
+                    draftedPairs = proposed.draftedPairs
+                }
+                mtpCache.markWritten(handle, upTo: basePairs + draftedPairs)
+                if canOverlapPriorCommit {
+                    let embedTable = mtpDeviceEmbedding
+                    let commitCB = pendingCommitCB
+                    pendingCommitCB = nil
+                    window = try verifyTokensCore(
+                        session, explicitTokens: [pending] + drafts, rowCount: 1 + drafts.count,
+                        pendingToken: nil, useDeviceEmbed: embedTable,
+                        priorCommitCB: commitCB, inFlightDraftCBs: [], completed: verifyCompleted).window
+                } else {
+                    try drainPendingCommitIfNeeded()
+                    window = try verifyTokensLocked(session, tokens: [pending] + drafts, completed: verifyCompleted)
+                }
+            }
             let decision: QWGreedyRoundDecision
             let evidence: QWStochasticRoundEvidence?
+            let rawTargetsForLease: [Int]?
             let margin = effectiveRelaxedMargin
             if let owner {
                 var targets: [QWSamplingDistribution] = []
@@ -303,18 +294,22 @@ extension QWEngineDriver {
                                                                  margin: Double(margin))
                     : try owner.stream.resolveGumbelRound(proposals: proposals,
                                                           targetDistributions: targets)
-                decision = try QWGreedyRoundDecision.sampled(geometry: geometry, 
+                decision = try QWGreedyRoundDecision.sampled(geometry: geometry,
                     proposals: proposals, result: result, maxNew: maxNew, stopIDs: stopIDs,
                     maxDrafts: dflashDrafter != nil ? 15 : 7)
                 preparedStochasticWitness = QWStochasticRoundWitness(owner: owner,
                     drawEnd: owner.stream.drawsConsumed)
                 evidence = QWStochasticRoundEvidence(proposals: proposals, targets: targets, result: result,
                     drawStart: boundary.record.samplerDrawIndex, drawEnd: owner.stream.drawsConsumed)
+                rawTargetsForLease = nil
             } else {
-                var rawDecision = try window.greedyDecision(drafts: drafts, maxNew: maxNew, stopIDs: stopIDs,
-                                                            activeRows: drafts.count + 1,
-                                                            relaxedMargin: margin,
-                                                            relaxedMinProb: effectiveRelaxedMinProb)
+                let withTargets = try window.greedyDecisionWithTargets(
+                    drafts: drafts, maxNew: maxNew, stopIDs: stopIDs,
+                    activeRows: drafts.count + 1,
+                    relaxedMargin: margin,
+                    relaxedMinProb: effectiveRelaxedMinProb)
+                var rawDecision = withTargets.decision
+                rawTargetsForLease = withTargets.targets
                 if let boundary = activeConstraint?.constraint.speculationBoundaryToken,
                    let idx = rawDecision.tokens.firstIndex(of: boundary),
                    idx + 1 < rawDecision.tokens.count {
@@ -328,7 +323,8 @@ extension QWEngineDriver {
                 decision = rawDecision
                 evidence = nil
             }
-            let lease = QWGreedyRoundLease(boundary: boundary, decision: decision, stochasticEvidence: evidence)
+            let lease = QWGreedyRoundLease(boundary: boundary, decision: decision,
+                                           stochasticEvidence: evidence, rawTargets: rawTargetsForLease)
             if let profileStart, let verifyStart, let draftAccumulator, let verifyAccumulator {
                 let rawDraftHostMs = Double(verifyStart - profileStart) / 1_000_000
                 let rawVerifyHostMs = Double(DispatchTime.now().uptimeNanoseconds - verifyStart) / 1_000_000
@@ -343,6 +339,7 @@ extension QWEngineDriver {
         } catch {
             // A submitted prefix may have changed pair/trunk bytes. Without a
             // completed verified lease, do not expose an apparently retryable round.
+            try? drainPendingCommitIfNeeded()
             session.stateFailed = true
             session.stochastic?.stream.cancelActiveRound()
             if let owner = session.stochastic { session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed }
@@ -375,13 +372,19 @@ extension QWEngineDriver {
         let decision = round.decision
         let drafts = Array(verifiedInputs.dropFirst())
         if !stochastic {
-            let (full, rawTargets) = try verifyWindow.greedyDecisionWithTargets(
-                drafts: drafts, maxNew: verifiedInputs.count, activeRows: verifiedInputs.count,
-                relaxedMargin: effectiveRelaxedMargin, relaxedMinProb: effectiveRelaxedMinProb)
-            guard decision.acceptedDrafts == full.acceptedDrafts,
-                  decision.tokens == Array(full.tokens.prefix(decision.tokens.count)),
-                  decision.tokens.count <= full.tokens.count else {
-                throw QWEngineDriverError.state("greedy commit decision does not match verified target rows")
+            let rawTargets: [Int]
+            if let cachedTargets = preparedGreedyLease.rawTargets, cachedTargets.count == verifiedInputs.count {
+                rawTargets = cachedTargets
+            } else {
+                let (full, computedTargets) = try verifyWindow.greedyDecisionWithTargets(
+                    drafts: drafts, maxNew: verifiedInputs.count, activeRows: verifiedInputs.count,
+                    relaxedMargin: effectiveRelaxedMargin, relaxedMinProb: effectiveRelaxedMinProb)
+                guard decision.acceptedDrafts == full.acceptedDrafts,
+                      decision.tokens == Array(full.tokens.prefix(decision.tokens.count)),
+                      decision.tokens.count <= full.tokens.count else {
+                    throw QWEngineDriverError.state("greedy commit decision does not match verified target rows")
+                }
+                rawTargets = computedTargets
             }
             if effectiveRelaxedMargin == 0, activeConstraint == nil {
                 let pendingInHistory = session.tokenHistory.count > session.position

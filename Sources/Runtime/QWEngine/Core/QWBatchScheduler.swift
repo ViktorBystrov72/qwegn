@@ -14,7 +14,7 @@ public final class QWBatchScheduler: @unchecked Sendable {
     private let underlying: any QWInferenceEngine
     private let driver: QWEngineDriver?
     private let lock = NSLock()
-    private let driverQueue = DispatchQueue(label: "qwegn.qwengine.batch.driver", qos: .userInitiated)
+    private let driverWorker = QWDriverWorkerThread()
     private var activeCount: Int = 0
     private var pendingQueue: [QWBatchScheduledJob] = []
     private var isDriving: Bool = false
@@ -24,6 +24,10 @@ public final class QWBatchScheduler: @unchecked Sendable {
     public init(engine: any QWInferenceEngine) {
         self.underlying = engine
         self.driver = Self.resolveDriver(engine)
+    }
+
+    deinit {
+        driverWorker.shutdown()
     }
 
     static func resolveDriver(_ engine: any QWInferenceEngine) -> QWEngineDriver? {
@@ -95,13 +99,13 @@ public final class QWBatchScheduler: @unchecked Sendable {
                     return true
                 }
                 if needsDrive {
-                    driverQueue.async { [weak self] in self?.driveLoop() }
+                    driverWorker.async { [weak self] in self?.driveLoop() }
                 }
             }
             return try underlying.generate(request: request, onToken: onToken)
         }
 
-        driverQueue.async { [weak self] in self?.driveLoop() }
+        driverWorker.async { [weak self] in self?.driveLoop() }
         return try job.wait()
     }
 
@@ -201,5 +205,57 @@ extension QWEngineDriver {
     final class BatchScratchBox {
         let scratch: QWBatchHeadScratch
         init(scratch: QWBatchHeadScratch) { self.scratch = scratch }
+    }
+}
+
+private final class QWDriverWorkerThread: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var queue: [@Sendable () -> Void] = []
+    private var started = false
+    private var stopped = false
+
+    func async(_ block: @escaping @Sendable () -> Void) {
+        condition.lock()
+        if stopped {
+            condition.unlock()
+            return
+        }
+        queue.append(block)
+        let needStart = !started
+        if needStart { started = true }
+        condition.signal()
+        condition.unlock()
+        if needStart {
+            let thread = Thread { self.runLoop() }
+            thread.name = "qwegn.qwengine.batch.driver"
+            thread.qualityOfService = .userInitiated
+            thread.stackSize = 8 * 1024 * 1024
+            thread.start()
+        }
+    }
+
+    func shutdown() {
+        condition.lock()
+        stopped = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    private func runLoop() {
+        while true {
+            condition.lock()
+            while queue.isEmpty && !stopped {
+                condition.wait()
+            }
+            if queue.isEmpty && stopped {
+                condition.unlock()
+                return
+            }
+            let work = queue.removeFirst()
+            condition.unlock()
+            autoreleasepool {
+                work()
+            }
+        }
     }
 }

@@ -85,9 +85,15 @@ extension QWEngineLifecycleActor {
             return (try tok.encode(wire), nil)
         }
         let saltKey = cacheSalt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let marker = "<|im_start|>"
-        guard tok.tokenId(for: marker) != nil,
-              let lastRange = wire.range(of: marker, options: .backwards),
+        let marker: String
+        if tok.tokenId(for: "<|im_start|>") != nil {
+            marker = "<|im_start|>"
+        } else if tok.tokenId(for: "<|maxwell_start|>") != nil {
+            marker = "<|maxwell_start|>"
+        } else {
+            return (try tok.encode(wire), nil)
+        }
+        guard let lastRange = wire.range(of: marker, options: .backwards),
               lastRange.lowerBound > wire.startIndex else {
             return (try tok.encode(wire), nil)
         }
@@ -103,7 +109,7 @@ extension QWEngineLifecycleActor {
         }
 
         var systemWire: String? = nil
-        if wire.hasPrefix("<|im_start|>system") || wire.hasPrefix("<|im_start|>developer") {
+        if wire.hasPrefix("\(marker)system") || wire.hasPrefix("\(marker)developer") {
             let afterFirst = wire.index(wire.startIndex, offsetBy: marker.count)
             if let secondRange = wire.range(of: marker, range: afterFirst..<wire.endIndex),
                secondRange.lowerBound <= lastRange.lowerBound {

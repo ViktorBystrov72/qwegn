@@ -46,7 +46,7 @@ def geo_v2(tc: dict) -> str:
         fa_interval = cand if all((i + 1) % cand == 0 for i in fa_indices) else 0
     else:
         fa_interval = 1
-    hd = tc.get("head_dim") or tc.get("qk_head_dim") or (
+    hd = tc.get("head_dim") or tc.get("attention_head_size") or tc.get("qk_head_dim") or (
         (tc.get("qk_nope_head_dim") or 0) + (tc.get("qk_rope_head_dim") or 0)
     ) or (tc["hidden_size"] // tc["num_attention_heads"])
     rope_params = tc.get("rope_parameters") or {}
@@ -71,7 +71,9 @@ def geo_v2(tc: dict) -> str:
     gdn_ck = tc.get("linear_conv_kernel_dim") or lin_cfg.get("short_conv_kernel_size") or 0
     mtp_layers = tc.get("mtp_num_hidden_layers")
     if mtp_layers is None:
-        mtp_layers = tc.get("num_nextn_predict_layers", 0) or 0
+        mtp_layers = tc.get("num_nextn_predict_layers")
+    if mtp_layers is None:
+        mtp_layers = tc.get("mtp_num_layers", 0) or 0
     fields = [
         f"model_type={tc['model_type']}",
         f"hidden={tc['hidden_size']}",
@@ -100,10 +102,10 @@ def geo_v2(tc: dict) -> str:
     if idx_comp is None:
         idx_comp = 4 if tc.get("index_kpool_compress") else (1 if idx_heads else 0)
     fields.append("idx={},{},{},{},{}".format(idx_heads, idx_kv, idx_hd, idx_budget, idx_comp))
-    eg = tc.get("scoring_func") or (
+    eg = tc.get("scoring_func") or tc.get("router_score_function") or (
         "sigmoid" if tc.get("model_type") in (
             "qwen4_exp", "qwen4_exp_text", "glm5_next", "glm5_next_text",
-            "ernie5_5_moe", "ernie5_5_moe_text",
+            "ernie5_5_moe", "ernie5_5_moe_text", "maxwell_moe",
         ) else "-"
     )
     num_exp = tc.get("num_experts") if tc.get("num_experts") is not None else (tc.get("n_routed_experts") or 0)
@@ -149,6 +151,7 @@ MODEL_ID = {
     "glm5_next_text": "glm5_next",
     "ernie5_5_moe": "ernie5_5_moe",
     "ernie5_5_moe_text": "ernie5_5_moe",
+    "maxwell_moe": "maxwell_moe",
     "qwen2": "qwen2-dense",
     "llama": "llama-dense",
     "mistral": "mistral-dense",

@@ -313,7 +313,7 @@ extension QWEngineDriver {
             + (E > 0 ? (H + 1) : 0)
         let persistentBytes = persistentF16 * 2 + persistentF32 * 4
 
-        let attnScratchF16 = usesMLA ? 0 : (geometry.attnTotalN + 2 * kvE + qOut)
+        let attnScratchF16 = usesMLA ? 0 : (geometry.attnProjTotalN + 2 * kvE + qOut)
         let attOutCols = max(qC, geometry.qHeads * geometry.vHeadDim)
         let fgbC = geometry.gdnVectorDecay ? (2 * geometry.gdnLowRankDim + vh) : 0
         let gdnYF32 = geometry.gdnVectorDecay ? 0 : geometry.gdnTotalN
@@ -617,5 +617,28 @@ extension QWEngineDriver {
         guard let hca = geometry.hcaConfig, geometry.hcaLayerCount > 0 else { return 0 }
         let ratio = max(1, hca.defaultCompressRatio)
         return (geometry.hcaLayerCount * (hca.headDim + 64) * 2 + ratio - 1) / ratio
+    }
+
+    static func mbsaFixedScratchBytes(
+        geometry: QWModelGeometry,
+        prefillChunkRows: Int,
+        attnLayerCount: Int
+    ) -> Int {
+        guard let bsa = geometry.blockSparseGQAConfig, attnLayerCount > 0 else { return 0 }
+        let maxR = max(8, prefillChunkRows)
+        let qkv = maxR * (geometry.kvHeads + 1) * geometry.headDim * 2
+        let q = maxR * geometry.kvHeads * geometry.headDim * 2
+        let blkList = maxR * geometry.kvHeads * max(1, bsa.maxSelectedBlocks) * 4
+        let blkCnt = maxR * geometry.kvHeads * 4
+        let maxTiles = (maxR + 31) / 32
+        let tileStride = QWMBSAAttnOperator.tileListStride(config: bsa)
+        let tileList = maxTiles * geometry.kvHeads * tileStride * 4 * 2
+        let tileCnt = maxTiles * geometry.kvHeads * 4
+        return qkv + q + blkList + blkCnt + tileList + tileCnt + attnLayerCount * 256 + 4096
+    }
+
+    static func mbsaPerTokenBytes(geometry: QWModelGeometry, attnLayerCount: Int) -> Int {
+        guard geometry.blockSparseGQAConfig != nil, attnLayerCount > 0 else { return 0 }
+        return attnLayerCount * geometry.headDim * 2
     }
 }

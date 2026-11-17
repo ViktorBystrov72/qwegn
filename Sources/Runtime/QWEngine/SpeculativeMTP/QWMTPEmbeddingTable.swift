@@ -68,22 +68,38 @@ final class QWMTPEmbeddingTable {
 
     func encode(_ enc: any MTLComputeCommandEncoder, token: QWTensorValue,
                 destination: QWTensorValue) throws {
-        guard token.shape.dtype == .i32, token.shape.elementCount == 1,
-              destination.shape.dtype == .f16, destination.shape.elementCount == hidden,
-              validExtent(token, alignment: 4), validExtent(destination, alignment: 2),
+        guard token.shape.elementCount == 1 else {
+            throw QWEngineDriverError.state("device embedding token/destination invalid")
+        }
+        try encodeRows(enc, tokens: token, rows: 1, destination: destination)
+    }
+
+    func encodeRows(_ enc: any MTLComputeCommandEncoder, tokensBuffer: any MTLBuffer,
+                    tokensByteOffset: Int, rows: Int, destination: QWTensorValue) throws {
+        let tokenVal = QWTensorValue(
+            region: QWMRegion(buffer: tokensBuffer, base: tokensByteOffset, length: rows * 4),
+            offset: 0, shape: QWTensorShape([rows], .i32))
+        try encodeRows(enc, tokens: tokenVal, rows: rows, destination: destination)
+    }
+
+    private func encodeRows(_ enc: any MTLComputeCommandEncoder, tokens: QWTensorValue,
+                            rows: Int, destination: QWTensorValue) throws {
+        guard rows >= 1, tokens.shape.dtype == .i32, tokens.shape.elementCount == rows,
+              destination.shape.dtype == .f16, destination.shape.elementCount == rows * hidden,
+              validExtent(tokens, alignment: 4), validExtent(destination, alignment: 2),
               destination.region.buffer !== buffer,
-              !overlap(token, destination) else {
+              !overlap(tokens, destination) else {
             throw QWEngineDriverError.state("device embedding token/destination invalid")
         }
         enc.memoryBarrier(scope: .buffers)
         enc.setComputePipelineState(pipeline)
         enc.setBuffer(buffer, offset: byteOffset, index: 0)
-        token.bind(enc, index: 1)
+        tokens.bind(enc, index: 1)
         destination.bind(enc, index: 2)
         var n = UInt32(vocabulary), h = UInt32(hidden)
         enc.setBytes(&n, length: 4, index: 3)
         enc.setBytes(&h, length: 4, index: 4)
-        enc.dispatchThreads(MTLSize(width: hidden, height: 1, depth: 1),
+        enc.dispatchThreads(MTLSize(width: hidden, height: rows, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.memoryBarrier(scope: .buffers)
     }

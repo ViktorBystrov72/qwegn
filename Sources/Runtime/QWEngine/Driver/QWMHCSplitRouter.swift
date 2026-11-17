@@ -9,6 +9,7 @@ struct QWMHCSplitRouter {
     static let maxRows = 16
     let partial: any MTLComputePipelineState
     let finalize: any MTLComputePipelineState
+    let finalizeMoE: any MTLComputePipelineState
     let partials: any MTLBuffer
 
     init?(hal: QWHal, geometry: QWModelGeometry) throws {
@@ -16,6 +17,7 @@ struct QWMHCSplitRouter {
               ProcessInfo.processInfo.environment["QW_MHC_SPLIT"] != "0" else { return nil }
         partial = try hal.pipeline("qwg_mhc_router_partial_f32")
         finalize = try hal.pipeline("qwg_mhc_router_finalize_f16")
+        finalizeMoE = try hal.pipeline("qwg_mhc_router_finalize_moe_f16")
         let parts = (geometry.hidden + 63) / 64
         let outs = 2 * cfg.streams + cfg.streams * cfg.streams + 1 + cfg.streams * (cfg.streams + 1) / 2
         guard let buf = hal.device.makeBuffer(length: Self.maxRows * parts * outs * 4,

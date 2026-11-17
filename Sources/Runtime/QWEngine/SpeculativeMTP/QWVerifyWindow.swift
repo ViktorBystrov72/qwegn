@@ -48,7 +48,7 @@ struct QWVerifyWindow {
             moeExtra +
             mhcExtra +
             aligned(rows * geometry.hidden / 128 * 4) +
-            (gpuTargets ? QWMTPGreedySelector.allocationBytes(geometry: geometry, vocabulary: vocabulary) + 256 : 0) +
+            (gpuTargets ? QWMTPGreedySelector.allocationBytes(geometry: geometry, vocabulary: vocabulary, maxRows: rows) + 256 : 0) +
             (q4Head ? aligned(rows * geometry.hidden / 128 * 4) : 0)
     }
 
@@ -87,7 +87,7 @@ struct QWVerifyWindow {
         mhcControls = (layerMajor && geometry.mhcConfig != nil)
             ? try allocator.allocate(QWTensorShape([rows * mhcCtrlCount], .f32))
             : nil
-        targetSelector = gpuTargets ? try QWMTPGreedySelector(geometry: geometry, allocator: allocator, vocabulary: vocabulary) : nil
+        targetSelector = gpuTargets ? try QWMTPGreedySelector(geometry: geometry, allocator: allocator, vocabulary: vocabulary, maxRows: rows) : nil
         targetTokens = gpuTargets ? try allocator.allocate(QWTensorShape([rows], .i32)) : nil
     }
 
@@ -200,13 +200,12 @@ struct QWVerifyWindow {
             enc.memoryBarrier(scope: .buffers)
         }
         if let selector = targetSelector, let journal = targetTokens {
-            for row in 0..<count {
-                let scores = QWTensorValue(region: logits.region, offset: logits.offset + row * vocabulary * 4,
-                    shape: QWTensorShape([vocabulary], .f32))
-                let saved = QWTensorValue(region: journal.region, offset: journal.offset + row * 4,
-                    shape: QWTensorShape([1], .i32))
-                try selector.encode(enc, hal: hal, logits: scores, ordering: .shippingTarget, destination: saved)
-            }
+            let activeLogits = QWTensorValue(region: logits.region, offset: logits.offset,
+                shape: QWTensorShape([count * vocabulary], .f32))
+            let saved = QWTensorValue(region: journal.region, offset: journal.offset,
+                shape: QWTensorShape([count], .i32))
+            try selector.encodeBatched(enc, hal: hal, logits: activeLogits, rows: count,
+                                       ordering: .shippingTarget, destination: saved)
         }
     }
 
@@ -299,7 +298,10 @@ struct QWVerifyWindow {
         guard minProbability > 0 else { return true }
         guard minProbability < 1 else { return false }
         var sum: Double = 0
-        for score in logits { sum += exp(Double(score - maxScore)) }
+        for score in logits {
+            let diff = score - maxScore
+            if diff > -45.0 { sum += exp(Double(diff)) }
+        }
         let logProb = Double(draftScore - maxScore) - log(sum)
         return logProb >= log(Double(minProbability))
     }
@@ -355,6 +357,7 @@ struct QWVerifyWindow {
                 guard let enc = cb.makeComputeCommandEncoder() else {
                     throw QWEngineDriverError.state("retained rollback encoder")
                 }
+                hal.touchKeepAlive(enc)
                 do {
                     try checkpoint.encodeRollbackTape(enc, decoder: decoder, rec: rec,
                                                       activeRows: verifiedRows, retaining: count)
@@ -387,6 +390,7 @@ struct QWVerifyWindow {
                 guard let enc = cb.makeComputeCommandEncoder() else {
                     throw QWEngineDriverError.state("retained replay encoder")
                 }
+                hal.touchKeepAlive(enc)
                 do {
                     try checkpoint.encodeReplay(enc, decoder: decoder, rec: rec, retaining: count)
                 } catch {
@@ -409,6 +413,7 @@ struct QWVerifyWindow {
         if count > 0 {
             let carrySource = carryFromStream ? try mhcStreamRow(count - 1) : try hiddenRow(count - 1)
             guard let enc = cb.makeComputeCommandEncoder() else { throw QWEngineDriverError.state("retained hidden encoder") }
+            hal.touchKeepAlive(enc)
             defer { enc.endEncoding() }
             try Self.encodeCopy(enc, hal: hal, source: carrySource, destination: trunkHidden)
         }
@@ -452,6 +457,7 @@ struct QWVerifyWindow {
             }
             enc = encoder
         }
+        hal.touchKeepAlive(enc)
         defer { enc.endEncoding() }
         try encodeHead(enc, hal: hal, head: head, storage: headStorage,
                        q4Head: q4Head, activeRows: count,

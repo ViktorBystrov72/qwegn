@@ -63,7 +63,7 @@ final class QWModelFamilyRegistryTests: XCTestCase {
         }
     }
 
-    func testAllElevenFamiliesHaveZeroOverloadSpecs() {
+    func testAllTwelveFamiliesHaveZeroOverloadSpecs() {
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "qwen3_5")?.family, .qwen38Dense)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "qwen3_5_moe")?.family, .qwen38MoE)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "qwen4_exp")?.family, .qwen38FlashNext)
@@ -71,6 +71,7 @@ final class QWModelFamilyRegistryTests: XCTestCase {
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "glm5_next")?.family, .glm5Next)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "glm5_next_text")?.family, .glm5Next)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "ernie5_5_moe")?.family, .ernie55MoE)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "maxwell_moe")?.family, .maxwellMoE)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "qwen3")?.family, .qwen3Dense)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "qwen3_moe")?.family, .qwen3MoE)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "qwen2")?.family, .qwen2Dense)
@@ -79,7 +80,7 @@ final class QWModelFamilyRegistryTests: XCTestCase {
 
         let expected: Set<QWModelDescriptor.Family> = [
             .qwen38Dense, .qwen38MoE, .qwen38FlashNext, .senseNovaLoop, .glm5Next,
-            .ernie55MoE, .qwen3Dense, .qwen3MoE, .qwen2Dense, .llamaDense, .mistralDense,
+            .ernie55MoE, .maxwellMoE, .qwen3Dense, .qwen3MoE, .qwen2Dense, .llamaDense, .mistralDense,
         ]
         XCTAssertEqual(Set(QWModelDescriptor.Family.allCases), expected)
     }

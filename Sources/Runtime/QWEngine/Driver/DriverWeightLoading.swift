@@ -87,6 +87,13 @@ extension QWEngineDriver {
             rawExists(resolveName(name))
         }
 
+        func tensorShape(_ name: String) -> [Int]? {
+            let resolved = resolveName(name)
+            if let pk, let entry = try? pk.entry(resolved) { return entry.shape }
+            if let st, let t = st.tensor(resolved) { return t.shape }
+            return nil
+        }
+
         var isMLXCheckpoint: Bool {
             st?.isMLXCheckpoint == true
         }
@@ -295,7 +302,7 @@ extension QWEngineDriver {
                         (k / entry.hqGroup) * entry.hqBlockBytes)
             }
             if let firstName, firstName.contains(".experts.") && !firstName.contains("shared_expert") {
-                if firstName.contains("down_proj") {
+                if firstName.contains("down_proj") || firstName.contains(".w2.") {
                     return (format.expertDownBits, format.expertDownGroupSize,
                             format.expertDownIsIncumbentContainer, format.expertDownIsSHVQ,
                             format.expertDownRowBytes(k: k))
@@ -378,7 +385,10 @@ extension QWEngineDriver {
             return (bigView, subViews)
         }
         mutating func packedGU(_ blk: String) throws -> QWMLPWeight {
-            let gate = blk + "mlp.gate_proj.weight", up = blk + "mlp.up_proj.weight"
+            let useBlockSparse = !hasTensor(blk + "mlp.gate_proj.weight")
+                && hasTensor(blk + "block_sparse_moe.w1.weight")
+            let gate = blk + (useBlockSparse ? "block_sparse_moe.w1.weight" : "mlp.gate_proj.weight")
+            let up = blk + (useBlockSparse ? "block_sparse_moe.w3.weight" : "mlp.up_proj.weight")
             let (bigView, _) = try concatQ4([(gate, geometry.intermediate), (up, geometry.intermediate)], k: geometry.hidden)
             guard let v = QWMLPWeight(blocks: bigView.blocks, n: 2 * geometry.intermediate, k: geometry.hidden,
                                     bits: bigView.bits, groupSize: bigView.groupSize,

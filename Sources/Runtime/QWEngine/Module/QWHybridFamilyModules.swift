@@ -31,3 +31,11 @@ public final class Ernie55MoEModule: DenseModule, @unchecked Sendable {
         DenseModule.capabilities.union([.expertStreaming])
     }
 }
+
+/// The Maxwell-MoE Block-Sparse GQA + mHC + dedicated mHC-MTP family (`maxwell_moe`).
+public final class MaxwellMoEModule: DenseModule, @unchecked Sendable {
+    public override class var family: QWModelDescriptor.Family { .maxwellMoE }
+    public override class var capabilities: Set<QWKnobCapability> {
+        DenseModule.capabilities.union([.expertStreaming])
+    }
+}

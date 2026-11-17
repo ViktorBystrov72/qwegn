@@ -80,4 +80,44 @@ final class QWMTPGreedySelectorTests: XCTestCase {
             XCTAssertThrowsError(try selector.encode(enc, hal: hal, logits: alias))
         }
     }
+
+    func testBatchedCheckedArgmaxMatchesRowReferenceAndRejectsBadRow() throws {
+        let hal = try QWHal(geometry: .qwen38_27b)
+        let vocab = 1025, rows = 4
+        let arena = try QWArena(hal: hal, weights: 256,
+                                activations: rows * vocab * 4 + 65_536, kv: 256, gdnStates: 256)
+        let a = arena.activationsRegion()
+        let selector = try QWMTPGreedySelector(geometry: QWTestGeometry.g27, allocator: a,
+                                               vocabulary: vocab, maxRows: rows)
+        XCTAssertEqual(a.usedBytes,
+            QWMTPGreedySelector.allocationBytes(geometry: QWTestGeometry.g27, vocabulary: vocab, maxRows: rows))
+        let logits = try a.allocate(QWTensorShape([rows * vocab], .f32))
+        let dest = try a.allocate(QWTensorShape([rows], .i32))
+        let lp = logits.region.pointer.advanced(by: logits.offset).assumingMemoryBound(to: Float.self)
+        let dp = dest.region.pointer.advanced(by: dest.offset).assumingMemoryBound(to: Int32.self)
+        _ = try hal.pipeline("qwg_mtp_argmax_target_checked")
+        _ = try hal.pipeline("qwg_head_argmax_fin")
+        a.markSteadyState()
+        let expectedWinners = [0, 255, 256, vocab - 1]
+        for r in 0..<rows {
+            for i in 0..<vocab { lp[r * vocab + i] = -Float(i + 1) }
+            lp[r * vocab + expectedWinners[r]] = 3.5
+        }
+        func submit() throws {
+            let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+            let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
+            try selector.encodeBatched(enc, hal: hal, logits: logits, rows: rows,
+                                       ordering: .shippingTarget, destination: dest)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            XCTAssertEqual(cb.status, .completed, "\(String(describing: cb.error))")
+        }
+        try submit()
+        for r in 0..<rows { XCTAssertEqual(Int(dp[r]), expectedWinners[r], "row \(r)") }
+        lp[2 * vocab + 500] = .nan
+        try submit()
+        for r in 0..<rows {
+            XCTAssertEqual(Int(dp[r]), r == 2 ? -1 : expectedWinners[r], "poisoned row \(r)")
+        }
+        XCTAssertEqual(a.steadyStateAllocs, 0)
+    }
 }

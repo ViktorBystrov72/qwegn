@@ -382,4 +382,96 @@ final class QWModelDescriptorTests: XCTestCase {
         }
     }
 
+    func testMaxwellMoEDescriptorAndPythonIdentity() throws {
+        let maxwellConfig = """
+        {
+          "model_type": "maxwell_moe",
+          "hidden_size": 2048,
+          "intermediate_size": 6144,
+          "vocab_size": 200704,
+          "num_hidden_layers": 45,
+          "mlp_only_layers": [0, 1, 2],
+          "num_experts": 256,
+          "num_experts_per_tok": 12,
+          "moe_intermediate_size": 512,
+          "shared_expert_intermediate_size": 1024,
+          "use_shared_expert_gate": false,
+          "moe_router_enable_expert_bias": true,
+          "router_score_function": "sigmoid",
+          "num_attention_heads": 32,
+          "num_key_value_heads": 4,
+          "attention_head_size": 128,
+          "qk_layernorm": true,
+          "attention_variant": "block_sparse_gqa",
+          "block_sparse_gqa_indexer_n_heads": 4,
+          "block_sparse_gqa_indexer_head_dim": 128,
+          "block_sparse_gqa_block_size": 128,
+          "block_sparse_gqa_prefix_window_size": 1024,
+          "block_sparse_gqa_local_window_size": 1024,
+          "block_sparse_gqa_num_remote_blocks": 16,
+          "enable_hyper_connections": true,
+          "num_residual_streams": 4,
+          "mhc_sinkhorn_iterations": 20,
+          "mtp_num_layers": 1,
+          "rms_norm_eps": 1e-6,
+          "rope_theta": 20000000,
+          "partial_rotary_factor": 1.0,
+          "max_position_embeddings": 524288,
+          "eos_token_id": 2
+        }
+        """.data(using: .utf8)!
+
+        let d = try QWModelDescriptor.decode(configJSON: maxwellConfig)
+        XCTAssertEqual(d.verifyInternalConsistency(), [])
+        XCTAssertEqual(d.family, .maxwellMoE)
+        XCTAssertEqual(d.headDim, 128)
+        XCTAssertEqual(d.firstKDenseReplace, 3)
+        XCTAssertTrue(d.isMoELayer(3))
+        XCTAssertFalse(d.isMoELayer(2))
+        XCTAssertFalse(d.sharedExpertHasGate)
+        XCTAssertTrue(d.hasBiasCorrectedRouter)
+        XCTAssertEqual(d.expertGateType, "sigmoid")
+        XCTAssertEqual(d.mtpLayers, 1)
+        XCTAssertFalse(d.mtpSharedLastLayer)
+        XCTAssertEqual(d.specialTokens.eosTokenId, 2)
+        XCTAssertEqual(d.specialTokens.imStartTokenId, 200000)
+        XCTAssertEqual(d.specialTokens.imEndTokenId, 200001)
+        XCTAssertEqual(d.specialTokens.thinkTokenId, 200006)
+        XCTAssertEqual(d.specialTokens.endThinkTokenId, 200007)
+        XCTAssertEqual(d.specialTokens.extraStopTokenIds, [2, 200001])
+        XCTAssertEqual(d.blockSparseGQAConfig?.denseEquivalenceTokens, 4096)
+
+        let geo = QWModelGeometry(descriptor: d)
+        XCTAssertTrue(geo.hasDedicatedMHCMTP)
+        XCTAssertTrue(geo.usesMultiStreamMTPHidden)
+        XCTAssertEqual(geo.fullAttentionLayerCount, 45)
+        XCTAssertEqual(geo.gdnLayerCount, 0)
+
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let py = repoRoot.appendingPathComponent(".venv-oracle/bin/python")
+        let script = repoRoot.appendingPathComponent("Scripts/oracle/emit_pack_identity.py")
+        if FileManager.default.isExecutableFile(atPath: py.path) {
+            let tmpCfg = FileManager.default.temporaryDirectory.appendingPathComponent("maxwell_cfg_\(UUID().uuidString).json")
+            let tmpOut = FileManager.default.temporaryDirectory.appendingPathComponent("maxwell_id_\(UUID().uuidString).json")
+            defer {
+                try? FileManager.default.removeItem(at: tmpCfg)
+                try? FileManager.default.removeItem(at: tmpOut)
+            }
+            try maxwellConfig.write(to: tmpCfg)
+            let proc = Process()
+            proc.executableURL = py
+            proc.arguments = [script.path, tmpCfg.path, tmpOut.path]
+            proc.standardOutput = Pipe()
+            proc.standardError = Pipe()
+            try proc.run()
+            proc.waitUntilExit()
+            XCTAssertEqual(proc.terminationStatus, 0)
+            let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: tmpOut)) as? [String: Any])
+            XCTAssertEqual(obj["_canonical_string"] as? String, d.geometryDigestV2)
+            XCTAssertEqual(obj["geometry_digest"] as? String, d.geometryDigestV2Hex)
+            XCTAssertEqual(obj["model_id"] as? String, "maxwell_moe")
+        }
+    }
+
 }

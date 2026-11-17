@@ -166,7 +166,7 @@ extension QWEngineDriver {
         try claimMLAIndexerState(session)
         try QWEngineSessionState.restore(session, to: snapshot, cache: kvCache,
                                         mtpCache: mtpCache, attnLayers: attnLayers)
-        if hcaOperator != nil || mlaOperator != nil || lsaOperator != nil {
+        if hcaOperator != nil || mlaOperator != nil || lsaOperator != nil || mbsaOperator != nil {
             restoreMLAIndexerState(snapshot.sparseStateData, position: snapshot.position, into: session)
             mlaOperator?.truncatePosition(snapshot.position)
             hcaOperator?.truncatePosition(snapshot.position)
@@ -261,10 +261,11 @@ extension QWEngineDriver {
         }
         if let mla = mlaOperator { return mla.indexerStateBytes(position: position) }
         if let lsa = lsaOperator { return lsa.indexerStateBytes(position: position) }
+        if let mbsa = mbsaOperator { return mbsa.indexerStateBytes(position: position) }
         return 0
     }
 
-    /// MLA/LSA/HCA pools live in the operator, so prefix capture copies them
+    /// MLA/LSA/HCA/MBSA pools live in the operator, so prefix capture copies them
     /// out and adoption writes them back; the session's GPU work must be done.
     func captureMLAIndexerState(_ session: QWEngineSession) -> Data? {
         if let hca = hcaOperator {
@@ -285,6 +286,12 @@ extension QWEngineDriver {
                 return stash.data
             }
             return lsa.captureIndexerState(position: session.position)
+        }
+        if let mbsa = mbsaOperator {
+            if mbsa.stateOwner !== session, let stash = session.mlaIndexerStash, stash.position == session.position {
+                return stash.data
+            }
+            return mbsa.captureIndexerState(position: session.position)
         }
         return nil
     }
@@ -314,6 +321,10 @@ extension QWEngineDriver {
             guard lsa.isValidIndexerState(data, position: position) else {
                 throw QWEngineDriverError.state("prefix lacks LSA indexer state for its position")
             }
+        } else if let mbsa = mbsaOperator, position > 0 {
+            guard data?.count == mbsa.indexerStateBytes(position: position) else {
+                throw QWEngineDriverError.state("prefix lacks MBSA indexer state for its position")
+            }
         }
     }
 
@@ -340,6 +351,10 @@ extension QWEngineDriver {
             try? claimMLAIndexerState(session, restoring: false)
             guard position > 0, let data else { return }
             _ = lsa.restoreIndexerState(data, position: position)
+        } else if let mbsa = mbsaOperator {
+            try? claimMLAIndexerState(session, restoring: false)
+            guard position > 0, let data else { return }
+            _ = mbsa.restoreIndexerState(data, position: position)
         }
     }
 
@@ -428,6 +443,20 @@ extension QWEngineDriver {
                   lsa.restoreIndexerState(stash.data, position: stash.position) else {
                 session.stateFailed = true
                 throw QWEngineDriverError.state("LSA indexer state was not stashed at the session position")
+            }
+        } else if let mbsa = mbsaOperator {
+            guard mbsa.stateOwner !== session else { return }
+            if let prev = mbsa.stateOwner as? QWEngineSession, !prev.sessionFinished, prev.position > 0 {
+                prev.lastCommitCB?.waitUntilCompleted()
+                prev.mlaIndexerStash = (mbsa.captureIndexerState(position: prev.position), prev.position)
+            }
+            mbsa.stateOwner = session
+            defer { session.mlaIndexerStash = nil }
+            guard restoring, session.position > 0 else { return }
+            guard let stash = session.mlaIndexerStash, stash.position == session.position,
+                  mbsa.restoreIndexerState(stash.data, position: stash.position) else {
+                session.stateFailed = true
+                throw QWEngineDriverError.state("MBSA indexer state was not stashed at the session position")
             }
         }
     }

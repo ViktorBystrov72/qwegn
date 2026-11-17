@@ -101,7 +101,8 @@ final class QWMHCSplitRouterTests: XCTestCase {
             enc.setBuffer(merge ? branch : out, offset: 0, index: 10)
             var uRows = UInt32(rows)
             enc.setBytes(&uRows, length: 4, index: 11)
-            let groups = kernel == .rows ? (rows + 3) / 4 : rows
+            let rpg = QWEngineDriver.mhcRouterRowsPerGroup
+            let groups = kernel == .rows ? (rows + rpg - 1) / rpg : rows
             enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }

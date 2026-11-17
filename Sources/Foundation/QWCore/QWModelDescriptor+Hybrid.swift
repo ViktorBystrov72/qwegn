@@ -156,6 +156,29 @@ extension QWModelDescriptor {
         }
     }
 
+    /// Block-sparse GQA (MBSA) indexer and block routing configuration (`attention_variant = "block_sparse_gqa"`).
+    public struct BlockSparseGQAConfig: Sendable, Hashable, Codable, Equatable {
+        public let blockSize: Int
+        public let prefixBlocks: Int
+        public let localBlocks: Int
+        public let remoteBlocks: Int
+        public let indexerHeadDim: Int
+
+        /// Maximum causal blocks retained per query (`prefix + local + remote`).
+        public var maxSelectedBlocks: Int { prefixBlocks + localBlocks + remoteBlocks }
+        /// Token count below which all causal blocks fit in `maxSelectedBlocks`.
+        public var denseEquivalenceTokens: Int { maxSelectedBlocks * blockSize }
+
+        public init(blockSize: Int, prefixBlocks: Int, localBlocks: Int,
+                    remoteBlocks: Int, indexerHeadDim: Int) {
+            self.blockSize = blockSize
+            self.prefixBlocks = prefixBlocks
+            self.localBlocks = localBlocks
+            self.remoteBlocks = remoteBlocks
+            self.indexerHeadDim = indexerHeadDim
+        }
+    }
+
     /// Gated FFN nonlinearity (`SwiGLU` vs bounded `SituAndMul`).
     public enum ActivationKind: Sendable, Hashable, Codable, Equatable {
         case silu
@@ -227,7 +250,8 @@ extension QWModelDescriptor {
                 inputDim: hidden
             )
         }
-        if isFullAttention(l) && !hasMLAAttention && capabilities.contains(.qsaIndexer) == false && lsaInputDim >= 64 {
+        if isFullAttention(l) && !hasMLAAttention && blockSparseGQAConfig == nil
+            && capabilities.contains(.qsaIndexer) == false && lsaInputDim >= 64 {
             return LSAKeyProjectionSpec(
                 kind: .gqaKeyProj,
                 tensorName: "model.layers.\(l).self_attn.k_proj.weight",

@@ -14,7 +14,7 @@ public final class QWRopeApply: @unchecked Sendable {
     /// every declared buffer index bound; the kernel null-checks the pointer.
     let nullSlab: MTLBuffer
     /// device copy of tables.cosSin ([rows][rotaryDims] f32).
-    let tableTensor: QWTensorValue
+    public let tableTensor: QWTensorValue
     private let pso: any MTLComputePipelineState
     private let psoExtract: any MTLComputePipelineState
     /// The general kernels: a head narrower than 256 halves leaves the upper
@@ -171,7 +171,8 @@ public final class QWRopeApply: @unchecked Sendable {
                                 attnY: QWTensorValue,
                                 qOut: QWTensorValue, kOut: QWTensorValue, vOut: QWTensorValue,
                                 wq: QWTensorValue?, wk: QWTensorValue?,
-                                positionStart: Int, count: Int) throws {
+                                positionStart: Int, count: Int,
+                                inRowCols: Int? = nil) throws {
         let nrows = tables?.rows ?? (tableTensor.shape.dims.first ?? 0)
         guard count > 0 else { throw QWRopeError.badShape("count mismatch: S=\(count)") }
         guard positionStart >= 0, positionStart + count <= nrows else {
@@ -179,12 +180,14 @@ public final class QWRopeApply: @unchecked Sendable {
         }
         let S = count
         let totalN = geometry.attnTotalN
+        let rowCols = inRowCols ?? totalN
         let qSlot = geometry.qProjOut
         let kAll = geometry.kvHeads * geometry.headDim
         let vAll = geometry.kvHeads * geometry.headDim
         guard attnY.shape.dtype == .f16, qOut.shape.dtype == .f16,
               kOut.shape.dtype == .f16, vOut.shape.dtype == .f16,
-              attnY.shape.elementCount == S * totalN,
+              attnY.shape.elementCount == S * rowCols,
+              rowCols >= totalN, rowCols % 8 == 0,
               qOut.shape.elementCount == S * qSlot,
               kOut.shape.elementCount == S * kAll,
               vOut.shape.elementCount == S * vAll,
@@ -193,7 +196,7 @@ public final class QWRopeApply: @unchecked Sendable {
               (wq == nil) == (wk == nil)
         else { throw QWRopeError.badShape("extractQK tensor shapes mismatch: S=\(S)") }
 
-        let general = needsGeneralKernel(hasNorm: wq != nil)
+        let general = needsGeneralKernel(hasNorm: wq != nil) || rowCols != totalN
         enc.setComputePipelineState(general ? psoExtractGeneral : psoExtract)
         attnY.bind(enc, index: 0)
         qOut.bind(enc, index: 1)
@@ -208,9 +211,9 @@ public final class QWRopeApply: @unchecked Sendable {
                       index: 6)
         var eps = geometry.rmsEps
         enc.setBytes(&eps, length: 4, index: 7)
-        struct RopeFlags { var headU4, writeNorm, kNormBaseU4, normOn: UInt32 }   // metal uint4
+        struct RopeFlags { var headU4, inRowU4, kNormBaseU4, normOn: UInt32 }
         var flags = RopeFlags(headU4: UInt32(geometry.headDim / 8),
-                              writeNorm: 0,
+                              inRowU4: rowCols == totalN ? 0 : UInt32(rowCols / 8),
                               kNormBaseU4: UInt32(S * (geometry.qHeads * geometry.headDim) / 8),
                               normOn: wq == nil ? 0 : 1)
         withUnsafeBytes(of: &flags) { (raw: UnsafeRawBufferPointer) in enc.setBytes(raw.baseAddress!, length: 16, index: 8) }

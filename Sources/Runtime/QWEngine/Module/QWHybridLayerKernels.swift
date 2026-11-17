@@ -371,16 +371,44 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
         if context.weights.mhc == nil {
             mark("attn.gqa")
         }
-        try driver.gemvH16T4(enc, n: geometry.attnTotalN, k: H, x: sc.ln1, gs: sc.gs, wQ4: w.qkvProj, y16: sc.attnY16)
+        let qkvCols = w.qkvProj.n
+        let attnYSlice = driver.prefixRows(sc.attnY16, rows: 1, cols: qkvCols, dt: .f16)
+        try driver.gemvH16T4(enc, n: qkvCols, k: H, x: sc.ln1, gs: sc.gs, wQ4: w.qkvProj, y16: attnYSlice)
         // C07 fused per-head norm + partial rope (position [pos]).
         try driver.ropeApply.encodeQK(enc, hal: driver.hal, q: sc.q16, k: sc.k16,
                                       wq: w.wq, wk: w.wkTiled,
                                       qOut: sc.qR, kOut: sc.kR,
                                       positionStart: pos, count: 1)
+        if let mbsa = driver.mbsaOperator, let mbsaW = w.mbsa, pos + 1 <= mbsa.maxContext {
+            let idxCols = (geometry.kvHeads + 1) * geometry.headDim
+            if let idxProj = mbsaW.qkvIdxProj {
+                try driver.gemvH16T4(
+                    enc, n: idxCols, k: H,
+                    x: sc.ln1, gs: sc.gs, wQ4: idxProj,
+                    y16: driver.prefixRows(mbsa.idxQKVScratch, rows: 1, cols: idxCols, dt: .f16))
+                mbsa.encodeIndexPrep(enc, weights: mbsaW, ropeTable: driver.ropeApply.tableTensor,
+                                     layerIndex: fullAttnIdx, pos0: pos, rows: 1)
+            } else {
+                let idxSlice = QWTensorValue(
+                    region: sc.attnY16.region,
+                    offset: sc.attnY16.offset + geometry.attnTotalN * 2,
+                    shape: QWTensorShape([idxCols], .f16))
+                mbsa.encodeIndexPrep(enc, weights: mbsaW, ropeTable: driver.ropeApply.tableTensor,
+                                     layerIndex: fullAttnIdx, pos0: pos, rows: 1,
+                                     qkvSource: idxSlice, qkvRowStrideCols: qkvCols)
+            }
+        }
         // C09 split-K decode: attends the new row from knew/vnew AND
         // materialises it into the page slot in the same launch.
         let attnDecode = driver.attnDecode!
-        if let lsa = driver.lsaOperator {
+        if let mbsa = driver.mbsaOperator, w.mbsa != nil,
+           pos >= mbsa.config.denseEquivalenceTokens, pos + 1 <= mbsa.maxContext {
+            driver.encodePagedKVWrite(enc, kv: views, k: sc.kR, v: sc.v16, startPos: pos, t: 1)
+            enc.memoryBarrier(scope: .buffers)
+            mbsa.encodeSelectAndAttend(enc, qgate: sc.qR, kv: views, out: sc.attOut,
+                                       layerIndex: fullAttnIdx, pos0: pos, rows: 1,
+                                       partials: sc.partials)
+        } else if let lsa = driver.lsaOperator {
             lsa.encodeIndexAndCluster(enc, qgate: sc.qR, kIn: sc.kR,
                                       fullAttnLayer: fullAttnIdx, pos0: pos, rows: 1)
             if pos >= driver.lsaConfig.denseBypassThreshold {
@@ -463,17 +491,41 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             driver.profileStage("attn.gqa")
             enc = driver.activeEnc ?? enc
         }
-        driver.gemmBatchedH16(enc, m: T, n: geometry.attnTotalN, k: H,
+        let qkvCols = w.qkvProj.n
+        let attnYSlice = driver.prefixRows(psc.attnY16, rows: T, cols: qkvCols, dt: .f16)
+        driver.gemmBatchedH16(enc, m: T, n: qkvCols, k: H,
                        x: driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16),
                        wQ4: w.qkvProj,
-                       y16: driver.prefixRows(psc.attnY16, rows: T, cols: geometry.attnTotalN, dt: .f16))
+                       y16: attnYSlice)
         try driver.ropeApply.encodeExtractQK(enc, hal: driver.hal,
-                                              attnY: driver.prefixRows(psc.attnY16, rows: T, cols: geometry.attnTotalN, dt: .f16),
+                                              attnY: attnYSlice,
                                               qOut: driver.prefixRows(psc.attQR16, rows: T, cols: qOut, dt: .f16),
                                               kOut: driver.prefixRows(psc.attKR16, rows: T, cols: kvC, dt: .f16),
                                               vOut: driver.prefixRows(psc.attV16, rows: T, cols: kvC, dt: .f16),
                                               wq: w.wq, wk: w.wkTiled,
-                                              positionStart: pos, count: T)
+                                              positionStart: pos, count: T,
+                                              inRowCols: qkvCols)
+        if let mbsa = driver.mbsaOperator, let mbsaW = w.mbsa, pos + T <= mbsa.maxContext {
+            let idxCols = (geometry.kvHeads + 1) * geometry.headDim
+            if let idxProj = mbsaW.qkvIdxProj {
+                driver.gemmBatchedH16(
+                    enc, m: T, n: idxCols, k: H,
+                    x: driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16),
+                    wQ4: idxProj,
+                    y16: driver.prefixRows(mbsa.idxQKVScratch, rows: T, cols: idxCols, dt: .f16))
+                enc.memoryBarrier(scope: .buffers)
+                mbsa.encodeIndexPrep(enc, weights: mbsaW, ropeTable: driver.ropeApply.tableTensor,
+                                     layerIndex: fullAttnIdx, pos0: pos, rows: T)
+            } else {
+                let idxSlice = QWTensorValue(
+                    region: psc.attnY16.region,
+                    offset: psc.attnY16.offset + geometry.attnTotalN * 2,
+                    shape: QWTensorShape([T * qkvCols - geometry.attnTotalN], .f16))
+                mbsa.encodeIndexPrep(enc, weights: mbsaW, ropeTable: driver.ropeApply.tableTensor,
+                                     layerIndex: fullAttnIdx, pos0: pos, rows: T,
+                                     qkvSource: idxSlice, qkvRowStrideCols: qkvCols)
+            }
+        }
         if let lsa = driver.lsaOperator {
             lsa.encodeIndexAndCluster(
                 enc,
@@ -489,7 +541,21 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
         if sp > T && QWEngineDriver.zeroPadServes(geometry: geometry) {
             try driver.encodeZeroPadAttn(enc, q: psc.attQR16, k: psc.attKR16, v: psc.attV16, t: T, sp: sp)
         }
-        if let lsa = driver.lsaOperator, pos + T > driver.lsaConfig.denseBypassThreshold {
+        if let mbsa = driver.mbsaOperator, w.mbsa != nil,
+           pos + T > mbsa.config.denseEquivalenceTokens, pos + T <= mbsa.maxContext {
+            driver.encodePagedKVWrite(enc, kv: views,
+                               k: driver.prefixRows(psc.attKR16, rows: T, cols: kvC, dt: .f16),
+                               v: driver.prefixRows(psc.attV16, rows: T, cols: kvC, dt: .f16),
+                               startPos: pos, t: T)
+            enc.memoryBarrier(scope: .buffers)
+            mbsa.encodeSelectAndAttend(
+                enc,
+                qgate: driver.prefixRows(psc.attQR16, rows: T, cols: qOut, dt: .f16),
+                kv: views,
+                out: driver.prefixRows(psc.attOut, rows: T, cols: qC, dt: .f16),
+                layerIndex: fullAttnIdx, pos0: pos, rows: T,
+                partials: T == 1 ? driver.sc.partials : (T <= 8 ? driver.mtpSharedAttentionPartials : nil))
+        } else if let lsa = driver.lsaOperator, pos + T > driver.lsaConfig.denseBypassThreshold {
             driver.encodePagedKVWrite(enc, kv: views,
                                k: driver.prefixRows(psc.attKR16, rows: T, cols: kvC, dt: .f16),
                                v: driver.prefixRows(psc.attV16, rows: T, cols: kvC, dt: .f16),

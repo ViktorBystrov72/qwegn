@@ -142,7 +142,7 @@ extension QWEngineDriver.WeightLoader {
             if let cb = coldBanks, let io = self.io {
                 let guPtr = cb.gu.blocks.region.buffer.contents().advanced(by: cb.gu.blocks.region.base + cb.gu.blocks.offset)
                 let downPtr = cb.down.blocks.region.buffer.contents().advanced(by: cb.down.blocks.region.base + cb.down.blocks.offset)
-                let probeSuffix = "mlp.gate.weight"
+                let probeSuffix = hasTensor(blk + "mlp.gate.weight") ? "mlp.gate.weight" : "block_sparse_moe.gate.weight"
                 let resolvedProbe = resolveName(blk + probeSuffix)
                 let resolvedLayerPrefix = resolvedProbe.hasSuffix(probeSuffix)
                     ? String(resolvedProbe.dropLast(probeSuffix.count))
@@ -171,15 +171,17 @@ extension QWEngineDriver.WeightLoader {
             let sharedGateScalar: QWTensorValue?
             if ISh > 0 {
                 if !hasTensor(blk + "mlp.shared_experts.gate_proj.weight")
-                    && !hasTensor(blk + "mlp.shared_expert.gate_proj.weight")
-                    && hasTensor(blk + "block_sparse_moe.shared_experts.w1.weight") {
-                    let shPrefix = blk + "block_sparse_moe.shared_experts."
+                    && !hasTensor(blk + "mlp.shared_expert.gate_proj.weight"),
+                   let shBsPrefix = hasTensor(blk + "block_sparse_moe.shared_experts.w1.weight")
+                    ? (blk + "block_sparse_moe.shared_experts.")
+                    : (hasTensor(blk + "block_sparse_moe.shared_expert.w1.weight")
+                        ? (blk + "block_sparse_moe.shared_expert.") : nil) {
                     let (shGU, _) = try concatQ4([
-                        (shPrefix + "w1.weight", ISh),
-                        (shPrefix + "w3.weight", ISh)
+                        (shBsPrefix + "w1.weight", ISh),
+                        (shBsPrefix + "w3.weight", ISh)
                     ], k: H)
                     sharedGateUp = shGU
-                    sharedDown = try q4(shPrefix + "w2.weight", n: H, k: ISh)
+                    sharedDown = try q4(shBsPrefix + "w2.weight", n: H, k: ISh)
                 } else {
                     let shPrefix = hasTensor(blk + "mlp.shared_experts.gate_proj.weight")
                         ? (blk + "mlp.shared_experts.")
@@ -211,6 +213,90 @@ extension QWEngineDriver.WeightLoader {
                         coldStreamer: coldStreamer)
         }
 
+        mutating func loadLayerMLP(
+            _ blk: String, isMoE: Bool, geometry: QWModelGeometry
+        ) throws -> (gu: QWMLPWeight, down: QWWeightView, moe: MoEW?) {
+            let experts = isMoE ? geometry.numExperts : 0
+            let moe: MoEW? = experts > 0
+                ? try packedMoE(blk, experts: experts, topK: geometry.expertsPerTok)
+                : nil
+            if let moe {
+                let outDim = geometry.moeRoutedDim
+                guard let v = QWMLPWeight(blocks: moe.gateUp.blocks,
+                                         n: 2 * geometry.moeIntermediate,
+                                         k: outDim,
+                                         bits: moe.gateUp.bits,
+                                         groupSize: moe.gateUp.groupSize,
+                                         isRotated: moe.gateUp.isRotated,
+                                         isIncumbentContainer: moe.gateUp.isIncumbentContainer,
+                                         isSHVQ: moe.gateUp.isSHVQ) else {
+                    throw QWEngineDriverError.weightMissing(blk + "mlp.experts", "moe gu view invalid")
+                }
+                let down = try firstExpert(moe.down, rows: outDim)
+                return (v, down, moe)
+            }
+            let gu = try packedGU(blk)
+            let downName = hasTensor(blk + "mlp.down_proj.weight")
+                ? (blk + "mlp.down_proj.weight")
+                : (blk + "block_sparse_moe.w2.weight")
+            let down = try q4(downName, n: geometry.hidden, k: geometry.intermediate)
+            return (gu, down, nil)
+        }
+
+        mutating func loadGQAAttn(
+            _ blk: String, geometry: QWModelGeometry, includeMBSA: Bool
+        ) throws -> AttnW {
+            var attnSpecs = [
+                (blk + "self_attn.q_proj.weight", geometry.qProjOut),
+                (blk + "self_attn.k_proj.weight", (geometry.kvHeads * geometry.headDim)),
+                (blk + "self_attn.v_proj.weight", (geometry.kvHeads * geometry.headDim))
+            ]
+            let hasMBSA = includeMBSA && geometry.blockSparseGQAConfig != nil
+            let idxPfx = blk + "self_attn.indexer."
+            if hasMBSA {
+                attnSpecs.append(contentsOf: [
+                    (idxPfx + "linear_q_proj.weight", geometry.kvHeads * geometry.headDim),
+                    (idxPfx + "linear_k_proj.weight", geometry.headDim)
+                ])
+            }
+            let (qkvProj, attnSub) = try concatQ4(attnSpecs, k: geometry.hidden)
+            let o = try q4(blk + "self_attn.o_proj.weight",
+                           n: geometry.hidden, k: geometry.qHeads * geometry.headDim)
+            let qNormName = hasTensor(blk + "self_attn.q_norm.weight")
+                ? (blk + "self_attn.q_norm.weight")
+                : (hasTensor(blk + "self_attn.q_layernorm.weight")
+                    ? (blk + "self_attn.q_layernorm.weight") : nil)
+            let wq: QWTensorValue? = try qNormName.map { try f16wNorm($0, geometry.headDim) }
+            // wk contract (C16 law): [kvHeads·headDim] — tile k_norm ×kvHeads.
+            let kNormName = hasTensor(blk + "self_attn.k_norm.weight")
+                ? (blk + "self_attn.k_norm.weight")
+                : (hasTensor(blk + "self_attn.k_layernorm.weight")
+                    ? (blk + "self_attn.k_layernorm.weight") : nil)
+            var wkT: QWTensorValue?
+            if let kNormName {
+                let knBits = try normGammaBits(kNormName, geometry.headDim)
+                let t = try allocateWeight(QWTensorShape([(geometry.kvHeads * geometry.headDim)], .f16))
+                let p = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
+                for h in 0..<geometry.kvHeads {
+                    knBits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                        p.advanced(by: h * geometry.headDim * 2)
+                         .copyMemory(from: raw.baseAddress!, byteCount: geometry.headDim * 2)
+                    }
+                }
+                wkT = t
+            }
+            let mbsaW: QWMBSAAttnOperator.LayerWeights?
+            if hasMBSA {
+                let wqIdx = try f16wNorm(idxPfx + "q_layernorm.weight", geometry.headDim)
+                let wkIdx = try f16wNorm(idxPfx + "k_layernorm.weight", geometry.headDim)
+                mbsaW = QWMBSAAttnOperator.LayerWeights(qkvIdxProj: nil, wqIdx: wqIdx, wkIdx: wkIdx)
+            } else {
+                mbsaW = nil
+            }
+            return AttnW(qkvProj: qkvProj, q: attnSub[0], k: attnSub[1], v: attnSub[2],
+                         o: o, wq: wq, wkTiled: wkT, mbsa: mbsaW)
+        }
+
         /// Every layer's weights, in the plan's order.
         mutating func loadLayers(geometry: QWModelGeometry) throws -> [LayerW] {
             var ws: [LayerW] = []
@@ -218,33 +304,7 @@ extension QWEngineDriver.WeightLoader {
                 let blk = "\(QWEngineDriver.P)layers.\(l)."
                 let ln1 = try f16wNorm(blk + "input_layernorm.weight", geometry.hidden)
                 let ln2 = try f16wNorm(blk + "post_attention_layernorm.weight", geometry.hidden)
-                // A sparse MoE layer has no dense MLP: its weights are the
-                // router and the two banks (Task 4.4a). Its attention is
-                // the same full attention as a dense layer's.
-                let experts = geometry.isMoELayer(l) ? geometry.numExperts : 0
-                let moe: MoEW? = experts > 0
-                    ? try packedMoE(blk, experts: experts, topK: geometry.expertsPerTok)
-                    : nil
-                let gu: QWMLPWeight
-                let down: QWWeightView
-                if let moe {
-                    let outDim = geometry.moeRoutedDim
-                    guard let v = QWMLPWeight(blocks: moe.gateUp.blocks,
-                                             n: 2 * geometry.moeIntermediate,
-                                             k: outDim,
-                                             bits: moe.gateUp.bits,
-                                             groupSize: moe.gateUp.groupSize,
-                                             isRotated: moe.gateUp.isRotated,
-                                             isIncumbentContainer: moe.gateUp.isIncumbentContainer,
-                                             isSHVQ: moe.gateUp.isSHVQ) else {
-                        throw QWEngineDriverError.weightMissing(blk + "mlp.experts", "moe gu view invalid")
-                    }
-                    gu = v
-                    down = try firstExpert(moe.down, rows: outDim)
-                } else {
-                    gu = try packedGU(blk)
-                    down = try q4(blk + "mlp.down_proj.weight", n: geometry.hidden, k: geometry.intermediate)
-                }
+                let (gu, down, moe) = try loadLayerMLP(blk, isMoE: geometry.isMoELayer(l), geometry: geometry)
                 if geometry.isCompressedAttention(l) {
                     ws.append(try loadHCAAttnLayer(
                         blk: blk, layer: l, ln1: ln1, ln2: ln2,
@@ -264,46 +324,16 @@ extension QWEngineDriver.WeightLoader {
                             gu: gu, down: down, moe: moe, geometry: geometry))
                         continue
                     }
-                    let attnSpecs = [
-                        (blk + "self_attn.q_proj.weight", geometry.qProjOut),
-                        (blk + "self_attn.k_proj.weight", (geometry.kvHeads * geometry.headDim)),
-                        (blk + "self_attn.v_proj.weight", (geometry.kvHeads * geometry.headDim))
-                    ]
-                    let (qkvProj, attnSub) = try concatQ4(attnSpecs, k: geometry.hidden)
-                    let q = attnSub[0], k = attnSub[1], v = attnSub[2]
-                    let o = try q4(blk + "self_attn.o_proj.weight",
-                                   n: geometry.hidden, k: geometry.qHeads * geometry.headDim)
-                    // q_norm / k_norm are optional: a standard family (llama,
-                    // mistral, qwen2) has no RMSNorm on q/k, and its q and k are
-                    // projected and roped as they are.
-                    let wq: QWTensorValue? = hasTensor(blk + "self_attn.q_norm.weight")
-                        ? try f16wNorm(blk + "self_attn.q_norm.weight", geometry.headDim) : nil
-                    // wk contract (C16 law): [kvHeads·headDim] — tile k_norm ×4
-                    // (a raw [256] dump makes the rope door read OOB).
-                    var wkT: QWTensorValue?
-                    if hasTensor(blk + "self_attn.k_norm.weight") {
-                        let knBits = try normGammaBits(blk + "self_attn.k_norm.weight", geometry.headDim)
-                        let t = try allocateWeight(QWTensorShape([(geometry.kvHeads * geometry.headDim)], .f16))
-                        let p = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
-                        for h in 0..<geometry.kvHeads {
-                            knBits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                                p.advanced(by: h * geometry.headDim * 2)
-                                 .copyMemory(from: raw.baseAddress!, byteCount: geometry.headDim * 2)
-                            }
-                        }
-                        wkT = t
-                    }
+                    let attn = try loadGQAAttn(blk, geometry: geometry, includeMBSA: true)
                     let mhcW: MHCLayerWeights?
                     if let mhc = geometry.mhcConfig, l >= mhc.start, l < mhc.end {
-                        mhcW = try loadMHC(blk, mhc: mhc)
+                        mhcW = try loadMHCOrErnieHC(blk, mhc: mhc)
                     } else {
                         mhcW = nil
                     }
                     ws.append(LayerW(ln1: ln1, ln2: ln2, gu: gu, down: down,
                                      kind: moe == nil ? .fullAttention : .moe,
-                                     gdn: nil,
-                                     attn: AttnW(qkvProj: qkvProj, q: q, k: k, v: v, o: o, wq: wq, wkTiled: wkT),
-                                     moe: moe, mhc: mhcW))
+                                     gdn: nil, attn: attn, moe: moe, mhc: mhcW))
                 } else {
                     if geometry.gdnVectorDecay {
                         ws.append(try loadKDALayer(

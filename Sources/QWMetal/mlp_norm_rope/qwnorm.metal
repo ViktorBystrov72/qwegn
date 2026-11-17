@@ -105,20 +105,45 @@ kernel void qwg_rmsnorm_from_rot(device const uint4* x            [[buffer(0)]],
     }
 }
 
-// variant 2 (default shipping): fused residual. residual += x; y = fwht32(rmsnorm(residual)·γ)
-//   buffers: 0 x | 1 gamma | 2 y | 3 hiddenU4 | 4 eps | 5 residual (rw)
-// The 27B's 5120 takes the register-resident path; others take the general one.
-kernel void qwg_rmsnorm_residual(device const uint4* x       [[buffer(0)]],
-                                 device const uint4* gamma   [[buffer(1)]],
-                                 device uint4* y             [[buffer(2)]],
-                                 constant uint& hiddenU4     [[buffer(3)]],
-                                 constant float& eps         [[buffer(4)]],
-                                 device uint4* residual      [[buffer(5)]],
-                                 uint tg [[threadgroup_position_in_grid]],
-                                 uint ti [[thread_index_in_threadgroup]]) {
+METAL_FUNC void qwg_norm_emit_moe_bridge(thread const half (&hv)[8],
+                                         device float* rotRow,
+                                         device float* plainRow,
+                                         uint u,
+                                         uint laneId,
+                                         bool skipRot32) {
+    float f[8];
+    for (int i = 0; i < 8; i++) {
+        f[i] = float(hv[i]);
+        if (!skipRot32) rotRow[u * 8u + i] = f[i];
+    }
+    if (QW_FWHT_ROTATED) {
+        half hi[8], lo[8];
+        fwht32_f32_to_split_h8(f, hi, lo, laneId);
+        for (int i = 0; i < 8; i++) plainRow[u * 8u + i] = float(hi[i]) + float(lo[i]);
+    } else {
+        for (int i = 0; i < 8; i++) plainRow[u * 8u + i] = f[i];
+    }
+}
+
+template <bool EMIT_MOE>
+static inline void qwg_rmsnorm_residual_impl(device const uint4* x,
+                                             device const uint4* gamma,
+                                             device uint4* y,
+                                             uint hiddenU4Packed,
+                                             float eps,
+                                             device uint4* residual,
+                                             device float* xRot32,
+                                             device float* xPlain32,
+                                             uint tg,
+                                             uint ti) {
+    const bool skipRot32 = EMIT_MOE && ((hiddenU4Packed & 0x80000000u) != 0u);
+    const uint hiddenU4 = hiddenU4Packed & 0x7FFFFFFFu;
+    const size_t realH = (size_t)hiddenU4 * 8u;
     device const uint4* xr = x + (size_t)tg * hiddenU4;
     device uint4* rr = residual + (size_t)tg * hiddenU4;
     device uint4* yr = y + (size_t)tg * hiddenU4;
+    device float* rotRow = EMIT_MOE ? (xRot32 + (size_t)tg * realH) : nullptr;
+    device float* plainRow = EMIT_MOE ? (xPlain32 + (size_t)tg * realH) : nullptr;
 
     if (hiddenU4 <= QW_RES2_U4_TOTAL) {
         float acc = 0.0f;
@@ -130,8 +155,8 @@ kernel void qwg_rmsnorm_residual(device const uint4* x       [[buffer(0)]],
             uint4 xv = xr[u], rv0 = rr[u];
             H8 av = asH8(xv), bv = asH8(rv0), sv;
             for (int i = 0; i < 8; i++) { sv.v[i] = half(float(av.v[i]) + float(bv.v[i])); float t = float(sv.v[i]); acc += t * t; }
-            rr[u] = *(thread uint4*)&sv;    // fused residual update (stays in standard basis!)
-            reg[k] = *(thread uint4*)&sv;   // keep in registers for pass 2
+            rr[u] = *(thread uint4*)&sv;
+            reg[k] = *(thread uint4*)&sv;
         }
         float total = simd_sum(acc);
         float rstd = rsqrt(total / float(hiddenU4 * 8) + eps);
@@ -144,6 +169,7 @@ kernel void qwg_rmsnorm_residual(device const uint4* x       [[buffer(0)]],
             for (int i = 0; i < 8; i++) f[i] = float(bv.v[i]) * rstd * (float(gv.v[i]) + 1.0f);
             fwht32_f32_to_h8(f, ov.v, ti);
             yr[u] = *(thread uint4*)&ov;
+            if (EMIT_MOE) qwg_norm_emit_moe_bridge(ov.v, rotRow, plainRow, u, ti, skipRot32);
         }
     } else {
         float acc = 0.0f;
@@ -161,25 +187,27 @@ kernel void qwg_rmsnorm_residual(device const uint4* x       [[buffer(0)]],
             for (int i = 0; i < 8; i++) f[i] = float(bv.v[i]) * rstd * (float(gv.v[i]) + 1.0f);
             fwht32_f32_to_h8(f, ov.v, ti);
             yr[u] = *(thread uint4*)&ov;
+            if (EMIT_MOE) qwg_norm_emit_moe_bridge(ov.v, rotRow, plainRow, u, ti, skipRot32);
         }
     }
 }
 
-// variant 2w: variant 2 with one threadgroup per row and one thread per uint4 (decode/verify).
-// Not bit-identical to variant 2 under fast-math. Needs hiddenU4 % 32 == 0,
-// hiddenU4 <= QW_RES2_U4_TOTAL and threads_per_threadgroup == hiddenU4.
-kernel void qwg_rmsnorm_residual_wide(device const uint4* x       [[buffer(0)]],
-                                      device const uint4* gamma   [[buffer(1)]],
-                                      device uint4* y             [[buffer(2)]],
-                                      constant uint& hiddenU4     [[buffer(3)]],
-                                      constant float& eps         [[buffer(4)]],
-                                      device uint4* residual      [[buffer(5)]],
-                                      uint tg [[threadgroup_position_in_grid]],
-                                      uint ti [[thread_index_in_threadgroup]]) {
-    threadgroup uint4 sx[QW_RES2_U4_TOTAL];
-    // Lane 0 publishes the reduction to the group at the barrier.
-    threadgroup float rs[1];
-    // One threadgroup per row; the row-0 addressing is unchanged.
+template <bool EMIT_MOE>
+static inline void qwg_rmsnorm_residual_wide_impl(device const uint4* x,
+                                                  device const uint4* gamma,
+                                                  device uint4* y,
+                                                  uint hiddenU4Packed,
+                                                  float eps,
+                                                  device uint4* residual,
+                                                  device float* xRot32,
+                                                  device float* xPlain32,
+                                                  uint tg,
+                                                  uint ti,
+                                                  threadgroup uint4* sx,
+                                                  threadgroup float* rs) {
+    const bool skipRot32 = EMIT_MOE && ((hiddenU4Packed & 0x80000000u) != 0u);
+    const uint hiddenU4 = hiddenU4Packed & 0x7FFFFFFFu;
+    const size_t realH = (size_t)hiddenU4 * 8u;
     const size_t rowBase = (size_t)tg * hiddenU4;
     x += rowBase;
     residual += rowBase;
@@ -211,6 +239,66 @@ kernel void qwg_rmsnorm_residual_wide(device const uint4* x       [[buffer(0)]],
     for (int i = 0; i < 8; i++) f[i] = float(sv.v[i]) * rstd * (float(gv.v[i]) + 1.0f);
     fwht32_f32_to_h8(f, ov.v, ti);
     y[u] = *(thread uint4*)&ov;
+    if (EMIT_MOE) {
+        qwg_norm_emit_moe_bridge(ov.v, xRot32 + (size_t)tg * realH, xPlain32 + (size_t)tg * realH,
+                                 u, ti & 31u, skipRot32);
+    }
+}
+
+// variant 2 (default shipping): fused residual. residual += x; y = fwht32(rmsnorm(residual)·γ)
+kernel void qwg_rmsnorm_residual(device const uint4* x       [[buffer(0)]],
+                                 device const uint4* gamma   [[buffer(1)]],
+                                 device uint4* y             [[buffer(2)]],
+                                 constant uint& hiddenU4     [[buffer(3)]],
+                                 constant float& eps         [[buffer(4)]],
+                                 device uint4* residual      [[buffer(5)]],
+                                 uint tg [[threadgroup_position_in_grid]],
+                                 uint ti [[thread_index_in_threadgroup]]) {
+    qwg_rmsnorm_residual_impl<false>(x, gamma, y, hiddenU4, eps, residual, nullptr, nullptr, tg, ti);
+}
+
+// variant 2m: variant 2 with fused f32 MoE bridge outputs (xRot32, xPlain32).
+kernel void qwg_rmsnorm_residual_moe(device const uint4* x       [[buffer(0)]],
+                                     device const uint4* gamma   [[buffer(1)]],
+                                     device uint4* y             [[buffer(2)]],
+                                     constant uint& hiddenU4     [[buffer(3)]],
+                                     constant float& eps         [[buffer(4)]],
+                                     device uint4* residual      [[buffer(5)]],
+                                     device float* xRot32        [[buffer(6)]],
+                                     device float* xPlain32      [[buffer(7)]],
+                                     uint tg [[threadgroup_position_in_grid]],
+                                     uint ti [[thread_index_in_threadgroup]]) {
+    qwg_rmsnorm_residual_impl<true>(x, gamma, y, hiddenU4, eps, residual, xRot32, xPlain32, tg, ti);
+}
+
+// variant 2w: variant 2 with one threadgroup per row and one thread per uint4 (decode/verify).
+kernel void qwg_rmsnorm_residual_wide(device const uint4* x       [[buffer(0)]],
+                                      device const uint4* gamma   [[buffer(1)]],
+                                      device uint4* y             [[buffer(2)]],
+                                      constant uint& hiddenU4     [[buffer(3)]],
+                                      constant float& eps         [[buffer(4)]],
+                                      device uint4* residual      [[buffer(5)]],
+                                      uint tg [[threadgroup_position_in_grid]],
+                                      uint ti [[thread_index_in_threadgroup]]) {
+    threadgroup uint4 sx[QW_RES2_U4_TOTAL];
+    threadgroup float rs[1];
+    qwg_rmsnorm_residual_wide_impl<false>(x, gamma, y, hiddenU4, eps, residual, nullptr, nullptr, tg, ti, sx, rs);
+}
+
+// variant 2wm: wide residual norm + fused f32 MoE bridge outputs (0-ULP parity with separate bridge).
+kernel void qwg_rmsnorm_residual_moe_wide(device const uint4* x       [[buffer(0)]],
+                                          device const uint4* gamma   [[buffer(1)]],
+                                          device uint4* y             [[buffer(2)]],
+                                          constant uint& hiddenU4     [[buffer(3)]],
+                                          constant float& eps         [[buffer(4)]],
+                                          device uint4* residual      [[buffer(5)]],
+                                          device float* xRot32        [[buffer(6)]],
+                                          device float* xPlain32      [[buffer(7)]],
+                                          uint tg [[threadgroup_position_in_grid]],
+                                          uint ti [[thread_index_in_threadgroup]]) {
+    threadgroup uint4 sx[QW_RES2_U4_TOTAL];
+    threadgroup float rs[1];
+    qwg_rmsnorm_residual_wide_impl<true>(x, gamma, y, hiddenU4, eps, residual, xRot32, xPlain32, tg, ti, sx, rs);
 }
 
 // variant 3 (P3 race candidate): norm + write row-scale side vector instead of

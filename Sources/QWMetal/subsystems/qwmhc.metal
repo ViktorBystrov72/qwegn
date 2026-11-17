@@ -303,14 +303,14 @@ kernel void qwg_mhc_router_partial_f32(device float*       mhcStream      [[buff
     }
 }
 
-template <uint C>
+template <uint C, bool EMIT_MOE>
 inline void qwg_mhc_router_finalize_impl(device const float* mhcStream,
                                          device const float* partials,
                                          device const float* routerB,
                                          device const half*  normGamma,
                                          device half*        outNorm,
                                          device float*       mhcControls,
-                                         uint                hidden,
+                                         uint                hiddenPacked,
                                          float               eps,
                                          float               preScale,
                                          uint                iterations,
@@ -318,11 +318,16 @@ inline void qwg_mhc_router_finalize_impl(device const float* mhcStream,
                                          uint                sg,
                                          uint                lane,
                                          threadgroup float*  tots,
-                                         threadgroup float*  sPre) {
+                                         threadgroup float*  sPre,
+                                         device float*       xRot32,
+                                         device float*       xPlain32,
+                                         threadgroup uint4*  shOutU4) {
     constexpr uint NUM_CTRL = C + C * C;
     constexpr uint NUM_ROWS = 2u * C + C * C;
     constexpr uint NUM_GRAM = C * (C + 1u) / 2u;
     constexpr uint NUM_OUT = NUM_ROWS + 1u + NUM_GRAM;
+    const bool skipRot32 = EMIT_MOE && ((hiddenPacked & 0x80000000u) != 0u);
+    const uint hidden = hiddenPacked & 0x7FFFFFFFu;
     const uint tid = sg * 32u + lane;
     const uint slice = tg.x;
     const uint t = tg.y;
@@ -381,7 +386,35 @@ inline void qwg_mhc_router_finalize_impl(device const float* mhcStream,
     }
     float v = bv * rstdBranch * (1.0f + (h < hidden ? float(normGamma[h]) : 0.0f));
     v = qwg_fwht32_lane_f32(v, lane);
-    if (h < hidden) dst[h] = half(v);
+    const half yH = half(v);
+    if (h < hidden) dst[h] = yH;
+    if (EMIT_MOE) {
+        ((threadgroup half*)shOutU4)[tid] = (h < hidden) ? yH : half(0.0h);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint hiddenU4 = hidden >> 3u;
+        if (tid < 32u) {
+            const uint u = slice * (QW_MHC_FIN_SLICE >> 3u) + tid;
+            if (u < hiddenU4) {
+                const uint4 w = shOutU4[tid];
+                half hv[8];
+                *(thread uint4*)hv = w;
+                float f[8];
+                device float* rRow = xRot32 + (size_t)t * hidden + u * 8u;
+                device float* pRow = xPlain32 + (size_t)t * hidden + u * 8u;
+                for (int i = 0; i < 8; i++) {
+                    f[i] = float(hv[i]);
+                    if (!skipRot32) rRow[i] = f[i];
+                }
+                if (QW_FWHT_ROTATED) {
+                    half hi[8], lo[8];
+                    fwht32_f32_to_split_h8(f, hi, lo, tid);
+                    for (int i = 0; i < 8; i++) pRow[i] = float(hi[i]) + float(lo[i]);
+                } else {
+                    for (int i = 0; i < 8; i++) pRow[i] = f[i];
+                }
+            }
+        }
+    }
 }
 
 kernel void qwg_mhc_router_finalize_f16(device const float* mhcStream   [[buffer(0)]],
@@ -400,13 +433,42 @@ kernel void qwg_mhc_router_finalize_f16(device const float* mhcStream   [[buffer
     threadgroup float tots[35];
     threadgroup float sPre[4];
     if (QW_MHC_STREAMS == 4u) {
-        qwg_mhc_router_finalize_impl<4u>(mhcStream, partials, routerB, normGamma, outNorm, mhcControls,
-                                         hidden, eps, preScale, iterations, tg, sg, lane,
-                                         tots, sPre);
+        qwg_mhc_router_finalize_impl<4u, false>(mhcStream, partials, routerB, normGamma, outNorm, mhcControls,
+                                                hidden, eps, preScale, iterations, tg, sg, lane,
+                                                tots, sPre, nullptr, nullptr, nullptr);
     } else {
-        qwg_mhc_router_finalize_impl<2u>(mhcStream, partials, routerB, normGamma, outNorm, mhcControls,
-                                         hidden, eps, preScale, iterations, tg, sg, lane,
-                                         tots, sPre);
+        qwg_mhc_router_finalize_impl<2u, false>(mhcStream, partials, routerB, normGamma, outNorm, mhcControls,
+                                                hidden, eps, preScale, iterations, tg, sg, lane,
+                                                tots, sPre, nullptr, nullptr, nullptr);
+    }
+}
+
+kernel void qwg_mhc_router_finalize_moe_f16(device const float* mhcStream   [[buffer(0)]],
+                                            device const float* partials    [[buffer(1)]],
+                                            device const float* routerB     [[buffer(2)]],
+                                            device const half*  normGamma   [[buffer(3)]],
+                                            device half*        outNorm     [[buffer(4)]],
+                                            device float*       mhcControls [[buffer(5)]],
+                                            constant uint&      hidden      [[buffer(6)]],
+                                            constant float&     eps         [[buffer(7)]],
+                                            constant float&     preScale    [[buffer(8)]],
+                                            constant uint&      iterations  [[buffer(9)]],
+                                            device float*       xRot32      [[buffer(10)]],
+                                            device float*       xPlain32    [[buffer(11)]],
+                                            uint2 tg  [[threadgroup_position_in_grid]],
+                                            uint sg   [[simdgroup_index_in_threadgroup]],
+                                            uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tots[35];
+    threadgroup float sPre[4];
+    threadgroup uint4 shOutU4[QW_MHC_FIN_SLICE >> 3u];
+    if (QW_MHC_STREAMS == 4u) {
+        qwg_mhc_router_finalize_impl<4u, true>(mhcStream, partials, routerB, normGamma, outNorm, mhcControls,
+                                               hidden, eps, preScale, iterations, tg, sg, lane,
+                                               tots, sPre, xRot32, xPlain32, shOutU4);
+    } else {
+        qwg_mhc_router_finalize_impl<2u, true>(mhcStream, partials, routerB, normGamma, outNorm, mhcControls,
+                                               hidden, eps, preScale, iterations, tg, sg, lane,
+                                               tots, sPre, xRot32, xPlain32, shOutU4);
     }
 }
 

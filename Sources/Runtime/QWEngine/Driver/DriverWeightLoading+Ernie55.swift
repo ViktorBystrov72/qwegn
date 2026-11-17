@@ -59,7 +59,9 @@ extension QWEngineDriver.WeightLoader {
         }
         let biasName = hasTensor(blk + "mlp.gate.e_score_correction_bias")
             ? (blk + "mlp.gate.e_score_correction_bias")
-            : (blk + "block_sparse_moe.e_score_correction_bias")
+            : (hasTensor(blk + "block_sparse_moe.e_score_correction_bias")
+                ? (blk + "block_sparse_moe.e_score_correction_bias")
+                : (blk + "block_sparse_moe.expert_bias"))
         let scaleName = hasTensor(blk + "mlp.routed_scaling_factor_param")
             ? (blk + "mlp.routed_scaling_factor_param")
             : (blk + "block_sparse_moe.gate.routed_scaling_factor_param")
@@ -195,7 +197,7 @@ extension QWEngineDriver.WeightLoader {
         return try allocateF16(mix)
     }
 
-    private mutating func loadMHCOrErnieHC(
+    mutating func loadMHCOrErnieHC(
         _ blk: String, mhc: QWModelDescriptor.MHCConfig
     ) throws -> QWEngineDriver.MHCLayerWeights {
         if hasTensor(blk + "mhc_attn.weight") || hasTensor(blk + "hc_attn_fn") {
@@ -207,6 +209,7 @@ extension QWEngineDriver.WeightLoader {
             let width = c * geometry.hidden
             let pfx = blk + sub + "."
             let rawMap = try rawFloats(pfx + "mapping_proj.weight", width * routerRows)
+            let needsTranspose = tensorShape(pfx + "mapping_proj.weight") == [width, routerRows]
             let aPre = (try? rawFloats(pfx + "alpha_pre", 1).first) ?? 1.0
             let aPost = (try? rawFloats(pfx + "alpha_post", 1).first) ?? 1.0
             let aRes = (try? rawFloats(pfx + "alpha_res", 1).first) ?? 1.0
@@ -214,14 +217,17 @@ extension QWEngineDriver.WeightLoader {
             for r in 0..<routerRows {
                 let s: Float = (r < c) ? aPre : ((r < 2 * c) ? aPost : aRes)
                 for col in 0..<width {
-                    wOut[r * width + col] = rawMap[col * routerRows + r] * s
+                    let src = needsTranspose ? rawMap[col * routerRows + r] : rawMap[r * width + col]
+                    wOut[r * width + col] = src * s
                 }
             }
             let wT = try allocateF32(wOut)
             let bT = try f32w(pfx + "bias", routerRows)
             return (wT, bT)
         }
-        let attn = try loadHCSub("self_attention_hyper_connection")
+        let attnSub = hasTensor(blk + "self_attention_hyper_connection.mapping_proj.weight")
+            ? "self_attention_hyper_connection" : "self_attn_hyper_connection"
+        let attn = try loadHCSub(attnSub)
         let ffn = try loadHCSub("mlp_hyper_connection")
         return QWEngineDriver.MHCLayerWeights(attnW: attn.w, attnB: attn.b, ffnW: ffn.w, ffnB: ffn.b)
     }
@@ -413,7 +419,7 @@ extension QWEngineDriver.WeightLoader {
         )
     }
 
-    private mutating func loadExitHeadPair(prefix: String, streams: Int) throws -> (w: QWTensorValue, b: QWTensorValue) {
+    mutating func loadExitHeadPair(prefix: String, streams: Int) throws -> (w: QWTensorValue, b: QWTensorValue) {
         let width = streams * geometry.hidden
         if hasTensor(prefix + ".weight") {
             let wT = try f32wOrDequant(prefix + ".weight", streams * width)
@@ -424,11 +430,20 @@ extension QWEngineDriver.WeightLoader {
         let scName = hasTensor(prefix + ".hc_head_scale") ? (prefix + ".hc_head_scale") : (prefix + "hc_head_scale")
         let bsName = hasTensor(prefix + ".hc_head_base") ? (prefix + ".hc_head_base") : (prefix + "hc_head_base")
         let rawFn = try rawFloats(fnName, width * streams)
-        let sc = (try? rawFloats(scName, 1).first) ?? 1.0
+        let needsTranspose = tensorShape(fnName) == [width, streams]
+        let scVals: [Float]
+        if let scShape = tensorShape(scName), scShape.reduce(1, *) == streams {
+            scVals = try rawFloats(scName, streams)
+        } else {
+            let s0 = (try? rawFloats(scName, 1).first) ?? 1.0
+            scVals = [Float](repeating: s0, count: streams)
+        }
         var wOut = [Float](repeating: 0, count: streams * width)
         for s in 0..<streams {
+            let sc = scVals[s]
             for col in 0..<width {
-                wOut[s * width + col] = rawFn[col * streams + s] * sc
+                let src = needsTranspose ? rawFn[col * streams + s] : rawFn[s * width + col]
+                wOut[s * width + col] = src * sc
             }
         }
         let wT = try allocateF32(wOut)
@@ -438,7 +453,10 @@ extension QWEngineDriver.WeightLoader {
 
     mutating func loadMHCExitHeadIfNeeded() throws -> QWEngineDriver.MHCExitHeadWeights? {
         guard let mhc = geometry.mhcConfig, mhc.hasExitHead else { return nil }
-        let pair = try loadExitHeadPair(prefix: QWEngineDriver.P + "mhc_contract", streams: mhc.streams)
+        let prefix = hasTensor(QWEngineDriver.P + "hc_head.hc_head_fn")
+            ? (QWEngineDriver.P + "hc_head")
+            : (QWEngineDriver.P + "mhc_contract")
+        let pair = try loadExitHeadPair(prefix: prefix, streams: mhc.streams)
         return QWEngineDriver.MHCExitHeadWeights(headW: pair.w, headB: pair.b)
     }
 
@@ -453,7 +471,11 @@ extension QWEngineDriver.WeightLoader {
     }
 
     mutating func loadEchoDraftWeightsIfNeeded(drafts: Int) throws -> QWEngineDriver.EchoDraftWeights? {
-        guard drafts > 0, geometry.mtpSharedLastLayer else { return nil }
+        guard drafts > 0 else { return nil }
+        if geometry.hasDedicatedMHCMTP {
+            return try loadDedicatedEchoDraftWeights()
+        }
+        guard geometry.mtpSharedLastLayer else { return nil }
         let h = geometry.hidden
         let streams = geometry.mhcConfig?.streams ?? 4
         let blk = QWEngineDriver.P + "layers.\(geometry.numLayers)."

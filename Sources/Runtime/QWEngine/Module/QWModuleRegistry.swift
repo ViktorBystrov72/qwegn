@@ -21,6 +21,7 @@ public enum QWModuleRegistry {
         case .senseNovaLoop: return SenseNovaLoopModule.self
         case .glm5Next: return Glm5NextModule.self
         case .ernie55MoE: return Ernie55MoEModule.self
+        case .maxwellMoE: return MaxwellMoEModule.self
         case .qwen2Dense: return Qwen2DenseModule.self
         case .llamaDense: return LlamaModule.self
         case .mistralDense: return MistralModule.self

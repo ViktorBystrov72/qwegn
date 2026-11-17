@@ -19,7 +19,7 @@ import QWQuant
 extension QWEngineDriver {
     /// Whether full-attention layers run O(T·B) subquadratic prefill at long context (`>= 131K`).
     var usesSubquadraticLongPrefill: Bool {
-        geometry.usesLatentOrCompressedAttention || lsaOperator != nil
+        geometry.usesLatentOrCompressedAttention || lsaOperator != nil || mbsaOperator != nil
     }
 
     func stridedRow(_ tv: QWTensorValue, row: Int, cols: Int, dt: QWDType, rowStrideBytes: Int? = nil) -> QWTensorValue {

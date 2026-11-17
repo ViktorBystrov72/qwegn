@@ -11,7 +11,7 @@ import QWCore
 /// Module marker (was Placeholder.swift).
 
 extension QWTokenizer {
-    public func piece(_ id: Int) -> String? { idToPiece[id] }
+    public func piece(_ id: Int) -> String? { idToPiece[id] ?? added.first(where: { $0.id == id })?.s }
 
     public func tokenId(for token: String) -> Int? {
         vocab[token] ?? added.first(where: { $0.s == token })?.id
@@ -20,9 +20,11 @@ extension QWTokenizer {
     public func resolveSpecialTokens(fallback: QWModelSpecialTokens) -> QWModelSpecialTokens {
         let imStart = tokenId(for: "<|im_start|>")
             ?? tokenId(for: "<|ernie:im_start|>")
+            ?? tokenId(for: "<|maxwell_start|>")
             ?? fallback.imStartTokenId
         let imEnd = tokenId(for: "<|im_end|>")
             ?? tokenId(for: "<|ernie:im_end|>")
+            ?? tokenId(for: "<|maxwell_end|>")
             ?? fallback.imEndTokenId
         let think = tokenId(for: "<think>")
             ?? tokenId(for: "<ernie:think>")
@@ -31,7 +33,7 @@ extension QWTokenizer {
             ?? tokenId(for: "</ernie:think>")
             ?? fallback.endThinkTokenId
         var extra = fallback.extraStopTokenIds
-        for s in ["<|im_end|>", "<|ernie:im_end|>", "<|ERNIE_endofprompt|>", "<|endoftext|>", "<|eot_id|>", "</s>"] {
+        for s in ["<|im_end|>", "<|ernie:im_end|>", "<|maxwell_end|>", "<|ERNIE_endofprompt|>", "<|endoftext|>", "<|eot_id|>", "</s>"] {
             if let id = tokenId(for: s), !extra.contains(id) {
                 extra.append(id)
             }
@@ -39,6 +41,7 @@ extension QWTokenizer {
         let hasChatIds = fallback.usesChatTemplateIds
             || tokenId(for: "<|im_end|>") != nil
             || tokenId(for: "<|ernie:im_end|>") != nil
+            || tokenId(for: "<|maxwell_end|>") != nil
         return QWModelSpecialTokens(
             eosTokenId: fallback.eosTokenId,
             imStartTokenId: imStart,

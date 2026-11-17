@@ -19,7 +19,7 @@ import QWQuant
 import QWLoad
 
 extension QWEngineDriver {
-    struct GdnW {
+    final class GdnW: @unchecked Sendable {
         let inProj: QWWeightView
         let qkv: QWWeightView, z: QWWeightView, a: QWWeightView, b: QWWeightView
         let conv: QWTensorValue, normW: QWTensorValue, aLog: QWTensorValue, dtBias: QWTensorValue
@@ -36,7 +36,7 @@ extension QWEngineDriver {
             self.out = out; self.fgbProj = fgbProj; self.fB = fB; self.gB = gB
         }
     }
-    struct AttnW {
+    final class AttnW: @unchecked Sendable {
         let qkvProj: QWWeightView
         let q: QWWeightView, k: QWWeightView, v: QWWeightView, o: QWWeightView
         /// The per-head q/k norms, when the model has them. A standard family
@@ -44,11 +44,14 @@ extension QWEngineDriver {
         /// roped as they are.
         let wq: QWTensorValue?, wkTiled: QWTensorValue?
         let mla: QWMLAAttnOperator.LayerWeights?
+        let mbsa: QWMBSAAttnOperator.LayerWeights?
 
         init(qkvProj: QWWeightView, q: QWWeightView, k: QWWeightView, v: QWWeightView, o: QWWeightView,
-             wq: QWTensorValue?, wkTiled: QWTensorValue?, mla: QWMLAAttnOperator.LayerWeights? = nil) {
+             wq: QWTensorValue?, wkTiled: QWTensorValue?,
+             mla: QWMLAAttnOperator.LayerWeights? = nil,
+             mbsa: QWMBSAAttnOperator.LayerWeights? = nil) {
             self.qkvProj = qkvProj; self.q = q; self.k = k; self.v = v; self.o = o
-            self.wq = wq; self.wkTiled = wkTiled; self.mla = mla
+            self.wq = wq; self.wkTiled = wkTiled; self.mla = mla; self.mbsa = mbsa
         }
     }
     enum QWLayerPass: Equatable, Sendable { case fullAttention, gdn, hca, moe, gdnMoe, hcaMoe }
@@ -56,7 +59,7 @@ extension QWEngineDriver {
     /// Streams cold expert weights into staging slots inside `gateUp`/`down` and zeroes them after use.
 
 
-    struct MoEW {
+    final class MoEW: @unchecked Sendable {
         let router: QWTensorValue
         let routerBias: QWTensorValue?
         let routedScaleParam: QWTensorValue?
@@ -106,7 +109,7 @@ extension QWEngineDriver {
         let ffnW: QWTensorValue
         let ffnB: QWTensorValue
     }
-    struct LayerW {
+    final class LayerW: @unchecked Sendable {
         let ln1: QWTensorValue, ln2: QWTensorValue
         let gu: QWMLPWeight, down: QWWeightView
         let kind: QWLayerPass

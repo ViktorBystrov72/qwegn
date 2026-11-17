@@ -113,9 +113,12 @@ class DenseLayerKernel: @unchecked Sendable {
             try encodeAttention(context)
             driver.profileStage("mhc.router_norm")
             enc = driver.activeEnc ?? context.enc
+            let moeBridge = driver.canFusePreMoENorm(weights: lw, rows: 1) ? sc.moe.map {
+                (xRot32: $0.xRot32, xPlain32: $0.xPlain32, skipRot32: false)
+            } : nil
             try driver.encodeMHCRouterNorm(enc, stream: mhcStream, w: mhc.ffnW, b: mhc.ffnB,
                                            gamma: lw.ln2, controls: mhcControls, out: sc.ln2,
-                                           rows: 1, mergeBranchOut: sc.o16)
+                                           rows: 1, mergeBranchOut: sc.o16, moeBridge: moeBridge)
             driver.profileStage("mlp." + Self.profileKind)
             try encodeMLP(context)
             driver.profileStage("mhc.merge")
@@ -153,7 +156,10 @@ class DenseLayerKernel: @unchecked Sendable {
             try encodeAttention(context)
             enc = driver.activeEnc ?? context.enc
             // ── shared tail (leg-2c rung order, parity-proven) ─────────────
-            try driver.encodeRMSNormResidualFast(enc, x: sc.o16, gamma: lw.ln2, out: sc.ln2, residual: sc.x)
+            let moeBridge = driver.canFusePreMoENorm(weights: lw, rows: 1) ? sc.moe.map {
+                (xRot32: $0.xRot32, xPlain32: $0.xPlain32, skipRot32: false)
+            } : nil
+            try driver.encodeRMSNormResidualFast(enc, x: sc.o16, gamma: lw.ln2, out: sc.ln2, residual: sc.x, moeBridge: moeBridge)
             try encodeMLP(context)
             enc = driver.activeEnc ?? context.enc
             // Rung 2: x := half(x + mlp) IN PLACE; the emitted norm uses the
@@ -216,9 +222,14 @@ class DenseLayerKernel: @unchecked Sendable {
             try encodeAttentionPrefill(context)
             driver.profileStage("mhc.router_norm")
             enc = driver.activeEnc ?? context.enc
+            let moeBridge = driver.canFusePreMoENorm(weights: lw, rows: T) ? psc.moe.map {
+                (xRot32: driver.prefixRows($0.xRot32, rows: T, cols: H, dt: .f32),
+                 xPlain32: driver.prefixRows($0.xPlain32, rows: T, cols: H, dt: .f32),
+                 skipRot32: false)
+            } : nil
             try driver.encodeMHCRouterNorm(enc, stream: mhcStream, w: mhc.ffnW, b: mhc.ffnB,
                                            gamma: lw.ln2, controls: mhcControls, out: activeLn2,
-                                           rows: T, mergeBranchOut: activeO16)
+                                           rows: T, mergeBranchOut: activeO16, moeBridge: moeBridge)
             driver.profileStage("mlp." + Self.profileKind)
             try encodeMLPPrefill(context)
             driver.profileStage("mhc.merge")
@@ -254,12 +265,17 @@ class DenseLayerKernel: @unchecked Sendable {
             }
             try encodeAttentionPrefill(context)
             enc = driver.activeEnc ?? context.enc
+            let moeBridge = driver.canFusePreMoENorm(weights: lw, rows: T) ? psc.moe.map {
+                (xRot32: driver.prefixRows($0.xRot32, rows: T, cols: H, dt: .f32),
+                 xPlain32: driver.prefixRows($0.xPlain32, rows: T, cols: H, dt: .f32),
+                 skipRot32: false)
+            } : nil
             try driver.encodeRMSNormResidualFast(enc,
                                       x: driver.prefixRows(psc.o16, rows: T, cols: H, dt: .f16),
                                       gamma: lw.ln2,
                                       out: driver.prefixRows(psc.ln2, rows: T, cols: H, dt: .f16),
                                       residual: driver.prefixRows(psc.x, rows: T, cols: H, dt: .f16),
-                                      rows: T, rowParallel: false)
+                                      rows: T, rowParallel: false, moeBridge: moeBridge)
             try encodeMLPPrefill(context)
             enc = driver.activeEnc ?? context.enc
             try driver.encodeRMSNormResidualFast(enc,

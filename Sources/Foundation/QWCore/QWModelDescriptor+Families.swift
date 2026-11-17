@@ -132,6 +132,14 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
             usesQwenChatTemplateIds: false
         ),
         QWModelFamilySpec(
+            modelType: "maxwell_moe",
+            family: .maxwellMoE,
+            defaultAttnOutputGate: false,
+            defaultExpertGateType: "sigmoid",
+            usesPlusOneRMSNorm: false,
+            usesQwenChatTemplateIds: false
+        ),
+        QWModelFamilySpec(
             modelType: "qwen4_exp",
             family: .qwen38FlashNext,
             defaultAttnOutputGate: true,

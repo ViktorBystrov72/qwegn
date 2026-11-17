@@ -453,12 +453,11 @@ extension QWEngineDriver {
                         try self.prepareGreedyRound(session, maxNew: remaining, stopIDs: stopIds, permit: permit)
                     }
                     try self.commitGreedyVerification(session, round: round, drain: false, permit: permit)
-                    if onToken != nil {
-                        session.lastCommitCB?.waitUntilCompleted()
+                    if let cb = session.lastCommitCB, cb.status == .error {
                         session.lastCommitCB = nil
-                        guard !session.stateFailed else {
-                            throw QWEngineDriverError.state("commit GPU failure during streaming speculative generation")
-                        }
+                        self.commandBufferErrors += 1
+                        session.stateFailed = true
+                        throw QWEngineDriverError.state("commit GPU failure during streaming speculative generation")
                     }
                     return round.decision
                 }

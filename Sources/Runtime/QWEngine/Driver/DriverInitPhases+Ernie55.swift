@@ -102,6 +102,7 @@ extension QWEngineDriver {
         var resident: [any MTLBuffer] = arena.allBuffers
         if let lsa = lsaOperator { resident.append(lsa.region.buffer) }
         if let mla = mlaOperator { resident.append(mla.region.buffer) }
+        if let mbsa = mbsaOperator { resident.append(mbsa.region.buffer) }
         if let hca = hcaOperator { resident.append(hca.region.buffer) }
         if let hcaLsa = hcaLsaBuffer { resident.append(hcaLsa) }
         if let echo = echoDrafter { resident.append(echo.region.buffer) }
@@ -115,7 +116,10 @@ extension QWEngineDriver {
         for lw in layersW {
             resident += [lw.gu.view.blocks.region.buffer, lw.down.blocks.region.buffer]
             if let g = lw.gdn { resident += [g.inProj.blocks.region.buffer, g.out.blocks.region.buffer] }
-            if let a = lw.attn { resident += [a.qkvProj.blocks.region.buffer, a.o.blocks.region.buffer] }
+            if let a = lw.attn {
+                resident += [a.qkvProj.blocks.region.buffer, a.o.blocks.region.buffer]
+                if let q = a.mbsa?.qkvIdxProj { resident.append(q.blocks.region.buffer) }
+            }
             if let hc = lw.hca {
                 if let f = hc.wFusedIn { resident.append(f.blocks.region.buffer) }
                 if let q = hc.wQUpGate { resident.append(q.blocks.region.buffer) }
@@ -137,6 +141,7 @@ extension QWEngineDriver {
         for buf in arena.allBuffers { enc.useResource(buf, usage: [.read, .write]) }
         if let lsa = lsaOperator { enc.useResource(lsa.region.buffer, usage: [.read, .write]) }
         if let mla = mlaOperator { enc.useResource(mla.region.buffer, usage: [.read, .write]) }
+        if let mbsa = mbsaOperator { enc.useResource(mbsa.region.buffer, usage: [.read, .write]) }
         if let hca = hcaOperator { enc.useResource(hca.region.buffer, usage: [.read, .write]) }
         if let hcaLsa = hcaLsaBuffer { enc.useResource(hcaLsa, usage: .read) }
         if let echo = echoDrafter { enc.useResource(echo.region.buffer, usage: [.read, .write]) }
@@ -164,6 +169,7 @@ extension QWEngineDriver {
             if let a = lw.attn {
                 enc.useResource(a.qkvProj.blocks.region.buffer, usage: .read)
                 enc.useResource(a.o.blocks.region.buffer, usage: .read)
+                if let q = a.mbsa?.qkvIdxProj { enc.useResource(q.blocks.region.buffer, usage: .read) }
             }
             if let hc = lw.hca {
                 if let f = hc.wFusedIn { enc.useResource(f.blocks.region.buffer, usage: .read) }

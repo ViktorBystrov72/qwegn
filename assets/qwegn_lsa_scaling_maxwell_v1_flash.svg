@@ -1,0 +1,205 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 828" width="1000" height="828">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#050811"/><stop offset="55%" stop-color="#0a1022"/><stop offset="100%" stop-color="#050811"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#11192e" stop-opacity="0.96"/><stop offset="100%" stop-color="#0b1020" stop-opacity="0.98"/>
+    </linearGradient>
+    <linearGradient id="aCy" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.28"/><stop offset="100%" stop-color="#38bdf8" stop-opacity="0.0"/>
+    </linearGradient>
+    <linearGradient id="aPu" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#c084fc" stop-opacity="0.22"/><stop offset="100%" stop-color="#c084fc" stop-opacity="0.0"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <style>
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif; }
+    .mono { font-family: "SF Mono", Menlo, Monaco, Consolas, monospace; }
+  </style>
+
+  <rect width="1000" height="828" rx="20" fill="url(#bg)" stroke="#1e293b" stroke-width="2"/>
+  <rect x="0" y="0" width="1000" height="5" fill="#818cf8" opacity="0.92"/>
+
+  <g transform="translate(28, 22)">
+    <rect x="0" y="0" width="408" height="28" rx="14" fill="#1c1936" stroke="#818cf8" stroke-width="1.2"/>
+    <text x="204.0" y="18.6" text-anchor="middle" class="mono" font-size="12.5" font-weight="700" fill="#c7d2fe" letter-spacing="0.3">MBSA SPARSE ATTENTION &amp; UMA SCALING · MAXWELL-V1</text>
+    <text x="0" y="64" class="sans" font-size="28" font-weight="800" fill="#f8fafc">Maxwell-V1-Flash (HQ8_G32 + SHVQ3/4_G64)</text>
+    <text x="0" y="90" class="mono" font-size="13" fill="#cbd5e1">45L All-MBSA MoE (256 exp top-12 + shared) · 4× Sinkhorn-20 mHC · 17.18 GiB QWP</text>
+  </g>
+
+  <g transform="translate(772, 20)">
+    <rect width="200" height="58" rx="13" fill="#0b1222" stroke="#334155" stroke-width="1.3"/>
+    <rect x="11" y="11" width="36" height="36" rx="9" fill="url(#mark)"/>
+    <text x="29" y="36" text-anchor="middle" class="sans" font-size="21" font-weight="900" fill="#04110c">Q</text>
+    <text x="56" y="29" class="sans" font-size="21" font-weight="800" fill="#f8fafc">Qwegn</text>
+    <text x="56" y="46" class="mono" font-size="11.5" font-weight="700" fill="#94a3b8">SWIFT 6.2 · METAL 4</text>
+  </g>
+
+  <g transform="translate(28, 142)">
+    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#38bdf8" stroke-opacity="0.52" stroke-width="1.2"/>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#7dd3fc">5,324 tok/s</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">Prefill @2K–4K (4,664 @5.4K)</text>
+  </g>
+  <g transform="translate(268, 142)">
+    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#10b981" stroke-opacity="0.52" stroke-width="1.2"/>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#6ee7b7">210.5 tok/s</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">Hybrid MTP-5 (102.3 serve)</text>
+  </g>
+  <g transform="translate(508, 142)">
+    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#818cf8" stroke-opacity="0.52" stroke-width="1.2"/>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#c7d2fe">0.0055 KLD</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">vs BF16 (100% top-1 · 3.84 bpw)</text>
+  </g>
+  <g transform="translate(748, 142)">
+    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#a855f7" stroke-opacity="0.52" stroke-width="1.2"/>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#e9d5ff">19.3 GiB · 3/3</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">64K q4 RAM &amp; needle recall</text>
+  </g>
+
+  <g transform="translate(28, 230)">
+    <rect width="460" height="384" rx="14" fill="url(#card)" stroke="#1e293b" stroke-width="1.4"/>
+    <text x="20" y="32" class="sans" font-size="15" font-weight="800" fill="#f8fafc" letter-spacing="0.2">PREFILL PROFILE (512 – 64K TOKENS)</text>
+    <rect x="372" y="15" width="68" height="22" rx="6" fill="#0b1324" stroke="#334155" stroke-width="1"/>
+    <text x="406" y="30" text-anchor="middle" class="mono" font-size="11.5" fill="#94a3b8">tok/s</text>
+    <line x1="68.0" y1="322.0" x2="424.0" y2="322.0" stroke="#475569" stroke-width="1.4"/>
+    <line x1="68.0" y1="82.0" x2="68.0" y2="322.0" stroke="#475569" stroke-width="1.4"/>
+    <text x="58.0" y="326.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">0</text>
+    <line x1="68.0" y1="262.0" x2="424.0" y2="262.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="266.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">1.5k</text>
+    <line x1="68.0" y1="202.0" x2="424.0" y2="202.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="206.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">3.0k</text>
+    <line x1="68.0" y1="142.0" x2="424.0" y2="142.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="146.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">4.5k</text>
+    <line x1="68.0" y1="82.0" x2="424.0" y2="82.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="86.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">6.0k</text>
+    <line x1="68.0" y1="322.0" x2="68.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="68.0" y="345.0" text-anchor="middle" class="mono" font-size="11.5" fill="#cbd5e1">512</text>
+    <line x1="127.3" y1="322.0" x2="127.3" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="127.3" y="345.0" text-anchor="middle" class="mono" font-size="11.5" fill="#6ee7b7">2K</text>
+    <line x1="186.7" y1="322.0" x2="186.7" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="186.7" y="345.0" text-anchor="middle" class="mono" font-size="11.5" fill="#6ee7b7">4K</text>
+    <line x1="246.0" y1="322.0" x2="246.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="246.0" y="345.0" text-anchor="middle" class="mono" font-size="11.5" fill="#cbd5e1">8K</text>
+    <line x1="305.3" y1="322.0" x2="305.3" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="305.3" y="345.0" text-anchor="middle" class="mono" font-size="11.5" fill="#cbd5e1">16K</text>
+    <line x1="364.7" y1="322.0" x2="364.7" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="364.7" y="345.0" text-anchor="middle" class="mono" font-size="11.5" fill="#cbd5e1">32K</text>
+    <line x1="424.0" y1="322.0" x2="424.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="424.0" y="345.0" text-anchor="middle" class="mono" font-size="11.5" fill="#6ee7b7">64K</text>
+    <text x="246.0" y="370.0" text-anchor="middle" class="mono" font-size="11" fill="#64748b">PROMPT CONTEXT TOKENS</text>
+
+    <polygon points="68.0,164.3 127.3,109.0 186.7,109.0 246.0,159.3 305.3,204.3 364.7,238.1 424.0,257.2 424.0,322.0 68.0,322.0" fill="url(#aCy)"/>
+    <polyline points="68.0,164.3 127.3,109.0 186.7,109.0 246.0,159.3 305.3,204.3 364.7,238.1 424.0,257.2" fill="none" stroke="#38bdf8" stroke-width="3.2" stroke-linejoin="round" stroke-linecap="round"/>
+
+    <polygon points="68.0,157.8 74.5,164.3 68.0,170.8 61.5,164.3" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <polygon points="127.3,102.5 133.8,109.0 127.3,115.5 120.8,109.0" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <polygon points="186.7,102.5 193.2,109.0 186.7,115.5 180.2,109.0" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <polygon points="246.0,152.8 252.5,159.3 246.0,165.8 239.5,159.3" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <polygon points="305.3,197.8 311.8,204.3 305.3,210.8 298.8,204.3" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <polygon points="364.7,231.6 371.2,238.1 364.7,244.6 358.2,238.1" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <polygon points="424.0,250.7 430.5,257.2 424.0,263.7 417.5,257.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+
+    <text x="72.0" y="188.0" text-anchor="start" class="mono" font-size="11" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">3,943</text>
+    <text x="72.0" y="188.0" text-anchor="start" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">3,943</text>
+
+    <text x="157.0" y="95.0" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">5,324 pk (2K–4K)</text>
+    <text x="157.0" y="95.0" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="#6ee7b7">5,324 pk (2K–4K)</text>
+
+    <text x="254.0" y="150.0" text-anchor="start" class="mono" font-size="11" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">4,067</text>
+    <text x="254.0" y="150.0" text-anchor="start" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">4,067</text>
+
+    <text x="313.0" y="194.0" text-anchor="start" class="mono" font-size="11" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">2,943 (3/3)</text>
+    <text x="313.0" y="194.0" text-anchor="start" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">2,943 (3/3)</text>
+
+    <text x="358.0" y="264.0" text-anchor="end" class="mono" font-size="11" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">2,097</text>
+    <text x="358.0" y="264.0" text-anchor="end" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">2,097</text>
+
+    <text x="424.0" y="238.0" text-anchor="end" class="mono" font-size="11" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">1,620 (3/3)</text>
+    <text x="424.0" y="238.0" text-anchor="end" class="mono" font-size="11" font-weight="800" fill="#34d399">1,620 (3/3)</text>
+  </g>
+
+  <g transform="translate(512, 230)">
+    <rect width="460" height="384" rx="14" fill="url(#card)" stroke="#1e293b" stroke-width="1.4"/>
+    <text x="20" y="32" class="sans" font-size="15" font-weight="800" fill="#f8fafc" letter-spacing="0.2">UMA MEMORY BUDGET (4K – 128K)</text>
+    <rect x="372" y="15" width="68" height="22" rx="6" fill="#0b1324" stroke="#334155" stroke-width="1"/>
+    <text x="406" y="30" text-anchor="middle" class="mono" font-size="11.5" fill="#94a3b8">GiB</text>
+    <line x1="68.0" y1="322.0" x2="424.0" y2="322.0" stroke="#475569" stroke-width="1.4"/>
+    <line x1="68.0" y1="82.0" x2="68.0" y2="322.0" stroke="#475569" stroke-width="1.4"/>
+    <text x="58.0" y="326.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">0</text>
+    <line x1="68.0" y1="262.0" x2="424.0" y2="262.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="266.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">10</text>
+    <line x1="68.0" y1="202.0" x2="424.0" y2="202.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="206.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">20</text>
+    <line x1="68.0" y1="142.0" x2="424.0" y2="142.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="146.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">30</text>
+    <line x1="68.0" y1="82.0" x2="424.0" y2="82.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="86.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">40</text>
+
+    <line x1="68.0" y1="223.5" x2="424.0" y2="223.5" stroke="#10b981" stroke-opacity="0.7" stroke-width="1.4" stroke-dasharray="4 4"/>
+    <text x="424.0" y="241.0" text-anchor="end" class="mono" font-size="11" fill="#6ee7b7">16.41 GiB QWP weights (0 swap)</text>
+
+    <line x1="68.0" y1="322.0" x2="68.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="68.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">4K</text>
+    <line x1="186.7" y1="322.0" x2="186.7" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="186.7" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">32K</text>
+    <line x1="305.3" y1="322.0" x2="305.3" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="305.3" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">64K</text>
+    <line x1="424.0" y1="322.0" x2="424.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="424.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#c084fc">128K</text>
+    <text x="246.0" y="370.0" text-anchor="middle" class="mono" font-size="11" fill="#64748b">CONTEXT CAPACITY &amp; KV RESIDENCY</text>
+
+    <polygon points="68.0,219.4 186.7,208.3 305.3,206.3 424.0,187.3 424.0,322.0 68.0,322.0" fill="url(#aPu)"/>
+    <polyline points="68.0,219.4 186.7,208.3 305.3,206.3 424.0,187.3" fill="none" stroke="#c084fc" stroke-width="3.2" stroke-linejoin="round" stroke-linecap="round"/>
+
+    <polygon points="68.0,212.9 74.5,219.4 68.0,225.9 61.5,219.4" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <polygon points="186.7,201.8 193.2,208.3 186.7,214.8 180.2,208.3" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <polygon points="305.3,199.8 311.8,206.3 305.3,212.8 298.8,206.3" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <polygon points="424.0,180.8 430.5,187.3 424.0,193.8 417.5,187.3" fill="#c084fc" stroke="#0b1220" stroke-width="1.2"/>
+
+    <circle cx="305.3" cy="180.9" r="5" fill="#fbbf24" stroke="#0b1220" stroke-width="1.2"/>
+    <text x="305.3" y="156.0" text-anchor="end" class="mono" font-size="11" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">23.5 GiB (f16)</text>
+    <text x="305.3" y="156.0" text-anchor="end" class="mono" font-size="11" font-weight="800" fill="#fde68a">23.5 GiB (f16)</text>
+
+    <text x="72.0" y="203.0" text-anchor="start" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">17.1 GiB</text>
+    <text x="72.0" y="203.0" text-anchor="start" class="mono" font-size="11.5" font-weight="800" fill="#7dd3fc">17.1 GiB</text>
+
+    <text x="186.7" y="191.0" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">19.0 GiB</text>
+    <text x="186.7" y="191.0" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="#7dd3fc">19.0 GiB</text>
+
+    <text x="305.3" y="200.0" text-anchor="end" class="mono" font-size="11" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">19.3 (q4)</text>
+    <text x="305.3" y="200.0" text-anchor="end" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">19.3 (q4)</text>
+
+    <text x="434.0" y="173.0" text-anchor="end" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">22.5 GiB (q4)</text>
+    <text x="434.0" y="173.0" text-anchor="end" class="mono" font-size="11.5" font-weight="800" fill="#e9d5ff">22.5 GiB (q4)</text>
+  </g>
+
+  <g transform="translate(28, 628)">
+    <rect width="944" height="54" rx="11" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
+    <line x1="20" y1="27" x2="50" y2="27" stroke="#38bdf8" stroke-width="3.2"/>
+    <text x="60" y="23" class="sans" font-size="13" font-weight="700" fill="#7dd3fc">HQ8_G32 + SHVQ3_G64 / SHVQ4_G64</text>
+    <text x="60" y="40" class="mono" font-size="11" fill="#94a3b8">17.18 GiB · 3.84 bpw · 0.0055 Teacher-KLD</text>
+    <line x1="336" y1="27" x2="366" y2="27" stroke="#10b981" stroke-width="3.2" stroke-dasharray="4 4"/>
+    <text x="376" y="23" class="sans" font-size="13" font-weight="700" fill="#6ee7b7">45L MBSA NAX + Split-K Decode</text>
+    <text x="376" y="40" class="mono" font-size="11" fill="#94a3b8">3/3 Needle 16K–64K · 0 steady allocs</text>
+    <line x1="652" y1="27" x2="682" y2="27" stroke="#c084fc" stroke-width="3.2"/>
+    <text x="692" y="23" class="sans" font-size="13" font-weight="700" fill="#e9d5ff">Async MTP-5 &amp; Compact q4 KV</text>
+    <text x="692" y="40" class="mono" font-size="11" fill="#94a3b8">210.5 tok/s spec · 36.5 KB/tok q4 KV</text>
+  </g>
+
+  <g transform="translate(28, 696)">
+    <rect width="944" height="62" rx="11" fill="#0a101f" stroke="#334155" stroke-width="1.2"/>
+    <rect x="14" y="13" width="96" height="36" rx="8" fill="#111c33" stroke="#818cf8" stroke-opacity="0.45" stroke-width="1"/>
+    <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#c7d2fe">M5 MAX</text>
+    <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
+    <text x="124" y="27" class="mono" font-size="12" font-weight="700" fill="#e2e8f0">Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
+    <text x="124" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.26.0 (Swift 6.2 &amp; Metal 4) · q4 KV · Temp 0 · 0 Steady Allocs</text>
+  </g>
+
+  <text x="500" y="782" text-anchor="middle" class="mono" font-size="12" fill="#94a3b8">Tiled-32 MBSA block selector + Apple10 NAX prefill preserve 3/3 passkey needle recall through 64K tokens.</text>
+  <text x="500" y="802" text-anchor="middle" class="mono" font-size="12" fill="#64748b">All 256 routed experts (top-12) across 42 MoE layers remain 100% resident in UMA with 17.1–22.5 GiB RSS.</text>
+</svg>

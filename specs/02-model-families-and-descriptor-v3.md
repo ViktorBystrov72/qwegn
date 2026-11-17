@@ -2,7 +2,7 @@
 
 > Normative specification for `QWModelDescriptor`, `QWModelRole`, `QWModelFamilyRegistry`, config-sourced geometry, and digest versioning (`Sources/Foundation/QWCore/`).
 
-## 1. Zero-Overload 11-Family Contract
+## 1. Zero-Overload 12-Family Contract
 Every HuggingFace `model_type` maps 1:1 through `QWModelFamilyRegistry` to an explicit `QWModelDescriptor.Family` case; no family case may be overloaded onto another architecture's traits or kernels. Unknown `model_type` strings throw `QWModelDescriptorError.unsupportedModelType`.
 
 | `QWModelDescriptor.Family` | `model_type` keys in `builtinSpecs` | Role / Key Architectural Traits |
@@ -13,6 +13,7 @@ Every HuggingFace `model_type` maps 1:1 through `QWModelFamilyRegistry` to an ex
 | `.senseNovaLoop` | `sensenova_loop`, `sensenova_loop_text` | Looped middle blocks (`LoopSettings`) + `MHCConfig` Sinkhorn mixing |
 | `.glm5Next` | `glm5_next`, `glm5_next_text` | Hybrid NoPE MLA (`HCAConfig`/`HybridMLAConfig`) + KDA, standard RMSNorm, sigmoid gate |
 | `.ernie55MoE` | `ernie5_5_moe`, `ernie5_5_moe_text` | Latent-MoE + HCA/MLA-DSA hybrid, standard RMSNorm, sigmoid gate |
+| `.maxwellMoE` | `maxwell_moe` | Block-sparse GQA (MBSA) + mHC + sigmoid MoE w/ F32 bias + dedicated mHC-MTP |
 | `.qwen3Dense` | `qwen3` | Standard HF/MLX dense Qwen3 (`defaultAttnOutputGate: false`) |
 | `.qwen3MoE` | `qwen3_moe` | Standard HF/MLX sparse MoE (`defaultAttnOutputGate: false`) |
 | `.qwen2Dense` | `qwen2` | Standard dense Qwen2 (`defaultAttnOutputGate: false`) |

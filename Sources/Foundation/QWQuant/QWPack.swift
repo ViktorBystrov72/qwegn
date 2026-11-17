@@ -103,7 +103,7 @@ public enum QWQuant {
                     let familyMatches = midFamily == descriptor.family
                         || isDrafterMid
                         || (midFamily == .qwen3MoE && descriptor.family == .qwen38MoE && (descriptor.numExperts ?? 0) > 0)
-                        || (midFamily == .qwen38Dense && [.qwen38MoE, .senseNovaLoop, .glm5Next, .ernie55MoE].contains(descriptor.family))
+                        || (midFamily == .qwen38Dense && [.qwen38MoE, .senseNovaLoop, .glm5Next, .ernie55MoE, .maxwellMoE].contains(descriptor.family))
                     guard familyMatches else {
                         throw QWQuantError.modelMismatch(pack: mid, expected: descriptor.family.rawValue)
                     }

@@ -62,6 +62,8 @@ public final class QWEngineDriver: @unchecked Sendable {
     let psoRMSNorm: any MTLComputePipelineState
     let psoRMSNormResidual: any MTLComputePipelineState
     let psoRMSNormResidualWide: any MTLComputePipelineState
+    let psoRMSNormResidualMoE: any MTLComputePipelineState
+    let psoRMSNormResidualMoEWide: any MTLComputePipelineState
     let psoHeadF16: any MTLComputePipelineState
     let psoGemmBatchedH16: any MTLComputePipelineState
     let psoGemmBatchedH16GdnInProj: any MTLComputePipelineState
@@ -208,6 +210,8 @@ public final class QWEngineDriver: @unchecked Sendable {
     public let lsaOperator: QWLSAOperator?
     /// Native NoPE / Decoupled-RoPE MLA + Key-Pool Indexer operator.
     public let mlaOperator: QWMLAAttnOperator?
+    /// Native Maxwell Block-Sparse GQA (MBSA) operator.
+    public let mbsaOperator: QWMBSAAttnOperator?
     /// Native Hybrid Compressed Attention (HCA) operator.
     public let hcaOperator: QWHCAAttnOperator?
     let hcaLsaBuffer: (any MTLBuffer)?
@@ -312,7 +316,10 @@ public final class QWEngineDriver: @unchecked Sendable {
         self.psoGEMVDxH16GdnInProjT4 = pipes.psoGEMVDxH16GdnInProjT4
         self.psoGEMVSiluPairH16 = pipes.psoGEMVSiluPairH16; self.psoFwht32 = pipes.psoFwht32
         self.psoRMSNorm = pipes.psoRMSNorm; self.psoRMSNormResidual = pipes.psoRMSNormResidual
-        self.psoRMSNormResidualWide = pipes.psoRMSNormResidualWide; self.psoHeadF16 = pipes.psoHeadF16
+        self.psoRMSNormResidualWide = pipes.psoRMSNormResidualWide
+        self.psoRMSNormResidualMoE = pipes.psoRMSNormResidualMoE
+        self.psoRMSNormResidualMoEWide = pipes.psoRMSNormResidualMoEWide
+        self.psoHeadF16 = pipes.psoHeadF16
         self.psoGemmBatchedH16 = pipes.psoGemmBatchedH16
         self.psoGemmBatchedH16GdnInProj = pipes.psoGemmBatchedH16GdnInProj
         self.psoSiluMulF16 = pipes.psoSiluMulF16; self.psoKVPagedWrite = pipes.psoKVPagedWrite
@@ -441,6 +448,9 @@ public final class QWEngineDriver: @unchecked Sendable {
             maxContext: budget.effectiveMaxTokens, maxPrefillChunk: chunkRows,
             lsaConfig: lsaConfig, extraAttnLayers: startup.mtpDrafts > 0 ? 1 : 0)
         self.mlaOperator = mlaOp
+        self.mbsaOperator = try QWMBSAAttnOperator.makeIfEnabled(
+            hal: prelimHal, geometry: geometry, attnLayers: attnL,
+            kvMode: kvMode, maxContext: budget.effectiveMaxTokens, maxPrefillChunk: chunkRows)
         self.hcaOperator = try QWHCAAttnOperator.makeIfEnabled(
             hal: prelimHal, geometry: geometry, hcaLayers: hcaL,
             maxContext: budget.effectiveMaxTokens, maxPrefillChunk: chunkRows,

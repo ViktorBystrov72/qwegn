@@ -20,7 +20,7 @@ import QWMTP
 
 extension QWEngineDriver {
     static func loadMTPWeights(_ L: inout WeightLoader, drafts: Int, geometry: QWModelGeometry) throws -> MTPWeights? {
-        guard drafts > 0, !geometry.mtpSharedLastLayer else { return nil }
+        guard drafts > 0, !geometry.mtpSharedLastLayer, !geometry.hasDedicatedMHCMTP else { return nil }
         if !L.hasTensor("mtp.pre_fc_norm_embedding.weight"),
            let nextN = try L.loadNextNMTPLayer(geometry: geometry),
            let attn = nextN.layer.attn {
@@ -200,8 +200,8 @@ extension QWEngineDriver {
         let qkv16 = QWTensorValue(region: gdnY16.region, offset: gdnY16.offset, shape: QWTensorShape([max(1, qkvC)], .f16))
         let z16 = QWTensorValue(region: gdnY16.region, offset: gdnY16.offset + qkvC * 2, shape: QWTensorShape([max(1, zC)], .f16))
 
-        let attnY = try tv(geometry.attnTotalN, .f32)
-        let attnY16 = try tv(geometry.attnTotalN, .f16)
+        let attnY = try tv(geometry.attnProjTotalN, .f32)
+        let attnY16 = try tv(geometry.attnProjTotalN, .f16)
         let q32 = QWTensorValue(region: attnY.region, offset: attnY.offset, shape: QWTensorShape([qOut], .f32))
         let k32 = QWTensorValue(region: attnY.region, offset: attnY.offset + geometry.attnKRow0 * 4, shape: QWTensorShape([kvE], .f32))
         let v32 = QWTensorValue(region: attnY.region, offset: attnY.offset + geometry.attnVRow0 * 4, shape: QWTensorShape([kvE], .f32))
@@ -298,7 +298,7 @@ extension QWEngineDriver {
 
         let wyElems = (!geometry.gdnVectorDecay && geometry.gdnLayerCount > 0 && maxT > 4096) ? (maxT * zC) : 0
         let pGdnY = try attnTv(geometry.gdnVectorDecay ? 0 : maxT * geometry.gdnTotalN, .f32)
-        let pAttnY16 = try attnTv(usesMLA ? 0 : maxT * geometry.attnTotalN, .f16)
+        let pAttnY16 = try attnTv(usesMLA ? 0 : maxT * geometry.attnProjTotalN, .f16)
         let pQkv16 = try attnTv(maxT * qkvC, .f16)
         let pZ16 = try attnTv(maxT * zC, .f16)
         let pBetas = try attnTv(maxT * gdnVH, .f32)

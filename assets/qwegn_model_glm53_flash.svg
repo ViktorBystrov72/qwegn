@@ -40,7 +40,7 @@
   <g transform="translate(28, 24)">
     <rect x="0.0" y="0.0" width="266" height="28" rx="14.0" fill="#361620" stroke="#e11d48" stroke-width="1.2"/>
     <circle cx="15.0" cy="14.0" r="4.5" fill="#fb7185"/>
-    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#fda4af" letter-spacing="0.25">QWEGN v0.20.5 · MODEL PROFILE</text>
+    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#fda4af" letter-spacing="0.25">QWEGN v0.26.0 · MODEL PROFILE</text>
     <rect x="276.0" y="0.0" width="420" height="28" rx="14.0" fill="#064e3b" stroke="#10b981" stroke-width="1.2"/>
     <text x="486.0" y="18.6" text-anchor="middle" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">321B TOTAL (18B ACT) · 100.6 GiB UMA RESIDENT</text>
     <text x="0" y="64" fill="#f8fafc" class="title" font-size="27">GLM-5.3-Flash (SHVQ4_G32 + SHVQ2/3_G64)</text>
@@ -86,9 +86,9 @@
     <rect width="288" height="268" rx="16" fill="url(#cardGrad)" stroke="#3a2346" stroke-width="1.4"/>
     <rect x="18.0" y="16.0" width="195" height="26" rx="13.0" fill="#33230c" stroke="#f59e0b" stroke-width="1.2"/>
     <text x="115.5" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#fde68a" letter-spacing="0.2">NEXTN SPECULATIVE</text>
-    <text x="18" y="90" fill="url(#amberGrad)" class="title mono" font-size="44">53.6</text>
+    <text x="18" y="90" fill="url(#amberGrad)" class="title mono" font-size="44">54.7</text>
     <text x="137.2" y="88" fill="#fbbf24" class="title mono" font-size="17">tok/s</text>
-    <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">Peak · 51.2 CLI · 48.9–50.7 Serve</text>
+    <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">Spec · 51.4 CLI · 50.8 Serve</text>
     <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">Exact Layer-45 NextN (1.98/step)</text>
     <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13.5">99.74% fidelity · 3/3 exact greedy</text>
     <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
@@ -124,6 +124,6 @@
     <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
     <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
     <text x="122" y="27" class="mono" font-size="11.5" font-weight="700" fill="#e2e8f0">Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
-    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.20.5 · q4 KV · Temp 0 · 0 Steady Allocs</text>
+    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.26.0 · q4 KV · Temp 0 · 0 Steady Allocs</text>
   </g>
 </svg>

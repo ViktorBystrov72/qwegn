@@ -118,6 +118,13 @@ public struct QWModelGeometry: Sendable, Equatable {
     public var usesNoPEMLA: Bool { descriptor.mlaUseNoPE && (descriptor.kvLoraRank ?? 0) > 0 }
     public var hcaConfig: QWModelDescriptor.HCAConfig? { descriptor.hcaConfig }
     public var hybridMLAConfig: QWModelDescriptor.HybridMLAConfig? { descriptor.hybridMLAConfig }
+    public var blockSparseGQAConfig: QWModelDescriptor.BlockSparseGQAConfig? { descriptor.blockSparseGQAConfig }
+    public var hasDedicatedMHCMTP: Bool {
+        descriptor.family == .maxwellMoE && descriptor.mtpLayers > 0 && !descriptor.mtpSharedLastLayer && descriptor.mhcConfig != nil
+    }
+    public var usesMultiStreamMTPHidden: Bool {
+        (mtpSharedLastLayer || hasDedicatedMHCMTP) && mhcConfig != nil
+    }
     public var usesDecoupledRopeMLA: Bool { descriptor.hybridMLAConfig?.decoupledRope == true }
     public var usesAnyMLA: Bool { usesNoPEMLA || descriptor.hybridMLAConfig != nil }
     public var usesLatentOrCompressedAttention: Bool { usesAnyMLA || descriptor.hcaConfig != nil }
@@ -149,6 +156,7 @@ public struct QWModelGeometry: Sendable, Equatable {
     public var attnKRow0: Int { qProjOut }
     public var attnVRow0: Int { qProjOut + kvChannels }
     public var attnTotalN: Int { qProjOut + 2 * kvChannels }
+    public var attnProjTotalN: Int { attnTotalN + (blockSparseGQAConfig != nil ? (kvHeads + 1) * headDim : 0) }
     public var partialRotaryFactor: Double { descriptor.partialRotaryFactor }
     public var rotaryDims: Int { descriptor.rotaryDims }
     public var lsaHeadSliceStart: Int { descriptor.lsaHeadSliceStart }

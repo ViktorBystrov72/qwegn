@@ -18,6 +18,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
         case senseNovaLoop = "sensenova_loop"
         case glm5Next = "glm5_next"
         case ernie55MoE = "ernie5_5_moe"
+        case maxwellMoE = "maxwell_moe"
         case qwen3Dense = "qwen3-dense"            // standard HF/MLX, dense MLP
         case qwen3MoE = "qwen3-moe"                // standard HF/MLX, sparse MoE
         case qwen2Dense = "qwen2-dense"
@@ -78,10 +79,12 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let mhcConfig: MHCConfig?
     public let hcaConfig: HCAConfig?
     public let hybridMLAConfig: HybridMLAConfig?
+    public let blockSparseGQAConfig: BlockSparseGQAConfig?
     public let activationKind: ActivationKind
     public let moeLatentSize: Int?
     public let latentMoeUseNorm: Bool
     public let moeSplitFeatureRouting: Bool
+    public let moeRouterEnableExpertBias: Bool
     public let routedScalingFactorLearnable: Bool
     public let multimaxHead: Bool
     public let mtpSharedLastLayer: Bool
@@ -198,7 +201,22 @@ public struct QWModelDescriptor: Sendable, Hashable {
 
     /// Resolved special token IDs for chat template framing, reasoning tags, and stop sets.
     public var specialTokens: QWModelSpecialTokens {
-        let stops = eosTokenIds.filter { $0 >= 0 && $0 < vocab }
+        var stops = eosTokenIds.filter { $0 >= 0 && $0 < vocab }
+        if family == .maxwellMoE {
+            let maxwellEnd = 200001
+            if maxwellEnd < vocab && !stops.contains(maxwellEnd) {
+                stops.append(maxwellEnd)
+            }
+            return QWModelSpecialTokens(
+                eosTokenId: eosTokenId,
+                imStartTokenId: 200000,
+                imEndTokenId: maxwellEnd,
+                thinkTokenId: 200006,
+                endThinkTokenId: 200007,
+                extraStopTokenIds: stops,
+                usesChatTemplateIds: true
+            )
+        }
         return QWModelSpecialTokens(eosTokenId: eosTokenId,
                                      extraStopTokenIds: stops,
                                      usesChatTemplateIds: usesChatTemplateIds)
@@ -267,10 +285,12 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 gdnSeparateConv: Bool = false,
                 hcaConfig: HCAConfig? = nil,
                 hybridMLAConfig: HybridMLAConfig? = nil,
+                blockSparseGQAConfig: BlockSparseGQAConfig? = nil,
                 activationKind: ActivationKind = .silu,
                 moeLatentSize: Int? = nil,
                 latentMoeUseNorm: Bool = false,
                 moeSplitFeatureRouting: Bool = false,
+                moeRouterEnableExpertBias: Bool = false,
                 routedScalingFactorLearnable: Bool = false,
                 multimaxHead: Bool = false,
                 mtpSharedLastLayer: Bool = false,
@@ -283,10 +303,12 @@ public struct QWModelDescriptor: Sendable, Hashable {
         self.mhcConfig = mhcConfig
         self.hcaConfig = hcaConfig
         self.hybridMLAConfig = hybridMLAConfig
+        self.blockSparseGQAConfig = blockSparseGQAConfig
         self.activationKind = activationKind
         self.moeLatentSize = moeLatentSize
         self.latentMoeUseNorm = latentMoeUseNorm
         self.moeSplitFeatureRouting = moeSplitFeatureRouting
+        self.moeRouterEnableExpertBias = moeRouterEnableExpertBias
         self.routedScalingFactorLearnable = routedScalingFactorLearnable
         self.multimaxHead = multimaxHead
         self.mtpSharedLastLayer = mtpSharedLastLayer
@@ -375,9 +397,9 @@ public struct QWModelDescriptor: Sendable, Hashable {
         return min(n, r)
     }
 
-    /// True when the MoE router applies an additive bias (`e_score_correction_bias`) for selection only.
+    /// True when the MoE router applies an additive bias (`e_score_correction_bias` or `expert_bias`) for selection only.
     public var hasBiasCorrectedRouter: Bool {
-        topkMethod == "noaux_tc"
+        topkMethod == "noaux_tc" || moeRouterEnableExpertBias
     }
 
     /// Return a copy of this descriptor overriding `residentExpertsPerLayer`.
@@ -422,9 +444,11 @@ public struct QWModelDescriptor: Sendable, Hashable {
             gdnVectorDecay: gdnVectorDecay, gdnLowRankDim: gdnLowRankDim,
             gdnGateLowerBound: gdnGateLowerBound, gdnSeparateConv: gdnSeparateConv,
             hcaConfig: hcaConfig, hybridMLAConfig: hybridMLAConfig,
+            blockSparseGQAConfig: blockSparseGQAConfig,
             activationKind: activationKind, moeLatentSize: moeLatentSize,
             latentMoeUseNorm: latentMoeUseNorm,
             moeSplitFeatureRouting: moeSplitFeatureRouting,
+            moeRouterEnableExpertBias: moeRouterEnableExpertBias,
             routedScalingFactorLearnable: routedScalingFactorLearnable,
             multimaxHead: multimaxHead, mtpSharedLastLayer: mtpSharedLastLayer,
             role: role
@@ -522,6 +546,9 @@ public struct QWModelDescriptor: Sendable, Hashable {
         f.append("mla=\(d.mlaUseNoPE ? 1 : 0),\(d.kvLoraRank ?? 0),\(d.qLoraRank ?? 0),\(d.hybridMLAConfig != nil ? 1 : 0)")
         f.append("loop=\(d.loopSettings.map { "\($0.start),\($0.end),\($0.evalCount)" } ?? "-")")
         f.append("mhc=\(d.mhcConfig.map { "\($0.start),\($0.end),\($0.streams),\($0.iterations)" } ?? "-")")
+        if let bsa = d.blockSparseGQAConfig {
+            f.append("bsa=\(bsa.blockSize),\(bsa.prefixBlocks),\(bsa.localBlocks),\(bsa.remoteBlocks)")
+        }
         if d.capabilities.contains(.vision) {
             f.append("vis=\(d.visDepth),\(d.visHidden),\(d.visHeads),\(d.visIntermediate),\(d.visPatch),\(d.visMerge),\(d.visPosEmbeds),\(d.visOut),\(d.imageTokenId),\(d.videoTokenId)")
         } else {

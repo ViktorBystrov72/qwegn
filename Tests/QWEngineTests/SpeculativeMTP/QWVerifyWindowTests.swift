@@ -57,7 +57,7 @@ final class QWVerifyWindowTests: XCTestCase {
         let head = try QWHead(hal: hal, geometry: .qwen38_27b)
         memset(weight.region.pointer.advanced(by: weight.offset), 0, weight.bytes)
         XCTAssertEqual(QWVerifyWindow.allocationBytes(geometry: QWTestGeometry.g27, rows: 3, gpuTargets: true) -
-            QWVerifyWindow.allocationBytes(geometry: QWTestGeometry.g27, rows: 3), 8704)
+            QWVerifyWindow.allocationBytes(geometry: QWTestGeometry.g27, rows: 3), 24_064)
         for rows in [2, 3] {
             let before = arena.activationsRegion().usedBytes
             let window = try QWVerifyWindow(geometry: QWTestGeometry.g27, allocator: arena.activationsRegion(), rows: rows,

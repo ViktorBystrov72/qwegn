@@ -62,49 +62,16 @@ extension QWEngineDriver {
         }
         let pos = session.position
         let pairs = QWMTPPromptSeeder.pairCount(position: pos, count: count)
-        if pairs >= 16 && count <= psc.maxChunk {
-            let H = geometry.hidden
+        if pairs >= 2 && count <= psc.maxChunk && geometry.hidden % 256 == 0 {
             guard let enc = cb.makeComputeCommandEncoder() else {
                 throw QWEngineDriverError.state("MTP batched seed encoder")
             }
+            hal.touchKeepAlive(enc)
             do {
-                let tStart = (pos == 0) ? 1 : 0
-                let concatBuf = prefixRows(psc.guRaw16, rows: pairs, cols: 2 * H, dt: .f16)
-                try QWNorm.encodeMTPPreFcNorm(enc, hal: hal,
-                                              embeddings: embeddings, hidden: hidden,
-                                              previous: previous,
-                                              gammaEmb: mtpWeights.preFcNormEmbedding,
-                                              gammaHid: mtpWeights.preFcNormHidden,
-                                              out: concatBuf,
-                                              tStart: tStart, pairs: pairs,
-                                              geometry: geometry)
-                let fcOutBuf = prefixRows(psc.o16, rows: pairs, cols: H, dt: .f16)
-                let ln1Buf = prefixRows(psc.dn16, rows: pairs, cols: H, dt: .f16)
-                gemmBatchedH16(enc, m: pairs, n: H, k: 2 * H, x: concatBuf, wQ4: mtpWeights.fc, y16: fcOutBuf)
-                try encodeRMSNormFast(enc, x: fcOutBuf, gamma: mtpWeights.inputNorm, out: ln1Buf, rows: pairs)
-                if let mla = mlaOperator, let mlaW = mtpWeights.mla {
-                    let latentN = geometry.qLoraRank + geometry.kvLoraRank + geometry.indexerHeadDim
-                    let latentBuf = prefixRows(mla.mlaLatentScratch, rows: pairs, cols: latentN, dt: .f16)
-                    gemmBatchedH16(enc, m: pairs, n: latentN, k: H, x: ln1Buf, wQ4: mtpWeights.qkvProj, y16: latentBuf)
-                    mla.encodeLatentPrepAndPool(
-                        enc, ln1: ln1Buf, mlaW: mlaW,
-                        kv: views, fullAttnLayer: attnLayers.count,
-                        pos0: cacheRows, rows: pairs)
-                } else {
-                    guard let wq = mtpWeights.wq, let wkTiled = mtpWeights.wkTiled else {
-                        throw QWEngineDriverError.state("MTP seeding Q/K norms are missing")
-                    }
-                    let qkvBuf = prefixRows(psc.attnY16, rows: pairs, cols: geometry.attnTotalN, dt: .f16)
-                    let qOutBuf = prefixRows(psc.attQR16, rows: pairs, cols: geometry.qProjOut, dt: .f16)
-                    let kOutBuf = prefixRows(psc.attKR16, rows: pairs, cols: geometry.kvChannels, dt: .f16)
-                    let vOutBuf = prefixRows(psc.attV16, rows: pairs, cols: geometry.kvChannels, dt: .f16)
-                    gemmBatchedH16(enc, m: pairs, n: geometry.attnTotalN, k: H, x: ln1Buf, wQ4: mtpWeights.qkvProj, y16: qkvBuf)
-                    try ropeApply.encodeExtractQK(enc, hal: hal, attnY: qkvBuf,
-                                                  qOut: qOutBuf, kOut: kOutBuf, vOut: vOutBuf,
-                                                  wq: wq, wk: wkTiled,
-                                                  positionStart: pos + tStart, count: pairs)
-                    encodePagedKVWrite(enc, kv: views, k: kOutBuf, v: vOutBuf, startPos: cacheRows, t: pairs)
-                }
+                try encodeBatchedMTPPairSeed(
+                    enc, mtpWeights: mtpWeights, embeddings: embeddings, hidden: hidden,
+                    previous: previous, pos: pos, tStart: pos == 0 ? 1 : 0,
+                    pairs: pairs, cacheRows: cacheRows, views: views)
             } catch {
                 enc.endEncoding()
                 throw error
@@ -113,6 +80,7 @@ extension QWEngineDriver {
             guard let blit = cb.makeBlitCommandEncoder() else {
                 throw QWEngineDriverError.state("MTP hidden retention encoder")
             }
+            let H = geometry.hidden
             blit.copy(from: hidden.region.buffer,
                       sourceOffset: hidden.region.base + hidden.offset + (count - 1) * H * 2,
                       to: previous.region.buffer,
@@ -124,6 +92,57 @@ extension QWEngineDriver {
         try QWMTPPromptSeeder.encodeChunk(cb, draft: mtpDraftEncoder, embeddings: embeddings,
                                           trunkHidden: hidden, previousHidden: previous,
                                           position: session.position, count: count, cacheRows: cacheRows, kv: views)
+    }
+
+    func encodeBatchedMTPPairSeed(
+        _ enc: any MTLComputeCommandEncoder,
+        mtpWeights: QWMTPDraftWeights,
+        embeddings: QWTensorValue,
+        hidden: QWTensorValue,
+        previous: QWTensorValue,
+        pos: Int,
+        tStart: Int,
+        pairs: Int,
+        cacheRows: Int,
+        views: (k: QWKVLayerView, v: QWKVLayerView)
+    ) throws {
+        let H = geometry.hidden
+        let concatBuf = prefixRows(psc.guRaw16, rows: pairs, cols: 2 * H, dt: .f16)
+        try QWNorm.encodeMTPPreFcNorm(enc, hal: hal,
+                                      embeddings: embeddings, hidden: hidden,
+                                      previous: previous,
+                                      gammaEmb: mtpWeights.preFcNormEmbedding,
+                                      gammaHid: mtpWeights.preFcNormHidden,
+                                      out: concatBuf,
+                                      tStart: tStart, pairs: pairs,
+                                      geometry: geometry)
+        let fcOutBuf = prefixRows(psc.o16, rows: pairs, cols: H, dt: .f16)
+        let ln1Buf = prefixRows(psc.dn16, rows: pairs, cols: H, dt: .f16)
+        gemmBatchedH16(enc, m: pairs, n: H, k: 2 * H, x: concatBuf, wQ4: mtpWeights.fc, y16: fcOutBuf)
+        try encodeRMSNormFast(enc, x: fcOutBuf, gamma: mtpWeights.inputNorm, out: ln1Buf, rows: pairs)
+        if let mla = mlaOperator, let mlaW = mtpWeights.mla {
+            let latentN = geometry.qLoraRank + geometry.kvLoraRank + geometry.indexerHeadDim
+            let latentBuf = prefixRows(mla.mlaLatentScratch, rows: pairs, cols: latentN, dt: .f16)
+            gemmBatchedH16(enc, m: pairs, n: latentN, k: H, x: ln1Buf, wQ4: mtpWeights.qkvProj, y16: latentBuf)
+            mla.encodeLatentPrepAndPool(
+                enc, ln1: ln1Buf, mlaW: mlaW,
+                kv: views, fullAttnLayer: attnLayers.count,
+                pos0: cacheRows, rows: pairs)
+        } else {
+            guard let wq = mtpWeights.wq, let wkTiled = mtpWeights.wkTiled else {
+                throw QWEngineDriverError.state("MTP seeding Q/K norms are missing")
+            }
+            let qkvBuf = prefixRows(psc.attnY16, rows: pairs, cols: geometry.attnTotalN, dt: .f16)
+            let qOutBuf = prefixRows(psc.attQR16, rows: pairs, cols: geometry.qProjOut, dt: .f16)
+            let kOutBuf = prefixRows(psc.attKR16, rows: pairs, cols: geometry.kvChannels, dt: .f16)
+            let vOutBuf = prefixRows(psc.attV16, rows: pairs, cols: geometry.kvChannels, dt: .f16)
+            gemmBatchedH16(enc, m: pairs, n: geometry.attnTotalN, k: H, x: ln1Buf, wQ4: mtpWeights.qkvProj, y16: qkvBuf)
+            try ropeApply.encodeExtractQK(enc, hal: hal, attnY: qkvBuf,
+                                          qOut: qOutBuf, kOut: kOutBuf, vOut: vOutBuf,
+                                          wq: wq, wk: wkTiled,
+                                          positionStart: pos + tStart, count: pairs)
+            encodePagedKVWrite(enc, kv: views, k: kOutBuf, v: vOutBuf, startPos: cacheRows, t: pairs)
+        }
     }
 
     private func encodeEchoSeeding(_ cb: any MTLCommandBuffer,
@@ -162,7 +181,7 @@ extension QWEngineDriver {
                 throw QWEngineDriverError.state("ECHO seed compute encoder")
             }
             do {
-                bindResidentResources(enc)
+                hal.touchKeepAlive(enc)
                 enc.useResource(echoDrafter.region.buffer, usage: [.read, .write])
                 var r0 = 0
                 while r0 < pairs {

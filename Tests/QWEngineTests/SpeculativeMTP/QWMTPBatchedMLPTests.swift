@@ -473,6 +473,68 @@ final class QWMTPBatchedMLPTests: XCTestCase {
             }
         }
     }
+
+    func testMaxwellMBSAIndexerProjectionAcceptedInHQ4AndAQ8() throws {
+        let cfg = """
+        {
+          "model_type": "maxwell_moe",
+          "hidden_size": 2048,
+          "intermediate_size": 6144,
+          "vocab_size": 2048,
+          "num_hidden_layers": 1,
+          "num_experts": 0,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 4,
+          "attention_head_size": 128,
+          "qk_layernorm": true,
+          "attention_variant": "block_sparse_gqa",
+          "block_sparse_gqa_indexer_n_heads": 4,
+          "block_sparse_gqa_indexer_head_dim": 128,
+          "block_sparse_gqa_block_size": 128,
+          "block_sparse_gqa_prefix_window_size": 1024,
+          "block_sparse_gqa_local_window_size": 1024,
+          "block_sparse_gqa_num_remote_blocks": 16,
+          "enable_hyper_connections": true,
+          "num_residual_streams": 4,
+          "mhc_sinkhorn_iterations": 20,
+          "rms_norm_eps": 1e-6,
+          "rope_theta": 20000000,
+          "max_position_embeddings": 8192,
+          "eos_token_id": 2
+        }
+        """.data(using: .utf8)!
+        let geom = QWModelGeometry(descriptor: try QWModelDescriptor.decode(configJSON: cfg))
+        let hal = try QWHal(geometry: geom)
+        let mbsaIdxCols = (geom.kvHeads + 1) * geom.headDim
+        let rows = 2
+        let arena = try QWArena(hal: hal, weights: 256, activations: 8 << 20, kv: 256, gdnStates: 256)
+        let alloc = arena.activationsRegion()
+        let batch = try QWMTPBatchedMLP(geometry: geom, hal: hal, allocator: alloc, rows: rows)
+        let input = try alloc.allocate(QWTensorShape([rows * geom.hidden], .f16))
+        let output = try alloc.allocate(QWTensorShape([rows * mbsaIdxCols], .f16))
+        let maxBlocksBytes = mbsaIdxCols * (geom.hidden / 32) * 36
+        let blkBuf = try XCTUnwrap(hal.device.makeBuffer(length: maxBlocksBytes, options: .storageModeShared))
+        let blkVal = QWTensorValue(region: QWMRegion(buffer: blkBuf, base: 0, length: maxBlocksBytes),
+                                   offset: 0, shape: QWTensorShape([maxBlocksBytes / 2], .f16))
+        let hq4W = try XCTUnwrap(QWWeightView(blocks: blkVal, n: mbsaIdxCols, k: geom.hidden, isRotated: true))
+        let aq8W = try XCTUnwrap(QWWeightView(blocks: blkVal, n: mbsaIdxCols, k: geom.hidden,
+                                              bits: 8, groupSize: 32, isRotated: true,
+                                              isIncumbentContainer: false, isSHVQ: false))
+
+        let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+        let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
+        do {
+            try batch.encodeProjection(enc, input: input, weight: hq4W, output: output, activeRows: rows)
+            try batch.encodeProjection(enc, input: input, weight: aq8W, output: output, activeRows: rows)
+        } catch {
+            enc.endEncoding()
+            throw error
+        }
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        XCTAssertEqual(cb.status, .completed)
+    }
 }
 
 private extension QWMTPBatchedMLP {

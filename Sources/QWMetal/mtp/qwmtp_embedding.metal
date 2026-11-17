@@ -7,12 +7,12 @@ kernel void qwg_mtp_embed_bf16(
     device half* output [[buffer(2)]],
     constant uint& vocabulary [[buffer(3)]],
     constant uint& hidden [[buffer(4)]],
-    uint i [[thread_position_in_grid]]) {
-    if (i >= hidden) return;
-    const int id = token[0];
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= hidden) return;
+    const int id = token[gid.y];
     // The host checks every retained token after completion. Invalid feedback
     // must not index the table while the rest of the command buffer drains.
-    output[i] = id >= 0 && uint(id) < vocabulary
-        ? half(as_type<float>(uint(table[ulong(id) * hidden + i]) << 16))
+    output[ulong(gid.y) * hidden + gid.x] = id >= 0 && uint(id) < vocabulary
+        ? half(as_type<float>(uint(table[ulong(id) * hidden + gid.x]) << 16))
         : half(0);
 }

@@ -340,7 +340,8 @@ extension QWLSAOperator {
         maxContext: Int,
         maxPrefillChunk: Int
     ) throws -> QWLSAOperator? {
-        guard lsaConfig.isEnabled && !geometry.usesAnyMLA && !attnLayers.isEmpty && geometry.lsaInputDim > 0 else { return nil }
+        guard lsaConfig.isEnabled && !geometry.usesAnyMLA && geometry.blockSparseGQAConfig == nil
+            && !attnLayers.isEmpty && geometry.lsaInputDim > 0 else { return nil }
         let sidecarURL = QWLSAConfig.resolveSidecarURL(packPath: packPath, explicitSidecarPath: lsaConfig.sidecarPath)
         let inDim = geometry.lsaInputDim
         var indexDim = QWLSAConfig.defaultIndexDim

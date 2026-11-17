@@ -38,7 +38,8 @@ extension QWEngineDriver {
                              stream: QWTensorValue, w: QWTensorValue, b: QWTensorValue,
                              gamma: QWTensorValue, controls: QWTensorValue,
                              out: QWTensorValue, rows: Int = 1,
-                             mergeBranchOut: QWTensorValue? = nil) throws {
+                             mergeBranchOut: QWTensorValue? = nil,
+                             moeBridge: (xRot32: QWTensorValue, xPlain32: QWTensorValue, skipRot32: Bool)? = nil) throws {
         try checkNormGeometry()
         guard let pso = psoMHCRouterNorm else {
             throw QWEngineDriverError.state("qwg_mhc_router_norm_f16 pipeline is absent")
@@ -51,7 +52,9 @@ extension QWEngineDriver {
         }
         enc.setComputePipelineState(pso)
         if let split = mhcSplit, rows <= QWMHCSplitRouter.maxRows {
-            let partialPSO = split.partial, finalizePSO = split.finalize, partials = split.partials
+            let partialPSO = split.partial
+            let finalizePSO = moeBridge != nil ? split.finalizeMoE : split.finalize
+            let partials = split.partials
             let parts = (hidden + 63) / 64
             enc.setComputePipelineState(partialPSO)
             enc.bindTensors(stream, w, controls, startIndex: 0)
@@ -66,10 +69,16 @@ extension QWEngineDriver {
             stream.bind(enc, index: 0)
             enc.setBuffer(partials, offset: 0, index: 1)
             enc.bindTensors(b, gamma, out, controls, startIndex: 2)
-            enc.setUInt32s(hidden, startIndex: 6)
+            var packedHidden = UInt32(hidden)
+            if let moeBridge, moeBridge.skipRot32 { packedHidden |= 0x8000_0000 }
+            enc.setBytes(&packedHidden, length: 4, index: 6)
             enc.setPod(geometry.rmsEps, index: 7)
             enc.setPod(preScale, index: 8)
             enc.setBytes(&iterations, length: 4, index: 9)
+            if let moeBridge {
+                moeBridge.xRot32.bind(enc, index: 10)
+                moeBridge.xPlain32.bind(enc, index: 11)
+            }
             enc.dispatchThreadgroups(MTLSize(width: (hidden + 255) / 256, height: rows, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             return
