@@ -54,26 +54,31 @@ extension QWHttpServer {
 
         let returnModelName = resolveReplyModelName(requested: req.model, strictNotFound: false) ?? self.actor.getModelName()
         let reqId = req.effectiveRequestId ?? "chatcmpl-\(UUID().uuidString.prefix(12))"
-        var extraHeaders = ["x-request-id: \(reqId)"]
+        var resolvedHeaders = ["x-request-id: \(reqId)"]
         if let sid = req.effectiveSessionId {
-            extraHeaders.append("x-session-id: \(sid)")
+            resolvedHeaders.append("x-session-id: \(sid)")
         }
+        let extraHeaders = resolvedHeaders
 
+        let serverConfig = self.actor.getConfig()
         let hasActiveTools = !(req.tools?.isEmpty ?? true) && !req.isToolChoiceNone
         let isConstrainedJson = (req.responseFormatType == "json_schema" || req.responseFormatType == "json_object")
             && !hasActiveTools
         let allowToolCalls = hasActiveTools
-        let allowReasoningTags = !isConstrainedJson
+        let (policyThink, _) = req.resolvedThinkingPolicy(
+            defaultEnableThinking: serverConfig.enableThinking,
+            defaultMaxTokens: serverConfig.maxTokens,
+            modelMaxLength: serverConfig.modelMaxLength
+        )
+        let shouldThink = policyThink && self.actor.supportsThinkingTags()
+        let allowReasoningTags = !isConstrainedJson || shouldThink
         let shouldStop = generationShouldStop(for: connection)
 
         if req.isStreaming {
-            sendSSEHeaders(connection, extraHeaders: extraHeaders)
-
-            let sseEncoder = JSONEncoder()
             let ssePrefix = Data("data: ".utf8)
             let sseSuffix = Data("\n\n".utf8)
-            func sendChunk(_ chunk: ChatCompletionChunk) {
-                if let chunkData = try? sseEncoder.encode(chunk) {
+            @Sendable func sendChunk(_ chunk: ChatCompletionChunk) {
+                if let chunkData = try? JSONEncoder().encode(chunk) {
                     var sseData = Data(capacity: ssePrefix.count + chunkData.count + sseSuffix.count)
                     sseData.append(ssePrefix)
                     sseData.append(chunkData)
@@ -82,10 +87,6 @@ extension QWHttpServer {
                 }
             }
 
-            sendChunk(ChatCompletionChunk(id: reqId, model: returnModelName, role: "assistant"))
-
-            let serverConfig = self.actor.getConfig()
-            let shouldThink = req.effectiveEnableThinking(defaultValue: serverConfig.enableThinking)
             let streamParser = QWChatStreamParser(
                 startsInReasoning: shouldThink,
                 allowToolCalls: allowToolCalls,
@@ -103,20 +104,54 @@ extension QWHttpServer {
             }
             let lpBox = StreamLogprobBox()
 
-            let (keepaliveGate, keepaliveTask) = startSSEKeepalive(connection: connection)
-            defer {
-                keepaliveGate.stop()
-                keepaliveTask.cancel()
+            final class StreamLifecycleBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var started = false
+                private var gate: QWStreamKeepaliveGate?
+                private var task: Task<Void, Never>?
+
+                var isStarted: Bool { lock.withLock { started } }
+
+                func markStarted(gate: QWStreamKeepaliveGate, task: Task<Void, Never>) {
+                    lock.withLock {
+                        started = true
+                        self.gate = gate
+                        self.task = task
+                    }
+                }
+
+                func stopKeepaliveIfRunning() {
+                    let t = lock.withLock { () -> Task<Void, Never>? in
+                        guard let g = gate, g.stopIfRunning() else { return nil }
+                        return task
+                    }
+                    t?.cancel()
+                }
+
+                func stopAll() {
+                    let (g, t) = lock.withLock { (gate, task) }
+                    g?.stop()
+                    t?.cancel()
+                }
             }
+            let lifecycleBox = StreamLifecycleBox()
+            defer { lifecycleBox.stopAll() }
 
             let result: ChatCompletionExecutionResult
             do {
                 result = try await self.actor.handleChatCompletion(
                     request: req,
+                    onStreamReady: { [weak self] in
+                        guard let self else { return }
+                        let readyShouldThink = policyThink && self.actor.supportsThinkingTags()
+                        streamParser.setStartsInReasoning(readyShouldThink, allowReasoningTags: !isConstrainedJson || readyShouldThink)
+                        self.sendSSEHeaders(connection, extraHeaders: extraHeaders)
+                        sendChunk(ChatCompletionChunk(id: reqId, model: returnModelName, role: "assistant"))
+                        let (gate, task) = self.startSSEKeepalive(connection: connection)
+                        lifecycleBox.markStarted(gate: gate, task: task)
+                    },
                     onToken: { tokenPiece in
-                        if keepaliveGate.stopIfRunning() {
-                            keepaliveTask.cancel()
-                        }
+                        lifecycleBox.stopKeepaliveIfRunning()
                         let deltas = streamParser.feed(tokenPiece)
                         for delta in deltas {
                             let chunkLP = lpBox.drain()
@@ -141,9 +176,13 @@ extension QWHttpServer {
                 )
             } catch {
                 if shouldStop() { return }
+                if !lifecycleBox.isStarted {
+                    self.sendChatError(connection, error: error, path: "/v1/chat/completions")
+                    return
+                }
                 self.logger.log(.error, "HTTP POST /v1/chat/completions (stream) failed: \(error)")
                 let errPayload = ServerErrorPayload(message: "\(error)", type: "server_error", code: 500)
-                if let errData = try? sseEncoder.encode(errPayload) {
+                if let errData = try? JSONEncoder().encode(errPayload) {
                     var sseErr = Data(capacity: ssePrefix.count + errData.count + sseSuffix.count)
                     sseErr.append(ssePrefix)
                     sseErr.append(errData)
@@ -208,7 +247,14 @@ extension QWHttpServer {
                 connection.cancel()
             }))
         } else {
-            let result = try await self.actor.handleChatCompletion(request: req, onToken: nil, shouldStop: shouldStop)
+            let result: ChatCompletionExecutionResult
+            do {
+                result = try await self.actor.handleChatCompletion(request: req, onToken: nil, shouldStop: shouldStop)
+            } catch {
+                if shouldStop() { return }
+                self.sendChatError(connection, error: error, path: "/v1/chat/completions")
+                return
+            }
             guard !shouldStop() else { return }
             let parsed = QWToolCallParser.parse(
                 text: result.content,
@@ -216,7 +262,7 @@ extension QWHttpServer {
                 startsInThinking: result.startsInThinking,
                 truncated: result.truncated,
                 allowToolCalls: allowToolCalls,
-                allowReasoningTags: allowReasoningTags
+                allowReasoningTags: !isConstrainedJson || result.startsInThinking
             )
             let effectiveCalls: [ToolCall]?
             if let calls = parsed.toolCalls, !calls.isEmpty {
@@ -238,6 +284,23 @@ extension QWHttpServer {
                 finishReason: parsed.finishReason
             )
             self.sendJsonResponse(connection, status: 200, object: resp, extraHeaders: extraHeaders)
+        }
+    }
+
+    func sendChatError(_ connection: NWConnection, error: any Error, path: String) {
+        if let ctxErr = error as? QWServerContextLengthError {
+            self.logger.log(.warn, "HTTP POST \(path) context length exceeded: \(ctxErr.description)")
+            self.sendOpenAIError(connection, status: 400, message: ctxErr.description,
+                                 type: "invalid_request_error", code: "context_length_exceeded")
+        } else if let mmErr = error as? QWMultimodalError {
+            self.logger.log(.warn, "HTTP POST \(path) bad multimodal request: \(mmErr)")
+            self.sendOpenAIError(connection, status: 400, message: "\(mmErr)", type: "invalid_request_error")
+        } else if error is QWJSONSchemaError || error is QWMetadataValidationError || error is QWChatTemplateError {
+            self.logger.log(.warn, "HTTP POST \(path) invalid request: \(error)")
+            self.sendOpenAIError(connection, status: 400, message: "\(error)", type: "invalid_request_error")
+        } else {
+            self.logger.log(.error, "HTTP POST \(path) failed: \(error)")
+            self.sendOpenAIError(connection, status: 500, message: "\(error)", type: "server_error")
         }
     }
 }

@@ -308,31 +308,37 @@ enum FNMTPChain {
 }
 
 extension FNGPUEngine {
+    @inline(__always)
+    static func resetRecurrentSlice(_ buffers: [QWTensorValue], parity: inout Int, arena: QWArena) {
+        if let first = buffers.first {
+            memset(arena.cpuPointer(of: first), 0, first.bytes)
+        }
+        parity = 0
+    }
+
+    static func wipeRecurrentLayer(gdn: FNGPUGDNMixer?, ple: FNGPUPLE?, arena: QWArena) {
+        if let g = gdn {
+            resetRecurrentSlice(g.states, parity: &g.stateParity, arena: arena)
+            resetRecurrentSlice(g.convState, parity: &g.convParity, arena: arena)
+        }
+        if let p = ple {
+            resetRecurrentSlice(p.history, parity: &p.parity, arena: arena)
+        }
+    }
+
     /// Wipes the recurrent state this session used: the GDN states, the PLE
     /// history, the attention KV rows above the water mark and the MTP's
     /// positions. The wipe belongs to the session, not to the engine.
     func wipeSessionState(overwriteTokens: Int = 0) {
         let activeCap = activeCapacity
         let used = min(activeCap, highWaterPos)
-        guard used > 0 else {
-            residentKVHistory.removeAll(keepingCapacity: true)
-            return
-        }
         let skipIdx = min(used, max(0, overwriteTokens))
         let skipBlocks = skipIdx / 4
         DispatchQueue.concurrentPerform(iterations: layerRecords.count) { idx in
             let rec = layerRecords[idx]
-            if let g = rec.gdn {
-                memset(arena.cpuPointer(of: g.states[0]), 0, g.states[0].bytes)
-                g.stateParity = 0
-                memset(arena.cpuPointer(of: g.convState[0]), 0, g.convState[0].bytes)
-                g.convParity = 0
-            }
-            if let p = rec.weights.ple {
-                memset(arena.cpuPointer(of: p.history[0]), 0, p.history[0].bytes)
-                p.parity = 0
-            }
-            if let a = rec.attnState {
+            // Recurrent/conv/PLE state at parity 0 must always clear even when highWaterPos == 0.
+            Self.wipeRecurrentLayer(gdn: rec.gdn, ple: rec.weights.ple, arena: arena)
+            if used > 0, let a = rec.attnState {
                 let cap = max(1, a.capacity)
                 let u = min(cap, used), s = min(cap, skipIdx)
                 if u > s {
@@ -351,10 +357,12 @@ extension FNGPUEngine {
                 }
             }
         }
-        if skipIdx > 0 {
-            mtp?.resetStateTail(from: max(0, skipIdx - 1), usedPositions: used)
-        } else {
-            mtp?.resetState(usedPositions: used)
+        if used > 0 {
+            if skipIdx > 0 {
+                mtp?.resetStateTail(from: max(0, skipIdx - 1), usedPositions: used)
+            } else {
+                mtp?.resetState(usedPositions: used)
+            }
         }
         highWaterPos = 0
         residentKVHistory.removeAll(keepingCapacity: true)

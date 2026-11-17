@@ -280,6 +280,7 @@ public struct ChatCompletionRequest: Codable, Sendable {
     public let enableThinking: Bool?
     public let reasoningEffort: String?
     public let reasoning: ReasoningConfig?
+    public let reasoningBudget: Int?
     public let chatTemplateKwargs: ChatTemplateKwargs?
     public let metadata: [String: String]?
     public let user: String?
@@ -316,6 +317,7 @@ public struct ChatCompletionRequest: Codable, Sendable {
         case enableThinking = "enable_thinking"
         case reasoningEffort = "reasoning_effort"
         case reasoning
+        case reasoningBudget = "reasoning_budget"
         case chatTemplateKwargs = "chat_template_kwargs"
         case metadata
         case user
@@ -352,6 +354,7 @@ public struct ChatCompletionRequest: Codable, Sendable {
         self.enableThinking = try container.decodeIfPresent(Bool.self, forKey: .enableThinking)
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
         self.reasoning = try container.decodeIfPresent(ReasoningConfig.self, forKey: .reasoning)
+        self.reasoningBudget = try container.decodeIfPresent(Int.self, forKey: .reasoningBudget)
         self.chatTemplateKwargs = try container.decodeIfPresent(ChatTemplateKwargs.self, forKey: .chatTemplateKwargs)
         self.user = try container.decodeIfPresent(String.self, forKey: .user)
         self.sessionId = try container.decodeIfPresent(String.self, forKey: .sessionId)
@@ -437,6 +440,7 @@ public struct ChatCompletionRequest: Codable, Sendable {
         try container.encodeIfPresent(enableThinking, forKey: .enableThinking)
         try container.encodeIfPresent(reasoningEffort, forKey: .reasoningEffort)
         try container.encodeIfPresent(reasoning, forKey: .reasoning)
+        try container.encodeIfPresent(reasoningBudget, forKey: .reasoningBudget)
         try container.encodeIfPresent(chatTemplateKwargs, forKey: .chatTemplateKwargs)
         try container.encodeIfPresent(metadata, forKey: .metadata)
         try container.encodeIfPresent(user, forKey: .user)
@@ -581,12 +585,14 @@ public struct ChatCompletionRequest: Codable, Sendable {
         Self.normalizeReasoningEffort(rawReasoningEffort, fallback: defaultValue)
     }
 
+    public var hasExplicitThinkingSetting: Bool {
+        enableThinking != nil || reasoningEffort != nil || reasoningBudget != nil
+            || chatTemplateKwargs?.enableThinking != nil || chatTemplateKwargs?.reasoningEffort != nil
+            || reasoning?.enabled != nil || reasoning?.effort != nil
+    }
+
     public func effectiveEnableThinking(defaultValue: Bool) -> Bool {
-        if isAssistantPrefill {
-            return false
-        }
-        // Structured output (`json_object` / `json_schema`) disables thinking unless explicitly enabled
-        // so the response starts directly with valid JSON without consuming max_tokens on `<think>`.
+        if isAssistantPrefill { return false }
         if let fmtType = responseFormatType, (fmtType == "json_object" || fmtType == "json_schema") {
             return enableThinking ?? chatTemplateKwargs?.enableThinking ?? reasoning?.enabled ?? false
         }
@@ -594,12 +600,27 @@ public struct ChatCompletionRequest: Codable, Sendable {
             return explicit
         }
         if let effort = rawReasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !effort.isEmpty {
-            if effort == "none" || effort == "off" || effort == "false" || effort == "disabled" || effort == "disable" {
-                return false
-            }
-            return true
+            return !(effort == "none" || effort == "off" || effort == "false" || effort == "disabled" || effort == "disable")
         }
+        if let budget = reasoningBudget { return budget > 0 }
         return defaultValue
+    }
+
+    public func resolvedThinkingPolicy(
+        defaultEnableThinking: Bool,
+        defaultMaxTokens: Int,
+        modelMaxLength: Int? = nil,
+        overrideMaxNewTokens: Int? = nil
+    ) -> (shouldThink: Bool, thinkingBudget: Int?) {
+        let initial = effectiveEnableThinking(defaultValue: defaultEnableThinking)
+        guard initial else { return (false, nil) }
+        let isJsonFormat = responseFormatType == "json_object" || responseFormatType == "json_schema"
+        if reasoningBudget == nil && (!hasExplicitThinkingSetting || isJsonFormat) {
+            let maxNew = max(0, overrideMaxNewTokens ?? maxTokens ?? maxCompletionTokens ?? modelMaxLength ?? defaultMaxTokens)
+            if maxNew <= 32 { return isJsonFormat ? (true, max(1, maxNew / 2)) : (false, nil) }
+            return (true, max(16, maxNew - min(256, max(16, maxNew / 4))))
+        }
+        return (true, reasoningBudget.map { max(0, $0) })
     }
 
     /// True when the final message in `messages` is an assistant text message to be continued in-place.

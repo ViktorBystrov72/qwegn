@@ -8,133 +8,53 @@ import QWVision
 /// like the Messages API answer: blocks, stop_reason, usage.
 extension QWHttpServer {
 
-    func handleMessages(connection: NWConnection, headers: [String: String] = [:], body: Data) async throws {
-        guard let parsed = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
-            sendAnthropicError(connection, status: 400, type: "invalid_request_error",
-                               message: "request body must be a JSON object")
+    func handleMessagesCountTokens(connection: NWConnection, headers: [String: String] = [:], body: Data) async throws {
+        guard let parsedReq = parseAnthropicRequest(connection: connection, headers: headers, body: body, requireMaxTokens: false) else {
             return
         }
-
-        guard let rawMessages = parsed["messages"] as? [[String: Any]], !rawMessages.isEmpty else {
-            sendAnthropicError(connection, status: 400, type: "invalid_request_error",
-                               message: "messages: expected required field present")
-            return
-        }
-
-        guard let maxTokens = (parsed["max_tokens"] as? Int) ?? (parsed["max_tokens"] as? NSNumber)?.intValue, maxTokens > 0 else {
-            sendAnthropicError(connection, status: 400, type: "invalid_request_error",
-                               message: "max_tokens: expect number greater than 0")
-            return
-        }
-
-        let requested = (parsed["model"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let replyModel = resolveReplyModelName(requested: requested, strictNotFound: true) else {
-            sendAnthropicError(connection, status: 404, type: "not_found_error",
-                               message: "model: model \"\(requested)\" not found")
-            return
-        }
-
-        var translated: [[String: Any]] = []
-        if let system = parsed["system"] as? String, !system.isEmpty {
-            translated.append(["role": "system", "content": system])
-        } else if let blocks = parsed["system"] as? [[String: Any]] {
-            let text = blocks.compactMap { block -> String? in
-                (block["type"] as? String) == "text" ? (block["text"] as? String) : nil
-            }.joined(separator: "\n")
-            if !text.isEmpty { translated.append(["role": "system", "content": text]) }
-        }
-        for msg in rawMessages {
-            translated.append(contentsOf: Self.translateAnthropicMessage(msg))
-        }
-
-        let thinkingDict = parsed["thinking"] as? [String: Any]
-        let thinkingType = (thinkingDict?["type"] as? String)?.lowercased()
-        let thinkingEnabled = (thinkingType == "enabled")
-
-        var payload: [String: Any] = [
-            "messages": translated,
-            "max_tokens": maxTokens,
-            "enable_thinking": thinkingEnabled,
-        ]
-        if !requested.isEmpty { payload["model"] = replyModel }
-        if (parsed["stream"] as? Bool) == true { payload["stream"] = true }
-        if let t = (parsed["temperature"] as? NSNumber)?.doubleValue { payload["temperature"] = t }
-        if let tp = (parsed["top_p"] as? NSNumber)?.doubleValue { payload["top_p"] = tp }
-        if let k = (parsed["top_k"] as? NSNumber)?.intValue { payload["top_k"] = k }
-        if let stop = parsed["stop_sequences"] as? [String], !stop.isEmpty { payload["stop"] = stop }
-        if let meta = parsed["metadata"] {
-            payload["metadata"] = meta
-            if let metaDict = meta as? [String: Any], let uid = metaDict["user_id"] as? String, !uid.isEmpty {
-                payload["user"] = uid
-            }
-        }
-        if let usr = parsed["user"] as? String, !usr.isEmpty { payload["user"] = usr }
-        for optKey in ["session_id", "prompt_cache_key", "cache_salt", "cache_prompt", "store"] {
-            if let v = parsed[optKey] { payload[optKey] = v }
-        }
-
-        if let rawTools = parsed["tools"] as? [[String: Any]], !rawTools.isEmpty {
-            let oaiTools: [[String: Any]] = rawTools.compactMap { t in
-                guard let name = t["name"] as? String, !name.isEmpty else { return nil }
-                var fn: [String: Any] = ["name": name]
-                if let desc = t["description"] as? String { fn["description"] = desc }
-                if let schema = t["input_schema"] { fn["parameters"] = schema }
-                return ["type": "function", "function": fn]
-            }
-            if !oaiTools.isEmpty { payload["tools"] = oaiTools }
-        }
-
-        if let tc = parsed["tool_choice"] as? [String: Any] {
-            let tcType = (tc["type"] as? String ?? "auto").lowercased()
-            switch tcType {
-            case "none":
-                payload["tool_choice"] = "none"
-            case "any", "required":
-                payload["tool_choice"] = "required"
-            case "tool":
-                if let name = tc["name"] as? String, !name.isEmpty {
-                    payload["tool_choice"] = ["type": "function", "function": ["name": name]]
-                }
-            default:
-                payload["tool_choice"] = "auto"
-            }
-            if (tc["disable_parallel_tool_use"] as? Bool) == true {
-                payload["parallel_tool_calls"] = false
-            }
-        }
-
-        var req: ChatCompletionRequest
         do {
-            req = try JSONDecoder().decode(ChatCompletionRequest.self,
-                                           from: JSONSerialization.data(withJSONObject: payload))
-            req.httpHeaders = headers
-            try req.validateMetadata()
+            let count = try await actor.countChatPromptTokens(request: parsedReq.req)
+            let payload: [String: Any] = ["input_tokens": count]
+            let data = try JSONSerialization.data(withJSONObject: payload)
+            sendRawData(connection, status: 200, contentType: "application/json", data: data)
         } catch {
-            sendAnthropicError(connection, status: 400, type: "invalid_request_error",
-                               message: "body: \(error)")
+            sendAnthropicCaughtError(connection, error: error)
+        }
+    }
+
+    func handleMessages(connection: NWConnection, headers: [String: String] = [:], body: Data) async throws {
+        guard let parsedReq = parseAnthropicRequest(connection: connection, headers: headers, body: body, requireMaxTokens: true) else {
             return
         }
+        let req = parsedReq.req
+        let replyModel = parsedReq.replyModel
+        let thinkingEnabled = parsedReq.thinkingEnabled
 
         let msgId = req.effectiveRequestId ?? ("msg_" + UUID().uuidString.replacingOccurrences(of: "-", with: ""))
-        var extraHeaders = ["x-request-id: \(msgId)"]
+        var hdrs = ["x-request-id: \(msgId)"]
         if let sid = req.effectiveSessionId {
-            extraHeaders.append("x-session-id: \(sid)")
+            hdrs.append("x-session-id: \(sid)")
         }
+        let extraHeaders = hdrs
         let hasActiveTools = !(req.tools?.isEmpty ?? true) && !req.isToolChoiceNone
-        let shouldThink = req.effectiveEnableThinking(defaultValue: thinkingEnabled)
+        let serverConfig = actor.getConfig()
+        let (shouldThink, _) = req.resolvedThinkingPolicy(
+            defaultEnableThinking: thinkingEnabled,
+            defaultMaxTokens: serverConfig.maxTokens,
+            modelMaxLength: serverConfig.modelMaxLength
+        )
         let shouldStop = generationShouldStop(for: connection)
 
-        do {
-            try self.actor.validateRequestCapabilities(req)
-        } catch {
-            sendAnthropicError(connection, status: 400, type: "invalid_request_error", message: "\(error)")
-            return
-        }
+        if req.isStreaming {
+            final class StreamStartedBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var started = false
+                var isStarted: Bool { lock.withLock { started } }
+                func markStarted() { lock.withLock { started = true } }
+            }
+            let startedBox = StreamStartedBox()
 
-        if (payload["stream"] as? Bool) == true {
-            sendSSEHeaders(connection, extraHeaders: extraHeaders)
-
-            func sendEvent(_ event: String, _ json: [String: Any]) {
+            @Sendable func sendEvent(_ event: String, _ json: [String: Any]) {
                 guard let data = try? JSONSerialization.data(withJSONObject: json) else { return }
                 let head = Data("event: \(event)\ndata: ".utf8)
                 var out = Data(capacity: head.count + data.count + 2)
@@ -144,18 +64,10 @@ extension QWHttpServer {
                 connection.send(content: out, isComplete: false, completion: .idempotent)
             }
 
-            sendEvent("message_start", [
-                "type": "message_start",
-                "message": [
-                    "id": msgId, "type": "message", "role": "assistant", "model": replyModel,
-                    "content": [Any](),
-                    "stop_reason": NSNull(), "stop_sequence": NSNull(),
-                    "usage": ["input_tokens": 0, "output_tokens": 0],
-                ] as [String: Any],
-            ])
-            sendEvent("ping", ["type": "ping"])
-
-            let streamParser = QWChatStreamParser(startsInReasoning: shouldThink, allowToolCalls: hasActiveTools)
+            let streamParser = QWChatStreamParser(
+                startsInReasoning: shouldThink && actor.supportsThinkingTags(),
+                allowToolCalls: hasActiveTools
+            )
 
             final class StreamBlockState: @unchecked Sendable {
                 var openBlockType: String? = nil
@@ -211,11 +123,35 @@ extension QWHttpServer {
 
             let result: ChatCompletionExecutionResult
             do {
-                result = try await actor.handleChatCompletion(request: req, onToken: { piece in
-                    for d in streamParser.feed(piece) { emitDelta(d) }
-                }, shouldStop: shouldStop)
+                result = try await actor.handleChatCompletion(
+                    request: req,
+                    onStreamReady: { [weak self] in
+                        guard let self else { return }
+                        streamParser.setStartsInReasoning(shouldThink && self.actor.supportsThinkingTags())
+                        self.sendSSEHeaders(connection, extraHeaders: extraHeaders)
+                        startedBox.markStarted()
+                        sendEvent("message_start", [
+                            "type": "message_start",
+                            "message": [
+                                "id": msgId, "type": "message", "role": "assistant", "model": replyModel,
+                                "content": [Any](),
+                                "stop_reason": NSNull(), "stop_sequence": NSNull(),
+                                "usage": ["input_tokens": 0, "output_tokens": 0],
+                            ] as [String: Any],
+                        ])
+                        sendEvent("ping", ["type": "ping"])
+                    },
+                    onToken: { piece in
+                        for d in streamParser.feed(piece) { emitDelta(d) }
+                    },
+                    shouldStop: shouldStop
+                )
             } catch {
                 if shouldStop() { return }
+                if !startedBox.isStarted {
+                    sendAnthropicCaughtError(connection, error: error)
+                    return
+                }
                 sendEvent("error", [
                     "type": "error",
                     "error": ["type": "api_error", "message": "\(error)"],
@@ -283,8 +219,9 @@ extension QWHttpServer {
             let result: ChatCompletionExecutionResult
             do {
                 result = try await actor.handleChatCompletion(request: req, onToken: nil, shouldStop: shouldStop)
-            } catch let mmErr as QWMultimodalError {
-                sendAnthropicError(connection, status: 400, type: "invalid_request_error", message: "\(mmErr)")
+            } catch {
+                if shouldStop() { return }
+                sendAnthropicCaughtError(connection, error: error)
                 return
             }
             guard !shouldStop() else { return }
@@ -508,5 +445,140 @@ extension QWHttpServer {
         } else {
             sendSimpleResponse(connection, status: status, body: message)
         }
+    }
+
+    private func sendAnthropicCaughtError(_ connection: NWConnection, error: any Error) {
+        if let ctxErr = error as? QWServerContextLengthError {
+            sendAnthropicError(connection, status: 400, type: "invalid_request_error", message: ctxErr.description)
+        } else if error is QWMultimodalError || error is QWJSONSchemaError
+                    || error is QWMetadataValidationError || error is QWChatTemplateError
+                    || error is DecodingError {
+            sendAnthropicError(connection, status: 400, type: "invalid_request_error", message: "\(error)")
+        } else {
+            sendAnthropicError(connection, status: 500, type: "api_error", message: "\(error)")
+        }
+    }
+
+    private func parseAnthropicRequest(
+        connection: NWConnection,
+        headers: [String: String],
+        body: Data,
+        requireMaxTokens: Bool
+    ) -> (req: ChatCompletionRequest, replyModel: String, thinkingEnabled: Bool)? {
+        guard let parsed = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
+            sendAnthropicError(connection, status: 400, type: "invalid_request_error",
+                               message: "request body must be a JSON object")
+            return nil
+        }
+
+        guard let rawMessages = parsed["messages"] as? [[String: Any]], !rawMessages.isEmpty else {
+            sendAnthropicError(connection, status: 400, type: "invalid_request_error",
+                               message: "messages: expected required field present")
+            return nil
+        }
+
+        let maxTokens: Int
+        if requireMaxTokens {
+            guard let mt = (parsed["max_tokens"] as? Int) ?? (parsed["max_tokens"] as? NSNumber)?.intValue, mt > 0 else {
+                sendAnthropicError(connection, status: 400, type: "invalid_request_error",
+                                   message: "max_tokens: expect number greater than 0")
+                return nil
+            }
+            maxTokens = mt
+        } else {
+            maxTokens = (parsed["max_tokens"] as? Int) ?? (parsed["max_tokens"] as? NSNumber)?.intValue ?? 1
+        }
+
+        let requested = (parsed["model"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let replyModel = resolveReplyModelName(requested: requested, strictNotFound: true) else {
+            sendAnthropicError(connection, status: 404, type: "not_found_error",
+                               message: "model: model \"\(requested)\" not found")
+            return nil
+        }
+
+        var translated: [[String: Any]] = []
+        if let system = parsed["system"] as? String, !system.isEmpty {
+            translated.append(["role": "system", "content": system])
+        } else if let blocks = parsed["system"] as? [[String: Any]] {
+            let text = blocks.compactMap { block -> String? in
+                (block["type"] as? String) == "text" ? (block["text"] as? String) : nil
+            }.joined(separator: "\n")
+            if !text.isEmpty { translated.append(["role": "system", "content": text]) }
+        }
+        for msg in rawMessages {
+            translated.append(contentsOf: Self.translateAnthropicMessage(msg))
+        }
+
+        let thinkingDict = parsed["thinking"] as? [String: Any]
+        let thinkingType = (thinkingDict?["type"] as? String)?.lowercased()
+        let thinkingEnabled = (thinkingType == "enabled")
+
+        var payload: [String: Any] = [
+            "messages": translated,
+            "max_tokens": maxTokens,
+            "enable_thinking": thinkingEnabled,
+        ]
+        if thinkingEnabled,
+           let budget = (thinkingDict?["budget_tokens"] as? Int) ?? (thinkingDict?["budget_tokens"] as? NSNumber)?.intValue,
+           budget > 0 {
+            payload["reasoning_budget"] = budget
+        }
+        if !requested.isEmpty { payload["model"] = replyModel }
+        if requireMaxTokens, (parsed["stream"] as? Bool) == true { payload["stream"] = true }
+        if let t = (parsed["temperature"] as? NSNumber)?.doubleValue { payload["temperature"] = t }
+        if let tp = (parsed["top_p"] as? NSNumber)?.doubleValue { payload["top_p"] = tp }
+        if let k = (parsed["top_k"] as? NSNumber)?.intValue { payload["top_k"] = k }
+        if let stop = parsed["stop_sequences"] as? [String], !stop.isEmpty { payload["stop"] = stop }
+        if let meta = parsed["metadata"] {
+            payload["metadata"] = meta
+            if let metaDict = meta as? [String: Any], let uid = metaDict["user_id"] as? String, !uid.isEmpty {
+                payload["user"] = uid
+            }
+        }
+        if let usr = parsed["user"] as? String, !usr.isEmpty { payload["user"] = usr }
+        for optKey in ["session_id", "prompt_cache_key", "cache_salt", "cache_prompt", "store"] {
+            if let v = parsed[optKey] { payload[optKey] = v }
+        }
+
+        if let rawTools = parsed["tools"] as? [[String: Any]], !rawTools.isEmpty {
+            let oaiTools: [[String: Any]] = rawTools.compactMap { t in
+                guard let name = t["name"] as? String, !name.isEmpty else { return nil }
+                var fn: [String: Any] = ["name": name]
+                if let desc = t["description"] as? String { fn["description"] = desc }
+                if let schema = t["input_schema"] { fn["parameters"] = schema }
+                return ["type": "function", "function": fn]
+            }
+            if !oaiTools.isEmpty { payload["tools"] = oaiTools }
+        }
+
+        if let tc = parsed["tool_choice"] as? [String: Any] {
+            let tcType = (tc["type"] as? String ?? "auto").lowercased()
+            switch tcType {
+            case "none": payload["tool_choice"] = "none"
+            case "any", "required": payload["tool_choice"] = "required"
+            case "tool":
+                if let name = tc["name"] as? String, !name.isEmpty {
+                    payload["tool_choice"] = ["type": "function", "function": ["name": name]]
+                }
+            default: payload["tool_choice"] = "auto"
+            }
+            if (tc["disable_parallel_tool_use"] as? Bool) == true {
+                payload["parallel_tool_calls"] = false
+            }
+        }
+
+        var req: ChatCompletionRequest
+        do {
+            req = try JSONDecoder().decode(ChatCompletionRequest.self,
+                                           from: JSONSerialization.data(withJSONObject: payload))
+            req.httpHeaders = headers
+            try req.validateMetadata()
+            try self.actor.validateRequestCapabilities(req)
+        } catch {
+            sendAnthropicError(connection, status: 400, type: "invalid_request_error", message: "\(error)")
+            return nil
+        }
+
+        return (req, replyModel, thinkingEnabled)
     }
 }

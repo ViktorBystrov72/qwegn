@@ -185,17 +185,17 @@ final class QWTelemetryHonestyTests: XCTestCase {
     /// The intervals are deliberately uneven, so a running average cannot be
     /// mistaken for the median.
     func testTheDecodeRateComesFromTheInterTokenLatencies() throws {
+        // Inject deterministic timestamps so VM scheduler sleep jitter cannot collapse p50 vs mean.
+        let t0 = Date()
         let registry = QWEngineTelemetryRegistry()
-        registry.beginPrefill(promptTokens: 8)
-        registry.beginDecode(promptTokens: 8)
+        registry.beginPrefill(promptTokens: 8, at: t0)
+        registry.beginDecode(promptTokens: 8, at: t0)
         var intervals: [Double] = []
-        var last = Date()
+        var now = t0
         for wait in [0.01, 0.01, 0.01, 0.15, 0.15] {
-            Thread.sleep(forTimeInterval: wait)
-            let now = Date()
-            intervals.append(now.timeIntervalSince(last) * 1000.0)
-            last = now
-            registry.recordDecodeToken()
+            now = now.addingTimeInterval(wait)
+            intervals.append(wait * 1000.0)
+            registry.recordDecodeToken(at: now)
         }
         let sorted = intervals.sorted()
         let expected = 1000.0 / sorted[sorted.count / 2]

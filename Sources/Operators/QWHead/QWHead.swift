@@ -129,8 +129,10 @@ public final class QWHead {
         var n = UInt32(N), k = UInt32(hidden)
         enc.setBytes(&n, length: 4, index: 4)
         enc.setBytes(&k, length: 4, index: 5)
-        enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        let tgCount = M == 1 ? N : (N + 7) / 8
+        let tgThreads = M == 1 ? 32 : 128
+        enc.dispatchThreadgroups(MTLSize(width: tgCount, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: tgThreads, height: 1, depth: 1))
     }
 
     public func encode(_ enc: any MTLComputeCommandEncoder, storage: QWHeadStorage,

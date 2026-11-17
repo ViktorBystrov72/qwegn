@@ -138,13 +138,20 @@ public final class FlashNextModule: QWInferenceModule, @unchecked Sendable {
         let weightsBytes = max(512 << 20, onDisk.weightsBytes - dflashDelta.nativeMTPWeightBytes + dflashDelta.dflashWeightBytes) + onDisk.pleBytes
         let scratchBytes = (1408 << 20) + (836 << 20) + (isDFlash ? max(0, dflashDelta.dflashScratchBytes - (112 << 20)) : 0)
         let fixedBytes = weightsBytes + scratchBytes
-        let alignedCap = QWCapacityPlan.steppedCapacity(clampedContext)
-        let kvCap = alignedCap >= 32_768 ? (alignedCap + 1024) : alignedCap
-        let kvBytes = kvCap * perTokBytes
-        let requiredBytes = fixedBytes + kvBytes
         let reserveGiB = tuning.osReserveGiB ?? Double(QWCapacityBudget.osReserveBytes >> 30)
         let reserveBytes = max(0, Int((reserveGiB * Double(1 << 30)).rounded()))
         let availBytes = max(0, (physicalMemoryBytes ?? 0) - reserveBytes)
+        let alignedCap = QWCapacityPlan.steppedCapacity(clampedContext)
+        let kvCap = availBytes > 0
+            ? FNGPUEngine.resolveKVCapacity(
+                alignedCap: alignedCap,
+                fixedBytes: fixedBytes,
+                perTokenBytes: perTokBytes,
+                availableBytes: availBytes
+            )
+            : (alignedCap >= 4096 ? (alignedCap + 1024) : alignedCap)
+        let kvBytes = kvCap * perTokBytes
+        let requiredBytes = fixedBytes + kvBytes
         let maxFitting = availBytes > fixedBytes ? min(1_048_576, (availBytes - fixedBytes) / perTokBytes) : 0
         return QWContextMemoryEstimate(
             contextTokens: clampedContext, weightsBytes: weightsBytes, kvBytes: kvBytes,

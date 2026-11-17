@@ -8,6 +8,42 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.25.0] - 2026-11-17
+
+What's changed since `v0.24.1`: full OpenAI `/v1/responses` and legacy `/v1/completions` support, Anthropic `/v1/messages/count_tokens`, vLLM-compatible remote tokenizer endpoints, generalized `B = 2..4` continuous multi-session batching across all dense and hybrid MoE families (`219–942 ms` 4-stream worst TTFT vs `2,034–8,320 ms` in `v0.24.1`), universal `16K+` KV page-pressure & RoPE boundary stability (`8/8` flagship configurations passing vs `1/8` in `v0.24.1`), non-thinking/JSON reasoning parity, and GitHub Actions `macos-26` CI gating.
+
+### Added
+- **OpenAI `/v1/responses` & Stateful Background Execution (`QWHttpServer+Responses`, `QWServerSchema+OpenAIResponses`, `QWResponsesStore`)**:
+  - Added `POST /v1/responses`, `GET /v1/responses/:id`, and `DELETE /v1/responses/:id` with multi-turn `previous_response_id` state chaining, `background: true` asynchronous job execution (`QWResponsesStore` LRU cache), preserved streamed item IDs, tool calling, structured JSON schemas, and disconnect cancellation.
+- **OpenAI Legacy `/v1/completions`, Anthropic `/v1/messages/count_tokens` & Remote Tokenizer APIs (`QWHttpServer+Completions`, `QWEngineLifecycleActor+Completions`, `QWHttpServer+Anthropic`)**:
+  - Added `POST /v1/completions` with prompt `echo: true`, token `logprobs` (clamped at finite `-9999.0`), streaming SSE, and stop sequences for log-likelihood harnesses.
+  - Added `POST /v1/messages/count_tokens` for exact pre-flight Anthropic message, system, and tool-schema token accounting with structured HTTP `400` error mapping.
+  - Added vLLM-compatible `GET /tokenizer_info`, `POST /tokenize`, and `POST /detokenize` (plus `/v1/*` aliases backed by `QWTokenizer.piece(_:)` and `QWChatTemplate.rawSource`), enabling zero-workaround evaluation with `lm-evaluation-harness` (`local-completions`) and `inspect_ai` (`responses_api=true`) directly against `.qwp` model packs.
+- **Generalized Continuous Multi-Session Batching (`B = 2..4`) Across Standard `QWEngineDriver` (`QWBatchScheduler`, `DriverBatchDecode`, `QWDenseLayerKernels`, `QWHybridLayerKernels`)**:
+  - Generalized continuous multi-slot decode batching beyond `QWFlashNext` to all `DenseModule` and `HybridMoEModule` architectures (`Qwen3.8-27B`, `Qwen3.6-35B-A3B`, `SenseNova-Loop-9B-Preview`, `GLM-5.3-Flash`, `ERNIE-5.5-Flash-Base`) with per-slot `ropeRows` capacity alignment, ungated MoE shared-gate initialization, `fgbProj` prewarming, per-request speculation opt-out, and KV-pressure polling backoff — reducing 4-stream concurrent worst TTFT from `2,034–8,320 ms` (`v0.24.1`) to **`219–942 ms`**.
+- **Composable Thinking-Budget Constraint (`QWThinkingBudgetConstraint`, `QWChatTemplate.supportsThinkingTags`)**:
+  - Added `QWThinkingBudgetConstraint` to bound reasoning token budgets and inject closing `</think>` / `</ernie:think>` tags before `max_tokens` exhaustion while composing cleanly with `QWJSONConstraint` and `QWToolCallConstraint`.
+
+### Changed
+- **Low-Latency Streaming & Pre-Stream HTTP `400` Validation (`QWHttpServer`)**:
+  - Enabled `TCP_NODELAY` (`tcpOptions.noDelay = true`) on HTTP listeners to eliminate Nagle stalls on single-token SSE chunks, unified client-disconnect cancellation across `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/messages`, `/api/chat`, and `/api/generate` (`QWConnectionCancellationHub`), and moved malformed JSON, parameter-bound, schema, and context-window errors to pre-stream HTTP `400` responses (`sendJsonResponse`).
+- **Multi-Slot `DFlash 2` / `DSpine` Residency & Batched `F16` Head Tiling (`QWDFlashDrafter`, `QWMLAAttnOperator+DecoupledRoPE`, `qwhead_f16_batched.metal`)**:
+  - Parameterized `QWDFlashDrafter(..., sessionSlotCount:)` to match `DriverResidency.gdnSlotCount()` (`4` slots on `>= 32 GiB` UMA, `2` on `16 GiB`), added decoupled RoPE attention encode paths in `QWMLAAttnOperator`, and updated `qwhead_f16_batched.metal` to use `device` buffer bindings with row-paired 128-thread tiling within the AGX `32 KiB` constant-cache ceiling.
+
+### Fixed
+- **Non-Thinking Template Isolation & `/v1/responses` Structured-Output Parity (`QWChatTurnPreparer`, `QWServerSchema`, `QWHttpServer+*`)**:
+  - Guarded thinking tags, closing-tag injection, and reasoning constraints behind `QWChatTemplate.supportsThinkingTags` (`<think>` / `<ernie:think>`) across OpenAI Chat, Responses, and Anthropic handlers so base/non-thinking templates (`ERNIE-5.5-Flash-Base`) never enter phantom reasoning states.
+  - Prevented non-empty `reasoning.effort` on `/v1/responses` from synthesizing `enable_thinking: true` over JSON/structured-output requests, enforced `thinkingBudget` caps on initial structured-output turns (`resolvedThinkingPolicy`), synced `QWChatStreamParser.setStartsInReasoning(_:allowReasoningTags:)`, and preserved direct JSON brace slicing when `!shouldThink`.
+- **Concurrent Batch Recurrent State Hygiene (`FNGPUSession`, `FNGPUBatchScheduler`)**:
+  - Unconditionally cleared GDN recurrent states, convolution rings, PLE histories, and parities in `FNGPUSession.wipeSessionState(overwriteTokens:)` and `FNGPUBatchScheduler.cleanupExtraSlotsBeforeSingleMode()` even when `used == 0` / `highWaterPos == 0` (plus `slotStates[syncSlot].highWaterPos` sync after `syncSlotFromEngine`), eliminating inter-request recurrent state leaks under concurrent HTTP bursts.
+- **Universal `16K+` KV Page-Pressure Eviction, RoPE Boundary Step-Down & `.qwcache`-Safe Prefix Eviction (`QWKVCache`, `PrefixCache`, `FNPrefixCache`, `FNGPUEngine`)**:
+  - Added universal `QWKVCache` page-pressure eviction, greedy/speculative RoPE boundary step-down, and `+1024` KV token headroom (`alignedCap` in `[memory]`), while marking normal per-turn prefix cache entries `isSharedBase: false` so LRU headroom reclaim frees KV/RAM pages without evicting pinned `.qwcache` shared repository bases (`isSharedBase: true`) — fixing `7/8` `16K`-context failures seen in `v0.24.1`.
+- **GitHub Actions `macos-26` CI Fix & Bare-Metal GPU Test Gating (`QWTelemetryHonestyTests`, `QWEngineLifecycleTests`, `QWResponsesEndpointTests`, `Makefile`, `Tests/*`)**:
+  - Fixed the `v0.24.1` GitHub Actions `macos-26` CI failure in `QWTelemetryHonestyTests.testTheDecodeRateComesFromTheInterTokenLatencies` by replacing wall-clock `Thread.sleep` intervals with deterministic `recordDecodeToken(at:)` timestamps, synchronized `QWEngineLifecycleTests` loading-phase checks via `LoadGate` (`DispatchSemaphore` + `CheckedContinuation`), widened background job polling in `QWResponsesEndpointTests`, aligned `Makefile` `make test` with `Scripts/ci.sh` under `GITHUB_ACTIONS=true`, gated all `v0.25.0` Metal GPU tests on `GITHUB_ACTIONS != "true" && QWDeviceCaps.current?.familyApple9 == true`, and scoped live `~/.qwg/models` pack-scan tests to registered `QWModelFamilyRegistry` model types.
+- **M5 Max (`128 GB` UMA) Fleet & Zero-Workaround Qualification (`v0.24.1 -> v0.25.0`)**:
+  - **Zero-workaround external suites (`Qwen3.8-Flash-Next` default args, thinking on):** `llmprobe --full --no-bench` **`292/292 (100%)`** (`chat 98/98`, `responses 94/94`, `messages 90/90`, `count-tokens 3/3`, `completions 3/3`, `0` stampede disagreements), `promptfoo` **`8/8 (100%)`**, `inspect_evals/gpqa_diamond` (`responses_api=true`) **`0.800 ± 0.1333`** (`40/40`); `ERNIE-5.5-Flash-Base` `lm_eval` `piqa --limit 50` **`acc = 0.8800` / `acc_norm = 0.9000`** (`100/100`).
+  - **8-configuration fleet gate vs `v0.24.1`:** **`89/89 (100%)`** API conformance across all `7/7` instruct packs (up from `61/61` in `v0.24.1`), **`8/8` `16K` context pass** with `0` server errors (vs `1/8` in `v0.24.1`), **`219–942 ms`** 4-stream worst TTFT (vs `2,034–8,320 ms` on `6/8` in `v0.24.1`), paired CLI A/B non-regression (`0.9978x–1.0033x`, `0` steady-state allocations), **`9/9`** bit-exact `SHA-256` greedy determinism, **`8/8 (24/24 needles)`** `16K` 3-needle recall, and live `--load-vision` (`+1.725–1.738 GiB` server / `exit=2` CLI refusal) & `--stream-ngrams` (`+27.13 GiB` `Edge0-145B`) residency verification.
+
 ## [0.24.1] - 2026-11-17
 
 ### Added

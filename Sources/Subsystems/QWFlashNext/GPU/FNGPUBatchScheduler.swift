@@ -345,26 +345,51 @@ public final class FNGPUBatchScheduler: @unchecked Sendable {
         currentTotalSlots = totalSlots
     }
 
+    static func resetExtraSlotRecurrentStates(
+        slotStates: inout [FNBatchSlotState],
+        gdnFlags: [Bool],
+        pleFlags: [Bool],
+        arena: QWArena
+    ) {
+        guard slotStates.count > 1 else { return }
+        for s in 1..<slotStates.count {
+            for i in gdnFlags.indices where gdnFlags[i] {
+                FNGPUEngine.resetRecurrentSlice(slotStates[s].gdnStates[i], parity: &slotStates[s].gdnStateParity[i], arena: arena)
+                FNGPUEngine.resetRecurrentSlice(slotStates[s].gdnConvState[i], parity: &slotStates[s].gdnConvParity[i], arena: arena)
+            }
+            for i in pleFlags.indices where pleFlags[i] {
+                FNGPUEngine.resetRecurrentSlice(slotStates[s].pleHistory[i], parity: &slotStates[s].pleParity[i], arena: arena)
+            }
+        }
+    }
+
     func cleanupExtraSlotsBeforeSingleMode() {
         guard slotStates.count > 1 else { return }
+        let gdnFlags = engine.layerRecords.map { $0.gdn != nil }
+        let pleFlags = engine.layerRecords.map { $0.weights.ple != nil }
+        Self.resetExtraSlotRecurrentStates(
+            slotStates: &slotStates, gdnFlags: gdnFlags, pleFlags: pleFlags, arena: engine.arena
+        )
         let sCap = slotCapacity(totalSlots: Self.maxSlots)
-        for s in 1..<slotStates.count where slotStates[s].highWaterPos > 0 {
-            let used = min(sCap, slotStates[s].highWaterPos)
-            for rec in engine.layerRecords {
-                if let a = rec.attnState, let m = rec.attn {
-                    a.selectPartition(slot: s, totalSlots: Self.maxSlots, mixer: m)
-                    let cap = max(1, a.capacity)
-                    let u = min(cap, used)
-                    let idxRowBytes = (a.indexK.bytes / cap) * u
-                    let poolBlocks = (u + 3) / 4
-                    let poolBytes = min(a.pooled.bytes, (a.pooled.bytes / max(1, cap / 4)) * poolBlocks)
-                    memset(engine.arena.cpuPointer(of: a.indexK), 0, idxRowBytes)
-                    memset(engine.arena.cpuPointer(of: a.pooled), 0, poolBytes)
+        for s in 1..<slotStates.count {
+            if slotStates[s].highWaterPos > 0 {
+                let used = min(sCap, slotStates[s].highWaterPos)
+                for rec in engine.layerRecords {
+                    if let a = rec.attnState, let m = rec.attn {
+                        a.selectPartition(slot: s, totalSlots: Self.maxSlots, mixer: m)
+                        let cap = max(1, a.capacity)
+                        let u = min(cap, used)
+                        let idxRowBytes = (a.indexK.bytes / cap) * u
+                        let poolBlocks = (u + 3) / 4
+                        let poolBytes = min(a.pooled.bytes, (a.pooled.bytes / max(1, cap / 4)) * poolBlocks)
+                        memset(engine.arena.cpuPointer(of: a.indexK), 0, idxRowBytes)
+                        memset(engine.arena.cpuPointer(of: a.pooled), 0, poolBytes)
+                    }
                 }
-            }
-            if let mtp = engine.mtp, case .attention(let m) = mtp.layer.mixer {
-                mtp.attnState1.selectPartition(slot: s, totalSlots: Self.maxSlots, mixer: m)
-                mtp.resetState(usedPositions: used)
+                if let mtp = engine.mtp, case .attention(let m) = mtp.layer.mixer {
+                    mtp.attnState1.selectPartition(slot: s, totalSlots: Self.maxSlots, mixer: m)
+                    mtp.resetState(usedPositions: used)
+                }
             }
             engine.residentKVHistoryBySlot[s]?.removeAll(keepingCapacity: true)
             slotStates[s].highWaterPos = 0

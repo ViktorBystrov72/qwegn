@@ -27,11 +27,20 @@ public enum QWChatTemplateError: Error, CustomStringConvertible, Sendable {
 public struct QWChatTemplate: Sendable {
     private let template: Template
     private let tokenizerContext: [String: QWJson]
+    public let rawSource: String
+    public let supportsThinkingTags: Bool
 
     public init(source: String, tokenizerContext: [String: QWJson] = [:]) throws {
         let normalizedSource = Self.normalizePythonJinjaSyntax(source)
         self.template = try Template(normalizedSource)
         self.tokenizerContext = tokenizerContext
+        self.rawSource = source
+        self.supportsThinkingTags = normalizedSource.contains("<think>") || normalizedSource.contains("<ernie:think>")
+    }
+
+    public func tokenizerTokenString(_ key: String) -> String? {
+        guard case .string(let token) = tokenizerContext[key], !token.isEmpty else { return nil }
+        return token
     }
 
     /// Normalizes Python Jinja2 integer attribute accesses (e.g. `m.content.0.type`)

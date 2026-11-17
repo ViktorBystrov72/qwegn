@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2">
   <img src="https://img.shields.io/badge/platform-macOS%2026%20(Apple%20Silicon)-lightgrey.svg" alt="macOS 26, Apple Silicon">
   <a href="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml"><img src="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.24.1-green.svg" alt="Release v0.24.1"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.25.0-green.svg" alt="Release v0.25.0"></a>
 </p>
 
 **Qwegn** (`qwg`) is a from-scratch LLM/VLM inference engine for Apple Silicon,
@@ -164,9 +164,9 @@ OpenAI-, Anthropic-, and Ollama-compatible HTTP server (auto-discovers `<repo>/.
 
 | Protocol | Endpoints | Features |
 | :--- | :--- | :--- |
-| **OpenAI API** | `POST /v1/chat/completions` · `GET /v1/models`<br>`POST /v1/models/load` · `POST /v1/models/unload` | Streaming SSE (`stream: true`), multimodal `image_url`, constrained JSON & tool calling, `reasoning_content`, runtime model switching |
-| **Anthropic API** | `POST /v1/messages` | Streaming SSE events, system prompts, thinking blocks, tool use |
-| **Ollama API** | `POST /api/chat` · `POST /api/generate` · `GET /api/tags`<br>`GET /api/ps` · `POST /api/show` · `POST /api/load` · `POST /api/unload` | NDJSON streaming, model status and residency management |
+| **OpenAI API** | `POST /v1/chat/completions` · `POST /v1/responses` (`GET`/`DELETE /v1/responses/:id`)<br>`POST /v1/completions` · `GET /v1/models` · `POST /v1/models/{load,unload}` | Streaming SSE (`stream: true`, `TCP_NODELAY`), `previous_response_id` & `background`, `echo` + `logprobs`, multimodal `image_url`, constrained JSON & tool calling, `reasoning_content`, runtime model switching |
+| **Anthropic API** | `POST /v1/messages` · `POST /v1/messages/count_tokens` | Streaming SSE events, system prompts, thinking blocks, tool use, exact token counting |
+| **Ollama & Tokenizers** | `POST /api/{chat,generate,show,load,unload}` · `GET /api/{tags,ps}`<br>`GET /tokenizer_info` · `POST /tokenize` · `POST /detokenize` | NDJSON streaming, model status/residency, vLLM-compatible remote tokenizer inspection (`lm_eval` / `inspect_ai`) |
 | **Memory & Telemetry** | `POST /v1/memory/inspect` · `POST /v1/memory/index` (SSE)<br>`POST /v1/memory/mount` · `POST /v1/memory/unmount`<br>`GET /v1/engine/info` · `GET /ui` · `GET /v1/dashboard` · `GET /metrics` | Live `.qwcache` inspection, streaming SSE indexing, and `#modal-memory-pack` in `/ui`, hot mount/unmount & `kvMode` lock, built-in web UI (`http://127.0.0.1:8080/ui`), live token/s and cache telemetry |
 
 Example OpenAI request:

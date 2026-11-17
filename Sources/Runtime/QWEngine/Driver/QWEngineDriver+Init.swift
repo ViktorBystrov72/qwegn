@@ -236,14 +236,15 @@ extension QWEngineDriver {
             geometry: geometry, prefillChunkRows: prefillChunkSize,
             mtpDrafts: mtpDrafts, maxTokens: maxTokens, useGroupedNAX: useGroupedNAX)
         let actBytes = pscBytes + decodeActBytes
+        let slotCount = Self.gdnSlotCount()
         let recB = QWSlotGeometry.recElems(geometry: geometry) * 4
         let ringB = QWSlotGeometry.ringElems(geometry: geometry) * 2
         let slotBytes = gdnLayerCount * (recB + ringB)
         let trunkHidBytes = (geometry.mtpSharedLastLayer && geometry.mhcConfig != nil)
             ? geometry.mhcConfig!.streams * geometry.hidden * 4 : geometry.hidden * 2
-        let gdnBytes = 2 * slotBytes + Self.partialsScratchBytes(geometry: geometry, mtpDrafts: mtpDrafts, maxTokens: maxTokens)
+        let gdnBytes = slotCount * slotBytes + Self.partialsScratchBytes(geometry: geometry, mtpDrafts: mtpDrafts, maxTokens: maxTokens)
             + (mtpDrafts > 0 ? QWGDNReplayCheckpoint.allocationBytes(geometry: geometry, layers: gdnLayerCount, rows: mtpDrafts + 1) : 0)
-            + (mtpDrafts > 0 ? 2 * trunkHidBytes : 0) + (1 << 20)
+            + (mtpDrafts > 0 ? slotCount * trunkHidBytes : 0) + (1 << 20)
         let activeAttnLayers = attnLayerCount + (mtpDrafts > 0 ? 1 : 0)
         let mlaPerTokBytes: Int
         if geometry.usesNoPEMLA {
@@ -398,7 +399,8 @@ extension QWEngineDriver {
     ) throws -> [GdnSlot] {
         var slots: [GdnSlot] = []
         let H = geometry.hidden
-        for slotIdx in 0..<2 {
+        let slotCount = Self.gdnSlotCount()
+        for slotIdx in 0..<slotCount {
             let recSlab = try gsub.allocate(QWTensorShape([max(1, gdnLayerCount * QWSlotGeometry.recElems(geometry: geometry))], .f32))
             let ringSlab = try gsub.allocate(QWTensorShape([max(1, gdnLayerCount * QWSlotGeometry.ringElems(geometry: geometry))], .f16))
             let recViews = Self.slotViews(recSlab, elem: QWSlotGeometry.recElems(geometry: geometry), dt: .f32, layers: gdnLayerCount, geometry: geometry)
@@ -416,12 +418,115 @@ extension QWEngineDriver {
                          "QWEngineDriver: GDN ring views ALIAS (per-layer state law)")
             let trunkHidShape = (geometry.mtpSharedLastLayer && geometry.mhcConfig != nil)
                 ? QWTensorShape([geometry.mhcConfig!.streams * H], .f32) : QWTensorShape([H], .f16)
+            let dflashSlot = (dflashDrafter.map { slotIdx < $0.sessionSlots.count ? $0.sessionSlots[slotIdx] : nil }) ?? nil
             slots.append(GdnSlot(recSlab: recSlab, ringSlab: ringSlab,
                                  rec: recViews, ring: ringViews,
                                  trunkHidden: mtpDrafts > 0 ? try gsub.allocate(trunkHidShape) : nil,
-                                 dflashSlot: dflashDrafter?.sessionSlots[slotIdx]))
+                                 dflashSlot: dflashSlot))
         }
         return slots
+    }
+
+    private static func prewarmBatchedDecodePipelines(
+        hal: QWHal, geometry: QWModelGeometry, layersW: [LayerW], headAQ4: Bool, hasMLA: Bool
+    ) throws {
+        // Always prewarm B=2..4 batched head pipelines before hal.freezePipelines().
+        for m in 2...4 {
+            _ = try hal.pipeline("qwg_head_f16_m\(m)")
+            _ = try hal.pipeline("qwg_head_q4g_m\(m)", isAQ4: headAQ4)
+        }
+        _ = try hal.pipeline("qwg_head_q4g_rp_m4", isAQ4: headAQ4)
+        guard !hasMLA && geometry.hcaConfig == nil && geometry.hybridMLAConfig == nil
+                && geometry.mhcConfig == nil else {
+            return
+        }
+        for m in 2...4 {
+            _ = try hal.pipeline("qwm_mlp_gate_up_m\(m)")
+            _ = try hal.pipeline("qwm_mlp_gate_up_fwht32_m\(m)")
+            _ = try hal.pipeline("qwm_mlp_down_m\(m)")
+            if m == 4 {
+                _ = try hal.pipeline("qwm_mlp_gate_up_rp_m\(m)")
+                _ = try hal.pipeline("qwm_mlp_down_rp_m\(m)")
+            }
+        }
+        var mlpAQ4Prewarmed = false
+        var seenGemms = Set<String>()
+        var seenAqDecode = Set<String>()
+        var seenAqSilu = Set<String>()
+        func prewarmWeight(_ w: QWWeightView) throws {
+            guard !w.isIncumbentContainer,
+                  let name = QWGemmAQ.gemmKernelName(bits: w.bits, group: w.groupSize, bm128: false, isSHVQ: w.isSHVQ),
+                  seenGemms.insert(name).inserted else { return }
+            _ = try hal.pipeline(name)
+        }
+        func prewarmBatchedProj(_ w: QWWeightView) throws {
+            if QWMTPBatchedMLP.usesQ4GMKernel(w) {
+                if !w.isIncumbentContainer && !mlpAQ4Prewarmed {
+                    for m in 2...4 {
+                        _ = try hal.pipeline("qwm_mlp_gate_up_m\(m)", isAQ4: true)
+                        _ = try hal.pipeline("qwm_mlp_gate_up_fwht32_m\(m)", isAQ4: true)
+                        _ = try hal.pipeline("qwm_mlp_down_m\(m)", isAQ4: true)
+                        if m == 4 {
+                            _ = try hal.pipeline("qwm_mlp_gate_up_rp_m\(m)", isAQ4: true)
+                            _ = try hal.pipeline("qwm_mlp_down_rp_m\(m)", isAQ4: true)
+                        }
+                    }
+                    mlpAQ4Prewarmed = true
+                }
+            } else if let name = QWGemmAQ.decodeKernelName(bits: w.bits, group: w.groupSize, isSHVQ: w.isSHVQ),
+                      seenAqDecode.insert(name).inserted {
+                _ = try hal.pipeline(name)
+            }
+        }
+        var gdnHQ4Prewarmed = false
+        var gdnAQ4Prewarmed = false
+        var seenGdnInProj = Set<String>()
+        for lw in layersW {
+            try prewarmWeight(lw.gu.view)
+            try prewarmWeight(lw.down)
+            if lw.moe == nil {
+                let gu = lw.gu.view
+                if QWMTPBatchedMLP.usesQ4GMKernel(gu) {
+                    try prewarmBatchedProj(gu)
+                } else if let name = QWGemmAQ.siluPairKernelName(bits: gu.bits, group: gu.groupSize, isSHVQ: gu.isSHVQ),
+                          seenAqSilu.insert(name).inserted {
+                    _ = try hal.pipeline(name)
+                }
+                try prewarmBatchedProj(lw.down)
+            }
+            if let a = lw.attn {
+                try prewarmWeight(a.qkvProj)
+                try prewarmWeight(a.o)
+                try prewarmBatchedProj(a.qkvProj)
+                try prewarmBatchedProj(a.o)
+            }
+            if let g = lw.gdn {
+                try prewarmWeight(g.inProj)
+                if geometry.gdnVectorDecay { try prewarmBatchedProj(g.inProj) }
+                if let fgb = g.fgbProj {
+                    try prewarmWeight(fgb)
+                    try prewarmBatchedProj(fgb)
+                }
+                try prewarmWeight(g.out)
+                try prewarmBatchedProj(g.out)
+                if !geometry.gdnVectorDecay {
+                    let v = g.inProj
+                    if v.isIncumbentContainer || (v.bits == 4 && v.groupSize == 32 && !v.isSHVQ) {
+                        let isAQ4 = !v.isIncumbentContainer
+                        if (isAQ4 && !gdnAQ4Prewarmed) || (!isAQ4 && !gdnHQ4Prewarmed) {
+                            for m in 2...4 {
+                                _ = try hal.pipeline("qwm_gdn_projection_m\(m)", isAQ4: isAQ4)
+                                if m == 4 { _ = try hal.pipeline("qwm_gdn_projection_rp_m\(m)", isAQ4: isAQ4) }
+                            }
+                            if isAQ4 { gdnAQ4Prewarmed = true } else { gdnHQ4Prewarmed = true }
+                        }
+                    } else if let name = QWGemmAQ.gdnInProjDecodeKernelName(bits: v.bits, group: v.groupSize, isSHVQ: v.isSHVQ),
+                              seenGdnInProj.insert(name).inserted {
+                        _ = try hal.pipeline(name)
+                    }
+                }
+            }
+        }
     }
 
     static func buildMTPVerificationResources(
@@ -433,6 +538,9 @@ extension QWEngineDriver {
         headIsQ4g: Bool, verifyHeadQ4Enabled: Bool, useGroupedNAX: Bool,
         scratch: Scratch, ropeApply: QWRopeApply, effectiveRopeRows: Int, kvMode: QWKVMode
     ) throws -> MTPVerificationResources {
+        let headAQ4 = (hal.weightBasis == .standard) || (layersW.first.map { !$0.gu.view.isIncumbentContainer } ?? false)
+        try Self.prewarmBatchedDecodePipelines(hal: hal, geometry: geometry, layersW: layersW,
+                                               headAQ4: headAQ4, hasMLA: mlaOperator != nil)
         guard mtpDrafts > 0 && (mtpWeights != nil || echoWeights != nil || dflashDrafter != nil) else {
             return MTPVerificationResources(
                 gdnReplayCheckpoint: nil, verifyWindow: nil, mtpBatchedMLP: nil,
@@ -474,11 +582,10 @@ extension QWEngineDriver {
         } else {
             echoDrafter = nil
         }
-        let headAQ4 = (hal.weightBasis == .standard) || (layersW.first.map { !$0.gu.view.isIncumbentContainer } ?? false)
-        for m in ["m2", "m3", "m4", "m5", "m6", "m7", "m8"] { _ = try hal.pipeline("qwg_head_f16_\(m)") }
-        for m in 2...8 {
+        for m in ["m5", "m6", "m7", "m8"] { _ = try hal.pipeline("qwg_head_f16_\(m)") }
+        for m in 5...8 {
             _ = try hal.pipeline("qwg_head_q4g_m\(m)", isAQ4: headAQ4)
-            if m >= 4 { _ = try hal.pipeline("qwg_head_q4g_rp_m\(m)", isAQ4: headAQ4) }
+            _ = try hal.pipeline("qwg_head_q4g_rp_m\(m)", isAQ4: headAQ4)
         }
         return MTPVerificationResources(
             gdnReplayCheckpoint: gdnReplayCheckpoint, verifyWindow: verifyWindow,

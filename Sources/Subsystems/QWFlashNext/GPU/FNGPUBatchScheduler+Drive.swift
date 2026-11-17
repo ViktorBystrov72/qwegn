@@ -86,76 +86,7 @@ extension FNGPUBatchScheduler {
                 for s in newlyAdmitted {
                     guard let job = activeJobs[s] else { continue }
                     do {
-                        if job.inBatchMode {
-                            activateSlot(s, totalSlots: Self.maxSlots)
-                            job.session.useSpec = (s == 0) ? job.useSpec : false
-                            if !engine.hasPrefixCacheTier {
-                                try engine.preparePrefill(forTokenCount: job.prompt.count)
-                            }
-                            engine.beginSession(&job.session, maxNew: job.maxNew)
-                            let prefillStart = Date()
-                            var chunkStart = 0
-                            var firstTok = 0
-                            let chunkRows = engine.dynamicPrefillChunkRows(forTotalTokens: job.prompt.count)
-                            while chunkStart < job.prompt.count {
-                                let end = min(chunkStart + chunkRows, job.prompt.count)
-                                let isFirst = chunkStart == 0
-                                firstTok = try engine.encodePrefillChunk(&job.session, chunk: chunkStart..<end,
-                                                                         runsHead: end == job.prompt.count)
-                                if isFirst {
-                                    onCacheEvaluated?(job.session)
-                                    onSlot0CacheEvaluated?(job.session)
-                                }
-                                chunkStart = end
-                            }
-                            job.prefillSeconds = Date().timeIntervalSince(prefillStart)
-                            job.session.useSpec = false
-                            syncSlotFromEngine(s)
-                            job.position = job.prompt.count
-                            if job.maxNew <= 0 {
-                                engine.flushPendingPrefixCache(&job.session)
-                                job.decodeStart = Date()
-                                finishJob(slot: s, job: job)
-                            } else {
-                                _ = emitAndCheckDone(token: firstTok, slot: s, job: job)
-                                engine.flushPendingPrefixCache(&job.session)
-                                job.decodeStart = Date()
-                            }
-                        } else {
-                            cleanupExtraSlotsBeforeSingleMode()
-                            activateSlot(0, totalSlots: 1)
-                            if !engine.hasPrefixCacheTier {
-                                try engine.preparePrefill(forTokenCount: job.prompt.count)
-                            }
-                            engine.beginSession(&job.session, maxNew: job.maxNew)
-                            let prefillStart = Date()
-                            var chunkStart = 0
-                            var firstTok = 0
-                            let chunkRows = engine.dynamicPrefillChunkRows(forTotalTokens: job.prompt.count)
-                            while chunkStart < job.prompt.count {
-                                let end = min(chunkStart + chunkRows, job.prompt.count)
-                                let isFirst = chunkStart == 0
-                                firstTok = try engine.encodePrefillChunk(&job.session, chunk: chunkStart..<end,
-                                                                         runsHead: end == job.prompt.count)
-                                if isFirst {
-                                    onCacheEvaluated?(job.session)
-                                    onSlot0CacheEvaluated?(job.session)
-                                }
-                                chunkStart = end
-                            }
-                            job.prefillSeconds = Date().timeIntervalSince(prefillStart)
-                            syncSlotFromEngine(0)
-                            job.position = job.prompt.count
-                            if job.maxNew <= 0 {
-                                engine.flushPendingPrefixCache(&job.session)
-                                job.decodeStart = Date()
-                                finishJob(slot: 0, job: job)
-                            } else {
-                                _ = emitAndCheckDone(token: firstTok, slot: 0, job: job)
-                                engine.flushPendingPrefixCache(&job.session)
-                                job.decodeStart = Date()
-                            }
-                        }
+                        try prefillAdmittedJob(slot: s, job: job, sCap4: sCap4)
                     } catch {
                         finishJob(slot: s, job: job, error: error)
                     }
@@ -201,6 +132,13 @@ extension FNGPUBatchScheduler {
             if activeSlots.count == 1 && activeSlots[0] == 0 && !activeJobs[0]!.inBatchMode {
                 let job = activeJobs[0]!
                 activateSlot(0, totalSlots: 1)
+                let activeCap = engine.activeCapacity
+                let capLimit = max(0, activeCap - job.prompt.count)
+                if (job.session.pendingTokens.isEmpty && job.session.history.count + 1 >= activeCap)
+                    || job.generatedTokens.count >= capLimit {
+                    finishJob(slot: 0, job: job)
+                    continue
+                }
                 do {
                     let prevRounds = job.session.roundTokenCounts.count
                     let started = Date()
@@ -221,7 +159,10 @@ extension FNGPUBatchScheduler {
                         job.stepTokenCounts = job.session.roundTokenCounts
                     }
                     syncSlotFromEngine(0)
-                    _ = emitAndCheckDone(token: nextTok, slot: 0, job: job)
+                    let done = emitAndCheckDone(token: nextTok, slot: 0, job: job)
+                    if !done && job.generatedTokens.count >= capLimit {
+                        finishJob(slot: 0, job: job)
+                    }
                 } catch {
                     finishJob(slot: 0, job: job, error: error)
                 }
@@ -231,12 +172,12 @@ extension FNGPUBatchScheduler {
             // Multi-session batched decode path across all `B` active slots (`1 <= B <= 4`).
             var validSlots: [Int] = []
             var histories: [[Int64]] = []
+            let slotCap = min(sCap4, engine.activeCapacity)
             for s in activeSlots {
                 guard let job = activeJobs[s] else { continue }
-                if job.session.history.count + 1 >= sCap4 {
-                    finishJob(slot: s, job: job,
-                              error: FNGPUError.contextDoesNotFit(requested: job.session.history.count + 1,
-                                                                  maxFitting: sCap4 - 1))
+                if job.session.history.count + 1 >= slotCap
+                    || job.generatedTokens.count >= max(0, slotCap - job.prompt.count) {
+                    finishJob(slot: s, job: job)
                     continue
                 }
                 let prevCount = job.session.history.count
@@ -285,12 +226,70 @@ extension FNGPUBatchScheduler {
                     job.position += 1
                     job.stepMs.append(wallMs)
                     job.stepTokenCounts.append(1)
-                    _ = emitAndCheckDone(token: nextTok, slot: s, job: job)
+                    let done = emitAndCheckDone(token: nextTok, slot: s, job: job)
+                    if !done && (job.session.history.count + 1 >= slotCap
+                                 || job.generatedTokens.count >= max(0, slotCap - job.prompt.count)) {
+                        finishJob(slot: s, job: job)
+                    }
                 }
             } catch {
                 for s in validSlots {
                     if let job = activeJobs[s] { finishJob(slot: s, job: job, error: error) }
                 }
+            }
+        }
+    }
+
+    /// Validates prompt fit, prefills an admitted job on its slot, and clamps output to remaining capacity.
+    private func prefillAdmittedJob(slot s: Int, job: FNBatchJob, sCap4: Int) throws {
+        if job.inBatchMode {
+            activateSlot(s, totalSlots: Self.maxSlots)
+            job.session.useSpec = (s == 0) ? job.useSpec : false
+        } else {
+            cleanupExtraSlotsBeforeSingleMode()
+            activateSlot(0, totalSlots: 1)
+        }
+        let activeCap = job.inBatchMode ? min(sCap4, engine.activeCapacity) : engine.activeCapacity
+        guard job.prompt.count < activeCap else {
+            throw FNGPUError.contextDoesNotFit(requested: job.prompt.count + 1,
+                                                maxFitting: max(0, activeCap - 1))
+        }
+        let effectiveMaxNew = min(max(0, job.maxNew), max(0, activeCap - job.prompt.count))
+        if !engine.hasPrefixCacheTier {
+            try engine.preparePrefill(forTokenCount: job.prompt.count)
+        }
+        engine.beginSession(&job.session, maxNew: effectiveMaxNew)
+        let prefillStart = Date()
+        var chunkStart = 0
+        var firstTok = 0
+        let chunkRows = engine.dynamicPrefillChunkRows(forTotalTokens: job.prompt.count)
+        while chunkStart < job.prompt.count {
+            let end = min(chunkStart + chunkRows, job.prompt.count)
+            let isFirst = chunkStart == 0
+            firstTok = try engine.encodePrefillChunk(&job.session, chunk: chunkStart..<end,
+                                                     runsHead: end == job.prompt.count)
+            if isFirst {
+                onCacheEvaluated?(job.session)
+                onSlot0CacheEvaluated?(job.session)
+            }
+            chunkStart = end
+        }
+        job.prefillSeconds = Date().timeIntervalSince(prefillStart)
+        if job.inBatchMode { job.session.useSpec = false }
+        let syncSlot = job.inBatchMode ? s : 0
+        syncSlotFromEngine(syncSlot)
+        slotStates[syncSlot].highWaterPos = engine.highWaterPos
+        job.position = job.prompt.count
+        if effectiveMaxNew <= 0 {
+            engine.flushPendingPrefixCache(&job.session)
+            job.decodeStart = Date()
+            finishJob(slot: syncSlot, job: job)
+        } else {
+            let done = emitAndCheckDone(token: firstTok, slot: syncSlot, job: job)
+            engine.flushPendingPrefixCache(&job.session)
+            job.decodeStart = Date()
+            if !done && job.generatedTokens.count >= effectiveMaxNew {
+                finishJob(slot: syncSlot, job: job)
             }
         }
     }

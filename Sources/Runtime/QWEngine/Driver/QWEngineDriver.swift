@@ -425,7 +425,8 @@ public final class QWEngineDriver: @unchecked Sendable {
         self.pscByteLength = asub.usedBytes - builtScratch.gsOff
         let dflash: QWDFlashDrafter? = (cfg.mtpBackend == .dflash2 && startup.mtpDrafts > 0)
             ? try QWDFlashDrafter(geometry: geometry, hal: prelimHal, packPath: cfg.dflashDraftPackPath,
-                                  drafts: startup.mtpDrafts, selectorTopK: cfg.dflashSelectorTopK) : nil
+                                  drafts: startup.mtpDrafts, selectorTopK: cfg.dflashSelectorTopK,
+                                  sessionSlotCount: Self.gdnSlotCount()) : nil
         self.dflashDrafter = dflash
         self.freeSlots = try Self.buildGDNSlots(
             gsub: gsub, geometry: geometry, gdnLayerCount: gdnL.count,

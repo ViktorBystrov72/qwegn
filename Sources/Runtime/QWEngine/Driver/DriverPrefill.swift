@@ -57,7 +57,14 @@ extension QWEngineDriver {
         guard pos + T <= ropeRows else { throw QWEngineDriverError.posBeyondTable(pos + T) }
         let mtpRows = try prepareMTPSeeding(session, count: T)
         if session.kv.tokenCapacity < pos + T {
-            try kvCache.grow(session.kv, to: pos + T + QWKVCache.pageTokens)
+            let lookaheadEnd = min(ropeRows, pos + T + QWKVCache.pageTokens)
+            do {
+                try kvCache.grow(session.kv, to: lookaheadEnd)
+            } catch QWKVError.outOfPages where lookaheadEnd > pos + T {
+                try kvCache.grow(session.kv, to: pos + T)
+            } catch QWKVError.badArgument where lookaheadEnd > pos + T {
+                try kvCache.grow(session.kv, to: pos + T)
+            }
             session.attnKVViews = try kvCache.layerViewsAll(session.kv, layers: attnLayers)
         }
         try kvCache.prepareWrites(session.kv, positions: pos..<(pos + T))
@@ -314,7 +321,15 @@ extension QWEngineDriver {
     func generate(session: QWEngineSession, prompt: [Int], maxNew: Int,
                           stopIds: Set<Int>, onToken: ((Int) -> Bool)?,
                           permit: QWGenerationPermit) throws -> [Int] {
+        guard maxNew >= 0 else {
+            throw QWEngineDriverError.state("invalid generation budget")
+        }
         guard !prompt.isEmpty else { return [] }
+        guard session.position + prompt.count < ropeRows else {
+            throw QWEngineDriverError.posBeyondTable(session.position + prompt.count)
+        }
+        let effectiveMaxNew = min(maxNew, max(0, ropeRows - (session.position + prompt.count)))
+        if effectiveMaxNew == 0 { return [] }
         QWGemm.configureDenseNax(temperature: 0, topP: 1, topK: 1)
         let t0 = Date()
         var next = try prefill(session, tokens: prompt, mode: gdnPrefillMode, permit: permit)
@@ -339,7 +354,7 @@ extension QWEngineDriver {
             return out
         }
         let d0 = Date()
-        while out.count < maxNew {
+        while out.count < effectiveMaxNew {
             try sample { next = try decodeStep(session, token: next, permit: permit) }
             if stopIds.contains(next) { lastStopToken = next; break }
             out.append(next)

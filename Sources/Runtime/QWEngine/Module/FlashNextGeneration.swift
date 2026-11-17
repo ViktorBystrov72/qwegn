@@ -93,6 +93,14 @@ extension FlashNextModule {
         for token in request.prompt where token < 0 || token >= plan.vocab {
             throw QWModuleError.invalidToken(token)
         }
+        let maxCap = engine.capacity
+        guard request.prompt.count < maxCap else {
+            throw FNGPUError.contextDoesNotFit(
+                requested: request.prompt.count + 1,
+                maxFitting: max(0, maxCap - 1)
+            )
+        }
+        let effectiveMaxNew = min(max(0, request.maxNew), max(0, maxCap - request.prompt.count))
         naxLogMessage = QWGemm.configureDenseNax(
             temperature: Double(request.sampling.temperature),
             topP: Double(request.sampling.topP),
@@ -107,7 +115,7 @@ extension FlashNextModule {
             : FNGPUSessionData.defaultMTPDrafts
         let job = FNBatchJob(
             prompt: request.prompt,
-            maxNew: request.maxNew,
+            maxNew: effectiveMaxNew,
             stopIDs: request.stopIDs,
             sampling: request.sampling,
             useSpec: useSpec && !request.collectLogprobs,

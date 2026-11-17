@@ -50,13 +50,14 @@ extension QWEngineDriver {
         let numV0 = raw.numVirtualLayers
         let attnCount0 = (0..<numV0).filter { raw.isVirtualLayerFullAttention($0) }.count
         let gdnCount0 = raw.gdnLayerCount
+        let slotCount = Self.gdnSlotCount()
         let slotB0 = gdnCount0 * (QWSlotGeometry.recElems(geometry: raw) * 4 + QWSlotGeometry.ringElems(geometry: raw) * 2)
         let trunkHidB0 = (raw.mtpSharedLastLayer && raw.mhcConfig != nil)
             ? raw.mhcConfig!.streams * raw.hidden * 4
             : raw.hidden * 2
-        let gdn0 = 2 * slotB0 + Self.partialsScratchBytes(geometry: raw, mtpDrafts: mtpDrafts, maxTokens: maxTokens)
+        let gdn0 = slotCount * slotB0 + Self.partialsScratchBytes(geometry: raw, mtpDrafts: mtpDrafts, maxTokens: maxTokens)
             + (mtpDrafts > 0 ? QWGDNReplayCheckpoint.allocationBytes(geometry: raw, layers: gdnCount0, rows: mtpDrafts + 1) : 0)
-            + (mtpDrafts > 0 ? 2 * trunkHidB0 : 0)
+            + (mtpDrafts > 0 ? slotCount * trunkHidB0 : 0)
             + (1 << 20)
         let activeAttn0 = attnCount0 + (mtpDrafts > 0 ? 1 : 0)
         let modelCap0 = raw.maxPositionEmbeddings > 0 ? min(maxTokens, raw.maxPositionEmbeddings) : maxTokens
@@ -151,6 +152,11 @@ extension QWEngineDriver {
         )
     }
 
+    /// Concurrent GDN state slots sized to host physical RAM (4 on >=32 GiB, 2 on 16 GiB CI VMs).
+    static func gdnSlotCount(physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes()) -> Int {
+        (physicalMemoryBytes ?? 0) >= (32 << 30) ? 4 : 2
+    }
+
     static func estimateDriverContextMemory(
         descriptor: QWModelDescriptor,
         packPath: String? = nil,
@@ -193,15 +199,16 @@ extension QWEngineDriver {
             geometry: rawGeometry, prefillChunkRows: chunkRows, mtpDrafts: effDrafts, maxTokens: clampedContext)
         let numV = rawGeometry.numVirtualLayers
         let attnCount = (0..<numV).filter { rawGeometry.isVirtualLayerFullAttention($0) }.count
+        let slotCount = Self.gdnSlotCount(physicalMemoryBytes: physicalMemoryBytes)
         let gdnCount = rawGeometry.gdnLayerCount
         let slotBytes = gdnCount * (QWSlotGeometry.recElems(geometry: rawGeometry) * 4
             + QWSlotGeometry.ringElems(geometry: rawGeometry) * 2)
         let trunkHidBytes = (rawGeometry.mtpSharedLastLayer && rawGeometry.mhcConfig != nil)
             ? rawGeometry.mhcConfig!.streams * rawGeometry.hidden * 4
             : rawGeometry.hidden * 2
-        let gdnBytes = 2 * slotBytes + Self.partialsScratchBytes(geometry: rawGeometry, mtpDrafts: effDrafts, maxTokens: clampedContext)
+        let gdnBytes = slotCount * slotBytes + Self.partialsScratchBytes(geometry: rawGeometry, mtpDrafts: effDrafts, maxTokens: clampedContext)
             + (effDrafts > 0 ? QWGDNReplayCheckpoint.allocationBytes(geometry: rawGeometry, layers: gdnCount, rows: effDrafts + 1) : 0)
-            + (effDrafts > 0 ? 2 * trunkHidBytes : 0) + (1 << 20)
+            + (effDrafts > 0 ? slotCount * trunkHidBytes : 0) + (1 << 20)
         let activeAttnLayers = attnCount + (effDrafts > 0 ? 1 : 0)
         let mlaFixedBytes = Self.mlaFixedScratchBytes(
             geometry: rawGeometry, prefillChunkRows: chunkRows, activeAttnLayers: activeAttnLayers)

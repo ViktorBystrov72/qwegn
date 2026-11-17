@@ -67,6 +67,7 @@ public actor QWEngineLifecycleActor {
         var failureDetail: String?
         var capabilities: [QWKnobCapability]
         var loadedParams: QWEngineParametersInfo?
+        var supportsThinkingTags: Bool = true
         var lastLoggedSamplingMessage: String?
         var mountedMemoryPack: QWEngineInfoResponse.MountedMemoryPackInfo? = nil
 
@@ -84,6 +85,7 @@ public actor QWEngineLifecycleActor {
             var nextDetail: String? = nil
             var nextCapabilities: [QWKnobCapability] = []
             var nextParams: QWEngineParametersInfo? = nil
+            var nextSupportsThinkingTags = true
             switch state {
             case .unloaded:
                 nextPhase = .unloaded
@@ -93,6 +95,7 @@ public actor QWEngineLifecycleActor {
                 nextPhase = .loaded
                 nextCapabilities = Array(loaded.modelBackend.capabilities)
                 nextParams = loaded.params
+                nextSupportsThinkingTags = loaded.chatTemplate.supportsThinkingTags
             case .unloading:
                 nextPhase = .unloading
             case .failed(let message):
@@ -106,6 +109,7 @@ public actor QWEngineLifecycleActor {
             self.failureDetail = nextDetail
             self.capabilities = nextCapabilities
             self.loadedParams = nextParams
+            self.supportsThinkingTags = nextSupportsThinkingTags
             lock.unlock()
         }
 
@@ -176,6 +180,10 @@ public actor QWEngineLifecycleActor {
             lock.lock()
             defer { lock.unlock() }
             return loadedParams
+        }
+
+        func getSupportsThinkingTags() -> Bool {
+            lock.withLock { supportsThinkingTags }
         }
 
         func shouldLogSamplingMessage(_ message: String) -> Bool {
@@ -369,6 +377,7 @@ public actor QWEngineLifecycleActor {
 
     nonisolated public func getModelName() -> String { statusBox.getModelName() }
     nonisolated public func getConfig() -> Config { statusBox.getConfig() }
+    nonisolated public func supportsThinkingTags() -> Bool { statusBox.getSupportsThinkingTags() }
     nonisolated public func getMountedMemoryPackInfo() -> QWEngineInfoResponse.MountedMemoryPackInfo? {
         statusBox.getMountedMemoryPackInfo()
     }

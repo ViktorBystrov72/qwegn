@@ -11,7 +11,7 @@ import QWCore
 /// Module marker (was Placeholder.swift).
 
 extension QWTokenizer {
-    func piece(_ id: Int) -> String? { idToPiece[id] }
+    public func piece(_ id: Int) -> String? { idToPiece[id] }
 
     public func tokenId(for token: String) -> Int? {
         vocab[token] ?? added.first(where: { $0.s == token })?.id

@@ -70,7 +70,11 @@ metallib: ## Compile Sources/QWMetal/*.metal into kernel.metallib
 # ----------------------------------------------------------------- test --
 
 test: ## Run the XCTest suite (serial: parallel GPU bundles are unsafe)
+ifeq ($(GITHUB_ACTIONS),true)
+	@swift test --no-parallel --filter QWCoreTests --filter QWQuantTests --filter QWTokenTests --filter QWCliTests --filter QWServerTests --filter QWMenuBarTests
+else
 	@swift test --no-parallel
+endif
 
 lint: ## Style, geometry, DAG, and kernel-reachability gates
 	@python3 Scripts/lint_style.py Sources Tests Scripts

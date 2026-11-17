@@ -82,7 +82,12 @@ extension QWEngineDriver {
                 throw QWEngineDriverError.state("invalid stochastic generation configuration or budget")
             }
             lastExperimentalGeneration = nil
-            guard !prompt.isEmpty, maxNew > 0 else { return [] }
+            guard !prompt.isEmpty else { return [] }
+            guard session.position + prompt.count < ropeRows else {
+                throw QWEngineDriverError.posBeyondTable(session.position + prompt.count)
+            }
+            let effectiveMaxNew = min(maxNew, max(0, ropeRows - (session.position + prompt.count)))
+            guard effectiveMaxNew > 0 else { return [] }
             guard owner.stream.drawsConsumed < UInt64.max else {
                 throw QWEngineDriverError.state("stochastic target draw counter exhausted")
             }
@@ -101,10 +106,14 @@ extension QWEngineDriver {
                 try self.commitStochasticVerification(session, round: round, permit: permit)
                 return round.decision
             } : nil
-            let output = try QWGreedyGenerationLoop.run(vocab: geometry.vocab, first: first, maxNew: maxNew, stopIDs: stopIds,
+            let output = try QWGreedyGenerationLoop.run(vocab: geometry.vocab, first: first, maxNew: effectiveMaxNew, stopIDs: stopIds,
                 onToken: onToken, ordinary: { token in
                     try self.decodeStochastic(session, token: token, permit: permit)
-                }, committedRound: committedRound, backoff: .armed(position: session.position, drafts: mtpDrafts))
+                }, committedRound: committedRound, backoff: .armed(position: session.position, drafts: mtpDrafts),
+                canSpeculate: {
+                    self.canRunSpeculativeRound(session)
+                        && (self.activeConstraint?.constraint.isUnconstrainedNow ?? true)
+                })
             lastExperimentalGeneration = QWExperimentalGenerationStats(
                 promptTokens: prompt.count, generatedTokens: output.tokens.count,
                 prefillSec: prefillSec, decodeSec: Date().timeIntervalSince(decoding),
@@ -138,15 +147,20 @@ extension QWEngineDriver {
             throw QWEngineDriverError.state("invalid experimental generation budget or stop IDs")
         }
         lastExperimentalGeneration = nil
-        guard !prompt.isEmpty, maxNew > 0 else { return [] }
+        guard !prompt.isEmpty else { return [] }
         guard mtpDrafts > 0 else { throw QWEngineDriverError.state("experimental generation requires MTP drafts") }
+        guard session.position + prompt.count < ropeRows else {
+            throw QWEngineDriverError.posBeyondTable(session.position + prompt.count)
+        }
+        let effectiveMaxNew = min(maxNew, max(0, ropeRows - (session.position + prompt.count)))
+        guard effectiveMaxNew > 0 else { return [] }
         QWGemm.configureDenseNax(temperature: 0, topP: 1, topK: 1)
         let started = Date()
         let first = try prefill(session, tokens: prompt, mode: gdnPrefillMode, permit: permit)
         let prefillSec = Date().timeIntervalSince(started)
         let decoding = Date()
         let output = try QWGreedyGenerationLoop.run(vocab: geometry.vocab, 
-            first: first, maxNew: maxNew, stopIDs: stopIds, onToken: onToken,
+            first: first, maxNew: effectiveMaxNew, stopIDs: stopIds, onToken: onToken,
             ordinary: { try self.decodeStep(session, token: $0, permit: permit) },
             committedRound: { remaining in
                 let round = try self.prepareGreedyRound(session, maxNew: remaining, stopIDs: stopIds, permit: permit)
@@ -161,7 +175,10 @@ extension QWEngineDriver {
                 return round.decision
             }, streamsCommittedRounds: true, onStopToken: onStopToken,
             backoff: .armed(position: session.position, drafts: mtpDrafts),
-            canSpeculate: { self.activeConstraint?.constraint.isUnconstrainedNow ?? true })
+            canSpeculate: {
+                self.canRunSpeculativeRound(session)
+                    && (self.activeConstraint?.constraint.isUnconstrainedNow ?? true)
+            })
         session.lastCommitCB?.waitUntilCompleted()
         session.lastCommitCB = nil
         guard !session.stateFailed else {

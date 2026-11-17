@@ -43,8 +43,10 @@ extension QWEngineDriver {
     func encodeMTPSeeding(_ cb: any MTLCommandBuffer, session: QWEngineSession,
                                   embeddings: QWTensorValue, hidden: QWTensorValue,
                                   count: Int, cacheRows: Int) throws {
-        if let dflashDrafter, let dSlot = session.dflashSlot {
-            try dflashDrafter.encodeContextUpdate(cb, slot: dSlot, startPosition: session.position, totalCount: count)
+        if dflashDrafter != nil {
+            if let dflashDrafter, let dSlot = session.dflashSlot {
+                try dflashDrafter.encodeContextUpdate(cb, slot: dSlot, startPosition: session.position, totalCount: count)
+            }
             return
         }
         if let echoDrafter, let previous = session.trunkHidden, let views = session.mtpKVViews.first {
@@ -211,7 +213,7 @@ extension QWEngineDriver {
         mtpCache.markWritten(handle, upTo: rows)
         session.roundRecord.mtpPhysicalRows = rows
         session.trunkHiddenValid = true
-        if dflashDrafter != nil {
+        if dflashDrafter != nil, session.dflashSlot != nil {
             session.dflashCacheOffset = position + count
         }
     }

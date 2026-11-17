@@ -6,10 +6,18 @@ import QWHAL
 import QWHead
 
 final class QWHeadF16BatchedTests: XCTestCase {
+    override func setUpWithError() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true,
+            "Metal F16 batched head tests require bare-metal Apple Silicon GPU"
+        )
+    }
+
     func testAllRowsBitExactAgainstShippingGemv() throws {
         let hal = try QWHal(geometry: .qwen38_27b)
         let h = QWModelGeometry.qwen38_27b.hidden
-        for n in [1, 257, 1024] {
+        for n in [1, 10, 257, 1024] {
             let arena = try QWArena(hal: hal, weights: n * h * 2 + 256,
                                     activations: 8 * h * 2 + 16 * n * 4 + 2048,
                                     kv: 256, gdnStates: 256)

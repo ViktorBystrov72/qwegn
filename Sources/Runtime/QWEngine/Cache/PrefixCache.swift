@@ -63,6 +63,8 @@ extension QWEngineDriver {
         if effectiveConfig.warmByteLimit == 0 {
             prefixStore = nil
             cacheDiskManager = nil
+            kvCache.onPagePressure = nil
+            mtpCache?.onPagePressure = nil
         } else {
             let coordinator = try QWPrefixCacheCoordinator(config: effectiveConfig, vocab: geometry.vocab)
             let store = coordinator.warmStore!
@@ -84,6 +86,11 @@ extension QWEngineDriver {
             }
             self.prefixStore = store
             self.cacheDiskManager = diskManager
+            let pressureHandler: @Sendable () -> Bool = { [weak self] in
+                self?.prefixStore?.evictOldest() ?? false
+            }
+            kvCache.onPagePressure = pressureHandler
+            mtpCache?.onPagePressure = pressureHandler
         }
         lastPrefixCacheStats = nil
     }
@@ -281,14 +288,18 @@ extension QWEngineDriver {
                                 inspectCompleted: ((QWEngineSession) throws -> Void)?,
                                 stochastic owner: QWStochasticSession?) throws -> [Int] {
         try requestGate.withRequest(flight: flight) { permit in
-            guard let store = prefixStore, !prompt.isEmpty, maxNew >= 0, prompt.count <= ropeRows,
+            guard let store = prefixStore, !prompt.isEmpty, maxNew >= 0,
                   prompt.allSatisfy({ (0..<geometry.vocab).contains($0) }),
                   stopIds.allSatisfy({ (0..<geometry.vocab).contains($0) }),
                   !speculative || mtpDrafts > 0 else {
                 throw QWEngineDriverError.state("invalid cached generation request or unconfigured cache")
             }
+            guard prompt.count < ropeRows else {
+                throw QWEngineDriverError.posBeyondTable(prompt.count)
+            }
             lastPrefixCacheStats = nil
-            if maxNew == 0 { return [] }
+            let effectiveMaxNew = min(maxNew, max(0, ropeRows - prompt.count))
+            if effectiveMaxNew == 0 { return [] }
             let mode = gdnPrefillMode, started = Date()
             let loaded = try prefixPagePressure(store) {
                 try cachedAdmission(prompt: prompt, mode: mode, store: store, permit: permit)
@@ -356,7 +367,7 @@ extension QWEngineDriver {
                     skippedOversize = try !retainCachedPrompt(
                         session, prompt: Array(prompt.prefix(retainLen)),
                         mode: mode, first: midFirst, store: store, permit: permit,
-                        isSharedBase: retainPrefixLength != nil && !store.hasSharedBase
+                        isSharedBase: false
                     )
                     // Reset intermediate head prediction counters and reserve COW for tail tokens
                     session.generated = 0
@@ -399,7 +410,7 @@ extension QWEngineDriver {
             let prefillSec = computePrefillSec ?? firstTokenSec
             var emittedFirst = false
             var cancelledOnFirst = false
-            if maxNew > 0, !stopIds.contains(first), let onToken {
+            if effectiveMaxNew > 0, !stopIds.contains(first), let onToken {
                 emittedFirst = true
                 if onToken(first) == false {
                     cancelledOnFirst = true
@@ -452,7 +463,7 @@ extension QWEngineDriver {
                     return round.decision
                 }
             } : nil
-            let output = try QWGreedyGenerationLoop.run(vocab: geometry.vocab, first: first, maxNew: maxNew, stopIDs: stopIds,
+            let output = try QWGreedyGenerationLoop.run(vocab: geometry.vocab, first: first, maxNew: effectiveMaxNew, stopIDs: stopIds,
                 onToken: loopOnToken, ordinary: { token in
                     try self.prefixPagePressure(store, session: session) {
                         if owner != nil {
@@ -463,7 +474,10 @@ extension QWEngineDriver {
                 }, committedRound: committedRound, streamsCommittedRounds: true,
                 onStopToken: { self.lastStopToken = $0 },
                 backoff: .armed(position: session.position, drafts: mtpDrafts),
-                canSpeculate: { self.activeConstraint?.constraint.isUnconstrainedNow ?? true })
+                canSpeculate: {
+                    self.canRunSpeculativeRound(session)
+                        && (self.activeConstraint?.constraint.isUnconstrainedNow ?? true)
+                })
             session.lastCommitCB?.waitUntilCompleted()
             session.lastCommitCB = nil
             guard !session.stateFailed else {

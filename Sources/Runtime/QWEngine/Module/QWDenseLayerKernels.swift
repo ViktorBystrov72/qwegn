@@ -290,5 +290,86 @@ class DenseLayerKernel: @unchecked Sendable {
             }
         }
     }
+
+    /// Batched decode trunk pass for B=2...4 independent sessions when mla/hca/lsa/mhc are inactive.
+    func encodeBatchDecode(
+        _ enc: any MTLComputeCommandEncoder,
+        driver: QWEngineDriver,
+        sessions: [QWEngineSession],
+        layer l: Int,
+        weights lw: QWEngineDriver.LayerW
+    ) throws {
+        var curEnc = driver.activeEnc ?? enc
+        let psc = driver.psc
+        let geometry = driver.geometry
+        let H = geometry.hidden
+        let B = sessions.count
+        let plan = geometry.executionPlan
+        let nextP = (l + 1 < plan.count) ? plan[l + 1] : nil
+        let nextGamma = nextP.map { driver.layersW[$0].ln1 } ?? driver.finalNorm
+
+        if l == 0 {
+            try driver.encodeRMSNormFast(
+                curEnc,
+                x: driver.prefixRows(psc.x, rows: B, cols: H, dt: .f16),
+                gamma: lw.ln1,
+                out: driver.prefixRows(psc.ln1, rows: B, cols: H, dt: .f16),
+                rows: B)
+            curEnc.memoryBarrier(scope: .buffers)
+        }
+        if lw.kind == .gdn || lw.kind == .gdnMoe {
+            try GDNLayerKernel.encodeAttentionBatch(
+                driver: driver, enc: curEnc, sessions: sessions, layer: l, weights: lw)
+        } else {
+            try FullAttentionLayerKernel.encodeAttentionBatch(
+                driver: driver, enc: curEnc, sessions: sessions, layer: l, weights: lw)
+        }
+        curEnc = driver.activeEnc ?? curEnc
+        try driver.encodeRMSNormResidualFast(
+            curEnc,
+            x: driver.prefixRows(psc.o16, rows: B, cols: H, dt: .f16),
+            gamma: lw.ln2,
+            out: driver.prefixRows(psc.ln2, rows: B, cols: H, dt: .f16),
+            residual: driver.prefixRows(psc.x, rows: B, cols: H, dt: .f16),
+            rows: B)
+        curEnc.memoryBarrier(scope: .buffers)
+        let dnSource: QWTensorValue
+        if lw.moe != nil {
+            let mlpContext = QWLayerPrefillContext(
+                driver: driver, enc: curEnc, session: sessions[0],
+                position: sessions[0].position, layer: l, weights: lw, rows: B, mode: .chunked)
+            try encodeMLPPrefill(mlpContext)
+            curEnc = driver.activeEnc ?? curEnc
+            dnSource = psc.dn16
+        } else {
+            let batchMLP = try driver.sharedBatchMLP()
+            curEnc.useResource(batchMLP.downRows.region.buffer, usage: [.read, .write])
+            curEnc.useResource(batchMLP.sums.region.buffer, usage: [.read, .write])
+            let activeMlpRows = driver.prefixRows(psc.gu16, rows: B, cols: geometry.intermediate, dt: .f16)
+            let fuseFwht = !lw.gu.view.isIncumbentContainer && geometry.intermediate > 0 && (geometry.intermediate % 32 == 0)
+            try batchMLP.encodeGateUp(
+                curEnc,
+                input: driver.prefixRows(psc.ln2, rows: B, cols: H, dt: .f16),
+                weight: lw.gu.view,
+                output: activeMlpRows,
+                activeRows: B,
+                fuseFwht32: fuseFwht)
+            if !fuseFwht {
+                driver.encodeFwht32Fast(curEnc, x: activeMlpRows)
+                curEnc.memoryBarrier(scope: .buffers)
+            }
+            try batchMLP.encodeDown(curEnc, input: activeMlpRows, weight: lw.down, activeRows: B)
+            dnSource = batchMLP.downRows
+        }
+        curEnc.memoryBarrier(scope: .buffers)
+        try driver.encodeRMSNormResidualFast(
+            curEnc,
+            x: driver.prefixRows(dnSource, rows: B, cols: H, dt: .f16),
+            gamma: nextGamma,
+            out: driver.prefixRows(psc.ln1, rows: B, cols: H, dt: .f16),
+            residual: driver.prefixRows(psc.x, rows: B, cols: H, dt: .f16),
+            rows: B)
+        curEnc.memoryBarrier(scope: .buffers)
+    }
 }
 

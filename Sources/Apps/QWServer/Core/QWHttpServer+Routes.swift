@@ -88,6 +88,11 @@ extension QWHttpServer {
             mountedMemoryPack: self.actor.getMountedMemoryPackInfo(),
             endpoints: [
                 "chat": "POST /v1/chat/completions",
+                "responses": "POST /v1/responses",
+                "completions": "POST /v1/completions",
+                "tokenizer_info": "GET /tokenizer_info",
+                "tokenize": "POST /tokenize",
+                "detokenize": "POST /detokenize",
                 "models": "GET /v1/models",
                 "metrics": "GET /v1/metrics",
                 "metrics_stream": "GET /v1/metrics/stream",
@@ -204,6 +209,23 @@ extension QWHttpServer {
 
     func sendSimpleResponse(_ connection: NWConnection, status: Int, body: String) {
         sendRawData(connection, status: status, contentType: "text/plain", data: Data(body.utf8))
+    }
+
+    func sendOpenAIError(
+        _ connection: NWConnection,
+        status: Int,
+        message: String,
+        type: String = "invalid_request_error",
+        code: String? = nil
+    ) {
+        var detail: [String: Any] = ["message": message, "type": type]
+        if let code { detail["code"] = code }
+        let payload: [String: Any] = ["error": detail]
+        if let data = try? JSONSerialization.data(withJSONObject: payload) {
+            sendRawData(connection, status: status, contentType: "application/json", data: data)
+        } else {
+            sendSimpleResponse(connection, status: status, body: message)
+        }
     }
 
     func handleMemoryInspectRoute(connection: NWConnection, body: Data) async throws {

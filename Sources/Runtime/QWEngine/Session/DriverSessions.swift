@@ -49,7 +49,8 @@ extension QWEngineDriver {
     func admitSession(promptTokens: Int, prefix: QWEngineSharedPrefix? = nil) throws -> QWEngineSession {
         slotLock.lock()
         guard !freeSlots.isEmpty else { slotLock.unlock(); throw QWEngineDriverError.busy }
-        let slot = freeSlots.removeFirst()          // FIFO (QWPrefixAlgebra law)
+        let slotIndex = freeSlots.firstIndex(where: { $0.dflashSlot != nil }) ?? 0
+        let slot = freeSlots.remove(at: slotIndex)
         slotLock.unlock()
         if prefix == nil {
             memset(slot.recSlab.region.buffer.contents()
@@ -112,6 +113,8 @@ extension QWEngineDriver {
         defer { flight.unlock() }
         guard !session.sessionFinished else { return }
         session.sessionFinished = true
+        session.mlaIndexerStash = nil
+        session.mlaLiveStash = nil
         session.lastCommitCB?.waitUntilCompleted()
         session.lastCommitCB = nil
         session.stochastic?.stream.cancelActiveRound()
@@ -381,14 +384,30 @@ extension QWEngineDriver {
         }
         if let mla = mlaOperator {
             guard mla.stateOwner !== session else { return }
+            let mtpLayer = (mtpDraftEncoder != nil || echoDrafter != nil) && attnLayers.count < mla.layers.count
+                ? attnLayers.count : nil
             if let prev = mla.stateOwner as? QWEngineSession, !prev.sessionFinished, prev.position > 0 {
                 prev.lastCommitCB?.waitUntilCompleted()
-                prev.mlaIndexerStash = (mla.captureIndexerState(position: prev.position), prev.position)
+                let mtpPos = prev.roundRecord.mtpPhysicalRows
+                prev.mlaLiveStash = (
+                    mla.captureLiveSessionStash(trunkPosition: prev.position, mtpLayerIndex: mtpLayer, mtpPosition: mtpPos),
+                    prev.position, mtpPos
+                )
             }
             mla.stateOwner = session
-            defer { session.mlaIndexerStash = nil }
+            defer {
+                session.mlaIndexerStash = nil
+                session.mlaLiveStash = nil
+            }
             guard restoring, session.position > 0 else {
                 mla.truncatePosition(session.position)
+                return
+            }
+            if let live = session.mlaLiveStash,
+               live.trunkPosition == session.position,
+               live.mtpPosition == session.roundRecord.mtpPhysicalRows,
+               mla.restoreLiveSessionStash(live.data, trunkPosition: live.trunkPosition,
+                                           mtpLayerIndex: mtpLayer, mtpPosition: live.mtpPosition) {
                 return
             }
             guard let stash = session.mlaIndexerStash, stash.position == session.position,

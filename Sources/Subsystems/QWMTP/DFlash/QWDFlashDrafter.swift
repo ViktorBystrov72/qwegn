@@ -111,7 +111,15 @@ public final class QWDFlashDrafter: @unchecked Sendable {
     let dspinePSO: DSpinePipelines
     let quantPSOs: [DrafterQuantKey: DrafterQuantPipelines]
 
-    public init(geometry: QWModelGeometry, hal: QWHal, packPath: String, drafts: Int = 7, selectorTopK: Int? = nil) throws {
+    public init(
+        geometry: QWModelGeometry,
+        hal: QWHal,
+        packPath: String,
+        drafts: Int = 7,
+        selectorTopK: Int? = nil,
+        sessionSlotCount: Int = 2
+    ) throws {
+        let resolvedSlots = max(1, sessionSlotCount)
         try QWDFlashConfig.validateDrafter(
             targetDescriptor: geometry.descriptor,
             packPath: packPath,
@@ -287,7 +295,8 @@ public final class QWDFlashDrafter: @unchecked Sendable {
         let maxD = maxB - 1
         let sCapacity = Self.computeScratchCapacity(
             config: config, maxCtx: maxCtx, maxB: maxB, maxD: maxD,
-            qDim: qDim, kvDim: kvDim, hasConv: hasConv, convProjDim: convProjDim
+            qDim: qDim, kvDim: kvDim, hasConv: hasConv, convProjDim: convProjDim,
+            sessionSlotCount: resolvedSlots
         )
         guard let sBuf = hal.device.makeBuffer(length: sCapacity, options: .storageModeShared) else {
             throw QWDFlashError.state("QWDFlashDrafter: failed to allocate scratch buffer")
@@ -321,7 +330,7 @@ public final class QWDFlashDrafter: @unchecked Sendable {
 
         let layerKVElements = maxCtx * kvDim
         var slots: [QWDFlashSessionSlot] = []
-        for _ in 0..<2 {
+        for _ in 0..<resolvedSlots {
             let kSlab = try sSub.allocate(QWTensorShape([config.numLayers * layerKVElements], .f16))
             let vSlab = try sSub.allocate(QWTensorShape([config.numLayers * layerKVElements], .f16))
             let kViews = (0..<config.numLayers).map { l in
@@ -393,7 +402,7 @@ public final class QWDFlashDrafter: @unchecked Sendable {
 
     private static func computeScratchCapacity(
         config: QWDFlashConfig, maxCtx: Int, maxB: Int, maxD: Int,
-        qDim: Int, kvDim: Int, hasConv: Bool, convProjDim: Int
+        qDim: Int, kvDim: Int, hasConv: Bool, convProjDim: Int, sessionSlotCount: Int = 2
     ) -> Int {
         func aligned(_ bytes: Int) -> Int { ((bytes + 4095) / 4096) * 4096 }
         let H = config.hiddenSize
@@ -422,7 +431,7 @@ public final class QWDFlashDrafter: @unchecked Sendable {
             total += aligned(maxD * 16 * br * 2) + aligned(maxD * 16 * H * 4)
             total += aligned(maxD * 16 * H * 2) * 2 + aligned(maxD * 16 * 16 * 4)
         }
-        total += 4 * aligned(config.numLayers * maxCtx * kvDim * 2)
+        total += (2 * max(1, sessionSlotCount)) * aligned(config.numLayers * maxCtx * kvDim * 2)
         return max(32 * 1024 * 1024, total + 16 * 1024 * 1024)
     }
 }

@@ -72,6 +72,12 @@ public final class QWKVCache: @unchecked Sendable {
     var freeSeqs: [QWKVSeqID] = []
     let lock = NSLock()
     let cacheEpoch = UUID()
+    private var _onPagePressure: (@Sendable () -> Bool)?
+    /// Invoked outside `lock` on `QWKVError.outOfPages`; returns `true` if pages may have freed.
+    public var onPagePressure: (@Sendable () -> Bool)? {
+        get { lock.withLock { _onPagePressure } }
+        set { lock.withLock { _onPagePressure = newValue } }
+    }
     /// Counts retained immutable-prefix objects and live table entries per
     /// physical page; snapshots continue to use the legacy per-sequence pins.
     struct SharedPage: Hashable { let pool: Int; let page: Int32 }
@@ -171,11 +177,32 @@ public final class QWKVCache: @unchecked Sendable {
         tableBase + ((Int(seq) * layers.count + li) * 2 + (kind == .k ? 0 : 1)) * Self.tableSlotBytes
     }
 
+    /// Runs `body` under `lock`; on `.outOfPages`, drops `lock` before invoking `onPagePressure`.
+    private func withPagePressure<T>(_ body: () throws -> T) throws -> T {
+        let maxRetries = max(1024, poolsFlat.reduce(0) { $0 + $1.pages.pageCount })
+        var attempts = 0
+        while true {
+            do {
+                return try lock.withLock { try body() }
+            } catch let error as QWKVError {
+                guard case .outOfPages = error, attempts < maxRetries else { throw error }
+                let pressure = lock.withLock { _onPagePressure }
+                guard let pressure, pressure() else { throw error }
+                attempts += 1
+            }
+        }
+    }
+
     /// Allocate a sequence's cache for `promptTokens` (prefill grows up-front;
     /// decode grows one page per 256 tokens via grow()). All-or-nothing: on a
     /// pool shortfall every page taken in this call returns to its own pool.
     public func allocate(_ seq: QWKVSeqID? = nil, promptTokens: Int) throws -> QWKVHandle {
-        lock.lock(); defer { lock.unlock() }
+        try withPagePressure {
+            try allocateLocked(seq, promptTokens: promptTokens)
+        }
+    }
+
+    private func allocateLocked(_ seq: QWKVSeqID? = nil, promptTokens: Int) throws -> QWKVHandle {
         let id = seq ?? (freeSeqs.isEmpty ? nextSeq : freeSeqs.removeFirst())
         // H2 FIX: the id is RETURNED to freeSeqs on every early exit below.
         // Before, a failed allocate (outOfPages, oversized prompt) ate the
@@ -227,7 +254,12 @@ public final class QWKVCache: @unchecked Sendable {
     /// the cached prefix are allocated, so admission does not first pay for a
     /// redundant private copy of the prefix.
     public func allocate(adopting prefix: QWKVSharedPrefix, promptTokens: Int) throws -> QWKVHandle {
-        lock.lock(); defer { lock.unlock() }
+        try withPagePressure {
+            try allocateLocked(adopting: prefix, promptTokens: promptTokens)
+        }
+    }
+
+    private func allocateLocked(adopting prefix: QWKVSharedPrefix, promptTokens: Int) throws -> QWKVHandle {
         try validateSharedPrefixLocked(prefix)
         guard promptTokens >= prefix.tokenCount, promptTokens <= Self.maxTokensPerSeq else {
             throw QWKVError.badArgument("shared prefix prompt extent invalid")
@@ -294,7 +326,12 @@ public final class QWKVCache: @unchecked Sendable {
     /// path (once per 256 tokens); zero host allocs when steady (the table
     /// arrays are capacity-reserved at allocate()). All-or-nothing per call.
     public func grow(_ h: QWKVHandle, to tokens: Int) throws {
-        lock.lock(); defer { lock.unlock() }
+        try withPagePressure {
+            try growLocked(h, to: tokens)
+        }
+    }
+
+    private func growLocked(_ h: QWKVHandle, to tokens: Int) throws {
         guard let st = seqs[h.seq] else { throw QWKVError.badArgument("unknown seq") }
         let havePages = st.tablesK.first?.count ?? 0
         let needPages = (tokens + Self.pageTokens - 1) / Self.pageTokens
@@ -340,7 +377,13 @@ public final class QWKVCache: @unchecked Sendable {
     /// positions.lowerBound + j). The hot decode path writes the SAME rows
     public func append(_ h: QWKVHandle, positions: Range<Int>,
                        layer: Int, kind: QWKVKind, src: [UInt16]) throws {
-        lock.lock(); defer { lock.unlock() }
+        try withPagePressure {
+            try appendLocked(h, positions: positions, layer: layer, kind: kind, src: src)
+        }
+    }
+
+    private func appendLocked(_ h: QWKVHandle, positions: Range<Int>,
+                              layer: Int, kind: QWKVKind, src: [UInt16]) throws {
         guard h.cache === self, !h.finished, let st = seqs[h.seq], let li = layerIndex(layer) else {
             throw QWKVError.badArgument("unknown seq/layer")
         }
@@ -438,7 +481,12 @@ public final class QWKVCache: @unchecked Sendable {
     /// range. It privatizes every shared page intersecting the range. The
     /// device table's contents change, but its buffer, base, and length do
     public func prepareWrites(_ h: QWKVHandle, positions: Range<Int>) throws {
-        lock.lock(); defer { lock.unlock() }
+        try withPagePressure {
+            try prepareWritesEntryLocked(h, positions: positions)
+        }
+    }
+
+    private func prepareWritesEntryLocked(_ h: QWKVHandle, positions: Range<Int>) throws {
         guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
             throw QWKVError.badArgument("unknown, foreign, or finished seq")
         }

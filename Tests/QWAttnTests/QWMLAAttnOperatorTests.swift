@@ -13,6 +13,14 @@ import QWQuant
 import QWGEMM
 
 final class QWMLAAttnOperatorTests: XCTestCase {
+    override func setUpWithError() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true,
+            "MLA/DSA GPU operator tests require bare-metal Apple Silicon GPU"
+        )
+    }
+
     static func makeBuffer<T: BitwiseCopyable>(_ values: [T], device: any MTLDevice) -> any MTLBuffer {
         let byteCount = values.count * MemoryLayout<T>.stride
         let buffer = device.makeBuffer(length: max(16, byteCount), options: .storageModeShared)!
@@ -524,6 +532,100 @@ final class QWMLAAttnOperatorTests: XCTestCase {
             let mlaRef = runMLA(pMLAH16, grid: MTLSize(width: rows, height: qHeads / 16, depth: 1), tg: 128)
             let mlaH32 = runMLA(pMLAH32, grid: MTLSize(width: qHeads / 32, height: rows, depth: 1), tg: 256)
             XCTAssertEqual(mlaH32, mlaRef, "MLA h32 vs h16 must be bit-exact kvMode=\(kvMode)")
+        }
+    }
+
+    func testLiveSessionStashPreservesFullRingAndMTPLayerAcrossMod4AndDSA() throws {
+        let geo = try Self.mlaGeometry()
+        let hal = try QWHal(geometry: geo)
+        let op = try QWMLAAttnOperator(hal: hal, geometry: geo, numAttnLayers: 3, maxContext: 512, maxPrefillChunk: 16)
+        let base = op.region.pointer
+
+        func fillDeterministic(seed: UInt8) {
+            for (idx, ls) in op.layers.enumerated() {
+                for (tIdx, t) in [ls.pooledKeys, ls.kPending, ls.gatePending].enumerated() {
+                    let p = base.advanced(by: t.offset).assumingMemoryBound(to: UInt8.self)
+                    for i in 0..<t.bytes {
+                        p[i] = UInt8(truncatingIfNeeded: i &* 17 &+ Int(seed) &+ idx &* 31 &+ tIdx * 7)
+                    }
+                }
+            }
+        }
+        func snapshotBytes(_ t: QWTensorValue, byteCount: Int) -> [UInt8] {
+            let p = base.advanced(by: t.offset).assumingMemoryBound(to: UInt8.self)
+            return Array(UnsafeBufferPointer(start: p, count: byteCount))
+        }
+
+        let rowBytes = op.idxDim * 2
+        let ringBytes = op.ringCap * rowBytes
+        for (trunkPos, mtpPos) in [(16, 11), (19, 14)] {
+            fillDeterministic(seed: UInt8(trunkPos))
+            let expected = op.layers.enumerated().map { (i, ls) -> ([UInt8], [UInt8], [UInt8]) in
+                let p = (i == 2) ? mtpPos : trunkPos
+                return (snapshotBytes(ls.pooledKeys, byteCount: (p / 4) * rowBytes),
+                        snapshotBytes(ls.kPending, byteCount: ringBytes),
+                        snapshotBytes(ls.gatePending, byteCount: ringBytes))
+            }
+            let stash = op.captureLiveSessionStash(trunkPosition: trunkPos, mtpLayerIndex: 2, mtpPosition: mtpPos)
+            XCTAssertEqual(stash.count, op.liveSessionStashBytes(trunkPosition: trunkPos, mtpLayerIndex: 2, mtpPosition: mtpPos))
+            fillDeterministic(seed: 0xAA)
+            XCTAssertTrue(op.restoreLiveSessionStash(stash, trunkPosition: trunkPos, mtpLayerIndex: 2, mtpPosition: mtpPos))
+            for (i, ls) in op.layers.enumerated() {
+                let p = (i == 2) ? mtpPos : trunkPos
+                XCTAssertEqual(snapshotBytes(ls.pooledKeys, byteCount: (p / 4) * rowBytes), expected[i].0)
+                XCTAssertEqual(snapshotBytes(ls.kPending, byteCount: ringBytes), expected[i].1)
+                XCTAssertEqual(snapshotBytes(ls.gatePending, byteCount: ringBytes), expected[i].2)
+            }
+        }
+
+        // Also check decoupled DSA live session stash (including kPeCache + mtpLayerIndex).
+        let dsaCfg = """
+        {
+          "architectures": ["Ernie5_5_MoeForCausalLM"], "model_type": "ernie5_5_moe",
+          "vocab_size": 1024, "hidden_size": 128, "intermediate_size": 128,
+          "num_hidden_layers": 2, "max_position_embeddings": 1048576, "rms_norm_eps": 1e-6,
+          "num_attention_heads": 16, "num_key_value_heads": 1, "head_dim": 512,
+          "compress_ratios": [4, -2], "default_compress_ratio": 4,
+          "q_lora_rank": 128, "kv_lora_rank": 512,
+          "compress_qk_nope_head_dim": 448, "compress_qk_rope_head_dim": 64, "compress_v_head_dim": 512,
+          "o_groups": 2, "o_lora_rank": 128, "sliding_window": 128,
+          "compress_rope_theta": 160000.0, "hca_rope_type": "yarn",
+          "rope_scaling": { "type": "yarn", "factor": 16, "original_max_position_embeddings": 65536, "beta_fast": 32, "beta_slow": 1 },
+          "rope_theta": 8000000.0, "rotary_percent": 1.0, "rope_interleave": true,
+          "hybrid_mla_attention": "mqa_dsa", "hybrid_mla_num_attention_heads": 16, "hybrid_mla_num_key_value_heads": 16,
+          "hybrid_mla_q_lora_rank": 64, "hybrid_mla_kv_lora_rank": 512,
+          "hybrid_mla_qk_nope_head_dim": 192, "hybrid_mla_qk_rope_head_dim": 64, "hybrid_mla_v_head_dim": 256,
+          "mqa_split_kv_b_proj": true, "index_n_heads": 64, "index_head_dim": 128, "index_topk": 256,
+          "use_fast_hadamard": true, "use_vha_attention": true, "add_full_attention_sink_bias": true,
+          "use_gated_attn": true, "use_attn_merger": true, "gated_attn_use_q_lora": true, "eos_token_id": 2
+        }
+        """.data(using: .utf8)!
+        let dsaGeo = QWModelGeometry(descriptor: try QWModelDescriptor.decode(configJSON: dsaCfg))
+        let dsaOp = try QWMLAAttnOperator(hal: hal, geometry: dsaGeo, numAttnLayers: 3, maxContext: 512, maxPrefillChunk: 32)
+        XCTAssertTrue(dsaOp.isDecoupledDSA)
+        let dsaBase = dsaOp.region.pointer
+        for (i, ls) in dsaOp.layers.enumerated() {
+            for t in [ls.pooledKeys, ls.kPeCache].compactMap({ $0 }) {
+                let p = dsaBase.advanced(by: t.offset).assumingMemoryBound(to: UInt8.self)
+                for j in 0..<t.bytes { p[j] = UInt8(truncatingIfNeeded: (j + i * 13) & 0xFF) }
+            }
+        }
+        let dsaStash = dsaOp.captureLiveSessionStash(trunkPosition: 16, mtpLayerIndex: 2, mtpPosition: 10)
+        let expectedPools = (0..<3).map { i -> [UInt8] in
+            let pos = (i == 2) ? 10 : 16
+            let p = dsaBase.advanced(by: dsaOp.layers[i].pooledKeys.offset).assumingMemoryBound(to: UInt8.self)
+            return Array(UnsafeBufferPointer(start: p, count: pos * dsaOp.idxDim * 2))
+        }
+        for ls in dsaOp.layers {
+            for t in [ls.pooledKeys, ls.kPeCache].compactMap({ $0 }) {
+                memset(dsaBase.advanced(by: t.offset), 0, t.bytes)
+            }
+        }
+        XCTAssertTrue(dsaOp.restoreLiveSessionStash(dsaStash, trunkPosition: 16, mtpLayerIndex: 2, mtpPosition: 10))
+        for i in 0..<3 {
+            let pos = (i == 2) ? 10 : 16
+            let p = dsaBase.advanced(by: dsaOp.layers[i].pooledKeys.offset).assumingMemoryBound(to: UInt8.self)
+            XCTAssertEqual(Array(UnsafeBufferPointer(start: p, count: pos * dsaOp.idxDim * 2)), expectedPools[i])
         }
     }
 }

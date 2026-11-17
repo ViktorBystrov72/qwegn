@@ -240,4 +240,25 @@ final class QWTwoTierCacheTests: XCTestCase {
         XCTAssertEqual(turn3Lookup?.value, 301)
         XCTAssertEqual(store.count, 3, "Pinned base + slotBaseKey + slotLastKey must not leak superseded entries")
     }
+
+    func testOpportunisticRetainedPrefixEvictsUnderPressureWhileMountedBaseStaysPinned() throws {
+        let store = try QWEnginePrefixStore<Int>(byteLimit: 5000, entryLimit: 8, vocab: 1000, maxSlots: 4)
+        let mountedBase = Array(100...163)
+        let retainedPrefix = Array(200...231)
+
+        // Mounted shared base (`isSharedBase: true`) + opportunistic retained system prefix (`isSharedBase: false`).
+        XCTAssertTrue(try store.insert(tokens: mountedBase, mode: "chunked", value: 1,
+                                       payloadBytes: 2200, allowsSuffix: true, isSharedBase: true))
+        XCTAssertTrue(try store.insert(tokens: retainedPrefix, mode: "chunked", value: 2,
+                                       payloadBytes: 1200, allowsSuffix: true, isSharedBase: false))
+        XCTAssertTrue(store.hasSharedBase)
+        XCTAssertEqual(store.count, 2)
+
+        // Page pressure eviction drops opportunistic retained prefix while mounted shared base stays pinned.
+        XCTAssertTrue(store.evictOldest())
+        XCTAssertNil(try store.lookup(tokens: retainedPrefix + [1], mode: "chunked"))
+        XCTAssertEqual(try store.lookup(tokens: mountedBase + [1], mode: "chunked")?.value, 1)
+        XCTAssertFalse(store.evictOldest())
+        XCTAssertEqual(try store.lookup(tokens: mountedBase + [1], mode: "chunked")?.tokenCount, mountedBase.count)
+    }
 }

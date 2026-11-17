@@ -19,6 +19,7 @@ public struct QWPreparedChatPrompt: @unchecked Sendable {
     public let isConstrainedJson: Bool
     public let enforceJson: Bool
     public let jsonConstraint: QWStructuredOutputConstraint?
+    public let innerConstraint: (any QWTokenConstraint)?
     public let activeConstraint: (any QWTokenConstraint)?
     public let stops: Set<Int>
     public let imEndTokenId: Int
@@ -39,7 +40,8 @@ public enum QWChatTurnPreparer {
         tokenizer tok: QWTokenizer,
         descriptor: QWModelDescriptor,
         supportsTokenConstraints: Bool,
-        memoryManifest: QWMemoryManifest? = nil
+        memoryManifest: QWMemoryManifest? = nil,
+        effectiveMaxNewTokens: Int? = nil
     ) throws -> QWPreparedChatPrompt {
         try preparePrompt(
             request: request,
@@ -49,7 +51,8 @@ public enum QWChatTurnPreparer {
             specialTokensFallback: descriptor.specialTokens,
             vocabularySize: descriptor.vocab,
             supportsTokenConstraints: supportsTokenConstraints,
-            memoryManifest: memoryManifest
+            memoryManifest: memoryManifest,
+            effectiveMaxNewTokens: effectiveMaxNewTokens
         )
     }
 
@@ -63,12 +66,20 @@ public enum QWChatTurnPreparer {
         specialTokensFallback: QWModelSpecialTokens = QWModelSpecialTokens(),
         vocabularySize: Int,
         supportsTokenConstraints: Bool,
-        memoryManifest: QWMemoryManifest? = nil
+        memoryManifest: QWMemoryManifest? = nil,
+        effectiveMaxNewTokens: Int? = nil
     ) throws -> QWPreparedChatPrompt {
         let hasActiveTools = !(request.tools?.isEmpty ?? true) && !request.isToolChoiceNone
         let fmtType = request.responseFormatType
         let isAssistantPrefill = request.isAssistantPrefill
-        let shouldThink = request.effectiveEnableThinking(defaultValue: config.enableThinking)
+        let (policyThink, policyBudget) = request.resolvedThinkingPolicy(
+            defaultEnableThinking: config.enableThinking,
+            defaultMaxTokens: config.maxTokens,
+            modelMaxLength: config.modelMaxLength,
+            overrideMaxNewTokens: effectiveMaxNewTokens
+        )
+        let shouldThink = chatTemplate.supportsThinkingTags && policyThink
+        let thinkingBudget = chatTemplate.supportsThinkingTags ? policyBudget : nil
 
         var extraSystemLines: [String] = []
         if let fmtType, (fmtType == "json_schema" || fmtType == "json_object") {
@@ -190,7 +201,23 @@ public enum QWChatTurnPreparer {
                 table: table, toolCallToken: toolCallTokenId,
                 toolCallEndToken: tok.tokenId(for: "</tool_call>"))
         }
-        let activeConstraint: (any QWTokenConstraint)? = jsonConstraint ?? builtToolConstraint
+        let innerConstraint: (any QWTokenConstraint)? = jsonConstraint ?? builtToolConstraint
+        let hasKnownEndThink = tok.tokenId(for: "</think>") != nil || tok.tokenId(for: "</ernie:think>") != nil
+        let activeConstraint: (any QWTokenConstraint)?
+        if let thinkingBudget, shouldThink, supportsTokenConstraints,
+           endThinkTokenId >= 0, endThinkTokenId < vocabularySize,
+           (hasKnownEndThink || endThinkTokenId != QWModelSpecialTokens().endThinkTokenId) {
+            let tokenBytes = QWStructuredOutput.tokenBytes(for: tok, vocabulary: vocabularySize)
+            activeConstraint = QWThinkingBudgetConstraint(
+                maxThinkingTokens: thinkingBudget,
+                endThinkTokenId: endThinkTokenId,
+                vocabularySize: vocabularySize,
+                tokenBytes: tokenBytes,
+                inner: innerConstraint
+            )
+        } else {
+            activeConstraint = innerConstraint
+        }
         let customStopStrings: [String] = (request.ignoreEos == true)
             ? []
             : (request.stop ?? []).filter { !$0.isEmpty }
@@ -205,6 +232,7 @@ public enum QWChatTurnPreparer {
             isConstrainedJson: isConstrainedJson,
             enforceJson: enforceJson,
             jsonConstraint: jsonConstraint,
+            innerConstraint: innerConstraint,
             activeConstraint: activeConstraint,
             stops: stops,
             imEndTokenId: imEndTokenId,

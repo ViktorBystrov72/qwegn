@@ -4,126 +4,93 @@ using namespace metal;
 
 struct QWHeadH8 { half v[8]; } __attribute__((__packed__, __aligned__(16)));
 
-template<uint M>
-static inline void qwhead_f16_batched(
-        device const QWHeadH8* W, constant const QWHeadH8* x,
-        device float* y, uint N, uint K, uint row, uint lane) {
-    if (row >= N) return;
-    const uint chunks = K / 8;
-    device const QWHeadH8* wr = W + (size_t)row * chunks;
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
-    for (uint c = lane; c < chunks; c += 32) {
-        const QWHeadH8 weight = wr[c];
-        for (int i = 0; i < 8; i++) {
-            const float w = float(weight.v[i]);
-            a0 += w * float(x[c].v[i]);
-            a1 += w * float(x[chunks + c].v[i]);
-            if (M >= 3) a2 += w * float(x[2 * chunks + c].v[i]);
-            if (M >= 4) a3 += w * float(x[3 * chunks + c].v[i]);
-            if (M >= 5) a4 += w * float(x[4 * chunks + c].v[i]);
-            if (M >= 6) a5 += w * float(x[5 * chunks + c].v[i]);
-            if (M >= 7) a6 += w * float(x[6 * chunks + c].v[i]);
-            if (M >= 8) a7 += w * float(x[7 * chunks + c].v[i]);
-        }
-    }
-    // Match the shipping GEMV's reduction order independently for each row.
-    float4 v = float4(a0, a1, a2, a3);
+static inline float4 qwhead_simd_sum4(float4 v) {
     v += simd_shuffle_down(v, 16);
     v += simd_shuffle_down(v, 8);
     v += simd_shuffle_down(v, 4);
     v += simd_shuffle_down(v, 2);
     v += simd_shuffle_down(v, 1);
-    float4 tail = float4(a4, a5, a6, a7);
-    tail += simd_shuffle_down(tail, 16);
-    tail += simd_shuffle_down(tail, 8);
-    tail += simd_shuffle_down(tail, 4);
-    tail += simd_shuffle_down(tail, 2);
-    tail += simd_shuffle_down(tail, 1);
-    if (lane == 0) {
-        y[row] = v.x;
-        y[(size_t)N + row] = v.y;
-        if (M >= 3) y[(size_t)2 * N + row] = v.z;
-        if (M >= 4) y[(size_t)3 * N + row] = v.w;
-        if (M >= 5) y[(size_t)4 * N + row] = tail.x;
-        if (M >= 6) y[(size_t)5 * N + row] = tail.y;
-        if (M >= 7) y[(size_t)6 * N + row] = tail.z;
-        if (M >= 8) y[(size_t)7 * N + row] = tail.w;
+    return v;
+}
+
+template<uint M>
+static inline void qwhead_f16_batched(
+        device const QWHeadH8* W, device const QWHeadH8* x,
+        device float* y, uint N, uint K, uint tg, uint ti) {
+    const uint row0 = (tg * 4u + (ti >> 5u)) * 2u;
+    const uint lane = ti & 31u;
+    if (row0 >= N) return;
+    const bool hasRow1 = (row0 + 1u < N);
+    const uint chunks = K / 8;
+    device const QWHeadH8* wr0 = W + (size_t)row0 * chunks;
+    device const QWHeadH8* wr1 = hasRow1 ? (wr0 + chunks) : wr0;
+    float a0[8] = {};
+    float a1[8] = {};
+    for (uint c = lane; c < chunks; c += 32) {
+        const QWHeadH8 w0 = wr0[c];
+        const QWHeadH8 w1 = hasRow1 ? wr1[c] : w0;
+        #pragma unroll
+        for (uint m = 0; m < M; m++) {
+            const QWHeadH8 xm = x[(size_t)m * chunks + c];
+            for (int i = 0; i < 8; i++) {
+                const float xv = float(xm.v[i]);
+                a0[m] += float(w0.v[i]) * xv;
+                if (hasRow1) a1[m] += float(w1.v[i]) * xv;
+            }
+        }
+    }
+    // Match qwg_gemv_f16_v4's shuffle-down reduction order per (vocabRow, batchRow).
+    float4 lo0 = qwhead_simd_sum4(float4(a0[0], a0[1], M >= 3 ? a0[2] : 0.0f, M >= 4 ? a0[3] : 0.0f));
+    float4 hi0 = float4(0.0f);
+    if (M > 4) {
+        hi0 = qwhead_simd_sum4(float4(a0[4], M >= 6 ? a0[5] : 0.0f, M >= 7 ? a0[6] : 0.0f, M >= 8 ? a0[7] : 0.0f));
+    }
+    float4 lo1 = float4(0.0f);
+    float4 hi1 = float4(0.0f);
+    if (hasRow1) {
+        lo1 = qwhead_simd_sum4(float4(a1[0], a1[1], M >= 3 ? a1[2] : 0.0f, M >= 4 ? a1[3] : 0.0f));
+        if (M > 4) {
+            hi1 = qwhead_simd_sum4(float4(a1[4], M >= 6 ? a1[5] : 0.0f, M >= 7 ? a1[6] : 0.0f, M >= 8 ? a1[7] : 0.0f));
+        }
+    }
+    if (lane == 0u) {
+        y[row0] = lo0.x;
+        y[(size_t)N + row0] = lo0.y;
+        if (M >= 3) y[(size_t)2 * N + row0] = lo0.z;
+        if (M >= 4) y[(size_t)3 * N + row0] = lo0.w;
+        if (M >= 5) y[(size_t)4 * N + row0] = hi0.x;
+        if (M >= 6) y[(size_t)5 * N + row0] = hi0.y;
+        if (M >= 7) y[(size_t)6 * N + row0] = hi0.z;
+        if (M >= 8) y[(size_t)7 * N + row0] = hi0.w;
+        if (hasRow1) {
+            const uint row1 = row0 + 1u;
+            y[row1] = lo1.x;
+            y[(size_t)N + row1] = lo1.y;
+            if (M >= 3) y[(size_t)2 * N + row1] = lo1.z;
+            if (M >= 4) y[(size_t)3 * N + row1] = lo1.w;
+            if (M >= 5) y[(size_t)4 * N + row1] = hi1.x;
+            if (M >= 6) y[(size_t)5 * N + row1] = hi1.y;
+            if (M >= 7) y[(size_t)6 * N + row1] = hi1.z;
+            if (M >= 8) y[(size_t)7 * N + row1] = hi1.w;
+        }
     }
 }
 
-kernel void qwg_head_f16_m2(
-        device const QWHeadH8* W [[buffer(0)]],
-        constant const QWHeadH8* x [[buffer(1)]],
-        device float* y [[buffer(3)]],
-        constant uint& N [[buffer(4)]],
-        constant uint& K [[buffer(5)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_threadgroup]]) {
-    qwhead_f16_batched<2>(W, x, y, N, K, row, lane);
+#define QW_HEAD_F16_ENTRY(M) \
+kernel void qwg_head_f16_m##M( \
+        device const QWHeadH8* W [[buffer(0)]], \
+        device const QWHeadH8* x [[buffer(1)]], \
+        device float* y [[buffer(3)]], \
+        constant uint& N [[buffer(4)]], \
+        constant uint& K [[buffer(5)]], \
+        uint tg [[threadgroup_position_in_grid]], \
+        uint ti [[thread_index_in_threadgroup]]) { \
+    qwhead_f16_batched<M>(W, x, y, N, K, tg, ti); \
 }
-
-kernel void qwg_head_f16_m3(
-        device const QWHeadH8* W [[buffer(0)]],
-        constant const QWHeadH8* x [[buffer(1)]],
-        device float* y [[buffer(3)]],
-        constant uint& N [[buffer(4)]],
-        constant uint& K [[buffer(5)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_threadgroup]]) {
-    qwhead_f16_batched<3>(W, x, y, N, K, row, lane);
-}
-
-kernel void qwg_head_f16_m4(
-        device const QWHeadH8* W [[buffer(0)]],
-        constant const QWHeadH8* x [[buffer(1)]],
-        device float* y [[buffer(3)]],
-        constant uint& N [[buffer(4)]],
-        constant uint& K [[buffer(5)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_threadgroup]]) {
-    qwhead_f16_batched<4>(W, x, y, N, K, row, lane);
-}
-
-kernel void qwg_head_f16_m5(
-        device const QWHeadH8* W [[buffer(0)]],
-        constant const QWHeadH8* x [[buffer(1)]],
-        device float* y [[buffer(3)]],
-        constant uint& N [[buffer(4)]],
-        constant uint& K [[buffer(5)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_threadgroup]]) {
-    qwhead_f16_batched<5>(W, x, y, N, K, row, lane);
-}
-
-kernel void qwg_head_f16_m6(
-        device const QWHeadH8* W [[buffer(0)]],
-        constant const QWHeadH8* x [[buffer(1)]],
-        device float* y [[buffer(3)]],
-        constant uint& N [[buffer(4)]],
-        constant uint& K [[buffer(5)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_threadgroup]]) {
-    qwhead_f16_batched<6>(W, x, y, N, K, row, lane);
-}
-
-kernel void qwg_head_f16_m7(
-        device const QWHeadH8* W [[buffer(0)]],
-        constant const QWHeadH8* x [[buffer(1)]],
-        device float* y [[buffer(3)]],
-        constant uint& N [[buffer(4)]],
-        constant uint& K [[buffer(5)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_threadgroup]]) {
-    qwhead_f16_batched<7>(W, x, y, N, K, row, lane);
-}
-
-kernel void qwg_head_f16_m8(
-        device const QWHeadH8* W [[buffer(0)]],
-        constant const QWHeadH8* x [[buffer(1)]],
-        device float* y [[buffer(3)]],
-        constant uint& N [[buffer(4)]],
-        constant uint& K [[buffer(5)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_threadgroup]]) {
-    qwhead_f16_batched<8>(W, x, y, N, K, row, lane);
-}
+QW_HEAD_F16_ENTRY(2)
+QW_HEAD_F16_ENTRY(3)
+QW_HEAD_F16_ENTRY(4)
+QW_HEAD_F16_ENTRY(5)
+QW_HEAD_F16_ENTRY(6)
+QW_HEAD_F16_ENTRY(7)
+QW_HEAD_F16_ENTRY(8)

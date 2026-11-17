@@ -95,8 +95,20 @@ public final class FNGPUEngine: @unchecked Sendable {
     var residentKVHistoryBySlot: [Int: [Int64]] { get { residentKVWatermark.historyBySlot } set { residentKVWatermark.historyBySlot = newValue } }
     var residentKVHistory: [Int64] { get { residentKVWatermark.currentHistory } set { residentKVWatermark.currentHistory = newValue } }
     var residentKVHasMTP: Bool { get { residentKVWatermark.currentHasMTP } set { residentKVWatermark.currentHasMTP = newValue } }
-    var activeCapacity: Int {
+    public var activeCapacity: Int {
         layerRecords.compactMap(\.attnState).first?.capacity ?? capacity
+    }
+
+    /// Resolves KV capacity, adding 1,024-token decode headroom for `alignedCap >= 4096` when RAM permits.
+    public static func resolveKVCapacity(
+        alignedCap: Int,
+        fixedBytes: Int,
+        perTokenBytes: Int,
+        availableBytes: Int
+    ) -> Int {
+        let headroomCap = alignedCap + 1024
+        let fitsHeadroom = fixedBytes + headroomCap * perTokenBytes <= availableBytes
+        return (alignedCap >= 4096 && fitsHeadroom) ? headroomCap : alignedCap
     }
     var cachedSeenHistory: [Int64] = [], cachedSeenSet: Set<Int> = [], cachedSeenList: [Int] = []
     public lazy var batchScheduler = FNGPUBatchScheduler(engine: self)
@@ -238,7 +250,12 @@ public final class FNGPUEngine: @unchecked Sendable {
             fixedBytes: fnFixedBytes, availableBytes: admission.availableBytes, yarnAllowed: true)
         guard plan.fits else { throw FNGPUError.contextDoesNotFit(requested: maxTokens, maxFitting: plan.maxFittingContext) }
         let alignedCap = QWCapacityPlan.steppedCapacity(plan.context)
-        let kvCap = alignedCap >= 32_768 ? (alignedCap + 1024) : alignedCap
+        let kvCap = Self.resolveKVCapacity(
+            alignedCap: alignedCap,
+            fixedBytes: fnFixedBytes,
+            perTokenBytes: perTokBytes,
+            availableBytes: admission.availableBytes
+        )
         let resolvedYarn = ProcessInfo.processInfo.environment["QW_ROPE_YARN_FACTOR"].flatMap(Double.init) ?? ropeYarnFactor
         let yarnFactor: Float? = resolvedYarn.map { Float($0) }
             ?? (alignedCap > desc.maxPositionEmbeddings ? Float(alignedCap) / Float(desc.maxPositionEmbeddings) : nil)
@@ -253,7 +270,7 @@ public final class FNGPUEngine: @unchecked Sendable {
             weightsBytes: admission.weightsBytes + resolvedPLE.residentBytes,
             fixedScratchBytes: admission.fixedScratchBytes + ngramCacheBytes,
             kvMode: resolvedKVMode.rawValue, perTokenBytes: perTokBytes,
-            maxTokens: alignedCap, totalPlannedBytes: fnFixedBytes + alignedCap * perTokBytes,
+            maxTokens: alignedCap, totalPlannedBytes: fnFixedBytes + kvCap * perTokBytes,
             availableBytes: admission.availableBytes, osReserveGiB: osReserveGiB)
 
         let H = desc.hidden

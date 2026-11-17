@@ -13,6 +13,20 @@ import QWQuant
 import QWToken
 import QWVision
 
+public struct QWServerContextLengthError: Error, CustomStringConvertible, Sendable {
+    public let promptTokens: Int
+    public let maxContext: Int
+
+    public init(promptTokens: Int, maxContext: Int) {
+        self.promptTokens = promptTokens
+        self.maxContext = maxContext
+    }
+
+    public var description: String {
+        "This model's maximum context length is \(maxContext) tokens. However, your messages resulted in \(promptTokens) tokens. Please reduce the length of the messages."
+    }
+}
+
 public struct ChatCompletionExecutionResult: Sendable {
     public let content: String
     public let promptTokens: Int
@@ -41,6 +55,7 @@ extension QWEngineLifecycleActor {
 
     nonisolated public func handleChatCompletion(
         request: ChatCompletionRequest,
+        onStreamReady: (@Sendable () async -> Void)? = nil,
         onToken: ((String) -> Void)? = nil,
         onTokenLogprob: ((ChatLogprobTokenEntry) -> Void)? = nil,
         shouldStop: (@Sendable () -> Bool)? = nil
@@ -50,6 +65,7 @@ extension QWEngineLifecycleActor {
         do {
             let result = try await executeChatCompletion(
                 request: request,
+                onStreamReady: onStreamReady,
                 onToken: onToken,
                 onTokenLogprob: onTokenLogprob,
                 shouldStop: shouldStop
@@ -64,6 +80,7 @@ extension QWEngineLifecycleActor {
 
     nonisolated private func executeChatCompletion(
         request: ChatCompletionRequest,
+        onStreamReady: (@Sendable () async -> Void)?,
         onToken: ((String) -> Void)?,
         onTokenLogprob: ((ChatLogprobTokenEntry) -> Void)?,
         shouldStop: (@Sendable () -> Bool)?
@@ -81,6 +98,7 @@ extension QWEngineLifecycleActor {
 
         let imageUrls = request.extractImageUrls()
 
+        let requestedHint = request.maxTokens ?? request.maxCompletionTokens ?? config.maxTokens
         let prepared = try QWChatTurnPreparer.preparePrompt(
             request: request,
             config: config,
@@ -88,7 +106,8 @@ extension QWEngineLifecycleActor {
             tokenizer: tok,
             descriptor: loaded.descriptor,
             supportsTokenConstraints: loaded.modelBackend.supportsTokenConstraints,
-            memoryManifest: memState.manifest
+            memoryManifest: memState.manifest,
+            effectiveMaxNewTokens: requestedHint
         )
         let shouldThink = prepared.shouldThink
         let isConstrainedJson = prepared.isConstrainedJson
@@ -124,18 +143,20 @@ extension QWEngineLifecycleActor {
             logger.log(.info, "vision_tower_unloaded_on_text_prompt=true")
         }
         let visualSpans = mmTurn.visualSpans
+        let backendBudget = loaded.modelBackend.parametersInfo.contextBudget
+        let effectiveMaxContext = min(config.maxContext, backendBudget > 0 ? backendBudget : config.maxContext)
         let requestedMaxNew = request.maxTokens ?? request.maxCompletionTokens
-            ?? config.modelMaxLength.map { max(0, $0 - mmTurn.tokens.count) }
+            ?? config.modelMaxLength.map { max(1, $0 - mmTurn.tokens.count) }
             ?? config.maxTokens
         let budgetGuard = QWMemoryVault.applyElasticBudgetGuard(
             mountedMemoryTokens: memState.mountedTokens,
             deltaTokens: memState.deltaTokens,
             agentPromptTokens: mmTurn.tokens.count,
             maxNewTokens: requestedMaxNew,
-            maxContext: config.maxContext
+            maxContext: effectiveMaxContext
         )
         if budgetGuard.bypassedOversizedCache {
-            logger.log(.info, "[MemoryPack] Elastic budget guard bypassed oversized .qwcache (\(memState.mountedTokens.count) tokens) to preserve \(mmTurn.tokens.count)-token agent prompt within maxContext=\(config.maxContext)")
+            logger.log(.info, "[MemoryPack] Elastic budget guard bypassed oversized .qwcache (\(memState.mountedTokens.count) tokens) to preserve \(mmTurn.tokens.count)-token agent prompt within maxContext=\(effectiveMaxContext)")
         }
         let memoryPrefixTokens = budgetGuard.prefixTokens
         let effectivePromptTokens: [Int]
@@ -157,6 +178,10 @@ extension QWEngineLifecycleActor {
         let jsonConstraint = prepared.jsonConstraint
         let customStopStrings = prepared.customStopStrings
         let reportedPromptTokenCount = effectivePromptTokens.count
+        guard reportedPromptTokenCount < effectiveMaxContext else {
+            throw QWServerContextLengthError(promptTokens: reportedPromptTokenCount, maxContext: effectiveMaxContext)
+        }
+        let clampedMaxNew = min(requestedMaxNew, max(1, effectiveMaxContext - reportedPromptTokenCount))
         let heal = Self.prepareTokenHeal(
             prepared: prepared,
             request: request,
@@ -169,7 +194,28 @@ extension QWEngineLifecycleActor {
             hasImages: !visualSpans.isEmpty
         )
         let genPromptTokens = heal.promptTokens
-        let activeGenConstraint = heal.constraint
+        let activeGenConstraint: (any QWTokenConstraint)?
+        let isJsonFormat = fmtType == "json_schema" || fmtType == "json_object"
+        if !heal.didPeel, shouldThink, request.reasoningBudget == nil,
+           (!request.hasExplicitThinkingSetting || isJsonFormat),
+           clampedMaxNew < requestedMaxNew, loaded.modelBackend.supportsTokenConstraints,
+           endThinkTokenId >= 0, endThinkTokenId < loaded.descriptor.vocab,
+           (tok.tokenId(for: "</think>") != nil || tok.tokenId(for: "</ernie:think>") != nil
+                || endThinkTokenId != QWModelSpecialTokens().endThinkTokenId) {
+            let clampedBudget = clampedMaxNew <= 32
+                ? max(1, clampedMaxNew / 2)
+                : max(16, clampedMaxNew - min(256, max(16, clampedMaxNew / 4)))
+            let tokenBytes = QWStructuredOutput.tokenBytes(for: tok, vocabulary: loaded.descriptor.vocab)
+            activeGenConstraint = QWThinkingBudgetConstraint(
+                maxThinkingTokens: clampedBudget,
+                endThinkTokenId: endThinkTokenId,
+                vocabularySize: loaded.descriptor.vocab,
+                tokenBytes: tokenBytes,
+                inner: prepared.innerConstraint
+            )
+        } else {
+            activeGenConstraint = heal.constraint
+        }
 
         final class StreamCapture: @unchecked Sendable {
             private static let endThinkUTF8 = Array("</think>".utf8)
@@ -255,14 +301,13 @@ extension QWEngineLifecycleActor {
             onTokenLogprob: onTokenLogprob,
             modelBackend: loaded.modelBackend
         )
-        let maxNew = request.maxTokens ?? request.maxCompletionTokens
-            ?? config.modelMaxLength.map { max(0, $0 - reportedPromptTokenCount) }
-            ?? config.maxTokens
+        let maxNew = clampedMaxNew
         let genMaxNew = heal.didPeel ? (maxNew + 1) : maxNew
         if request.ignoreEos == true || (request.minTokens ?? 0) >= maxNew {
             stops.removeAll()
         }
 
+        await onStreamReady?()
         let telemetry = QWEngineTelemetryRegistry.shared
         telemetry.beginPrefill(promptTokens: genPromptTokens.count)
         let promptTokCount = genPromptTokens.count
@@ -281,6 +326,7 @@ extension QWEngineLifecycleActor {
             } else {
                 telemetry.recordDecodeToken()
             }
+            let wasInThinking = capture.inThinking
             if capture.inThinking {
                 capture.reasoningTokenCount += 1
                 if id == endThinkTokenId {
@@ -305,7 +351,7 @@ extension QWEngineLifecycleActor {
                     return false
                 }
             } else if let decoded = try? capture.streamDecoder.decode(id, skipSpecialTokens: true) {
-                piece = decoded
+                piece = (decoded.isEmpty && wasInThinking && id == endThinkTokenId) ? "</think>" : decoded
             }
             guard !piece.isEmpty else { return true }
 
@@ -494,6 +540,7 @@ extension QWEngineLifecycleActor {
 
         var fullText = capture.fullText
         if let fmtType, (fmtType == "json_schema" || fmtType == "json_object"),
+           !shouldThink,
            (isConstrainedJson || !fullText.contains("<tool_call>")),
            let startBrace = fullText.firstIndex(of: "{"),
            let endBrace = Self.firstCompleteJsonObjectEnd(in: String(fullText[startBrace...])) {

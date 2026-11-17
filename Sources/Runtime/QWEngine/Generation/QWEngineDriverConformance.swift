@@ -13,6 +13,16 @@ import QWHead
 
 private let denseDriverGenerateLock = NSRecursiveLock()
 
+extension QWEngineDriver {
+    func withDriverGenerateLock<T>(_ body: () throws -> T) rethrows -> T {
+        try denseDriverGenerateLock.withLock(body)
+    }
+
+    var maxBatchSlots: Int {
+        Self.gdnSlotCount()
+    }
+}
+
 extension QWEngineDriver: QWSessionInferenceEngine {
     public var prefixCacheChargedBytes: Int { prefixStore?.chargedBytes ?? 0 }
     public var prefixCacheEntries: Int { prefixStore?.count ?? 0 }
@@ -127,11 +137,18 @@ extension QWEngineDriver: QWSessionInferenceEngine {
         request: QWGenerationRequest,
         onToken: ((Int) -> Bool)?
     ) throws -> QWGenerationResult {
-        denseDriverGenerateLock.lock()
-        defer { denseDriverGenerateLock.unlock() }
-        if request.usePrefixCache && !hasPrefixCache {
-            throw QWEngineDriverError.state("the request wants a prefix cache this engine does not have")
+        try denseDriverGenerateLock.withLock {
+            if request.usePrefixCache && !hasPrefixCache {
+                throw QWEngineDriverError.state("the request wants a prefix cache this engine does not have")
+            }
+            return try generateLocked(request: request, onToken: onToken)
         }
+    }
+
+    private func generateLocked(
+        request: QWGenerationRequest,
+        onToken: ((Int) -> Bool)?
+    ) throws -> QWGenerationResult {
         // The records this generation reports must be its own: a record
         // left by an earlier turn is not this turn's measurement.
         lastGeneration = nil
@@ -271,7 +288,7 @@ extension QWEngineDriver: QWSessionInferenceEngine {
                           totalTokens: request.prompt.count, tier: stats.tier)
         }
         var specSummary: String? = nil
-        if let g = experimental, !g.roundTokenCounts.isEmpty {
+        if useSpeculative, let g = experimental, !g.roundTokenCounts.isEmpty {
             let totalTokens = g.roundTokenCounts.reduce(0, +)
             let rounds = g.roundTokenCounts.count
             specSummary = String(format: "rounds=%d, mean=%.2f tok/rnd", rounds, Double(totalTokens) / Double(rounds))

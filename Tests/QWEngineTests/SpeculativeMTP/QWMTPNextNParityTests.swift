@@ -4,10 +4,18 @@ import CryptoKit
 import Foundation
 import XCTest
 import QWCore
+import QWFlashNext
 import QWHAL
 @testable import QWEngine
 
 final class QWMTPNextNParityTests: XCTestCase {
+    override func setUpWithError() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true,
+            "MTP NextN GPU parity tests require bare-metal Apple Silicon GPU"
+        )
+    }
 
     private enum PlaneSpec {
         case bf16(shape: [Int], values: [Float])
@@ -221,6 +229,95 @@ final class QWMTPNextNParityTests: XCTestCase {
             driver.finishSession(session)
             XCTAssertEqual(tokens, baseline,
                            "NextN strategy \(strategy) must be bit-exact with greedy baseline")
+        }
+    }
+
+    func testBatchedDecodeParityWithMTPDrafts2AndPostBatchScheduler() throws {
+        try XCTSkipUnless(QWDeviceCaps.current?.isMetal4TensorCapable == true,
+                          "Batched MTP parity requires bare-metal Apple Silicon GPU")
+        let rootDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qw-nextn-batch-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        try Self.buildSyntheticNextNPack(at: rootDir)
+
+        // mtpDrafts=2 allocates a 3-row mtpBatchedMLP (< 4), exercising lazy 4-row sharedBatchMLP upgrade.
+        let driver = try QWEngineDriver(
+            packPath: rootDir.path, maxTokens: 2048, ropeRows: 2048,
+            kvMode: .q4, mtpDrafts: 2, mtpAdaptiveDepth: false, prefillChunkSize: 32)
+        XCTAssertTrue(driver.canRunBatchedDecode)
+        XCTAssertEqual(driver.mtpBatchedMLP?.rows, 3)
+
+        let prompts = [
+            [1, 10, 20, 30, 40],
+            [2, 15, 25, 35, 45, 55],
+            [5, 19, 31, 47, 61],
+            [4, 18, 32, 44],
+        ]
+        let steps = 5
+        var serialOutputs: [[Int]] = []
+        for p in prompts {
+            let res = try driver.generate(request: QWGenerationRequest(prompt: p, maxNew: steps, sampling: .greedy), onToken: nil)
+            serialOutputs.append(res.tokens)
+        }
+
+        let activeB = min(driver.freeSlots.count, 4)
+        for batchSize in 2...activeB {
+            var sessions: [QWEngineSession] = []
+            var pending: [Int] = []
+            defer { for s in sessions where !s.sessionFinished { driver.finishSession(s) } }
+            for b in 0..<batchSize {
+                let sess = try driver.makeSession(promptTokens: prompts[b].count)
+                sessions.append(sess)
+                pending.append(try driver.prefill(sess, tokens: prompts[b]))
+            }
+            var batched = pending.map { [$0] }
+            for _ in 1..<steps {
+                let (nextIds, _, scratch) = try driver.forwardBatchStep(sessions, tokens: pending)
+                for b in 0..<batchSize {
+                    XCTAssertTrue(scratch.logitBuffer(b).allSatisfy(\.isFinite))
+                    XCTAssertTrue(sessions[b].batchedDecodeTouched)
+                    XCTAssertFalse(driver.canRunSpeculativeRound(sessions[b]))
+                    batched[b].append(nextIds[b])
+                }
+                pending = nextIds
+            }
+            for b in 0..<batchSize {
+                XCTAssertEqual(batched[b], serialOutputs[b], "B=\(batchSize) row \(b) diverged with mtpDrafts=2")
+            }
+        }
+
+        // Concurrent burst forcing B=3 -> B=1 stepSingleSlot tail (batchedDecodeTouched == true), plus 1-stream speculative.
+        let module = DenseModule(engine: driver)
+        let engine = try QWEngine(engine: module, descriptor: driver.geometry.descriptor, plan: driver.plan)
+        let scheduler = engine.batchScheduler
+        let singleSpec = try scheduler.generate(request: QWGenerationRequest(prompt: [1, 10, 20, 30, 40, 10, 20, 30, 40], maxNew: 8, sampling: .greedy))
+        let serialLong = try driver.generate(request: QWGenerationRequest(prompt: [1, 10, 20, 30, 40, 10, 20, 30, 40], maxNew: 8, sampling: .greedy), onToken: nil)
+        XCTAssertEqual(singleSpec.tokens, serialLong.tokens)
+        XCTAssertFalse(singleSpec.stepTokenCounts.isEmpty)
+
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock()
+            var values: [Int: QWGenerationResult] = [:]
+            func set(_ idx: Int, _ val: QWGenerationResult) { lock.withLock { values[idx] = val } }
+        }
+        let box = Box()
+        let group = DispatchGroup()
+        let maxNewPerReq = [2, 2, 5]
+        FNBatchAdmissionTracker.beginPreparing()
+        for idx in 0..<3 {
+            group.enter()
+            DispatchQueue.global().async {
+                defer { group.leave() }
+                if let res = try? scheduler.generate(request: QWGenerationRequest(prompt: prompts[idx], maxNew: maxNewPerReq[idx], sampling: .greedy)) {
+                    box.set(idx, res)
+                }
+            }
+        }
+        usleep(2000)
+        FNBatchAdmissionTracker.endPreparing()
+        group.wait()
+        for idx in 0..<3 {
+            XCTAssertEqual(box.values[idx]?.tokens, Array(serialOutputs[idx].prefix(maxNewPerReq[idx])))
         }
     }
 }

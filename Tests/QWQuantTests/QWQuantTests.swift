@@ -166,7 +166,7 @@ final class QWQuantTests: XCTestCase {
     }
 
     func testLiveInstalledPacksValidateWithoutFallback() throws {
-        try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != nil, "requires bare-metal ~/.qwg/models")
+        try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == "true", "requires bare-metal ~/.qwg/models")
         let modelsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".qwg/models")
         try XCTSkipUnless(FileManager.default.fileExists(atPath: modelsDir.path), "~/.qwg/models absent")
         let entries = try FileManager.default.contentsOfDirectory(at: modelsDir, includingPropertiesForKeys: [.isDirectoryKey])
@@ -175,18 +175,29 @@ final class QWQuantTests: XCTestCase {
             guard FileManager.default.fileExists(atPath: dir.appendingPathComponent("model.qwp").path) else { continue }
             let cfgURL = dir.appendingPathComponent("assets/config.json")
             guard FileManager.default.fileExists(atPath: cfgURL.path) else { continue }
+            let cfgData = try Data(contentsOf: cfgURL)
             let name = dir.lastPathComponent.lowercased()
             if name.contains("dflash") || name.contains("dspine") {
-                let d = try QWModelDescriptor.decodeDrafter(configJSON: Data(contentsOf: cfgURL))
+                let d = try QWModelDescriptor.decodeDrafter(configJSON: cfgData)
                 let pk = try QWQuant.Pack(url: dir, descriptor: d)
                 XCTAssertEqual(pk.descriptor.role, .speculativeDrafter, dir.lastPathComponent)
             } else {
+                // Skip packs from unmerged feature branches whose model_type is not in this build's registry.
+                if Self.hasUnregisteredModelType(in: cfgData) { continue }
                 let pk = try QWQuant.Pack(url: dir)
                 XCTAssertNotEqual(pk.descriptor.role, .speculativeDrafter, dir.lastPathComponent)
             }
             validated += 1
         }
         XCTAssertGreaterThan(validated, 0)
+    }
+
+    private static func hasUnregisteredModelType(in data: Data) -> Bool {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        let rawType = (obj["text_config"] as? [String: Any])?["model_type"] as? String
+            ?? obj["model_type"] as? String
+        guard let modelType = rawType, !modelType.isEmpty else { return false }
+        return QWModelFamilyRegistry.shared.spec(forModelType: modelType) == nil
     }
 }
 

@@ -66,6 +66,78 @@ extension QWMLAAttnOperator {
         return true
     }
 
+    /// Bytes needed to capture live multi-session indexer pools, preserving full `ringCap` open rows and optional MTP layer cursor.
+    public func liveSessionStashBytes(trunkPosition: Int, mtpLayerIndex: Int?, mtpPosition: Int) -> Int {
+        if isDecoupledDSA {
+            return liveDSASessionStashBytes(trunkPosition: trunkPosition, mtpLayerIndex: mtpLayerIndex, mtpPosition: mtpPosition)
+        }
+        let rowBytes = idxDim * 2
+        let ringBytes = 2 * ringCap * rowBytes
+        var total = 0
+        for i in layers.indices {
+            let pos = max(0, (i == mtpLayerIndex) ? mtpPosition : trunkPosition)
+            total += (pos / 4) * rowBytes + ringBytes
+        }
+        return total
+    }
+
+    public func captureLiveSessionStash(trunkPosition: Int, mtpLayerIndex: Int?, mtpPosition: Int) -> Data {
+        if isDecoupledDSA {
+            return captureDSALiveSessionStash(trunkPosition: trunkPosition, mtpLayerIndex: mtpLayerIndex, mtpPosition: mtpPosition)
+        }
+        precondition(trunkPosition >= 0 && mtpPosition >= 0)
+        let rowBytes = idxDim * 2
+        let ringBytes = ringCap * rowBytes
+        var out = Data(capacity: liveSessionStashBytes(trunkPosition: trunkPosition, mtpLayerIndex: mtpLayerIndex, mtpPosition: mtpPosition))
+        let base = region.pointer
+        for (i, ls) in layers.enumerated() {
+            let pos = max(0, (i == mtpLayerIndex) ? mtpPosition : trunkPosition)
+            precondition(pos / 4 <= maxBlocks)
+            let pooledBytes = (pos / 4) * rowBytes
+            if pooledBytes > 0 {
+                out.append(base.advanced(by: ls.pooledKeys.offset).assumingMemoryBound(to: UInt8.self), count: pooledBytes)
+            }
+            out.append(base.advanced(by: ls.kPending.offset).assumingMemoryBound(to: UInt8.self), count: ringBytes)
+            out.append(base.advanced(by: ls.gatePending.offset).assumingMemoryBound(to: UInt8.self), count: ringBytes)
+        }
+        return out
+    }
+
+    public func restoreLiveSessionStash(_ data: Data, trunkPosition: Int, mtpLayerIndex: Int?, mtpPosition: Int) -> Bool {
+        if isDecoupledDSA {
+            return restoreDSALiveSessionStash(data, trunkPosition: trunkPosition, mtpLayerIndex: mtpLayerIndex, mtpPosition: mtpPosition)
+        }
+        guard trunkPosition >= 0, mtpPosition >= 0,
+              data.count == liveSessionStashBytes(trunkPosition: trunkPosition, mtpLayerIndex: mtpLayerIndex, mtpPosition: mtpPosition) else {
+            return false
+        }
+        for i in layers.indices {
+            let pos = max(0, (i == mtpLayerIndex) ? mtpPosition : trunkPosition)
+            if pos / 4 > maxBlocks { return false }
+        }
+        let rowBytes = idxDim * 2
+        let ringBytes = ringCap * rowBytes
+        let base = region.pointer
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let srcBase = raw.baseAddress else { return }
+            var src = 0
+            for (i, ls) in layers.enumerated() {
+                let pos = max(0, (i == mtpLayerIndex) ? mtpPosition : trunkPosition)
+                let pooledBytes = (pos / 4) * rowBytes
+                if pooledBytes > 0 {
+                    base.advanced(by: ls.pooledKeys.offset).copyMemory(from: srcBase.advanced(by: src), byteCount: pooledBytes)
+                    src += pooledBytes
+                }
+                base.advanced(by: ls.kPending.offset).copyMemory(from: srcBase.advanced(by: src), byteCount: ringBytes)
+                src += ringBytes
+                base.advanced(by: ls.gatePending.offset).copyMemory(from: srcBase.advanced(by: src), byteCount: ringBytes)
+                src += ringBytes
+            }
+        }
+        resetCoarseWatermarks()
+        return true
+    }
+
     public func encodeLatentPrepAndPool(_ enc: any MTLComputeCommandEncoder,
                                         ln1: QWTensorValue,
                                         mlaW: LayerWeights,

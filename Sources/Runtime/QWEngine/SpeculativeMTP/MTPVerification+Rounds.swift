@@ -18,6 +18,34 @@ import QWMTP
 import QWQuant
 
 extension QWEngineDriver {
+    /// True while a speculative verify window fits below both `ropeRows` and the draft encoder's RoPE ceiling.
+    func canRunSpeculativeRound(_ session: QWEngineSession) -> Bool {
+        guard let verifyWindow, !session.batchedDecodeTouched,
+              !session.sessionFinished, !session.stateFailed, !session.verificationPending,
+              session.trunkHiddenValid,
+              session.roundRecord.consumedCount == session.position,
+              session.roundRecord.absolutePosition == session.position,
+              session.roundRecord.outputCount == session.generated else {
+            return false
+        }
+        if let mtpCache {
+            guard let handle = session.mtpKV,
+                  mtpCache.written(handle) == session.roundRecord.mtpPhysicalRows else {
+                return false
+            }
+        }
+        if dflashDrafter != nil {
+            guard session.dflashSlot != nil, session.dflashCacheOffset == session.position else {
+                return false
+            }
+        }
+        let count = verifyWindow.rows - 1
+        let draftCapacity = (dflashDrafter != nil ? nil : mtpDraftEncoder?.positionCapacity) ?? ropeRows
+        return session.position > 0
+            && session.position <= ropeRows - verifyWindow.rows
+            && session.position <= draftCapacity - count
+    }
+
     /// Diagnostic two-phase round owner. Output is tentative until commit succeeds;
     /// scratch stays leased across prefix selection until commit/discard/finish.
     /// No user callback runs under flight, and ordinary generation never calls it.
@@ -43,7 +71,7 @@ extension QWEngineDriver {
             throw QWEngineDriverError.state("QW_MTP_ADAPTIVE_DEPTH currently supports greedy rounds only")
         }
         let profileStart = mtpStageProfiling ? DispatchTime.now().uptimeNanoseconds : nil
-        if (echoDrafter != nil || mtpDraftEncoder != nil), let cb = session.lastCommitCB {
+        if (echoDrafter != nil || mtpDraftEncoder != nil || dflashDrafter != nil), let cb = session.lastCommitCB {
             cb.waitUntilCompleted()
             if cb.status != .completed {
                 session.stateFailed = true
@@ -52,11 +80,13 @@ extension QWEngineDriver {
         } else if let cb = session.lastCommitCB, cb.status == .error {
             session.stateFailed = true
         }
+        let dflashReady = (dflashDrafter == nil) || (session.dflashSlot != nil && session.dflashCacheOffset == session.position)
         guard (session.stochastic != nil) == stochastic,
               session.stochastic?.stream.isRoundActive != true,
               session.stochastic?.stream.drawsConsumed == (stochastic ? session.roundRecord.samplerDrawIndex : nil),
               verifiedSession == nil, let verifyWindow,
               (mtpDraftEncoder != nil || echoDrafter != nil || dflashDrafter != nil),
+              dflashReady,
               let mtpCache, let handle = session.mtpKV, let hidden = session.trunkHidden,
               let pending = session.roundRecord.pendingToken,
               !session.sessionFinished, !session.stateFailed, !session.verificationPending,
@@ -70,10 +100,11 @@ extension QWEngineDriver {
               stopIDs.allSatisfy({ (0..<geometry.vocab).contains($0) }) else {
             throw QWEngineDriverError.state("greedy round requires a seeded boundary and valid output budget")
         }
+        let activeDraftEncoder = dflashDrafter == nil ? mtpDraftEncoder : nil
         let count = verifyWindow.rows - 1, basePairs = session.roundRecord.mtpPhysicalRows
-        let nextNResolving = mtpDraftEncoder != nil && echoDrafter == nil && dflashDrafter == nil && !mtpStageProfiling
+        let nextNResolving = activeDraftEncoder != nil && echoDrafter == nil && !mtpStageProfiling
         let nextNMaxPairs = nextNResolving
-            ? min(verifyWindow.rows, max(count, (mtpDraftEncoder?.positionCapacity ?? ropeRows) - session.position))
+            ? min(verifyWindow.rows, max(count, (activeDraftEncoder?.positionCapacity ?? ropeRows) - session.position))
             : count
         let pairSlotsNeeded = echoDrafter != nil ? verifyWindow.rows : nextNMaxPairs
         try kvCache.validate(session.kv)
@@ -81,7 +112,7 @@ extension QWEngineDriver {
         guard kvCache.written(session.kv) == session.position,
               mtpCache.written(handle) == basePairs,
               basePairs >= 0, basePairs <= QWKVCache.maxTokensPerSeq - pairSlotsNeeded,
-              session.position <= (mtpDraftEncoder?.positionCapacity ?? ropeRows) - count else {
+              session.position <= (activeDraftEncoder?.positionCapacity ?? ropeRows) - count else {
             throw QWEngineDriverError.state("greedy round cache or RoPE boundary mismatch")
         }
         try claimMLAIndexerState(session)
@@ -124,7 +155,10 @@ extension QWEngineDriver {
             let draftCompleted: ((any MTLCommandBuffer) throws -> Void)? = draftAccumulator.map { accumulator in
                 { try accumulator.record($0) }
             }
-            if let dflashDrafter, let dSlot = session.dflashSlot {
+            if let dflashDrafter {
+                guard let dSlot = session.dflashSlot else {
+                    throw QWEngineDriverError.state("DFlash slot unavailable for speculative round")
+                }
                 let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
                 let canAdapt = (owner == nil && !mtpStageProfiling && resolvedStrategy != .mtp)
                 var usedPLD = false
@@ -493,7 +527,7 @@ extension QWEngineDriver {
             throw error
         }
         session.position += retained
-        if dflashDrafter != nil {
+        if dflashDrafter != nil, session.dflashSlot != nil {
             session.dflashCacheOffset = session.position
         }
         session.generated += decision.tokens.count

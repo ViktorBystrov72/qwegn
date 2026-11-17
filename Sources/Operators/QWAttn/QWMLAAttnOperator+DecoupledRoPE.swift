@@ -111,6 +111,68 @@ extension QWMLAAttnOperator {
         return true
     }
 
+    internal func liveDSASessionStashBytes(trunkPosition: Int, mtpLayerIndex: Int?, mtpPosition: Int) -> Int {
+        let idxStride = idxDim * 2
+        let peStride = ropeDim * 2
+        var total = 0
+        for (i, ls) in layers.enumerated() {
+            let pos = max(0, (i == mtpLayerIndex) ? mtpPosition : trunkPosition)
+            total += pos * idxStride
+            if ls.kPeCache != nil { total += pos * peStride }
+        }
+        return total
+    }
+
+    internal func captureDSALiveSessionStash(trunkPosition: Int, mtpLayerIndex: Int?, mtpPosition: Int) -> Data {
+        precondition(trunkPosition >= 0 && mtpPosition >= 0)
+        var out = Data(capacity: liveDSASessionStashBytes(trunkPosition: trunkPosition, mtpLayerIndex: mtpLayerIndex, mtpPosition: mtpPosition))
+        let base = region.pointer
+        for (i, ls) in layers.enumerated() {
+            let pos = max(0, (i == mtpLayerIndex) ? mtpPosition : trunkPosition)
+            precondition(pos <= maxBlocks)
+            let idxBytes = pos * idxDim * 2
+            let peBytes = pos * ropeDim * 2
+            if idxBytes > 0 {
+                out.append(base.advanced(by: ls.pooledKeys.offset).assumingMemoryBound(to: UInt8.self), count: idxBytes)
+            }
+            if peBytes > 0, let kPe = ls.kPeCache {
+                out.append(base.advanced(by: kPe.offset).assumingMemoryBound(to: UInt8.self), count: peBytes)
+            }
+        }
+        return out
+    }
+
+    internal func restoreDSALiveSessionStash(_ data: Data, trunkPosition: Int, mtpLayerIndex: Int?, mtpPosition: Int) -> Bool {
+        guard trunkPosition >= 0, mtpPosition >= 0,
+              data.count == liveDSASessionStashBytes(trunkPosition: trunkPosition, mtpLayerIndex: mtpLayerIndex, mtpPosition: mtpPosition) else {
+            return false
+        }
+        for i in layers.indices {
+            let pos = max(0, (i == mtpLayerIndex) ? mtpPosition : trunkPosition)
+            if pos > maxBlocks { return false }
+        }
+        let base = region.pointer
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let srcBase = raw.baseAddress else { return }
+            var src = 0
+            for (i, ls) in layers.enumerated() {
+                let pos = max(0, (i == mtpLayerIndex) ? mtpPosition : trunkPosition)
+                let idxBytes = pos * idxDim * 2
+                let peBytes = pos * ropeDim * 2
+                if idxBytes > 0 {
+                    base.advanced(by: ls.pooledKeys.offset).copyMemory(from: srcBase.advanced(by: src), byteCount: idxBytes)
+                    src += idxBytes
+                }
+                if peBytes > 0, let kPe = ls.kPeCache {
+                    base.advanced(by: kPe.offset).copyMemory(from: srcBase.advanced(by: src), byteCount: peBytes)
+                    src += peBytes
+                }
+            }
+        }
+        resetCoarseWatermarks()
+        return true
+    }
+
     internal func encodeDSALatentPrepAndCluster(_ enc: any MTLComputeCommandEncoder,
                                                 ln1: QWTensorValue,
                                                 mlaW: LayerWeights,

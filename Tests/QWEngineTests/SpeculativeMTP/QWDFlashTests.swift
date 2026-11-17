@@ -1,8 +1,10 @@
+import CryptoKit
 import XCTest
 import Metal
 import QWAlloc
 import QWCore
 import QWHAL
+import QWMTP
 import QWQuant
 @testable import QWEngine
 
@@ -20,6 +22,11 @@ final class QWDFlashTests: XCTestCase {
         XCTAssertEqual(cfg.selectorRank, 256)
         XCTAssertEqual(cfg.selectorTopK, 16)
 
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true,
+            "DFlash pipeline check requires bare-metal Apple Silicon GPU"
+        )
         let hal = try QWHal(geometry: .qwen38_27b)
         for name in [
             "qwg_dflash_capture_target_hidden",
@@ -38,8 +45,11 @@ final class QWDFlashTests: XCTestCase {
     }
 
     func testDFlashDrafterLoadsPackedCheckpoint() throws {
-        try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != nil,
-                      "Local ~/.qwg/models pack check skipped on GitHub Actions")
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true,
+            "Local ~/.qwg/models pack check requires bare-metal Apple Silicon GPU"
+        )
         let packPath = QWDFlashDrafter.defaultPackPath
         try XCTSkipUnless(FileManager.default.fileExists(atPath: packPath),
                           "DFlash 2 pack not installed at \(packPath)")
@@ -207,6 +217,11 @@ final class QWDFlashTests: XCTestCase {
         XCTAssertEqual(cfg.bridgeRank, 512)
         XCTAssertEqual(cfg.bridgeEps, 1e-6, accuracy: 1e-12)
 
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true,
+            "DSpine pipeline check requires bare-metal Apple Silicon GPU"
+        )
         let hal = try QWHal(geometry: .qwen38_27b)
         for name in [
             "qwg_dspine_bridge_state",
@@ -221,6 +236,11 @@ final class QWDFlashTests: XCTestCase {
     }
 
     func testDSpineFusedBridgeAndRefinementKernelsParity() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true,
+            "DSpine kernel parity test requires bare-metal Apple Silicon GPU"
+        )
         let hal = try QWHal(geometry: .qwen38_27b)
         let dev = hal.device
         let H5120 = 5120
@@ -495,5 +515,201 @@ final class QWDFlashTests: XCTestCase {
         let shvq15Bytes = 128 * (256 / 64) * 14
         XCTAssertGreaterThanOrEqual(cap, rawCodebookBytes + shvq15Bytes + 64 * 1024 * 1024)
         XCTAssertLessThan(cap, 128 * 1024 * 1024)
+    }
+
+    func testDFlashTop16Stage1And2SanitizesNonFiniteLogits() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.isMetal4TensorCapable == true,
+            "DFlash top16 NaN sanitization kernel check requires bare-metal Apple Silicon GPU"
+        )
+        let hal = try QWHal(geometry: .qwen38_27b)
+        let pStage1 = try hal.pipeline("qwg_dflash_top16_stage1")
+        let pStage2 = try hal.pipeline("qwg_dflash_top16_stage2")
+        let D = 2, V = 1024, topK = 16
+        let logitsBuf = hal.device.makeBuffer(length: D * V * 4, options: .storageModeShared)!
+        let partValBuf = hal.device.makeBuffer(length: D * 256 * 16 * 4, options: .storageModeShared)!
+        let partIdBuf = hal.device.makeBuffer(length: D * 256 * 16 * 4, options: .storageModeShared)!
+        let unaryBuf = hal.device.makeBuffer(length: D * 16 * 4, options: .storageModeShared)!
+        let candBuf = hal.device.makeBuffer(length: D * 16 * 4, options: .storageModeShared)!
+
+        let lPtr = logitsBuf.contents().bindMemory(to: Float.self, capacity: D * V)
+        for i in 0..<V { lPtr[i] = .nan }
+        for i in V..<(2 * V) { lPtr[i] = -.infinity }
+
+        var vocabU = UInt32(V), topKU = UInt32(topK)
+        guard let (cb, enc) = hal.begin() else { XCTFail("hal.begin"); return }
+        enc.setComputePipelineState(pStage1)
+        enc.setBuffer(logitsBuf, offset: 0, index: 0)
+        enc.setBuffer(partValBuf, offset: 0, index: 1)
+        enc.setBuffer(partIdBuf, offset: 0, index: 2)
+        enc.setBytes(&vocabU, length: 4, index: 3)
+        enc.setBytes(&topKU, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: 256, height: D, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.memoryBarrier(scope: .buffers)
+        enc.setComputePipelineState(pStage2)
+        enc.setBuffer(partValBuf, offset: 0, index: 0)
+        enc.setBuffer(partIdBuf, offset: 0, index: 1)
+        enc.setBuffer(unaryBuf, offset: 0, index: 2)
+        enc.setBuffer(candBuf, offset: 0, index: 3)
+        enc.setBytes(&topKU, length: 4, index: 4)
+        enc.setBytes(&vocabU, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: D, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        hal.end(cb, enc)
+        cb.waitUntilCompleted()
+        XCTAssertNil(cb.error)
+
+        let cPtr = candBuf.contents().bindMemory(to: Int32.self, capacity: D * 16)
+        let uPtr = unaryBuf.contents().bindMemory(to: Float.self, capacity: D * 16)
+        for i in 0..<(D * topK) {
+            XCTAssertNotEqual(cPtr[i], 0x7fff_ffff)
+            XCTAssertTrue((0..<Int32(V)).contains(cPtr[i]), "Out-of-range candidate \(cPtr[i])")
+            XCTAssertTrue(uPtr[i].isFinite, "Non-finite unary score at \(i)")
+        }
+    }
+
+    func testAdmitSessionPrefersDFlashSlotsAcrossSequentialAndConcurrentSessions() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.isMetal4TensorCapable == true,
+            "Driver DFlash slot admission test requires bare-metal Apple Silicon GPU"
+        )
+        let rootDir = FileManager.default.temporaryDirectory.appendingPathComponent("qwg-dflash-slots-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        try Self.buildTinyDensePack(at: rootDir)
+
+        let driver = try QWEngineDriver(packPath: rootDir.path, maxTokens: 2048, ropeRows: 2048, kvMode: .q4, mtpDrafts: 0)
+        let dev = driver.hal.device
+        let dummySlabBuf = dev.makeBuffer(length: 4096, options: .storageModeShared)!
+        let dummyTensor = QWTensorValue(region: QWMRegion(buffer: dummySlabBuf, base: 0, length: 4096),
+                                        offset: 0, shape: QWTensorShape([128], .f16))
+        let dummySlot = QWDFlashSessionSlot(kSlab: dummyTensor, vSlab: dummyTensor, kLayers: [dummyTensor], vLayers: [dummyTensor])
+        while driver.freeSlots.count < 4 {
+            let tmpl = driver.freeSlots[0]
+            driver.freeSlots.append(QWEngineDriver.GdnSlot(recSlab: tmpl.recSlab, ringSlab: tmpl.ringSlab,
+                                                           rec: tmpl.rec, ring: tmpl.ring,
+                                                           trunkHidden: tmpl.trunkHidden, dflashSlot: nil))
+        }
+        for i in driver.freeSlots.indices {
+            driver.freeSlots[i].dflashSlot = (i < 2) ? dummySlot : nil
+        }
+
+        // More than 4 sequential admissions must always claim a dflashSlot != nil slot.
+        for seqIdx in 0..<8 {
+            let s = try driver.admitSession(promptTokens: 4)
+            XCTAssertNotNil(s.dflashSlot, "Sequential session \(seqIdx) missed dflashSlot")
+            driver.finishSession(s)
+        }
+
+        // 4 concurrent sessions on 2 DFlash slots: first 2 hold dflashSlot, slots 2 & 3 stay valid with nil.
+        var active: [QWEngineSession] = []
+        defer { for s in active where !s.sessionFinished { driver.finishSession(s) } }
+        for _ in 0..<4 {
+            active.append(try driver.admitSession(promptTokens: 4))
+        }
+        XCTAssertNotNil(active[0].dflashSlot)
+        XCTAssertNotNil(active[1].dflashSlot)
+        XCTAssertNil(active[2].dflashSlot)
+        XCTAssertNil(active[3].dflashSlot)
+        XCTAssertFalse(driver.canRunSpeculativeRound(active[2]))
+    }
+
+    func testDFlashDrafterAllocatesDisjointSessionSlotsForRequestedCount() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true,
+            "Local ~/.qwg/models pack check requires bare-metal Apple Silicon GPU"
+        )
+        let packPath = QWDFlashDrafter.defaultPackPath
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: packPath),
+                          "DFlash 2 pack not installed at \(packPath)")
+        let hal = try QWHal(geometry: .qwen38_27b)
+        let drafter2 = try QWDFlashDrafter(
+            geometry: QWTestGeometry.g27, hal: hal, packPath: packPath, selectorTopK: 16, sessionSlotCount: 2)
+        XCTAssertEqual(drafter2.sessionSlots.count, 2)
+
+        let drafter4 = try QWDFlashDrafter(
+            geometry: QWTestGeometry.g27, hal: hal, packPath: packPath, selectorTopK: 16, sessionSlotCount: 4)
+        XCTAssertEqual(drafter4.sessionSlots.count, 4)
+
+        var ranges: [(start: Int, end: Int)] = []
+        for slot in drafter4.sessionSlots {
+            XCTAssertEqual(slot.kLayers.count, drafter4.config.numLayers)
+            XCTAssertEqual(slot.vLayers.count, drafter4.config.numLayers)
+            for slab in [slot.kSlab, slot.vSlab] {
+                let start = slab.region.base + slab.offset
+                ranges.append((start, start + slab.bytes))
+            }
+        }
+        let sorted = ranges.sorted { $0.start < $1.start }
+        for idx in 1..<sorted.count {
+            XCTAssertGreaterThanOrEqual(sorted[idx].start, sorted[idx - 1].end, "DFlash session slabs overlap")
+        }
+    }
+
+    private static func buildTinyDensePack(at rootDir: URL) throws {
+        let h = 256, v = 256, inter = 256, qHeads = 4, kvHeads = 2, headDim = 64
+        let cfgJSON = """
+        {"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","vocab_size":\(v),"hidden_size":\(h),
+         "intermediate_size":\(inter),"num_hidden_layers":1,"num_attention_heads":\(qHeads),
+         "num_key_value_heads":\(kvHeads),"head_dim":\(headDim),"max_position_embeddings":2048,
+         "rms_norm_eps":1e-6,"rope_theta":1000000.0,"tie_word_embeddings":false,"bos_token_id":1,"eos_token_id":2}
+        """.data(using: .utf8)!
+        let desc = try QWModelDescriptor.decode(configJSON: cfgJSON)
+        let g = QWModelGeometry(descriptor: desc)
+        let assets = rootDir.appendingPathComponent("assets")
+        try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+        try cfgJSON.write(to: assets.appendingPathComponent("config.json"))
+        try Data("{\"version\":\"1.0\"}".utf8).write(to: assets.appendingPathComponent("tokenizer.json"))
+        try Data("bos".utf8).write(to: assets.appendingPathComponent("chat_template.jinja"))
+        var mf: [String: [String: Any]] = [:]
+        for n in ["config.json", "tokenizer.json", "chat_template.jinja"] {
+            let d = try Data(contentsOf: assets.appendingPathComponent(n))
+            let hex = SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined()
+            mf[n] = ["sha256": hex, "bytes": d.count]
+        }
+        let mfData = try JSONSerialization.data(withJSONObject: mf, options: [.sortedKeys])
+        try mfData.write(to: assets.appendingPathComponent("manifest.json"))
+        let planes: [(String, Bool, Int, Int)] = [
+            ("model.embed_tokens.weight", false, v, h), ("model.norm.weight", false, 1, h),
+            ("lm_head.weight", true, v, h),
+            ("model.layers.0.input_layernorm.weight", false, 1, h),
+            ("model.layers.0.post_attention_layernorm.weight", false, 1, h),
+            ("model.layers.0.self_attn.q_proj.weight", true, g.qProjOut, h),
+            ("model.layers.0.self_attn.k_proj.weight", true, kvHeads * headDim, h),
+            ("model.layers.0.self_attn.v_proj.weight", true, kvHeads * headDim, h),
+            ("model.layers.0.self_attn.o_proj.weight", true, h, qHeads * headDim),
+            ("model.layers.0.self_attn.q_norm.weight", false, 1, headDim),
+            ("model.layers.0.self_attn.k_norm.weight", false, 1, headDim),
+            ("model.layers.0.mlp.gate_proj.weight", true, inter, h),
+            ("model.layers.0.mlp.up_proj.weight", true, inter, h),
+            ("model.layers.0.mlp.down_proj.weight", true, h, inter),
+        ]
+        var file = Data("QWP1".utf8) + Data(repeating: 0, count: 8)
+        var entries: [String: [String: Any]] = [:]
+        func pad(_ align: Int) { let r = file.count % align; if r != 0 { file.append(Data(repeating: 0, count: align - r)) } }
+        for (name, isQ4, n, k) in planes {
+            if isQ4 {
+                pad(16_384); let off = file.count; file.append(Data(count: n * (k / 32) * 20)); pad(16_384)
+                entries[name] = ["shape": [n, k], "hq4_off": off]
+            } else {
+                pad(256); let off = file.count; let count = name == "model.embed_tokens.weight" ? v * h : n * k
+                file.append(Data(count: count * 2)); pad(256)
+                entries[name] = ["shape": name.contains("norm") ? [k] : [v, h], "kind": "bf16", "raw_off": off]
+            }
+        }
+        let mfHex = SHA256.hash(data: mfData).map { String(format: "%02x", $0) }.joined()
+        let hdr = try JSONSerialization.data(withJSONObject: [
+            "provenance": ["model_id": "qwen3", "geometry_digest": desc.geometryDigestV2Hex,
+                           "source": "synthetic", "sha256_source": "synthetic", "quant_recorded": "q4g",
+                           "assets_dir": "assets", "assets_manifest_sha256": mfHex],
+            "tensors": entries
+        ], options: [.sortedKeys])
+        var hdrLen = UInt64(hdr.count).littleEndian
+        withUnsafeBytes(of: &hdrLen) { (raw: UnsafeRawBufferPointer) in file.replaceSubrange(4..<12, with: raw) }
+        file.append(hdr)
+        try file.write(to: rootDir.appendingPathComponent("model.qwp"))
     }
 }

@@ -53,7 +53,8 @@ extension QWEngineDriver {
         // SIGABRT via encoder dealloc — validate before the encoder opens.
         guard token >= 0, token < geometry.vocab else { throw QWEngineDriverError.badToken(token) }
         try claimMLAIndexerState(session)
-        let mtpRows = try prepareMTPSeeding(session, count: 1)
+        let seedMTP = mtpScratch != nil && !session.batchedDecodeTouched
+        let mtpRows = seedMTP ? try prepareMTPSeeding(session, count: 1) : 0
         // KV capacity: grow a page ahead so the C09 fused page write never
         // overruns (grow() is page-granular; tokenCapacity = pages·256).
         if session.kv.tokenCapacity <= pos {
@@ -113,7 +114,7 @@ extension QWEngineDriver {
 
         try encodeTargetHeadGreedy(enc, x: sc.ln1,
                                    writeLogits: session.stochastic != nil || activeCollectLogprobs || activeConstraint != nil)
-        if let mtpScratch {
+        if seedMTP, let mtpScratch {
             enc.endEncoding()
             encoderEnded = true
             let seedHidden: QWTensorValue = echoDrafter != nil ? sc.mhcStream! : sc.ln1
@@ -198,7 +199,9 @@ extension QWEngineDriver {
         // rollback(by:)/snapshots price the true retained window. Monotonic,
         // zero GPU cost.
         kvCache.markWritten(session.kv, upTo: pos + 1)
-        commitMTPSeeding(session, position: pos, count: 1, cacheRows: mtpRows)
+        if seedMTP {
+            commitMTPSeeding(session, position: pos, count: 1, cacheRows: mtpRows)
+        }
         let rawId = Int(sc.token.region.buffer.contents()
             .advanced(by: sc.token.region.base + sc.token.offset)
             .assumingMemoryBound(to: Int32.self).pointee)

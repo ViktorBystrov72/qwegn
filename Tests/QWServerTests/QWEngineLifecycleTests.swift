@@ -10,11 +10,41 @@ private enum LoadStop: Error {
     case stopped
 }
 
-/// Occupies the calling thread the way a real weight load does. It is
-/// deliberately not async: a load that suspends would let the actor
-/// answer even if the load ran on it, and the test would prove nothing.
-private func occupyTheThread(for seconds: Double) {
-    Thread.sleep(forTimeInterval: seconds)
+private final class LoadGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entered = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    private let releaseSem = DispatchSemaphore(value: 0)
+
+    func parkUntilReleased() {
+        let cont: CheckedContinuation<Void, Never>? = lock.withLock {
+            entered = true
+            let w = waiter
+            waiter = nil
+            return w
+        }
+        cont?.resume()
+        _ = releaseSem.wait(timeout: .now() + 5.0)
+    }
+
+    func waitUntilLoading(_ actor: QWEngineLifecycleActor) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let alreadyEntered: Bool = lock.withLock {
+                if entered { return true }
+                waiter = cont
+                return false
+            }
+            if alreadyEntered { cont.resume() }
+        }
+        for _ in 0..<400 {
+            if actor.lifecyclePhase() == .loading { return }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
+    func releaseLoad() {
+        releaseSem.signal()
+    }
 }
 
 final class QWEngineLifecycleTests: XCTestCase {
@@ -40,29 +70,23 @@ final class QWEngineLifecycleTests: XCTestCase {
     }
 
     func testTheActorAnswersWhileTheLoadIsRunning() async throws {
-        // The load occupies its thread the way a real weight load does.
-        // If the load ran on the actor, the actor could not answer while
-        // it ran — and this test would fail rather than pass quietly.
+        // The load parks deterministically on `gate` so the actor
+        // stays observable in `.loading` regardless of VM scheduler jitter.
+        let gate = LoadGate()
+        defer { gate.releaseLoad() }
         let actor = QWEngineLifecycleActor(
             config: makeConfig(),
             logger: QWServerLogger(level: .none),
             load: { _, _, _ in
-                occupyTheThread(for: 0.3)
+                gate.parkUntilReleased()
                 throw LoadStop.stopped
             })
 
         let load = Task { try await actor.loadExplicit() }
+        await gate.waitUntilLoading(actor)
+        XCTAssertEqual(actor.lifecyclePhase(), .loading, "the loading phase must be externally observable")
 
-        var sawLoading = false
-        for _ in 0..<200 {
-            if actor.lifecyclePhase() == .loading {
-                sawLoading = true
-                break
-            }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
-        XCTAssertTrue(sawLoading, "the loading phase must be externally observable")
-
+        gate.releaseLoad()
         _ = try? await load.value
         let phase = actor.lifecyclePhase()
         XCTAssertEqual(phase, .failed)
@@ -137,24 +161,23 @@ final class QWEngineLifecycleTests: XCTestCase {
     }
 
     func testAnUnloadDuringALoadLeavesTheEngineSettled() async throws {
+        let gate = LoadGate()
+        defer { gate.releaseLoad() }
         let actor = QWEngineLifecycleActor(
             config: makeConfig(),
             logger: QWServerLogger(level: .none),
             load: { _, _, _ in
-                occupyTheThread(for: 0.2)
+                gate.parkUntilReleased()
                 throw LoadStop.stopped
             })
 
         let load = Task { try await actor.loadExplicit() }
-        // Wait for the load to be under way before asking for the unload.
-        for _ in 0..<200 {
-            if actor.lifecyclePhase() == .loading { break }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await gate.waitUntilLoading(actor)
 
-        // The unload must return, and the engine must not be left
-        // waiting on a load that has already ended.
-        let reclaimed = try await actor.unloadExplicit()
+        let unload = Task { try await actor.unloadExplicit() }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        gate.releaseLoad()
+        let reclaimed = try await unload.value
         XCTAssertNil(reclaimed, "a failed load reclaimed nothing")
         let phase = actor.lifecyclePhase()
         XCTAssertNotEqual(phase, .loading, "the engine cannot stay in the loading phase")
@@ -165,18 +188,17 @@ final class QWEngineLifecycleTests: XCTestCase {
     func testTheModelIsThePackAndNotTheNameItWasGiven() async throws {
         // The user may call the model anything. The engine must report
         // the pack that is really there.
+        let gate = LoadGate()
+        defer { gate.releaseLoad() }
         let actor = QWEngineLifecycleActor(
             config: makeConfig(),
             logger: QWServerLogger(level: .none),
             load: { _, _, _ in
-                occupyTheThread(for: 0.2)
+                gate.parkUntilReleased()
                 throw LoadStop.stopped
             })
         let load = Task { try await actor.loadExplicit() }
-        for _ in 0..<200 {
-            if actor.lifecyclePhase() == .loading { break }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await gate.waitUntilLoading(actor)
 
         let info = actor.lifecycleInfo()
         XCTAssertEqual(info.phase, .loading)
@@ -185,6 +207,7 @@ final class QWEngineLifecycleTests: XCTestCase {
         let resident = actor.loadedModelName()
         XCTAssertNil(resident)
 
+        gate.releaseLoad()
         _ = try? await load.value
     }
 

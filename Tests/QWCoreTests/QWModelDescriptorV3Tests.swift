@@ -81,7 +81,7 @@ final class QWModelDescriptorV3Tests: XCTestCase {
     }
 
     func testLiveInstalledConfigsDecodeUniqueFamilyAndRole() throws {
-        let inCI = ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != nil
+        let inCI = ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == "true"
         try XCTSkipIf(inCI, "requires bare-metal ~/.qwg/models")
         let modelsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".qwg/models")
         try XCTSkipUnless(FileManager.default.fileExists(atPath: modelsDir.path), "~/.qwg/models absent")
@@ -99,6 +99,8 @@ final class QWModelDescriptorV3Tests: XCTestCase {
                 XCTAssertEqual(d.role, .speculativeDrafter, dir.lastPathComponent)
                 XCTAssertEqual(d.verifyInternalConsistency(), [], dir.lastPathComponent)
             } else {
+                // Skip packs from unmerged feature branches whose model_type is not in this build's registry.
+                if Self.hasUnregisteredModelType(in: data) { continue }
                 let d = try QWModelDescriptor.decode(configJSON: data)
                 XCTAssertNotEqual(d.role, .speculativeDrafter, dir.lastPathComponent)
                 XCTAssertEqual(d.verifyInternalConsistency(), [], dir.lastPathComponent)
@@ -106,5 +108,13 @@ final class QWModelDescriptorV3Tests: XCTestCase {
             checked += 1
         }
         XCTAssertGreaterThan(checked, 0)
+    }
+
+    private static func hasUnregisteredModelType(in data: Data) -> Bool {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        let rawType = (obj["text_config"] as? [String: Any])?["model_type"] as? String
+            ?? obj["model_type"] as? String
+        guard let modelType = rawType, !modelType.isEmpty else { return false }
+        return QWModelFamilyRegistry.shared.spec(forModelType: modelType) == nil
     }
 }

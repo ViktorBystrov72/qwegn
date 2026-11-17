@@ -429,23 +429,27 @@ public final class QWJSONTokenTable: @unchecked Sendable {
     private static func buildTrie(_ ids: [Int], bytes: [[UInt8]?]) -> Trie {
         let sorted = ids.sorted { bytes[$0]!.lexicographicallyPrecedes(bytes[$1]!) }
         var trie = Trie()
-        func build(_ lo: Int, _ hi: Int, _ depth: Int) -> Int32 {
+        var stack: [(childSlot: Int, lo: Int, hi: Int, depth: Int)] = [(-1, 0, sorted.count, 0)]
+        while let frame = stack.popLast() {
             let node = Int32(trie.childStart.count)
+            if frame.childSlot >= 0 {
+                trie.childNode[frame.childSlot] = node
+            }
             trie.childStart.append(0)
             trie.childCount.append(0)
             trie.tokenStart.append(Int32(trie.tokens.count))
             trie.tokenCount.append(0)
-            var i = lo
-            while i < hi && bytes[sorted[i]]!.count == depth {
+            var i = frame.lo
+            while i < frame.hi && bytes[sorted[i]]!.count == frame.depth {
                 trie.tokens.append(Int32(sorted[i]))
                 i += 1
             }
-            trie.tokenCount[Int(node)] = UInt16(i - lo)
+            trie.tokenCount[Int(node)] = UInt16(i - frame.lo)
             var groups: [(UInt8, Int, Int)] = []
-            while i < hi {
-                let b = bytes[sorted[i]]![depth]
+            while i < frame.hi {
+                let b = bytes[sorted[i]]![frame.depth]
                 var j = i + 1
-                while j < hi && bytes[sorted[j]]![depth] == b { j += 1 }
+                while j < frame.hi && bytes[sorted[j]]![frame.depth] == b { j += 1 }
                 groups.append((b, i, j))
                 i = j
             }
@@ -454,30 +458,36 @@ public final class QWJSONTokenTable: @unchecked Sendable {
             trie.childCount[Int(node)] = UInt16(groups.count)
             trie.childByte.append(contentsOf: groups.map(\.0))
             trie.childNode.append(contentsOf: [Int32](repeating: 0, count: groups.count))
-            for (k, g) in groups.enumerated() {
-                trie.childNode[start + k] = build(g.1, g.2, depth + 1)
+            if !groups.isEmpty {
+                for k in stride(from: groups.count - 1, through: 0, by: -1) {
+                    let g = groups[k]
+                    stack.append((start + k, g.1, g.2, frame.depth + 1))
+                }
             }
-            return node
         }
-        _ = build(0, sorted.count, 0)
         return trie
     }
 
     /// Appends every token whose bytes keep `state` alive.
     func collect(_ trie: Trie, from state: QWJState, into out: inout [Int]) {
-        func walk(_ node: Int32, _ state: QWJState) {
-            let start = Int(trie.childStart[Int(node)])
-            let end = start + Int(trie.childCount[Int(node)])
-            for k in start..<end {
-                var next = state
-                guard next.step(trie.childByte[k]) else { continue }
-                let child = Int(trie.childNode[k])
-                let ts = Int(trie.tokenStart[child])
-                for t in ts..<(ts + Int(trie.tokenCount[child])) { out.append(Int(trie.tokens[t])) }
-                walk(Int32(child), next)
+        var stack: [(node: Int, state: QWJState)] = [(0, state)]
+        while let (node, cur) = stack.popLast() {
+            if node != 0 {
+                let ts = Int(trie.tokenStart[node])
+                for t in ts..<(ts + Int(trie.tokenCount[node])) {
+                    out.append(Int(trie.tokens[t]))
+                }
+            }
+            let start = Int(trie.childStart[node])
+            let end = start + Int(trie.childCount[node])
+            if end > start {
+                for k in stride(from: end - 1, through: start, by: -1) {
+                    var next = cur
+                    guard next.step(trie.childByte[k]) else { continue }
+                    stack.append((Int(trie.childNode[k]), next))
+                }
             }
         }
-        walk(0, state)
     }
 
     func allowed(from state: QWJState, stopTokens: [Int]) -> [Int] {

@@ -493,7 +493,13 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
 
     private func evictKey(_ key: Key) {
         guard let entry = entries[key] else { return }
+        let slot = keySlot[key]
         forget(key)
+        if let slot, slotLastKey[slot] == nil, slotBaseKey[slot] == nil, !keySlot.values.contains(slot) {
+            slotLastTokens.removeValue(forKey: slot)
+            slotRootHash.removeValue(forKey: slot)
+            slotLastTouch.removeValue(forKey: slot)
+        }
         evictions += 1
         onEvict?(key, entry)
     }

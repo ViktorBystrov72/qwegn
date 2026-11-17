@@ -483,7 +483,7 @@ public final class QWChatStreamParser: @unchecked Sendable {
 
     private var mode: Mode
     private let allowToolCalls: Bool
-    private let allowReasoningTags: Bool
+    private var allowReasoningTags: Bool
     private var buffer = ""
     private var leadingPending = true
     private var contentEmitted = false
@@ -496,6 +496,12 @@ public final class QWChatStreamParser: @unchecked Sendable {
         self.mode = (startsInReasoning && allowReasoningTags) ? .reasoning : .content
         self.allowToolCalls = allowToolCalls
         self.allowReasoningTags = allowReasoningTags
+    }
+
+    public func setStartsInReasoning(_ startsInReasoning: Bool, allowReasoningTags: Bool? = nil) {
+        guard buffer.isEmpty && reasoning.isEmpty && content.isEmpty && toolText.isEmpty else { return }
+        if let allowReasoningTags { self.allowReasoningTags = allowReasoningTags }
+        mode = (startsInReasoning && self.allowReasoningTags) ? .reasoning : .content
     }
 
     public func feed(_ piece: String) -> [Delta] {

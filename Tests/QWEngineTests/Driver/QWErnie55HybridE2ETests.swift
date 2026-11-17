@@ -8,11 +8,19 @@ import Metal
 import XCTest
 import QWAlloc
 import QWCore
+import QWFlashNext
 import QWHAL
 import QWQuant
 @testable import QWEngine
 
 final class QWErnie55HybridE2ETests: XCTestCase {
+    override func setUpWithError() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true,
+            "ERNIE-5.5 hybrid GPU E2E tests require bare-metal Apple Silicon GPU"
+        )
+    }
 
     private enum PlaneSpec {
         case bf16(shape: [Int], values: [Float])
@@ -577,5 +585,56 @@ final class QWErnie55HybridE2ETests: XCTestCase {
         let exactCachedOut = try exactFreshDriver.generateCachedGreedy(prompt: fullPrompt, maxNew: maxNew)
         XCTAssertEqual(exactCachedOut, expected,
                        "Mounted standalone .qwcache exact hit must be bit-exact with single-chunk prefill")
+    }
+
+    func testNonBatchedConcurrentSchedulerSpeculativeInterleavingBitExactParity() throws {
+        try XCTSkipUnless(QWDeviceCaps.current?.isMetal4TensorCapable == true,
+                          "Non-batched concurrent scheduler speculative test requires bare-metal Apple Silicon GPU")
+        let rootDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qw-ernie55-conc-spec-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        _ = try Self.buildSyntheticErnie55Pack(at: rootDir)
+
+        let driver = try QWEngineDriver(
+            packPath: rootDir.path, maxTokens: 512, ropeRows: 512,
+            kvMode: .q4, mtpDrafts: 2, mtpAdaptiveDepth: false,
+            mtpDraftStrategy: "mtp", prefillChunkSize: 32)
+        XCTAssertFalse(driver.canRunBatchedDecode)
+
+        let prompts = [[1, 10, 20, 30, 40, 50], [2, 14, 28, 42, 56, 70]]
+        let maxNew = 6
+        let baselines = try prompts.map { p in
+            try runGreedyTokens(driver: driver, prompt: p, maxNew: maxNew, speculative: false)
+        }
+
+        let module = DenseModule(engine: driver)
+        let engine = try QWEngine(engine: module, descriptor: driver.geometry.descriptor, plan: driver.plan)
+        let scheduler = engine.batchScheduler
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock()
+            var values: [Int: QWGenerationResult] = [:]
+            func set(_ i: Int, _ r: QWGenerationResult) { lock.withLock { values[i] = r } }
+        }
+        let box = Box()
+        let group = DispatchGroup()
+        FNBatchAdmissionTracker.beginPreparing()
+        for idx in 0..<prompts.count {
+            group.enter()
+            DispatchQueue.global().async {
+                defer { group.leave() }
+                if let res = try? scheduler.generate(request: QWGenerationRequest(prompt: prompts[idx], maxNew: maxNew, sampling: .greedy)) {
+                    box.set(idx, res)
+                }
+            }
+        }
+        usleep(2000)
+        FNBatchAdmissionTracker.endPreparing()
+        group.wait()
+
+        for idx in 0..<prompts.count {
+            let res = try XCTUnwrap(box.values[idx])
+            XCTAssertEqual(res.tokens, baselines[idx], "Concurrent speculative !canRunBatchedDecode stream \(idx) diverged")
+            XCTAssertGreaterThan(res.stepTokenCounts.count, 0)
+        }
     }
 }

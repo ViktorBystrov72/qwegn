@@ -21,6 +21,7 @@ public final class QWHttpServer: @unchecked Sendable {
     let connectionStateLock = NSLock()
     var cancellationHubs: [ObjectIdentifier: QWConnectionCancellationHub] = [:]
     var connectionOrigins: [ObjectIdentifier: String] = [:]
+    let responsesStore = QWResponsesStore()
 
     public init(
         actor: QWEngineLifecycleActor,
@@ -52,7 +53,9 @@ public final class QWHttpServer: @unchecked Sendable {
             throw QWHttpServerError.unauthenticatedNonLoopbackBind(host: trimmedHost)
         }
 
-        let params = NWParameters.tcp
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
         let nwPort: NWEndpoint.Port = port == 0 ? .any : (NWEndpoint.Port(rawValue: port) ?? .any)
         let listener: NWListener
@@ -245,7 +248,7 @@ public final class QWHttpServer: @unchecked Sendable {
         if method == "OPTIONS" {
             var corsHeader = "HTTP/1.1 204 No Content\r\n"
             corsHeader += corsHeaderLines(for: connection)
-            corsHeader += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            corsHeader += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
             corsHeader += "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, x-request-id, x-session-id\r\n"
             corsHeader += "Access-Control-Expose-Headers: x-request-id, x-session-id\r\n"
             corsHeader += "Access-Control-Max-Age: 86400\r\n"
@@ -268,8 +271,42 @@ public final class QWHttpServer: @unchecked Sendable {
         let routeTask = Task {
             do {
                 switch (method, cleanPath) {
-                case ("POST", "/v1/chat/completions"):
+                case ("POST", "/v1/chat/completions"), ("POST", "/chat/completions"):
                     try await self.handleChatCompletions(connection: connection, headers: headers, body: body)
+
+                case ("POST", "/v1/completions"), ("POST", "/completions"):
+                    try await self.handleCompletions(connection: connection, headers: headers, body: body)
+
+                case ("GET", "/tokenizer_info"), ("GET", "/v1/tokenizer_info"):
+                    let model = URLComponents(string: path)?.queryItems?.first(where: { $0.name == "model" })?.value
+                    try await self.handleTokenizerInfo(connection: connection, model: model)
+
+                case ("POST", "/tokenize"), ("POST", "/v1/tokenize"):
+                    try await self.handleTokenize(connection: connection, body: body)
+
+                case ("POST", "/detokenize"), ("POST", "/v1/detokenize"):
+                    try await self.handleDetokenize(connection: connection, body: body)
+
+                case ("POST", "/v1/responses"), ("POST", "/responses"):
+                    try await self.handleCreateResponse(connection: connection, headers: headers, body: body)
+
+                case ("GET", let path) where path.hasPrefix("/v1/responses/") || path.hasPrefix("/responses/"):
+                    let prefix = path.hasPrefix("/v1/responses/") ? "/v1/responses/" : "/responses/"
+                    let responseId = String(path.dropFirst(prefix.count))
+                    if responseId.isEmpty || responseId.contains("/") {
+                        self.sendOpenAIError(connection, status: 404, message: "Not found: \(method) \(cleanPath)")
+                    } else {
+                        self.handleGetResponse(connection: connection, responseId: responseId)
+                    }
+
+                case ("DELETE", let path) where path.hasPrefix("/v1/responses/") || path.hasPrefix("/responses/"):
+                    let prefix = path.hasPrefix("/v1/responses/") ? "/v1/responses/" : "/responses/"
+                    let responseId = String(path.dropFirst(prefix.count))
+                    if responseId.isEmpty || responseId.contains("/") {
+                        self.sendOpenAIError(connection, status: 404, message: "Not found: \(method) \(cleanPath)")
+                    } else {
+                        self.handleDeleteResponse(connection: connection, responseId: responseId)
+                    }
 
                 case ("POST", "/api/chat"):
                     try await self.handleOllamaChat(connection: connection, body: body)
@@ -277,7 +314,10 @@ public final class QWHttpServer: @unchecked Sendable {
                 case ("POST", "/api/generate"):
                     try await self.handleOllamaGenerate(connection: connection, body: body)
 
-                case ("POST", "/v1/messages"):
+                case ("POST", "/v1/messages/count_tokens"), ("POST", "/messages/count_tokens"):
+                    try await self.handleMessagesCountTokens(connection: connection, headers: headers, body: body)
+
+                case ("POST", "/v1/messages"), ("POST", "/messages"):
                     try await self.handleMessages(connection: connection, headers: headers, body: body)
 
                 case ("POST", "/v1/models/load"), ("POST", "/api/load"):

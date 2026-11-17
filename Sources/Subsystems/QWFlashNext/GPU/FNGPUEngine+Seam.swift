@@ -331,7 +331,7 @@ extension FNGPUEngine {
                     savePrefixCache(history: Array(baseSlice), lastChunkRows: session.lastRows, useSpec: session.useSpec,
                                     lastArgmax: session.lastArgmax, mtpDraft: session.mtpDraft,
                                     cacheDir: prefixCacheDirectory,
-                                    isSharedBase: session.cacheSalt == nil && prefixCacheWarmStore?.hasSharedBase != true)
+                                    isSharedBase: false)
                 }
             }
         }
