@@ -33,11 +33,13 @@ extension QWEngineDriver {
         guard let next = try forwardStep(session, token: token) else {
             throw QWEngineDriverError.state("ordinary forward did not produce a token")
         }
-        if activeConstraint == nil, let prev1 = session.tokenHistory.last {
-            let prev2 = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
-            session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: next)
+        if session.stochastic == nil {
+            if activeConstraint == nil, let prev1 = session.tokenHistory.last {
+                let prev2 = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
+                session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: next)
+            }
+            session.tokenHistory.append(next)
         }
-        session.tokenHistory.append(next)
         return next
     }
 
@@ -53,7 +55,7 @@ extension QWEngineDriver {
         // SIGABRT via encoder dealloc — validate before the encoder opens.
         guard token >= 0, token < geometry.vocab else { throw QWEngineDriverError.badToken(token) }
         try claimMLAIndexerState(session)
-        let seedMTP = mtpScratch != nil && !session.batchedDecodeTouched
+        let seedMTP = (mtpScratch != nil || dflashDrafter != nil) && !session.batchedDecodeTouched
         let mtpRows = seedMTP ? try prepareMTPSeeding(session, count: 1) : 0
         // KV capacity: grow a page ahead so the C09 fused page write never
         // overruns (grow() is page-granular; tokenCapacity = pages·256).
@@ -114,11 +116,12 @@ extension QWEngineDriver {
 
         try encodeTargetHeadGreedy(enc, x: sc.ln1,
                                    writeLogits: session.stochastic != nil || activeCollectLogprobs || activeConstraint != nil)
-        if seedMTP, let mtpScratch {
+        if seedMTP, (mtpScratch != nil || dflashDrafter != nil) {
             enc.endEncoding()
             encoderEnded = true
+            let seedEmbeddings = mtpScratch?.embedding ?? sc.x
             let seedHidden: QWTensorValue = echoDrafter != nil ? sc.mhcStream! : sc.ln1
-            try encodeMTPSeeding(cb, session: session, embeddings: mtpScratch.embedding,
+            try encodeMTPSeeding(cb, session: session, embeddings: seedEmbeddings,
                                  hidden: seedHidden, count: 1, cacheRows: mtpRows)
             cb.commit()
         } else {
@@ -214,20 +217,19 @@ extension QWEngineDriver {
 
     /// Selects a token under `activeConstraint` when set, or returns `rawArgmax`.
     func selectConstrainedToken(session: QWEngineSession, rawArgmax: Int) throws -> Int {
-        guard let active = activeConstraint else { return rawArgmax }
+        guard let active = activeConstraint, session.stochastic == nil else { return rawArgmax }
         let rawLogits = sc.logits.region.pointer.advanced(by: sc.logits.offset)
             .assumingMemoryBound(to: Float.self)
         let rowBuf = UnsafeBufferPointer(start: rawLogits, count: geometry.vocab)
+        let repArr = active.sampler.config.repetitionPenalty == 1.0 ? [] : session.activeRepetitionHistory()
         let token: Int
         if let allowed = try active.constraint.allowedTokens() {
-            let repSet = active.sampler.config.repetitionPenalty == 1.0 ? Set<Int>() : Set(session.tokenHistory)
-            token = try active.sampler.constrainedToken(logits: rowBuf, allowed: allowed, repetitionHistory: repSet)
+            token = try active.sampler.constrainedToken(logits: rowBuf, allowed: allowed, repetitionHistory: Set(repArr))
         } else if active.sampler.config.isGreedy && active.sampler.config.repetitionPenalty == 1.0 {
             token = rawArgmax
         } else if active.sampler.config.isGreedy {
-            token = try active.sampler.penalisedGreedyToken(logits: rowBuf, repetitionHistory: Set(session.tokenHistory))
+            token = try active.sampler.penalisedGreedyToken(logits: rowBuf, repetitionHistory: Set(repArr))
         } else {
-            let repArr = active.sampler.config.repetitionPenalty == 1.0 ? [] : session.tokenHistory
             token = try active.sampler.sampleToken(logits: rowBuf, repetitionHistory: repArr)
         }
         try active.constraint.accept(token)

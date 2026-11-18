@@ -9,6 +9,7 @@ public struct QWEngineSessionSnapshot: Sendable {
     let kvGeneration: UInt64
     let mtpKVGeneration: UInt64?
     public let position: Int
+    public let promptTokenCount: Int
     public let generated: Int
     public let roundRecord: QWRoundRecord
     public let kvWritten: Int
@@ -24,7 +25,7 @@ public struct QWEngineSessionSnapshot: Sendable {
     let stochastic: QWStochasticState?
 
     init(source: QWEngineSession, kvGeneration: UInt64, mtpKVGeneration: UInt64?,
-         position: Int, generated: Int, roundRecord: QWRoundRecord,
+         position: Int, promptTokenCount: Int = 0, generated: Int, roundRecord: QWRoundRecord,
          kvWritten: Int, mtpKVWritten: Int?, recData: Data, ringData: Data,
          trunkHiddenData: Data?, trunkHiddenValid: Bool,
          dflashKData: Data? = nil, dflashVData: Data? = nil, dflashCacheOffset: Int = 0,
@@ -34,6 +35,7 @@ public struct QWEngineSessionSnapshot: Sendable {
         self.kvGeneration = kvGeneration
         self.mtpKVGeneration = mtpKVGeneration
         self.position = position
+        self.promptTokenCount = promptTokenCount
         self.generated = generated
         self.roundRecord = roundRecord
         self.kvWritten = kvWritten
@@ -58,7 +60,7 @@ enum QWEngineSessionState {
         return QWEngineSessionSnapshot(
             source: session, kvGeneration: try cache.rollbackGeneration(session.kv),
             mtpKVGeneration: try session.mtpKV.flatMap { try mtpCache?.rollbackGeneration($0) },
-            position: session.position, generated: session.generated,
+            position: session.position, promptTokenCount: session.promptTokenCount, generated: session.generated,
             roundRecord: session.roundRecord, kvWritten: cache.written(session.kv),
             mtpKVWritten: session.mtpKV.flatMap { mtpCache?.written($0) },
             recData: Data(bytes: session.recSlab.region.pointer.advanced(by: session.recSlab.offset),
@@ -128,6 +130,7 @@ enum QWEngineSessionState {
                 .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
         }
         session.position = snapshot.position
+        session.promptTokenCount = snapshot.promptTokenCount
         session.generated = snapshot.generated
         session.roundRecord = snapshot.roundRecord
         if let owner = session.stochastic { session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed }

@@ -27,8 +27,26 @@ extension QWEngineDriver {
             throw QWEngineDriverError.state("target sampling requires an idle live stochastic session")
         }
         do {
-            let token = try owner.stream.sampleTarget(
-                owner.distribution(logits: sc.logits, repetitionHistory: session.tokenHistory))
+            let repHistory = session.activeRepetitionHistory()
+            let token: Int
+            if let active = activeConstraint, let allowed = try active.constraint.allowedTokens() {
+                let rawLogits = sc.logits.region.pointer.advanced(by: sc.logits.offset)
+                    .assumingMemoryBound(to: Float.self)
+                let rowBuf = UnsafeBufferPointer(start: rawLogits, count: geometry.vocab)
+                let repSet = owner.config.repetitionPenalty == 1.0 ? Set<Int>() : Set(repHistory)
+                token = try active.sampler.constrainedToken(logits: rowBuf, allowed: allowed, repetitionHistory: repSet)
+            } else {
+                token = try owner.stream.sampleTarget(
+                    owner.distribution(logits: sc.logits, repetitionHistory: repHistory))
+            }
+            try activeConstraint?.constraint.accept(token)
+            if activeConstraint == nil, let prev1 = session.tokenHistory.last {
+                let prev2 = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
+                session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: token)
+            }
+            if session.tokenHistory.count == session.position {
+                session.tokenHistory.append(token)
+            }
             session.roundRecord.consumedCount = session.position
             session.roundRecord.absolutePosition = session.position
             session.roundRecord.outputCount = session.generated

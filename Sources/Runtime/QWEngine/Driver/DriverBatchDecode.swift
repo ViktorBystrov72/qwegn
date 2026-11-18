@@ -491,7 +491,8 @@ extension QWEngineDriver {
         }
 
         let started = Date()
-        let pureGreedy = (req.sampling.isGreedy && req.sampling.repetitionPenalty == 1.0) || req.constraint != nil
+        let pureGreedy = (req.sampling.isGreedy && req.sampling.repetitionPenalty == 1.0)
+            || (req.constraint != nil && !(req.constraint?.allowsSpeculation ?? false))
         let stochasticOwner = pureGreedy ? nil : try QWStochasticSession(geometry: geometry, config: req.sampling)
         let savedSalt = activeCacheSalt
         let savedVisual = activeVisualSpans
@@ -590,6 +591,7 @@ extension QWEngineDriver {
                 generated: [], pendingToken: unconditionedFirst
             )
             session.tokenHistory = req.prompt
+            session.promptTokenCount = req.prompt.count
             session.tokenRecycler.reset()
             session.tokenRecycler.ingestSequence(req.prompt)
             try consumePredictedToken(
@@ -693,22 +695,27 @@ extension QWEngineDriver {
         stepMsValue: Double?
     ) throws {
         let chosen: Int
+        let repArr = slot.session.activeRepetitionHistory()
         if let constraint = slot.constraint, let sampler = slot.constraintSampler {
             if let allowed = try constraint.allowedTokens() {
-                let rep = sampler.config.repetitionPenalty == 1.0 ? Set<Int>() : Set(slot.session.tokenHistory)
+                let rep = sampler.config.repetitionPenalty == 1.0 ? Set<Int>() : Set(repArr)
                 chosen = try sampler.constrainedToken(logits: logitBuf, allowed: allowed, repetitionHistory: rep)
+            } else if let owner = slot.session.stochastic {
+                chosen = try owner.stream.sampleTarget(
+                    owner.distribution(logits: logitsTensor, repetitionHistory: repArr))
+                slot.session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed
             } else if sampler.config.isGreedy && sampler.config.repetitionPenalty == 1.0 {
                 chosen = rawArgmax
             } else if sampler.config.isGreedy {
-                chosen = try sampler.penalisedGreedyToken(logits: logitBuf, repetitionHistory: Set(slot.session.tokenHistory))
+                chosen = try sampler.penalisedGreedyToken(logits: logitBuf, repetitionHistory: Set(repArr))
             } else {
-                let rep = sampler.config.repetitionPenalty == 1.0 ? [] : slot.session.tokenHistory
+                let rep = sampler.config.repetitionPenalty == 1.0 ? [] : repArr
                 chosen = try sampler.sampleToken(logits: logitBuf, repetitionHistory: rep)
             }
             try constraint.accept(chosen)
         } else if let owner = slot.session.stochastic {
             chosen = try owner.stream.sampleTarget(
-                owner.distribution(logits: logitsTensor, repetitionHistory: slot.session.tokenHistory))
+                owner.distribution(logits: logitsTensor, repetitionHistory: repArr))
             slot.session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed
         } else {
             chosen = rawArgmax

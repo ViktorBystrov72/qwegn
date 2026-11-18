@@ -110,7 +110,6 @@ public final class FNGPUEngine: @unchecked Sendable {
         let fitsHeadroom = fixedBytes + headroomCap * perTokenBytes <= availableBytes
         return (alignedCap >= 4096 && fitsHeadroom) ? headroomCap : alignedCap
     }
-    var cachedSeenHistory: [Int64] = [], cachedSeenSet: Set<Int> = [], cachedSeenList: [Int] = []
     public lazy var batchScheduler = FNGPUBatchScheduler(engine: self)
 
     public var arenaBytes: Int { arena.totalBytes + extraWeightBytes }

@@ -606,19 +606,26 @@ public struct ChatCompletionRequest: Codable, Sendable {
         return defaultValue
     }
 
+    private static let effortThinkingCaps: [String: Int] = [
+        "low": 256, "min": 256, "minimal": 256, "light": 256, "fast": 256, "quick": 256,
+        "medium": 1024, "mid": 1024, "med": 1024, "normal": 1024, "auto": 1024, "default": 1024,
+        "high": 4096, "xhigh": 8192, "max": 8192, "maximum": 8192, "deep": 8192,
+    ]
     public func resolvedThinkingPolicy(
-        defaultEnableThinking: Bool,
-        defaultMaxTokens: Int,
-        modelMaxLength: Int? = nil,
-        overrideMaxNewTokens: Int? = nil
+        defaultEnableThinking: Bool, defaultMaxTokens: Int,
+        modelMaxLength: Int? = nil, overrideMaxNewTokens: Int? = nil
     ) -> (shouldThink: Bool, thinkingBudget: Int?) {
-        let initial = effectiveEnableThinking(defaultValue: defaultEnableThinking)
-        guard initial else { return (false, nil) }
+        guard effectiveEnableThinking(defaultValue: defaultEnableThinking) else { return (false, nil) }
         let isJsonFormat = responseFormatType == "json_object" || responseFormatType == "json_schema"
+        let maxNew = max(0, overrideMaxNewTokens ?? maxTokens ?? maxCompletionTokens ?? modelMaxLength ?? defaultMaxTokens)
+        let reserved = maxNew <= 32 ? nil : max(16, maxNew - min(256, max(16, maxNew / 4)))
+        if reasoningBudget == nil,
+           let raw = rawReasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           let cap = Self.effortThinkingCaps[raw] {
+            return (true, reserved.map { min(cap, $0) } ?? max(1, min(cap, maxNew / 2)))
+        }
         if reasoningBudget == nil && (!hasExplicitThinkingSetting || isJsonFormat) {
-            let maxNew = max(0, overrideMaxNewTokens ?? maxTokens ?? maxCompletionTokens ?? modelMaxLength ?? defaultMaxTokens)
-            if maxNew <= 32 { return isJsonFormat ? (true, max(1, maxNew / 2)) : (false, nil) }
-            return (true, max(16, maxNew - min(256, max(16, maxNew / 4))))
+            return reserved.map { (true, $0) } ?? (isJsonFormat ? (true, max(1, maxNew / 2)) : (false, nil))
         }
         return (true, reasoningBudget.map { max(0, $0) })
     }

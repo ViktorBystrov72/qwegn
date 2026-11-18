@@ -76,8 +76,9 @@ extension QWEngineDriver {
         draftCompleted: ((any MTLCommandBuffer) throws -> Void)?
     ) throws -> MTPRoundProposal {
         let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
-        let canAdapt = (owner == nil && !mtpStageProfiling && resolvedStrategy != .mtp)
-        if canAdapt && activeConstraint == nil {
+        let canUsePLD = (owner == nil && activeConstraint == nil && !mtpStageProfiling && resolvedStrategy != .mtp)
+        let canAdapt = (!mtpStageProfiling && resolvedStrategy != .mtp)
+        if canUsePLD {
             let ctx = pendingHistoryContext(session: session, pending: pending)
             let minPldTokens = resolvedStrategy == .ngram ? min(4, count) : min(7, count)
             var cand: [Int] = []
@@ -301,17 +302,18 @@ extension QWEngineDriver {
         if let owner {
             try owner.stream.beginGumbelRound(drafts: neuralCount, vocabulary: geometry.vocab)
         }
-        var draftHistory = extraPending != nil ? (session.tokenHistory + [pending]) : (owner != nil ? session.tokenHistory : [])
+        var extraDrafts: [Int] = extraPending.map { [$0] } ?? []
         let sampledToken: ((QWTensorValue) throws -> Int)? = owner.map { owner in
             { logits in
+                let draftHistory = session.activeRepetitionHistory(extraTokens: extraDrafts)
                 let proposal = try owner.stream.sampleGumbelProposal(
                     owner.distribution(logits: logits, repetitionHistory: draftHistory))
                 proposals.append(proposal)
-                draftHistory.append(proposal.token)
+                extraDrafts.append(proposal.token)
                 return proposal.token
             }
         }
-        let needsAdaptiveStop = mtpAdaptiveDepth && (neuralCount > 1 || mtpStageProfiling)
+        let needsAdaptiveStop = mtpAdaptiveDepth && owner == nil && (neuralCount > 1 || mtpStageProfiling)
         let stopAfterDraft: ((QWTensorValue, Int) throws -> Bool)? = needsAdaptiveStop ? { logits, completedDrafts in
             if completedDrafts >= neuralCount && !self.mtpStageProfiling {
                 return false

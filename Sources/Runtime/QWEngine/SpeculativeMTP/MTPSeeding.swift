@@ -231,14 +231,14 @@ extension QWEngineDriver {
         if verifyWindow != nil {
             session.trunkHiddenValid = true
         }
+        if dflashDrafter != nil, session.dflashSlot != nil {
+            session.dflashCacheOffset = position + count
+        }
         guard let mtpCache, let handle = session.mtpKV else { return }
         let rows = cacheRows + QWMTPPromptSeeder.pairCount(position: position, count: count)
         mtpCache.markWritten(handle, upTo: rows)
         session.roundRecord.mtpPhysicalRows = rows
         session.trunkHiddenValid = true
-        if dflashDrafter != nil, session.dflashSlot != nil {
-            session.dflashCacheOffset = position + count
-        }
     }
 
     /// One greedy decode step: token in → argmax token out. Full 64-layer

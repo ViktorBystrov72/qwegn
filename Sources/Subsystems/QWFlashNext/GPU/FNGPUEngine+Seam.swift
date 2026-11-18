@@ -223,29 +223,9 @@ extension FNGPUEngine {
     public func beginSession(_ session: inout FNGPUSessionData, maxNew: Int) {
         _ = maxNew
         session.prefillStepChunk = 0
-        guard session.sampler.config.repetitionPenalty != 1.0 else {
-            session.seenTokens = []; session.seenTokenList = []; return
-        }
-        let n = vocab
-        let hist = session.history
-        var seen: Set<Int>
-        var seenList: [Int]
-        let startIdx: Int
-        if !cachedSeenHistory.isEmpty, hist.count >= cachedSeenHistory.count,
-           hist.prefix(cachedSeenHistory.count) == cachedSeenHistory[...] {
-            seen = cachedSeenSet; seenList = cachedSeenList; startIdx = cachedSeenHistory.count
-        } else {
-            seen = Set<Int>(minimumCapacity: min(hist.count, 4096))
-            seenList = []
-            seenList.reserveCapacity(min(hist.count, 4096))
-            startIdx = 0
-        }
-        for i in startIdx..<hist.count {
-            let id = Int(hist[i])
-            if id >= 0 && id < n, seen.insert(id).inserted { seenList.append(id) }
-        }
-        cachedSeenHistory = hist; cachedSeenSet = seen; cachedSeenList = seenList
-        session.seenTokens = seen; session.seenTokenList = seenList
+        session.recentGeneratedTokens.removeAll(keepingCapacity: true)
+        session.seenTokens.removeAll(keepingCapacity: true)
+        session.seenTokenList.removeAll(keepingCapacity: true)
     }
 
     /// Flushes a deferred prefix cache save after the first token has been emitted to the caller.
@@ -310,28 +290,37 @@ extension FNGPUEngine {
         let limit = runsHead ? history.count : min(chunk.upperBound, history.count)
         let autoSharedRetain = (prefixCacheWarmStore?.hasSharedBase == true && runsHead && history.count > session.prefillPos + 4)
             ? (history.count - 4) : nil
-        let effectiveRetainLen = session.retainPrefixLength ?? autoSharedRetain ?? prefixCacheWarmStore?.sharedBranchPrefixLength(for: cacheHistory)
-        if canUsePrefixCache, let retainLen = effectiveRetainLen, retainLen >= 128,
-           retainLen < history.count, session.prefillPos < retainLen {
+        var retainPoints: [Int] = []
+        if let baseRetain = session.retainPrefixLength ?? prefixCacheWarmStore?.sharedBranchPrefixLength(for: cacheHistory),
+           baseRetain >= 128, baseRetain < history.count, baseRetain > session.prefillPos {
+            retainPoints.append(baseRetain)
+        }
+        if let autoSharedRetain, autoSharedRetain >= 128, autoSharedRetain < history.count,
+           autoSharedRetain > max(session.prefillPos, retainPoints.last ?? 0) + 4 {
+            retainPoints.append(autoSharedRetain)
+        }
+        if canUsePrefixCache && !retainPoints.isEmpty {
             let hasMTP = (session.useSpec || canUsePrefixCache) && mtp != nil
-            let baseSlice = cacheHistory.prefix(retainLen)
-            let baseHash = Self.fnPrefixHash(tokens: baseSlice, kvMode: kvMode, hasMTP: hasMTP,
-                                              dflashMarker: dflashPrefixMarker)
-            let baseName = String(format: "fn_entry_%016llx_%d.qwcache", baseHash, retainLen)
-            if prefixCacheWarmStore?.contains(name: baseName) != true {
-                let baseLimit = min(limit, retainLen)
-                let baseStepChunk = dynamicPrefillChunkRows(forTotalTokens: max(1, retainLen - session.prefillPos))
-                while session.prefillPos < baseLimit {
-                    let nextRows = min(baseStepChunk, retainLen - session.prefillPos)
-                    if !runsHead && session.prefillPos + nextRows > baseLimit { break }
-                    try prefillChunk(&session, history: history, cacheHistory: cacheHistory,
-                                     chunkSize: baseStepChunk, targetEnd: retainLen, gpuSec: &gpuSec)
-                }
-                if session.prefillPos == retainLen {
-                    savePrefixCache(history: Array(baseSlice), lastChunkRows: session.lastRows, useSpec: session.useSpec,
-                                    lastArgmax: session.lastArgmax, mtpDraft: session.mtpDraft,
-                                    cacheDir: prefixCacheDirectory,
-                                    isSharedBase: false)
+            for retainLen in retainPoints where session.prefillPos < retainLen {
+                let baseSlice = cacheHistory.prefix(retainLen)
+                let baseHash = Self.fnPrefixHash(tokens: baseSlice, kvMode: kvMode, hasMTP: hasMTP,
+                                                  dflashMarker: dflashPrefixMarker)
+                let baseName = String(format: "fn_entry_%016llx_%d.qwcache", baseHash, retainLen)
+                if prefixCacheWarmStore?.contains(name: baseName) != true {
+                    let baseLimit = min(limit, retainLen)
+                    let baseStepChunk = dynamicPrefillChunkRows(forTotalTokens: max(1, retainLen - session.prefillPos))
+                    while session.prefillPos < baseLimit {
+                        let nextRows = min(baseStepChunk, retainLen - session.prefillPos)
+                        if !runsHead && session.prefillPos + nextRows > baseLimit { break }
+                        try prefillChunk(&session, history: history, cacheHistory: cacheHistory,
+                                         chunkSize: baseStepChunk, targetEnd: retainLen, gpuSec: &gpuSec)
+                    }
+                    if session.prefillPos == retainLen {
+                        savePrefixCache(history: Array(baseSlice), lastChunkRows: session.lastRows, useSpec: session.useSpec,
+                                        lastArgmax: session.lastArgmax, mtpDraft: session.mtpDraft,
+                                        cacheDir: prefixCacheDirectory,
+                                        isSharedBase: false)
+                    }
                 }
             }
         }
@@ -379,6 +368,7 @@ extension FNGPUEngine {
                                                 maxFitting: FNGPUDFlash.maxFittingContext(activeCapacity: activeCap))
         }
         if session.useSpec, let vStack = verifyStack,
+           (session.constraint?.isUnconstrainedNow ?? true),
            session.history.count + 8 < activeCap {
             if let mtp {
                 return try speculativeStep(&session, token: token, vStack: vStack, mtp: mtp)

@@ -613,4 +613,38 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
         XCTAssertTrue(pBudget.shouldThink)
         XCTAssertEqual(pBudget.thinkingBudget, 24)
     }
+
+    func testResolvedThinkingPolicyEnforcesReasoningEffortLowAndMedium() throws {
+        let lowReq = try JSONDecoder().decode(
+            ChatCompletionRequest.self,
+            from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true,"reasoning_effort":"low"}"#.utf8)
+        )
+        let pLow = lowReq.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        XCTAssertTrue(pLow.shouldThink)
+        XCTAssertEqual(pLow.thinkingBudget, 256)
+
+        let medReq = try JSONDecoder().decode(
+            ChatCompletionRequest.self,
+            from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true,"reasoning_effort":"medium"}"#.utf8)
+        )
+        let pMed = medReq.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        XCTAssertTrue(pMed.shouldThink)
+        XCTAssertEqual(pMed.thinkingBudget, 1024)
+
+        let highReq = try JSONDecoder().decode(
+            ChatCompletionRequest.self,
+            from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true,"reasoning_effort":"high"}"#.utf8)
+        )
+        let pHigh = highReq.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        XCTAssertTrue(pHigh.shouldThink)
+        XCTAssertEqual(pHigh.thinkingBudget, 4096)
+
+        let xhighReq = try JSONDecoder().decode(
+            ChatCompletionRequest.self,
+            from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true,"reasoning_effort":"xhigh"}"#.utf8)
+        )
+        let pXHigh = xhighReq.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        XCTAssertTrue(pXHigh.shouldThink)
+        XCTAssertEqual(pXHigh.thinkingBudget, 8192)
+    }
 }

@@ -79,9 +79,6 @@ extension QWEngineDriver {
         guard flight.try() else { throw QWEngineDriverError.busy }
         defer { flight.unlock() }
         try requestGate.validate(permit)
-        guard !mtpAdaptiveDepth || !stochastic else {
-            throw QWEngineDriverError.state("QW_MTP_ADAPTIVE_DEPTH currently supports greedy rounds only")
-        }
         let profileStart = mtpStageProfiling ? DispatchTime.now().uptimeNanoseconds : nil
         let canOverlapPriorCommit = !stochastic && !mtpStageProfiling && !mtpVerificationProfiling
             && coldEvents == nil && mtpDeviceEmbedding != nil
@@ -202,7 +199,7 @@ extension QWEngineDriver {
         let boundary = try greedyRoundBoundary(session)
         lastMTPRoundProfile = nil
         pendingMTPProfile = nil
-        pendingMTPAdaptiveEntropy = mtpAdaptiveDepth ? [] : nil
+        pendingMTPAdaptiveEntropy = (mtpAdaptiveDepth && !stochastic) ? [] : nil
         preparedStochasticWitness = nil
         lastRoundUsedPLD = false
         lastDraftedPairs = 0
@@ -320,17 +317,19 @@ extension QWEngineDriver {
                     window = try verifyTokensLocked(session, tokens: [pending] + drafts, completed: verifyCompleted)
                 }
             }
-            let decision: QWGreedyRoundDecision
+            var rawDecision: QWGreedyRoundDecision
             let evidence: QWStochasticRoundEvidence?
             let rawTargetsForLease: [Int]?
             let margin: Float = lastRoundUsedPLD ? 0 : effectiveRelaxedMargin
             let minProb: Float = margin > 0 ? effectiveRelaxedMinProb : 0
             if let owner {
                 var targets: [QWSamplingDistribution] = []
+                let ctx = pendingHistoryContext(session: session, pending: pending)
+                let extraPending = ctx.extraPending.map { [$0] } ?? []
                 for row in 0..<(drafts.count + 1) {
-                    let history = session.tokenHistory + [pending] + Array(drafts.prefix(row))
+                    let history = session.activeRepetitionHistory(extraTokens: extraPending + Array(drafts.prefix(row)))
                     targets.append(try owner.distribution(logits: window.logitRow(row),
-                                                          repetitionHistory: Array(history)))
+                                                          repetitionHistory: history))
                 }
                 let result = margin > 0
                     ? try owner.stream.resolveRelaxedGumbelRound(proposals: proposals,
@@ -338,7 +337,7 @@ extension QWEngineDriver {
                                                                  margin: Double(margin))
                     : try owner.stream.resolveGumbelRound(proposals: proposals,
                                                           targetDistributions: targets)
-                decision = try QWGreedyRoundDecision.sampled(geometry: geometry,
+                rawDecision = try QWGreedyRoundDecision.sampled(geometry: geometry,
                     proposals: proposals, result: result, maxNew: maxNew, stopIDs: stopIDs,
                     maxDrafts: dflashDrafter != nil ? 15 : 7)
                 preparedStochasticWitness = QWStochasticRoundWitness(owner: owner,
@@ -352,21 +351,21 @@ extension QWEngineDriver {
                     activeRows: drafts.count + 1,
                     relaxedMargin: margin,
                     relaxedMinProb: minProb)
-                var rawDecision = withTargets.decision
+                rawDecision = withTargets.decision
                 rawTargetsForLease = withTargets.targets
-                if let boundary = activeConstraint?.constraint.speculationBoundaryToken,
-                   let idx = rawDecision.tokens.firstIndex(of: boundary),
-                   idx + 1 < rawDecision.tokens.count {
-                    rawDecision = QWGreedyRoundDecision(
-                        acceptedDrafts: rawDecision.acceptedDrafts,
-                        tokens: Array(rawDecision.tokens.prefix(idx + 1)),
-                        stopped: false,
-                        stoppedToken: nil
-                    )
-                }
-                decision = rawDecision
                 evidence = nil
             }
+            if let boundaryTok = activeConstraint?.constraint.speculationBoundaryToken,
+               let idx = rawDecision.tokens.firstIndex(of: boundaryTok),
+               idx + 1 < rawDecision.tokens.count {
+                rawDecision = QWGreedyRoundDecision(
+                    acceptedDrafts: rawDecision.acceptedDrafts,
+                    tokens: Array(rawDecision.tokens.prefix(idx + 1)),
+                    stopped: false,
+                    stoppedToken: nil
+                )
+            }
+            let decision = rawDecision
             let lease = QWGreedyRoundLease(boundary: boundary, decision: decision,
                                            stochasticEvidence: evidence, rawTargets: rawTargetsForLease)
             if let profileStart, let verifyStart, let draftAccumulator, let verifyAccumulator {
@@ -605,7 +604,7 @@ extension QWEngineDriver {
         session.roundRecord.mtpPhysicalRows = basePairs + retainedPairs
         mtpDraftAccepted += decision.acceptedDrafts
         if dflashDrafter != nil {
-            if !stochastic && !mtpStageProfiling && !usedPLDThisRound {
+            if !mtpStageProfiling && !usedPLDThisRound {
                 let roundMs = session.dflashRoundStartNs.map {
                     Double(DispatchTime.now().uptimeNanoseconds - $0) / 1_000_000
                 }

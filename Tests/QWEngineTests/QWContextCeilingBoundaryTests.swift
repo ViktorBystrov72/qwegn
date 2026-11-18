@@ -296,4 +296,233 @@ final class QWContextCeilingBoundaryTests: XCTestCase {
         try driver.configurePrefixCache(byteLimit: 0, entryLimit: 8)
         XCTAssertNil(driver.kvCache.onPagePressure)
     }
+
+    func testGenerateCachedStochasticWritesPrefillLogitsAcrossMultiTurnAndStopTokens() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.isMetal4TensorCapable == true,
+            "Synthetic driver stochastic prefill test requires bare-metal Apple Silicon GPU"
+        )
+        let rootDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qw-stoch-prefill-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        try Self.buildSyntheticNextNPack(at: rootDir, maxPos: 256)
+
+        // Fresh driver starts with zeroed sc.logits; profile-style repetitionPenalty=1.05 routes temperature=0 through generateCachedStochastic.
+        let driver = try QWEngineDriver(
+            packPath: rootDir.path, maxTokens: 256, ropeRows: 256,
+            kvMode: .q4, mtpDrafts: 0, prefillChunkSize: 32)
+        try driver.configurePrefixCache(byteLimit: 64 << 20, entryLimit: 8)
+
+        let sampler = QWSamplerConfig(
+            QWSamplingParameters(temperature: 0.0, topP: 1.0, topK: 1, repetitionPenalty: 1.05, seed: 7),
+            vocabulary: 256
+        )
+        let p1 = (0..<40).map { 10 + $0 }
+        let p2 = (0..<44).map { 100 + $0 }
+
+        // Turn 1 with maxNew=4 so decodeStochastic runs and leaves a real token in sc.logits; stop at its 2nd generated token on Turn 1 replay below.
+        let turn1Warm = try driver.generate(
+            request: QWGenerationRequest(prompt: p1, maxNew: 3, sampling: sampler, usePrefixCache: true),
+            onToken: nil
+        )
+        XCTAssertEqual(turn1Warm.tokens.count, 3)
+
+        let stopTok = turn1Warm.tokens[1]
+        // Ensure Turn 1 stopping on `stopTok` leaves `stopTok` logits in `sc.logits`, then Turn 2 still prefill-samples its own first token.
+        let freshDriver = try QWEngineDriver(
+            packPath: rootDir.path, maxTokens: 256, ropeRows: 256,
+            kvMode: .q4, mtpDrafts: 0, prefillChunkSize: 32)
+        try freshDriver.configurePrefixCache(byteLimit: 64 << 20, entryLimit: 8)
+
+        let cachedTurn1 = try freshDriver.generate(
+            request: QWGenerationRequest(prompt: p1, maxNew: 4, stopIDs: [stopTok], sampling: sampler, usePrefixCache: true),
+            onToken: nil
+        )
+        XCTAssertEqual(cachedTurn1.tokens, [turn1Warm.tokens[0]])
+
+        let cachedTurn2 = try freshDriver.generate(
+            request: QWGenerationRequest(prompt: p2, maxNew: 4, stopIDs: [stopTok], sampling: sampler, usePrefixCache: true),
+            onToken: nil
+        )
+        XCTAssertGreaterThan(cachedTurn2.tokens.count, 0)
+
+        let refS1 = try freshDriver.makeStochasticSession(promptTokens: p1.count, config: sampler)
+        let refTurn1 = try freshDriver.generateExperimentalStochastic(session: refS1, prompt: p1, maxNew: 1, speculative: false)
+        freshDriver.finishSession(refS1)
+        XCTAssertEqual(turn1Warm.tokens.first, refTurn1.first)
+
+        let refS2 = try freshDriver.makeStochasticSession(promptTokens: p2.count, config: sampler)
+        let refTurn2 = try freshDriver.generateExperimentalStochastic(session: refS2, prompt: p2, maxNew: 4, speculative: false)
+        freshDriver.finishSession(refS2)
+        let refTurn2Clipped = Array(refTurn2.prefix { $0 != stopTok })
+        XCTAssertFalse(refTurn2Clipped.isEmpty)
+        XCTAssertEqual(cachedTurn2.tokens, refTurn2Clipped)
+    }
+
+    func testGenerateCachedMultiTurnWithRetainPrefixLengthCachesSystemAndTurnPrefixes() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.isMetal4TensorCapable == true,
+            "Synthetic driver multi-turn retain test requires bare-metal Apple Silicon GPU"
+        )
+        let rootDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qw-multiturn-retain-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        try Self.buildSyntheticNextNPack(at: rootDir, maxPos: 1024)
+
+        let driver = try QWEngineDriver(
+            packPath: rootDir.path, maxTokens: 1024, ropeRows: 1024,
+            kvMode: .q4, mtpDrafts: 0, prefillChunkSize: 32)
+        try driver.configurePrefixCache(byteLimit: 64 << 20, entryLimit: 16)
+
+        let sampler = QWSamplerConfig(
+            QWSamplingParameters(temperature: 0.0, topP: 1.0, topK: 1, repetitionPenalty: 1.05, seed: 11),
+            vocabulary: 256
+        )
+        let p1 = (0..<96).map { 10 + ($0 % 200) }
+        let p2 = Array(p1.prefix(92)) + (0..<36).map { 50 + ($0 % 180) }
+        let p3 = Array(p2.prefix(124)) + (0..<36).map { 90 + ($0 % 150) }
+
+        let r1 = try driver.generate(
+            request: QWGenerationRequest(prompt: p1, maxNew: 2, sampling: sampler, usePrefixCache: true, retainPrefixLength: 32),
+            onToken: nil
+        )
+        XCTAssertEqual(r1.tokens.count, 2)
+        XCTAssertEqual(driver.lastPrefixCacheStats?.hit, false)
+
+        let r2 = try driver.generate(
+            request: QWGenerationRequest(prompt: p2, maxNew: 2, sampling: sampler, usePrefixCache: true, retainPrefixLength: 32),
+            onToken: nil
+        )
+        XCTAssertEqual(r2.tokens.count, 2)
+        XCTAssertEqual(driver.lastPrefixCacheStats?.hit, true)
+        XCTAssertEqual(driver.lastPrefixCacheStats?.matchedTokens, 92)
+
+        let r3 = try driver.generate(
+            request: QWGenerationRequest(prompt: p3, maxNew: 2, sampling: sampler, usePrefixCache: true, retainPrefixLength: 32),
+            onToken: nil
+        )
+        XCTAssertEqual(r3.tokens.count, 2)
+        XCTAssertEqual(driver.lastPrefixCacheStats?.hit, true)
+        XCTAssertEqual(driver.lastPrefixCacheStats?.matchedTokens, 124)
+    }
+
+    func testActiveRepetitionHistoryExcludesPromptAndCapsGeneratedWindow() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.isMetal4TensorCapable == true,
+            "Synthetic driver session window test requires bare-metal Apple Silicon GPU"
+        )
+        let rootDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qw-rep-window-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        try Self.buildSyntheticNextNPack(at: rootDir, maxPos: 512)
+
+        let driver = try QWEngineDriver(
+            packPath: rootDir.path, maxTokens: 512, ropeRows: 512,
+            kvMode: .q4, mtpDrafts: 0, prefillChunkSize: 32)
+        let stopTok = 77
+        let prompt = [stopTok, stopTok, stopTok, stopTok, 11, 12]
+        let session = try driver.makeSession(promptTokens: prompt.count)
+        defer { driver.finishSession(session) }
+        _ = try driver.prefill(session, tokens: prompt, mode: .chunked)
+        XCTAssertEqual(session.promptTokenCount, prompt.count)
+
+        session.tokenHistory = prompt + (100..<180).map { $0 }
+        XCTAssertEqual(session.activeRepetitionHistory(extraTokens: [180, 181]), [])
+        session.tokenHistory = prompt + [55, 55, 55]
+        XCTAssertEqual(session.activeRepetitionHistory(), [])
+        session.tokenHistory = prompt + [1, 0, 2, 99, 1, 0]
+        XCTAssertEqual(session.activeRepetitionHistory(), [])
+        session.tokenHistory = prompt + [55, 55, 55, 55]
+        XCTAssertEqual(session.activeRepetitionHistory(), [55])
+        session.tokenHistory = prompt + [20, 21, 20, 21, 20, 21]
+        XCTAssertEqual(session.activeRepetitionHistory(), [20])
+        session.tokenHistory = prompt + [20, 21, 99, 20, 21, 99]
+        XCTAssertEqual(session.activeRepetitionHistory(), [20])
+        session.tokenHistory = prompt + [42, 1, 42, 2, 42, 3, 42, 4, 42, 5, 42]
+        XCTAssertEqual(session.activeRepetitionHistory(), [42])
+        // Loop outside the 64-token generated window drops cleanly without false positives.
+        session.tokenHistory = prompt + [55, 55, 55, 55] + (100..<164).map { $0 }
+        XCTAssertEqual(session.activeRepetitionHistory(), [])
+
+        var fnSession = FNGPUSessionData(history: [Int64(stopTok), Int64(stopTok), Int64(stopTok), Int64(stopTok)], sampler: QWSampler(config: .greedy))
+        for tok in 100..<180 {
+            fnSession.recordSeenToken(tok, vocab: 256)
+        }
+        XCTAssertEqual(fnSession.recentGeneratedTokens.count, FNGPUSessionData.repetitionPenaltyWindow)
+        XCTAssertEqual(fnSession.seenTokenList, [])
+        for _ in 0..<3 {
+            fnSession.recordSeenToken(210, vocab: 256)
+        }
+        XCTAssertEqual(fnSession.seenTokenList, [])
+        fnSession.recordSeenToken(210, vocab: 256)
+        XCTAssertEqual(fnSession.seenTokenList, [210])
+        XCTAssertFalse(fnSession.seenTokens.contains(stopTok))
+    }
+
+    func testSpeculatableConstraintWithStochasticSamplingAndRepetitionPenalty() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.isMetal4TensorCapable == true,
+            "Synthetic driver constrained stochastic test requires bare-metal Apple Silicon GPU"
+        )
+        final class BoundaryBudgetConstraint: QWTokenConstraint, @unchecked Sendable {
+            private let maxBudget: Int
+            private let endThinkId: Int
+            private(set) var acceptedCount = 0
+            private(set) var closed = false
+            init(maxBudget: Int, endThinkId: Int) {
+                self.maxBudget = maxBudget
+                self.endThinkId = endThinkId
+            }
+            var allowsSpeculation: Bool { true }
+            var isUnconstrainedNow: Bool { !closed && (maxBudget - acceptedCount) > 16 }
+            var speculationBoundaryToken: Int? { closed ? nil : endThinkId }
+            func allowedTokens() throws -> [Int]? {
+                if !closed && acceptedCount >= maxBudget { return [endThinkId] }
+                return nil
+            }
+            func accept(_ token: Int) throws {
+                if !closed {
+                    if token == endThinkId { closed = true }
+                    else { acceptedCount += 1 }
+                }
+            }
+        }
+
+        let rootDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qw-stoch-constraint-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        try Self.buildSyntheticNextNPack(at: rootDir, maxPos: 512)
+
+        let driver = try QWEngineDriver(
+            packPath: rootDir.path, maxTokens: 512, ropeRows: 512,
+            kvMode: .q4, mtpDrafts: 2, mtpAdaptiveDepth: true, prefillChunkSize: 32)
+        try driver.configurePrefixCache(byteLimit: 64 << 20, entryLimit: 8)
+
+        let endThinkId = 201
+        let constraint = BoundaryBudgetConstraint(maxBudget: 20, endThinkId: endThinkId)
+        let sampling = QWSamplerConfig(
+            QWSamplingParameters(temperature: 0.4, topP: 0.95, topK: 40, repetitionPenalty: 1.5, seed: -1),
+            vocabulary: 256
+        )
+        let prompt = (0..<24).map { 10 + $0 }
+        let res = try driver.generate(
+            request: QWGenerationRequest(
+                prompt: prompt,
+                maxNew: 26,
+                sampling: sampling,
+                usePrefixCache: true,
+                speculative: QWSpeculativeParameters(enabled: true, mtpDrafts: 2, mtpBackend: "standard"),
+                constraint: constraint
+            ),
+            onToken: nil
+        )
+        XCTAssertEqual(res.tokens.count, 26)
+        XCTAssertTrue(constraint.closed)
+        XCTAssertTrue(res.tokens.contains(endThinkId))
+        XCTAssertLessThanOrEqual(constraint.acceptedCount, 20)
+    }
 }

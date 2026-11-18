@@ -335,6 +335,44 @@ extension QWSampler {
         }
         return QWTokenLogprob(tokenId: chosenToken, logprob: chosenLP, topCandidates: candidates)
     }
+
+    /// Identifies tokens forming consecutive periodic cycles or >=6x trailing bursts.
+    public static func loopRepetitionTokens(in window: [Int]) -> [Int] {
+        let m = window.count
+        guard m >= 4 else { return [] }
+        var out: [Int] = []
+        var seen = Set<Int>()
+        for period in 1...min(16, m / 2) {
+            let repeats = period == 1 ? 4 : (period == 2 ? 3 : 2)
+            let span = period * repeats
+            guard m >= span else { continue }
+            let start = m - span
+            var matches = true
+            for offset in 0..<(span - period) where window[start + offset] != window[start + period + offset] {
+                matches = false
+                break
+            }
+            if matches {
+                let candidate = window[m - period]
+                if seen.insert(candidate).inserted { out.append(candidate) }
+            }
+        }
+        let tailStart = max(0, m - 16)
+        for i in tailStart..<m {
+            let candidate = window[i]
+            if seen.contains(candidate) { continue }
+            var count = 0
+            for j in i..<m where window[j] == candidate {
+                count += 1
+                if count >= 6 {
+                    seen.insert(candidate)
+                    out.append(candidate)
+                    break
+                }
+            }
+        }
+        return out
+    }
 }
 
 // (the median-of-medians helpers that lived here are GONE — the bounded

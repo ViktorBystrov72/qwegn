@@ -306,6 +306,9 @@ extension QWEngineDriver {
             }
             let session = loaded.session
             defer { finishSession(session) }
+            session.tokenHistory = Array(prompt.prefix(loaded.matched))
+            session.promptTokenCount = prompt.count
+            if let owner { session.stochastic = owner }
             var first: Int
             let unconditionedFirst: Int
             var skippedOversize = false
@@ -336,58 +339,71 @@ extension QWEngineDriver {
                     }
                 }
                 let firstVis = activeVisualSpans.map(\.tokenOffset).min() ?? prompt.count
-                let effectiveRetainLen: Int? = {
-                    if let explicit = retainPrefixLength { return explicit <= firstVis ? explicit : nil }
-                    if firstVis >= 64 {
-                        let autoRetain = firstVis - 4
-                        if autoRetain >= 60, autoRetain > loaded.matched + 4, autoRetain < firstVis {
-                            return autoRetain
-                        }
+                var retainPoints: [Int] = []
+                if let explicit = retainPrefixLength, explicit > loaded.matched, explicit < firstVis {
+                    retainPoints.append(explicit)
+                }
+                let autoBase = retainPoints.last ?? loaded.matched
+                if firstVis >= 64 {
+                    let autoRetain = firstVis - 4
+                    if autoRetain >= 60, autoRetain > autoBase + 4, autoRetain < firstVis {
+                        retainPoints.append(autoRetain)
                     }
-                    if let branchLen = store.sharedBranchPrefixLength(for: Array(prompt.prefix(firstVis))),
-                       branchLen > loaded.matched, branchLen < firstVis {
-                        return branchLen
-                    }
-                    return nil
-                }()
+                }
+                let branchBase = retainPoints.last ?? loaded.matched
+                if branchBase == loaded.matched || branchBase == retainPrefixLength,
+                   let branchLen = store.sharedBranchPrefixLength(for: Array(prompt.prefix(firstVis))),
+                   branchLen > branchBase, branchLen < firstVis {
+                    retainPoints.append(branchLen)
+                }
                 let prefillStart = Date()
-                if let retainLen = effectiveRetainLen, retainLen > loaded.matched, retainLen < prompt.count {
-                    let savedConstraint = activeConstraint
-                    activeConstraint = nil
-                    let midFirst: Int
-                    do {
-                        midFirst = try prefill(session, tokens: Array(prompt[loaded.matched..<retainLen]),
-                                               mode: mode, permit: permit)
-                        activeConstraint = savedConstraint
-                    } catch {
-                        activeConstraint = savedConstraint
-                        throw error
-                    }
-                    let midSec = Date().timeIntervalSince(prefillStart)
-                    skippedOversize = try !retainCachedPrompt(
-                        session, prompt: Array(prompt.prefix(retainLen)),
-                        mode: mode, first: midFirst, store: store, permit: permit,
-                        isSharedBase: false
-                    )
-                    // Reset intermediate head prediction counters and reserve COW for tail tokens
-                    session.generated = 0
-                    session.roundRecord.outputCount = 0
-                    session.roundRecord.pendingToken = nil
-                    try prefixPagePressure(store, session: session) {
-                        flight.lock()
-                        defer { flight.unlock() }
-                        try requestGate.validate(permit)
-                        try kvCache.prepareWrites(session.kv, positions: session.position..<prompt.count)
-                        if let mtpCache, let handle = session.mtpKV {
-                            let rows = mtpCache.written(handle)
-                            let count = prompt.count - retainLen
-                            try mtpCache.prepareWrites(handle, positions: rows..<(rows + count))
+                if !retainPoints.isEmpty {
+                    var totalComputeSec = 0.0
+                    for retainLen in retainPoints where retainLen > session.position && retainLen < prompt.count {
+                        let segStart = Date()
+                        let savedConstraint = activeConstraint
+                        activeConstraint = nil
+                        let midFirst: Int
+                        do {
+                            midFirst = try prefill(session, tokens: Array(prompt[session.position..<retainLen]),
+                                                   mode: mode, permit: permit, evictScratchOnCompletion: false)
+                            activeConstraint = savedConstraint
+                        } catch {
+                            activeConstraint = savedConstraint
+                            throw error
+                        }
+                        totalComputeSec += Date().timeIntervalSince(segStart)
+                        do {
+                            let savedStochastic = session.stochastic
+                            session.stochastic = nil
+                            defer { session.stochastic = savedStochastic }
+                            skippedOversize = try !retainCachedPrompt(
+                                session, prompt: Array(prompt.prefix(retainLen)),
+                                mode: mode, first: midFirst, store: store, permit: permit,
+                                isSharedBase: false
+                            )
+                        }
+                        // Reset intermediate head prediction counters and reserve COW for tail tokens
+                        session.generated = 0
+                        session.roundRecord.outputCount = 0
+                        session.roundRecord.pendingToken = nil
+                        session.tokenHistory = Array(prompt.prefix(retainLen))
+                        try prefixPagePressure(store, session: session) {
+                            flight.lock()
+                            defer { flight.unlock() }
+                            try requestGate.validate(permit)
+                            try kvCache.prepareWrites(session.kv, positions: session.position..<prompt.count)
+                            if let mtpCache, let handle = session.mtpKV {
+                                let rows = mtpCache.written(handle)
+                                let count = prompt.count - retainLen
+                                try mtpCache.prepareWrites(handle, positions: rows..<(rows + count))
+                            }
                         }
                     }
                     let tailStart = Date()
-                    first = try prefill(session, tokens: Array(prompt[retainLen..<prompt.count]),
+                    first = try prefill(session, tokens: Array(prompt[session.position..<prompt.count]),
                                         mode: mode, permit: permit)
-                    computePrefillSec = midSec + Date().timeIntervalSince(tailStart)
+                    computePrefillSec = totalComputeSec + Date().timeIntervalSince(tailStart)
                 } else {
                     first = try prefill(session, tokens: Array(prompt.dropFirst(loaded.matched)),
                                         mode: mode, permit: permit)
@@ -399,11 +415,14 @@ extension QWEngineDriver {
             }
             let needsFullPromptRetain = loaded.first == nil &&
                 !(retainPrefixLength != nil && retainPrefixLength! > loaded.matched && retainPrefixLength! < prompt.count)
-            if let owner, activeConstraint == nil {
-                session.stochastic = owner
+            if owner != nil {
+                session.promptTokenCount = prompt.count
                 first = try sampleStochasticTarget(session, permit: permit)
             }
-            session.tokenHistory = prompt + [first]
+            if session.tokenHistory.count != prompt.count + 1 {
+                session.tokenHistory = prompt + [first]
+            }
+            session.promptTokenCount = prompt.count
             session.tokenRecycler.reset()
             session.tokenRecycler.ingestSequence(session.tokenHistory)
             let firstTokenSec = Date().timeIntervalSince(started)
@@ -418,8 +437,13 @@ extension QWEngineDriver {
             }
             if needsFullPromptRetain {
                 let savedStochastic = session.stochastic
+                let savedConstraint = activeConstraint
                 session.stochastic = nil
-                defer { session.stochastic = savedStochastic }
+                activeConstraint = nil
+                defer {
+                    session.stochastic = savedStochastic
+                    activeConstraint = savedConstraint
+                }
                 skippedOversize = try !retainCachedPrompt(session, prompt: prompt, mode: mode,
                                                           first: unconditionedFirst,
                                                           store: store, permit: permit)

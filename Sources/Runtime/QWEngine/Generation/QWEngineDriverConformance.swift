@@ -192,7 +192,7 @@ extension QWEngineDriver: QWSessionInferenceEngine {
         let prefillMark = prefillTimingLedger.values().count
         let cacheActive = request.usePrefixCache
         let pureGreedy = (request.sampling.isGreedy && request.sampling.repetitionPenalty == 1.0)
-            || request.constraint != nil
+            || (request.constraint != nil && !(request.constraint?.allowsSpeculation ?? false))
         // The engine's own drafts decide whether it can speculate: a
         // request that asks for a drafter this engine does not have is
         // served without one, never refused.

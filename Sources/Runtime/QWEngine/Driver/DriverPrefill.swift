@@ -139,8 +139,7 @@ extension QWEngineDriver {
             profileStage("head")
             enc = activeEnc ?? enc
             let lastLn1 = stridedRow(psc.ln1, row: T - 1, cols: H, dt: .f16)
-            try encodeTargetHeadGreedy(enc, x: lastLn1,
-                                       writeLogits: session.stochastic != nil || activeCollectLogprobs || activeConstraint != nil)
+            try encodeTargetHeadGreedy(enc, x: lastLn1, writeLogits: true)
             // M2 FIX: `generated` is a COMMITTED counter — it advances after
             // the cb lands (below), never before. An errored chunk threw and
             // left the count honest.
@@ -206,14 +205,18 @@ extension QWEngineDriver {
             let rawId = Int(sc.token.region.buffer.contents()
                 .advanced(by: sc.token.region.base + sc.token.offset)
                 .assumingMemoryBound(to: Int32.self).pointee)
-            nextId = try selectConstrainedToken(session: session, rawArgmax: rawId)
             session.generated += 1    // M2: committed only after the cb landed (the head ran once)
-            if activeConstraint == nil, count >= 1 {
-                let tailCur = tokens[start + count - 1]
-                let tailPrev = count >= 2 ? tokens[start + count - 2] : (start > 0 ? tokens[start - 1] : nil)
-                session.tokenRecycler.recordTransition(previous: tailPrev, current: tailCur, next: nextId)
+            if session.stochastic == nil {
+                nextId = try selectConstrainedToken(session: session, rawArgmax: rawId)
+                if activeConstraint == nil, count >= 1 {
+                    let tailCur = tokens[start + count - 1]
+                    let tailPrev = count >= 2 ? tokens[start + count - 2] : (start > 0 ? tokens[start - 1] : nil)
+                    session.tokenRecycler.recordTransition(previous: tailPrev, current: tailCur, next: nextId)
+                }
+                session.tokenHistory.append(nextId)
+            } else {
+                nextId = rawId
             }
-            session.tokenHistory.append(nextId)
         }
 
         session.position += T
@@ -265,18 +268,37 @@ extension QWEngineDriver {
     }
 
     func prefill(_ session: QWEngineSession, tokens: [Int],
-                         mode: GDNPrefillMode?, permit: QWGenerationPermit) throws -> Int {
+                         mode: GDNPrefillMode?, permit: QWGenerationPermit,
+                         evictScratchOnCompletion: Bool = true) throws -> Int {
         guard !tokens.isEmpty else { return 0 }
-        if session.position == 0 { session.tokenRecycler.reset() }
+        if session.position == 0 {
+            session.tokenRecycler.reset()
+            session.tokenHistory = tokens
+        } else {
+            if session.tokenHistory.count > session.position {
+                session.tokenHistory.removeSubrange(session.position..<session.tokenHistory.count)
+            }
+            session.tokenHistory.append(contentsOf: tokens)
+        }
+        session.promptTokenCount = session.tokenHistory.count
+        let naivePromptHistory = session.tokenHistory
         session.tokenRecycler.ingestSequence(tokens)
-        session.tokenHistory = tokens
         emitPrefillProgress(session, done: 0, promptCount: tokens.count)
         let effectiveMode = mode ?? gdnPrefillMode
         switch effectiveMode {
         case .naive:
             var lastToken = 0
             for (idx, t) in tokens.enumerated() {
-                lastToken = try decodeStep(session, token: t, permit: permit)
+                if idx + 1 == tokens.count {
+                    session.tokenHistory = naivePromptHistory
+                    session.promptTokenCount = naivePromptHistory.count
+                    let savedCollectLP = activeCollectLogprobs
+                    activeCollectLogprobs = true
+                    defer { activeCollectLogprobs = savedCollectLP }
+                    lastToken = try decodeStep(session, token: t, permit: permit)
+                } else {
+                    lastToken = try decodeStep(session, token: t, permit: permit)
+                }
                 if (idx + 1) % 32 == 0 || idx + 1 == tokens.count {
                     emitPrefillProgress(session, done: idx + 1, promptCount: tokens.count)
                 }
@@ -310,7 +332,7 @@ extension QWEngineDriver {
                 offset += count
                 emitPrefillProgress(session, done: offset, promptCount: tokens.count)
             }
-            if prefillScratchEviction.shouldEvict(wiredEngineBytes: arena.committedBytes) {
+            if evictScratchOnCompletion, prefillScratchEviction.shouldEvict(wiredEngineBytes: arena.committedBytes) {
                 evictPrefillScratch()
             }
             return lastToken

@@ -8,6 +8,21 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.27.2] - 2026-11-19
+
+What's changed since `v0.27.1`: fixed persistent multi-turn generation failures, thinking-budget overflows, degenerate repetition loops under WebUI/API sampling overrides (`repetition_penalty > 1.0`, `temperature > 0`), and stochastic speculative speed regressions across dense, looped, MoE, and Flash-Next architectures.
+
+### Fixed
+- **Multi-Turn Prefix Cache & Stochastic Token History Hygiene (`PrefixCache`, `DriverPrefill`, `DriverDecode`, `DriverBatchDecode`, `EngineSession`, `QWEngineSessionState`, `FNGPUEngine+Seam`, `FNGPUSession`)**:
+  - Restored live prefill head-logit writes (`runsHead == true`) and multi-checkpoint prefix retention on prompt boundaries so Turn 2+ prefix cache hits resume cleanly from the exact KV/recurrent frontier across `QWEngineDriver` and `QWFlashNext`.
+  - Fixed prefill/decode `tokenHistory` and `tokenRecycler` corruption during stochastic runs where greedy `argmax` tokens were previously recorded alongside (or instead of) sampled tokens, corrupting constrained decoding, `.ngram` drafting, and repetition penalties on subsequent turns.
+  - Scoped `repetition_penalty` strictly to the trailing 64 generated tokens (`promptTokenCount`, `EngineSession.activeRepetitionHistory`, `FNGPUSessionData.recentGeneratedTokens`) so repeated tokens in long system/tool prompts or earlier conversation turns no longer suppress valid output tokens (including `</think>` or `</ernie:think>`).
+- **Consecutive-Cycle `loopRepetitionTokens` Predicate (`QWSampler+Distribution`, `FNGPUSession`)**:
+  - Replaced blanket full-history / non-consecutive bigram repetition checks—which penalized valid recurring digits (`102` → `10`), math operators, and stop tokens under strong penalties (`repetition_penalty = 1.5`)—with a loop-targeted detector matching consecutive periodic cycles (`4×` period-1, `3×` period-2, `2×` period-`3..16`) or dense bursts (`≥6×` within the trailing 16 generated tokens).
+- **Graduated Thinking Budgets & Stochastic Speculative Decoding (`QWServerSchema`, `QWEngineDriverConformance`, `MTPVerification+Rounds`, `MTPVerification+Hybrid`, `FNGPUDFlash`, `chat-presets.js`)**:
+  - Wired `reasoning.effort` (`low` → `256`, `medium` → `1024`, `high` → `4096`, `xhigh` → `8192` reasoning tokens) into `resolvedThinkingPolicy` so reasoning traces reliably close within budget across all effort levels.
+  - Enabled speculative decoding (`DSpine`, `DFlash 2`, `.ngram`, and speculatable constraints such as `QWThinkingBudgetConstraint` and `QWToolCallConstraint`) with adaptive `DFlash`/`MTP` drafting under stochastic sampling, disabled unsafe greedy-only fast-accept shortcuts when `repetition_penalty != 1.0`, and cleared stale `maxTokens` session overrides when switching WebUI chat presets.
+
 ## [0.27.1] - 2026-11-18
 
 What's changed since `v0.27.0`: quantized, qualified, and published **`Apex-35B-V1.0`** (`qwegnai/Apex-35B-V1.0-hq4g32`, `22.18 GiB` `HQ4_G32_M5` + `963.6 KiB` `QLSA0001` sidecar, dynamic `<think>` + AMX vision) from short context up to `1M` (`1,048,576`) tokens with **`6,416 tok/s`** prefill, **`213.8 tok/s`** speculative decode, **`9.79×` prefill / `3.16×` decode** LSA speedup over dense attention `@256K`, **`5,491 / 100.9 tok/s` `@1M`** (`3/3` needles across `64K–1M`), **`295/295 (100%)`** API conformance, **`100%`** engine fidelity, and **`0` steady-state allocations**.

@@ -120,7 +120,11 @@ public struct FNGPUSessionData {
     public var lastStepGPUMillis: Double
     /// Tokens committed per speculative verification round in this session.
     public var roundTokenCounts: [Int]
-    /// Unique valid token IDs seen in `history` so far, maintained incrementally
+    /// Window size (trailing generated tokens) used for repetition-penalty tracking.
+    public static let repetitionPenaltyWindow = 64
+    /// Trailing generated token IDs used to populate `seenTokens` and `seenTokenList`.
+    public var recentGeneratedTokens: [Int]
+    /// Unique valid token IDs seen in recent generated tokens, maintained incrementally
     /// so repetition-penalty sampling is O(unique) instead of O(history.count) per step.
     public var seenTokens: Set<Int>
     /// Deterministic insertion-ordered unique token IDs matching `seenTokens`
@@ -214,6 +218,7 @@ public struct FNGPUSessionData {
         stepMs = 0
         lastStepGPUMillis = 0
         roundTokenCounts = []
+        recentGeneratedTokens = []
         seenTokens = []
         seenTokenList = []
         specProposals = 0
@@ -248,11 +253,20 @@ public struct FNGPUSessionData {
     /// The number of tokens the session has consumed.
     public var activeTokens: Int { history.count }
 
-    /// Records a token into `seenTokens` and `seenTokenList` if in-bounds and unseen.
+    /// Identifies active repetition-loop tokens in a trailing generated window.
+    public static func loopRepetitionTokens(in window: [Int]) -> [Int] {
+        QWSampler.loopRepetitionTokens(in: window)
+    }
+
+    /// Records a generated token in the trailing `repetitionPenaltyWindow` and refreshes active loop tokens.
     public mutating func recordSeenToken(_ token: Int, vocab: Int) {
-        if token >= 0 && token < vocab, seenTokens.insert(token).inserted {
-            seenTokenList.append(token)
+        guard token >= 0, token < vocab else { return }
+        recentGeneratedTokens.append(token)
+        if recentGeneratedTokens.count > Self.repetitionPenaltyWindow {
+            recentGeneratedTokens.removeFirst(recentGeneratedTokens.count - Self.repetitionPenaltyWindow)
         }
+        seenTokenList = Self.loopRepetitionTokens(in: recentGeneratedTokens)
+        seenTokens = Set(seenTokenList)
     }
 }
 
@@ -532,10 +546,11 @@ extension FNGPUEngine {
         session.specProposals += dCount
         var tok0 = 0
         var accepted = 0
+        let boundaryTok = session.constraint?.speculationBoundaryToken
         for r in 0..<dCount {
             let draftTok = drafts[r]
             let sampled: Int
-            if v[r] == draftTok && (session.constraint?.isUnconstrainedNow ?? true) {
+            if v[r] == draftTok && session.sampler.config.isGreedy && !trackRep && (session.constraint?.isUnconstrainedNow ?? true) {
                 try session.constraint?.accept(draftTok)
                 sampled = draftTok
             } else {
@@ -549,7 +564,8 @@ extension FNGPUEngine {
             } else {
                 session.pendingTokens.append(sampled)
             }
-            if sampled == draftTok && v[r] == draftTok {
+            let hitBoundary = (boundaryTok != nil && sampled == boundaryTok) || !(session.constraint?.isUnconstrainedNow ?? true)
+            if sampled == draftTok && v[r] == draftTok && !hitBoundary {
                 accepted += 1
                 if trackRep { session.recordSeenToken(draftTok, vocab: vocab) }
             } else {

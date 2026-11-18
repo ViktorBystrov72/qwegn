@@ -19,7 +19,9 @@ import QWQuant
 
 /// THE PER-LAYER STATE LAW (C23 fix — the single-slot version conflated
 public final class QWEngineSession: @unchecked Sendable {
+    public static let repetitionPenaltyWindow = 64
     public internal(set) var position: Int = 0        // next token's absolute position
+    public internal(set) var promptTokenCount: Int = 0
     public internal(set) var generated: Int = 0
     public internal(set) var roundRecord: QWRoundRecord
     public var tokenHistory: [Int] = []
@@ -70,5 +72,29 @@ public final class QWEngineSession: @unchecked Sendable {
 
     public func rollback(using driver: QWEngineDriver, to snapshot: QWEngineSessionSnapshot) throws {
         try driver.rollbackSession(self, to: snapshot)
+    }
+
+    /// Identifies active repetition-loop tokens in a trailing generated window.
+    public static func loopRepetitionTokens(in window: [Int]) -> [Int] {
+        QWSampler.loopRepetitionTokens(in: window)
+    }
+
+    /// Returns loop-targeted tokens from the trailing `repetitionPenaltyWindow` current-turn generated tokens.
+    public func activeRepetitionHistory(extraTokens: [Int] = []) -> [Int] {
+        let baseStart = min(max(0, promptTokenCount), tokenHistory.count)
+        let generatedCount = (tokenHistory.count - baseStart) + extraTokens.count
+        guard generatedCount >= 2 else { return [] }
+        let dropCount = max(0, generatedCount - Self.repetitionPenaltyWindow)
+        let histStart = min(tokenHistory.count, baseStart + dropCount)
+        let extraStart = max(0, dropCount - (tokenHistory.count - baseStart))
+        var out: [Int] = []
+        out.reserveCapacity(min(generatedCount, Self.repetitionPenaltyWindow))
+        if histStart < tokenHistory.count {
+            out.append(contentsOf: tokenHistory[histStart..<tokenHistory.count])
+        }
+        if extraStart < extraTokens.count {
+            out.append(contentsOf: extraTokens[extraStart..<extraTokens.count])
+        }
+        return Self.loopRepetitionTokens(in: out)
     }
 }

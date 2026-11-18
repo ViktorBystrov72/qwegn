@@ -168,6 +168,7 @@ function applyPresetHarnessToSession(session, presetId) {
   if ("topP" in h) session.params.topP = h.topP;
   if ("topK" in h) session.params.topK = h.topK;
   if ("repetitionPenalty" in h) session.params.repetitionPenalty = h.repetitionPenalty;
+  session.params.maxTokens = ("maxTokens" in h) ? h.maxTokens : null;
   if ("enableThinking" in h) session.params.enableThinking = h.enableThinking;
   if ("reasoningEffort" in h) session.params.reasoningEffort = h.reasoningEffort;
   if ("responseFormat" in h) {
