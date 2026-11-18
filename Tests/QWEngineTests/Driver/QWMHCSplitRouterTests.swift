@@ -36,12 +36,14 @@ final class QWMHCSplitRouterTests: XCTestCase {
 
     private enum Kernel { case fused, split, rows }
 
-    private func run(_ kernel: Kernel, merge: Bool, rows: Int = 3) throws -> Outputs {
-        let geo = try QWWeightAllocationPlanTests.glm53FlashGeometry()
+    private func run(_ kernel: Kernel, merge: Bool, rows: Int = 3,
+                     streams: Int? = nil, geometry: QWModelGeometry? = nil) throws -> Outputs {
+        let activeC = streams ?? c
+        let geo = try geometry ?? QWWeightAllocationPlanTests.glm53FlashGeometry()
         let hal = try QWHal(geometry: geo)
-        let numRows = 2 * c + c * c
-        let numCtrl = c + c * c
-        let width = c * hidden
+        let numRows = 2 * activeC + activeC * activeC
+        let numCtrl = activeC + activeC * activeC
+        let width = activeC * hidden
         let stream = try buffer(hal, (0..<(rows * width)).map { sin(Float($0) * 0.0037) * 0.9 })
         let w = try buffer(hal, (0..<(numRows * width)).map { cos(Float($0) * 0.013) * 0.05 })
         let b = try buffer(hal, (0..<numRows).map { sin(Float($0) * 0.3) * 0.2 })
@@ -49,8 +51,8 @@ final class QWMHCSplitRouterTests: XCTestCase {
         let out = try buffer(hal, f16: [Float](repeating: 0, count: rows * hidden))
         var prev = [Float](repeating: 0, count: rows * numCtrl)
         for t in 0..<rows {
-            for i in 0..<c { prev[t * numCtrl + i] = 0.5 + 0.1 * Float(i) }
-            for m in 0..<(c * c) { prev[t * numCtrl + c + m] = (m % (c + 1) == 0 ? 0.7 : 0.1) }
+            for i in 0..<activeC { prev[t * numCtrl + i] = 0.5 + 0.1 * Float(i) }
+            for m in 0..<(activeC * activeC) { prev[t * numCtrl + activeC + m] = (m % (activeC + 1) == 0 ? 0.7 : 0.1) }
         }
         let ctrl = try buffer(hal, prev)
         let branch = try buffer(hal, f16: (0..<(rows * hidden)).map { cos(Float($0) * 0.021) * 0.5 })
@@ -63,7 +65,7 @@ final class QWMHCSplitRouterTests: XCTestCase {
         let enc = try XCTUnwrap(cb.makeComputeCommandEncoder(dispatchType: .serial))
         if kernel == .split {
             let parts = (hidden + 63) / 64
-            let partials = try XCTUnwrap(hal.device.makeBuffer(length: rows * parts * (numRows + 1 + c * (c + 1) / 2) * 4))
+            let partials = try XCTUnwrap(hal.device.makeBuffer(length: rows * parts * (numRows + 1 + activeC * (activeC + 1) / 2) * 4))
             enc.setComputePipelineState(try hal.pipeline("qwg_mhc_router_partial_f32"))
             enc.setBuffer(stream, offset: 0, index: 0)
             enc.setBuffer(w, offset: 0, index: 1)
@@ -114,6 +116,46 @@ final class QWMHCSplitRouterTests: XCTestCase {
                        ctrl: floats(ctrl, rows * numCtrl))
     }
 
+    private func assertZeroULP(_ a: [Float], _ b: [Float], _ what: String) {
+        XCTAssertEqual(a.count, b.count)
+        for i in 0..<a.count {
+            XCTAssertEqual(a[i].bitPattern, b[i].bitPattern, "\(what) 0-ULP mismatch at \(i): \(a[i]) vs \(b[i])")
+        }
+    }
+
+    private func c2Geometry() throws -> QWModelGeometry {
+        let json = """
+        {
+          "architectures": ["SenseNovaLoopForConditionalGeneration"],
+          "model_type": "sensenova_loop",
+          "loop_settings": { "start": 0, "end": 1, "eval_count": 1, "counts": [1] },
+          "mhc": { "start": 0, "end": 1, "streams": 2, "iterations": 20, "fixed_identity": false, "pre_scale": 1.0 },
+          "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "vocab_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "layer_types": ["linear_attention", "full_attention"],
+            "max_position_embeddings": 8192,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25,
+            "eos_token_id": 2
+          }
+        }
+        """.data(using: .utf8)!
+        return QWModelGeometry(descriptor: try QWModelDescriptor.decode(configJSON: json))
+    }
+
     private func assertClose(_ a: [Float], _ b: [Float], tol: Float, _ what: String) {
         XCTAssertEqual(a.count, b.count)
         var worst: Float = 0
@@ -144,6 +186,23 @@ final class QWMHCSplitRouterTests: XCTestCase {
             assertClose(multi.stream, fused.stream, tol: 0, "stream merge=\(merge)")
             assertClose(multi.ctrl, fused.ctrl, tol: 1e-5, "ctrl merge=\(merge)")
             assertClose(multi.norm, fused.norm, tol: 1e-3, "norm merge=\(merge)")
+        }
+    }
+
+    func testC2SplitAndRowsMatchFusedZeroULP() throws {
+        let geo = try c2Geometry()
+        for merge in [false, true] {
+            let fused7 = try run(.fused, merge: merge, rows: 7, streams: 2, geometry: geo)
+            let multi7 = try run(.rows, merge: merge, rows: 7, streams: 2, geometry: geo)
+            assertZeroULP(multi7.stream, fused7.stream, "c2 rows stream merge=\(merge)")
+            assertZeroULP(multi7.ctrl, fused7.ctrl, "c2 rows ctrl merge=\(merge)")
+            assertZeroULP(multi7.norm, fused7.norm, "c2 rows norm merge=\(merge)")
+
+            let fused3 = try run(.fused, merge: merge, rows: 3, streams: 2, geometry: geo)
+            let split3 = try run(.split, merge: merge, rows: 3, streams: 2, geometry: geo)
+            assertClose(split3.stream, fused3.stream, tol: 1e-6, "c2 split stream merge=\(merge)")
+            assertClose(split3.ctrl, fused3.ctrl, tol: 1e-4, "c2 split ctrl merge=\(merge)")
+            assertClose(split3.norm, fused3.norm, tol: 1e-3, "c2 split norm merge=\(merge)")
         }
     }
 }

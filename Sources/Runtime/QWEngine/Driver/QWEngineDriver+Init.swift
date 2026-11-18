@@ -46,6 +46,7 @@ extension QWEngineDriver {
         let psoRMSNormResidualMoEWide: any MTLComputePipelineState
         let psoHeadF16: any MTLComputePipelineState
         let psoGemmBatchedH16: any MTLComputePipelineState
+        let psoGemmBatchedH16SwiGLU: any MTLComputePipelineState
         let psoGemmBatchedH16GdnInProj: any MTLComputePipelineState
         let psoSiluMulF16: any MTLComputePipelineState
         let psoKVPagedWrite: any MTLComputePipelineState
@@ -157,11 +158,15 @@ extension QWEngineDriver {
         } else {
             hasMTPWeights = false
         }
-        let mtpDrafts = (cfg.mtpBackend == .dflash2 || hasMTPWeights) ? requestedMTPDrafts : 0
+        let resolvedDraftStrategy = (try? QWDraftStrategy.resolve(cfg.mtpDraftStrategy)) ?? .hybrid
+        let allowWeightFreeMTP = !hasMTPWeights && cfg.mtpBackend != .dflash2 && resolvedDraftStrategy == .ngram
+        let mtpDrafts = (cfg.mtpBackend == .dflash2 || hasMTPWeights)
+            ? requestedMTPDrafts
+            : (allowWeightFreeMTP ? min(requestedMTPDrafts, 7) : 0)
         let mtpWeightDrafts = (cfg.mtpBackend == .dflash2) ? 0 : (hasMTPWeights ? mtpDrafts : 0)
         try Self.validateGeometry(rawGeometry, kvMode: kvMode)
         let choice = try Self.weightFormatChoice(for: root, quantization: rawGeometry.descriptor.quantization,
-                                                 geometry: rawGeometry, mtpDrafts: mtpDrafts, pack: pack)
+                                                 geometry: rawGeometry, mtpDrafts: mtpWeightDrafts, pack: pack)
         let prelimHal = try QWHal(geometry: rawGeometry, weightBasis: choice.format.basis)
         let clampedChunk = max(32, min(QWPrefillLimits.maxRows, (prefillChunkSize / 32) * 32))
         let (geometry, plannedChunk) = (explicitResE != nil || rawGeometry.numExperts == 0)
@@ -194,6 +199,7 @@ extension QWEngineDriver {
         let psoRMSNormResidualMoEWide = try hal.pipeline("qwg_rmsnorm_residual_moe_wide")
         let psoHeadF16 = try hal.pipeline("qwg_gemv_f16_v4")
         let psoGemmBatchedH16 = try hal.pipeline(Self.gemmKernelName(format: weightFormat, bm128: false))
+        let psoGemmBatchedH16SwiGLU = try hal.pipeline(Self.swigluGemmKernelName(format: weightFormat))
         let psoGemmBatchedH16GdnInProj = try hal.pipeline(Self.gdnInProjPrefillKernelName(format: weightFormat))
         let psoSiluMulF16 = try hal.pipeline("qwg_silu_mul_f16")
         let psoKVPagedWrite = try hal.pipeline("qwg_kv_paged_write")
@@ -226,6 +232,7 @@ extension QWEngineDriver {
             psoRMSNormResidualMoEWide: psoRMSNormResidualMoEWide,
             psoHeadF16: psoHeadF16,
             psoGemmBatchedH16: psoGemmBatchedH16,
+            psoGemmBatchedH16SwiGLU: psoGemmBatchedH16SwiGLU,
             psoGemmBatchedH16GdnInProj: psoGemmBatchedH16GdnInProj,
             psoSiluMulF16: psoSiluMulF16, psoKVPagedWrite: psoKVPagedWrite,
             psoKVPagedWriteGeneral: psoKVPagedWriteGeneral, psoZeroPadAttn: psoZeroPadAttn,
@@ -255,10 +262,11 @@ extension QWEngineDriver {
         let slotBytes = gdnLayerCount * (recB + ringB)
         let trunkHidBytes = geometry.usesMultiStreamMTPHidden
             ? geometry.mhcConfig!.streams * geometry.hidden * 4 : geometry.hidden * 2
-        let gdnBytes = slotCount * slotBytes + Self.partialsScratchBytes(geometry: geometry, mtpDrafts: mtpDrafts, maxTokens: maxTokens)
+        let needsMTPCache = (mtpWeightDrafts > 0 || cfg.mtpBackend == .dflash2) && mtpDrafts > 0
+        let gdnBytes = slotCount * slotBytes + Self.partialsScratchBytes(geometry: geometry, mtpDrafts: mtpWeightDrafts > 0 ? mtpDrafts : 0, maxTokens: maxTokens)
             + (mtpDrafts > 0 ? QWGDNReplayCheckpoint.allocationBytes(geometry: geometry, layers: gdnLayerCount, rows: mtpDrafts + 1) : 0)
             + (mtpDrafts > 0 ? slotCount * trunkHidBytes : 0) + (1 << 20)
-        let activeAttnLayers = attnLayerCount + (mtpDrafts > 0 ? 1 : 0)
+        let activeAttnLayers = attnLayerCount + (needsMTPCache ? 1 : 0)
         let mlaPerTokBytes: Int
         if geometry.usesNoPEMLA {
             mlaPerTokBytes = activeAttnLayers * ((geometry.indexerHeadDim * 2) / 4)
@@ -275,7 +283,7 @@ extension QWEngineDriver {
         let extraFixedBytes = mlaFixedBytes
             + Self.hcaFixedScratchBytes(geometry: geometry, prefillChunkRows: prefillChunkSize)
             + Self.mbsaFixedScratchBytes(geometry: geometry, prefillChunkRows: prefillChunkSize, attnLayerCount: attnLayerCount)
-            + (mtpDrafts > 0 && (geometry.mtpSharedLastLayer || geometry.hasDedicatedMHCMTP) ? (112 << 20) : 0)
+            + (mtpWeightDrafts > 0 && (geometry.mtpSharedLastLayer || geometry.hasDedicatedMHCMTP) ? (112 << 20) : 0)
         let perTokBytes = 2 * activeAttnLayers * (QWKVCache.pageBytes(mode: kvMode, geometry: geometry) / QWKVCache.pageTokens)
             + mlaPerTokBytes + hcaPerTokBytes + mbsaPerTokBytes
         let maxMTP = cfg.mtpBackend == .dflash2 ? 15 : 7
@@ -303,7 +311,9 @@ extension QWEngineDriver {
                                                     headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP, format: weightFormat)
         let weightsBytes = weightPlan.bytes
         let trunkKVBytes = Self.kvBudgetBytes(maxTokens: effectiveMaxTokens, mtpDrafts: 0, kvMode: kvMode, geometry: geometry)
-        let mtpKVBytes = Self.kvBudgetBytes(maxTokens: effectiveMaxTokens, mtpDrafts: mtpDrafts, kvMode: kvMode, geometry: geometry) - trunkKVBytes
+        let mtpKVBytes = needsMTPCache
+            ? (Self.kvBudgetBytes(maxTokens: effectiveMaxTokens, mtpDrafts: mtpDrafts, kvMode: kvMode, geometry: geometry) - trunkKVBytes)
+            : 0
         let kvBytes = trunkKVBytes + mtpKVBytes
         let fixedBytes = weightsBytes + actBytes + gdnBytes + extraFixedBytes
         let capPlan = try QWCapacityPlan.plan(
@@ -331,13 +341,13 @@ extension QWEngineDriver {
     static func loadEmbeddingsAndHead(
         loader L: inout WeightLoader, pack: QWQuant.Pack?, stContainer: QWSafeTensorsContainer?,
         packPath: String, hal: QWHal, geometry: QWModelGeometry, cfg: StartupConfig,
-        mtpDrafts: Int, budget: ArenaBudgetPlan
+        mtpDrafts: Int, hasMTPDrafter: Bool, budget: ArenaBudgetPlan
     ) throws -> EmbeddingAndHeadSetup {
         let embedName = L.resolveName(Self.P + "embed_tokens.weight")
         let embedBytes = geometry.vocab * geometry.hidden * 2
         let devEmbedEnv = cfg.environment["QW_MTP_DEVICE_EMBEDDING"] ?? cfg.environment["QW_MTP_DEVICE_EMBED"]
         let fixedBytes = budget.fixedBytes
-        let allowDeviceEmbed = devEmbedEnv != "0" && mtpDrafts > 0 && (
+        let allowDeviceEmbed = devEmbedEnv != "0" && hasMTPDrafter && mtpDrafts > 0 && (
             devEmbedEnv == "1"
             || (geometry.effectiveResidentExperts == geometry.numExperts
                 && fixedBytes + budget.trunkKVBytes + budget.mtpKVBytes + embedBytes + (1 << 30) <= budget.availBytes)
@@ -451,7 +461,7 @@ extension QWEngineDriver {
         }
         _ = try hal.pipeline("qwg_head_q4g_rp_m4", isAQ4: headAQ4)
         guard !hasMLA && geometry.hcaConfig == nil && geometry.hybridMLAConfig == nil
-                && geometry.mhcConfig == nil else {
+                && geometry.blockSparseGQAConfig == nil else {
             return
         }
         for m in 2...4 {
@@ -555,7 +565,7 @@ extension QWEngineDriver {
         let headAQ4 = (hal.weightBasis == .standard) || (layersW.first.map { !$0.gu.view.isIncumbentContainer } ?? false)
         try Self.prewarmBatchedDecodePipelines(hal: hal, geometry: geometry, layersW: layersW,
                                                headAQ4: headAQ4, hasMLA: mlaOperator != nil)
-        guard mtpDrafts > 0 && (mtpWeights != nil || echoWeights != nil || dflashDrafter != nil) else {
+        guard mtpDrafts > 0 else {
             return MTPVerificationResources(
                 gdnReplayCheckpoint: nil, verifyWindow: nil, mtpBatchedMLP: nil,
                 mtpBatchedTrunk: nil, mtpSharedAttentionPartials: nil, mtpScratch: nil,
@@ -580,13 +590,20 @@ extension QWEngineDriver {
             mtpSharedAttentionPartials = nil
         }
         _ = try hal.pipeline("qwg_mtp_argmax_target_checked")
+        let needsNeuralScratch = mtpWeights != nil || echoWeights != nil
         let partials = QWMRegion(buffer: gsub.region.buffer, base: gsub.region.base + mtpPartialsOff, length: pCarveBytes)
-        let mtpScratch = try MTPScratch(geometry: geometry, allocator: asub, partials: partials)
-        let mtpPromptEmbeddings = try asub.allocate(QWTensorShape([maxT * geometry.hidden], .f16))
-        let mtpDraftEncoder = try mtpWeights.map {
-            try QWMTPDraftEncoder(geometry: geometry, hal: hal, weights: $0, scratch: mtpScratch,
-                                  rope: ropeApply, ropeRows: effectiveRopeRows, kvMode: kvMode,
-                                  mlaOperator: mlaOperator, mlaLayerIndex: attnLayers.count)
+        let mtpScratch = needsNeuralScratch
+            ? try MTPScratch(geometry: geometry, allocator: asub, partials: partials)
+            : nil
+        let mtpPromptEmbeddings = (needsNeuralScratch || dflashDrafter != nil)
+            ? try asub.allocate(QWTensorShape([maxT * geometry.hidden], .f16))
+            : nil
+        let mtpDraftEncoder: QWMTPDraftEncoder? = try mtpWeights.flatMap { w in
+            try mtpScratch.map { scratch in
+                try QWMTPDraftEncoder(geometry: geometry, hal: hal, weights: w, scratch: scratch,
+                                      rope: ropeApply, ropeRows: effectiveRopeRows, kvMode: kvMode,
+                                      mlaOperator: mlaOperator, mlaLayerIndex: attnLayers.count)
+            }
         }
         let echoDrafter: QWEchoDraftEncoder?
         if let ew = echoWeights, let draftLayer = ew.dedicatedLayer ?? layersW.last,

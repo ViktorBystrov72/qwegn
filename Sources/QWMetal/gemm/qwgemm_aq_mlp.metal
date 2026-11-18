@@ -23,6 +23,7 @@ template <int BITS, int GROUP>
 static inline QWAQSiluPair qwg_aq_silu_pair_rows4(device const char* blocks,
                                                   device const half* x,
                                                   uint r0, uint I, uint K, uint lane) {
+#pragma clang fp contract(off) reassociate(off)
     const uint nBlocks = K >> 5u;
     const uint groupBytes = GROUP * BITS / 8 + 4u;
     const uint rowBytes = (K / GROUP) * groupBytes;
@@ -75,6 +76,7 @@ static inline void qwg_aq_silu_pair_rows4_m(device const char* blocks,
                                             uint I, uint K, uint mRows,
                                             bool fuseFwht,
                                             uint tg, uint sgi, uint lane) {
+#pragma clang fp contract(off) reassociate(off)
     const uint rBase = tg * 32u;
     const uint r0 = rBase + sgi * 4u;
     if (r0 < I) {
@@ -204,6 +206,7 @@ template <int BITS, int GROUP>
 static inline float2 qwg_aq_silu_pair_row1(device const char* blocks,
                                            device const half* x,
                                            uint row, uint I, uint K, uint lane) {
+#pragma clang fp contract(off) reassociate(off)
     const uint nBlocks = K >> 5u;
     const uint groupBytes = GROUP * BITS / 8 + 4u;
     const uint rowBytes = (K / GROUP) * groupBytes;

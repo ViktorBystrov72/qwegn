@@ -1,0 +1,190 @@
+// qw_gemm_nax_swiglu.metalh — Paired-tile NAX gate_up + SwiGLU + FWHT-32 fused epilogue.
+// Computes out = FWHT32(silu(x @ W_gate^T) * (x @ W_up^T)) directly in threadgroup SRAM.
+
+#pragma once
+#include "qw_gemm_nax.metalh"
+#include "qw_weight_basis.metalh"
+
+template <bool ALIGNED_M, int SM, int TM, int TN, int TK, int SK,
+          int AQ_BITS, int AQ_GROUP, bool IS_SHVQ, bool HAS_SHVQ_TG_LUT>
+METAL_FUNC void qmm_t_nax_swiglu_kloop(
+    const device char* w,
+    const device half* x,
+    int K,
+    int xStride,
+    int w_row_base,
+    short sgp_sm,
+    short2 sc,
+    thread NAXTile<float, TM, TN>& Dtile,
+    threadgroup const ushort4* shvqLut16) {
+  const ushort w_sub = ushort(sc.x >> 3);
+  const ushort shift = ushort((sc.x & 4) << 1);
+  const int K_g = K / 32;
+  const device Block_HQ4_G32* w_tile =
+      (AQ_BITS == 0) ? ((const device Block_HQ4_G32*)w + static_cast<int64_t>(w_row_base) * K_g) : nullptr;
+  constexpr uint aqGroupBytes = AQ_BITS > 0
+      ? (IS_SHVQ ? qwg_shvq_group_bytes(AQ_BITS, AQ_GROUP) : (uint(AQ_GROUP * AQ_BITS / 8) + 4u))
+      : 0u;
+  const uint aqRowBytes = AQ_BITS > 0 ? uint(K / AQ_GROUP) * aqGroupBytes : 0u;
+  const device char* w_aq_tile =
+      (AQ_BITS > 0) ? (w + static_cast<int64_t>(w_row_base) * aqRowBytes) : nullptr;
+
+  STEEL_PRAGMA_NO_UNROLL
+  for (int k = 0; k < K; k += SK) {
+    NAXTile<half, TM, TK> Atile;
+    NAXTile<half, TN, TK> Btile;
+    if constexpr (ALIGNED_M) {
+      Atile.load(x, xStride);
+    } else {
+      Atile.load_safe(x, xStride, short2(SK, sgp_sm));
+    }
+
+    const uint aqGroupIndex = AQ_BITS > 0 ? (uint(k) / uint(AQ_GROUP)) : 0u;
+    const uint aqColInGroup = AQ_BITS > 0 ? ((uint(k) & uint(AQ_GROUP - 1)) + uint(sc.x)) : 0u;
+    const uint aqBitInGroup = aqColInGroup * uint(AQ_BITS);
+    const device char* aqGroupBase = AQ_BITS > 0
+        ? (w_aq_tile + static_cast<int64_t>(aqGroupIndex) * aqGroupBytes)
+        : nullptr;
+
+    const_for_loop<0, TN, 1>([&](auto idx_row) {
+      thread auto& f0 = Btile.template frag_at<idx_row.value, 0>();
+      thread auto& f1 = Btile.template frag_at<idx_row.value, 1>();
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < 2; ++i) {
+        const int r_tile = idx_row.value * 16 + int(sc.y) + int(i) * 8;
+        if constexpr (AQ_BITS == 0) {
+          const device Block_HQ4_G32& blk = w_tile[r_tile * K_g];
+          const half2 dm = *(const device half2*)(&blk);
+          const half2 s2 = half2(dm.x);
+          const half2 b2 = half2(dm.y);
+          const ushort2 raw0 = as_type<ushort2>(blk.qs[w_sub]) >> shift;
+          const ushort2 raw1 = as_type<ushort2>(blk.qs[2u + w_sub]) >> shift;
+          const half2 w01 = fma(as_type<half2>((raw0 & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
+          const half2 w23 = fma(as_type<half2>(((raw0 >> 4) & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
+          const half2 w45 = fma(as_type<half2>((raw1 & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
+          const half2 w67 = fma(as_type<half2>(((raw1 >> 4) & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
+          f0[i * 4 + 0] = w01.x; f0[i * 4 + 1] = w01.y;
+          f0[i * 4 + 2] = w23.x; f0[i * 4 + 3] = w23.y;
+          f1[i * 4 + 0] = w45.x; f1[i * 4 + 1] = w45.y;
+          f1[i * 4 + 2] = w67.x; f1[i * 4 + 3] = w67.y;
+        } else {
+          const device char* gp = aqGroupBase + static_cast<int64_t>(r_tile) * aqRowBytes;
+          half4 lo, hi;
+          if constexpr (IS_SHVQ) {
+            qwg_shvq_frag8_tg<AQ_BITS, AQ_BITS == 4 || AQ_BITS == 15, HAS_SHVQ_TG_LUT>(
+                gp, aqColInGroup, shvqLut16, lo, hi);
+          } else {
+            (void)shvqLut16;
+            qwg_aq_frag8<AQ_BITS>(gp, aqBitInGroup, lo, hi);
+          }
+          f0[i * 4 + 0] = lo.x; f0[i * 4 + 1] = lo.y;
+          f0[i * 4 + 2] = lo.z; f0[i * 4 + 3] = lo.w;
+          f1[i * 4 + 0] = hi.x; f1[i * 4 + 1] = hi.y;
+          f1[i * 4 + 2] = hi.z; f1[i * 4 + 3] = hi.w;
+        }
+      }
+    });
+
+    tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
+    x += SK;
+    if constexpr (AQ_BITS == 0) { w_tile += 1; }
+  }
+}
+
+METAL_FUNC void qwg_swiglu_store_row8(threadgroup const half* tgGateRow,
+                                      threadgroup const half* tgUpRow,
+                                      device half* outRow,
+                                      uint col0,
+                                      uint uI,
+                                      uint simd_lid) {
+  const half4 g0 = *(threadgroup const half4*)(tgGateRow + col0);
+  const half4 g1 = *(threadgroup const half4*)(tgGateRow + col0 + 4u);
+  const half4 u0 = *(threadgroup const half4*)(tgUpRow + col0);
+  const half4 u1 = *(threadgroup const half4*)(tgUpRow + col0 + 4u);
+  half ov[8] = {
+    half(qwg_swiglu_mul(float(g0[0]), float(u0[0]))),
+    half(qwg_swiglu_mul(float(g0[1]), float(u0[1]))),
+    half(qwg_swiglu_mul(float(g0[2]), float(u0[2]))),
+    half(qwg_swiglu_mul(float(g0[3]), float(u0[3]))),
+    half(qwg_swiglu_mul(float(g1[0]), float(u1[0]))),
+    half(qwg_swiglu_mul(float(g1[1]), float(u1[1]))),
+    half(qwg_swiglu_mul(float(g1[2]), float(u1[2]))),
+    half(qwg_swiglu_mul(float(g1[3]), float(u1[3])))
+  };
+  if ((uI & 31u) == 0u) {
+    fwht32_inplace(ov, simd_lid);
+  }
+  device half4* op = (device half4*)(outRow + col0);
+  op[0] = half4(ov[0], ov[1], ov[2], ov[3]);
+  op[1] = half4(ov[4], ov[5], ov[6], ov[7]);
+}
+
+template <int BM, int BN_OUT, int WM, int WN,
+          int AQ_BITS = 0, int AQ_GROUP = 0,
+          bool IS_SHVQ = false, bool HAS_SHVQ_TG_LUT = false>
+METAL_FUNC void qmm_t_nax_swiglu_impl(
+    const device char* w,
+    const device half* x,
+    device half* out,
+    int K,
+    int I,
+    int M,
+    int xStride,
+    int yStride,
+    uint3 tid,
+    uint lid,
+    uint simd_gid,
+    uint simd_lid,
+    threadgroup half* tgGU,
+    threadgroup const ushort4* shvqLut16 = nullptr) {
+  constexpr short SM = BM / WM;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = 2;
+  constexpr short TK = SK / 16;
+
+  const int y_row = int(tid.y) * BM;
+  const int y_col = int(tid.x) * BN_OUT;
+  const int isUp = (BN_OUT == 64) ? (int(simd_gid) >> 1) : (int(simd_gid) & 1);
+  const int wm = (BN_OUT == 64) ? 0 : (int(simd_gid) >> 1);
+  const int sub = (BN_OUT == 64) ? ((int(simd_gid) & 1) * 32) : 0;
+  const short tm = SM * short(wm);
+  const int w_row_base = (isUp != 0 ? I : 0) + y_col + sub;
+  threadgroup half* tgDst = tgGU + (isUp * BM + int(tm)) * BN_OUT + sub;
+
+  const short sgp_sm = short(min(int(SM), max(0, M - (y_row + int(tm)))));
+  if (sgp_sm > 0) {
+    NAXTile<float, TM, TN> Dtile;
+    Dtile.clear();
+    const device half* xSG = x + static_cast<int64_t>(y_row + int(tm)) * static_cast<int64_t>(xStride);
+    const short2 sc = BaseNAXFrag::get_coord();
+    if (sgp_sm == SM) {
+      qmm_t_nax_swiglu_kloop<true, SM, TM, TN, TK, SK, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_SHVQ_TG_LUT>(
+          w, xSG, K, xStride, w_row_base, sgp_sm, sc, Dtile, shvqLut16);
+    } else {
+      qmm_t_nax_swiglu_kloop<false, SM, TM, TN, TK, SK, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_SHVQ_TG_LUT>(
+          w, xSG, K, xStride, w_row_base, sgp_sm, sc, Dtile, shvqLut16);
+    }
+    Dtile.template store<half, BN_OUT, 1>(tgDst);
+  }
+  // Barrier must execute across all 128 threads even when bottom simdgroups have sgp_sm <= 0.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const int actualM = min(BM, max(0, M - y_row));
+  threadgroup const half* tgGate = tgGU;
+  threadgroup const half* tgUp = tgGU + BM * BN_OUT;
+  if constexpr (BN_OUT == 64) {
+    const uint col0 = (lid & 7u) * 8u;
+    const int rr = int(lid >> 3u);
+    if (rr < actualM) {
+      device half* outRow = out + static_cast<int64_t>(y_row + rr) * static_cast<int64_t>(yStride) + y_col;
+      qwg_swiglu_store_row8(tgGate + rr * 64, tgUp + rr * 64, outRow, col0, uint(I), simd_lid);
+    }
+  } else {
+    const uint col0 = (lid & 3u) * 8u;
+    for (int rr = int(lid >> 2u); rr < actualM; rr += 32) {
+      device half* outRow = out + static_cast<int64_t>(y_row + rr) * static_cast<int64_t>(yStride) + y_col;
+      qwg_swiglu_store_row8(tgGate + rr * 32, tgUp + rr * 32, outRow, col0, uint(I), simd_lid);
+    }
+  }
+}

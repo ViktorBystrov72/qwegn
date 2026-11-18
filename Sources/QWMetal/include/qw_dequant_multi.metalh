@@ -82,8 +82,12 @@ METAL_FUNC float qwg_aq_gemv_row_f32(device const char* blocks, device const flo
 /// Sums 32 half activations (4x lo + 4x hi) in fp32 once per 32-column block.
 METAL_FUNC float qwg_aq_sum32(thread const half4 (&lo)[4],
                               thread const half4 (&hi)[4]) {
-    float4 s = (float4(lo[0]) + float4(hi[0])) + (float4(lo[1]) + float4(hi[1]))
-             + (float4(lo[2]) + float4(hi[2])) + (float4(lo[3]) + float4(hi[3]));
+#pragma clang fp contract(off) reassociate(off)
+    const float4 p0 = float4(lo[0]) + float4(hi[0]);
+    const float4 p1 = float4(lo[1]) + float4(hi[1]);
+    const float4 p2 = float4(lo[2]) + float4(hi[2]);
+    const float4 p3 = float4(lo[3]) + float4(hi[3]);
+    const float4 s = ((p0 + p1) + p2) + p3;
     return (s.x + s.y) + (s.z + s.w);
 }
 
@@ -142,6 +146,7 @@ METAL_FUNC void qwg_aq_accum_pair8(ushort2 raw,
                                    thread const Vec4 &hi,
                                    thread float &acc0,
                                    thread float &acc1) {
+#pragma clang fp contract(off) reassociate(off)
     const half2 c0 = as_type<half2>((raw & ushort2(MASK)) | ushort2(0x6400u));
     const half2 c1 = as_type<half2>(((raw >> SHIFT) & ushort2(MASK)) | ushort2(0x6400u));
     const half2 c2 = as_type<half2>(((raw >> (2u * SHIFT)) & ushort2(MASK)) | ushort2(0x6400u));
@@ -164,6 +169,7 @@ METAL_FUNC float qwg_aq_slice_dot(device const char* gp,
                                   thread const Vec4 (&lo)[4],
                                   thread const Vec4 (&hi)[4],
                                   float sumX) {
+#pragma clang fp contract(off) reassociate(off)
     const half2 sb = *(device const half2*)gp;
     device const uint* pw = (device const uint*)(gp + 4 + byteInGroup);
     float acc0 = 0.0f;
@@ -251,7 +257,10 @@ METAL_FUNC float qwg_aq_slice_dot(device const char* gp,
             acc1 = fma(float(cHiYW.y), float(hi[w].w), acc1);
         }
     }
-    return fma(fma(-1024.0f, sumX, acc0 + acc1), float(sb.x), float(sb.y) * sumX);
+    const float raw = acc0 + acc1;
+    const float unscaled = fma(-1024.0f, sumX, raw);
+    const float biasTerm = float(sb.y) * sumX;
+    return fma(unscaled, float(sb.x), biasTerm);
 }
 
 template <typename Vec4>
@@ -259,6 +268,7 @@ METAL_FUNC void qwg_aq_accum_pair8_2bit_2(ushort2 raw,
                                           thread const Vec4 &lo0, thread const Vec4 &hi0,
                                           thread const Vec4 &lo1, thread const Vec4 &hi1,
                                           thread float2 &acc0, thread float2 &acc1) {
+#pragma clang fp contract(off) reassociate(off)
     const half2 kBias = half2(-1024.0h);
     const half2 c0 = as_type<half2>((raw & ushort2(0x0003u)) | ushort2(0x6400u)) + kBias;
     const half2 c1 = as_type<half2>((raw & ushort2(0x000Cu)) | ushort2(0x6400u)) + kBias;
@@ -279,6 +289,7 @@ METAL_FUNC void qwg_aq_accum_pair8_2(ushort2 raw,
                                      thread const Vec4 &lo0, thread const Vec4 &hi0,
                                      thread const Vec4 &lo1, thread const Vec4 &hi1,
                                      thread float2 &acc0, thread float2 &acc1) {
+#pragma clang fp contract(off) reassociate(off)
     const half2 c0 = as_type<half2>((raw & ushort2(MASK)) | ushort2(0x6400u));
     const half2 c1 = as_type<half2>(((raw >> SHIFT) & ushort2(MASK)) | ushort2(0x6400u));
     const half2 c2 = as_type<half2>(((raw >> (2u * SHIFT)) & ushort2(MASK)) | ushort2(0x6400u));
@@ -300,6 +311,7 @@ METAL_FUNC float2 qwg_aq_slice_dot2(device const char* gp,
                                     thread const Vec4 (&lo0)[4], thread const Vec4 (&hi0)[4],
                                     thread const Vec4 (&lo1)[4], thread const Vec4 (&hi1)[4],
                                     float2 sumX) {
+#pragma clang fp contract(off) reassociate(off)
     const half2 sb = *(device const half2*)gp;
     device const uint* pw = (device const uint*)(gp + 4 + byteInGroup);
     float2 acc0 = float2(0.0f);
@@ -387,7 +399,10 @@ METAL_FUNC float2 qwg_aq_slice_dot2(device const char* gp,
             acc1 = fma(float2(float(cHiYW.y)), float2(float(hi0[w].w), float(hi1[w].w)), acc1);
         }
     }
-    return fma(fma(float2(-1024.0f), sumX, acc0 + acc1), float2(float(sb.x)), float2(float(sb.y)) * sumX);
+    const float2 raw = acc0 + acc1;
+    const float2 unscaled = fma(float2(-1024.0f), sumX, raw);
+    const float2 biasTerm = float2(float(sb.y)) * sumX;
+    return fma(unscaled, float2(float(sb.x)), biasTerm);
 }
 
 // Second half of the family: f32 prescale, word8 unpack, and the rows4/rowsN GEMV bodies.

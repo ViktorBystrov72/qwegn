@@ -78,6 +78,10 @@ public struct QWModelGeometry: Sendable, Equatable {
     public var fullAttentionInterval: Int { descriptor.fullAttentionInterval }
     public var rmsEps: Float { descriptor.rmsEps }
     public var maxPositionEmbeddings: Int { descriptor.maxPositionEmbeddings }
+    public var yarnRopeConfig: QWModelDescriptor.YarnRopeConfig? { descriptor.yarnRopeConfig }
+    public var originalMaxPositionEmbeddings: Int {
+        descriptor.yarnRopeConfig?.originalMaxPositionEmbeddings ?? maxPositionEmbeddings
+    }
 
     /// Authoritative per-layer kind from the config's `layer_types`.
     public func isFullAttention(_ layer: Int) -> Bool {

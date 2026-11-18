@@ -7,301 +7,16 @@
 #include "mlx/backend/metal/kernels/steel/defines.h"
 #include "mlx/backend/metal/kernels/steel/utils/integral_constant.h"
 #include "mlx/backend/metal/kernels/steel/gemm/nax.h"
-#include "include/qw_geometry_constants.metalh"
-#include "include/qw_dequant.metalh"
-#include "include/qw_kv_paged.metalh"
-#include "include/qw_attn_decode.metalh"
+#include "include/qw_attn_sparse_decode.metalh"
 
 using namespace metal;
 using namespace mlx::steel;
 
-#define QW_LSA_MAXSPLITS    64u
-#define QW_LSA_HEAD_DIM_MAX 256u
 #define QW_LSA_KU           16u
 #define QW_LSA_BK           32u
 #define QW_LSA_NAX_HDIM     256u
 
-static inline float lsa_dec_logit_general(float v) {
-    return simd_sum(v) * QW_ATTN_SCALE;
-}
-
-// 1. Sparse Split-K Decode over Paged KV Pool (f16, q8, q4)
-// Attends over `blockCount[0]` 4-token blocks in `blockList`, plus the unaligned
-// tail in `[4 * ((C + 1) / 4), C)` and the new row `C` (`knew`, `vnew`).
-template <uint MODE>
-static inline void lsa_decode_sparse_body(
-        const device half* qgate, device half* kpool, device half* vpool,
-        const device int* ktab, const device int* vtab,
-        const device half* knew, const device half* vnew,
-        device float* partials, device half* outp,
-        const device int* blockList, const device uint* blockCountBuf,
-        uint C, uint splits, uint tid, uint3 tg,
-        threadgroup half* stageK, threadgroup half* stageV) {
-    const uint sg   = tid >> 5u;
-    const uint lane = tid & 31u;
-    const uint head = tg.x * QW_GQA_RATIO + sg;
-    const uint kvh  = head / QW_GQA_RATIO;
-    const uint d0   = lane * 8u;
-    const bool live = d0 < QW_HEAD_DIM;
-
-    const uint totalCompleteBlocks = (C + 1u) >> 2u;
-    const uint uCount = min(blockCountBuf[0], totalCompleteBlocks);
-    const uint tailStart = totalCompleteBlocks * 4u;
-    const uint nTailPool = (C > tailStart) ? (C - tailStart) : 0u;
-    const uint totalSelectedKeys = uCount * 4u + nTailPool + 1u;
-
-    const uint per = (totalSelectedKeys + splits - 1u) / splits;
-    const uint s0 = min(tg.y * per, totalSelectedKeys);
-    const uint s1 = min(s0 + per, totalSelectedKeys);
-
-    float q8[8];
-    if (live) {
-        device const half* q4 = qgate + head * QW_Q_STRIDE * QW_HEAD_DIM + d0;
-        for (uint i = 0u; i < 8u; i++) q8[i] = float(q4[i]);
-    } else {
-        for (uint i = 0u; i < 8u; i++) q8[i] = 0.0f;
-    }
-
-    float m = -1e30f, lsum = 0.0f;
-    float oacc[8];
-    for (uint i = 0u; i < 8u; i++) oacc[i] = 0.0f;
-
-    #define LSA_MERGE(s, vv) {                                           \
-        const float _mn = max(m, s);                                     \
-        const float _c  = (s > m) ? metal::exp(m - s) : 1.0f;            \
-        const float _p  = metal::exp(s - _mn);                           \
-        lsum = lsum * _c + _p;                                           \
-        for (uint _i = 0u; _i < 8u; _i++) oacc[_i] = oacc[_i] * _c + _p * float(vv[_i]); \
-        m = _mn;                                                         \
-    }
-    #define LSA_DOT(kk) ({                                               \
-        float _pd = 0.0f;                                                \
-        for (uint _i = 0u; _i < 8u; _i++) _pd += q8[_i] * float(kk[_i]); \
-        lsa_dec_logit_general(_pd); })
-
-    const uint poolKeyLimit = uCount * 4u + nTailPool;
-    const uint cEnd = min(s1, poolKeyLimit);
-    const uint keysPerPhase = 2u * QW_GQA_RATIO;
-    const uint safeBlockEnd = (uCount > 0u) ? (uCount * 4u - (((C & 3u) == 3u) ? 1u : 0u)) : 0u;
-    const uint stageEnd = min(cEnd, safeBlockEnd);
-
-    uint sIdx = s0;
-    for (; sIdx + keysPerPhase <= stageEnd; sIdx += keysPerPhase) {
-        if (QW_HEAD_DIM <= 128u) {
-            const uint keyIdx = tid >> 4u, col = (tid & 15u) << 3u;
-            const uint slot = sIdx + keyIdx;
-            const uint r = uint(blockList[slot >> 2u]) * 4u + (slot & 3u);
-            const uint pk = (uint)ktab[r >> 8u], pv = (uint)vtab[r >> 8u];
-            const uint e = keyIdx * QW_LSA_HEAD_DIM_MAX + col;
-            threadgroup half* dk = &stageK[e];
-            threadgroup half* dv = &stageV[e];
-            if (col < QW_HEAD_DIM) {
-                if (MODE == 0u) {
-                    const uint off = (r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + col;
-                    *(threadgroup uint4*)dk = *(device const uint4*)(kpool + (uint64_t)pk * QW_PGEL + off);
-                    *(threadgroup uint4*)dv = *(device const uint4*)(vpool + (uint64_t)pv * QW_PGEL + off);
-                } else {
-                    half ka[8], va[8];
-                    QW_KV_LOAD8(ka, kpool, pk, r & 255u, kvh, col, MODE)
-                    QW_KV_LOAD8(va, vpool, pv, r & 255u, kvh, col, MODE)
-                    for (uint i = 0u; i < 8u; i++) { dk[i] = ka[i]; dv[i] = va[i]; }
-                }
-            }
-        } else {
-            #pragma unroll
-            for (uint s = 0u; s < 2u; ++s) {
-                const uint e = s * (QW_GQA_RATIO * 32u * 8u) + tid * 8u;
-                const uint slot = sIdx + (e >> 8u);
-                const uint r = uint(blockList[slot >> 2u]) * 4u + (slot & 3u);
-                const uint pk = (uint)ktab[r >> 8u], pv = (uint)vtab[r >> 8u];
-                threadgroup half* dk = &stageK[e];
-                threadgroup half* dv = &stageV[e];
-                if (live) {
-                    if (MODE == 0u) {
-                        const uint off = (r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + (e & 255u);
-                        *(threadgroup uint4*)dk = *(device const uint4*)(kpool + (uint64_t)pk * QW_PGEL + off);
-                        *(threadgroup uint4*)dv = *(device const uint4*)(vpool + (uint64_t)pv * QW_PGEL + off);
-                    } else {
-                        half ka[8], va[8];
-                        QW_KV_LOAD8(ka, kpool, pk, r & 255u, kvh, e & 255u, MODE)
-                        QW_KV_LOAD8(va, vpool, pv, r & 255u, kvh, e & 255u, MODE)
-                        for (uint i = 0u; i < 8u; i++) { dk[i] = ka[i]; dv[i] = va[i]; }
-                    }
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float s16[16];
-        for (uint j = 0u; j < keysPerPhase; j++) {
-            threadgroup const half* ks = &stageK[j * QW_LSA_HEAD_DIM_MAX + d0];
-            half kk[8];
-            if (live) *(thread uint4*)kk = *(threadgroup const uint4*)ks;
-            else for (uint i = 0u; i < 8u; i++) kk[i] = half(0.0h);
-            s16[j] = LSA_DOT(kk);
-        }
-        float bm = s16[0];
-        for (uint j = 1u; j < keysPerPhase; j++) bm = max(bm, s16[j]);
-        const float Mb = max(m, bm);
-        float lp = 0.0f, op[8];
-        for (uint i = 0u; i < 8u; i++) op[i] = 0.0f;
-        for (uint j = 0u; j < keysPerPhase; j++) {
-            const float pj = metal::exp(s16[j] - Mb);
-            lp += pj;
-            threadgroup const half* vs = &stageV[j * QW_LSA_HEAD_DIM_MAX + d0];
-            half vv[8];
-            if (live) *(thread uint4*)vv = *(threadgroup const uint4*)vs;
-            else for (uint i = 0u; i < 8u; i++) vv[i] = half(0.0h);
-            for (uint i = 0u; i < 8u; i++) op[i] += pj * float(vv[i]);
-        }
-        const float cb = metal::exp(m - Mb);
-        lsum = lsum * cb + lp;
-        for (uint i = 0u; i < 8u; i++) oacc[i] = oacc[i] * cb + op[i];
-        m = Mb;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    for (; sIdx < cEnd; sIdx++) {
-        const uint r = (sIdx < uCount * 4u)
-            ? (uint(blockList[sIdx >> 2u]) * 4u + (sIdx & 3u))
-            : (tailStart + (sIdx - uCount * 4u));
-        half kk[8], vv[8];
-        if (live && r < C) {
-            if (MODE == 0u) {
-                device const half* kb = kpool + (uint64_t)ktab[r >> 8u] * QW_PGEL
-                                      + (uint64_t)(r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
-                device const half* vb = vpool + (uint64_t)vtab[r >> 8u] * QW_PGEL
-                                      + (uint64_t)(r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
-                *(thread uint4*)kk = *(device const uint4*)kb;
-                *(thread uint4*)vv = *(device const uint4*)vb;
-            } else {
-                QW_KV_LOAD8(kk, kpool, ktab[r >> 8u], r & 255u, kvh, d0, MODE)
-                QW_KV_LOAD8(vv, vpool, vtab[r >> 8u], r & 255u, kvh, d0, MODE)
-            }
-        } else if (live && r == C) {
-            // When C is the 4th token of a completed block (C % 4 == 3), r == C is in blockList[uCount - 1].
-            continue;
-        } else {
-            for (uint i = 0u; i < 8u; i++) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
-        }
-        LSA_MERGE(LSA_DOT(kk), vv)
-    }
-
-    // Attend the new token row C (from knew / vnew) in the split that owns slot `totalSelectedKeys - 1`.
-    const uint ownSlot = totalSelectedKeys - 1u;
-    if (ownSlot >= s0 && ownSlot < s1) {
-        half kk[8], vv[8];
-        if (live) {
-            device const half* kb = knew + kvh * QW_HEAD_DIM + d0;
-            device const half* vb = vnew + kvh * QW_HEAD_DIM + d0;
-            if (MODE == 0u) {
-                *(thread uint4*)kk = *(device const uint4*)kb;
-                *(thread uint4*)vv = *(device const uint4*)vb;
-            } else if (MODE == 1u) {
-                float km = 0.0f, vm = 0.0f;
-                for (uint i = 0u; i < 8u; i++) {
-                    km = fmax(km, fabs(float(kb[i])));
-                    vm = fmax(vm, fabs(float(vb[i])));
-                }
-                km = simd_max(km); vm = simd_max(vm);
-                const float ks = float(half(fmax(km / 127.0f, 1e-8f)));
-                const float vs = float(half(fmax(vm / 127.0f, 1e-8f)));
-                const float kinv = 1.0f / ks, vinv = 1.0f / vs;
-                for (uint i = 0u; i < 8u; i++) {
-                    kk[i] = half(clamp(round(float(kb[i]) * kinv), -127.0f, 127.0f) * ks);
-                    vv[i] = half(clamp(round(float(vb[i]) * vinv), -127.0f, 127.0f) * vs);
-                }
-            } else {
-                uint knib[8], vnib[8]; float ksc, kmn, vsc, vmn;
-                qwg_q4_quant8(kb, kk, knib, &ksc, &kmn);
-                qwg_q4_quant8(vb, vv, vnib, &vsc, &vmn);
-            }
-        } else {
-            for (uint i = 0u; i < 8u; i++) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
-        }
-        LSA_MERGE(LSA_DOT(kk), vv)
-    }
-
-    #undef LSA_MERGE
-    #undef LSA_DOT
-
-    const uint splitStride = max(QW_LSA_MAXSPLITS, splits);
-    device float* pb = partials + (head * splitStride + tg.y) * (QW_HEAD_DIM + 2u);
-    if (live) {
-        for (uint i = 0u; i < 8u; i++) pb[d0 + i] = oacc[i];
-    }
-    if (lane == 0u) {
-        pb[QW_HEAD_DIM] = m;
-        pb[QW_HEAD_DIM + 1u] = lsum;
-    }
-
-    if (splits == 1u && live) {
-        float gf[8];
-        for (uint i = 0u; i < 8u; i++) gf[i] = 1.0f;
-        if (QW_HAS_Q_GATE) {
-            device const half* g4 = qgate + head * QW_Q_STRIDE * QW_HEAD_DIM + QW_HEAD_DIM + d0;
-            for (uint i = 0u; i < 8u; i++) gf[i] = 1.0f / (1.0f + metal::exp(-float(g4[i])));
-        }
-        const float linv = (lsum > 0.0f) ? 1.0f / lsum : 0.0f;
-        half hv[8];
-        for (uint i = 0u; i < 8u; i++) hv[i] = half(oacc[i] * linv * gf[i]);
-        fwht32_inplace(hv, lane);
-        device half* ov = outp + head * QW_HEAD_DIM + d0;
-        *(device uint4*)ov = *(thread uint4*)hv;
-    }
-
-    // Materialize the new token's K/V into row C of the paged KV pool (split 0, simdgroup 0).
-    if (tg.y == 0u && sg == 0u) {
-        if (MODE == 0u) {
-            if (live) {
-                device half* kw = kpool + (uint64_t)ktab[C >> 8u] * QW_PGEL
-                                  + (uint64_t)(C & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
-                device half* vw = vpool + (uint64_t)vtab[C >> 8u] * QW_PGEL
-                                  + (uint64_t)(C & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
-                *(device uint4*)kw = *(device const uint4*)(knew + kvh * QW_HEAD_DIM + d0);
-                *(device uint4*)vw = *(device const uint4*)(vnew + kvh * QW_HEAD_DIM + d0);
-            }
-        } else if (MODE == 1u) {
-            half kn8[8], vn8[8];
-            float kMax = 0.0f, vMax = 0.0f;
-            if (live) {
-                for (uint i = 0u; i < 8u; i++) {
-                    kn8[i] = knew[kvh * QW_HEAD_DIM + d0 + i];
-                    vn8[i] = vnew[kvh * QW_HEAD_DIM + d0 + i];
-                    kMax = fmax(kMax, fabs(float(kn8[i])));
-                    vMax = fmax(vMax, fabs(float(vn8[i])));
-                }
-            }
-            const float kSegMax = simd_max(kMax);
-            const float vSegMax = simd_max(vMax);
-            if (live) {
-                qwg_q8_store_seg((device char*)kpool, uint64_t(ktab[C >> 8u]) * QW_Q8_PGE, C & 255u, kvh, d0, kn8, kSegMax);
-                qwg_q8_store_seg((device char*)vpool, uint64_t(vtab[C >> 8u]) * QW_Q8_PGE, C & 255u, kvh, d0, vn8, vSegMax);
-            }
-        } else {
-            half kn8[8], vn8[8];
-            float mnk = 1e30f, mxk = -1e30f, mnv4 = 1e30f, mxv4 = -1e30f;
-            if (live) {
-                for (uint i = 0u; i < 8u; i++) {
-                    kn8[i] = knew[kvh * QW_HEAD_DIM + d0 + i];
-                    vn8[i] = vnew[kvh * QW_HEAD_DIM + d0 + i];
-                    const float a = float(kn8[i]), b = float(vn8[i]);
-                    mnk = fmin(mnk, a); mxk = fmax(mxk, a);
-                    mnv4 = fmin(mnv4, b); mxv4 = fmax(mxv4, b);
-                }
-            }
-            #pragma unroll
-            for (uint sh = 1u; sh <= 8u; sh <<= 1u) {
-                mnk = fmin(mnk, simd_shuffle_xor(mnk, sh)); mxk = fmax(mxk, simd_shuffle_xor(mxk, sh));
-                mnv4 = fmin(mnv4, simd_shuffle_xor(mnv4, sh)); mxv4 = fmax(mxv4, simd_shuffle_xor(mxv4, sh));
-            }
-            if (live) {
-                qwg_q4_store_seg((device uchar*)kpool, uint64_t(ktab[C >> 8u]) * QW_Q4_PGE, C & 255u, kvh, d0, kn8, mnk, mxk);
-                qwg_q4_store_seg((device uchar*)vpool, uint64_t(vtab[C >> 8u]) * QW_Q4_PGE, C & 255u, kvh, d0, vn8, mnv4, mxv4);
-            }
-        }
-    }
-}
-
+// 1. Sparse Split-K Decode & Batched Decode over Paged KV Pool (f16, q8, q4)
 #define QW_DECODE_SPARSE_ENTRY(SFX, MODE) \
 kernel void qwg_attn_decode_sparse##SFX( \
         const device half* qgate         [[buffer(0)]], \
@@ -320,8 +35,30 @@ kernel void qwg_attn_decode_sparse##SFX( \
         uint tid [[thread_index_in_threadgroup]], \
         uint3 tg [[threadgroup_position_in_grid]]) { \
     threadgroup half stageK[16u * QW_LSA_HEAD_DIM_MAX], stageV[16u * QW_LSA_HEAD_DIM_MAX]; \
-    lsa_decode_sparse_body<MODE>(qgate, kpool, vpool, ktab, vtab, knew, vnew, partials, outp, \
-                                 blockList, blockCountBuf, C, splits, tid, tg, stageK, stageV); \
+    lsa_decode_sparse_core<MODE, false>(qgate, kpool, vpool, ktab, vtab, knew, vnew, partials, outp, \
+                                        blockList, blockCountBuf, C, splits, 0u, true, tid, tg, stageK, stageV); \
+} \
+kernel void qwg_attn_decode_sparse_batched##SFX( \
+        const device half* qgate         [[buffer(0)]], \
+        device half*       kpool         [[buffer(1)]], \
+        device half*       vpool         [[buffer(2)]], \
+        const device int*  ktab          [[buffer(3)]], \
+        const device int*  vtab          [[buffer(4)]], \
+        const device half* knew          [[buffer(5)]], \
+        const device half* vnew          [[buffer(6)]], \
+        device float*      partials      [[buffer(7)]], \
+        constant uint&     cBase         [[buffer(8)]], \
+        constant uint&     splits        [[buffer(9)]], \
+        device half*       outp          [[buffer(10)]], \
+        const device int*  blockList     [[buffer(11)]], \
+        const device uint* blockCountBuf [[buffer(12)]], \
+        constant uint&     listStride    [[buffer(13)]], \
+        constant uint&     writeKV       [[buffer(14)]], \
+        uint tid [[thread_index_in_threadgroup]], \
+        uint3 tg [[threadgroup_position_in_grid]]) { \
+    threadgroup half stageK[16u * QW_LSA_HEAD_DIM_MAX], stageV[16u * QW_LSA_HEAD_DIM_MAX]; \
+    lsa_decode_sparse_core<MODE, true>(qgate, kpool, vpool, ktab, vtab, knew, vnew, partials, outp, \
+                                       blockList, blockCountBuf, cBase, splits, listStride, writeKV != 0u, tid, tg, stageK, stageV); \
 }
 QW_DECODE_SPARSE_ENTRY(, 0u)
 QW_DECODE_SPARSE_ENTRY(_q8, 1u)
@@ -431,7 +168,7 @@ kernel void qwg_attn_prefill_paged_general_sparse(
 
 // 3. M5 NAX Cooperative Tensor Sparse Paged Prefill (f16, q8, q4)
 // Uses the tile's last query row `qRef = min(tile0 + 31, T - 1)` block list on 16x32 NAX MMA tiles.
-template <uint MODE>
+template <uint MODE, uint STAGE_HDIM = QW_LSA_NAX_HDIM>
 static inline void lsa_prefill_paged_nax_sparse_body(
         const device half* qgate, const device half* kpool, const device half* vpool,
         const device int* ktab, const device int* vtab, device half* outp,
@@ -460,6 +197,8 @@ static inline void lsa_prefill_paged_nax_sparse_body(
 
     const float scale2 = QW_ATTN_SCALE * 1.4426950408889634f;
     constexpr short kU = 16;
+    constexpr short kMaxNq = short(STAGE_HDIM >> 4u);
+    constexpr short kMaxPair = short(STAGE_HDIM >> 5u);
     const short nq = short(QW_HEAD_DIM >> 4u);
     const short npair = short(QW_HEAD_DIM >> 5u);
 
@@ -469,10 +208,10 @@ static inline void lsa_prefill_paged_nax_sparse_body(
     const short2 sc = BaseNAXFrag::get_coord();
     const short sm = sc.y, sn = sc.x;
 
-    NAXTile<half, 1, 1> Qf[16];
+    NAXTile<half, 1, 1> Qf[kMaxNq];
     const short validRows = short(clamp(int(T) - int(rowBase), 0, 16));
     STEEL_PRAGMA_UNROLL
-    for (short id = 0; id < 16; id++) {
+    for (short id = 0; id < kMaxNq; id++) {
         if (id < nq) {
             if (validRows == 16)
                 Qf[id].load(qdev + id * kU, int(QW_QPROJ_OUT));
@@ -481,7 +220,7 @@ static inline void lsa_prefill_paged_nax_sparse_body(
         }
     }
 
-    NAXTile<float, 1, 16> Otile;
+    NAXTile<float, 1, kMaxNq> Otile;
     Otile.clear();
 
     float mrow[2], lrow[2];
@@ -489,7 +228,7 @@ static inline void lsa_prefill_paged_nax_sparse_body(
     for (short i = 0; i < 2; i++) { mrow[i] = -1e30f; lrow[i] = 0.0f; }
 
     const uint kLoadVec8 = 4u * QW_HEAD_DIM;
-    const uint kStageStride = QW_LSA_NAX_HDIM;
+    const uint kStageStride = STAGE_HDIM;
 
     for (uint s0 = 0u; s0 < totalSlots; s0 += QW_LSA_BK) {
         NAXTile<half, 1, 2> Pt;
@@ -535,10 +274,10 @@ static inline void lsa_prefill_paged_nax_sparse_body(
         NAXTile<float, 1, 2> Stile;
         Stile.clear();
         STEEL_PRAGMA_UNROLL
-        for (short id = 0; id < 16; id++) {
+        for (short id = 0; id < kMaxNq; id++) {
             if (id < nq) {
                 NAXTile<half, 2, 1> Kt;
-                Kt.template load<half, QW_LSA_NAX_HDIM, 1>(kvblk + id * kU);
+                Kt.template load<half, STAGE_HDIM, 1>(kvblk + id * kU);
                 BaseNAXFrag::mma(Stile.frag_at(0, 0),
                                  Stile.frag_at(0, 1),
                                  Qf[id].frag_at(0, 0), metal::false_type{},
@@ -646,7 +385,7 @@ static inline void lsa_prefill_paged_nax_sparse_body(
 
         if (corr[0] != 1.0f || corr[1] != 1.0f) {
             STEEL_PRAGMA_UNROLL
-            for (short id = 0; id < 16; id++) {
+            for (short id = 0; id < kMaxNq; id++) {
                 if (id < nq) {
                     thread auto& of = Otile.frag_at(0, id);
                     STEEL_PRAGMA_UNROLL
@@ -660,11 +399,11 @@ static inline void lsa_prefill_paged_nax_sparse_body(
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < 2; ik++) {
             STEEL_PRAGMA_UNROLL
-            for (short idp = 0; idp < 8; idp++) {
+            for (short idp = 0; idp < kMaxPair; idp++) {
                 if (idp < npair) {
                     const short id0 = idp * 2;
                     NAXTile<half, 1, 2> Vt;
-                    Vt.template load<half, QW_LSA_NAX_HDIM, 1>(vblk + (ik * kU) * kStageStride + id0 * kU);
+                    Vt.template load<half, STAGE_HDIM, 1>(vblk + (ik * kU) * kStageStride + id0 * kU);
                     BaseNAXFrag::mma(Otile.frag_at(0, id0),
                                      Otile.frag_at(0, id0 + 1),
                                      Pt.frag_at(0, ik), metal::false_type{},
@@ -685,7 +424,7 @@ static inline void lsa_prefill_paged_nax_sparse_body(
                         + (uint64_t)head * QW_HEAD_DIM;
 
     STEEL_PRAGMA_UNROLL
-    for (short idp = 0; idp < 8; idp++) {
+    for (short idp = 0; idp < kMaxPair; idp++) {
         if (idp < npair) {
             const short id0 = idp * 2;
             const short id1 = id0 + 1;
@@ -763,7 +502,7 @@ static inline void lsa_prefill_paged_nax_sparse_body(
     }
 }
 
-#define QW_NAX_SPARSE_PREFILL_ENTRY(SFX, MODE) \
+#define QW_NAX_SPARSE_PREFILL_ENTRY(SFX, MODE, STAGE_HDIM) \
 kernel void qwg_attn_prefill_paged_nax_sparse_pair##SFX( \
         const device half*  qgate         [[buffer(0)]], \
         const device half*  kpool         [[buffer(1)]], \
@@ -779,12 +518,15 @@ kernel void qwg_attn_prefill_paged_nax_sparse_pair##SFX( \
         uint tid [[thread_index_in_threadgroup]], \
         uint sgi [[simdgroup_index_in_threadgroup]], \
         uint3 tg [[threadgroup_position_in_grid]]) { \
-    threadgroup half kvblk[QW_LSA_BK * QW_LSA_NAX_HDIM]; \
-    threadgroup half vblk[QW_LSA_BK * QW_LSA_NAX_HDIM]; \
-    lsa_prefill_paged_nax_sparse_body<MODE>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, \
-                                            blockList, blockCountBuf, listStride, tid, sgi, tg, kvblk, vblk); \
+    threadgroup half kvblk[QW_LSA_BK * STAGE_HDIM]; \
+    threadgroup half vblk[QW_LSA_BK * STAGE_HDIM]; \
+    lsa_prefill_paged_nax_sparse_body<MODE, STAGE_HDIM>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, \
+                                                        blockList, blockCountBuf, listStride, tid, sgi, tg, kvblk, vblk); \
 }
-QW_NAX_SPARSE_PREFILL_ENTRY(, 0u)
-QW_NAX_SPARSE_PREFILL_ENTRY(_q8, 1u)
-QW_NAX_SPARSE_PREFILL_ENTRY(_q4, 2u)
+QW_NAX_SPARSE_PREFILL_ENTRY(, 0u, 256u)
+QW_NAX_SPARSE_PREFILL_ENTRY(_q8, 1u, 256u)
+QW_NAX_SPARSE_PREFILL_ENTRY(_q4, 2u, 256u)
+QW_NAX_SPARSE_PREFILL_ENTRY(_hd128, 0u, 128u)
+QW_NAX_SPARSE_PREFILL_ENTRY(_hd128_q8, 1u, 128u)
+QW_NAX_SPARSE_PREFILL_ENTRY(_hd128_q4, 2u, 128u)
 #undef QW_NAX_SPARSE_PREFILL_ENTRY

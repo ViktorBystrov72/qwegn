@@ -230,14 +230,23 @@ extension QWModelDescriptor {
         if resolvedMtpLayers > 0 { caps.insert(.mtp) }
 
         let parsedYarn: YarnRopeConfig? = {
-            guard let rs = t.rope_scaling else { return nil }
-            let kind = (rs.type ?? rs.rope_type ?? "").lowercased()
-            guard kind == "yarn", let factor = rs.factor, let orig = rs.original_max_position_embeddings else {
-                return nil
+            if let rs = t.rope_scaling {
+                let kind = (rs.type ?? rs.rope_type ?? "").lowercased()
+                if kind == "yarn", let factor = rs.factor, let orig = rs.original_max_position_embeddings {
+                    return YarnRopeConfig(factor: factor, originalMaxPositionEmbeddings: orig,
+                                          betaFast: rs.beta_fast ?? 32.0, betaSlow: rs.beta_slow ?? 1.0,
+                                          mscale: rs.mscale ?? 0.0, mscaleAllDim: rs.mscale_all_dim ?? 0.0)
+                }
             }
-            return YarnRopeConfig(factor: factor, originalMaxPositionEmbeddings: orig,
-                                  betaFast: rs.beta_fast ?? 32.0, betaSlow: rs.beta_slow ?? 1.0,
-                                  mscale: rs.mscale ?? 0.0, mscaleAllDim: rs.mscale_all_dim ?? 0.0)
+            if let rp = t.rope_parameters {
+                let kind = (rp.type ?? rp.rope_type ?? "").lowercased()
+                if kind == "yarn", let factor = rp.factor, let orig = rp.original_max_position_embeddings {
+                    return YarnRopeConfig(factor: factor, originalMaxPositionEmbeddings: orig,
+                                          betaFast: rp.beta_fast ?? 32.0, betaSlow: rp.beta_slow ?? 1.0,
+                                          mscale: rp.mscale ?? 1.0, mscaleAllDim: rp.mscale_all_dim ?? 0.0)
+                }
+            }
+            return nil
         }()
 
         let parsedHCA: HCAConfig? = {
@@ -339,9 +348,11 @@ extension QWModelDescriptor {
             parsedBlockSparseGQA = nil
         }
 
-        guard let familySpec = QWModelFamilyRegistry.shared.spec(forModelType: t.model_type) else {
+        guard let textFamilySpec = QWModelFamilyRegistry.shared.spec(forModelType: t.model_type) else {
             throw QWModelDescriptorError.unsupportedModelType(t.model_type)
         }
+        let envFamilySpec = env.model_type.flatMap { QWModelFamilyRegistry.shared.spec(forModelType: $0) }
+        let familySpec = envFamilySpec ?? textFamilySpec
         let family = familySpec.family
         let gateDeclared: Bool = t.output_gate_type != nil
         let attnGate: Bool = t.attn_output_gate ?? t.use_gated_attn ?? (gateDeclared || familySpec.defaultAttnOutputGate)
@@ -418,6 +429,7 @@ extension QWModelDescriptor {
             hcaConfig: parsedHCA,
             hybridMLAConfig: parsedHybridMLA,
             blockSparseGQAConfig: parsedBlockSparseGQA,
+            yarnRopeConfig: (!hasHybridMLA && parsedHCA == nil) ? parsedYarn : nil,
             activationKind: parsedAct,
             moeLatentSize: t.moe_latent_size,
             latentMoeUseNorm: t.latent_moe_use_norm ?? false,

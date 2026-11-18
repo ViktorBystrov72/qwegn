@@ -274,15 +274,21 @@ extension QWEngineDriver {
         }
         let partials = mtpSharedAttentionPartials
         let plan = geometry.executionPlan
+        var needsEntryBarrier = false
         if let embedTable = deviceEmbedding {
             enc.useResource(embedTable.buffer, usage: .read)
             enc.useResource(embedTable.tokens, usage: .read)
             try embedTable.encodeRows(
                 enc, tokensBuffer: embedTable.tokens, tokensByteOffset: 0, rows: activeRows,
                 destination: prefixRows(window.hidden, rows: activeRows, cols: h, dt: .f16))
+            needsEntryBarrier = true
         }
         if let firstP = plan.first, layersW[firstP].mhc == nil || geometry.mhcConfig == nil {
             try encodeRMSNormFast(enc, x: window.hidden, gamma: layersW[firstP].ln1, out: normalized, rows: activeRows)
+            needsEntryBarrier = true
+        }
+        if needsEntryBarrier {
+            enc.memoryBarrier(scope: .buffers)
         }
         for (layer, p) in plan.enumerated() {
             let weights = layersW[p]
@@ -429,25 +435,28 @@ extension QWEngineDriver {
                     out: normalized, residual: window.hidden, rows: activeRows)
                 enc.memoryBarrier(scope: .buffers)
             }
-            if let dflashDrafter, p < dflashDrafter.targetLayerSlotMap.count {
-                let slot = dflashDrafter.targetLayerSlotMap[p]
-                if slot >= 0 {
-                    if let _ = weights.mhc, let mhcCfg = geometry.mhcConfig,
-                       let mhcStream = window.mhcStream, let mhcControls = window.mhcControls {
-                        let isLeave = (p == mhcCfg.end - 1)
-                        let nextIsMHC = nextP.map { $0 >= mhcCfg.start && $0 < mhcCfg.end } ?? false
-                        let deferPostFFN = !isLeave && nextIsMHC && (nextP != mhcCfg.start)
-                        if deferPostFFN { enc.memoryBarrier(scope: .buffers) }
-                        dflashDrafter.encodeCaptureHCTargetHidden(
-                            enc, base: mhcStream, srcRowOffset: 0, dstRowOffset: 0, rows: activeRows,
-                            slot: slot, hc: mhcCfg.streams,
-                            deferredInject: deferPostFFN
-                                ? (src: mtpBatchedMLP.downRows, inj: mhcControls, isMHC: true) : nil)
-                    } else {
-                        dflashDrafter.encodeCaptureTargetHidden(
-                            enc, source: window.hidden, srcRowOffset: 0, dstRowOffset: 0, rows: activeRows, slot: slot)
+            if let dflashDrafter {
+                let captureIdx = dflashDrafter.usesVirtualLayerCapture ? layer : p
+                if captureIdx < dflashDrafter.targetLayerSlotMap.count {
+                    let slot = dflashDrafter.targetLayerSlotMap[captureIdx]
+                    if slot >= 0 {
+                        if let _ = weights.mhc, let mhcCfg = geometry.mhcConfig,
+                           let mhcStream = window.mhcStream, let mhcControls = window.mhcControls {
+                            let isLeave = (p == mhcCfg.end - 1)
+                            let nextIsMHC = nextP.map { $0 >= mhcCfg.start && $0 < mhcCfg.end } ?? false
+                            let deferPostFFN = !isLeave && nextIsMHC && (nextP != mhcCfg.start)
+                            if deferPostFFN { enc.memoryBarrier(scope: .buffers) }
+                            dflashDrafter.encodeCaptureHCTargetHidden(
+                                enc, base: mhcStream, srcRowOffset: 0, dstRowOffset: 0, rows: activeRows,
+                                slot: slot, hc: mhcCfg.streams,
+                                deferredInject: deferPostFFN
+                                    ? (src: mtpBatchedMLP.downRows, inj: mhcControls, isMHC: true) : nil)
+                        } else {
+                            dflashDrafter.encodeCaptureTargetHidden(
+                                enc, source: window.hidden, srcRowOffset: 0, dstRowOffset: 0, rows: activeRows, slot: slot)
+                        }
+                        enc.memoryBarrier(scope: .buffers)
                     }
-                    enc.memoryBarrier(scope: .buffers)
                 }
             }
         }

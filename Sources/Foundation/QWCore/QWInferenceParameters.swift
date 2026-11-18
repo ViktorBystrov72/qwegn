@@ -210,6 +210,18 @@ public struct QWSpeculativeParameters: Codable, Sendable, Equatable {
             )
         }
         let hasMTP = descriptor.supportsNativeMTP
+        if !hasMTP && descriptor.loopSettings != nil && (descriptor.numExperts ?? 0) == 0 {
+            return QWSpeculativeParameters(
+                enabled: true,
+                mtpDrafts: 5,
+                mtpBackend: "standard",
+                mtpRelaxedMargin: 0.0,
+                mtpDraftStrategy: "ngram",
+                mtpQuadraticSeeding: false,
+                adaptiveDepth: false,
+                entropyThreshold: 0.7
+            )
+        }
         let drafts = hasMTP ? min(3, descriptor.maxSpeculativeDrafts) : 0
         return QWSpeculativeParameters(
             enabled: hasMTP,

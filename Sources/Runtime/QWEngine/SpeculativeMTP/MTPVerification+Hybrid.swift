@@ -170,6 +170,42 @@ extension QWEngineDriver {
             draftedPairs: proposed.drafts.count)
     }
 
+    var isWeightFreeSpeculation: Bool {
+        verifyWindow != nil && mtpDraftEncoder == nil && echoDrafter == nil && dflashDrafter == nil
+    }
+
+    func proposeWeightFreeDrafts(session: QWEngineSession, pending: Int, count: Int) -> [Int]? {
+        guard count > 0 else { return nil }
+        let (extraPending, previousToken) = pendingHistoryContext(session: session, pending: pending)
+        if let pd = QWContextCopyDrafter.periodicDrafts(
+            history: session.tokenHistory, extraToken: extraPending,
+            maxCount: count, minRepeats: 3),
+           !pd.isEmpty {
+            return Array(pd.prefix(count))
+        }
+        if let match = QWContextCopyDrafter.drafts(
+            history: session.tokenHistory, extraToken: extraPending,
+            maxCount: count, minMatchLen: 3),
+           !match.tokens.isEmpty {
+            let take = match.matchLen >= 5 ? count : min(3, match.tokens.count)
+            var out = Array(match.tokens.prefix(max(1, take)))
+            if out.count < count {
+                session.tokenRecycler.appendDrafts(
+                    into: &out, maxCount: count,
+                    previousToken: previousToken, pendingToken: pending,
+                    maxUnigramFallbacks: 0)
+            }
+            return out
+        }
+        var recycled: [Int] = []
+        recycled.reserveCapacity(count)
+        session.tokenRecycler.appendDrafts(
+            into: &recycled, maxCount: count,
+            previousToken: previousToken, pendingToken: pending,
+            maxUnigramFallbacks: 0)
+        return recycled.isEmpty ? nil : Array(recycled.prefix(count))
+    }
+
     func proposeEchoOrPLDRound(
         session: QWEngineSession,
         echoDrafter: QWEchoDraftEncoder,
@@ -503,13 +539,18 @@ extension QWEngineDriver {
     }
 
     func greedyRoundBoundary(_ session: QWEngineSession) throws -> QWGreedyRoundBoundary {
-        guard let mtpCache, let handle = session.mtpKV else {
+        let pairRewind: UInt64
+        if let mtpCache, let handle = session.mtpKV {
+            pairRewind = try mtpCache.rollbackGeneration(handle)
+        } else if isWeightFreeSpeculation {
+            pairRewind = 0
+        } else {
             throw QWEngineDriverError.state("greedy round pair cache is absent")
         }
         return QWGreedyRoundBoundary(position: session.position, generated: session.generated,
                                      record: session.roundRecord, hiddenValid: session.trunkHiddenValid,
                                      trunkRewind: try kvCache.rollbackGeneration(session.kv),
-                                     pairRewind: try mtpCache.rollbackGeneration(handle))
+                                     pairRewind: pairRewind)
     }
 
     /// A guarded round publication door, not generation integration. The draft

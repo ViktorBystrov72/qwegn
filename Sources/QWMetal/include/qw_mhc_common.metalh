@@ -13,7 +13,7 @@ template <uint C>
 inline void qwg_mhc_controls(thread const float* tot, float totSS, uint width, float eps,
                              float preScale, uint realIterations,
                              device const float* routerB, device float* ctrl,
-                             threadgroup float* sPre) {
+                             threadgroup float* sPre, bool writeCtrl = true) {
     const float meanSq = totSS / float(width);
     const float effEps = (C == 4u) ? eps : 1.0e-6f;
     const float rstd = (C == 4u && QW_FC_MHC_ADDITIVE_EPS)
@@ -26,7 +26,7 @@ inline void qwg_mhc_controls(thread const float* tot, float totSS, uint width, f
         const float lPre = tot[c] * rstd + routerB[c];
         sPre[c] = (1.0f / (1.0f + exp(-lPre))) * preScale + hcEps;
         const float lPost = tot[C + c] * rstd + routerB[C + c];
-        ctrl[c] = 2.0f / (1.0f + exp(-lPost));
+        if (writeCtrl) ctrl[c] = 2.0f / (1.0f + exp(-lPost));
     }
 
     float m[C * C];
@@ -82,12 +82,14 @@ inline void qwg_mhc_controls(thread const float* tot, float totSS, uint width, f
             }
         }
         // Store comb^T so matmul(comb.transpose(-1, -2), residual) is a direct row dot product.
-        #pragma unroll
-        for (uint i = 0u; i < C; ++i) {
+        if (writeCtrl) {
             #pragma unroll
-            for (uint j = 0u; j < C; ++j) {
-                const float v = m[j * C + i];
-                ctrl[C + i * C + j] = QW_FC_MHC_ADDITIVE_EPS ? v : float(half(v));
+            for (uint i = 0u; i < C; ++i) {
+                #pragma unroll
+                for (uint j = 0u; j < C; ++j) {
+                    const float v = m[j * C + i];
+                    ctrl[C + i * C + j] = QW_FC_MHC_ADDITIVE_EPS ? v : float(half(v));
+                }
             }
         }
     } else {
@@ -117,11 +119,48 @@ inline void qwg_mhc_controls(thread const float* tot, float totSS, uint width, f
                 for (uint i = 0u; i < C; ++i) m[i * C + j] -= cLog;
             }
         }
-        #pragma unroll
-        for (uint idx = 0u; idx < C * C; ++idx) {
-            ctrl[C + idx] = exp(m[idx]);
+        if (writeCtrl) {
+            #pragma unroll
+            for (uint idx = 0u; idx < C * C; ++idx) {
+                ctrl[C + idx] = exp(m[idx]);
+            }
         }
     }
+}
+
+// C=2 controls on one simdgroup (0-ULP IEEE-754 left-to-right parity with qwg_mhc_controls<2>).
+inline void qwg_mhc_controls2_simd(threadgroup const float* tots, uint width, float eps,
+                                   float preScale, uint realIterations,
+                                   device const float* routerB, device float* ctrl,
+                                   threadgroup float* sPre, uint lane, bool writeCtrl = true) {
+#pragma clang fp contract(off) reassociate(off)
+    (void)eps;
+    const float meanSq = tots[0] / float(width);
+    const float rstd = rsqrt(meanSq + 1.0e-6f);
+    if (lane < 2u) {
+        const float lPre = tots[1u + lane] * rstd + routerB[lane];
+        sPre[lane] = (1.0f / (1.0f + exp(-lPre))) * preScale;
+        const float lPost = tots[3u + lane] * rstd + routerB[2u + lane];
+        if (writeCtrl) ctrl[lane] = 2.0f / (1.0f + exp(-lPost));
+    }
+    const uint e = lane & 3u;
+    float m = tots[5u + e] * rstd + routerB[4u + e];
+    for (uint it = 0u; it < realIterations; ++it) {
+        const float rm = max(m, simd_shuffle_xor(m, 1u));
+        const float re = exp(m - rm);
+        const float rpe = simd_shuffle_xor(re, 1u);
+        const float rSum = ((e & 1u) == 0u) ? (re + rpe) : (rpe + re);
+        const float rLog = rm + log(rSum);
+        m = m - rLog;
+
+        const float cm = max(m, simd_shuffle_xor(m, 2u));
+        const float ce = exp(m - cm);
+        const float cpe = simd_shuffle_xor(ce, 2u);
+        const float cSum = (e < 2u) ? (ce + cpe) : (cpe + ce);
+        const float cLog = cm + log(cSum);
+        m = m - cLog;
+    }
+    if (writeCtrl && lane < 4u) ctrl[2u + e] = exp(m);
 }
 
 // C=4 controls on one simdgroup (same math as qwg_mhc_controls<4>): lane&15 owns mix entry

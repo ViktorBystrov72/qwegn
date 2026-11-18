@@ -582,8 +582,13 @@ def quantize_model(source: Path, destination: Path,
                         yield name, arr, "hq8"
                     continue
                 if raw:
-                    stats["bf16"] += 1
-                    yield name, arr, True
+                    if (isinstance(arr, _t.Tensor) and arr.dtype == _t.float32
+                            and any(t in name for t in (".mhc_attn.", ".mhc_ffn.", ".A_log", ".dt_bias", "loop_gate"))):
+                        stats["f32"] = stats.get("f32", 0) + 1
+                        yield name, arr, "f32"
+                    else:
+                        stats["bf16"] += 1
+                        yield name, arr, True
                 else:
                     stats[dense_fmt] = stats.get(dense_fmt, 0) + 1
                     yield name, arr, dense_spec

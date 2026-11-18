@@ -106,6 +106,7 @@ static inline void qwm_mlp_down(device const Block_HQ4_G32* blocks, device const
 static inline void qwm_gdn_store_row(uint row, uint N, float value, uint m,
                                      device half* output, device const float* aLog,
                                      device const float* bias, device float* controls) {
+#pragma clang fp contract(off) reassociate(off)
     output[(size_t)m * N + row] = half(value);
     const uint aRow0 = QW_GDN_QKV_CH + QW_GDN_Z_CH;
     const uint bRow0 = aRow0 + QW_GDN_V_HEADS;

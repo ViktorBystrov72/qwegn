@@ -55,6 +55,7 @@ sys.path.insert(0, str(SCRIPT_DIR / "oracle"))
 
 from hq_blocks import VALID_BITS, VALID_GROUPS, dequant_hq_blocks, hq_block_bytes  # noqa: E402
 from hq4 import dequant_hq4_g32_m5  # noqa: E402
+from shvq import any_block_bytes, dequant_any_blocks  # noqa: E402
 
 QLSA_MAGIC = b"QLSA"
 QLSA_VERSION = 1
@@ -237,6 +238,8 @@ class WeightReader:
                 if "raw_off" in entry:
                     f.seek(int(entry["raw_off"]))
                     n_elem = math.prod(shape)
+                    if entry.get("kind") == "f32":
+                        return np.frombuffer(f.read(n_elem * 4), dtype="<f4").astype(np.float32).reshape(shape)
                     raw_u16 = np.frombuffer(f.read(n_elem * 2), dtype=np.uint16)
                     if entry.get("kind") == "f16":
                         return raw_u16.view(np.float16).astype(np.float32).reshape(shape)
@@ -256,13 +259,14 @@ class WeightReader:
                         return dequant_hq4_g32_m5(raw)
                     bits = int(hq["bits"])
                     grp = int(hq["group"])
-                    bbytes = hq_block_bytes(bits, grp)
+                    is_shvq = hq.get("vq") == "shvq1"
+                    bbytes = any_block_bytes(bits, grp, is_m5=False, is_shvq=is_shvq)
                     nb = k // grp
                     f.seek(int(entry["hq4_off"]))
                     raw = np.frombuffer(f.read(n * nb * bbytes), dtype=np.uint8).reshape(
                         n, nb, bbytes
                     )
-                    return dequant_hq_blocks(raw, bits=bits, group=grp, is_m5=False)
+                    return dequant_any_blocks(raw, bits=bits, group=grp, is_m5=False, is_shvq=is_shvq)
                 raise ValueError(f"Unsupported QWP tensor plane for {key}: {entry}")
 
         from safetensors import safe_open

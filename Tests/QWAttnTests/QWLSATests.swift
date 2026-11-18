@@ -358,4 +358,225 @@ final class QWLSATests: XCTestCase {
                        op2.captureIndexerState(position: turn1Pos, forceFull: true),
                        "Delta restore on resident base must match full indexer state bit-for-bit")
     }
+
+    func testSparseBatchedDecodeBitExactMatchesSerialSparseAcrossModes() throws {
+        let layer = 3
+        let kvRow = Self.geometry.kvChannels
+        let qProj = Self.geometry.qProjOut
+        let qChan = Self.geometry.qChannels
+        for mode in [QWKVMode.f16, .q8, .q4] {
+            for T in [4, 8] {
+                for mod4 in 0...3 {
+                    let cBase = 300 + mod4
+                    let ceiling = cBase + T + 256
+                    let pageBytes = QWKVCache.pageBytes(mode: mode, geometry: Self.geometry)
+                    let pagesPerSeq = (ceiling + 255) / 256
+                    let poolBytes = pageBytes * pagesPerSeq * 3 * 2
+                    let tables = QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs
+                    let pBytes = QWAttnDecode.decodePartialsBytesBatched(T: T, geometry: Self.geometry)
+                    let arena = try QWArena(hal: Self.hal, weights: 0, activations: 0,
+                                            kv: poolBytes + tables, gdnStates: pBytes)
+                    let cache = try QWKVCache(hal: Self.hal, arena: arena, layers: [layer],
+                                              mode: mode, geometry: Self.geometry)
+                    let g = arena.gdnRegion()
+                    let pOff = try g.allocate(bytes: pBytes)
+                    let partials = QWMRegion(buffer: g.region.buffer, base: g.region.base + pOff, length: pBytes)
+
+                    let seqSerial = try cache.allocate(promptTokens: ceiling)
+                    let seqBatched = try cache.allocate(promptTokens: ceiling)
+                    let seqPre = try cache.allocate(promptTokens: ceiling)
+                    let kAll = QWAttnPagedPrefillTests.synthKV(n: cBase + T, seed: 0x3100 + UInt64(mod4))
+                    let vAll = QWAttnPagedPrefillTests.synthV(n: cBase + T, seed: 0x4200 + UInt64(mod4))
+                    let qAll = QWAttnPagedPrefillTests.synthQGate(n: T, seed: 0x5300 + UInt64(mod4))
+                    let baseRange = 0..<cBase
+                    let preRange = 0..<(cBase + T)
+                    try cache.append(seqSerial, positions: baseRange, layer: layer, kind: .k, src: Array(kAll[0..<(cBase * kvRow)]))
+                    try cache.append(seqSerial, positions: baseRange, layer: layer, kind: .v, src: Array(vAll[0..<(cBase * kvRow)]))
+                    try cache.append(seqBatched, positions: baseRange, layer: layer, kind: .k, src: Array(kAll[0..<(cBase * kvRow)]))
+                    try cache.append(seqBatched, positions: baseRange, layer: layer, kind: .v, src: Array(vAll[0..<(cBase * kvRow)]))
+                    try cache.append(seqPre, positions: preRange, layer: layer, kind: .k, src: kAll)
+                    try cache.append(seqPre, positions: preRange, layer: layer, kind: .v, src: vAll)
+
+                    let kNewAll = Array(kAll[(cBase * kvRow)..<((cBase + T) * kvRow)])
+                    let vNewAll = Array(vAll[(cBase * kvRow)..<((cBase + T) * kvRow)])
+                    let qBuf = QWAttnPagedPrefillTests.buf(qAll)
+                    let kNewBuf = QWAttnPagedPrefillTests.buf(kNewAll)
+                    let vNewBuf = QWAttnPagedPrefillTests.buf(vNewAll)
+                    let outSerialBuf = Self.hal.device.makeBuffer(length: T * qChan * 2, options: .storageModeShared)!
+                    let outBatchBuf = Self.hal.device.makeBuffer(length: T * qChan * 2, options: .storageModeShared)!
+                    let outPreBuf = Self.hal.device.makeBuffer(length: T * qChan * 2, options: .storageModeShared)!
+
+                    let listStride = (cBase + T) / 4 + 4
+                    var bListArr = [Int32](repeating: 0, count: T * listStride)
+                    var bCountArr = [UInt32](repeating: 0, count: T)
+                    for r in 0..<T {
+                        let blocks = (cBase + r + 1) / 4
+                        bCountArr[r] = UInt32(blocks)
+                        for b in 0..<blocks { bListArr[r * listStride + b] = Int32(b) }
+                    }
+                    let listBuf = Self.hal.device.makeBuffer(bytes: bListArr, length: bListArr.count * 4, options: .storageModeShared)!
+                    let countBuf = Self.hal.device.makeBuffer(bytes: bCountArr, length: bCountArr.count * 4, options: .storageModeShared)!
+                    let listRegion = QWMRegion(buffer: listBuf, base: 0, length: listBuf.length)
+                    let countRegion = QWMRegion(buffer: countBuf, base: 0, length: countBuf.length)
+
+                    let dec = try QWAttnDecode(hal: Self.hal, kvMode: mode, geometry: Self.geometry)
+                    let splits = QWAttnDecode.splits(forKeys: cBase + T)
+                    let serialViews = try cache.layerViews(seqSerial, layer: layer)
+                    let batchViews = try cache.layerViews(seqBatched, layer: layer)
+                    let preViews = try cache.layerViews(seqPre, layer: layer)
+
+                    func rowTV(_ buf: any MTLBuffer, _ row: Int, _ cols: Int) -> QWTensorValue {
+                        QWTensorValue(region: QWMRegion(buffer: buf, base: 0, length: buf.length),
+                                      offset: row * cols * 2, shape: QWTensorShape([cols], .f16))
+                    }
+                    guard let (cb, enc) = Self.hal.begin() else { XCTFail("hal.begin"); return }
+                    for r in 0..<T {
+                        let qRow = rowTV(qBuf, r, qProj)
+                        let kRow = rowTV(kNewBuf, r, kvRow)
+                        let vRow = rowTV(vNewBuf, r, kvRow)
+                        let oRow = rowTV(outSerialBuf, r, qChan)
+                        let bl = QWTensorValue(region: listRegion, offset: r * listStride * 4, shape: QWTensorShape([listStride], .i32))
+                        let bc = QWTensorValue(region: countRegion, offset: r * 4, shape: QWTensorShape([1], .i32))
+                        try dec.encodeSparse(enc, qgate: qRow, kv: serialViews, knew: kRow, vnew: vRow,
+                                             partials: partials, out: oRow, blockList: bl, blockCount: bc,
+                                             C: cBase + r, splits: splits, listStride: listStride)
+                        enc.memoryBarrier(scope: .buffers)
+                    }
+                    try dec.encodeSparseBatched(
+                        enc,
+                        qgate: QWAttnPagedPrefillTests.tv(qBuf, T * qProj),
+                        kv: batchViews,
+                        knew: QWAttnPagedPrefillTests.tv(kNewBuf, T * kvRow),
+                        vnew: QWAttnPagedPrefillTests.tv(vNewBuf, T * kvRow),
+                        partials: partials,
+                        out: QWAttnPagedPrefillTests.tv(outBatchBuf, T * qChan),
+                        blockList: QWTensorValue(region: listRegion, offset: 0, shape: QWTensorShape([T * listStride], .i32)),
+                        blockCount: QWTensorValue(region: countRegion, offset: 0, shape: QWTensorShape([T], .i32)),
+                        cBase: cBase, T: T, splits: splits, listStride: listStride, writeKV: true)
+                    enc.memoryBarrier(scope: .buffers)
+                    try dec.encodeSparseBatched(
+                        enc,
+                        qgate: QWAttnPagedPrefillTests.tv(qBuf, T * qProj),
+                        kv: preViews,
+                        knew: QWAttnPagedPrefillTests.tv(kNewBuf, T * kvRow),
+                        vnew: QWAttnPagedPrefillTests.tv(vNewBuf, T * kvRow),
+                        partials: partials,
+                        out: QWAttnPagedPrefillTests.tv(outPreBuf, T * qChan),
+                        blockList: QWTensorValue(region: listRegion, offset: 0, shape: QWTensorShape([T * listStride], .i32)),
+                        blockCount: QWTensorValue(region: countRegion, offset: 0, shape: QWTensorShape([T], .i32)),
+                        cBase: cBase, T: T, splits: splits, listStride: listStride, writeKV: false)
+                    Self.hal.end(cb, enc)
+                    cb.waitUntilCompleted()
+                    XCTAssertNil(cb.error)
+
+                    let sPtr = outSerialBuf.contents().assumingMemoryBound(to: UInt16.self)
+                    let bPtr = outBatchBuf.contents().assumingMemoryBound(to: UInt16.self)
+                    let pPtr = outPreBuf.contents().assumingMemoryBound(to: UInt16.self)
+                    for idx in 0..<(T * qChan) {
+                        XCTAssertEqual(bPtr[idx], sPtr[idx], "0-ULP mismatch (writeKV=true) mode=\(mode) T=\(T) mod4=\(mod4) idx=\(idx)")
+                        XCTAssertEqual(pPtr[idx], sPtr[idx], "0-ULP mismatch (writeKV=false) mode=\(mode) T=\(T) mod4=\(mod4) idx=\(idx)")
+                    }
+                    cache.finish(seqSerial); cache.finish(seqBatched); cache.finish(seqPre)
+                }
+            }
+        }
+    }
+
+    func testIndexPrepQModesAndSparsePagedNAXHd128Parity() throws {
+        // Part 1: Verify .none / .tiled32 Q-modes match .allRows on pooledKeys, centroids, and block selections.
+        let chunk = 512
+        let qTV512 = QWAttnPagedPrefillTests.tv(QWAttnPagedPrefillTests.buf(QWAttnPagedPrefillTests.synthQGate(n: chunk, seed: 0x3141)), chunk * Self.geometry.qProjOut)
+        let kTV512 = QWAttnPagedPrefillTests.tv(QWAttnPagedPrefillTests.buf(QWAttnPagedPrefillTests.synthKV(n: chunk, seed: 0x5926)), chunk * Self.geometry.kvChannels)
+        let opRef = try Self.makeOperator(maxContext: 8192, budget: 512)
+        let opOpt = try Self.makeOperator(maxContext: 8192, budget: 512)
+        for sb in 0..<8 {
+            guard let (c1, e1) = Self.hal.begin(), let (c2, e2) = Self.hal.begin() else { XCTFail("hal.begin"); return }
+            opRef.encodeIndexAndCluster(e1, qgate: qTV512, kIn: kTV512, fullAttnLayer: 0, pos0: sb * chunk, rows: chunk, qMode: .allRows)
+            opOpt.encodeIndexAndCluster(e2, qgate: qTV512, kIn: kTV512, fullAttnLayer: 0, pos0: sb * chunk, rows: chunk, qMode: .none)
+            Self.hal.end(c1, e1); Self.hal.end(c2, e2); c1.waitUntilCompleted(); c2.waitUntilCompleted()
+        }
+        let pkRef = opRef.region.pointer.advanced(by: opRef.layers[0].pooledKeys.offset).assumingMemoryBound(to: UInt16.self)
+        let pkOpt = opOpt.region.pointer.advanced(by: opOpt.layers[0].pooledKeys.offset).assumingMemoryBound(to: UInt16.self)
+        for i in 0..<(1024 * opRef.indexDim) { XCTAssertEqual(pkOpt[i], pkRef[i], "pooledKeys mismatch at \(i)") }
+
+        for T in [50, 64] {
+            guard let (c1, e1) = Self.hal.begin(), let (c2, e2) = Self.hal.begin() else { XCTFail("hal.begin"); return }
+            let qSub = qTV512.slice(byteOffset: 0, count: T * Self.geometry.qProjOut)
+            let kSub = kTV512.slice(byteOffset: 0, count: T * Self.geometry.kvChannels)
+            opRef.encodeIndexAndCluster(e1, qgate: qSub, kIn: kSub, fullAttnLayer: 0, pos0: 4096, rows: T, qMode: .allRows)
+            e1.memoryBarrier(scope: .buffers)
+            opRef.encodeSelectBlocks(e1, fullAttnLayer: 0, pos0: 4096, rows: T, tiled32: true)
+            opOpt.encodeIndexAndCluster(e2, qgate: qSub, kIn: kSub, fullAttnLayer: 0, pos0: 4096, rows: T, qMode: .tiled32)
+            e2.memoryBarrier(scope: .buffers)
+            opOpt.encodeSelectBlocks(e2, fullAttnLayer: 0, pos0: 4096, rows: T, tiled32: true)
+            Self.hal.end(c1, e1); Self.hal.end(c2, e2); c1.waitUntilCompleted(); c2.waitUntilCompleted()
+            let rCnt = opRef.region.pointer.advanced(by: opRef.blockCountScratch.offset).assumingMemoryBound(to: UInt32.self)
+            let oCnt = opOpt.region.pointer.advanced(by: opOpt.blockCountScratch.offset).assumingMemoryBound(to: UInt32.self)
+            let rLst = opRef.region.pointer.advanced(by: opRef.blockListScratch.offset).assumingMemoryBound(to: Int32.self)
+            let oLst = opOpt.region.pointer.advanced(by: opOpt.blockListScratch.offset).assumingMemoryBound(to: Int32.self)
+            for tile in 0..<((T + 31) / 32) {
+                let refRow = min(tile * 32 + 31, T - 1)
+                XCTAssertEqual(oCnt[refRow], rCnt[refRow])
+                for b in 0..<Int(rCnt[refRow]) {
+                    XCTAssertEqual(oLst[refRow * opRef.listStride + b], rLst[refRow * opRef.listStride + b])
+                }
+            }
+        }
+
+        // Part 2: headDim = 128 (_hd128) NAX sparse paged prefill parity vs scalar general kernel across f16/q8/q4.
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable, "NAX _hd128 test requires Metal 4 tensor hardware")
+        let geo = try QWAttnPagedPrefillGeneralTests.tinyGeometry(gated: true)
+        XCTAssertEqual(geo.headDim, 128)
+        let hal128 = try QWHal(geometry: geo)
+        let nax = try QWAttnPagedPrefill(hal: hal128, geometry: geo)
+        let gen = try QWAttnPagedPrefillGeneral(hal: hal128, geometry: geo)
+        let pos = 256, T = 48, sp = 64, ceiling = pos + T + 256, qChan = geo.qChannels
+        let fix = QWAttnPagedPrefillGeneralTests.fixture(geometry: geo, keys: pos + T, queries: T)
+        let qPad = fix.qRows + [UInt16](repeating: 0, count: (sp - T) * geo.qProjOut)
+        let qBuf = hal128.device.makeBuffer(bytes: qPad, length: qPad.count * 2, options: .storageModeShared)!
+        let qTV = QWTensorValue(region: QWMRegion(buffer: qBuf, base: 0, length: qBuf.length),
+                                offset: 0, shape: QWTensorShape([sp * geo.qProjOut], .f16))
+        let prefixBlocks: [Int32] = [0, 5, 11, 20, 40, 62, 63]
+        let listStride = prefixBlocks.count + 16
+        var bList = [Int32](repeating: 0, count: T * listStride)
+        var bCount = [UInt32](repeating: 0, count: T)
+        for r in 0..<T {
+            let curBlocks = ((pos + r + 1) >> 2) - 64
+            bCount[r] = UInt32(prefixBlocks.count + curBlocks)
+            for (idx, blk) in prefixBlocks.enumerated() { bList[r * listStride + idx] = blk }
+            for idx in 0..<12 { bList[r * listStride + prefixBlocks.count + idx] = Int32(64 + idx) }
+        }
+        let lBuf = hal128.device.makeBuffer(bytes: bList, length: bList.count * 4, options: .storageModeShared)!
+        let cBuf = hal128.device.makeBuffer(bytes: bCount, length: bCount.count * 4, options: .storageModeShared)!
+        let lTV = QWTensorValue(region: QWMRegion(buffer: lBuf, base: 0, length: lBuf.length), offset: 0, shape: QWTensorShape([T * listStride], .i32))
+        let cTV = QWTensorValue(region: QWMRegion(buffer: cBuf, base: 0, length: cBuf.length), offset: 0, shape: QWTensorShape([T], .i32))
+
+        for mode in [QWKVMode.f16, .q8, .q4] {
+            let needPages = (ceiling + 255) / 256
+            let arena = try QWArena(hal: hal128, weights: 0, activations: 0,
+                                    kv: QWKVCache.pageBytes(mode: mode, geometry: geo) * needPages * 2
+                                        + QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs, gdnStates: 0)
+            let cache = try QWKVCache(hal: hal128, arena: arena, layers: [0], mode: mode, geometry: geo)
+            let seq = try cache.allocate(promptTokens: ceiling)
+            try cache.append(seq, positions: 0..<(pos + T), layer: 0, kind: .k, src: fix.kRows.flatMap { $0 })
+            try cache.append(seq, positions: 0..<(pos + T), layer: 0, kind: .v, src: fix.vRows.flatMap { $0 })
+            let views = try cache.layerViews(seq, layer: 0)
+            let oNaxBuf = hal128.device.makeBuffer(length: T * qChan * 2, options: .storageModeShared)!
+            let oGenBuf = hal128.device.makeBuffer(length: T * qChan * 2, options: .storageModeShared)!
+            let oNaxTV = QWTensorValue(region: QWMRegion(buffer: oNaxBuf, base: 0, length: oNaxBuf.length), offset: 0, shape: QWTensorShape([T * qChan], .f16))
+            let oGenTV = QWTensorValue(region: QWMRegion(buffer: oGenBuf, base: 0, length: oGenBuf.length), offset: 0, shape: QWTensorShape([T * qChan], .f16))
+            guard let (cb, enc) = hal128.begin() else { XCTFail("hal128.begin"); return }
+            try nax.encodeSparse(enc, qgate: qTV, kv: views, out: oNaxTV, blockList: lTV, blockCount: cTV, pos: pos, T: T, listStride: listStride)
+            try gen.encodeSparse(enc, qgate: qTV, kv: views, out: oGenTV, blockList: lTV, blockCount: cTV, pos: pos, T: T, listStride: listStride)
+            hal128.end(cb, enc); cb.waitUntilCompleted(); XCTAssertNil(cb.error)
+            let nPtr = oNaxBuf.contents().assumingMemoryBound(to: UInt16.self)
+            let gPtr = oGenBuf.contents().assumingMemoryBound(to: UInt16.self)
+            var worst: Float = 0
+            for i in 0..<(T * qChan) {
+                worst = max(worst, abs(QWQuant.f16tof32Bits(nPtr[i]) - QWQuant.f16tof32Bits(gPtr[i])))
+            }
+            XCTAssertLessThan(worst, 2e-3, "_hd128 sparse NAX vs general failed for \(mode), maxDiff=\(worst)")
+            cache.finish(seq)
+        }
+    }
 }

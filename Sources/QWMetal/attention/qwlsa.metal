@@ -52,47 +52,61 @@ kernel void qwg_lsa_index_prep(device const half* qgate      [[buffer(0)]],
                                constant uint&     sliceDim   [[buffer(14)]],
                                constant uint&     indexDim   [[buffer(15)]],
                                constant uint&     ringMask   [[buffer(16)]],
+                               constant uint&     qMode      [[buffer(17)]],
                                uint t   [[threadgroup_position_in_grid]],
                                uint tid [[thread_index_in_threadgroup]]) {
     if (t >= T) return;
-    threadgroup float qSlice[2048];
-    threadgroup float kSlice[2048];
+    threadgroup float sliceBuf[2048];
     threadgroup float qProj[128];
     threadgroup float partial[4];
 
     const uint inputDim = min(kvHeads * sliceDim, 2048u);
     const uint gqaRatio = max(1u, qHeads / max(1u, kvHeads));
     const float invGqa = 1.0f / float(gqaRatio);
-    device const half* qRow = qgate + uint64_t(t) * qProjOut;
     device const half* kRow = kIn + uint64_t(t) * (kvHeads * headDim);
 
     for (uint idx = tid; idx < inputDim; idx += 128u) {
         const uint kvh = idx / sliceDim;
-        const uint c = idx - kvh * sliceDim;
-        const uint d = sliceStart + c;
-        kSlice[idx] = float(kRow[kvh * headDim + d]);
+        const uint d = sliceStart + (idx - kvh * sliceDim);
+        sliceBuf[idx] = float(kRow[kvh * headDim + d]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < indexDim) {
+        device const half* wkRow = wkIdx + uint64_t(tid) * inputDim;
+        float accK = 0.0f;
+        for (uint j = 0u; j < inputDim; j++) {
+            accK = fma(sliceBuf[j], float(wkRow[j]), accK);
+        }
+        const uint ringSlot = (pos0 + t) & ringMask;
+        kPending[ringSlot * indexDim + tid] = half(accK);
+    }
+
+    const bool needQ = (qMode == 1u) || (qMode == 2u && (((t & 31u) == 31u) || (t + 1u == T)));
+    if (!needQ) return;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const half* qRow = qgate + uint64_t(t) * qProjOut;
+    for (uint idx = tid; idx < inputDim; idx += 128u) {
+        const uint kvh = idx / sliceDim;
+        const uint d = sliceStart + (idx - kvh * sliceDim);
         float qSum = 0.0f;
         const uint hBase = kvh * gqaRatio;
         for (uint r = 0u; r < gqaRatio; r++) {
             qSum += float(qRow[(hBase + r) * qStride * headDim + d]);
         }
-        qSlice[idx] = qSum * invGqa;
+        sliceBuf[idx] = qSum * invGqa;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float qVal = 0.0f;
-    float kVal = 0.0f;
     if (tid < indexDim) {
         device const half* wqRow = wqIdx + uint64_t(tid) * inputDim;
-        device const half* wkRow = wkIdx + uint64_t(tid) * inputDim;
         float accQ = 0.0f;
-        float accK = 0.0f;
         for (uint j = 0u; j < inputDim; j++) {
-            accQ = fma(qSlice[j], float(wqRow[j]), accQ);
-            accK = fma(kSlice[j], float(wkRow[j]), accK);
+            accQ = fma(sliceBuf[j], float(wqRow[j]), accQ);
         }
         qVal = accQ;
-        kVal = accK;
         qProj[tid] = qVal;
     }
 
@@ -102,11 +116,8 @@ kernel void qwg_lsa_index_prep(device const half* qgate      [[buffer(0)]],
 
     const float qNormSq = partial[0] + partial[1] + partial[2] + partial[3];
     const float qInv = rsqrt(max(qNormSq, 1e-12f));
-    const uint ringSlot = (pos0 + t) & ringMask;
-
     if (tid < indexDim) {
         qIdxOut[t * indexDim + tid] = half(qProj[tid] * qInv);
-        kPending[ringSlot * indexDim + tid] = half(kVal);
     }
 }
 

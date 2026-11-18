@@ -237,7 +237,8 @@ final class QWAQGDNTwinTests: XCTestCase {
         let x16 = try act.allocate(QWTensorShape([tokens * f.k], .f16))
         let qkv16 = try act.allocate(QWTensorShape([tokens * qkv], .f16))
         let z16 = try act.allocate(QWTensorShape([tokens * zCh], .f16))
-        let y32 = try act.allocate(QWTensorShape([tokens * f.n], .f32))
+        let abCols = max(1, f.n - qkv - zCh)
+        let y32 = try act.allocate(QWTensorShape([tokens * abCols], .f32))
         try step(f.hal) { enc in
             try QWGemm.encodeCast(enc, hal: f.hal, x32: x32, y16: x16, count: tokens * f.k)
         }
@@ -257,7 +258,7 @@ final class QWAQGDNTwinTests: XCTestCase {
         }
         return PrefillResult(qkv16: arena.read(qkv16, as: Float16.self, count: tokens * qkv),
                              z16: arena.read(z16, as: Float16.self, count: tokens * zCh),
-                             y32: arena.read(y32, as: Float.self, count: tokens * f.n))
+                             y32: arena.read(y32, as: Float.self, count: tokens * abCols))
     }
 
     /// The decode twin: the GDN's in-projection over one row of activations.
@@ -322,10 +323,12 @@ final class QWAQGDNTwinTests: XCTestCase {
                     XCTAssertLessThan(err, 1e-3,
                                       "\(bits)-bit group \(group), token \(t), z column \(c)")
                 }
-                for c in (geometry.gdnQKVChannels + geometry.gdnZChannels)..<f.n {
+                let abStart = geometry.gdnQKVChannels + geometry.gdnZChannels
+                let abCols = max(1, f.n - abStart)
+                for c in abStart..<f.n {
                     let ref = hostRow(bits: bits, group: group, row: c, k: f.k, bank: f.bank, x: row)
                     let want = hostRowNarrowed(bits: bits, group: group, row: c, k: f.k, bank: f.bank, x: row)
-                    let err = relativeError(got.y32[t * f.n + c], want, magnitude: ref.magnitude)
+                    let err = relativeError(got.y32[t * abCols + (c - abStart)], want, magnitude: ref.magnitude)
                     XCTAssertLessThan(err, 1e-3,
                                       "\(bits)-bit group \(group), token \(t), ab column \(c)")
                 }

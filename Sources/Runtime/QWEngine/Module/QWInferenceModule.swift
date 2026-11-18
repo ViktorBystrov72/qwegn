@@ -118,6 +118,12 @@ extension QWInferenceModule {
         environment: [String: String], modelSwitch: Bool
     ) throws -> QWResolvedSpeculation {
         var parameters = requested
+        let lowerBackend = parameters.mtpBackend?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if lowerBackend == "ngram" {
+            parameters.mtpDraftStrategy = "ngram"
+            parameters.mtpBackend = "standard"
+        }
+        let isNgramStrategy = parameters.mtpDraftStrategy.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "ngram"
         let isDFlashFamily = ["dflash2", "dflash", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "")
         if modelSwitch {
             if isDFlashFamily {
@@ -131,11 +137,15 @@ extension QWInferenceModule {
                 }
             }
             let stillDFlash = ["dflash2", "dflash", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "")
-            let maximum = stillDFlash ? 15 : max(1, descriptor.maxSpeculativeDrafts)
+            let supportsWeightFreeNgramSwitch = !descriptor.capabilities.contains(.mtp)
+                && Self.capabilities.contains(.speculative) && isNgramStrategy
+            let maximum = stillDFlash ? 15 : (supportsWeightFreeNgramSwitch ? 7 : max(1, descriptor.maxSpeculativeDrafts))
             parameters.mtpDrafts = min(parameters.mtpDrafts, maximum)
         }
+        let supportsWeightFreeNgram = Self.capabilities.contains(.speculative) && isNgramStrategy
         let supportsMTP = descriptor.capabilities.contains(.mtp)
             || ["dflash2", "dflash", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "")
+            || supportsWeightFreeNgram
         let drafts = parameters.enabled && supportsMTP ? parameters.mtpDrafts : 0
         var backend: QWMTPBackend?
         if drafts > 0, let name = parameters.mtpBackend, !name.isEmpty {

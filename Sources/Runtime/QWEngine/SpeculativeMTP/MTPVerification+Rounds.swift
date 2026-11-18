@@ -40,6 +40,18 @@ extension QWEngineDriver {
             }
         }
         let count = verifyWindow.rows - 1
+        if lsaOperator != nil,
+           session.position < lsaConfig.denseBypassThreshold,
+           session.position + verifyWindow.rows > lsaConfig.denseBypassThreshold {
+            return false
+        }
+        if isWeightFreeSpeculation {
+            guard session.stochastic == nil, activeConstraint == nil,
+                  let pending = session.roundRecord.pendingToken,
+                  proposeWeightFreeDrafts(session: session, pending: pending, count: count) != nil else {
+                return false
+            }
+        }
         let draftCapacity = (dflashDrafter != nil ? nil : mtpDraftEncoder?.positionCapacity) ?? ropeRows
         return session.position > 0
             && session.position <= ropeRows - verifyWindow.rows
@@ -83,7 +95,7 @@ extension QWEngineDriver {
                     session.stateFailed = true
                 }
                 pendingCommitCB = cb
-            } else if echoDrafter != nil || mtpDraftEncoder != nil || dflashDrafter != nil {
+            } else if echoDrafter != nil || mtpDraftEncoder != nil || dflashDrafter != nil || isWeightFreeSpeculation {
                 cb.waitUntilCompleted()
                 if cb.status != .completed {
                     session.stateFailed = true
@@ -99,13 +111,15 @@ extension QWEngineDriver {
             }
         }
         let dflashReady = (dflashDrafter == nil) || (session.dflashSlot != nil && session.dflashCacheOffset == session.position)
+        let hasValidMTPCache = (mtpCache != nil && session.mtpKV != nil)
+            || (isWeightFreeSpeculation && !stochastic && mtpCache == nil && session.mtpKV == nil)
         guard (session.stochastic != nil) == stochastic,
               session.stochastic?.stream.isRoundActive != true,
               session.stochastic?.stream.drawsConsumed == (stochastic ? session.roundRecord.samplerDrawIndex : nil),
               verifiedSession == nil, let verifyWindow,
-              (mtpDraftEncoder != nil || echoDrafter != nil || dflashDrafter != nil),
-              dflashReady,
-              let mtpCache, let handle = session.mtpKV, let hidden = session.trunkHidden,
+              (mtpDraftEncoder != nil || echoDrafter != nil || dflashDrafter != nil || (isWeightFreeSpeculation && !stochastic)),
+              dflashReady, hasValidMTPCache,
+              let hidden = session.trunkHidden,
               let pending = session.roundRecord.pendingToken,
               !session.sessionFinished, !session.stateFailed, !session.verificationPending,
               session.trunkHiddenValid, session.position > 0,
@@ -128,14 +142,18 @@ extension QWEngineDriver {
         let pairSlotsNeeded = echoDrafter != nil ? verifyWindow.rows : nextNMaxPairs
         do {
             try kvCache.validate(session.kv)
-            try mtpCache.validate(handle)
+            if let mtpCache, let handle = session.mtpKV {
+                try mtpCache.validate(handle)
+                guard mtpCache.written(handle) == basePairs,
+                      basePairs >= 0, basePairs <= QWKVCache.maxTokensPerSeq - pairSlotsNeeded else {
+                    throw QWEngineDriverError.state("greedy round cache or RoPE boundary mismatch")
+                }
+            }
         } catch {
             pendingCommitCB?.waitUntilCompleted()
             throw error
         }
         guard kvCache.written(session.kv) == session.position,
-              mtpCache.written(handle) == basePairs,
-              basePairs >= 0, basePairs <= QWKVCache.maxTokensPerSeq - pairSlotsNeeded,
               session.position <= (activeDraftEncoder?.positionCapacity ?? ropeRows) - count else {
             pendingCommitCB?.waitUntilCompleted()
             throw QWEngineDriverError.state("greedy round cache or RoPE boundary mismatch")
@@ -144,10 +162,13 @@ extension QWEngineDriver {
             || (mlaOperator.map { $0.stateOwner !== session } ?? false)
             || (lsaOperator.map { $0.stateOwner !== session } ?? false)
             || (mbsaOperator.map { $0.stateOwner !== session } ?? false)
+        let needsMTPCacheWait = (mtpCache != nil && session.mtpKV != nil) && (
+            basePairs + pairSlotsNeeded > session.mtpKV!.tokenCapacity
+            || mtpCache!.hasSharedPages(session.mtpKV!, positions: basePairs..<(basePairs + pairSlotsNeeded))
+        )
         if needsSparseClaim
             || session.position + verifyWindow.rows > session.kv.tokenCapacity
-            || basePairs + pairSlotsNeeded > handle.tokenCapacity
-            || mtpCache.hasSharedPages(handle, positions: basePairs..<(basePairs + pairSlotsNeeded)) {
+            || needsMTPCacheWait {
             try drainPendingCommitIfNeeded()
         }
         try claimMLAIndexerState(session)
@@ -157,22 +178,26 @@ extension QWEngineDriver {
             try kvCache.grow(session.kv, to: session.position + verifyWindow.rows)
             session.attnKVViews = try kvCache.layerViewsAll(session.kv, layers: attnLayers)
         }
-        if basePairs + pairSlotsNeeded > handle.tokenCapacity {
-            try mtpCache.grow(handle, to: basePairs + pairSlotsNeeded)
-            session.mtpKVViews = [try mtpCache.layerViews(handle, layer: 0)]
-        }
         try kvCache.prepareWrites(session.kv, positions: session.position..<(session.position + verifyWindow.rows))
-        try mtpCache.prepareWrites(handle, positions: basePairs..<(basePairs + pairSlotsNeeded))
         if session.attnKVViews.isEmpty {
             session.attnKVViews = try kvCache.layerViewsAll(session.kv, layers: attnLayers)
         }
-        let views: (k: QWKVLayerView, v: QWKVLayerView)
-        if let current = session.mtpKVViews.first {
-            views = current
+        let views: (k: QWKVLayerView, v: QWKVLayerView)?
+        if let mtpCache, let handle = session.mtpKV {
+            if basePairs + pairSlotsNeeded > handle.tokenCapacity {
+                try mtpCache.grow(handle, to: basePairs + pairSlotsNeeded)
+                session.mtpKVViews = [try mtpCache.layerViews(handle, layer: 0)]
+            }
+            try mtpCache.prepareWrites(handle, positions: basePairs..<(basePairs + pairSlotsNeeded))
+            if let current = session.mtpKVViews.first {
+                views = current
+            } else {
+                let v = try mtpCache.layerViews(handle, layer: 0)
+                session.mtpKVViews = [v]
+                views = v
+            }
         } else {
-            let v = try mtpCache.layerViews(handle, layer: 0)
-            session.mtpKVViews = [v]
-            views = v
+            views = nil
         }
         let boundary = try greedyRoundBoundary(session)
         lastMTPRoundProfile = nil
@@ -197,7 +222,8 @@ extension QWEngineDriver {
             }
             let window: QWVerifyWindow
             if owner == nil, !mtpStageProfiling, !mtpVerificationProfiling, coldEvents == nil,
-               !mtpAdaptiveDepth, activeConstraint == nil, dflashDrafter == nil,
+               !mtpAdaptiveDepth, activeConstraint == nil, dflashDrafter == nil, !isWeightFreeSpeculation,
+               let mtpCache, let handle = session.mtpKV, let views,
                let table = mtpDeviceEmbedding,
                let draftPlan = try prepareAsyncNeuralDraft(
                    session: session, hidden: hidden, views: views, pending: pending,
@@ -244,6 +270,10 @@ extension QWEngineDriver {
                     proposals = proposed.proposals
                     draftedPairs = proposed.draftedPairs
                 } else if let echoDrafter {
+                    guard let views else {
+                        try? drainPendingCommitIfNeeded()
+                        throw QWEngineDriverError.state("ECHO round requires MTP KV views")
+                    }
                     let proposed = try proposeEchoOrPLDRound(
                         session: session, echoDrafter: echoDrafter, hidden: hidden,
                         views: views, pending: pending, count: count, basePairs: basePairs,
@@ -251,8 +281,19 @@ extension QWEngineDriver {
                     drafts = proposed.drafts
                     proposals = proposed.proposals
                     draftedPairs = proposed.draftedPairs
+                } else if isWeightFreeSpeculation {
+                    guard let chosen = proposeWeightFreeDrafts(session: session, pending: pending, count: count) else {
+                        try? drainPendingCommitIfNeeded()
+                        throw QWEngineDriverError.state("weight-free round had no context or recycler drafts")
+                    }
+                    drafts = chosen
+                    proposals = []
+                    draftedPairs = 0
+                    lastRoundUsedPLD = true
+                    mtpDraftProposals += drafts.count
                 } else {
-                    guard let mtpDraftEncoder else {
+                    guard let mtpDraftEncoder, let views else {
+                        try? drainPendingCommitIfNeeded()
                         throw QWEngineDriverError.state("MTP draft encoder is absent")
                     }
                     let proposed = try proposeNextNOrPLDRound(
@@ -263,7 +304,9 @@ extension QWEngineDriver {
                     proposals = proposed.proposals
                     draftedPairs = proposed.draftedPairs
                 }
-                mtpCache.markWritten(handle, upTo: basePairs + draftedPairs)
+                if let mtpCache, let handle = session.mtpKV {
+                    mtpCache.markWritten(handle, upTo: basePairs + draftedPairs)
+                }
                 if canOverlapPriorCommit {
                     let embedTable = mtpDeviceEmbedding
                     let commitCB = pendingCommitCB
@@ -280,7 +323,8 @@ extension QWEngineDriver {
             let decision: QWGreedyRoundDecision
             let evidence: QWStochasticRoundEvidence?
             let rawTargetsForLease: [Int]?
-            let margin = effectiveRelaxedMargin
+            let margin: Float = lastRoundUsedPLD ? 0 : effectiveRelaxedMargin
+            let minProb: Float = margin > 0 ? effectiveRelaxedMinProb : 0
             if let owner {
                 var targets: [QWSamplingDistribution] = []
                 for row in 0..<(drafts.count + 1) {
@@ -307,7 +351,7 @@ extension QWEngineDriver {
                     drafts: drafts, maxNew: maxNew, stopIDs: stopIDs,
                     activeRows: drafts.count + 1,
                     relaxedMargin: margin,
-                    relaxedMinProb: effectiveRelaxedMinProb)
+                    relaxedMinProb: minProb)
                 var rawDecision = withTargets.decision
                 rawTargetsForLease = withTargets.targets
                 if let boundary = activeConstraint?.constraint.speculationBoundaryToken,
@@ -328,9 +372,16 @@ extension QWEngineDriver {
             if let profileStart, let verifyStart, let draftAccumulator, let verifyAccumulator {
                 let rawDraftHostMs = Double(verifyStart - profileStart) / 1_000_000
                 let rawVerifyHostMs = Double(DispatchTime.now().uptimeNanoseconds - verifyStart) / 1_000_000
+                let draftTiming: QWMTPStageTiming
+                if isWeightFreeSpeculation && draftAccumulator.commandBuffers == 0 {
+                    draftTiming = try QWMTPStageTiming.hostOnly(hostMs: rawDraftHostMs)
+                } else {
+                    draftTiming = try QWMTPStageTiming(
+                        hostMs: max(draftAccumulator.gpuMs, rawDraftHostMs),
+                        gpuMs: draftAccumulator.gpuMs, commandBuffers: draftAccumulator.commandBuffers)
+                }
                 pendingMTPProfile = (
-                    try QWMTPStageTiming(hostMs: max(draftAccumulator.gpuMs, rawDraftHostMs),
-                                         gpuMs: draftAccumulator.gpuMs, commandBuffers: draftAccumulator.commandBuffers),
+                    draftTiming,
                     try QWMTPStageTiming(hostMs: max(verifyAccumulator.gpuMs, rawVerifyHostMs),
                                          gpuMs: verifyAccumulator.gpuMs, commandBuffers: verifyAccumulator.commandBuffers))
             }
@@ -354,11 +405,13 @@ extension QWEngineDriver {
         defer { flight.unlock() }
         try requestGate.validate(permit)
         let profileStart = mtpStageProfiling ? DispatchTime.now().uptimeNanoseconds : nil
+        let hasValidMTPCache = (mtpCache != nil && session.mtpKV != nil)
+            || (isWeightFreeSpeculation && !stochastic && mtpCache == nil && session.mtpKV == nil)
         guard (preparedStochasticWitness != nil) == stochastic,
               (session.stochastic != nil) == stochastic,
               verifiedSession === session, session.verificationPending,
               !session.stateFailed, !session.sessionFinished,
-              let verifyWindow, let gdnReplayCheckpoint, let mtpCache, let mtpHandle = session.mtpKV,
+              let verifyWindow, let gdnReplayCheckpoint, hasValidMTPCache,
               let preparedGreedyLease,
               let trunkHidden = session.trunkHidden, (2...verifyWindow.rows).contains(verifiedInputs.count),
               verifiedInputs.first == session.roundRecord.pendingToken else {
@@ -372,13 +425,15 @@ extension QWEngineDriver {
         let decision = round.decision
         let drafts = Array(verifiedInputs.dropFirst())
         if !stochastic {
+            let commitMargin: Float = lastRoundUsedPLD ? 0 : effectiveRelaxedMargin
+            let commitMinProb: Float = commitMargin > 0 ? effectiveRelaxedMinProb : 0
             let rawTargets: [Int]
             if let cachedTargets = preparedGreedyLease.rawTargets, cachedTargets.count == verifiedInputs.count {
                 rawTargets = cachedTargets
             } else {
                 let (full, computedTargets) = try verifyWindow.greedyDecisionWithTargets(
                     drafts: drafts, maxNew: verifiedInputs.count, activeRows: verifiedInputs.count,
-                    relaxedMargin: effectiveRelaxedMargin, relaxedMinProb: effectiveRelaxedMinProb)
+                    relaxedMargin: commitMargin, relaxedMinProb: commitMinProb)
                 guard decision.acceptedDrafts == full.acceptedDrafts,
                       decision.tokens == Array(full.tokens.prefix(decision.tokens.count)),
                       decision.tokens.count <= full.tokens.count else {
@@ -386,7 +441,7 @@ extension QWEngineDriver {
                 }
                 rawTargets = computedTargets
             }
-            if effectiveRelaxedMargin == 0, activeConstraint == nil {
+            if commitMargin == 0, activeConstraint == nil {
                 let pendingInHistory = session.tokenHistory.count > session.position
                     && session.tokenHistory.last == verifiedInputs[0]
                 let prevBeforePending: Int? = pendingInHistory
@@ -403,7 +458,9 @@ extension QWEngineDriver {
             throw QWEngineDriverError.state("round output count overflows")
         }
         try kvCache.validate(session.kv)
-        try mtpCache.validate(mtpHandle)
+        if let mtpCache, let mtpHandle = session.mtpKV {
+            try mtpCache.validate(mtpHandle)
+        }
         let basePairs = session.roundRecord.mtpPhysicalRows
         let usesManagedPairs = echoDrafter != nil || (mtpDraftEncoder != nil && dflashDrafter == nil
             && (lastRoundUsedPLD || lastDraftedPairs < drafts.count || (mtpQuadraticSeeding && !mtpStageProfiling)))
@@ -413,10 +470,14 @@ extension QWEngineDriver {
             : (usesManagedPairs && mtpDraftEncoder != nil
                 ? min(verifiedInputs.count, max(drafts.count, mtpDraftEncoder!.positionCapacity - session.position))
                 : drafts.count)
-        guard basePairs >= 0, basePairs <= QWKVCache.maxTokensPerSeq - maxAddedPairs,
-              kvCache.written(session.kv) == session.position + verifiedInputs.count,
-              mtpCache.written(mtpHandle) == basePairs + draftedPairs else {
+        guard kvCache.written(session.kv) == session.position + verifiedInputs.count else {
             throw QWEngineDriverError.state("greedy commit requires complete trunk and draft pair windows")
+        }
+        if let mtpCache, let mtpHandle = session.mtpKV {
+            guard basePairs >= 0, basePairs <= QWKVCache.maxTokensPerSeq - maxAddedPairs,
+                  mtpCache.written(mtpHandle) == basePairs + draftedPairs else {
+                throw QWEngineDriverError.state("greedy commit requires complete trunk and draft pair windows")
+            }
         }
         let retained = decision.retainedRows
         let retainedPairs: Int
@@ -424,8 +485,10 @@ extension QWEngineDriver {
             retainedPairs = retained
         } else if usesManagedPairs, let mtpDraftEncoder {
             retainedPairs = min(retained, max(0, mtpDraftEncoder.positionCapacity - session.position))
-        } else {
+        } else if mtpCache != nil {
             retainedPairs = try decision.retainedPairRows(drafts: drafts.count)
+        } else {
+            retainedPairs = 0
         }
         guard let cb = hal.queue.makeCommandBuffer() else { throw QWEngineDriverError.state("greedy commit command buffer") }
         if let echoDrafter {
@@ -485,15 +548,17 @@ extension QWEngineDriver {
                 mlaOperator?.truncatePosition(session.position + retained)
                 hcaOperator?.truncatePosition(session.position + retained)
             }
-            if echoDrafter != nil || usesManagedPairs {
-                try finalizeMTPPairCursor(session: session, mtpCache: mtpCache, mtpHandle: mtpHandle,
-                                          basePairs: basePairs, draftedPairs: draftedPairs,
-                                          retainedPairs: retainedPairs)
-            } else {
-                let pairRollback = drafts.count - retainedPairs
-                if pairRollback > 0 {
-                    try mtpCache.rollback(mtpHandle, by: pairRollback)
-                    session.mtpKVViews = [try mtpCache.layerViews(mtpHandle, layer: 0)]
+            if let mtpCache, let mtpHandle = session.mtpKV {
+                if echoDrafter != nil || usesManagedPairs {
+                    try finalizeMTPPairCursor(session: session, mtpCache: mtpCache, mtpHandle: mtpHandle,
+                                              basePairs: basePairs, draftedPairs: draftedPairs,
+                                              retainedPairs: retainedPairs)
+                } else {
+                    let pairRollback = drafts.count - retainedPairs
+                    if pairRollback > 0 {
+                        try mtpCache.rollback(mtpHandle, by: pairRollback)
+                        session.mtpKVViews = [try mtpCache.layerViews(mtpHandle, layer: 0)]
+                    }
                 }
             }
             lastRoundUsedPLD = false

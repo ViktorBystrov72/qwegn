@@ -297,7 +297,10 @@ extension QWEngineDriver {
         }
 
         let wyElems = (!geometry.gdnVectorDecay && geometry.gdnLayerCount > 0 && maxT > 4096) ? (maxT * zC) : 0
-        let pGdnY = try attnTv(geometry.gdnVectorDecay ? 0 : maxT * geometry.gdnTotalN, .f32)
+        let gdnYElems = geometry.gdnVectorDecay
+            ? 0
+            : max(maxT * 2 * gdnVH, QWBatchHeadScratch.maxBatchRows * geometry.gdnTotalN)
+        let pGdnY = try attnTv(gdnYElems, .f32)
         let pAttnY16 = try attnTv(usesMLA ? 0 : maxT * geometry.attnProjTotalN, .f16)
         let pQkv16 = try attnTv(maxT * qkvC, .f16)
         let pZ16 = try attnTv(maxT * zC, .f16)
@@ -316,7 +319,8 @@ extension QWEngineDriver {
         let pB = try attnTv(wyElems, .f32)
         let pFgb16 = geometry.gdnVectorDecay ? try attnTv(maxT * fgbC, .f16) : nil
 
-        let pGuRaw16 = try mlpTv(maxT * max(2 * I, 2 * H), .f16)
+        let usesFusedSwiGLU = (I & 31) == 0 && useGroupedNAX
+        let pGuRaw16 = try mlpTv(maxT * (usesFusedSwiGLU ? (2 * H) : max(2 * I, 2 * H)), .f16)
         let pGu16 = try mlpTv(maxT * I, .f16)
         let pMoe: MoEScratch? = geometry.numExperts > 0
             ? try Self.makeMoEScratch(mlpTv, persistentAlloc: moePersistentTv, rows: maxT, geometry: geometry, useGroupedNAX: useGroupedNAX)

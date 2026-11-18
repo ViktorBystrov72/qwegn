@@ -342,13 +342,11 @@ kernel void qwg_gdn_conv_headnorm(const device half* x       [[buffer(0)]],   //
         if (h < QW_GDN_V_HEADS) {
             const float al = aLog[h];
             const float db = dtBias[h];
-            const uint aRow0 = QW_GDN_QKV_CH + QW_GDN_Z_CH;
-            const uint bRow0 = aRow0 + QW_GDN_V_HEADS;
-            const uint totalN = bRow0 + QW_GDN_V_HEADS;
+            const uint abStride = 2u * QW_GDN_V_HEADS;
             for (uint t = t0; t < t1; t++) {
-                const size_t in_row = (size_t)t * totalN;
-                const float av = gdnY32[in_row + aRow0 + h];
-                const float bv = gdnY32[in_row + bRow0 + h];
+                const size_t in_row = (size_t)t * abStride;
+                const float av = gdnY32[in_row + h];
+                const float bv = gdnY32[in_row + QW_GDN_V_HEADS + h];
                 const size_t outIdx = (size_t)t * QW_GDN_V_HEADS + h;
                 betas[outIdx] = 1.0f / (1.0f + metal::exp(-bv));
                 const float sp = metal::log(1.0f + metal::exp(av + db));

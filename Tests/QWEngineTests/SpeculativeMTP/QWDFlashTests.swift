@@ -712,4 +712,83 @@ final class QWDFlashTests: XCTestCase {
         file.append(hdr)
         try file.write(to: rootDir.appendingPathComponent("model.qwp"))
     }
+
+    func testVirtualLayerCaptureValidationAndSlotMappingForLoopedTarget() throws {
+        let lt = (0..<32).map { ($0 + 1) % 4 == 0 ? "\"full_attention\"" : "\"linear_attention\"" }.joined(separator: ",")
+        let loopCfg = """
+        {"architectures":["SenseNovaLoopForConditionalGeneration"],"model_type":"sensenova_loop",
+         "loop_settings":{"start":4,"end":28,"eval_count":2,"counts":[2]},
+         "mhc":{"start":4,"end":28,"streams":2,"iterations":20,"fixed_identity":false,"pre_scale":1.0},
+         "text_config":{"model_type":"qwen3_5_text","hidden_size":256,"intermediate_size":256,
+          "num_hidden_layers":32,"mtp_num_hidden_layers":0,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":64,
+          "attn_output_gate":true,"vocab_size":256,"rms_norm_eps":1e-6,"rope_theta":1000000,"partial_rotary_factor":0.25,
+          "max_position_embeddings":32768,"full_attention_interval":4,"layer_types":[\(lt)],"tie_word_embeddings":false,
+          "bos_token_id":1,"eos_token_id":2,"linear_conv_kernel_dim":4,"linear_key_head_dim":32,
+          "linear_num_key_heads":2,"linear_num_value_heads":4,"linear_value_head_dim":32}}
+        """.data(using: .utf8)!
+        let targetDesc = try QWModelDescriptor.decode(configJSON: loopCfg)
+        XCTAssertEqual(targetDesc.numLayers, 32)
+        XCTAssertEqual(targetDesc.executionPlan.count, 56)
+
+        let modelsDir = FileManager.default.temporaryDirectory.appendingPathComponent("qwg-dflash-loop-\(UUID().uuidString)")
+        let packDir = modelsDir.appendingPathComponent("SenseNova-Loop-Test-DFlash2-hq4g32")
+        let assets = packDir.appendingPathComponent("assets")
+        defer { try? FileManager.default.removeItem(at: modelsDir) }
+        try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+
+        func makeDraftCfg(_ tapIds: [Int]) -> Data {
+            """
+            {"model_type":"qwen3","vocab_size":256,"hidden_size":256,"intermediate_size":256,
+             "num_hidden_layers":\(tapIds.count),"num_attention_heads":2,"num_key_value_heads":2,"head_dim":128,
+             "rms_norm_eps":1e-6,"rope_theta":1000000,"sliding_window":64,
+             "dflash_config":{"block_size":8,"target_layer_ids":\(tapIds),"conv_kernel_size":0,"selector_rank":64,"selector_top_k":8}}
+            """.data(using: .utf8)!
+        }
+        let cfg41 = makeDraftCfg([41])
+        try cfg41.write(to: assets.appendingPathComponent("config.json"))
+        XCTAssertTrue(QWDFlashConfig.load(from: packDir).usesVirtualCapture(for: targetDesc))
+        let drafterDesc = try QWModelDescriptor.decodeDrafter(configJSON: cfg41)
+
+        var file = Data("QWP1".utf8) + Data(repeating: 0, count: 8)
+        var entries: [String: [String: Any]] = [:]
+        func pad(_ a: Int) { let r = file.count % a; if r != 0 { file.append(Data(repeating: 0, count: a - r)) } }
+        for n in ["fc.weight", "layers.0.self_attn.q_proj.weight", "layers.0.self_attn.k_proj.weight",
+                  "layers.0.self_attn.v_proj.weight", "layers.0.self_attn.o_proj.weight",
+                  "layers.0.mlp.gate_proj.weight", "layers.0.mlp.up_proj.weight", "layers.0.mlp.down_proj.weight"] {
+            pad(16_384); let off = file.count; file.append(Data(count: 256 * 8 * 20)); pad(16_384)
+            entries[n] = ["shape": [256, 256], "hq4_off": off]
+        }
+        let bf16Specs: [(String, [Int])] = [
+            ("hidden_norm.weight", [256]), ("norm.weight", [256]),
+            ("candidate_selector.hidden_projection.weight", [64, 256]),
+            ("candidate_selector.predecessor_codebook", [256, 64]), ("candidate_selector.successor_codebook", [256, 64]),
+            ("layers.0.input_layernorm.weight", [256]), ("layers.0.post_attention_layernorm.weight", [256]),
+            ("layers.0.self_attn.q_norm.weight", [128]), ("layers.0.self_attn.k_norm.weight", [128]),
+        ]
+        for (n, shape) in bf16Specs {
+            pad(256); let off = file.count; file.append(Data(count: shape.reduce(1, *) * 2)); pad(256)
+            entries[n] = ["shape": shape, "kind": "bf16", "raw_off": off]
+        }
+        let hdr = try JSONSerialization.data(withJSONObject: [
+            "provenance": ["model_id": "dflash2", "geometry_digest": drafterDesc.geometryDigestV2Hex],
+            "tensors": entries
+        ])
+        var hdrLen = UInt64(hdr.count).littleEndian
+        withUnsafeBytes(of: &hdrLen) { (raw: UnsafeRawBufferPointer) in file.replaceSubrange(4..<12, with: raw) }
+        file.append(hdr)
+        try file.write(to: packDir.appendingPathComponent("model.qwp"))
+        XCTAssertEqual(URL(fileURLWithPath: QWDFlashConfig.defaultPackPath(for: targetDesc, modelsDirectory: modelsDir))
+            .resolvingSymlinksInPath().path, packDir.resolvingSymlinksInPath().path)
+        XCTAssertNoThrow(try QWDFlashConfig.validateDrafter(targetDescriptor: targetDesc, packPath: packDir.path))
+        if QWDeviceCaps.current?.familyApple9 == true {
+            let hal = try QWHal(geometry: QWModelGeometry(descriptor: targetDesc))
+            let drafter = try QWDFlashDrafter(geometry: QWModelGeometry(descriptor: targetDesc), hal: hal, packPath: packDir.path)
+            XCTAssertTrue(drafter.usesVirtualLayerCapture)
+            XCTAssertEqual(drafter.targetLayerSlotMap.count, 56)
+            XCTAssertEqual(drafter.targetLayerSlotMap[41], 0)
+            XCTAssertEqual(drafter.targetLayerSlotMap[9], -1)
+        }
+        try makeDraftCfg([56]).write(to: assets.appendingPathComponent("config.json"))
+        XCTAssertThrowsError(try QWDFlashConfig.validateDrafter(targetDescriptor: targetDesc, packPath: packDir.path))
+    }
 }

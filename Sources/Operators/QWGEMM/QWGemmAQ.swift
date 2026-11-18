@@ -54,6 +54,12 @@ public enum QWGemmAQ {
         return base + (bm128 ? "_bm128" : "")
     }
 
+    /// The fused gate_up + SwiGLU + FWHT-32 prefill GEMM for a `(bits, group)` pair.
+    public static func swigluGemmKernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
+        guard isSupported(bits: bits, group: group, isSHVQ: isSHVQ) else { return nil }
+        return isSHVQ ? "qwg_gemm_shvq\(bits)_g\(group)_h16_swiglu" : "qwg_gemm_aq\(bits)_g\(group)_h16_swiglu"
+    }
+
     /// The GDN in-projection decode kernel for a `(bits, group)` pair.
     public static func gdnInProjDecodeKernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
         guard isSupported(bits: bits, group: group, isSHVQ: isSHVQ) else { return nil }

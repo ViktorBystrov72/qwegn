@@ -5,8 +5,17 @@ extension QWModelDescriptor {
     internal struct ConfigEnvelope: Decodable {
         struct RopeParameters: Decodable {
             let mrope_section: [Int]?
+            let mrope_interleaved: Bool?
             let rope_theta: Double?
             let partial_rotary_factor: Double?
+            let type: String?
+            let rope_type: String?
+            let factor: Double?
+            let original_max_position_embeddings: Int?
+            let beta_fast: Double?
+            let beta_slow: Double?
+            let mscale: Double?
+            let mscale_all_dim: Double?
         }
         struct RopeScaling: Decodable {
             let type: String?

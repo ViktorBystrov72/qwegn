@@ -48,6 +48,17 @@ extension QWEngineDriver {
         return name
     }
 
+    /// The fused gate_up + SwiGLU + FWHT-32 prefill GEMM for a container.
+    static func swigluGemmKernelName(format: QWWeightFormat) throws -> String {
+        guard format.usesDenseAQKernels else { return "qwg_gemm_q4g_h16_swiglu" }
+        guard let name = QWGemmAQ.swigluGemmKernelName(bits: format.bits, group: format.groupSize,
+                                                       isSHVQ: format.denseIsSHVQ) else {
+            throw QWEngineDriverError.state("no fused SwiGLU kernel for \(format.bits)-bit group "
+                                            + "\(format.groupSize)")
+        }
+        return name
+    }
+
     /// The GDN in-projection decode kernel for a container: the incumbent's
     /// over `Block_HQ4_G32`, the family's twin over the family's blocks.
     static func gdnInProjDecodeKernelName(format: QWWeightFormat) throws -> String {

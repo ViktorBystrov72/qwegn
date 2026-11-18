@@ -57,6 +57,13 @@ public final class QWAttnDecode {
         case .q4:  return "qwg_attn_decode_sparse_q4"
         }
     }
+    static func sparseBatchedKernelName(_ mode: QWKVMode) -> String {
+        switch mode {
+        case .f16: return "qwg_attn_decode_sparse_batched"
+        case .q8:  return "qwg_attn_decode_sparse_batched_q8"
+        case .q4:  return "qwg_attn_decode_sparse_batched_q4"
+        }
+    }
     static func batchedKernelName(_ mode: QWKVMode) -> String {
         switch mode {
         case .f16: return "qwg_attn_decode_batched"
@@ -75,6 +82,7 @@ public final class QWAttnDecode {
     /// the two kernels above. Lazily resolved so callers that never use the
     /// batched path pay no extra pipeline-build cost.
     private var cachedDecodeBatched: (any MTLComputePipelineState)?
+    private var cachedDecodeSparseBatched: (any MTLComputePipelineState)?
     private var cachedCombineBatched: (any MTLComputePipelineState)?
 
     private func decodeBatchedPipeline() throws -> any MTLComputePipelineState {
@@ -84,9 +92,17 @@ public final class QWAttnDecode {
         return p
     }
 
+    private func decodeSparseBatchedPipeline() throws -> any MTLComputePipelineState {
+        if let p = cachedDecodeSparseBatched { return p }
+        let p = try hal.pipeline(Self.sparseBatchedKernelName(self.kvMode))
+        cachedDecodeSparseBatched = p
+        return p
+    }
+
     private func combineBatchedPipeline() throws -> any MTLComputePipelineState {
         if let p = cachedCombineBatched { return p }
-        let p = try hal.pipeline("qwg_attn_decode_combine_batched")
+        let p = try hal.pipeline(isGeneral ? "qwg_attn_decode_combine_batched_general"
+                                           : "qwg_attn_decode_combine_batched")
         cachedCombineBatched = p
         return p
     }
@@ -140,7 +156,8 @@ public final class QWAttnDecode {
                 map[r] = try hal.pipeline(Self.sharedKernelName(kvMode, r))
             }
             psoSharedPrefixByRows = map
-            psoSharedCombine = try hal.pipeline("qwg_attn_decode_combine_batched")
+            psoSharedCombine = try hal.pipeline(general ? "qwg_attn_decode_combine_batched_general"
+                                                          : "qwg_attn_decode_combine_batched")
         } else {
             psoSharedPrefixByRows = [:]
             psoSharedCombine = nil
@@ -292,6 +309,68 @@ public final class QWAttnDecode {
             enc.setBytes(&sU, length: 4, index: 3)
             enc.dispatchThreadgroups(
                 MTLSize(width: geometry.qHeads, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        }
+    }
+
+    /// Encode a batched LSA sparse verification/decode pass for `T` queries `cBase ..< cBase + T`.
+    public func encodeSparseBatched(_ enc: any MTLComputeCommandEncoder,
+                                    qgate: QWTensorValue,
+                                    kv: (k: QWKVLayerView, v: QWKVLayerView),
+                                    knew: QWTensorValue, vnew: QWTensorValue,
+                                    partials: QWMRegion,
+                                    out: QWTensorValue,
+                                    blockList: QWTensorValue,
+                                    blockCount: QWTensorValue,
+                                    cBase: Int, T: Int, splits: Int, listStride: Int,
+                                    writeKV: Bool = true) throws {
+        guard cBase >= 0, T >= 1, splits >= 1, splits <= Self.maxLongContextSplits, listStride >= 0,
+              qgate.shape.elementCount == T * geometry.qProjOut,
+              knew.shape.elementCount == T * geometry.kvHeads * geometry.headDim,
+              vnew.shape.elementCount == T * geometry.kvHeads * geometry.headDim,
+              out.shape.elementCount == T * geometry.qHeads * geometry.headDim,
+              blockList.shape.elementCount >= T * listStride,
+              blockCount.shape.elementCount >= T,
+              partials.length >= Self.decodePartialsBytesBatched(T: T, geometry: geometry, maxSplits: max(Self.maxSplits, splits)),
+              kv.k.pageBytes == QWKVCache.pageBytes(mode: kv.k.mode, geometry: geometry),
+              kv.k.mode == kv.v.mode,
+              kv.k.mode == kvMode
+        else { throw QWAttnDecodeError.badShape("sparseBatched cBase=\(cBase) T=\(T) splits=\(splits)") }
+        let pages = (cBase + T + 255) / 256
+        guard kv.k.table.shape.elementCount >= pages,
+              kv.v.table.shape.elementCount >= pages
+        else { throw QWAttnDecodeError.badShape("page table too short for sparseBatched cBase=\(cBase) T=\(T)") }
+
+        var cU = UInt32(cBase), sU = UInt32(splits), strideU = UInt32(listStride), writeU = UInt32(writeKV ? 1 : 0)
+        enc.setComputePipelineState(try decodeSparseBatchedPipeline())
+        qgate.bind(enc, index: 0)
+        kv.k.pool.bindTo(enc, index: 1)
+        kv.v.pool.bindTo(enc, index: 2)
+        kv.k.table.bind(enc, index: 3)
+        kv.v.table.bind(enc, index: 4)
+        knew.bind(enc, index: 5)
+        vnew.bind(enc, index: 6)
+        enc.setBuffer(partials.buffer, offset: partials.base, index: 7)
+        enc.setBytes(&cU, length: 4, index: 8)
+        enc.setBytes(&sU, length: 4, index: 9)
+        out.bind(enc, index: 10)
+        blockList.bind(enc, index: 11)
+        blockCount.bind(enc, index: 12)
+        enc.setBytes(&strideU, length: 4, index: 13)
+        enc.setBytes(&writeU, length: 4, index: 14)
+        enc.dispatchThreadgroups(
+            MTLSize(width: geometry.kvHeads, height: splits, depth: T),
+            threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1))
+
+        if splits > 1 {
+            enc.memoryBarrier(scope: .buffers)
+            enc.setComputePipelineState(try combineBatchedPipeline())
+            qgate.bind(enc, index: 0)
+            out.bind(enc, index: 1)
+            enc.setBuffer(partials.buffer, offset: partials.base, index: 2)
+            enc.setBytes(&sU, length: 4, index: 3)
+            enc.dispatchThreadgroups(
+                MTLSize(width: geometry.qHeads, height: T, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         }
     }

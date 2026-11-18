@@ -408,10 +408,13 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             mbsa.encodeSelectAndAttend(enc, qgate: sc.qR, kv: views, out: sc.attOut,
                                        layerIndex: fullAttnIdx, pos0: pos, rows: 1,
                                        partials: sc.partials)
-        } else if let lsa = driver.lsaOperator {
+        } else if let lsa = driver.lsaOperator,
+                  !(context.session.batchedDecodeTouched && pos < driver.lsaConfig.denseBypassThreshold) {
+            let isSparse = pos >= driver.lsaConfig.denseBypassThreshold
             lsa.encodeIndexAndCluster(enc, qgate: sc.qR, kIn: sc.kR,
-                                      fullAttnLayer: fullAttnIdx, pos0: pos, rows: 1)
-            if pos >= driver.lsaConfig.denseBypassThreshold {
+                                      fullAttnLayer: fullAttnIdx, pos0: pos, rows: 1,
+                                      qMode: isSparse ? .allRows : .none)
+            if isSparse {
                 lsa.encodeSelectBlocks(enc, fullAttnLayer: fullAttnIdx, pos0: pos, rows: 1)
                 let activeKeys = min(pos + 1, driver.lsaConfig.alignedBudget + 640)
                 try attnDecode.encodeSparse(
@@ -527,11 +530,15 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             }
         }
         if let lsa = driver.lsaOperator {
+            let sparseActive = (pos + T) > driver.lsaConfig.denseBypassThreshold
+            let qMode: QWLSAOperator.IndexPrepQMode = !sparseActive
+                ? .none
+                : (driver.geometry.supportsNAXPagedAttnPrefill ? .tiled32 : .allRows)
             lsa.encodeIndexAndCluster(
                 enc,
                 qgate: driver.prefixRows(psc.attQR16, rows: T, cols: qOut, dt: .f16),
                 kIn: driver.prefixRows(psc.attKR16, rows: T, cols: kvC, dt: .f16),
-                fullAttnLayer: fullAttnIdx, pos0: pos, rows: T)
+                fullAttnLayer: fullAttnIdx, pos0: pos, rows: T, qMode: qMode)
         }
         // Pad to the SELECTED prefill backend's tile (32 rows, 64 for
         // the quad kernel) — a hardcoded 32 crashed quad at S=32. Only the

@@ -328,12 +328,23 @@ extension QWEngineDriver {
         let dstBase = dst.region.buffer.contents().advanced(by: dst.region.base + dst.offset)
             .assumingMemoryBound(to: UInt16.self)
         if let pack {
-            for t in 0..<count {
-                let tok = tokens[start + t]
-                let byteOffset = embedRawOff + tok * H * 2
-                try pack.withRawPointer(at: byteOffset, byteCount: H * 2) { raw in
-                    let src = raw.assumingMemoryBound(to: UInt16.self)
-                    QWQuant.bf16ToF16Array(src: src, dst: dstBase.advanced(by: t * H), count: H)
+            try pack.withRawPointer(at: embedRawOff, byteCount: geometry.vocab * H * 2) { rawBase in
+                let rawAddr = Int(bitPattern: rawBase)
+                let dstAddr = Int(bitPattern: dstBase)
+                if count >= 64 {
+                    DispatchQueue.concurrentPerform(iterations: count) { t in
+                        let tok = tokens[start + t]
+                        let src = UnsafeRawPointer(bitPattern: rawAddr)!.advanced(by: tok * H * 2)
+                            .assumingMemoryBound(to: UInt16.self)
+                        let out = UnsafeMutablePointer<UInt16>(bitPattern: dstAddr)!.advanced(by: t * H)
+                        QWQuant.bf16ToF16Array(src: src, dst: out, count: H)
+                    }
+                } else {
+                    for t in 0..<count {
+                        let tok = tokens[start + t]
+                        let src = rawBase.advanced(by: tok * H * 2).assumingMemoryBound(to: UInt16.self)
+                        QWQuant.bf16ToF16Array(src: src, dst: dstBase.advanced(by: t * H), count: H)
+                    }
                 }
             }
             return

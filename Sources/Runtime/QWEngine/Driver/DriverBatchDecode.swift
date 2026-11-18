@@ -111,9 +111,10 @@ extension QWEngineDriver {
     nonisolated(unsafe) private static var batchMLPAssocKey: UInt8 = 0
 
     var canRunBatchedDecode: Bool {
-        mlaOperator == nil && hcaOperator == nil && lsaOperator == nil
-            && geometry.mhcConfig == nil && psc.maxChunk >= QWBatchHeadScratch.maxBatchRows
+        mlaOperator == nil && hcaOperator == nil && echoDrafter == nil && mbsaOperator == nil
+            && psc.maxChunk >= QWBatchHeadScratch.maxBatchRows
             && geometry.vocab > 0
+            && (geometry.mhcConfig == nil || (psc.mhcStream != nil && psc.mhcControls != nil))
             && (geometry.gdnLayerCount == 0 || psc.dn32.shape.elementCount >= QWBatchHeadScratch.maxBatchRows * 2 * geometry.gdnVHeads)
     }
 
@@ -190,6 +191,7 @@ extension QWEngineDriver {
             }
         }
         let scratch = try headScratch ?? sharedBatchHeadScratch()
+        try prepareLSASessionsForBatchStep(sessions)
         try copyEmbedRows(tokens, start: 0, count: B,
                           to: prefixRows(psc.x, rows: B, cols: geometry.hidden, dt: .f16))
         if geometry.sharedExpertIntermediate > 0 && !geometry.sharedExpertHasGate, let s = psc.moe {
@@ -253,6 +255,7 @@ extension QWEngineDriver {
             sessions[b].position += 1
             sessions[b].generated += 1
             sessions[b].batchedDecodeTouched = true
+            sessions[b].mlaIndexerStash = nil
             kvCache.markWritten(sessions[b].kv, upTo: pos + 1)
             rawIds.append(scratch.readToken(b))
         }
@@ -392,29 +395,32 @@ extension QWEngineDriver {
                 }
                 if active.isEmpty { break }
 
-                let useBatchedStep = active.count >= 2 && canRunBatchedDecode
-                    && (geometry.numExperts == 0 || !active.contains { canSpeculateSlot($0) })
+                let stepIndices = eligibleBatchSlotIndices(
+                    slots: active.map { ($0.session.position, $0.maxNew - $0.generated.count) },
+                    maxRows: QWBatchHeadScratch.maxBatchRows)
+                let mixedShortAndLong = stepIndices.count < active.count
+                let rrAllowsBatch = !mixedShortAndLong || stepIndices.contains(rrIndex)
+                let useBatchedStep = stepIndices.count >= 2 && canRunBatchedDecode && rrAllowsBatch
+                    && (geometry.numExperts == 0 || !stepIndices.contains { canSpeculateSlot(active[$0]) })
                 if useBatchedStep {
-                    let B = min(QWBatchHeadScratch.maxBatchRows, active.count)
-                    let stepIndices = Array(0..<B)
                     let stepSessions = stepIndices.map { active[$0].session }
                     let stepTokens = stepIndices.map { active[$0].pendingToken }
                     do {
                         let (rawIds, stepMs, usedScratch) = try forwardBatchStep(
                             stepSessions, tokens: stepTokens, permit: permit, headScratch: scratch)
-                        for b in stepIndices {
-                            if active[b].decodeStartedAt == nil { active[b].decodeStartedAt = Date() }
+                        for (batchIdx, slotIdx) in stepIndices.enumerated() {
+                            if active[slotIdx].decodeStartedAt == nil { active[slotIdx].decodeStartedAt = Date() }
                             try consumePredictedToken(
-                                slot: &active[b], rawArgmax: rawIds[b],
-                                logitsTensor: usedScratch.logitRow(b),
-                                logitBuf: usedScratch.logitBuffer(b),
+                                slot: &active[slotIdx], rawArgmax: rawIds[batchIdx],
+                                logitsTensor: usedScratch.logitRow(batchIdx),
+                                logitBuf: usedScratch.logitBuffer(batchIdx),
                                 stepMsValue: stepMs)
                         }
                     } catch {
-                        for b in stepIndices.reversed() {
-                            finishSession(active[b].session)
-                            active[b].job.complete(.failure(error))
-                            active.remove(at: b)
+                        for slotIdx in stepIndices.sorted(by: >) {
+                            finishSession(active[slotIdx].session)
+                            active[slotIdx].job.complete(.failure(error))
+                            active.remove(at: slotIdx)
                         }
                         blockedFreeKVPages = nil
                     }
@@ -423,7 +429,11 @@ extension QWEngineDriver {
                         finishAndCompleteSlot(completed)
                         blockedFreeKVPages = nil
                     }
-                    if rrIndex >= active.count { rrIndex = 0 }
+                    if mixedShortAndLong && !active.isEmpty {
+                        rrIndex = ((stepIndices.last ?? rrIndex) + 1) % active.count
+                    } else if rrIndex >= active.count {
+                        rrIndex = 0
+                    }
                 } else {
                     if rrIndex >= active.count { rrIndex = 0 }
                     let canSpecCur = canSpeculateSlot(active[rrIndex])

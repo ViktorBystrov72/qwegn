@@ -33,4 +33,4 @@ Every HuggingFace `model_type` maps 1:1 through `QWModelFamilyRegistry` to an ex
 
 ## 4. `geometryDigestV2` vs `geometryDigestV3`
 - **`geometryDigestV2` (`qwg-geo-v2:...`)**: Preserved **byte-identical** for on-disk `.qwp` pack headers and `.qlsa` sidecar trailers so existing packs validate without re-packing.
-- **`geometryDigestV3` (`qwg-geo-v3:...`)**: Extends `V2` with `family`, `role`, `env_type`, `kda`, `mla`, `loop`, `mhc`, and vision geometry (`vis=...` when `.vision` capability is present). Used for `QWEnginePlan`, compiled layer caches, and newly generated artifacts to eliminate cross-family/cross-role digest collisions.
+- **`geometryDigestV3` (`qwg-geo-v3:...`)**: Extends `V2` with `family`, `role`, `env_type`, `kda`, `mla`, `loop`, `mhc`, native YaRN (`yarn=<factor>,<originalMaxPositionEmbeddings>` when `yarnRopeConfig != nil`), block-sparse GQA (`bsa=<blockSize>,<prefixBlocks>,<localBlocks>,<remoteBlocks>` when `blockSparseGQAConfig != nil`), and vision geometry (`vis=...` when `.vision` capability is present). Used for `QWEnginePlan`, compiled layer caches, and newly generated artifacts to eliminate cross-family/cross-role digest collisions.

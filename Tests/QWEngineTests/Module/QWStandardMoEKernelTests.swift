@@ -419,8 +419,8 @@ final class QWStandardMoEKernelTests: XCTestCase {
                        "the 27B has no MoE layer")
         let g = try Self.geometry(normTopKProb: true)
         XCTAssertGreaterThan(QWEngineDriver.moeBytesPerToken(geometry: g), 0)
-        // The dense prefill law aliases disjoint attn vs mlp transients and omits <=4096 WY slabs.
-        XCTAssertEqual(QWEngineDriver.prefillBytesPerToken(geometry: .qwen38_27b), 297_728)
+        // The dense prefill law aliases disjoint attn vs mlp transients with compact ab32 and omits <=4096 WY slabs.
+        XCTAssertEqual(QWEngineDriver.prefillBytesPerToken(geometry: .qwen38_27b), 232_192)
     }
 
     func testPrefillScratchDisjointBranchAliasingAndCarveBudget() throws {

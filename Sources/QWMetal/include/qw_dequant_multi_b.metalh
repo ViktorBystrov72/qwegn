@@ -11,7 +11,12 @@ using namespace metal;
 template <int BITS>
 METAL_FUNC float qwg_aq_prescale32_f32_inplace(thread float4 (&lo)[4],
                                                thread float4 (&hi)[4]) {
-    float4 s = (lo[0] + hi[0]) + (lo[1] + hi[1]) + (lo[2] + hi[2]) + (lo[3] + hi[3]);
+#pragma clang fp contract(off) reassociate(off)
+    const float4 p0 = lo[0] + hi[0];
+    const float4 p1 = lo[1] + hi[1];
+    const float4 p2 = lo[2] + hi[2];
+    const float4 p3 = lo[3] + hi[3];
+    const float4 s = ((p0 + p1) + p2) + p3;
     const float sumX = (s.x + s.y) + (s.z + s.w);
     if constexpr (BITS == 2) {
         constexpr float4 kScale = float4(1.0f, 0.25f, 0.0625f, 0.015625f);
@@ -478,6 +483,7 @@ METAL_FUNC float4 qwg_gemv_aq_rowsN(device const char* blocks,
                                     uint N,
                                     uint K,
                                     uint lane) {
+#pragma clang fp contract(off) reassociate(off)
     const uint nBlocks = K >> 5u;
     const uint groupBytes = GROUP * BITS / 8 + 4u;
     const uint rowBytes = (K / GROUP) * groupBytes;
@@ -524,6 +530,7 @@ METAL_FUNC void qwg_gemv_aq_rows4_m(device const char* blocks,
                                     uint K,
                                     uint mRows,
                                     uint lane) {
+#pragma clang fp contract(off) reassociate(off)
     const uint nBlocks = K >> 5u;
     const uint groupBytes = GROUP * BITS / 8 + 4u;
     const uint rowBytes = (K / GROUP) * groupBytes;

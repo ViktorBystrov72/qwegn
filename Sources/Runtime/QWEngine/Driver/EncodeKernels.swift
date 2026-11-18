@@ -137,6 +137,45 @@ extension QWEngineDriver {
         }
     }
 
+    func gemmBatchedH16SwiGLU(_ enc: any MTLComputeCommandEncoder,
+                              m: Int, i: Int, k: Int,
+                              x: QWTensorValue, wQ4: QWWeightView,
+                              out16: QWTensorValue,
+                              xStride: Int? = nil, yStride: Int? = nil) {
+        let pso: any MTLComputePipelineState
+        if wQ4.isIncumbentContainer != weightFormat.denseIsIncumbentContainer
+            || wQ4.bits != weightFormat.bits || wQ4.groupSize != weightFormat.groupSize
+            || wQ4.isSHVQ != weightFormat.denseIsSHVQ {
+            let name = wQ4.isIncumbentContainer
+                ? "qwg_gemm_q4g_h16_swiglu"
+                : QWGemmAQ.swigluGemmKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ)
+            pso = (name.flatMap { try? hal.pipeline($0) }) ?? psoGemmBatchedH16SwiGLU
+        } else {
+            pso = psoGemmBatchedH16SwiGLU
+        }
+        enc.setComputePipelineState(pso)
+        enc.bindTensors(wQ4.blocks, x, out16, startIndex: 0)
+        let xs = xStride ?? k, ys = yStride ?? i
+        let useSmallTile = hal.caps.isMetal4TensorCapable
+        let chunk = QWGemm.naxRowChunk(rows: m, k: k)
+        var r0 = 0
+        while r0 < m {
+            let r = min(chunk, m - r0)
+            let use64 = useSmallTile && r <= 16 && (i & 63) == 0
+            let bm = useSmallTile ? (use64 ? 16 : (r <= 32 ? 32 : 64)) : 64
+            let bn = use64 ? 64 : 32
+            let modeBits = useSmallTile ? (use64 ? 0x2000_0000 : (r <= 32 ? 0x4000_0000 : 0)) : 0
+            if r0 > 0 {
+                x.slice(byteOffset: r0 * xs * 2, count: r * xs).bind(enc, index: 1)
+                out16.slice(byteOffset: r0 * ys * 2, count: r * ys).bind(enc, index: 2)
+            }
+            enc.setUInt32s(r | modeBits, i, k, xs, ys, startIndex: 3)
+            enc.dispatchThreadgroups(MTLSize(width: i / bn, height: (r + bm - 1) / bm, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            r0 += r
+        }
+    }
+
     func gemmBatchedH16GdnInProj(_ enc: any MTLComputeCommandEncoder,
                                  m: Int, n: Int, k: Int,
                                  x: QWTensorValue, wQ4: QWWeightView,
@@ -146,6 +185,7 @@ extension QWEngineDriver {
         enc.setUInt32s(n, k, startIndex: 5)
         z16.bind(enc, index: 7)
         let qkvC = geometry.gdnQKVChannels, zC = geometry.gdnZChannels
+        let abCols = max(1, n - qkvC - zC)
         let chunk = QWGemm.naxRowChunk(rows: m, k: k)
         var r0 = 0
         while r0 < m {
@@ -153,7 +193,7 @@ extension QWEngineDriver {
             if r0 > 0 {
                 x.slice(byteOffset: r0 * k * 2, count: r * k).bind(enc, index: 1)
                 qkv16.slice(byteOffset: r0 * qkvC * 2, count: r * qkvC).bind(enc, index: 2)
-                y32.slice(byteOffset: r0 * n * 4, count: r * n).bind(enc, index: 3)
+                y32.slice(byteOffset: r0 * abCols * 4, count: r * abCols).bind(enc, index: 3)
                 z16.slice(byteOffset: r0 * zC * 2, count: r * zC).bind(enc, index: 7)
             }
             enc.setUInt32s(r, startIndex: 4)

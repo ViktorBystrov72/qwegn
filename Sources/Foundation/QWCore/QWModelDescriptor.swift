@@ -80,6 +80,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let hcaConfig: HCAConfig?
     public let hybridMLAConfig: HybridMLAConfig?
     public let blockSparseGQAConfig: BlockSparseGQAConfig?
+    public let yarnRopeConfig: YarnRopeConfig?
     public let activationKind: ActivationKind
     public let moeLatentSize: Int?
     public let latentMoeUseNorm: Bool
@@ -286,6 +287,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 hcaConfig: HCAConfig? = nil,
                 hybridMLAConfig: HybridMLAConfig? = nil,
                 blockSparseGQAConfig: BlockSparseGQAConfig? = nil,
+                yarnRopeConfig: YarnRopeConfig? = nil,
                 activationKind: ActivationKind = .silu,
                 moeLatentSize: Int? = nil,
                 latentMoeUseNorm: Bool = false,
@@ -304,6 +306,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
         self.hcaConfig = hcaConfig
         self.hybridMLAConfig = hybridMLAConfig
         self.blockSparseGQAConfig = blockSparseGQAConfig
+        self.yarnRopeConfig = yarnRopeConfig
         self.activationKind = activationKind
         self.moeLatentSize = moeLatentSize
         self.latentMoeUseNorm = latentMoeUseNorm
@@ -445,6 +448,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
             gdnGateLowerBound: gdnGateLowerBound, gdnSeparateConv: gdnSeparateConv,
             hcaConfig: hcaConfig, hybridMLAConfig: hybridMLAConfig,
             blockSparseGQAConfig: blockSparseGQAConfig,
+            yarnRopeConfig: yarnRopeConfig,
             activationKind: activationKind, moeLatentSize: moeLatentSize,
             latentMoeUseNorm: latentMoeUseNorm,
             moeSplitFeatureRouting: moeSplitFeatureRouting,
@@ -548,6 +552,9 @@ public struct QWModelDescriptor: Sendable, Hashable {
         f.append("mhc=\(d.mhcConfig.map { "\($0.start),\($0.end),\($0.streams),\($0.iterations)" } ?? "-")")
         if let bsa = d.blockSparseGQAConfig {
             f.append("bsa=\(bsa.blockSize),\(bsa.prefixBlocks),\(bsa.localBlocks),\(bsa.remoteBlocks)")
+        }
+        if let y = d.yarnRopeConfig {
+            f.append("yarn=\(y.factor),\(y.originalMaxPositionEmbeddings)")
         }
         if d.capabilities.contains(.vision) {
             f.append("vis=\(d.visDepth),\(d.visHidden),\(d.visHeads),\(d.visIntermediate),\(d.visPatch),\(d.visMerge),\(d.visPosEmbeds),\(d.visOut),\(d.imageTokenId),\(d.videoTokenId)")

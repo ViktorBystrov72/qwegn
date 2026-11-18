@@ -164,7 +164,7 @@
     <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
     <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
     <text x="124" y="27" class="mono" font-size="12" font-weight="700" fill="#e2e8f0">INFERENCE MACHINE · Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
-    <text x="124" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.26.0 (Swift 6.2 &amp; Metal 4) · q4 KV · Temp 0 · 0 Steady Allocs</text>
+    <text x="124" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.27.0 (Swift 6.2 &amp; Metal 4) · q4 KV · Temp 0 · 0 Steady Allocs</text>
   </g>
   <text x="500" y="782" text-anchor="middle" class="mono" font-size="12" fill="#94a3b8">Spherical SHVQ4/2/3 packs 321.3B weights into 100.6 GiB (2.69 bpp) so all 288/288 experts + 1M q4 MLA KV fit 100% in 128 GB UMA.</text>
   <text x="500" y="802" text-anchor="middle" class="mono" font-size="12" fill="#64748b">Subquadratic MLA keeps full 4096-row NAX chunks beyond 131K (4-layer CB slicing), reaching 743 / 45.0 tok/s at 242.5K with 3/3 needle recall.</text>

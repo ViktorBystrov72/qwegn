@@ -43,6 +43,7 @@ public struct QWDFlashConfig: Sendable, Equatable {
     public let bridgeCodeSize: Int
     public let bridgeRank: Int
     public let bridgeEps: Float
+    public let virtualLayerCapture: Bool
 
     public init(
         hiddenSize: Int = 5120, numLayers: Int = 5,
@@ -54,7 +55,8 @@ public struct QWDFlashConfig: Sendable, Equatable {
         convKernelSize: Int = 2, convGroupSize: Int = 16,
         selectorRank: Int = 256, selectorTopK: Int = 16,
         isDSpine: Bool = false, draftBlockCausal: Bool = false,
-        bridgeCodeSize: Int = 1024, bridgeRank: Int = 512, bridgeEps: Float = 1e-6
+        bridgeCodeSize: Int = 1024, bridgeRank: Int = 512, bridgeEps: Float = 1e-6,
+        virtualLayerCapture: Bool = false
     ) {
         self.hiddenSize = hiddenSize; self.numLayers = numLayers
         self.numAttentionHeads = numAttentionHeads; self.numKeyValueHeads = numKeyValueHeads
@@ -66,6 +68,13 @@ public struct QWDFlashConfig: Sendable, Equatable {
         self.selectorRank = selectorRank; self.selectorTopK = min(max(1, selectorTopK), 16)
         self.isDSpine = isDSpine; self.draftBlockCausal = draftBlockCausal
         self.bridgeCodeSize = bridgeCodeSize; self.bridgeRank = bridgeRank; self.bridgeEps = bridgeEps
+        self.virtualLayerCapture = virtualLayerCapture
+    }
+
+    /// True when capture indices follow virtual `executionPlan` layers (`0..<executionPlan.count`) on looped targets.
+    public func usesVirtualCapture(for target: QWModelDescriptor) -> Bool {
+        virtualLayerCapture || (target.executionPlan.count > target.numLayers
+            && targetLayerIds.contains { $0 >= target.numLayers })
     }
 
     public static let defaultDSpinePackPath: String =
@@ -100,10 +109,13 @@ public struct QWDFlashConfig: Sendable, Equatable {
             let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             guard isDir || url.pathExtension == "qwp", isDrafterPack(at: url) else { continue }
             let cfg = load(from: url)
+            let layerBound = cfg.usesVirtualCapture(for: target)
+                ? max(target.numLayers, target.executionPlan.count)
+                : target.numLayers
             let compatible = cfg.hiddenSize == target.hidden
                 && cfg.vocabSize == target.vocab
                 && cfg.targetLayerIds.count == cfg.numLayers
-                && cfg.targetLayerIds.allSatisfy { (0..<target.numLayers).contains($0) }
+                && cfg.targetLayerIds.allSatisfy { (0..<layerBound).contains($0) }
             guard compatible else { continue }
             if cfg.isDSpine {
                 dspineMatches.append(url.path)
@@ -161,10 +173,13 @@ public struct QWDFlashConfig: Sendable, Equatable {
                 "DFlash2 drafter vocabSize (\(cfg.vocabSize)) does not match target (\(targetDescriptor.vocab))"
             )
         }
+        let layerBound = cfg.usesVirtualCapture(for: targetDescriptor)
+            ? max(targetDescriptor.numLayers, targetDescriptor.executionPlan.count)
+            : targetDescriptor.numLayers
         guard cfg.targetLayerIds.count == cfg.numLayers,
-              cfg.targetLayerIds.allSatisfy({ (0..<targetDescriptor.numLayers).contains($0) }) else {
+              cfg.targetLayerIds.allSatisfy({ (0..<layerBound).contains($0) }) else {
             throw QWDFlashError.state(
-                "DFlash2 drafter targetLayerIds \(cfg.targetLayerIds) out of range for \(targetDescriptor.numLayers)-layer target"
+                "DFlash2 drafter targetLayerIds \(cfg.targetLayerIds) out of range for \(layerBound)-layer target"
             )
         }
         guard cfg.headDim == 128 else {
@@ -260,7 +275,9 @@ public struct QWDFlashConfig: Sendable, Equatable {
             draftBlockCausal: (dflash["draft_block_causal"] as? Bool) ?? isDSpine,
             bridgeCodeSize: (bridgeDict?["code_size"] as? Int) ?? (json["selected_prefix_code_size"] as? Int) ?? 1024,
             bridgeRank: (bridgeDict?["rank"] as? Int) ?? (json["selected_prefix_rank"] as? Int) ?? 512,
-            bridgeEps: Float((bridgeDict?["eps"] as? Double) ?? 1e-6)
+            bridgeEps: Float((bridgeDict?["eps"] as? Double) ?? 1e-6),
+            virtualLayerCapture: (dflash["virtual_layer_capture"] as? Bool)
+                ?? (json["virtual_layer_capture"] as? Bool) ?? false
         )
     }
 }

@@ -68,14 +68,22 @@ class DenseLayerKernel: @unchecked Sendable {
         let H = geometry.hidden
         let I = geometry.intermediate
         let T = context.rows
-        driver.gemmBatchedH16(enc, m: T, n: 2 * I, k: H,
-                       x: driver.prefixRows(psc.ln2, rows: T, cols: H, dt: .f16),
-                       wQ4: lw.gu.view,
-                       y16: driver.prefixRows(psc.guRaw16, rows: T, cols: 2 * I, dt: .f16))
-        driver.encodeSiluMulF16(enc,
-                         gu: driver.prefixRows(psc.guRaw16, rows: T, cols: 2 * I, dt: .f16),
-                         out: driver.prefixRows(psc.gu16, rows: T, cols: I, dt: .f16),
-                         m: T, i: I)
+        if (I & 31) == 0 && driver.hal.caps.isMetal4TensorCapable {
+            driver.gemmBatchedH16SwiGLU(
+                enc, m: T, i: I, k: H,
+                x: driver.prefixRows(psc.ln2, rows: T, cols: H, dt: .f16),
+                wQ4: lw.gu.view,
+                out16: driver.prefixRows(psc.gu16, rows: T, cols: I, dt: .f16))
+        } else {
+            driver.gemmBatchedH16(enc, m: T, n: 2 * I, k: H,
+                           x: driver.prefixRows(psc.ln2, rows: T, cols: H, dt: .f16),
+                           wQ4: lw.gu.view,
+                           y16: driver.prefixRows(psc.guRaw16, rows: T, cols: 2 * I, dt: .f16))
+            driver.encodeSiluMulF16(enc,
+                             gu: driver.prefixRows(psc.guRaw16, rows: T, cols: 2 * I, dt: .f16),
+                             out: driver.prefixRows(psc.gu16, rows: T, cols: I, dt: .f16),
+                             m: T, i: I)
+        }
         driver.gemmBatchedH16(enc, m: T, n: H, k: I,
                        x: driver.prefixRows(psc.gu16, rows: T, cols: I, dt: .f16),
                        wQ4: lw.down,
@@ -167,8 +175,10 @@ class DenseLayerKernel: @unchecked Sendable {
             // `x = x + mlp(...)` followed by the next layer's
             try driver.encodeRMSNormResidualFast(enc, x: sc.dn16, gamma: nextGamma, out: sc.ln1, residual: sc.x)
         }
-        if let dflashDrafter = driver.dflashDrafter, p < dflashDrafter.targetLayerSlotMap.count {
-            let slot = dflashDrafter.targetLayerSlotMap[p]
+        if let dflashDrafter = driver.dflashDrafter {
+            let captureIdx = dflashDrafter.usesVirtualLayerCapture ? l : p
+            guard captureIdx < dflashDrafter.targetLayerSlotMap.count else { return }
+            let slot = dflashDrafter.targetLayerSlotMap[captureIdx]
             if slot >= 0 {
                 if let _ = lw.mhc, let mhcCfg = geometry.mhcConfig,
                    let mhcStream = sc.mhcStream, let mhcControls = sc.mhcControls {
@@ -285,8 +295,10 @@ class DenseLayerKernel: @unchecked Sendable {
                                       residual: driver.prefixRows(psc.x, rows: T, cols: H, dt: .f16),
                                       rows: T, rowParallel: false)
         }
-        if let dflashDrafter = driver.dflashDrafter, p < dflashDrafter.targetLayerSlotMap.count {
-            let slot = dflashDrafter.targetLayerSlotMap[p]
+        if let dflashDrafter = driver.dflashDrafter {
+            let captureIdx = dflashDrafter.usesVirtualLayerCapture ? l : p
+            guard captureIdx < dflashDrafter.targetLayerSlotMap.count else { return }
+            let slot = dflashDrafter.targetLayerSlotMap[captureIdx]
             if slot >= 0 {
                 let capRows = min(T, dflashDrafter.config.maxCacheSize)
                 if let _ = lw.mhc, let mhcCfg = geometry.mhcConfig,
@@ -307,7 +319,7 @@ class DenseLayerKernel: @unchecked Sendable {
         }
     }
 
-    /// Batched decode trunk pass for B=2...4 independent sessions when mla/hca/lsa/mhc are inactive.
+    /// Batched decode trunk pass for B=2...4 independent sessions (including mHC and short-context LSA).
     func encodeBatchDecode(
         _ enc: any MTLComputeCommandEncoder,
         driver: QWEngineDriver,
@@ -321,16 +333,33 @@ class DenseLayerKernel: @unchecked Sendable {
         let H = geometry.hidden
         let B = sessions.count
         let plan = geometry.executionPlan
+        let p = plan.indices.contains(l) ? plan[l] : l
         let nextP = (l + 1 < plan.count) ? plan[l + 1] : nil
         let nextGamma = nextP.map { driver.layersW[$0].ln1 } ?? driver.finalNorm
 
-        if l == 0 {
-            try driver.encodeRMSNormFast(
-                curEnc,
-                x: driver.prefixRows(psc.x, rows: B, cols: H, dt: .f16),
-                gamma: lw.ln1,
-                out: driver.prefixRows(psc.ln1, rows: B, cols: H, dt: .f16),
-                rows: B)
+        let activeX = driver.prefixRows(psc.x, rows: B, cols: H, dt: .f16)
+        let activeLn1 = driver.prefixRows(psc.ln1, rows: B, cols: H, dt: .f16)
+        let activeLn2 = driver.prefixRows(psc.ln2, rows: B, cols: H, dt: .f16)
+        let activeO16 = driver.prefixRows(psc.o16, rows: B, cols: H, dt: .f16)
+
+        if let mhc = lw.mhc, let mhcCfg = geometry.mhcConfig,
+           let mhcStream = psc.mhcStream, let mhcControls = psc.mhcControls {
+            let prevP = l > 0 ? (plan.indices.contains(l - 1) ? plan[l - 1] : (l - 1)) : -1
+            let hasDeferredPrevFFN = (p != mhcCfg.start) && (prevP >= mhcCfg.start && prevP < mhcCfg.end - 1)
+            let prevDnSource = (prevP >= 0 && driver.layersW[prevP].moe != nil)
+                ? psc.dn16
+                : try driver.sharedBatchMLP().downRows
+            if p == mhcCfg.start {
+                try driver.encodeMHCEnter(curEnc, x: activeX, stream: mhcStream, rows: B)
+                curEnc.memoryBarrier(scope: .buffers)
+            }
+            try driver.encodeMHCRouterNorm(
+                curEnc, stream: mhcStream, w: mhc.attnW, b: mhc.attnB,
+                gamma: lw.ln1, controls: mhcControls, out: activeLn1,
+                rows: B, mergeBranchOut: hasDeferredPrevFFN ? driver.prefixRows(prevDnSource, rows: B, cols: H, dt: .f16) : nil)
+            curEnc.memoryBarrier(scope: .buffers)
+        } else if l == 0 {
+            try driver.encodeRMSNormFast(curEnc, x: activeX, gamma: lw.ln1, out: activeLn1, rows: B)
             curEnc.memoryBarrier(scope: .buffers)
         }
         if lw.kind == .gdn || lw.kind == .gdnMoe {
@@ -341,13 +370,16 @@ class DenseLayerKernel: @unchecked Sendable {
                 driver: driver, enc: curEnc, sessions: sessions, layer: l, weights: lw)
         }
         curEnc = driver.activeEnc ?? curEnc
-        try driver.encodeRMSNormResidualFast(
-            curEnc,
-            x: driver.prefixRows(psc.o16, rows: B, cols: H, dt: .f16),
-            gamma: lw.ln2,
-            out: driver.prefixRows(psc.ln2, rows: B, cols: H, dt: .f16),
-            residual: driver.prefixRows(psc.x, rows: B, cols: H, dt: .f16),
-            rows: B)
+        if let mhc = lw.mhc, geometry.mhcConfig != nil,
+           let mhcStream = psc.mhcStream, let mhcControls = psc.mhcControls {
+            try driver.encodeMHCRouterNorm(
+                curEnc, stream: mhcStream, w: mhc.ffnW, b: mhc.ffnB,
+                gamma: lw.ln2, controls: mhcControls, out: activeLn2,
+                rows: B, mergeBranchOut: activeO16)
+        } else {
+            try driver.encodeRMSNormResidualFast(
+                curEnc, x: activeO16, gamma: lw.ln2, out: activeLn2, residual: activeX, rows: B)
+        }
         curEnc.memoryBarrier(scope: .buffers)
         let dnSource: QWTensorValue
         if lw.moe != nil {
@@ -365,7 +397,7 @@ class DenseLayerKernel: @unchecked Sendable {
             let fuseFwht = !lw.gu.view.isIncumbentContainer && geometry.intermediate > 0 && (geometry.intermediate % 32 == 0)
             try batchMLP.encodeGateUp(
                 curEnc,
-                input: driver.prefixRows(psc.ln2, rows: B, cols: H, dt: .f16),
+                input: activeLn2,
                 weight: lw.gu.view,
                 output: activeMlpRows,
                 activeRows: B,
@@ -378,14 +410,40 @@ class DenseLayerKernel: @unchecked Sendable {
             dnSource = batchMLP.downRows
         }
         curEnc.memoryBarrier(scope: .buffers)
-        try driver.encodeRMSNormResidualFast(
-            curEnc,
-            x: driver.prefixRows(dnSource, rows: B, cols: H, dt: .f16),
-            gamma: nextGamma,
-            out: driver.prefixRows(psc.ln1, rows: B, cols: H, dt: .f16),
-            residual: driver.prefixRows(psc.x, rows: B, cols: H, dt: .f16),
-            rows: B)
-        curEnc.memoryBarrier(scope: .buffers)
+        if let _ = lw.mhc, let mhcCfg = geometry.mhcConfig,
+           let mhcStream = psc.mhcStream, let mhcControls = psc.mhcControls {
+            let isLeave = (p == mhcCfg.end - 1)
+            let nextIsMHC = nextP.map { $0 >= mhcCfg.start && $0 < mhcCfg.end } ?? false
+            let deferPostFFN = !isLeave && nextIsMHC && (nextP != mhcCfg.start)
+            if !deferPostFFN {
+                let activeDn = driver.prefixRows(dnSource, rows: B, cols: H, dt: .f16)
+                if isLeave, mhcCfg.hasExitHead, let exitH = driver.mhcExitHead {
+                    try driver.encodeMHCMerge(
+                        curEnc, stream: mhcStream, branchOut: activeDn, controls: mhcControls,
+                        xOut: activeX, nextGamma: nextGamma, nextNormOut: activeLn1,
+                        rows: B, isLeave: false, sinkhornIters: mhcCfg.iterations, hasNextNorm: false)
+                    curEnc.memoryBarrier(scope: .buffers)
+                    try driver.encodeMHCExitHead(
+                        curEnc, stream: mhcStream, headW: exitH.headW, headB: exitH.headB,
+                        normGamma: driver.finalNorm, outNorm: activeLn1, rows: B, applyNorm: true)
+                } else {
+                    try driver.encodeMHCMerge(
+                        curEnc, stream: mhcStream, branchOut: activeDn, controls: mhcControls,
+                        xOut: activeX, nextGamma: nextGamma, nextNormOut: activeLn1,
+                        rows: B, isLeave: isLeave, sinkhornIters: mhcCfg.iterations, hasNextNorm: isLeave)
+                }
+                curEnc.memoryBarrier(scope: .buffers)
+            }
+        } else {
+            try driver.encodeRMSNormResidualFast(
+                curEnc,
+                x: driver.prefixRows(dnSource, rows: B, cols: H, dt: .f16),
+                gamma: nextGamma,
+                out: activeLn1,
+                residual: activeX,
+                rows: B)
+            curEnc.memoryBarrier(scope: .buffers)
+        }
     }
 }
 

@@ -134,6 +134,8 @@ METAL_FUNC void qmm_t_nax_tgp_dual_impl(
   const int gdnQKVZ = gdnQKV + gdnZ;
   const int gdnTotalN = gdnQKVZ + 2 * int(QW_GDN_V_HEADS);
   const bool need_store32 = store32 && (N != gdnTotalN || (y_col + BN > gdnQKVZ));
+  const int y32Stride = splitGdn ? max(1, N - gdnQKVZ) : N;
+  const int y32Col = splitGdn ? (y_col - gdnQKVZ) : y_col;
 
   const device Block_HQ4_G32* w_tile =
       (AQ_BITS == 0) ? (const device Block_HQ4_G32*)w + static_cast<int64_t>(y_col) * K_g : nullptr;
@@ -144,7 +146,7 @@ METAL_FUNC void qmm_t_nax_tgp_dual_impl(
     y += y_row * static_cast<int64_t>(N) + y_col;
   }
   if (need_store32 && y32 != nullptr) {
-    y32 += y_row * static_cast<int64_t>(N) + y_col;
+    y32 += y_row * static_cast<int64_t>(y32Stride) + y32Col;
   }
 
   constexpr short SM = BM / WM;
@@ -308,24 +310,24 @@ METAL_FUNC void qmm_t_nax_tgp_dual_impl(
           if constexpr (kAlignedM.value) Dtile.store(z_dst, gdnZ);
           else Dtile.store_safe(z_dst, gdnZ, short2(sgp_sn, sgp_sm));
         } else if (need_store32 && y32 != nullptr) {
-          if constexpr (kAlignedM.value && kAlignedN.value) Dtile.store(y32 + tm * N + tn, N);
-          else Dtile.store_safe(y32 + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+          if constexpr (kAlignedM.value && kAlignedN.value) Dtile.store(y32 + tm * y32Stride + tn, y32Stride);
+          else Dtile.store_safe(y32 + tm * y32Stride + tn, y32Stride, short2(sgp_sn, sgp_sm));
         }
       } else {
         if constexpr (kAlignedM.value && kAlignedN.value) {
           Dtile.store(y + tm * N + tn, N);
           if constexpr (store32) {
-            if (need_store32 && y32 != nullptr) Dtile.store(y32 + tm * N + tn, N);
+            if (need_store32 && y32 != nullptr) Dtile.store(y32 + tm * y32Stride + tn, y32Stride);
           }
         } else if (kAlignedM.value && sgp_sn == SN) {
           Dtile.store(y + tm * N + tn, N);
           if constexpr (store32) {
-            if (need_store32 && y32 != nullptr) Dtile.store(y32 + tm * N + tn, N);
+            if (need_store32 && y32 != nullptr) Dtile.store(y32 + tm * y32Stride + tn, y32Stride);
           }
         } else {
           Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
           if constexpr (store32) {
-            if (need_store32 && y32 != nullptr) Dtile.store_safe(y32 + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+            if (need_store32 && y32 != nullptr) Dtile.store_safe(y32 + tm * y32Stride + tn, y32Stride, short2(sgp_sn, sgp_sm));
           }
         }
       }

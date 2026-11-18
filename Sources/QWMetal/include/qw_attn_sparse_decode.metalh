@@ -1,0 +1,355 @@
+// qw_attn_sparse_decode.metalh — Shared single & batched sparse paged decode attention body.
+#pragma once
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include "qw_geometry_constants.metalh"
+#include "qw_dequant.metalh"
+#include "qw_kv_paged.metalh"
+#include "qw_attn_decode.metalh"
+using namespace metal;
+
+#define QW_LSA_MAXSPLITS    64u
+#define QW_LSA_HEAD_DIM_MAX 256u
+
+static inline float lsa_dec_logit_general(float v) {
+    return simd_sum(v) * QW_ATTN_SCALE;
+}
+
+template <uint MODE>
+static inline void lsa_load_window_kv8(
+        const device half* kRow, const device half* vRow, uint kvh, uint col,
+        bool liveCol, uint q8MaxXor, thread half (&kk)[8], thread half (&vv)[8]) {
+    const device half* kb = kRow + kvh * QW_HEAD_DIM + col;
+    const device half* vb = vRow + kvh * QW_HEAD_DIM + col;
+    if (MODE == 0u) {
+        if (liveCol) {
+            *(thread uint4*)kk = *(const device uint4*)kb;
+            *(thread uint4*)vv = *(const device uint4*)vb;
+        } else {
+            for (uint i = 0u; i < 8u; i++) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
+        }
+    } else if (MODE == 1u) {
+        float km = 0.0f, vm = 0.0f;
+        half kRaw[8], vRaw[8];
+        if (liveCol) {
+            for (uint i = 0u; i < 8u; i++) {
+                kRaw[i] = kb[i]; vRaw[i] = vb[i];
+                km = fmax(km, fabs(float(kRaw[i])));
+                vm = fmax(vm, fabs(float(vRaw[i])));
+            }
+        }
+        for (uint sh = 1u; sh <= q8MaxXor; sh <<= 1u) {
+            km = fmax(km, simd_shuffle_xor(km, sh));
+            vm = fmax(vm, simd_shuffle_xor(vm, sh));
+        }
+        const float ks = float(half(fmax(km / 127.0f, 1e-8f)));
+        const float vs = float(half(fmax(vm / 127.0f, 1e-8f)));
+        const float kinv = 1.0f / ks, vinv = 1.0f / vs;
+        if (liveCol) {
+            for (uint i = 0u; i < 8u; i++) {
+                kk[i] = half(clamp(round(float(kRaw[i]) * kinv), -127.0f, 127.0f) * ks);
+                vv[i] = half(clamp(round(float(vRaw[i]) * vinv), -127.0f, 127.0f) * vs);
+            }
+        } else {
+            for (uint i = 0u; i < 8u; i++) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
+        }
+    } else {
+        float kmn = 1e30f, kmx = -1e30f, vmn = 1e30f, vmx = -1e30f;
+        half kRaw[8], vRaw[8];
+        if (liveCol) {
+            for (uint i = 0u; i < 8u; i++) {
+                kRaw[i] = kb[i]; vRaw[i] = vb[i];
+                const float kv = float(kRaw[i]), vv0 = float(vRaw[i]);
+                kmn = fmin(kmn, kv); kmx = fmax(kmx, kv);
+                vmn = fmin(vmn, vv0); vmx = fmax(vmx, vv0);
+            }
+        }
+        #pragma unroll
+        for (uint sh = 1u; sh <= 8u; sh <<= 1u) {
+            kmn = fmin(kmn, simd_shuffle_xor(kmn, sh)); kmx = fmax(kmx, simd_shuffle_xor(kmx, sh));
+            vmn = fmin(vmn, simd_shuffle_xor(vmn, sh)); vmx = fmax(vmx, simd_shuffle_xor(vmx, sh));
+        }
+        if (liveCol) {
+            const float ksc = float(half(fmax((kmx - kmn) / 15.0f, 1e-8f))), km0 = float(half(kmn)), kinv = 1.0f / ksc;
+            const float vsc = float(half(fmax((vmx - vmn) / 15.0f, 1e-8f))), vm0 = float(half(vmn)), vinv = 1.0f / vsc;
+            for (uint i = 0u; i < 8u; i++) {
+                const uint kq = (uint)clamp(round((float(kRaw[i]) - km0) * kinv), 0.0f, 15.0f);
+                const uint vq = (uint)clamp(round((float(vRaw[i]) - vm0) * vinv), 0.0f, 15.0f);
+                kk[i] = half(float(kq) * ksc + km0);
+                vv[i] = half(float(vq) * vsc + vm0);
+            }
+        } else {
+            for (uint i = 0u; i < 8u; i++) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
+        }
+    }
+}
+
+template <uint MODE, bool BATCHED>
+static inline void lsa_decode_sparse_core(
+        const device half* qgate, device half* kpool, device half* vpool,
+        const device int* ktab, const device int* vtab,
+        const device half* knew, const device half* vnew,
+        device float* partials, device half* outp,
+        const device int* blockList, const device uint* blockCountBuf,
+        uint cBase, uint splits, uint listStride, bool writeKV,
+        uint tid, uint3 tg,
+        threadgroup half* stageK, threadgroup half* stageV) {
+    const uint qi   = BATCHED ? tg.z : 0u;
+    const uint C    = cBase + qi;
+    const uint sg   = tid >> 5u;
+    const uint lane = tid & 31u;
+    const uint head = tg.x * QW_GQA_RATIO + sg;
+    const uint kvh  = head / QW_GQA_RATIO;
+    const uint d0   = lane * 8u;
+    const bool live = d0 < QW_HEAD_DIM;
+
+    const device half* qgateQ = BATCHED ? (qgate + uint64_t(qi) * QW_QPROJ_OUT) : qgate;
+    const device half* knewQ  = BATCHED ? (knew + uint64_t(qi) * QW_ROW) : knew;
+    const device half* vnewQ  = BATCHED ? (vnew + uint64_t(qi) * QW_ROW) : vnew;
+    const device int*  bList  = BATCHED ? (blockList + uint64_t(qi) * listStride) : blockList;
+    const uint totalCompleteBlocks = (C + 1u) >> 2u;
+    const uint uCount = min(BATCHED ? blockCountBuf[qi] : blockCountBuf[0], totalCompleteBlocks);
+    const uint tailStart = totalCompleteBlocks * 4u;
+    const uint nTailPool = (C > tailStart) ? (C - tailStart) : 0u;
+    const uint totalSelectedKeys = uCount * 4u + nTailPool + 1u;
+
+    const uint per = (totalSelectedKeys + splits - 1u) / splits;
+    const uint s0  = min(tg.y * per, totalSelectedKeys);
+    const uint s1  = min(s0 + per, totalSelectedKeys);
+
+    float q8[8];
+    if (live) {
+        const device half* q4 = qgateQ + head * QW_Q_STRIDE * QW_HEAD_DIM + d0;
+        for (uint i = 0u; i < 8u; i++) q8[i] = float(q4[i]);
+    } else {
+        for (uint i = 0u; i < 8u; i++) q8[i] = 0.0f;
+    }
+
+    float m = -1e30f, lsum = 0.0f;
+    float oacc[8];
+    for (uint i = 0u; i < 8u; i++) oacc[i] = 0.0f;
+
+    #define LSA_CORE_MERGE(s, vv) {                                      \
+        const float _mn = max(m, s);                                     \
+        const float _c  = (s > m) ? metal::exp(m - s) : 1.0f;            \
+        const float _p  = metal::exp(s - _mn);                           \
+        lsum = lsum * _c + _p;                                           \
+        for (uint _i = 0u; _i < 8u; _i++) oacc[_i] = oacc[_i] * _c + _p * float(vv[_i]); \
+        m = _mn;                                                         \
+    }
+    #define LSA_CORE_DOT(kk) ({                                          \
+        float _pd = 0.0f;                                                \
+        for (uint _i = 0u; _i < 8u; _i++) _pd += q8[_i] * float(kk[_i]); \
+        lsa_dec_logit_general(_pd); })
+
+    const uint poolKeyLimit = uCount * 4u + nTailPool;
+    const uint cEnd = min(s1, poolKeyLimit);
+    const uint keysPerPhase = 2u * QW_GQA_RATIO;
+    const uint safeBlockEnd = (uCount > 0u) ? (uCount * 4u - (((C & 3u) == 3u) ? 1u : 0u)) : 0u;
+    const uint stageEnd = min(cEnd, safeBlockEnd);
+
+    uint sIdx = s0;
+    for (; sIdx + keysPerPhase <= stageEnd; sIdx += keysPerPhase) {
+        if (QW_HEAD_DIM <= 128u) {
+            const uint keyIdx = tid >> 4u, col = (tid & 15u) << 3u;
+            const uint slot = sIdx + keyIdx;
+            const uint r = uint(bList[slot >> 2u]) * 4u + (slot & 3u);
+            const uint pk = (uint)ktab[r >> 8u], pv = (uint)vtab[r >> 8u];
+            const uint e = keyIdx * QW_LSA_HEAD_DIM_MAX + col;
+            threadgroup half* dk = &stageK[e];
+            threadgroup half* dv = &stageV[e];
+            const bool liveCol = col < QW_HEAD_DIM;
+            if (BATCHED && writeKV && r >= cBase) {
+                half ka[8], va[8];
+                lsa_load_window_kv8<MODE>(knew + uint64_t(r - cBase) * QW_ROW,
+                                          vnew + uint64_t(r - cBase) * QW_ROW,
+                                          kvh, col, liveCol, 8u, ka, va);
+                if (liveCol) for (uint i = 0u; i < 8u; i++) { dk[i] = ka[i]; dv[i] = va[i]; }
+            } else if (liveCol) {
+                if (MODE == 0u) {
+                    const uint off = (r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + col;
+                    *(threadgroup uint4*)dk = *(const device uint4*)(kpool + (uint64_t)pk * QW_PGEL + off);
+                    *(threadgroup uint4*)dv = *(const device uint4*)(vpool + (uint64_t)pv * QW_PGEL + off);
+                } else {
+                    half ka[8], va[8];
+                    QW_KV_LOAD8(ka, kpool, pk, r & 255u, kvh, col, MODE)
+                    QW_KV_LOAD8(va, vpool, pv, r & 255u, kvh, col, MODE)
+                    for (uint i = 0u; i < 8u; i++) { dk[i] = ka[i]; dv[i] = va[i]; }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (uint s = 0u; s < 2u; ++s) {
+                const uint e = s * (QW_GQA_RATIO * 32u * 8u) + tid * 8u;
+                const uint slot = sIdx + (e >> 8u);
+                const uint r = uint(bList[slot >> 2u]) * 4u + (slot & 3u);
+                const uint pk = (uint)ktab[r >> 8u], pv = (uint)vtab[r >> 8u];
+                threadgroup half* dk = &stageK[e];
+                threadgroup half* dv = &stageV[e];
+                if (BATCHED && writeKV && r >= cBase) {
+                    half ka[8], va[8];
+                    lsa_load_window_kv8<MODE>(knew + uint64_t(r - cBase) * QW_ROW,
+                                              vnew + uint64_t(r - cBase) * QW_ROW,
+                                              kvh, e & 255u, live, 16u, ka, va);
+                    if (live) for (uint i = 0u; i < 8u; i++) { dk[i] = ka[i]; dv[i] = va[i]; }
+                } else if (live) {
+                    if (MODE == 0u) {
+                        const uint off = (r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + (e & 255u);
+                        *(threadgroup uint4*)dk = *(const device uint4*)(kpool + (uint64_t)pk * QW_PGEL + off);
+                        *(threadgroup uint4*)dv = *(const device uint4*)(vpool + (uint64_t)pv * QW_PGEL + off);
+                    } else {
+                        half ka[8], va[8];
+                        QW_KV_LOAD8(ka, kpool, pk, r & 255u, kvh, e & 255u, MODE)
+                        QW_KV_LOAD8(va, vpool, pv, r & 255u, kvh, e & 255u, MODE)
+                        for (uint i = 0u; i < 8u; i++) { dk[i] = ka[i]; dv[i] = va[i]; }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float s16[16];
+        for (uint j = 0u; j < keysPerPhase; j++) {
+            threadgroup const half* ks = &stageK[j * QW_LSA_HEAD_DIM_MAX + d0];
+            half kk[8];
+            if (live) *(thread uint4*)kk = *(threadgroup const uint4*)ks;
+            else for (uint i = 0u; i < 8u; i++) kk[i] = half(0.0h);
+            s16[j] = LSA_CORE_DOT(kk);
+        }
+        float bm = s16[0];
+        for (uint j = 1u; j < keysPerPhase; j++) bm = max(bm, s16[j]);
+        const float Mb = max(m, bm);
+        float lp = 0.0f, op[8];
+        for (uint i = 0u; i < 8u; i++) op[i] = 0.0f;
+        for (uint j = 0u; j < keysPerPhase; j++) {
+            const float pj = metal::exp(s16[j] - Mb);
+            lp += pj;
+            threadgroup const half* vs = &stageV[j * QW_LSA_HEAD_DIM_MAX + d0];
+            half vv[8];
+            if (live) *(thread uint4*)vv = *(threadgroup const uint4*)vs;
+            else for (uint i = 0u; i < 8u; i++) vv[i] = half(0.0h);
+            for (uint i = 0u; i < 8u; i++) op[i] += pj * float(vv[i]);
+        }
+        const float cb = metal::exp(m - Mb);
+        lsum = lsum * cb + lp;
+        for (uint i = 0u; i < 8u; i++) oacc[i] = oacc[i] * cb + op[i];
+        m = Mb;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (; sIdx < cEnd; sIdx++) {
+        const uint r = (sIdx < uCount * 4u)
+            ? (uint(bList[sIdx >> 2u]) * 4u + (sIdx & 3u))
+            : (tailStart + (sIdx - uCount * 4u));
+        half kk[8], vv[8];
+        if (BATCHED && writeKV && r >= cBase && r < C) {
+            lsa_load_window_kv8<MODE>(knew + uint64_t(r - cBase) * QW_ROW,
+                                      vnew + uint64_t(r - cBase) * QW_ROW,
+                                      kvh, d0, live, QW_HEAD_DIM > 128u ? 16u : 8u, kk, vv);
+        } else if (live && r < C) {
+            if (MODE == 0u) {
+                const device half* kb = kpool + (uint64_t)ktab[r >> 8u] * QW_PGEL
+                                      + (uint64_t)(r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
+                const device half* vb = vpool + (uint64_t)vtab[r >> 8u] * QW_PGEL
+                                      + (uint64_t)(r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
+                *(thread uint4*)kk = *(const device uint4*)kb;
+                *(thread uint4*)vv = *(const device uint4*)vb;
+            } else {
+                QW_KV_LOAD8(kk, kpool, ktab[r >> 8u], r & 255u, kvh, d0, MODE)
+                QW_KV_LOAD8(vv, vpool, vtab[r >> 8u], r & 255u, kvh, d0, MODE)
+            }
+        } else if (live && r == C) {
+            continue;
+        } else {
+            for (uint i = 0u; i < 8u; i++) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
+        }
+        LSA_CORE_MERGE(LSA_CORE_DOT(kk), vv)
+    }
+
+    const uint ownSlot = totalSelectedKeys - 1u;
+    if (ownSlot >= s0 && ownSlot < s1) {
+        half kk[8], vv[8];
+        lsa_load_window_kv8<MODE>(knewQ, vnewQ, kvh, d0, live, QW_HEAD_DIM > 128u ? 16u : 8u, kk, vv);
+        LSA_CORE_MERGE(LSA_CORE_DOT(kk), vv)
+    }
+
+    #undef LSA_CORE_MERGE
+    #undef LSA_CORE_DOT
+
+    const uint splitStride = max(QW_LSA_MAXSPLITS, splits);
+    device float* pb = partials
+        + (BATCHED ? (uint64_t(qi) * (QW_Q_HEADS * splitStride * (QW_HEAD_DIM + 2u))) : 0ul)
+        + (head * splitStride + tg.y) * (QW_HEAD_DIM + 2u);
+    if (live) {
+        for (uint i = 0u; i < 8u; i++) pb[d0 + i] = oacc[i];
+    }
+    if (lane == 0u) {
+        pb[QW_HEAD_DIM] = m;
+        pb[QW_HEAD_DIM + 1u] = lsum;
+    }
+
+    if (splits == 1u && live) {
+        float gf[8];
+        for (uint i = 0u; i < 8u; i++) gf[i] = 1.0f;
+        if (QW_HAS_Q_GATE) {
+            const device half* g4 = qgateQ + head * QW_Q_STRIDE * QW_HEAD_DIM + QW_HEAD_DIM + d0;
+            for (uint i = 0u; i < 8u; i++) gf[i] = 1.0f / (1.0f + metal::exp(-float(g4[i])));
+        }
+        const float linv = (lsum > 0.0f) ? 1.0f / lsum : 0.0f;
+        half hv[8];
+        for (uint i = 0u; i < 8u; i++) hv[i] = half(oacc[i] * linv * gf[i]);
+        fwht32_inplace(hv, lane);
+        device half* ov = outp + (BATCHED ? (uint64_t(qi) * (QW_Q_HEADS * QW_HEAD_DIM)) : 0ul)
+                        + head * QW_HEAD_DIM + d0;
+        *(device uint4*)ov = *(thread uint4*)hv;
+    }
+
+    if (writeKV && tg.y == 0u && sg == 0u) {
+        if (MODE == 0u) {
+            if (live) {
+                device half* kw = kpool + (uint64_t)ktab[C >> 8u] * QW_PGEL
+                                  + (uint64_t)(C & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
+                device half* vw = vpool + (uint64_t)vtab[C >> 8u] * QW_PGEL
+                                  + (uint64_t)(C & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
+                *(device uint4*)kw = *(const device uint4*)(knewQ + kvh * QW_HEAD_DIM + d0);
+                *(device uint4*)vw = *(const device uint4*)(vnewQ + kvh * QW_HEAD_DIM + d0);
+            }
+        } else if (MODE == 1u) {
+            half kn8[8], vn8[8];
+            float kMax = 0.0f, vMax = 0.0f;
+            if (live) {
+                for (uint i = 0u; i < 8u; i++) {
+                    kn8[i] = knewQ[kvh * QW_HEAD_DIM + d0 + i];
+                    vn8[i] = vnewQ[kvh * QW_HEAD_DIM + d0 + i];
+                    kMax = fmax(kMax, fabs(float(kn8[i])));
+                    vMax = fmax(vMax, fabs(float(vn8[i])));
+                }
+            }
+            const float kSegMax = simd_max(kMax), vSegMax = simd_max(vMax);
+            if (live) {
+                qwg_q8_store_seg((device char*)kpool, uint64_t(ktab[C >> 8u]) * QW_Q8_PGE, C & 255u, kvh, d0, kn8, kSegMax);
+                qwg_q8_store_seg((device char*)vpool, uint64_t(vtab[C >> 8u]) * QW_Q8_PGE, C & 255u, kvh, d0, vn8, vSegMax);
+            }
+        } else {
+            half kn8[8], vn8[8];
+            float mnk = 1e30f, mxk = -1e30f, mnv4 = 1e30f, mxv4 = -1e30f;
+            if (live) {
+                for (uint i = 0u; i < 8u; i++) {
+                    kn8[i] = knewQ[kvh * QW_HEAD_DIM + d0 + i];
+                    vn8[i] = vnewQ[kvh * QW_HEAD_DIM + d0 + i];
+                    const float a = float(kn8[i]), b = float(vn8[i]);
+                    mnk = fmin(mnk, a); mxk = fmax(mxk, a);
+                    mnv4 = fmin(mnv4, b); mxv4 = fmax(mxv4, b);
+                }
+            }
+            #pragma unroll
+            for (uint sh = 1u; sh <= 8u; sh <<= 1u) {
+                mnk = fmin(mnk, simd_shuffle_xor(mnk, sh)); mxk = fmax(mxk, simd_shuffle_xor(mxk, sh));
+                mnv4 = fmin(mnv4, simd_shuffle_xor(mnv4, sh)); mxv4 = fmax(mxv4, simd_shuffle_xor(mxv4, sh));
+            }
+            if (live) {
+                qwg_q4_store_seg((device uchar*)kpool, uint64_t(ktab[C >> 8u]) * QW_Q4_PGE, C & 255u, kvh, d0, kn8, mnk, mxk);
+                qwg_q4_store_seg((device uchar*)vpool, uint64_t(vtab[C >> 8u]) * QW_Q4_PGE, C & 255u, kvh, d0, vn8, mnv4, mxv4);
+            }
+        }
+    }
+}

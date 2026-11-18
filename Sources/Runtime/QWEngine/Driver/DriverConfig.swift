@@ -316,7 +316,7 @@ extension QWEngineDriver {
         let attnScratchF16 = usesMLA ? 0 : (geometry.attnProjTotalN + 2 * kvE + qOut)
         let attOutCols = max(qC, geometry.qHeads * geometry.vHeadDim)
         let fgbC = geometry.gdnVectorDecay ? (2 * geometry.gdnLowRankDim + vh) : 0
-        let gdnYF32 = geometry.gdnVectorDecay ? 0 : geometry.gdnTotalN
+        let gdnYF32 = geometry.gdnVectorDecay ? 0 : (2 * vh)
         let needsWy = !geometry.gdnVectorDecay && geometry.gdnLayerCount > 0 && maxPrefillChunk > 4096
         let attnF16 = attnScratchF16 + 2 * qkvC + 2 * zC + attOutCols + fgbC
         let attnF32 = gdnYF32 + zC + vh + glogC + (needsWy ? 4 * zC : 0)

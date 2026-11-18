@@ -232,13 +232,17 @@ extension QWServerConfigurationResolver {
                 sources["ropeScaling"] = "env (QW_ROPE_YARN_FACTOR=\(factor))"
                 return (factor > 1.0 ? "yarn" : "none", factor)
             }
-            let nativeMaxPos: Int? = (!resolvedPack.isEmpty
-                ? (try? QWModelGeometry.load(packPath: resolvedPack).maxPositionEmbeddings)
+            let geom: QWModelGeometry? = (!resolvedPack.isEmpty
+                ? (try? QWModelGeometry.load(packPath: resolvedPack))
                 : nil)
-            if let nativeMaxPos, resolvedMaxContext > nativeMaxPos {
-                let autoFactor = Double(resolvedMaxContext) / Double(nativeMaxPos)
-                sources["ropeScaling"] = "auto-derived (context \(resolvedMaxContext) > native \(nativeMaxPos))"
+            if let geom, resolvedMaxContext > geom.maxPositionEmbeddings {
+                let autoFactor = Double(resolvedMaxContext) / Double(geom.originalMaxPositionEmbeddings)
+                sources["ropeScaling"] = "auto-derived (context \(resolvedMaxContext) > native \(geom.maxPositionEmbeddings))"
                 return ("yarn", autoFactor)
+            }
+            if fileSettings.ropeScalingType.lowercased() == "none", let nativeYarn = geom?.yarnRopeConfig, nativeYarn.factor > 1.0 {
+                sources["ropeScaling"] = "model-config (yarn \(nativeYarn.factor)x)"
+                return ("yarn", nativeYarn.factor)
             }
             sources["ropeScaling"] = "config-file"
             return (fileSettings.ropeScalingType, fileSettings.ropeScalingFactor)

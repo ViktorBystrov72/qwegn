@@ -212,6 +212,7 @@ METAL_FUNC void qwg_gemv_hq4_row_m_t(device const Block_HQ4_G32* blocks,
                                      uint K,
                                      uint lane,
                                      thread float (&out)[M]) {
+#pragma clang fp contract(off) reassociate(off)
     const uint nBlocks = K >> 5u;
     device const Block_HQ4_G32* rowBlocks = blocks + (size_t)row * nBlocks;
     float acc[M];
@@ -256,7 +257,11 @@ METAL_FUNC void qwg_gemv_hq4_row_m_t(device const Block_HQ4_G32* blocks,
             #pragma unroll
             for (uint m = 0; m < M; ++m) {
                 const float sumX = (sVec[m].x + sVec[m].y) + (sVec[m].z + sVec[m].w);
-                acc[m] += fma(fma(-1024.0f, sumX, acc0[m] + acc1[m]), float(blk.scale), float(blk.bias) * sumX);
+                const float raw = acc0[m] + acc1[m];
+                const float unscaled = fma(-1024.0f, sumX, raw);
+                const float biasTerm = float(blk.bias) * sumX;
+                const float grp = fma(unscaled, float(blk.scale), biasTerm);
+                acc[m] = acc[m] + grp;
             }
         }
     } else {
@@ -321,6 +326,7 @@ METAL_FUNC void qwg_gemv_hq4_rows_r_m_t(device const Block_HQ4_G32* const (&rows
                                         uint K,
                                         uint lane,
                                         thread float (&out)[R][M]) {
+#pragma clang fp contract(off) reassociate(off)
     const uint nBlocks = K >> 5u;
     float acc[R][M];
     #pragma unroll
@@ -381,8 +387,11 @@ METAL_FUNC void qwg_gemv_hq4_rows_r_m_t(device const Block_HQ4_G32* const (&rows
                 const float sumX = (sVec[m].x + sVec[m].y) + (sVec[m].z + sVec[m].w);
                 #pragma unroll
                 for (uint r = 0; r < R; ++r) {
-                    acc[r][m] += fma(fma(-1024.0f, sumX, acc0[r][m] + acc1[r][m]),
-                                     float(blk[r].scale), float(blk[r].bias) * sumX);
+                    const float raw = acc0[r][m] + acc1[r][m];
+                    const float unscaled = fma(-1024.0f, sumX, raw);
+                    const float biasTerm = float(blk[r].bias) * sumX;
+                    const float grp = fma(unscaled, float(blk[r].scale), biasTerm);
+                    acc[r][m] = acc[r][m] + grp;
                 }
             }
         }
@@ -464,6 +473,7 @@ METAL_FUNC void qwg_gemv_hq4_rows2_m_t(device const Block_HQ4_G32* blocks,
                                        uint lane,
                                        thread float (&out0)[M],
                                        thread float (&out1)[M]) {
+#pragma clang fp contract(off) reassociate(off)
     const uint nBlocks = K >> 5u;
     device const Block_HQ4_G32* r0 = blocks + (size_t)row0 * nBlocks;
     device const Block_HQ4_G32* r1 = (row0 + 1u < N) ? (r0 + nBlocks) : r0;
@@ -526,8 +536,17 @@ METAL_FUNC void qwg_gemv_hq4_rows2_m_t(device const Block_HQ4_G32* blocks,
             #pragma unroll
             for (uint m = 0; m < M; ++m) {
                 const float sumX = (sVec[m].x + sVec[m].y) + (sVec[m].z + sVec[m].w);
-                acc0[m] += fma(fma(-1024.0f, sumX, bAcc0_0[m] + bAcc0_1[m]), float(blk0.scale), float(blk0.bias) * sumX);
-                acc1[m] += fma(fma(-1024.0f, sumX, bAcc1_0[m] + bAcc1_1[m]), float(blk1.scale), float(blk1.bias) * sumX);
+                const float raw0 = bAcc0_0[m] + bAcc0_1[m];
+                const float unscaled0 = fma(-1024.0f, sumX, raw0);
+                const float bias0 = float(blk0.bias) * sumX;
+                const float grp0 = fma(unscaled0, float(blk0.scale), bias0);
+                acc0[m] = acc0[m] + grp0;
+
+                const float raw1 = bAcc1_0[m] + bAcc1_1[m];
+                const float unscaled1 = fma(-1024.0f, sumX, raw1);
+                const float bias1 = float(blk1.bias) * sumX;
+                const float grp1 = fma(unscaled1, float(blk1.scale), bias1);
+                acc1[m] = acc1[m] + grp1;
             }
         }
     } else {

@@ -43,6 +43,7 @@ extension QWEngineDriver {
     func encodeMTPSeeding(_ cb: any MTLCommandBuffer, session: QWEngineSession,
                                   embeddings: QWTensorValue, hidden: QWTensorValue,
                                   count: Int, cacheRows: Int) throws {
+        if isWeightFreeSpeculation { return }
         if dflashDrafter != nil {
             if let dflashDrafter, let dSlot = session.dflashSlot {
                 try dflashDrafter.encodeContextUpdate(cb, slot: dSlot, startPosition: session.position, totalCount: count)
@@ -227,6 +228,9 @@ extension QWEngineDriver {
     func commitMTPSeeding(_ session: QWEngineSession, position: Int, count: Int, cacheRows: Int) {
         session.roundRecord.consumedCount = position + count
         session.roundRecord.absolutePosition = position + count
+        if verifyWindow != nil {
+            session.trunkHiddenValid = true
+        }
         guard let mtpCache, let handle = session.mtpKV else { return }
         let rows = cacheRows + QWMTPPromptSeeder.pairCount(position: position, count: count)
         mtpCache.markWritten(handle, upTo: rows)

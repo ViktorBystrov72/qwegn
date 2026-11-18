@@ -228,6 +228,9 @@ public final class QWGDNConv {
         var tU = UInt32(T)
         enc.setBytes(&tU, length: 4, index: 6)
         if let gdnY32, let aLog, let dtBias, let betas, let glog {
+            guard gdnY32.shape.elementCount >= T * 2 * max(1, geometry.gdnVHeads) else {
+                throw QWGDNConvError.badShape("T=\(T): compact ab32 \(gdnY32.shape.elementCount) < \(T * 2 * max(1, geometry.gdnVHeads))")
+            }
             gdnY32.bind(enc, index: 7)
             aLog.bind(enc, index: 8)
             dtBias.bind(enc, index: 9)

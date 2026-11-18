@@ -48,4 +48,19 @@ final class QWRopeYaRN1MTests: XCTestCase {
             XCTAssertTrue(mropeRow[i].isFinite)
         }
     }
+
+    func testSenseNovaLoopNativeYaRN2xMatchesHuggingFaceOracle() {
+        let yarn = QWYaRNConfig(factor: 2.0, originalMaxPosition: 262_144)
+        let tables = QWRopeTables(rows: 128, yarn: yarn, geometry: .qwen38_27b)
+        let expectedScale: Float = 1.0693147180559945
+        XCTAssertEqual(tables.attentionScaling, expectedScale, accuracy: 1e-6)
+        XCTAssertEqual(tables.cosSinRow(0)[0], expectedScale, accuracy: 1e-6)
+        let row100 = tables.cosSinRow(100)
+        let hfCos100: [Float] = [
+            0.92209029, -0.79010397, 0.40564939, -1.06621253, 0.76853240, -0.21709053,
+        ]
+        for (idx, expected) in hfCos100.enumerated() {
+            XCTAssertEqual(row100[idx], expected, accuracy: 1e-5, "cos mismatch at pair \(idx)")
+        }
+    }
 }

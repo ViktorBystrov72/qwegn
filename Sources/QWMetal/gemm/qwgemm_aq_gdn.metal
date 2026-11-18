@@ -19,6 +19,7 @@ static inline void qwg_aq_gdn_inproj_store_row(uint row, float vx, device half* 
                                                device float* y32, device const float* aLog,
                                                device const float* dtBias, device float* betas,
                                                device float* glog) {
+#pragma clang fp contract(off) reassociate(off)
     const uint aRow0 = QW_GDN_QKV_CH + QW_GDN_Z_CH;
     const uint bRow0 = aRow0 + QW_GDN_V_HEADS;
     const uint totalN = bRow0 + QW_GDN_V_HEADS;
@@ -53,6 +54,7 @@ static inline void qwg_gemv_aq_gdn_inproj_rows4_body(device const char* blocks,
                                                      uint tg,
                                                      uint ti,
                                                      uint tptg = 128u) {
+#pragma clang fp contract(off) reassociate(off)
     uint simd_per_tg = max(1u, tptg >> 5u);
     uint simd_id = ti >> 5u;
     uint lane = ti & 31u;
@@ -81,6 +83,7 @@ static inline void qwg_gemv_aq_gdn_inproj_rows4_m_body(device const char* blocks
                                                        uint tg,
                                                        uint ti,
                                                        uint tptg = 128u) {
+#pragma clang fp contract(off) reassociate(off)
     const uint simd_per_tg = max(1u, tptg >> 5u);
     const uint simd_id = ti >> 5u;
     const uint lane = ti & 31u;
@@ -174,6 +177,7 @@ static inline void qwg_gemv_aq_gdn_inproj_body(device const char* blocks,
                                                uint tg,
                                                uint ti,
                                                uint tptg = 32u) {
+#pragma clang fp contract(off) reassociate(off)
     uint rows_per_tg = max(1u, tptg >> 5u);
     uint simd_id = ti >> 5u;
     uint lane = ti & 31u;

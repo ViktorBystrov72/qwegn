@@ -66,6 +66,7 @@ public final class QWEngineDriver: @unchecked Sendable {
     let psoRMSNormResidualMoEWide: any MTLComputePipelineState
     let psoHeadF16: any MTLComputePipelineState
     let psoGemmBatchedH16: any MTLComputePipelineState
+    let psoGemmBatchedH16SwiGLU: any MTLComputePipelineState
     let psoGemmBatchedH16GdnInProj: any MTLComputePipelineState
     let psoSiluMulF16: any MTLComputePipelineState
     let psoKVPagedWrite: any MTLComputePipelineState
@@ -321,6 +322,7 @@ public final class QWEngineDriver: @unchecked Sendable {
         self.psoRMSNormResidualMoEWide = pipes.psoRMSNormResidualMoEWide
         self.psoHeadF16 = pipes.psoHeadF16
         self.psoGemmBatchedH16 = pipes.psoGemmBatchedH16
+        self.psoGemmBatchedH16SwiGLU = pipes.psoGemmBatchedH16SwiGLU
         self.psoGemmBatchedH16GdnInProj = pipes.psoGemmBatchedH16GdnInProj
         self.psoSiluMulF16 = pipes.psoSiluMulF16; self.psoKVPagedWrite = pipes.psoKVPagedWrite
         self.psoKVPagedWriteGeneral = pipes.psoKVPagedWriteGeneral
@@ -363,9 +365,11 @@ public final class QWEngineDriver: @unchecked Sendable {
             throw QWEngineDriverError.packMissing(packPath)
         }
 
+        let hasMTPDrafter = (startup.mtpWeightDrafts > 0 || cfg.mtpBackend == .dflash2) && startup.mtpDrafts > 0
         let embHead = try Self.loadEmbeddingsAndHead(
             loader: &L, pack: startup.pack, stContainer: stContainer, packPath: packPath,
-            hal: prelimHal, geometry: geometry, cfg: cfg, mtpDrafts: startup.mtpDrafts, budget: budget)
+            hal: prelimHal, geometry: geometry, cfg: cfg,
+            mtpDrafts: startup.mtpDrafts, hasMTPDrafter: hasMTPDrafter, budget: budget)
         self.embedPlane = embHead.embedPlane; self.embedRawOff = embHead.embedRawOff
         self.embedReader = embHead.embedReader; self.embedScalesReader = embHead.embedScalesReader
         self.embedBiasesReader = embHead.embedBiasesReader
@@ -387,12 +391,20 @@ public final class QWEngineDriver: @unchecked Sendable {
         self.mhcExitHead = try L.loadMHCExitHeadIfNeeded()
         self.multimaxParams = try L.loadMultimaxIfNeeded()
 
+        let origMaxPos = geometry.originalMaxPositionEmbeddings
+        let nativeYarn = geometry.yarnRopeConfig
+        let betaFast = Float(nativeYarn?.betaFast ?? 32.0)
+        let betaSlow = Float(nativeYarn?.betaSlow ?? 1.0)
         let yarnFactor = try Self.resolveYaRNFactor(environment["QW_ROPE_YARN_FACTOR"] ?? ropeYarnFactor.map { String($0) })
         let yarnConfig: QWYaRNConfig? = yarnFactor.map {
-            QWYaRNConfig(factor: $0, originalMaxPosition: geometry.maxPositionEmbeddings)
+            QWYaRNConfig(factor: $0, originalMaxPosition: origMaxPos, betaFast: betaFast, betaSlow: betaSlow)
         } ?? (budget.effectiveMaxTokens > geometry.maxPositionEmbeddings
-              ? QWYaRNConfig.config1M(targetContext: budget.effectiveMaxTokens, originalMaxPosition: geometry.maxPositionEmbeddings)
-              : nil)
+              ? QWYaRNConfig.config1M(targetContext: budget.effectiveMaxTokens, originalMaxPosition: origMaxPos,
+                                      betaFast: betaFast, betaSlow: betaSlow)
+              : nativeYarn.map {
+                  QWYaRNConfig(factor: Float($0.factor), originalMaxPosition: $0.originalMaxPositionEmbeddings,
+                               betaFast: betaFast, betaSlow: betaSlow)
+              })
         let tableRopeRows = geometry.usesLatentOrCompressedAttention ? 1 : budget.effectiveRopeRows
         let tables = QWRopeTables(rows: tableRopeRows, yarn: yarnConfig, geometry: geometry)
         self.ropeRows = budget.effectiveRopeRows
@@ -414,15 +426,16 @@ public final class QWEngineDriver: @unchecked Sendable {
         self.attnDecode = aDec
         self.gdnConv = try QWGDNConv(hal: prelimHal, geometry: geometry)
         self.gdnDecode = try QWGDNDecode(hal: prelimHal)
+        let needsMTPCache = (startup.mtpWeightDrafts > 0 || cfg.mtpBackend == .dflash2) && startup.mtpDrafts > 0
         let caches = try Self.makeKVCaches(
             hal: prelimHal, arena: budget.arena, attnLayers: attnL, kvMode: kvMode,
-            geometry: geometry, mtpDrafts: startup.mtpDrafts,
+            geometry: geometry, mtpDrafts: needsMTPCache ? startup.mtpDrafts : 0,
             trunkKVBytes: budget.trunkKVBytes, mtpKVBytes: budget.mtpKVBytes)
         self.kvCache = caches.kvCache; self.mtpCache = caches.mtpCache
 
         let asub = budget.arena.activationsRegion(); let gsub = budget.arena.gdnRegion()
         let pOff = try gsub.allocate(bytes: budget.pCarveBytes)
-        let mtpPartialsOff: Int = startup.mtpDrafts > 0 ? try gsub.allocate(bytes: budget.pCarveBytes) : 0
+        let mtpPartialsOff: Int = startup.mtpWeightDrafts > 0 ? try gsub.allocate(bytes: budget.pCarveBytes) : 0
         let builtScratch = try Self.makeDecodeAndPrefillScratch(
             asub: asub, gsub: gsub, geometry: geometry, maxPrefillChunk: chunkRows,
             pOff: pOff, pCarveBytes: budget.pCarveBytes, useGroupedNAX: budget.useGroupedNAX)
@@ -446,7 +459,7 @@ public final class QWEngineDriver: @unchecked Sendable {
         let mlaOp = try QWMLAAttnOperator.makeIfEnabled(
             hal: prelimHal, geometry: geometry, attnLayers: attnL,
             maxContext: budget.effectiveMaxTokens, maxPrefillChunk: chunkRows,
-            lsaConfig: lsaConfig, extraAttnLayers: startup.mtpDrafts > 0 ? 1 : 0)
+            lsaConfig: lsaConfig, extraAttnLayers: needsMTPCache ? 1 : 0)
         self.mlaOperator = mlaOp
         self.mbsaOperator = try QWMBSAAttnOperator.makeIfEnabled(
             hal: prelimHal, geometry: geometry, attnLayers: attnL,

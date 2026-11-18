@@ -27,7 +27,8 @@ inline void qwg_mhc_router_norm_rows_impl(device float*       mhcStream,
                                           uint                lane,
                                           threadgroup float*  partSS,
                                           threadgroup float*  partDots,
-                                          threadgroup float*  sPre) {
+                                          threadgroup float*  sPre,
+                                          threadgroup float*  rowTots) {
     constexpr uint NUM_CTRL = C + C * C;
     constexpr uint NUM_ROWS = 2u * C + C * C;
     const uint tid = sg * 32u + lane;
@@ -106,8 +107,26 @@ inline void qwg_mhc_router_norm_rows_impl(device float*       mhcStream,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Lane 0 of simdgroup r runs row r's controls (rows in parallel).
-    if (lane == 0u && sg < nRows) {
+    // Simdgroup r runs row r's controls in parallel across lanes/rows.
+    if constexpr (C == 2u) {
+        if (sg < nRows) {
+            const uint r = sg;
+            threadgroup float* tots = rowTots + r * 9u;
+            if (lane < 9u) {
+                float a = 0.0f;
+                if (lane == 0u) {
+                    for (uint i = 0u; i < 8u; ++i) a += partSS[r * 8u + i];
+                } else {
+                    const uint q = lane - 1u;
+                    for (uint i = 0u; i < 8u; ++i) a += partDots[(r * 8u + i) * NUM_ROWS + q];
+                }
+                tots[lane] = a;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            qwg_mhc_controls2_simd(tots, width, eps, preScale, realIterations, routerB,
+                                   mhcControls + (size_t)(t0 + r) * NUM_CTRL, sPre + r * 4u, lane, true);
+        }
+    } else if (lane == 0u && sg < nRows) {
         const uint r = sg;
         float totSS = 0.0f;
         float tot[NUM_ROWS];
@@ -151,15 +170,16 @@ kernel void qwg_mhc_router_norm_rows_f16(device float*       mhcStream      [[bu
     threadgroup float partSS[QW_MHC_ROWS * 8u];
     threadgroup float partDots[QW_MHC_ROWS * 8u * 24u];
     threadgroup float sPre[QW_MHC_ROWS * 4u];
+    threadgroup float rowTots[QW_MHC_ROWS * 9u];
     if (QW_MHC_STREAMS == 4u) {
         qwg_mhc_router_norm_rows_impl<4u, QW_MHC_ROWS>(mhcStream, routerW, routerB, normGamma, outNorm,
                                                        mhcControls, hidden, eps, preScale, iterations,
                                                        mergeBranchOut, rows, tg, sg, lane,
-                                                       partSS, partDots, sPre);
+                                                       partSS, partDots, sPre, rowTots);
     } else {
         qwg_mhc_router_norm_rows_impl<2u, QW_MHC_ROWS>(mhcStream, routerW, routerB, normGamma, outNorm,
                                                        mhcControls, hidden, eps, preScale, iterations,
                                                        mergeBranchOut, rows, tg, sg, lane,
-                                                       partSS, partDots, sPre);
+                                                       partSS, partDots, sPre, rowTots);
     }
 }

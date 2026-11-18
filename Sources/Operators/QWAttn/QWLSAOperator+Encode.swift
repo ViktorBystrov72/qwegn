@@ -8,12 +8,20 @@ import QWGEMM
 import QWQuant
 
 extension QWLSAOperator {
+    /// Controls which rows project `Q_idx` in `qwg_lsa_index_prep` (`0` = K-only, `1` = all rows, `2` = tiled32 ref rows).
+    public enum IndexPrepQMode: UInt32, Sendable {
+        case none = 0
+        case allRows = 1
+        case tiled32 = 2
+    }
+
     public func encodeIndexAndCluster(_ enc: any MTLComputeCommandEncoder,
                                       qgate: QWTensorValue,
                                       kIn: QWTensorValue,
                                       fullAttnLayer: Int,
                                       pos0: Int,
-                                      rows: Int) {
+                                      rows: Int,
+                                      qMode: IndexPrepQMode = .allRows) {
         guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0 else { return }
         let unitTok = clusterUnitTokens
         if pos0 < residentPos512 {
@@ -31,6 +39,7 @@ extension QWLSAOperator {
         var sliceDimU = UInt32(sliceDim)
         var idxDimU = UInt32(indexDim)
         var ringMaskU = UInt32(ringCap - 1)
+        var qModeU = qMode.rawValue
 
         // 1. Project Q_idx (into qIdxScratch) and K_idx (into kPending ring buffer)
         enc.setComputePipelineState(psoIndexPrep)
@@ -51,6 +60,7 @@ extension QWLSAOperator {
         enc.setBytes(&sliceDimU, length: 4, index: 14)
         enc.setBytes(&idxDimU, length: 4, index: 15)
         enc.setBytes(&ringMaskU, length: 4, index: 16)
+        enc.setBytes(&qModeU, length: 4, index: 17)
         enc.dispatchThreadgroups(
             MTLSize(width: rows, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))

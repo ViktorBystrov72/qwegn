@@ -93,6 +93,12 @@ extension QWEngineDriver {
                 try validateMLAIndexerState(prefix.state.mlaIndexerData, position: prefix.position)
                 prefix.state.publish(into: s, stochastic: stochasticOwner)
                 restoreMLAIndexerState(prefix.state.mlaIndexerData, position: prefix.position, into: s)
+                if isWeightFreeSpeculation {
+                    s.roundRecord.consumedCount = s.position
+                    s.roundRecord.absolutePosition = s.position
+                    s.roundRecord.outputCount = s.generated
+                    s.trunkHiddenValid = s.trunkHidden != nil && s.position > 0
+                }
             }
             return s
         } catch {
@@ -432,12 +438,17 @@ extension QWEngineDriver {
             }
         } else if let lsa = lsaOperator {
             guard lsa.stateOwner !== session else { return }
-            if let prev = lsa.stateOwner as? QWEngineSession, !prev.sessionFinished, prev.position > 0 {
+            if let prev = lsa.stateOwner as? QWEngineSession,
+               !prev.sessionFinished, !prev.batchedDecodeTouched, prev.position > 0 {
                 prev.lastCommitCB?.waitUntilCompleted()
                 prev.mlaIndexerStash = (lsa.captureIndexerState(position: prev.position), prev.position)
             }
             lsa.stateOwner = session
             defer { session.mlaIndexerStash = nil }
+            if session.batchedDecodeTouched && session.position < lsaConfig.denseBypassThreshold {
+                lsa.stateOwner = nil
+                return
+            }
             guard restoring, session.position > 0 else { return }
             guard let stash = session.mlaIndexerStash, stash.position == session.position,
                   lsa.restoreIndexerState(stash.data, position: stash.position) else {

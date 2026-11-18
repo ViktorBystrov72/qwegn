@@ -595,6 +595,38 @@ class HybridHQ8PackTests(unittest.TestCase):
             "input_mix_weight_up.weight"))
         self.assertFalse(hq8_target("lm_head.weight"))
 
+    def test_f32_mhc_gdn_and_loop_gate_preserve_fp32_kind(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            source.mkdir()
+            for name in ("config.json", "tokenizer.json"):
+                (source / name).write_text("{}")
+            (source / "chat_template.jinja").write_text("template")
+            tensors = {
+                "model.language_model.layers.0.linear_attn.A_log": torch.linspace(-4.0, -1.0, 32, dtype=torch.float32),
+                "model.language_model.layers.0.linear_attn.dt_bias": torch.linspace(-2.0, 2.0, 32, dtype=torch.float32),
+                "model.language_model.layers.4.mhc_attn.weight": torch.randn(8, 128, dtype=torch.float32),
+                "model.language_model.layers.4.mhc_attn.bias": torch.randn(8, dtype=torch.float32),
+                "model.language_model.loop_gate.logits": torch.full((128,), -3.8918202, dtype=torch.float32),
+                "model.language_model.layers.0.mlp.down_proj.weight": torch.randn(64, 128, dtype=torch.bfloat16),
+            }
+            save_file(tensors, source / "model.safetensors")
+            (source / "model.safetensors.index.json").write_text(json.dumps({
+                "weight_map": {name: "model.safetensors" for name in tensors}}))
+            destination = root / "release"
+            quantize_model(source, destination)
+            header, counts = audit_pack(destination / "model.qwp")
+            self.assertEqual(counts["f32"], 5)
+            for k in (
+                "model.language_model.layers.0.linear_attn.A_log",
+                "model.language_model.layers.0.linear_attn.dt_bias",
+                "model.language_model.layers.4.mhc_attn.weight",
+                "model.language_model.layers.4.mhc_attn.bias",
+                "model.language_model.loop_gate.logits",
+            ):
+                self.assertEqual(header["tensors"][k]["kind"], "f32")
+
 
 if __name__ == "__main__":
     unittest.main()

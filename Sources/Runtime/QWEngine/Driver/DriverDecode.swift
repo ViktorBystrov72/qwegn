@@ -178,17 +178,18 @@ extension QWEngineDriver {
                 decodeTel.coldWaitUs / 1000, decodeTel.coldIOUs / 1000, decodeTel.coldStaged,
                 coldEvents?.bridgeIters ?? 0).utf8))
         }
+        let hasSpecState = mtpCache != nil || verifyWindow != nil
         // H3 FIX: a failed command buffer leaves sc.token STALE (last
         // step's id) and position untouched — returning it silently
         // corrupts the stream and every parity ledger after it. The count
         // stays (the triad gate); the caller now gets a throw instead of
         // garbage. Session state stays consistent: nothing was committed.
-        if mtpCache != nil, cb.status != .completed {
+        if hasSpecState, cb.status != .completed {
             session.stateFailed = true
             throw QWEngineDriverError.state("MTP step GPU completion failed: \(String(describing: cb.error))")
         }
         if let e = cb.error {
-            if mtpCache != nil { session.stateFailed = true }
+            if hasSpecState { session.stateFailed = true }
             throw QWEngineDriverError.state("step cb: \(e.localizedDescription)")
         }
 
@@ -199,7 +200,7 @@ extension QWEngineDriver {
         // rollback(by:)/snapshots price the true retained window. Monotonic,
         // zero GPU cost.
         kvCache.markWritten(session.kv, upTo: pos + 1)
-        if seedMTP {
+        if seedMTP || (isWeightFreeSpeculation && !session.batchedDecodeTouched) {
             commitMTPSeeding(session, position: pos, count: 1, cacheRows: mtpRows)
         }
         let rawId = Int(sc.token.region.buffer.contents()

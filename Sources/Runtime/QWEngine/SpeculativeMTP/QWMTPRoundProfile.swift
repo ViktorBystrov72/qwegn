@@ -26,6 +26,20 @@ struct QWMTPStageTiming: Codable, Equatable {
         self.commandBuffers = commandBuffers
     }
 
+    private init(hostOnlyMs: Double) {
+        self.hostMs = hostOnlyMs
+        self.gpuMs = 0
+        self.commandBuffers = 0
+    }
+
+    static func hostOnly(hostMs: Double) throws -> QWMTPStageTiming {
+        let clamped = max(hostMs, 1.0e-6)
+        guard clamped.isFinite, clamped > 0 else {
+            throw QWEngineDriverError.state("invalid MTP stage timing")
+        }
+        return QWMTPStageTiming(hostOnlyMs: clamped)
+    }
+
     static func gpuDurationMs(start: Double, end: Double) throws -> Double {
         guard start.isFinite, end.isFinite, start > 0, end > start else {
             throw QWEngineDriverError.state("MTP profiling requires valid completed GPU timestamps")

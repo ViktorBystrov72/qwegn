@@ -56,7 +56,8 @@ inline void qwg_mhc_router_norm_f16_impl(device float*       mhcStream,
                                          uint                lane,
                                          threadgroup float*  partSS,
                                          threadgroup float*  partDots,
-                                         threadgroup float*  sPre) {
+                                         threadgroup float*  sPre,
+                                         threadgroup float*  tots) {
     constexpr uint NUM_CTRL = C + C * C;
     constexpr uint NUM_ROWS = 2u * C + C * C;
     const uint tid = sg * 32u + lane;
@@ -127,7 +128,23 @@ inline void qwg_mhc_router_norm_f16_impl(device float*       mhcStream,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0u) {
+    if constexpr (C == 2u) {
+        if (sg == 0u) {
+            if (lane < 9u) {
+                float a = 0.0f;
+                if (lane == 0u) {
+                    for (uint i = 0u; i < 8u; ++i) a += partSS[i];
+                } else {
+                    const uint r = lane - 1u;
+                    for (uint i = 0u; i < 8u; ++i) a += partDots[i * NUM_ROWS + r];
+                }
+                tots[lane] = a;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            qwg_mhc_controls2_simd(tots, width, eps, preScale, realIterations, routerB,
+                                   mhcControls + (size_t)t * NUM_CTRL, sPre, lane, true);
+        }
+    } else if (tid == 0u) {
         float totSS = 0.0f;
         float tot[NUM_ROWS];
         #pragma unroll
@@ -165,14 +182,15 @@ kernel void qwg_mhc_router_norm_f16(device float*       mhcStream      [[buffer(
     threadgroup float partSS[8];
     threadgroup float partDots[8 * 24];
     threadgroup float sPre[4];
+    threadgroup float tots[9];
     if (QW_MHC_STREAMS == 4u) {
         qwg_mhc_router_norm_f16_impl<4u>(mhcStream, routerW, routerB, normGamma, outNorm,
                                          mhcControls, hidden, eps, preScale, iterations,
-                                         mergeBranchOut, tg, sg, lane, partSS, partDots, sPre);
+                                         mergeBranchOut, tg, sg, lane, partSS, partDots, sPre, tots);
     } else {
         qwg_mhc_router_norm_f16_impl<2u>(mhcStream, routerW, routerB, normGamma, outNorm,
                                          mhcControls, hidden, eps, preScale, iterations,
-                                         mergeBranchOut, tg, sg, lane, partSS, partDots, sPre);
+                                         mergeBranchOut, tg, sg, lane, partSS, partDots, sPre, tots);
     }
 }
 
@@ -344,18 +362,22 @@ inline void qwg_mhc_router_finalize_impl(device const float* mhcStream,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Every slice threadgroup recomputes the (cheap) controls; only slice 0 stores them.
-    if (C == 4u) {
+    if constexpr (C == 4u) {
         if (sg == 0u) {
             qwg_mhc_controls4_simd(tots, width, eps, preScale, iterations & 0x7FFFFFFFu, routerB,
+                                   mhcControls + (size_t)t * NUM_CTRL, sPre, lane, writeCtrl);
+        }
+    } else if constexpr (C == 2u) {
+        if (sg == 0u) {
+            qwg_mhc_controls2_simd(tots, width, eps, preScale, iterations & 0x7FFFFFFFu, routerB,
                                    mhcControls + (size_t)t * NUM_CTRL, sPre, lane, writeCtrl);
         }
     } else if (tid == 0u) {
         float tot[NUM_ROWS];
         #pragma unroll
         for (uint r = 0u; r < NUM_ROWS; ++r) tot[r] = tots[1u + r];
-        // C == 2 slices store identical controls; the redundant writes are benign.
         qwg_mhc_controls<C>(tot, tots[0], width, eps, preScale, iterations & 0x7FFFFFFFu, routerB,
-                            mhcControls + (size_t)t * NUM_CTRL, sPre);
+                            mhcControls + (size_t)t * NUM_CTRL, sPre, writeCtrl);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

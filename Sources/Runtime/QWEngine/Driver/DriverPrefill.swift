@@ -191,13 +191,14 @@ extension QWEngineDriver {
         }
         // H3 FIX (prefill): same law as decodeStep — a failed chunk cb
         // would return a stale token and leave position/state half-true.
+        let hasSpecState = mtpCache != nil || verifyWindow != nil
         for sliceCb in allCbs {
-            if mtpCache != nil, sliceCb.status != .completed {
+            if hasSpecState, sliceCb.status != .completed {
                 session.stateFailed = true
                 throw QWEngineDriverError.state("MTP prefill GPU completion failed: \(String(describing: sliceCb.error))")
             }
             if let e = sliceCb.error {
-                if mtpCache != nil { session.stateFailed = true }
+                if hasSpecState { session.stateFailed = true }
                 throw QWEngineDriverError.state("prefill cb: \(e.localizedDescription)")
             }
         }
@@ -250,6 +251,19 @@ extension QWEngineDriver {
         activePrefillProgress?(done, total)
     }
 
+    /// Chooses chunk row counts while splitting final small remainder tails across two NAX-aligned chunks.
+    static func nextBalancedChunkCount(remaining: Int, stepCap: Int) -> Int {
+        guard remaining > stepCap, stepCap >= 512 else { return min(stepCap, remaining) }
+        let tail = remaining - stepCap
+        if tail < 256 {
+            let half = min(stepCap, ((remaining / 2) + 63) & ~63)
+            if half >= 256 && remaining - half <= stepCap {
+                return half
+            }
+        }
+        return stepCap
+    }
+
     func prefill(_ session: QWEngineSession, tokens: [Int],
                          mode: GDNPrefillMode?, permit: QWGenerationPermit) throws -> Int {
         guard !tokens.isEmpty else { return 0 }
@@ -288,7 +302,7 @@ extension QWEngineDriver {
                     position: session.position,
                     maxChunk: maxChunk,
                     isSubquadraticAttention: usesSubquadraticLongPrefill)
-                let count = min(stepCap, tokens.count - offset)
+                let count = Self.nextBalancedChunkCount(remaining: tokens.count - offset, stepCap: stepCap)
                 let isLast = (offset + count == tokens.count)
                 lastToken = try prefillChunk(session, tokens: tokens,
                                              start: offset, count: count,

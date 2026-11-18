@@ -29,9 +29,13 @@ public final class QWAttnPagedPrefill: Sendable {
         self.psoF16 = try hal.pipeline("qwg_attn_prefill_paged_nax_pair")
         self.psoQ8 = try hal.pipeline("qwg_attn_prefill_paged_nax_pair_q8")
         self.psoQ4 = try hal.pipeline("qwg_attn_prefill_paged_nax_pair_q4")
-        self.psoSparseF16 = try hal.pipeline("qwg_attn_prefill_paged_nax_sparse_pair")
-        self.psoSparseQ8 = try hal.pipeline("qwg_attn_prefill_paged_nax_sparse_pair_q8")
-        self.psoSparseQ4 = try hal.pipeline("qwg_attn_prefill_paged_nax_sparse_pair_q4")
+        let hd128 = geometry.headDim <= 128
+        self.psoSparseF16 = try hal.pipeline(
+            hd128 ? "qwg_attn_prefill_paged_nax_sparse_pair_hd128" : "qwg_attn_prefill_paged_nax_sparse_pair")
+        self.psoSparseQ8 = try hal.pipeline(
+            hd128 ? "qwg_attn_prefill_paged_nax_sparse_pair_hd128_q8" : "qwg_attn_prefill_paged_nax_sparse_pair_q8")
+        self.psoSparseQ4 = try hal.pipeline(
+            hd128 ? "qwg_attn_prefill_paged_nax_sparse_pair_hd128_q4" : "qwg_attn_prefill_paged_nax_sparse_pair_q4")
     }
 
     /// Encode paged FlashAttention over the KV cache.

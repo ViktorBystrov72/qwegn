@@ -110,6 +110,69 @@ final class QWModelDescriptorV3Tests: XCTestCase {
         XCTAssertGreaterThan(checked, 0)
     }
 
+    func testSenseNovaLoopFinalRopeParametersYaRNDecode() throws {
+        let loopFinalJSON = """
+        {
+          "architectures": ["SenseNovaLoopForConditionalGeneration"],
+          "model_type": "sensenova_loop",
+          "model_name": "SenseNova-Loop-9B",
+          "image_token_id": 248056,
+          "video_token_id": 248057,
+          "vision_start_token_id": 248053,
+          "vision_end_token_id": 248054,
+          "loop_settings": { "start": 4, "end": 28, "eval_count": 2, "counts": [2] },
+          "mhc": { "start": 4, "end": 28, "streams": 2, "iterations": 20, "fixed_identity": false, "pre_scale": 1.0 },
+          "vision_config": {
+            "depth": 27, "hidden_size": 1152, "intermediate_size": 4304, "num_heads": 16,
+            "num_position_embeddings": 2304, "out_hidden_size": 4096, "patch_size": 16,
+            "spatial_merge_size": 2, "temporal_patch_size": 2
+          },
+          "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 4096, "intermediate_size": 12288, "vocab_size": 248320,
+            "num_hidden_layers": 32, "full_attention_interval": 4,
+            "layer_types": [
+              "linear_attention", "linear_attention", "linear_attention", "full_attention",
+              "linear_attention", "linear_attention", "linear_attention", "full_attention",
+              "linear_attention", "linear_attention", "linear_attention", "full_attention",
+              "linear_attention", "linear_attention", "linear_attention", "full_attention",
+              "linear_attention", "linear_attention", "linear_attention", "full_attention",
+              "linear_attention", "linear_attention", "linear_attention", "full_attention",
+              "linear_attention", "linear_attention", "linear_attention", "full_attention",
+              "linear_attention", "linear_attention", "linear_attention", "full_attention"
+            ],
+            "rms_norm_eps": 1e-6, "max_position_embeddings": 524288,
+            "num_attention_heads": 16, "num_key_value_heads": 4, "head_dim": 256,
+            "attn_output_gate": true, "partial_rotary_factor": 0.25,
+            "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+            "linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_conv_kernel_dim": 4,
+            "mtp_num_hidden_layers": 0, "eos_token_id": 248044,
+            "rope_parameters": {
+              "mrope_interleaved": true, "mrope_section": [11, 11, 10],
+              "partial_rotary_factor": 0.25, "rope_theta": 10000000,
+              "rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 262144
+            }
+          }
+        }
+        """.data(using: .utf8)!
+
+        let d = try QWModelDescriptor.decode(configJSON: loopFinalJSON)
+        XCTAssertEqual(d.verifyInternalConsistency(), [])
+        XCTAssertEqual(d.family, .senseNovaLoop)
+        XCTAssertEqual(d.modelType, "qwen3_5_text")
+        XCTAssertEqual(d.envelopeModelType, "sensenova_loop")
+        XCTAssertEqual(d.maxPositionEmbeddings, 524_288)
+        XCTAssertEqual(d.mtpLayers, 0)
+        XCTAssertFalse(d.capabilities.contains(.mtp))
+        XCTAssertEqual(d.executionPlan.count, 56)
+        XCTAssertEqual(d.yarnRopeConfig?.factor, 2.0)
+        XCTAssertEqual(d.yarnRopeConfig?.originalMaxPositionEmbeddings, 262_144)
+
+        let geom = QWModelGeometry(descriptor: d)
+        XCTAssertEqual(geom.originalMaxPositionEmbeddings, 262_144)
+        XCTAssertEqual(geom.yarnRopeConfig?.factor, 2.0)
+    }
+
     private static func hasUnregisteredModelType(in data: Data) -> Bool {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
         let rawType = (obj["text_config"] as? [String: Any])?["model_type"] as? String

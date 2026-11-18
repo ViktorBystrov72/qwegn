@@ -197,11 +197,21 @@ struct QWResolvedCliEngineConfig {
         )
         let minMemoryContext = memoryPack.map { max(4096, (($0.artifact.tokenCount + 16384 + 255) / 256) * 256) } ?? 0
         let defaultContext = max(runtimeAssets.descriptor.maxPositionEmbeddings, minMemoryContext)
+        let defaultStrategy = knobs.mtpDraftStrategy ?? effectivePair.settings.mtpDraftStrategy
+        let isWeightFreeLoopNgram = !runtimeAssets.descriptor.capabilities.contains(.mtp)
+            && effectivePair.settings.speculativeDecodingEnabled
+            && effectivePair.settings.mtpDrafts > 0
+            && defaultStrategy.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "ngram"
         var effectiveMtpDrafts = initialMtpDrafts
         if knobs.mtpDrafts == nil && dflashWindow == nil && resolvedBackend != .dflash2
             && !runtimeAssets.descriptor.capabilities.contains(.mtp) {
-            effectiveMtpDrafts = 0
+            effectiveMtpDrafts = isWeightFreeLoopNgram ? effectivePair.settings.mtpDrafts : 0
         }
+        let resolvedBackendForConfig = resolvedBackend
+            ?? (knobs.mtpDrafts == nil && isWeightFreeLoopNgram
+                ? (try? QWMTPBackend.resolve(name: effectivePair.settings.mtpBackend)) : nil)
+        let resolvedBackendNameForConfig = effectiveMtpBackend
+            ?? (knobs.mtpDrafts == nil && isWeightFreeLoopNgram ? effectivePair.settings.mtpBackend : nil)
         let profileKV = effectivePair.profile?.values["kvMode"]?.stringValue
             ?? effectivePair.profile?.values["kv_mode"]?.stringValue
         let effectiveKVString = memoryPack?.artifact.kvMode ?? knobs.kvMode ?? profileKV ?? "q4"
@@ -242,8 +252,8 @@ struct QWResolvedCliEngineConfig {
             profileApplied: effectivePair.profile != nil,
             defaultContext: defaultContext,
             effectiveMtpDrafts: effectiveMtpDrafts,
-            effectiveMtpBackend: effectiveMtpBackend,
-            resolvedBackend: resolvedBackend,
+            effectiveMtpBackend: resolvedBackendNameForConfig,
+            resolvedBackend: resolvedBackendForConfig,
             resolvedKVMode: resolvedKVMode,
             tokenizer: tok,
             specialTokens: specialTokens,
@@ -302,9 +312,9 @@ struct QWResolvedCliEngineConfig {
             prefillScratchEviction: prefillScratchEviction,
             mtpAdaptiveDepth: knobs.mtpAdaptiveDepth,
             mtpAdaptiveEntropyThreshold: knobs.mtpEntropyThreshold,
-            mtpRelaxedMargin: knobs.mtpRelaxedMargin ?? 1.5,
+            mtpRelaxedMargin: knobs.mtpRelaxedMargin ?? effectiveSettings.mtpRelaxedMargin,
             mtpRelaxedMinProb: knobs.mtpRelaxedMinProb ?? QWSpeculativeParameters.defaultRelaxedMinProb,
-            mtpDraftStrategy: knobs.mtpDraftStrategy ?? "hybrid",
+            mtpDraftStrategy: knobs.mtpDraftStrategy ?? effectiveSettings.mtpDraftStrategy,
             mtpQuadraticSeeding: knobs.mtpQuadraticSeeding ?? true,
             dflashDraftPackPath: knobs.dflashDraftPack
                 ?? (effectiveMtpBackend?.lowercased() == "dspine" ? QWDFlashConfig.defaultDSpinePackPath : nil),
@@ -333,9 +343,9 @@ struct QWResolvedCliEngineConfig {
             enabled: effectiveMtpDrafts > 0,
             mtpDrafts: effectiveMtpDrafts,
             mtpBackend: effectiveMtpBackend,
-            mtpRelaxedMargin: knobs.mtpRelaxedMargin ?? 1.5,
+            mtpRelaxedMargin: knobs.mtpRelaxedMargin ?? effectiveSettings.mtpRelaxedMargin,
             mtpRelaxedMinProb: knobs.mtpRelaxedMinProb ?? QWSpeculativeParameters.defaultRelaxedMinProb,
-            mtpDraftStrategy: knobs.mtpDraftStrategy ?? "hybrid",
+            mtpDraftStrategy: knobs.mtpDraftStrategy ?? effectiveSettings.mtpDraftStrategy,
             mtpQuadraticSeeding: knobs.mtpQuadraticSeeding ?? true,
             adaptiveDepth: knobs.mtpAdaptiveDepth ?? false,
             entropyThreshold: knobs.mtpEntropyThreshold ?? 0.5

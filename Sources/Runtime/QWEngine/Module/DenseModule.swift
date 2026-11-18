@@ -285,7 +285,8 @@ open class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendabl
                 position: engineSession.position,
                 maxChunk: engine.prefillChunkSize,
                 isSubquadraticAttention: engine.usesSubquadraticLongPrefill)
-            let count = min(stepCap, chunk.upperBound - offset)
+            let count = QWEngineDriver.nextBalancedChunkCount(
+                remaining: chunk.upperBound - offset, stepCap: stepCap)
             let last = offset + count == chunk.upperBound
             token = try engine.prefillChunk(engineSession, tokens: tokens,
                                             start: offset, count: count,

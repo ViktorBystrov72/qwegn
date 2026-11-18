@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2">
   <img src="https://img.shields.io/badge/platform-macOS%2026%20(Apple%20Silicon)-lightgrey.svg" alt="macOS 26, Apple Silicon">
   <a href="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml"><img src="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.26.0-green.svg" alt="Release v0.26.0"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.27.0-green.svg" alt="Release v0.27.0"></a>
 </p>
 
 **Qwegn** (`qwg`) is a from-scratch LLM/VLM inference engine for Apple Silicon,
@@ -73,6 +73,7 @@ Pre-quantized official Qwegn model packs are hosted under [`huggingface.co/qwegn
 | Maxwell-V1-Flash (`HQ8 + SHVQ3/4` 17.2 GiB) | **5,324 tok/s** (`4,664` @5.4K · `1,620` @64K) | **210.5 tok/s** (`118.1` CLI SQL · `102.3` srv · `100.4` ser) | **1,620 / 20.8 tok/s** @64K (`3/3` needle · `19.3 GiB` `q4`) | **15 ms** warm cache (`25.8×`) |
 | Qwen3.8-Flash-Next (`HQ8+HQ4` + `VQ2` PLE + `DFlash2-shvq4g32`) | **3,035 tok/s** (`2,947` @4K) | **177.2 tok/s** (`DFlash2` spec · `111.8` srv · `89.4` CLI · `83/100` code) | **1,888 / 63.7 tok/s** @1M (`e-means` · `1,350 / 41.1` QSA) | **0.12–0.24 s** `.qwcache` (`74.3×` vs 17.84 s) |
 | Edge0-145B (`145B`, `HQ8+HQ4` + `VQ2` PLE 83.1 GiB) | **2,568–2,572 tok/s** | **135.6 tok/s** spec (`69.2` CLI `d=1` · `68.5` srv) | **1,886 tok/s** @300K (`3/3` · 1M `69.7 GiB` `q4` / `103.0 GiB` `q8` UMA) | **8 ms** warm cache (`119.8×`) |
+| SenseNova-Loop-9B (`HQ4_G32`, 7.4 GiB) | **2,045 tok/s** (`1,944` @16K · `1,763` @64K) | **165.7 tok/s** (`98.1` CLI code · `153.0` 4-srv · `58.4` srv) | **49.3 / 49.4 tok/s** dec @524K YaRN / @1M (`3/3` @16K–64K · `14.3 / 22.4 GiB`) | **18 ms** warm cache (`46.1×`) |
 | Qwen3.8-27B (+ `DSpine-b16`) | 1,043 tok/s (`914` @64K) | **148.0 tok/s** (`144.1` srv · `4.19×`) | **831 / 36.5 tok/s** @1M (`e-means` / `Ward`) | 6–29 ms warm cache (`2.33M` tok/s @65.5K) |
 | GLM-5.3-Flash (`321B`, `SHVQ4/2/3` 100.6 GiB) | **1,014 tok/s** (`1,006` @5.2K · `869` serve) | **54.7 tok/s** NextN (`51.4` CLI · `50.8` srv · `81/100` code) | **743 / 45.0 tok/s** @242.5K (`e-means`) · 1M UMA | **10–18 ms** warm cache (`96–193×`) |
 | ERNIE-5.5-Flash-Base (`280B`, `HQ8+SHVQ15/3` 81.6 GiB) | **1,137 tok/s** (`1,015` serve · `909` @16K) | **52.7 tok/s** srv (`45.6` CLI ECHO `d=1` · `64.2` `d=5` code) | **303 / 16.3 tok/s** @300K (`e-means`) · 1M `87.6 GiB` UMA | **0.29 s** `.qwcache` (`78.6×` vs 22.79 s) |
@@ -132,7 +133,7 @@ Full tables, paired A/B repository memory benchmarks, and thermal protocol: [doc
   <img src="assets/qwegn_model_sensenova_loop_9b.svg" alt="SenseNova-Loop-9B" width="100%">
 </p>
 
-**SenseNova-Loop-9B-Preview** · 32 physical → 56 effective layers (2× loop), 2-stream Sinkhorn mHC, MTP-3 (`1,749` prefill `@64K`, **`149.2 tok/s`** spec / `91.4` CLI, `10/10` Core-10)
+**SenseNova-Loop-9B** · 32 physical → 56 effective layers (`2×` loop `[4..28]`), `F32` 2-stream Sinkhorn-20 mHC, `524K` native YaRN-2×, `HQ4_G32` (`qwg pull qwegnai/SenseNova-Loop-9B-hq4g32`, `7.38 GiB` / `4.87 GiB` `--no-load-vision` — **`2,045 tok/s`** `@4K` / `1,944` `@16K` / `1,763` `@64K` prefill, **`165.7 tok/s`** serve spec / `98.1` CLI code / **`153.0 tok/s`** 4-stream HTTP `3.02×`, `92%` HumanEval, `211/211` API, `3/3` needles `@16K`/`64K`; `Preview` MTP-3 `149.2` serve spec / `94.0` CLI / `1,476` `@1M`)
 
 <p align="center">
   <img src="assets/qwegn_memory_pack_experiments.svg" alt="QWMemoryPack Live Benchmarks" width="100%">

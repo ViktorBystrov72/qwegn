@@ -234,7 +234,7 @@
     <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
     <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
     <text x="124" y="27" class="mono" font-size="12" font-weight="700" fill="#e2e8f0">INFERENCE MACHINE · Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
-    <text x="124" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.26.0 (Swift 6.2 &amp; Metal 4) · q4 KV · Temp 0 · 0 Steady Allocs</text>
+    <text x="124" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.27.0 (Swift 6.2 &amp; Metal 4) · q4 KV · Temp 0 · 0 Steady Allocs</text>
   </g>
   <text x="500" y="782" text-anchor="middle" class="mono" font-size="12" fill="#94a3b8">64K–262K run with GPU-resident VQ2 PLE; 524K–1M stream VQ2 PLE from NVMe (--stream-ngrams, 23.0 GiB dynamic arena).</text>
   <text x="500" y="802" text-anchor="middle" class="mono" font-size="12" fill="#64748b">Capacity-balanced 4096-token e-means macro-clusters prune 260,000 QSA pool blocks to &lt;=14,336 candidates at 1M tokens.</text>

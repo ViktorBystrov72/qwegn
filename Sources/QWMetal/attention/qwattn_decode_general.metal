@@ -323,17 +323,17 @@ kernel void qwg_attn_decode_general_q4(
                                  C, splits, tid, tg, &stageK[0], &stageV[0]);
 }
 
-kernel void qwg_attn_decode_combine_general(
-        const device half* qgate [[buffer(0)]],
-        device half* outp [[buffer(1)]],
-        const device float* partials [[buffer(2)]],
-        constant uint& splits [[buffer(3)]],
-        uint lane [[thread_index_in_threadgroup]],
-        uint3 tg [[threadgroup_position_in_grid]]) {
-    const uint head = tg.x;
+static inline void qwg_decode_combine_general_row(
+        const device half* qgateRow,
+        device half* outRow,
+        const device float* partialsRow,
+        uint splits,
+        uint splitStride,
+        uint head,
+        uint lane) {
     const uint d0 = lane * 8u;
-    if (d0 >= QW_HEAD_DIM) return;          // the head window
-    const device float* base = partials + head * (QW_MAXSPLITS * (QW_HEAD_DIM + 2u));
+    if (d0 >= QW_HEAD_DIM) return;
+    const device float* base = partialsRow + head * (splitStride * (QW_HEAD_DIM + 2u));
 
     float M = -1e30f;
     for (uint i = 0; i < splits; i++) {
@@ -357,7 +357,7 @@ kernel void qwg_attn_decode_combine_general(
     float gf[8];
     for (uint i = 0; i < 8u; i++) gf[i] = 1.0f;
     if (QW_HAS_Q_GATE) {
-        device const half* g4 = qgate + head * QW_Q_STRIDE * QW_HEAD_DIM + QW_HEAD_DIM + d0;
+        device const half* g4 = qgateRow + head * QW_Q_STRIDE * QW_HEAD_DIM + QW_HEAD_DIM + d0;
         half gg[8];
         for (uint i = 0; i < 8u; i++) gg[i] = g4[i];
         for (uint i = 0; i < 8u; i++) gf[i] = 1.0f / (1.0f + metal::exp(-float(gg[i])));
@@ -366,6 +366,32 @@ kernel void qwg_attn_decode_combine_general(
     half hv[8];
     for (uint i = 0; i < 8u; i++) hv[i] = half(o[i] * linv * gf[i]);
     fwht32_inplace(hv, lane);
-    device half* ov = outp + head * QW_HEAD_DIM + d0;
+    device half* ov = outRow + head * QW_HEAD_DIM + d0;
     *(device uint4*)ov = *(thread uint4*)hv;
+}
+
+kernel void qwg_attn_decode_combine_general(
+        const device half* qgate [[buffer(0)]],
+        device half* outp [[buffer(1)]],
+        const device float* partials [[buffer(2)]],
+        constant uint& splits [[buffer(3)]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint3 tg [[threadgroup_position_in_grid]]) {
+    qwg_decode_combine_general_row(qgate, outp, partials, splits, QW_MAXSPLITS, tg.x, lane);
+}
+
+kernel void qwg_attn_decode_combine_batched_general(
+        const device half* qgate [[buffer(0)]],
+        device half* outp [[buffer(1)]],
+        const device float* partials [[buffer(2)]],
+        constant uint& splits [[buffer(3)]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint3 tg [[threadgroup_position_in_grid]]) {
+    const uint head = tg.x;
+    const uint qi = tg.y;
+    const uint splitStride = max(QW_MAXSPLITS, splits);
+    const device half* qgateRow = qgate + (uint64_t)qi * QW_QPROJ_OUT;
+    device half* outRow = outp + (uint64_t)qi * (QW_Q_HEADS * QW_HEAD_DIM);
+    const device float* partialsRow = partials + (uint64_t)qi * (QW_Q_HEADS * splitStride * (QW_HEAD_DIM + 2u));
+    qwg_decode_combine_general_row(qgateRow, outRow, partialsRow, splits, splitStride, head, lane);
 }

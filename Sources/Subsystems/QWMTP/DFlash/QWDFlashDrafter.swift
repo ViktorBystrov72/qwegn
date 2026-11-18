@@ -47,6 +47,7 @@ public final class QWDFlashDrafter: @unchecked Sendable {
 
     public let config: QWDFlashConfig
     public let packPath: String
+    public let usesVirtualLayerCapture: Bool
     public let targetLayerSlotMap: [Int]
     public let sessionSlots: [QWDFlashSessionSlot]
     public let targetHidden: QWTensorValue
@@ -134,8 +135,11 @@ public final class QWDFlashDrafter: @unchecked Sendable {
         }
         self.packPath = resolvedURL.path
         self.config = QWDFlashConfig.load(from: resolvedURL, topKOverride: selectorTopK)
-        var slotMap = [Int](repeating: -1, count: geometry.numLayers)
-        for (slot, lid) in config.targetLayerIds.enumerated() where (0..<geometry.numLayers).contains(lid) {
+        let virtualCap = self.config.usesVirtualCapture(for: geometry.descriptor)
+        self.usesVirtualLayerCapture = virtualCap
+        let layerBound = virtualCap ? max(geometry.numLayers, geometry.numVirtualLayers) : geometry.numLayers
+        var slotMap = [Int](repeating: -1, count: layerBound)
+        for (slot, lid) in self.config.targetLayerIds.enumerated() where (0..<layerBound).contains(lid) {
             slotMap[lid] = slot
         }
         self.targetLayerSlotMap = slotMap

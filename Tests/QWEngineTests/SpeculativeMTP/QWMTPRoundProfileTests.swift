@@ -12,6 +12,12 @@ final class QWMTPRoundProfileTests: XCTestCase {
                                      (2, 1, 0), (.nan, 1, 1), (2, .infinity, 1)] {
             XCTAssertThrowsError(try QWMTPStageTiming(hostMs: host, gpuMs: gpu, commandBuffers: buffers))
         }
+        let hostOnly = try QWMTPStageTiming.hostOnly(hostMs: 0.42)
+        XCTAssertEqual(hostOnly.gpuMs, 0)
+        XCTAssertEqual(hostOnly.commandBuffers, 0)
+        XCTAssertGreaterThan(hostOnly.hostMs, 0)
+        XCTAssertThrowsError(try QWMTPStageTiming.hostOnly(hostMs: .nan))
+        XCTAssertThrowsError(try QWMTPStageTiming.hostOnly(hostMs: .infinity))
     }
 
     func testRoundAccountingAndSerialization() throws {

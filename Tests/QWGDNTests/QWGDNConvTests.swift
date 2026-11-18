@@ -221,4 +221,57 @@ final class QWGDNConvTests: XCTestCase {
                                             y: Self.tv(x, 2048), stOut: Self.tv(x, 2048), T: 5))
         ce.endEncoding(); cb.commit()          // discarded buffer: end anyway
     }
+
+    func testHeadnormPrefillReadsCompactAB32Gates() throws {
+        let g = QWModelGeometry.qwen38_27b
+        let vh = g.gdnVHeads, T = 4, ch = g.gdnQKVChannels
+        let enc = try QWGDNConv(hal: Self.hal, geometry: g)
+        let xBuf = Self.hal.device.makeBuffer(length: T * ch * 2, options: .storageModeShared)!
+        let yBuf = Self.hal.device.makeBuffer(length: T * ch * 2, options: .storageModeShared)!
+        let wBuf = Self.hal.device.makeBuffer(length: ch * 4 * 2, options: .storageModeShared)!
+        let stInBuf = Self.hal.device.makeBuffer(length: 3 * ch * 2, options: .storageModeShared)!
+        let stOutBuf = Self.hal.device.makeBuffer(length: 3 * ch * 2, options: .storageModeShared)!
+        let abBuf = Self.hal.device.makeBuffer(length: T * 2 * vh * 4, options: .storageModeShared)!
+        let aLogBuf = Self.hal.device.makeBuffer(length: vh * 4, options: .storageModeShared)!
+        let dtBiasBuf = Self.hal.device.makeBuffer(length: vh * 4, options: .storageModeShared)!
+        let betasBuf = Self.hal.device.makeBuffer(length: T * vh * 4, options: .storageModeShared)!
+        let glogBuf = Self.hal.device.makeBuffer(length: T * vh * 4, options: .storageModeShared)!
+        memset(xBuf.contents(), 0, xBuf.length)
+        memset(wBuf.contents(), 0, wBuf.length)
+        memset(stInBuf.contents(), 0, stInBuf.length)
+        let abPtr = abBuf.contents().assumingMemoryBound(to: Float.self)
+        let aLogPtr = aLogBuf.contents().assumingMemoryBound(to: Float.self)
+        let dtPtr = dtBiasBuf.contents().assumingMemoryBound(to: Float.self)
+        for h in 0..<vh {
+            aLogPtr[h] = Float(h % 7) * 0.1 - 0.3
+            dtPtr[h] = Float(h % 5) * 0.05 - 0.1
+            for t in 0..<T {
+                abPtr[t * 2 * vh + h] = Float(t) * 0.25 - Float(h) * 0.01
+                abPtr[t * 2 * vh + vh + h] = Float(t) * -0.15 + Float(h) * 0.02
+            }
+        }
+        func f32tv(_ b: MTLBuffer, _ n: Int) -> QWTensorValue {
+            QWTensorValue(region: QWMRegion(buffer: b, base: 0, length: b.length),
+                          offset: 0, shape: QWTensorShape([n], .f32))
+        }
+        guard let (cb, ce) = Self.hal.begin() else { throw NSError(domain: "hal", code: 1) }
+        try enc.encodePrefillWithHeadnorm(
+            ce, x: Self.tv(xBuf, T * ch), w: Self.tv(wBuf, ch * 4), bias: nil,
+            stIn: Self.tv(stInBuf, 3 * ch), y: Self.tv(yBuf, T * ch), stOut: Self.tv(stOutBuf, 3 * ch),
+            T: T, gdnY32: f32tv(abBuf, T * 2 * vh), aLog: f32tv(aLogBuf, vh),
+            dtBias: f32tv(dtBiasBuf, vh), betas: f32tv(betasBuf, T * vh), glog: f32tv(glogBuf, T * vh))
+        ce.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        XCTAssertEqual(cb.status, .completed)
+        let bOut = betasBuf.contents().assumingMemoryBound(to: Float.self)
+        let gOut = glogBuf.contents().assumingMemoryBound(to: Float.self)
+        for t in 0..<T {
+            for h in 0..<vh {
+                let av = abPtr[t * 2 * vh + h], bv = abPtr[t * 2 * vh + vh + h]
+                let refBeta = 1.0 / (1.0 + exp(-bv))
+                let refGlog = -exp(aLogPtr[h]) * log(1.0 + exp(av + dtPtr[h]))
+                XCTAssertEqual(bOut[t * vh + h], refBeta, accuracy: 1e-6)
+                XCTAssertEqual(gOut[t * vh + h], refGlog, accuracy: 1e-5)
+            }
+        }
+    }
 }
