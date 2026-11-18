@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2">
   <img src="https://img.shields.io/badge/platform-macOS%2026%20(Apple%20Silicon)-lightgrey.svg" alt="macOS 26, Apple Silicon">
   <a href="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml"><img src="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.27.0-green.svg" alt="Release v0.27.0"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.27.1-green.svg" alt="Release v0.27.1"></a>
 </p>
 
 **Qwegn** (`qwg`) is a from-scratch LLM/VLM inference engine for Apple Silicon,
@@ -70,6 +70,7 @@ Pre-quantized official Qwegn model packs are hosted under [`huggingface.co/qwegn
 | Model | Prefill (peak) | Decode (spec) | Long-ctx / 1M prefill / decode (LSA · `e-means`) | Repo `.qwcache` / Warm Cache TTFT |
 | :--- | :---: | :---: | :---: | :---: |
 | Qwen3.6-35B-A3B (`HQ4_G32`) | **6,462 tok/s** (`6,316` @6.5K · `6,142` @64K) | **382.8 tok/s** (`324.3` CLI `d=5` · `182.0` srv) | **2,317 / 105.6 tok/s** @1M (`143.7` @64K) | **0.12 s** `.qwcache` (`54.4×` vs 6.53 s) |
+| Apex-35B-V1.0 (`HQ4_G32`, 22.2 GiB) | **6,416 tok/s** (`6,262` @16K · `5,810` srv) | **213.8 tok/s** (`178.0` srv · `174.9` CLI · `148.5` ser) | **5,491 / 100.9 tok/s** @1M (`155.4` @64K `e-means` · `3/3`) | **28 ms** warm cache (`11.5×`) |
 | Maxwell-V1-Flash (`HQ8 + SHVQ3/4` 17.2 GiB) | **5,324 tok/s** (`4,664` @5.4K · `1,620` @64K) | **210.5 tok/s** (`118.1` CLI SQL · `102.3` srv · `100.4` ser) | **1,620 / 20.8 tok/s** @64K (`3/3` needle · `19.3 GiB` `q4`) | **15 ms** warm cache (`25.8×`) |
 | Qwen3.8-Flash-Next (`HQ8+HQ4` + `VQ2` PLE + `DFlash2-shvq4g32`) | **3,035 tok/s** (`2,947` @4K) | **177.2 tok/s** (`DFlash2` spec · `111.8` srv · `89.4` CLI · `83/100` code) | **1,888 / 63.7 tok/s** @1M (`e-means` · `1,350 / 41.1` QSA) | **0.12–0.24 s** `.qwcache` (`74.3×` vs 17.84 s) |
 | Edge0-145B (`145B`, `HQ8+HQ4` + `VQ2` PLE 83.1 GiB) | **2,568–2,572 tok/s** | **135.6 tok/s** spec (`69.2` CLI `d=1` · `68.5` srv) | **1,886 tok/s** @300K (`3/3` · 1M `69.7 GiB` `q4` / `103.0 GiB` `q8` UMA) | **8 ms** warm cache (`119.8×`) |
@@ -104,6 +105,12 @@ Full tables, paired A/B repository memory benchmarks, and thermal protocol: [doc
 </p>
 
 **Qwen3.6-35B-A3B** · 40L MoE (256 experts, 8 + 1 active), 10 QSA + 30 GDN, async MoE MTP (`6,462` `@2K` / `6,316` `@6.5K` prefill, **`382.8 tok/s`** serve spec / `324.3` CLI `d=5` / `182.0` serve, `82%` `Code-50`, `83.3%` `Core-30`), vision
+
+<p align="center">
+  <img src="assets/qwegn_model_apex_35b_v1.svg" alt="Apex-35B-V1.0" width="100%">
+</p>
+
+**Apex-35B-V1.0** · 40L MoE (`35.95B`/`3B` active, 256 experts `8+1`), 10 GQA + 30 GDN, Variational MTP-3, AMX vision (`qwg pull qwegnai/Apex-35B-V1.0-hq4g32`, `HQ4_G32_M5`, `22.18 GiB` — **`6,416` `@4K` / `6,262` `@16K` / `5,810` serve** prefill, **`213.8` pred / `178.0` serve / `174.9` CLI** decode, **`5,491 / 100.9 tok/s` `@1M`** `Ward-512` with `3/3` needles across `64K–1M`, **`295/295`** conformance, **`100%`** fidelity, `91.9%` capability, `82%` HumanEval, `3,219` vision prefill)
 
 <p align="center">
   <img src="assets/qwegn_model_maxwell_v1_flash.svg" alt="Maxwell-V1-Flash" width="100%">

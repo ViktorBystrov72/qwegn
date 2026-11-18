@@ -8,6 +8,15 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.27.1] - 2026-11-18
+
+What's changed since `v0.27.0`: quantized, qualified, and published **`Apex-35B-V1.0`** (`qwegnai/Apex-35B-V1.0-hq4g32`, `22.18 GiB` `HQ4_G32_M5` + `963.6 KiB` `QLSA0001` sidecar, dynamic `<think>` + AMX vision) from short context up to `1M` (`1,048,576`) tokens with **`6,416 tok/s`** prefill, **`213.8 tok/s`** speculative decode, **`9.79×` prefill / `3.16×` decode** LSA speedup over dense attention `@256K`, **`5,491 / 100.9 tok/s` `@1M`** (`3/3` needles across `64K–1M`), **`295/295 (100%)`** API conformance, **`100%`** engine fidelity, and **`0` steady-state allocations**.
+
+### Added
+- **Native Model Pack — `qwegnai/Apex-35B-V1.0-hq4g32` (`HQ4_G32_M5` + `model.qlsa`, `22.18 GiB`)**: Packed `Apexintelligence-AI/Apex-35B-V1.0` (`qwen3_5_moe`, `35.95B` total / `3B` active, `40L`: `10` `16Q/2KV` GQA + `30` Gated-DeltaNet, `256` experts `8+1`, native MTP head, `27`-layer vision tower, `5.30 bpw` across `401` `HQ4_G32_M5` + `644` `BF16` tensors) with data-free SVD `model.qlsa` (`QLSA0001`, `index_dim=64`, budget `2,048`), pullable via `qwg pull qwegnai/Apex-35B-V1.0-hq4g32`.
+- **Short-Context, Speculative, Multimodal Vision & `llmprobe --full` Qualification (`1.64M` tok)**: **`6,415.7 tok/s`** `@4K` (`6,475.7` GPU) / **`6,261.8`** `@16K` CLI & **`5,810.2`** `@10.4K` serve prefill; **`213.8 tok/s`** predictable spec (`178.0` serve median, `174.93` CLI `d=3` Var-MTP, `148.54` serial); **`89 ms`** cold TTFT / **`28 ms` (`11.5×`)** warm prefix cache; **`+2.9%`** steady load drift; **`295/295 (100%)`** API conformance, **`100%`** fidelity (`36/36`, `0.968` top-1 prob, `3/3` byte-exact), **`91.9%` (`34/37`)** capability, **`64/88`** agentic, **`72/100`** `code-100` (**`82%` HumanEval**); and CLI/HTTP AMX vision (`3,218.8 / 134.57 tok/s`, `--no-load-vision` RAM guard).
+- **`64K → 1M` Latent Sparse Attention (`Ward-512` & `e-means-4096`) Scaling & Infographics**: Verified **`3/3` needle recall across all `13/13` runs (`64K`–`1M`)** with **`0` steady allocs**, **`9.79×` prefill (`442.37s → 45.17s`) & `3.16×` decode (`42.52 → 134.22 tok/s`)** vs Dense `@256K`, and **`5,491.2 / 100.90 tok/s` `@1M`** (`189.40 s` TTFT, `28.96 GiB` `Ward-512` / `28.78 GiB` `e-means-4096` RSS); added `assets/qwegn_model_apex_35b_v1.svg`, `assets/qwegn_lsa_scaling_apex_35b_v1.svg`, and updated `README.md`, `docs/benchmarks.md`, `docs/lsa.md`, `docs/tuning.md`, and `assets/qwegn_engine_bento.svg`.
+
 ## [0.27.0] - 2026-11-18
 
 What's changed since `v0.26.0`: onboarded `SenseNova-Loop-9B` Final (`qwegnai/SenseNova-Loop-9B-hq4g32`, `524K` native YaRN-2×, `F32` `mHC`/`GDN`, `SHVQ4` `.qlsa`, `7.38 GiB`) and landed six generalized looped/hybrid engine optimization slices — fused paired-tile NAX `gate_up + SwiGLU` prefill, weight-free `.ngram` (`d=5`) speculation, batched LSA sparse verify (`q4`/`q8`/`f16`), `B = 2..4` concurrent `mHC` + short-context `LSA` server batching, `0`-ULP `C = 2` SIMD Sinkhorn `mHC`, and compact GDN `ab32` / `_hd128` sparse NAX / virtual-layer `DFlash 2` capture — reaching **`2,045 tok/s`** prefill, **`165.7 tok/s`** speculative decode, and **`153.0 tok/s` (`3.02×`)** 4-stream aggregate HTTP decode with **`0` steady-state allocations** and **`0` cross-model regressions** across all 7 flagship packs.
@@ -788,16 +797,3 @@ What's changed since `v0.24.1`: full OpenAI `/v1/responses` and legacy `/v1/comp
 ## [0.7.0] - 2026-11-01
 
 Baseline release before this changelog was started.
-
-[Unreleased]: https://github.com/qwegnai/qwegine/compare/v0.10.1...HEAD
-[0.10.1]: https://github.com/qwegnai/qwegine/compare/v0.10.0...v0.10.1
-[0.10.0]: https://github.com/qwegnai/qwegine/compare/v0.9.7...v0.10.0
-[0.9.7]: https://github.com/qwegnai/qwegine/compare/v0.9.6...v0.9.7
-[0.9.6]: https://github.com/qwegnai/qwegine/compare/v0.9.5...v0.9.6
-[0.9.5]: https://github.com/qwegnai/qwegine/compare/v0.9.4...v0.9.5
-[0.9.4]: https://github.com/qwegnai/qwegine/compare/v0.9.3...v0.9.4
-[0.9.3]: https://github.com/qwegnai/qwegine/compare/v0.9.1...v0.9.3
-[0.9.1]: https://github.com/qwegnai/qwegine/compare/v0.9.0...v0.9.1
-[0.9.0]: https://github.com/qwegnai/qwegine/compare/v0.8.0...v0.9.0
-[0.8.0]: https://github.com/qwegnai/qwegine/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/qwegnai/qwegine/releases/tag/v0.7.0

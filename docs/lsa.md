@@ -9,6 +9,9 @@ Qwegn implements a general, model-agnostic **Latent Sparse Attention (LSA)** sub
   <img src="../assets/qwegn_lsa_scaling_qwen36_35b_a3b.svg" alt="Qwegn LSA & e-means vs Dense scaling, 64K to 1M tokens: Qwen3.6-35B-A3B" width="100%">
 </p>
 <p align="center">
+  <img src="../assets/qwegn_lsa_scaling_apex_35b_v1.svg" alt="Qwegn LSA & e-means vs Dense scaling, 64K to 1M tokens: Apex-35B-V1.0" width="100%">
+</p>
+<p align="center">
   <img src="../assets/qwegn_lsa_scaling_flash_next.svg" alt="Qwegn Native QSA vs LSA Ward-512 vs e-means-4096 scaling, 64K to 1M tokens: Qwen3.8-Flash-Next" width="100%">
 </p>
 <p align="center">
@@ -41,6 +44,11 @@ All runs measured on an idle Apple M5 Max (`Mac17,6`, 128 GB Unified Memory, 40-
 | | 262K | `581 / 50.1` | **`3,805.2 / 118.3`** | `3,526.3 / 102.1` | `0/3` · **`3/3`** · **`3/3`** | **`6.55×` prefill · `2.36×` decode vs Dense** |
 | | 524K | `231 / 23.2` | **`3,207.1 / 103.9`** | `3,126.1 / 93.4` | `0/3` · **`3/3`** · **`3/3`** | **`13.88×` prefill · `4.48×` decode vs Dense** |
 | | **1M** | — | **`2,317.0 / 105.6`** (`448.8 s`) | `2,315.1 / 88.5` (`30.53 GiB`) | — · **`3/3`** · **`3/3`** | **`105.6 tok/s` @1M (`Ward`) · `-180 MiB` (`e-means`)** |
+| **`Apex-35B-V1.0-hq4g32`** | 64K | `3,101.5 / 99.4` | `5,675.4 / 153.4` | **`5,692.3 / 155.4`** | `3/3` · **`3/3`** · **`3/3`** | **`1.84×` prefill · `1.56×` decode (`e-means`)** |
+| *(40L MoE: 10 GQA + 30 GDN)* | 128K | `1,844.2 / 68.4` | **`5,866.4 / 148.9`** | `5,600.1 / 145.0` | `3/3` · **`3/3`** · **`3/3`** | **`3.18×` prefill · `2.18×` decode vs Dense** |
+| | 256K | `583.1 / 42.5` | **`5,710.6 / 134.2`** | `5,488.1 / 114.2` | `3/3` · **`3/3`** · **`3/3`** | **`9.79×` prefill · `3.16×` decode vs Dense** |
+| | 512K | — | `5,205.0` / **`110.3`** | **`5,425.9`** / `96.1` | — · **`3/3`** · **`3/3`** | **`+14.2 tok/s` dec (`Ward`) · `-4.1 s` TTFT (`e-means`)** |
+| | **1M** | — | **`5,491.2 / 100.9`** (`189.4 s`) | `5,325.4 / 89.0` (`28.78 GiB`) | — · **`3/3`** · **`3/3`** | **`5,491 / 100.9 tok/s` @1M (`Ward`) · `28.96 GiB` RSS** |
 | **`Qwen3.8-Flash-Next-hq8g32-hq4g64`** | 64K | **`2,279.9 / 72.7`** *(QSA)* | `2,155.4 / 56.7` | `2,183.8 / 72.5` | **`3/3` · `3/3` · `3/3`** | `+27.9%` decode (`e-means` vs `Ward-512`) |
 | *(48L MoE: 12 QSA + 36 GDN,* | 160K | **`2,157.6`** / `66.8` *(QSA)* | `1,741.2 / 40.4` | `2,041.0` / **`70.9`** | **`3/3` · `3/3` · `3/3`** | **`+6.2%` decode vs Native QSA (`+75.5%` vs `Ward`)** |
 | *`+ VQ2_G32` PLE)* | 262K | `2,051.8` / **`68.6`** *(QSA)* | `1,522.1 / 32.4` | **`2,057.6`** / `63.5` | **`3/3` · `3/3` · `3/3`** | **`1.35×` prefill · `1.96×` decode vs `Ward-512`** |
