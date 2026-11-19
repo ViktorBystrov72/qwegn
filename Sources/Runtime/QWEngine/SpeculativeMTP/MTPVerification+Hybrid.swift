@@ -76,7 +76,9 @@ extension QWEngineDriver {
         draftCompleted: ((any MTLCommandBuffer) throws -> Void)?
     ) throws -> MTPRoundProposal {
         let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
-        let canUsePLD = (owner == nil && activeConstraint == nil && !mtpStageProfiling && resolvedStrategy != .mtp)
+        let canUsePLD = ((owner == nil || owner?.config.isGreedy == true)
+            && (activeConstraint?.constraint.isUnconstrainedNow ?? true)
+            && !mtpStageProfiling && resolvedStrategy != .mtp)
         let canAdapt = (!mtpStageProfiling && resolvedStrategy != .mtp)
         if canUsePLD {
             let ctx = pendingHistoryContext(session: session, pending: pending)
@@ -158,7 +160,7 @@ extension QWEngineDriver {
                 },
                 encodeAnchorMaskEmbed: anchorMaskEmbed,
                 embedding: { try self.copyEmbedRow($0, to: $1) },
-                stochastic: owner.map { (Float($0.config.temperature), $0.stream) },
+                stochastic: owner.map { ($0.config.isGreedy ? Float(1e-6) : Float($0.config.temperature), $0.stream) },
                 completed: draftCompleted)
         } catch {
             commandBufferErrors += 1
@@ -284,7 +286,9 @@ extension QWEngineDriver {
         let effectiveCount = adaptiveDraftCount(count: count, defaultTrunkBits: defaultTrunkBits)
         let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
         let (extraPending, previousToken) = pendingHistoryContext(session: session, pending: pending)
-        if owner == nil && !mtpStageProfiling && resolvedStrategy != .mtp,
+        if (owner == nil || owner?.config.isGreedy == true)
+            && (activeConstraint?.constraint.isUnconstrainedNow ?? true)
+            && !mtpStageProfiling && resolvedStrategy != .mtp,
            let chosen = tryZeroCostContextDrafts(
                session: session, pending: pending, extraPending: extraPending,
                previousToken: previousToken, count: count, strategy: resolvedStrategy) {

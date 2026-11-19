@@ -525,4 +525,47 @@ final class QWContextCeilingBoundaryTests: XCTestCase {
         XCTAssertTrue(res.tokens.contains(endThinkId))
         XCTAssertLessThanOrEqual(constraint.acceptedCount, 20)
     }
+
+    func testNaivePrefillAndUncachedStreamingStochasticSpeculation() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.isMetal4TensorCapable == true,
+            "Synthetic driver prefill/speculative test requires bare-metal Apple Silicon GPU"
+        )
+        let rootDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qw-naive-stoch-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+        try Self.buildSyntheticNextNPack(at: rootDir, maxPos: 512)
+
+        let driver = try QWEngineDriver(
+            packPath: rootDir.path, maxTokens: 512, ropeRows: 512,
+            kvMode: .q4, mtpDrafts: 2, prefillChunkSize: 32)
+        let prompt = [10, 11, 12, 13, 14]
+        let naiveSession = try driver.makeSession(promptTokens: prompt.count)
+        defer { driver.finishSession(naiveSession) }
+        _ = try driver.prefill(naiveSession, tokens: prompt, mode: .naive)
+        XCTAssertEqual(naiveSession.generated, 1)
+        XCTAssertEqual(naiveSession.promptTokenCount, prompt.count)
+        XCTAssertEqual(naiveSession.tokenHistory.count, prompt.count + 1)
+
+        let sampling = QWSamplerConfig(
+            QWSamplingParameters(temperature: 0.4, topP: 0.95, topK: 40, repetitionPenalty: 1.5, seed: -1),
+            vocabulary: 256
+        )
+        var streamed: [Int] = []
+        let res = try driver.generate(
+            request: QWGenerationRequest(
+                prompt: prompt,
+                maxNew: 12,
+                sampling: sampling,
+                usePrefixCache: false,
+                speculative: QWSpeculativeParameters(enabled: true, mtpDrafts: 2, mtpBackend: "standard")
+            ),
+            onToken: { tok in streamed.append(tok); return true }
+        )
+        XCTAssertEqual(res.tokens.count, 12)
+        XCTAssertEqual(streamed, res.tokens)
+        XCTAssertNotNil(res.speculativeSummary)
+        XCTAssertFalse(res.stepTokenCounts.isEmpty)
+    }
 }

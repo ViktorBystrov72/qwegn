@@ -8,6 +8,18 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.27.3] - 2026-11-19
+
+What's changed since `v0.27.2`: tightened `QWFlashNext` repetition tracking, expanded stochastic and repetition-penalized speculative decoding coverage, hardened `.naive` prefill and async-commit fallback synchronization, and capped unbounded fallback thinking budgets at large `max_tokens`.
+
+### Fixed
+- **`QWFlashNext` Repetition Tracking & Fast-Accept Hygiene (`FNGPUSession`, `FNGPUDFlash`, `FNGPUEngine+Seam`, `FNGPUBatchScheduler+Drive`)**:
+  - Recorded `firstToken` in `drawFirstToken` when `repetitionPenalty != 1.0`, moved `recordSeenToken` in speculative seam/batch loops from pre-step tokens to newly sampled `next` / `nextTok` tokens, and relaxed fast-accept checks to `!session.seenTokens.contains(draftTok)` while enabling `allowPLD` and `isUnconstrainedNow` `tokenRecycler` parity in `FNGPUDFlash`.
+- **Stochastic, Penalty, Constraint & Uncached-Streaming Speculation (`MTPVerification+Rounds`, `MTPVerification+Hybrid`, `Stochastic`, `QWEngineDriverConformance`)**:
+  - Enabled `.ngram`, `PLD`, `tokenRecycler`, and `DSpine` / `DFlash 2` greedy-with-penalty speculation across stochastic and `isUnconstrainedNow` constraint sessions, fixed deterministic target sampling in `prepareRound` (`proposals.isEmpty && owner != nil`), updated `tokenRecycler` on stochastic verification commits, and enabled speculative streaming in `generateExperimentalStochastic` for `cache_prompt: false` / `--no-prefix-cache` SSE requests — lifting `Qwen3.8-27B` `DSpine b=16` (`rep=1.05`) decode `+3.31%` (`55.82 -> 57.71 tok/s`, acceptance `43.5% -> 47.1%`).
+- **Prefill/Decode Synchronization, Batch Retention & Thinking-Budget Safety Cap (`DriverPrefill`, `DriverDecode`, `DriverBatchDecode`, `QWServerSchema`)**:
+  - Skipped unused `40 MB` `mtpPromptEmbeddings` copies when `dflashDrafter != nil`, isolated `.naive` prefill intermediate tokens from `activeConstraint` / session history until the final token, drained `session.lastCommitCB` before touching slabs on serial fallback in `DriverDecode.forwardStep`, retained concurrent stochastic prompts in `DriverBatchDecode`, and guarded explicit `enable_thinking: true` without `reasoning_effort` at `max_tokens > 32` with the `reserved` budget cap.
+
 ## [0.27.2] - 2026-11-19
 
 What's changed since `v0.27.1`: fixed persistent multi-turn generation failures, thinking-budget overflows, degenerate repetition loops under WebUI/API sampling overrides (`repetition_penalty > 1.0`, `temperature > 0`), and stochastic speculative speed regressions across dense, looped, MoE, and Flash-Next architectures.

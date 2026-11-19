@@ -624,8 +624,11 @@ public struct ChatCompletionRequest: Codable, Sendable {
            let cap = Self.effortThinkingCaps[raw] {
             return (true, reserved.map { min(cap, $0) } ?? max(1, min(cap, maxNew / 2)))
         }
-        if reasoningBudget == nil && (!hasExplicitThinkingSetting || isJsonFormat) {
-            return reserved.map { (true, $0) } ?? (isJsonFormat ? (true, max(1, maxNew / 2)) : (false, nil))
+        if reasoningBudget == nil {
+            if !hasExplicitThinkingSetting || isJsonFormat {
+                return reserved.map { (true, $0) } ?? (isJsonFormat ? (true, max(1, maxNew / 2)) : (false, nil))
+            }
+            return (true, reserved)
         }
         return (true, reasoningBudget.map { max(0, $0) })
     }

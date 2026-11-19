@@ -96,7 +96,7 @@ extension QWEngineDriver {
         if !activeVisualSpans.isEmpty {
             applyVisualSpans(start: pos, count: T, to: psc.x)
         }
-        if let mtpPromptEmbeddings {
+        if let mtpPromptEmbeddings, dflashDrafter == nil {
             let src = psc.x.region.buffer.contents().advanced(by: psc.x.region.base + psc.x.offset)
             let dst = mtpPromptEmbeddings.region.buffer.contents().advanced(by: mtpPromptEmbeddings.region.base + mtpPromptEmbeddings.offset)
             memcpy(dst, src, T * H * 2)
@@ -208,7 +208,7 @@ extension QWEngineDriver {
             session.generated += 1    // M2: committed only after the cb landed (the head ran once)
             if session.stochastic == nil {
                 nextId = try selectConstrainedToken(session: session, rawArgmax: rawId)
-                if activeConstraint == nil, count >= 1 {
+                if (activeConstraint?.constraint.isUnconstrainedNow ?? true), count >= 1 {
                     let tailCur = tokens[start + count - 1]
                     let tailPrev = count >= 2 ? tokens[start + count - 2] : (start > 0 ? tokens[start - 1] : nil)
                     session.tokenRecycler.recordTransition(previous: tailPrev, current: tailCur, next: nextId)
@@ -287,9 +287,11 @@ extension QWEngineDriver {
         let effectiveMode = mode ?? gdnPrefillMode
         switch effectiveMode {
         case .naive:
+            let baseGenerated = session.generated
             var lastToken = 0
             for (idx, t) in tokens.enumerated() {
                 if idx + 1 == tokens.count {
+                    session.generated = baseGenerated
                     session.tokenHistory = naivePromptHistory
                     session.promptTokenCount = naivePromptHistory.count
                     let savedCollectLP = activeCollectLogprobs
@@ -297,6 +299,9 @@ extension QWEngineDriver {
                     defer { activeCollectLogprobs = savedCollectLP }
                     lastToken = try decodeStep(session, token: t, permit: permit)
                 } else {
+                    let savedConstraint = activeConstraint
+                    activeConstraint = nil
+                    defer { activeConstraint = savedConstraint }
                     lastToken = try decodeStep(session, token: t, permit: permit)
                 }
                 if (idx + 1) % 32 == 0 || idx + 1 == tokens.count {

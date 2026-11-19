@@ -560,7 +560,7 @@ extension QWEngineDriver {
                 unconditionedFirst = try prefill(session, tokens: Array(req.prompt.dropFirst(cacheMatched)),
                                                  mode: nil, permit: permit)
                 prefillElapsed = Date().timeIntervalSince(tPrefill)
-                if req.usePrefixCache, let store = prefixStore, stochasticOwner == nil,
+                if req.usePrefixCache, let store = prefixStore,
                    req.visualSpans.isEmpty {
                     _ = try? retainCachedPrompt(session, prompt: req.prompt, mode: gdnPrefillMode,
                                                 first: unconditionedFirst, store: store, permit: permit)
@@ -703,7 +703,6 @@ extension QWEngineDriver {
             } else if let owner = slot.session.stochastic {
                 chosen = try owner.stream.sampleTarget(
                     owner.distribution(logits: logitsTensor, repetitionHistory: repArr))
-                slot.session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed
             } else if sampler.config.isGreedy && sampler.config.repetitionPenalty == 1.0 {
                 chosen = rawArgmax
             } else if sampler.config.isGreedy {
@@ -716,9 +715,11 @@ extension QWEngineDriver {
         } else if let owner = slot.session.stochastic {
             chosen = try owner.stream.sampleTarget(
                 owner.distribution(logits: logitsTensor, repetitionHistory: repArr))
-            slot.session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed
         } else {
             chosen = rawArgmax
+        }
+        if let owner = slot.session.stochastic {
+            slot.session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed
         }
 
         if let stepMsValue {
@@ -738,7 +739,7 @@ extension QWEngineDriver {
             slot.logprobs.append(lp)
             slot.job.request.onTokenLogprob?(lp)
         }
-        if slot.constraint == nil, let prev1 = slot.session.tokenHistory.last {
+        if (slot.constraint?.isUnconstrainedNow ?? true), let prev1 = slot.session.tokenHistory.last {
             let prev2 = slot.session.tokenHistory.count >= 2
                 ? slot.session.tokenHistory[slot.session.tokenHistory.count - 2] : nil
             slot.session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: chosen)

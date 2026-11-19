@@ -40,7 +40,7 @@ extension QWEngineDriver {
                     owner.distribution(logits: sc.logits, repetitionHistory: repHistory))
             }
             try activeConstraint?.constraint.accept(token)
-            if activeConstraint == nil, let prev1 = session.tokenHistory.last {
+            if (activeConstraint?.constraint.isUnconstrainedNow ?? true), let prev1 = session.tokenHistory.last {
                 let prev2 = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
                 session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: token)
             }
@@ -127,7 +127,8 @@ extension QWEngineDriver {
             let output = try QWGreedyGenerationLoop.run(vocab: geometry.vocab, first: first, maxNew: effectiveMaxNew, stopIDs: stopIds,
                 onToken: onToken, ordinary: { token in
                     try self.decodeStochastic(session, token: token, permit: permit)
-                }, committedRound: committedRound, backoff: .armed(position: session.position, drafts: mtpDrafts),
+                }, committedRound: committedRound, streamsCommittedRounds: true, onStopToken: onStopToken,
+                backoff: .armed(position: session.position, drafts: mtpDrafts),
                 canSpeculate: {
                     self.canRunSpeculativeRound(session)
                         && (self.activeConstraint?.constraint.isUnconstrainedNow ?? true)

@@ -646,5 +646,13 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
         let pXHigh = xhighReq.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pXHigh.shouldThink)
         XCTAssertEqual(pXHigh.thinkingBudget, 8192)
+
+        let explicitEnableLarge = try JSONDecoder().decode(
+            ChatCompletionRequest.self,
+            from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true}"#.utf8)
+        )
+        let pExplicitLarge = explicitEnableLarge.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        XCTAssertTrue(pExplicitLarge.shouldThink)
+        XCTAssertEqual(pExplicitLarge.thinkingBudget, 65280)
     }
 }

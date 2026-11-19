@@ -268,7 +268,8 @@ extension QWEngineDriver: QWSessionInferenceEngine {
                 maxNew: request.maxNew,
                 stopIds: request.stopIDs,
                 speculative: useSpeculative,
-                onToken: effectiveOnToken
+                onToken: effectiveOnToken,
+                onStopToken: { stoppedToken = $0 }
             )
         }
 

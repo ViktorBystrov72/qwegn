@@ -34,7 +34,7 @@ extension QWEngineDriver {
             throw QWEngineDriverError.state("ordinary forward did not produce a token")
         }
         if session.stochastic == nil {
-            if activeConstraint == nil, let prev1 = session.tokenHistory.last {
+            if (activeConstraint?.constraint.isUnconstrainedNow ?? true), let prev1 = session.tokenHistory.last {
                 let prev2 = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
                 session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: next)
             }
@@ -49,6 +49,15 @@ extension QWEngineDriver {
         // GPU's share of it is the engine's own busy ratio: measured, never
         // estimated from the token rate.
         let tStep0 = Date()
+        if let prevCB = session.lastCommitCB {
+            session.lastCommitCB = nil
+            prevCB.waitUntilCompleted()
+            if prevCB.status != .completed {
+                commandBufferErrors += 1
+                session.stateFailed = true
+                throw QWEngineDriverError.state("prior speculative commit GPU failure before serial step")
+            }
+        }
         let pos = session.position
         guard pos < ropeRows else { throw QWEngineDriverError.posBeyondTable(pos) }
         // C5 guard UP FRONT (C16 law): a throw after hal.begin() would

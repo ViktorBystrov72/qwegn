@@ -389,7 +389,6 @@ extension FNGPUEngine {
         session.history.append(Int64(token))
         if residentKVHistory.count == prevCount { residentKVHistory.append(Int64(token)) }
         highWaterPos = max(highWaterPos, session.history.count)
-        if session.sampler.config.repetitionPenalty != 1.0 { session.recordSeenToken(token, vocab: vocab) }
         let stepT0 = Date()
         let r = try decodeStack.forwardToken(history: session.history, embedTable: embedTable,
                                               head: head, readStream: false,
@@ -404,6 +403,7 @@ extension FNGPUEngine {
         let next = try sampleFromHead(argmaxToken: r.token, seenTokens: session.seenTokens,
                                       seenTokenList: session.seenTokenList,
                                       sampler: session.sampler, constraint: session.constraint)
+        if session.sampler.config.repetitionPenalty != 1.0 { session.recordSeenToken(next, vocab: vocab) }
         if session.collectLogprobs { recordTokenLogprob(&session, token: next, row: 0) }
         if next != r.token {
             arena.write(head.token, from: [Int32(next)])

@@ -307,7 +307,7 @@ public enum FNGPUDFlash {
         let maxCap = max(1, min(min(session.maxDrafts, dflashCap), engine.activeCapacity - prevCount - 2))
         let stepT0 = Date(), trackRep = session.sampler.config.repetitionPenalty != 1.0
         let isUnconstrained = session.constraint?.isUnconstrainedNow ?? true, isGreedy = session.sampler.config.isGreedy
-        let allowPLD = (session.constraint == nil) && isGreedy && !trackRep && !session.sampler.config.hasExplicitSeed
+        let allowPLD = isUnconstrained && isGreedy && session.seenTokens.isEmpty && !session.sampler.config.hasExplicitSeed
         let preCtx = consumePendingContextUpdate(&session, slot: dSlot)
         var drafts = allowPLD
             ? selectHybridBypassDrafts(history: session.history, pendingToken: token,
@@ -341,7 +341,6 @@ public enum FNGPUDFlash {
         let dCount = drafts.count, activeRows = 1 + dCount
         let prevBefore = prevCount > 0 ? Int(session.history[prevCount - 1]) : nil
         session.history.append(Int64(token)); drafts.forEach { session.history.append(Int64($0)) }
-        if trackRep { session.recordSeenToken(token, vocab: engine.vocab) }
         if engine.residentKVHistory.count == prevCount {
             engine.residentKVHistory.append(Int64(token)); drafts.forEach { engine.residentKVHistory.append(Int64($0)) }
         }
@@ -428,7 +427,7 @@ public enum FNGPUDFlash {
             return (tok0, committedAccepted)
         }
         let v = engine.head.argmaxTokens(count: 1 + dCount)
-        if verifyMargin == 0 && session.sampler.config.isGreedy && session.constraint == nil {
+        if verifyMargin == 0 && session.sampler.config.isGreedy && (session.constraint?.isUnconstrainedNow ?? true) {
             for row in (0..<(1 + dCount)).reversed() {
                 let prev = (row == 0) ? prevBefore : Int(session.history[prevCount + row - 1])
                 session.tokenRecycler.recordTransition(previous: prev, current: Int(session.history[prevCount + row]), next: v[row])
@@ -438,7 +437,7 @@ public enum FNGPUDFlash {
         let boundaryTok = session.constraint?.speculationBoundaryToken
         for r in 0..<dCount {
             let draftTok = drafts[r], sampled: Int
-            if v[r] == draftTok && session.sampler.config.isGreedy && !trackRep && (session.constraint?.isUnconstrainedNow ?? true) {
+            if v[r] == draftTok && session.sampler.config.isGreedy && !session.seenTokens.contains(draftTok) && (session.constraint?.isUnconstrainedNow ?? true) {
                 try session.constraint?.accept(draftTok); sampled = draftTok
             } else {
                 sampled = try engine.sampleFromHead(argmaxToken: v[r], seenTokens: session.seenTokens,

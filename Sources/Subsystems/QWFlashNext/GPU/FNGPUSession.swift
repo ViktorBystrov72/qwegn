@@ -428,6 +428,9 @@ extension FNGPUEngine {
                                      sampler: session.sampler,
                                      constraint: session.constraint)
         session.firstToken = tok
+        if session.sampler.config.repetitionPenalty != 1.0 {
+            session.recordSeenToken(tok, vocab: vocab)
+        }
         if session.collectLogprobs {
             recordTokenLogprob(&session, token: tok, row: 0)
         }
@@ -521,7 +524,6 @@ extension FNGPUEngine {
         let prevCount = session.history.count
         let trackRep = session.sampler.config.repetitionPenalty != 1.0
         session.history.append(Int64(token))
-        if trackRep { session.recordSeenToken(token, vocab: vocab) }
         let (drafts, stepMTP) = draftsFor(&session, mtp: mtp)
         let dCount = drafts.count
         let activeRows = 1 + dCount
@@ -550,7 +552,7 @@ extension FNGPUEngine {
         for r in 0..<dCount {
             let draftTok = drafts[r]
             let sampled: Int
-            if v[r] == draftTok && session.sampler.config.isGreedy && !trackRep && (session.constraint?.isUnconstrainedNow ?? true) {
+            if v[r] == draftTok && session.sampler.config.isGreedy && !session.seenTokens.contains(draftTok) && (session.constraint?.isUnconstrainedNow ?? true) {
                 try session.constraint?.accept(draftTok)
                 sampled = draftTok
             } else {

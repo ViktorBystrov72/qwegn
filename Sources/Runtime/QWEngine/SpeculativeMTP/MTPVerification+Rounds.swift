@@ -46,7 +46,7 @@ extension QWEngineDriver {
             return false
         }
         if isWeightFreeSpeculation {
-            guard session.stochastic == nil, activeConstraint == nil,
+            guard (activeConstraint?.constraint.isUnconstrainedNow ?? true),
                   let pending = session.roundRecord.pendingToken,
                   proposeWeightFreeDrafts(session: session, pending: pending, count: count) != nil else {
                 return false
@@ -109,12 +109,12 @@ extension QWEngineDriver {
         }
         let dflashReady = (dflashDrafter == nil) || (session.dflashSlot != nil && session.dflashCacheOffset == session.position)
         let hasValidMTPCache = (mtpCache != nil && session.mtpKV != nil)
-            || (isWeightFreeSpeculation && !stochastic && mtpCache == nil && session.mtpKV == nil)
+            || (isWeightFreeSpeculation && mtpCache == nil && session.mtpKV == nil)
         guard (session.stochastic != nil) == stochastic,
               session.stochastic?.stream.isRoundActive != true,
               session.stochastic?.stream.drawsConsumed == (stochastic ? session.roundRecord.samplerDrawIndex : nil),
               verifiedSession == nil, let verifyWindow,
-              (mtpDraftEncoder != nil || echoDrafter != nil || dflashDrafter != nil || (isWeightFreeSpeculation && !stochastic)),
+              (mtpDraftEncoder != nil || echoDrafter != nil || dflashDrafter != nil || isWeightFreeSpeculation),
               dflashReady, hasValidMTPCache,
               let hidden = session.trunkHidden,
               let pending = session.roundRecord.pendingToken,
@@ -323,27 +323,44 @@ extension QWEngineDriver {
             let margin: Float = lastRoundUsedPLD ? 0 : effectiveRelaxedMargin
             let minProb: Float = margin > 0 ? effectiveRelaxedMinProb : 0
             if let owner {
-                var targets: [QWSamplingDistribution] = []
                 let ctx = pendingHistoryContext(session: session, pending: pending)
                 let extraPending = ctx.extraPending.map { [$0] } ?? []
-                for row in 0..<(drafts.count + 1) {
-                    let history = session.activeRepetitionHistory(extraTokens: extraPending + Array(drafts.prefix(row)))
-                    targets.append(try owner.distribution(logits: window.logitRow(row),
-                                                          repetitionHistory: history))
+                if proposals.isEmpty {
+                    var targetTokens = [Int](repeating: 0, count: drafts.count + 1)
+                    for row in 0..<(drafts.count + 1) {
+                        let history = session.activeRepetitionHistory(extraTokens: extraPending + Array(drafts.prefix(row)))
+                        let dist = try owner.distribution(logits: window.logitRow(row), repetitionHistory: history)
+                        let sampled = try owner.stream.sampleTarget(dist)
+                        targetTokens[row] = sampled
+                        if row < drafts.count && sampled != drafts[row] { break }
+                    }
+                    rawDecision = try QWGreedyRoundDecision.make(
+                        geometry: geometry, drafts: drafts, targetTokens: targetTokens,
+                        maxNew: maxNew, stopIDs: stopIDs)
+                    preparedStochasticWitness = QWStochasticRoundWitness(
+                        owner: owner, drawEnd: owner.stream.drawsConsumed)
+                    evidence = nil
+                } else {
+                    var targets: [QWSamplingDistribution] = []
+                    for row in 0..<(drafts.count + 1) {
+                        let history = session.activeRepetitionHistory(extraTokens: extraPending + Array(drafts.prefix(row)))
+                        targets.append(try owner.distribution(logits: window.logitRow(row),
+                                                              repetitionHistory: history))
+                    }
+                    let result = margin > 0
+                        ? try owner.stream.resolveRelaxedGumbelRound(proposals: proposals,
+                                                                     targetDistributions: targets,
+                                                                     margin: Double(margin))
+                        : try owner.stream.resolveGumbelRound(proposals: proposals,
+                                                              targetDistributions: targets)
+                    rawDecision = try QWGreedyRoundDecision.sampled(geometry: geometry,
+                        proposals: proposals, result: result, maxNew: maxNew, stopIDs: stopIDs,
+                        maxDrafts: dflashDrafter != nil ? 15 : 7)
+                    preparedStochasticWitness = QWStochasticRoundWitness(owner: owner,
+                        drawEnd: owner.stream.drawsConsumed)
+                    evidence = QWStochasticRoundEvidence(proposals: proposals, targets: targets, result: result,
+                        drawStart: boundary.record.samplerDrawIndex, drawEnd: owner.stream.drawsConsumed)
                 }
-                let result = margin > 0
-                    ? try owner.stream.resolveRelaxedGumbelRound(proposals: proposals,
-                                                                 targetDistributions: targets,
-                                                                 margin: Double(margin))
-                    : try owner.stream.resolveGumbelRound(proposals: proposals,
-                                                          targetDistributions: targets)
-                rawDecision = try QWGreedyRoundDecision.sampled(geometry: geometry,
-                    proposals: proposals, result: result, maxNew: maxNew, stopIDs: stopIDs,
-                    maxDrafts: dflashDrafter != nil ? 15 : 7)
-                preparedStochasticWitness = QWStochasticRoundWitness(owner: owner,
-                    drawEnd: owner.stream.drawsConsumed)
-                evidence = QWStochasticRoundEvidence(proposals: proposals, targets: targets, result: result,
-                    drawStart: boundary.record.samplerDrawIndex, drawEnd: owner.stream.drawsConsumed)
                 rawTargetsForLease = nil
             } else {
                 let withTargets = try window.greedyDecisionWithTargets(
@@ -405,7 +422,7 @@ extension QWEngineDriver {
         try requestGate.validate(permit)
         let profileStart = mtpStageProfiling ? DispatchTime.now().uptimeNanoseconds : nil
         let hasValidMTPCache = (mtpCache != nil && session.mtpKV != nil)
-            || (isWeightFreeSpeculation && !stochastic && mtpCache == nil && session.mtpKV == nil)
+            || (isWeightFreeSpeculation && mtpCache == nil && session.mtpKV == nil)
         guard (preparedStochasticWitness != nil) == stochastic,
               (session.stochastic != nil) == stochastic,
               verifiedSession === session, session.verificationPending,
@@ -440,7 +457,7 @@ extension QWEngineDriver {
                 }
                 rawTargets = computedTargets
             }
-            if commitMargin == 0, activeConstraint == nil {
+            if commitMargin == 0, (activeConstraint?.constraint.isUnconstrainedNow ?? true) {
                 let pendingInHistory = session.tokenHistory.count > session.position
                     && session.tokenHistory.last == verifiedInputs[0]
                 let prevBeforePending: Int? = pendingInHistory
@@ -615,7 +632,17 @@ extension QWEngineDriver {
         }
     
 
-        session.tokenHistory.append(contentsOf: decision.tokens)
+        if stochastic, (activeConstraint?.constraint.isUnconstrainedNow ?? true) {
+            for tok in decision.tokens {
+                if let prev1 = session.tokenHistory.last {
+                    let prev2 = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
+                    session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: tok)
+                }
+                session.tokenHistory.append(tok)
+            }
+        } else {
+            session.tokenHistory.append(contentsOf: decision.tokens)
+        }
         if let active = activeConstraint {
             for tok in decision.tokens {
                 try active.constraint.accept(tok)

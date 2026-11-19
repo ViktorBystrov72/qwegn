@@ -186,9 +186,6 @@ extension FNGPUBatchScheduler {
                 if engine.residentKVHistoryBySlot[s]?.count == prevCount {
                     engine.residentKVHistoryBySlot[s]?.append(Int64(tok))
                 }
-                if job.session.sampler.config.repetitionPenalty != 1.0 {
-                    job.session.recordSeenToken(tok, vocab: engine.vocab)
-                }
                 slotStates[s].highWaterPos = max(slotStates[s].highWaterPos, job.session.history.count)
                 validSlots.append(s)
                 histories.append(job.session.history)
@@ -220,6 +217,9 @@ extension FNGPUBatchScheduler {
                         row: b,
                         constraint: job.session.constraint
                     )
+                    if job.session.sampler.config.repetitionPenalty != 1.0 {
+                        job.session.recordSeenToken(nextTok, vocab: engine.vocab)
+                    }
                     if job.session.collectLogprobs {
                         engine.recordTokenLogprob(&job.session, token: nextTok, row: b)
                     }
