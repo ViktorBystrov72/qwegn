@@ -3,6 +3,7 @@
 #pragma once
 #include <metal_stdlib>
 #include <metal_simdgroup>
+#include "qw_fastmath_safe.metalh"
 using namespace metal;
 
 struct EmeansSelParams {
@@ -38,9 +39,7 @@ struct EmeansSelGeom {
 };
 
 static inline uint emeans_float_to_u32(float x) {
-    if (isnan(x)) return 0u;
-    const uint bits = as_type<uint>(x);
-    return (bits & 0x80000000u) ? (~bits) : (bits ^ 0x80000000u);
+    return qw_sortable_f32_u32(x);
 }
 
 static inline uint emeans_nonzero_score_u32(float x) {

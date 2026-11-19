@@ -1,0 +1,27 @@
+// qw_fastmath_safe.metalh
+// Bit-level float checks safe under Metal -ffast-math.
+#ifndef QW_FASTMATH_SAFE_METALH
+#define QW_FASTMATH_SAFE_METALH
+
+#include <metal_stdlib>
+using namespace metal;
+
+inline bool qw_is_finite_bits(float x) {
+    return (as_type<uint>(x) & 0x7f800000u) != 0x7f800000u;
+}
+
+inline bool qw_is_nan_bits(float x) {
+    return (as_type<uint>(x) & 0x7fffffffu) > 0x7f800000u;
+}
+
+inline float qw_safe_softplus(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+inline uint qw_sortable_f32_u32(float x) {
+    uint u = as_type<uint>(x);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return 0u;
+    return (u & 0x80000000u) != 0u ? ~u : (u ^ 0x80000000u);
+}
+
+#endif

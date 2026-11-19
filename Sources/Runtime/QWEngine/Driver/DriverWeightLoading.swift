@@ -120,7 +120,9 @@ extension QWEngineDriver {
             // an over-cap dispatch silently no-ops — half a matrix would
             // upload as zeros). 65535·256 elems = 32 MB bf16 per chunk.
             let chunk = 65535 * 256
-            let tmp = hl.device.makeBuffer(length: chunk * 2, options: .storageModeShared)!
+            guard let tmp = hl.device.makeBuffer(length: chunk * 2, options: .storageModeShared) else {
+                throw QWEngineDriverError.state("bf16 conversion staging buffer allocation failed")
+            }
             var done = 0
             while done < total {
                 let n = min(chunk, total - done)
@@ -235,9 +237,12 @@ extension QWEngineDriver {
             let t = try allocateWeight(QWTensorShape([elems], .f16))
             var bits = [UInt16](repeating: 0, count: elems)
             for i in 0..<elems { bits[i] = QWQuant.f32tof16Bits(src[i]) }
-            bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in t.region.buffer.contents()
-                .advanced(by: t.region.base + t.offset)
-                .copyMemory(from: raw.baseAddress!, byteCount: elems * 2) }
+            bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                t.region.buffer.contents()
+                    .advanced(by: t.region.base + t.offset)
+                    .copyMemory(from: base, byteCount: elems * 2)
+            }
             return t
         }
         /// A norm gamma's bits, in the law the engine's `1 + w` norms read:
@@ -254,9 +259,12 @@ extension QWEngineDriver {
             guard !geometry.normGammaIsPlusOne || isMLXCheckpoint else { return try f16w(name, elems) }
             let bits = try normGammaBits(name, elems)
             let t = try allocateWeight(QWTensorShape([elems], .f16))
-            bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in t.region.buffer.contents()
-                .advanced(by: t.region.base + t.offset)
-                .copyMemory(from: raw.baseAddress!, byteCount: elems * 2) }
+            bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                t.region.buffer.contents()
+                    .advanced(by: t.region.base + t.offset)
+                    .copyMemory(from: base, byteCount: elems * 2)
+            }
             return t
         }
 
@@ -268,9 +276,12 @@ extension QWEngineDriver {
         mutating func f32w(_ name: String, _ elems: Int) throws -> QWTensorValue {
             let src = try rawFloats(name, elems)
             let t = try allocateWeight(QWTensorShape([elems], .f32))
-            src.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in t.region.buffer.contents()
-                .advanced(by: t.region.base + t.offset)
-                .copyMemory(from: raw.baseAddress!, byteCount: elems * 4) }
+            src.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                t.region.buffer.contents()
+                    .advanced(by: t.region.base + t.offset)
+                    .copyMemory(from: base, byteCount: elems * 4)
+            }
             return t
         }
         mutating func f32wOrDequant(_ name: String, _ elems: Int) throws -> QWTensorValue {
@@ -290,9 +301,12 @@ extension QWEngineDriver {
                 src = try rawFloats(name, elems)
             }
             let t = try allocateWeight(QWTensorShape([elems], .f32))
-            src.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in t.region.buffer.contents()
-                .advanced(by: t.region.base + t.offset)
-                .copyMemory(from: raw.baseAddress!, byteCount: elems * 4) }
+            src.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                t.region.buffer.contents()
+                    .advanced(by: t.region.base + t.offset)
+                    .copyMemory(from: base, byteCount: elems * 4)
+            }
             return t
         }
         // ── W3: plane concatenation helper (pure plumbing, zero math change) ──
@@ -318,7 +332,7 @@ extension QWEngineDriver {
         mutating func concatPlane(_ tensors: [(name: String, n: Int)], k: Int,
                          key: KeyPath<QWQTensorEntry, Int?>, extraZeroRows: Int = 0) throws -> QWTensorValue {
             if format.isNativeAffine {
-                return try aqConcatPlane(tensors, k: k)
+                return try aqConcatPlane(tensors, k: k, extraZeroRows: extraZeroRows)
             }
             let rowBytes = resolvedPlaneLayout(tensors.first?.name, k: k).rowBytes
             let totalRows = tensors.reduce(0) { $0 + $1.n } + extraZeroRows

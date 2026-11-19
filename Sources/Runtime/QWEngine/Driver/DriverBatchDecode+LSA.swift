@@ -13,15 +13,9 @@ extension QWEngineDriver {
 
     /// Selects up to `maxRows` batch-eligible active indices, honoring the LSA dense window.
     func eligibleBatchSlotIndices(slots: [(position: Int, remaining: Int)], maxRows: Int) -> [Int] {
-        var out: [Int] = []
-        out.reserveCapacity(min(maxRows, slots.count))
-        for (idx, item) in slots.enumerated() {
-            if isSlotEligibleForLSABatchedDecode(position: item.position, remaining: item.remaining) {
-                out.append(idx)
-                if out.count == maxRows { break }
-            }
+        QWBatchPartitionSelection.eligibleSlotIndices(count: slots.count, maxRows: maxRows) { idx in
+            isSlotEligibleForLSABatchedDecode(position: slots[idx].position, remaining: slots[idx].remaining)
         }
-        return out
     }
 
     /// Stashes any prior non-batch LSA state owner and clears ownership prior to batched dense decode.

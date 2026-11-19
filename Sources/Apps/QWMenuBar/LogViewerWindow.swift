@@ -4,6 +4,55 @@ import AppKit
 import QWServer
 import SwiftUI
 
+/// Memoizes filtered log slices with O(1) cache hits and incremental append support.
+@MainActor
+final class QWLogFilterCache {
+    private var lastCount: Int = -1
+    private var lastFirstId: UInt64?
+    private var lastLastId: UInt64?
+    private var lastFilter: QWLogFilterLevel = .all
+    private var lastQuery: String = ""
+    private var cached: [QWLogEntry] = []
+    private(set) var fullRecomputeCount: Int = 0
+
+    func entries(
+        from source: [QWLogEntry],
+        filter: QWLogFilterLevel,
+        query: String
+    ) -> [QWLogEntry] {
+        let count = source.count
+        let firstId = source.first?.id
+        let lastId = source.last?.id
+
+        if count == lastCount && firstId == lastFirstId && lastId == lastLastId
+            && filter == lastFilter && query == lastQuery {
+            return cached
+        }
+
+        if filter == lastFilter && query == lastQuery && lastCount > 0 && count > lastCount
+            && firstId == lastFirstId && source[lastCount - 1].id == lastLastId {
+            for entry in source[lastCount...] where entry.matches(filter: filter, query: query) {
+                cached.append(entry)
+            }
+            lastCount = count
+            lastLastId = lastId
+            return cached
+        }
+
+        let filtered = (filter == .all && query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            ? source
+            : source.filter { $0.matches(filter: filter, query: query) }
+        cached = filtered
+        lastCount = count
+        lastFirstId = firstId
+        lastLastId = lastId
+        lastFilter = filter
+        lastQuery = query
+        fullRecomputeCount &+= 1
+        return filtered
+    }
+}
+
 /// Streaming engine & HTTP request log window with chip filters, wrap toggle, and copy feedback.
 public struct LogViewerWindow: View {
     public var telemetry: TelemetryObservable
@@ -14,6 +63,7 @@ public struct LogViewerWindow: View {
     @State private var autoScroll: Bool = true
     @State private var wrapLines: Bool = true
     @State private var showCopiedFeedback: Bool = false
+    @State private var filterCache = QWLogFilterCache()
 
     public init(
         telemetry: TelemetryObservable,
@@ -34,26 +84,27 @@ public struct LogViewerWindow: View {
     }
 
     private var filteredEntries: [QWLogEntry] {
-        telemetry.logEntries.filter { $0.matches(filter: filterLevel, query: searchText) }
+        filterCache.entries(from: telemetry.logEntries, filter: filterLevel, query: searchText)
     }
 
     public var body: some View {
-        ZStack {
+        let entries = filteredEntries
+        return ZStack {
             SystemVibrancyView()
                 .edgesIgnoringSafeArea(.all)
 
             VStack(spacing: 0) {
-                toolbarHeader
+                toolbarHeader(entryCount: entries.count)
                 Divider()
                 filterBar
                 Divider()
-                logScrollBody
+                logScrollBody(entries: entries)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var toolbarHeader: some View {
+    private func toolbarHeader(entryCount: Int) -> some View {
         HStack(spacing: 8) {
             HStack(spacing: 6) {
                 Image(systemName: "terminal")
@@ -62,7 +113,7 @@ public struct LogViewerWindow: View {
                 Text("Engine Logs")
                     .font(TelemetryTheme.ui(13, .semibold))
                     .foregroundStyle(TelemetryTheme.primary(increasedContrast: increasedContrast))
-                Text("\(filteredEntries.count)")
+                Text("\(entryCount)")
                     .font(TelemetryTheme.numeric(11, .medium))
                     .foregroundStyle(TelemetryTheme.secondary(increasedContrast: increasedContrast))
                     .padding(.horizontal, 6)
@@ -198,15 +249,15 @@ public struct LogViewerWindow: View {
         .background(TelemetryTheme.rowSubstrate)
     }
 
-    private var logScrollBody: some View {
+    private func logScrollBody(entries: [QWLogEntry]) -> some View {
         ScrollViewReader { proxy in
             Group {
-                if filteredEntries.isEmpty {
+                if entries.isEmpty {
                     emptyLogView
                 } else {
                     ScrollView(wrapLines ? .vertical : [.vertical, .horizontal], showsIndicators: true) {
                         LazyVStack(alignment: .leading, spacing: 3) {
-                            ForEach(filteredEntries) { entry in
+                            ForEach(entries) { entry in
                                 logRowView(entry)
                                     .id(entry.id)
                             }
@@ -214,7 +265,7 @@ public struct LogViewerWindow: View {
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .onChange(of: filteredEntries.last?.id) { _, lastId in
+                    .onChange(of: entries.last?.id) { _, lastId in
                         guard autoScroll, let lastId else { return }
                         withAnimation(.easeOut(duration: 0.1)) {
                             proxy.scrollTo(lastId, anchor: .bottom)

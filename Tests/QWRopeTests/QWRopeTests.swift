@@ -230,8 +230,8 @@ final class QWRopeTests: XCTestCase {
             let nGot = readNorm(io, S)
             let nRef = Self.f16Vals(Self.fixture("rope_q_norm_S\(S).bin"))   // f16 engine law
             var qSlots: [Float] = []
-            for p in 0..<S { for row in 0..<24 {   // compact [p·768 + r·32] uint4s
-                let b = p * 6144 + row * 256
+            for p in 0..<S { for row in 0..<24 {   // slot head = 2*row inside [p*12288 + head*256]
+                let b = p * Self.qSlot + row * 512
                 qSlots += nGot[b ..< b + 256] } }
             let vn = Self.parityViolations(qSlots, nRef)
             if vn.violations > 0, S <= 8 {
@@ -247,8 +247,8 @@ final class QWRopeTests: XCTestCase {
             XCTAssertEqual(vn.violations, 0, "S=\(S) staged norm: worst \(vn.worstAbs) @\(vn.worstIdx) ratio \(vn.worstRatio)")
             let knRef = Self.f16Vals(Self.fixture("rope_k_norm_S\(S).bin"))  // f16 engine law
             var kSlots: [Float] = []
-            for p in 0..<S { for row in 0..<4 {   // kBase = S·6144, [p·1024 + r·256]
-                let base = S * 6144 + p * 1024 + row * 256
+            for p in 0..<S { for row in 0..<4 {   // kBase = S*qSlot, [p*1024 + r*256]
+                let base = S * Self.qSlot + p * Self.kAll + row * 256
                 kSlots += nGot[base ..< base + 256] } }
             let vk = Self.parityViolations(kSlots, knRef)
             XCTAssertEqual(vk.violations, 0, "S=\(S) k staged norm: worst \(vk.worstAbs) @\(vk.worstIdx)")

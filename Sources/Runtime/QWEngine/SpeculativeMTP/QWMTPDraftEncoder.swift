@@ -134,10 +134,14 @@ final class QWMTPDraftEncoder {
     private let outPlan: QWGemmPlan
     private let guPlan: QWGemmPlan
     private let downPlan: QWGemmPlan
+    weak var driver: QWEngineDriver?
+    var hasColdMoE: Bool { weights.moe?.coldStreamer != nil }
 
     init(geometry: QWModelGeometry, hal: QWHal, weights: QWMTPDraftWeights, scratch: QWMTPDraftScratch,
          rope: QWRopeApply, ropeRows: Int, kvMode: QWKVMode = .f16,
-         mlaOperator: QWMLAAttnOperator? = nil, mlaLayerIndex: Int = 0) throws {
+         mlaOperator: QWMLAAttnOperator? = nil, mlaLayerIndex: Int = 0,
+         driver: QWEngineDriver? = nil) throws {
+        self.driver = driver
         self.geometry = geometry
         let h = geometry.hidden, kv = geometry.kvHeads * geometry.headDim
         let i = weights.down.k
@@ -323,6 +327,15 @@ final class QWMTPDraftEncoder {
     func encode(_ enc: any MTLComputeCommandEncoder, embedding: QWTensorValue,
                 hidden: QWTensorValue, kv: (k: QWKVLayerView, v: QWKVLayerView),
                 cacheRows: Int, absolutePosition: Int) throws {
+        var current = enc
+        try encode(&current, embedding: embedding, hidden: hidden, kv: kv,
+                   cacheRows: cacheRows, absolutePosition: absolutePosition)
+    }
+
+    func encode(_ enc: inout any MTLComputeCommandEncoder, embedding: QWTensorValue,
+                hidden: QWTensorValue, kv: (k: QWKVLayerView, v: QWKVLayerView),
+                cacheRows: Int, absolutePosition: Int,
+                driver: QWEngineDriver? = nil, cb: (any MTLCommandBuffer)? = nil) throws {
         try encodeQKV(enc, embedding: embedding, hidden: hidden, kv: kv,
                        cacheRows: cacheRows, absolutePosition: absolutePosition)
         let s = scratch, w = weights
@@ -349,10 +362,19 @@ final class QWMTPDraftEncoder {
                           x: s.oProjOut, gamma: w.postAttnNorm, out: s.ln2, residual: s.fcOut16,
                           geometry: geometry)
         if let moe = w.moe, let moeScratch = s.moe {
-            var mEnc = enc
-            try QWMoEChain.encode(enc: &mEnc, hal: hal, moe: moe, s: moeScratch,
+            let activeDriver = driver ?? self.driver
+            if moe.coldStreamer != nil && activeDriver == nil {
+                throw QWEngineDriverError.state("MTP draft MoE cold experts require an attached driver")
+            }
+            let prevID = ObjectIdentifier(enc)
+            try QWMoEChain.encode(enc: &enc, hal: hal, moe: moe, s: moeScratch,
                                   x16: s.ln2, dn32: s.fcOut32, dn16: s.downOut,
-                                  rows: 1, geometry: geometry, skipOut32: true)
+                                  rows: 1, geometry: geometry,
+                                  driver: moe.coldStreamer != nil ? activeDriver : nil,
+                                  cb: cb, skipOut32: true)
+            if ObjectIdentifier(enc) != prevID {
+                hal.touchKeepAlive(enc)
+            }
         } else {
             try project(enc, x: s.ln2, gs: s.gsHidden, w: w.gu.view,
                         plan: guPlan, y32: s.mlp32, y16: s.mlpIntermediate)

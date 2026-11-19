@@ -2,6 +2,7 @@
 #include <metal_simdgroup>
 using namespace metal;
 #include "include/qw_dequant.metalh"   // the fold law (C05 winner body, verbatim)
+#include "include/qw_fastmath_safe.metalh"
 #include "qw_dequant_multi.metalh"     // the size-preserving family's blocks
 
 // qwhead.metal — C15: LM-head GEMV (split-K raced vs C05 plain) + GPU
@@ -46,8 +47,7 @@ using namespace metal;
 // (sign set), set the high bit for non-negative. A naive `v>=0?b:~b` puts
 // negatives INSIDE the positive range inverted — measured, it ranked
 static inline uint qw_sortable(float v) {
-    const uint b = as_type<uint>(v);
-    return (b & 0x80000000u) ? ~b : (b ^ 0x80000000u);
+    return qw_sortable_f32_u32(v);
 }
 
 kernel void qwg_head_gemv_split(
@@ -178,9 +178,8 @@ kernel void qwg_mtp_head_gemv_q4g_argmax(
             y[row] = vx;
         }
         const uint raw = as_type<uint>(vx);
-        const bool invalid = row < N && (raw & 0x7f800000u) == 0x7f800000u;
-        const uint bits = (raw & 0x7fffffffu) == 0u ? 0u : raw;
-        sh[sg] = invalid ? 0xffffffffu : ((bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u));
+        const bool invalid = (row < N) && ((raw & 0x7fffffffu) > 0x7f800000u || raw == 0x7f800000u);
+        sh[sg] = invalid ? 0xffffffffu : qw_sortable_f32_u32(vx);
         sl[sg] = (invalid || row >= N) ? 0u : ~row;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -223,8 +222,8 @@ kernel void qwg_head_argmax(
         uint tid [[thread_index_in_threadgroup]]) {
     const uint i = tg.x * 256u + tid;
     const float v = (i < N) ? logits[i] : -INFINITY;
-    const uint hi = qw_sortable(v);
-    const uint lo = ~i;
+    const uint hi = (i < N) ? qw_sortable(v) : 0u;
+    const uint lo = (i < N) ? ~i : 0u;
     const uint maxHi = simd_max(hi);
     const uint maxLo = simd_max((hi == maxHi) ? lo : 0u);
     threadgroup uint sh[8], sl[8];
@@ -318,7 +317,7 @@ kernel void qwg_head_argmax_fin_variational(
                 const float maxLogit = as_type<float>(rawMax);
                 const float draftLogit = logits[(size_t)row * vocab + dTok];
                 if (draftLogit >= maxLogit - margin) {
-                    if (isfinite(minLogProb)) {
+                    if (qw_is_finite_bits(minLogProb)) {
                         gate = 1u;
                         sDraft = dTok;
                         sMax = maxLogit;

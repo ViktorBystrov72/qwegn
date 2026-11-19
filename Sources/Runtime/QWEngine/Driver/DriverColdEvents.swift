@@ -12,6 +12,25 @@ import QWHAL
 import QWGEMM
 
 final class ColdEventPipeline: @unchecked Sendable {
+    private final class WorkerState: @unchecked Sendable {
+        struct Job {
+            let wait: UInt64
+            let run: () throws -> Bool
+            let abort: () -> Void
+        }
+        let cond = NSCondition()
+        var jobs: [Job] = []
+        var isStopped = false
+        var workerExited = false
+        var failure: (any Error)?
+        var gpuTimedOut = false
+        var ioUs: Double = 0
+        var waitUs: Double = 0
+        var staged = 0
+        var activeJobs = 0
+        var signalTimes: [CFTimeInterval?] = []
+    }
+
     let event: any MTLSharedEvent
     let promoList: any MTLBuffer
     let promoCapacity: Int
@@ -20,21 +39,18 @@ final class ColdEventPipeline: @unchecked Sendable {
     let residentIds: any MTLBuffer
     /// Delay length in dependent FMAs; tuned by `tuneBridge` from the step's timings.
     private(set) var bridgeIters: UInt32 = 3000
-    /// Host signal time per job; nil when the job read from SSD (late by design).
-    private var signalTimes: [CFTimeInterval?] = []
     /// This step's bridge CBs, in route order (encode thread only).
     var bridgeCBs: [any MTLCommandBuffer] = []
     static let bridgeEnabled = ProcessInfo.processInfo.environment["QW_COLD_EVENT_BRIDGE"] != "0"
     private var nextValue: UInt64 = 0
-    private let cond = NSCondition()
-    private var jobs: [(wait: UInt64, run: () throws -> Bool)] = []
-    private var isStopped = false
-    private var workerExited = false
-    private var failure: (any Error)?
-    private var ioUs: Double = 0
-    private var waitUs: Double = 0
-    private var staged = 0
+    private let state = WorkerState()
     static let spinTimeout: TimeInterval = 30
+
+    var hasFailure: Bool {
+        state.cond.lock()
+        defer { state.cond.unlock() }
+        return state.failure != nil
+    }
 
     init?(device: any MTLDevice, promoCapacity: Int = 64) {
         guard let event = device.makeSharedEvent(),
@@ -47,7 +63,10 @@ final class ColdEventPipeline: @unchecked Sendable {
         self.event = event
         self.promoList = list
         self.promoCapacity = promoCapacity
-        let t = Thread { [unowned self] in self.workerLoop() }
+        let workerState = self.state
+        let t = Thread { [weak self, workerState] in
+            Self.workerLoop(owner: { self }, state: workerState)
+        }
         t.qualityOfService = .userInteractive
         t.name = "qwg.cold-events"
         t.start()
@@ -55,19 +74,28 @@ final class ColdEventPipeline: @unchecked Sendable {
 
     /// Stops the background cold-event worker thread and waits for it to exit cleanly.
     func shutdown() {
-        cond.lock()
-        if !isStopped {
-            isStopped = true
-            cond.broadcast()
+        state.cond.lock()
+        if !state.isStopped {
+            state.isStopped = true
+            state.cond.broadcast()
         }
-        while !workerExited {
-            cond.wait()
+        while !state.workerExited {
+            state.cond.wait()
         }
-        cond.unlock()
+        state.cond.unlock()
     }
 
     deinit {
         shutdown()
+    }
+
+    /// Waits until all queued and active cold-event jobs have completed.
+    func waitUntilIdle() {
+        state.cond.lock()
+        while !state.jobs.isEmpty || state.activeJobs > 0 {
+            state.cond.wait()
+        }
+        state.cond.unlock()
     }
 
     /// Reserves (ready, done): the GPU signals `ready`, the worker signals `done`.
@@ -76,33 +104,45 @@ final class ColdEventPipeline: @unchecked Sendable {
         return (nextValue - 1, nextValue)
     }
 
-    /// `run` returns whether it read from SSD.
-    func enqueue(ready: UInt64, _ run: @escaping () throws -> Bool) {
-        cond.lock()
-        jobs.append((ready, run))
-        cond.signal()
-        cond.unlock()
+    /// `run` returns whether it read from SSD; `onAbort` zeroes GPU inputs if skipped/failed.
+    func enqueue(
+        ready: UInt64,
+        onAbort: @escaping () -> Void = {},
+        _ run: @escaping () throws -> Bool
+    ) {
+        state.cond.lock()
+        state.jobs.append(WorkerState.Job(wait: ready, run: run, abort: onAbort))
+        state.cond.signal()
+        state.cond.unlock()
     }
 
     func addStats(ioUs: Double, staged: Int) {
-        cond.lock(); self.ioUs += ioUs; self.staged += staged; cond.unlock()
+        state.cond.lock()
+        state.ioUs += ioUs
+        state.staged += staged
+        state.cond.unlock()
     }
 
     /// Drains failure and counters; call only after the step's last CB completed.
     func takeStepResult() -> (failure: (any Error)?, ioUs: Double, waitUs: Double, staged: Int) {
-        cond.lock(); defer { cond.unlock() }
-        let r = (failure, ioUs, waitUs, staged)
-        failure = nil; ioUs = 0; waitUs = 0; staged = 0
+        state.cond.lock()
+        defer { state.cond.unlock() }
+        let r = (state.failure, state.ioUs, state.waitUs, state.staged)
+        state.failure = nil
+        state.gpuTimedOut = false
+        state.ioUs = 0
+        state.waitUs = 0
+        state.staged = 0
         return r
     }
 
     /// Retunes the delay from the step's bridge CBs and the host signal times: grow while the
     /// host signals after the bridge ends, shrink on spare slack. Call after the step completed.
     func tuneBridge() {
-        cond.lock()
-        let signals = signalTimes
-        signalTimes.removeAll(keepingCapacity: true)
-        cond.unlock()
+        state.cond.lock()
+        let signals = state.signalTimes
+        state.signalTimes.removeAll(keepingCapacity: true)
+        state.cond.unlock()
         let bridges = bridgeCBs
         bridgeCBs.removeAll(keepingCapacity: true)
         guard Self.bridgeEnabled, signals.count == bridges.count, !signals.isEmpty else { return }
@@ -123,23 +163,35 @@ final class ColdEventPipeline: @unchecked Sendable {
         }
     }
 
-    private func workerLoop() {
+    private static func workerLoop(owner: () -> ColdEventPipeline?, state: WorkerState) {
         while true {
-            cond.lock()
-            while jobs.isEmpty && !isStopped { cond.wait() }
-            if isStopped && jobs.isEmpty {
-                workerExited = true
-                cond.broadcast()
-                cond.unlock()
+            state.cond.lock()
+            while state.jobs.isEmpty && !state.isStopped { state.cond.wait() }
+            if state.isStopped && state.jobs.isEmpty {
+                state.workerExited = true
+                state.cond.broadcast()
+                state.cond.unlock()
                 return
             }
-            let job = jobs.removeFirst()
-            let failed = failure != nil
-            cond.unlock()
+            let job = state.jobs.removeFirst()
+            state.activeJobs += 1
+            let failed = state.failure != nil
+            let earlierTimedOut = state.gpuTimedOut
+            state.cond.unlock()
+
+            guard let pipeline = owner(), !state.isStopped else {
+                job.abort()
+                state.cond.lock()
+                state.activeJobs -= 1
+                state.cond.broadcast()
+                state.cond.unlock()
+                continue
+            }
+
             let t0 = Date()
-            var ready = event.signaledValue >= job.wait
-            while !ready, Date().timeIntervalSince(t0) < Self.spinTimeout {
-                ready = event.signaledValue >= job.wait
+            var ready = earlierTimedOut ? false : (pipeline.event.signaledValue >= job.wait)
+            while !ready && !earlierTimedOut && !state.isStopped && Date().timeIntervalSince(t0) < Self.spinTimeout {
+                ready = pipeline.event.signaledValue >= job.wait
             }
             let waited = Date().timeIntervalSince(t0) * 1e6
             var err: (any Error)?
@@ -149,27 +201,37 @@ final class ColdEventPipeline: @unchecked Sendable {
             } else if !failed {
                 do { didIO = try job.run() } catch { err = error }
             }
-            if err != nil || failed { promoList.contents().storeBytes(of: UInt32(0), as: UInt32.self) }
-            cond.lock()
-            waitUs += waited
-            if let err, failure == nil { failure = err }
-            cond.unlock()
-            // Always signal, so the GPU never waits forever on a failed job.
-            event.signaledValue = job.wait + 1
+            if err != nil || failed {
+                pipeline.promoList.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+                if ready { job.abort() }
+            }
+            // Only unblock GPU wait when route CB signaled ready and ids were safely invalidated on error.
+            if ready {
+                pipeline.event.signaledValue = job.wait + 1
+            }
             let signalled = CACurrentMediaTime()
-            cond.lock(); signalTimes.append(didIO ? nil : signalled); cond.unlock()
+            state.cond.lock()
+            state.waitUs += waited
+            if !ready { state.gpuTimedOut = true }
+            if let err, state.failure == nil { state.failure = err }
+            state.signalTimes.append(didIO ? nil : signalled)
+            state.activeJobs -= 1
+            state.cond.broadcast()
+            state.cond.unlock()
         }
     }
 }
 
 extension QWEngineDriver {
-    func coldEventsUsable(_ moe: MoEW, rows: Int) -> Bool {
+    func coldEventsUsable(_ moe: MoEW, rows: Int, isVerifyWindow: Bool = false) -> Bool {
         let totalRoutes = rows * moe.expertsPerTok
         guard tuning.coldEvents, !Self.decodeProfileEnabled, !QWMoEChain.coldTimingProxy,
               (1...4).contains(rows), stepCBs != nil,
-              let st = moe.coldStreamer, st.isDynamic, st.stagingSlots >= totalRoutes,
+              let st = moe.coldStreamer, st.isDynamic,
               moe.coldGateUp != nil, moe.coldDown != nil,
               st.guExpertBytes % 16 == 0, st.downExpertBytes % 16 == 0 else { return false }
+        let effectiveSlots = st.effectiveColdBudget(isVerifyWindow: isVerifyWindow).slots
+        guard effectiveSlots >= totalRoutes else { return false }
         if coldEvents == nil { coldEvents = ColdEventPipeline(device: hal.device) }
         return coldEvents != nil && totalRoutes <= coldEvents!.promoCapacity
     }
@@ -181,10 +243,14 @@ extension QWEngineDriver {
     /// Returns whether `resident` was encoded.
     @discardableResult
     func stageColdExpertsEvent(moe: MoEW, s: MoEScratch, rows: Int = 1,
+                               isVerifyWindow: Bool = false,
                                resident: ((any MTLComputeCommandEncoder, QWTensorValue) throws -> Void)? = nil) throws -> Bool {
         guard let pipe = coldEvents, let streamer = moe.coldStreamer,
               let curCB = activeCB, let curEnc = activeEnc else {
             throw QWEngineDriverError.state("cold event staging without pipeline or active CB")
+        }
+        if pipe.hasFailure {
+            throw QWEngineDriverError.state("cold event staging aborted due to earlier layer failure")
         }
         let routes = moe.expertsPerTok
         let count = rows * routes
@@ -206,14 +272,18 @@ extension QWEngineDriver {
         }
         let v = pipe.reserve()
         curEnc.endEncoding()
+        activeEnc = nil
         curCB.encodeSignalEvent(pipe.event, value: v.ready)
         curCB.commit()
+        activeCB = nil
         stepCBs?.append(curCB)
         // The signal fires only when its CB completes, so the delay is a CB of its own.
         if let residentIds, let resident {
             guard let (resCB, resEnc) = hal.begin(.serial) else {
                 throw QWEngineDriverError.state("cold event resident cmdbuffer")
             }
+            var resOpen = true
+            defer { if resOpen { resEnc.endEncoding() } }
             try resident(resEnc, residentIds)
             if ColdEventPipeline.bridgeEnabled {
                 resEnc.setComputePipelineState(try hal.pipeline("qwg_cold_event_bridge"))
@@ -222,44 +292,66 @@ extension QWEngineDriver {
                 resEnc.setBytes(&iters, length: 4, index: 1)
                 resEnc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                resOpen = false
                 hal.end(resCB, resEnc)
                 pipe.bridgeCBs.append(resCB)
             } else {
+                resOpen = false
                 hal.end(resCB, resEnc)
             }
+            stepCBs?.append(resCB)
         } else if ColdEventPipeline.bridgeEnabled, let (bridgeCB, bridge) = hal.begin(.serial) {
+            var bridgeOpen = true
+            defer { if bridgeOpen { bridge.endEncoding() } }
             bridge.setComputePipelineState(try hal.pipeline("qwg_cold_event_bridge"))
             bridge.setBuffer(pipe.bridgeTick, offset: 0, index: 0)
             var iters = pipe.bridgeIters
             bridge.setBytes(&iters, length: 4, index: 1)
             bridge.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            bridgeOpen = false
             hal.end(bridgeCB, bridge)
+            stepCBs?.append(bridgeCB)
             pipe.bridgeCBs.append(bridgeCB)
-        }
-        let idxPtr = UnsafeMutableRawPointer(s.idx.region.buffer.contents()
-            .advanced(by: s.idx.region.base + s.idx.offset))
-        let list = pipe.promoList.contents().assumingMemoryBound(to: UInt32.self)
-        let cap = pipe.promoCapacity
-        pipe.enqueue(ready: v.ready) {
-            let ids = idxPtr.assumingMemoryBound(to: UInt32.self)
-            let prep = try streamer.prepareSpan(idxPtr: ids, startRow: 0, totalRows: rows, routes: routes)
-            defer { streamer.pendingPromotions.removeAll(keepingCapacity: true) }
-            guard prep.nextRow == rows, streamer.pendingPromotions.count <= cap else {
-                throw QWEngineDriverError.state("cold event span did not fit staging")
-            }
-            for (i, p) in streamer.pendingPromotions.enumerated() {
-                list[1 + 2 * i] = UInt32(p.staging)
-                list[2 + 2 * i] = UInt32(p.bank)
-            }
-            list[0] = UInt32(streamer.pendingPromotions.count)
-            let t0 = Date()
-            if prep.stagedCount > 0 { try streamer.executeBatch(prep.guBatch + prep.downBatch) }
-            pipe.addStats(ioUs: Date().timeIntervalSince(t0) * 1e6, staged: prep.stagedCount)
-            return prep.stagedCount > 0
         }
         guard let next = hal.begin(.serial, waitingFor: pipe.event, value: v.done) else {
             throw QWEngineDriverError.state("cold event cmdbuffer")
+        }
+        struct SendablePointers: @unchecked Sendable {
+            let idxPtr: UnsafeMutableRawPointer
+            let listPtr: UnsafeMutablePointer<UInt32>
+        }
+        let ptrs = SendablePointers(
+            idxPtr: s.idx.region.buffer.contents().advanced(by: s.idx.region.base + s.idx.offset),
+            listPtr: pipe.promoList.contents().assumingMemoryBound(to: UInt32.self)
+        )
+        let cap = pipe.promoCapacity
+        pipe.enqueue(
+            ready: v.ready,
+            onAbort: {
+                ptrs.listPtr[0] = 0
+                let ids = ptrs.idxPtr.assumingMemoryBound(to: UInt32.self)
+                for i in 0..<count { ids[i] = 0xFFFF_FFFF }
+            }
+        ) {
+            let ids = ptrs.idxPtr.assumingMemoryBound(to: UInt32.self)
+            let prep = try streamer.prepareSpan(
+                idxPtr: ids, startRow: 0, totalRows: rows, routes: routes, isVerifyWindow: isVerifyWindow)
+            guard prep.nextRow == rows, prep.promotions.count <= cap else {
+                throw QWEngineDriverError.state("cold event span did not fit staging")
+            }
+            let t0 = Date()
+            if prep.stagedCount > 0 {
+                try streamer.executeBatch(guBatch: prep.guBatch, downBatch: prep.downBatch)
+            }
+            for (i, p) in prep.promotions.enumerated() {
+                ptrs.listPtr[1 + 2 * i] = UInt32(p.staging)
+                ptrs.listPtr[2 + 2 * i] = UInt32(p.bank)
+            }
+            ptrs.listPtr[0] = UInt32(prep.promotions.count)
+            streamer.commitPromotion(prep.transaction, recordPendingPromotions: false)
+            pipe.addStats(ioUs: Date().timeIntervalSince(t0) * 1e6, staged: prep.stagedCount)
+            return prep.stagedCount > 0
         }
         activeCB = next.0
         activeEnc = next.1

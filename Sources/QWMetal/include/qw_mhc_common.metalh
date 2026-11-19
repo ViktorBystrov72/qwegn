@@ -243,23 +243,27 @@ inline void qwg_mhc_branch_norm(device const float* sBase, device const half* no
     if (nPerThread <= 16u) {
         #pragma unroll
         for (uint i = 0u; i < 16u; ++i) {
-            const uint h = tid + i * 256u;
-            if (h < hidden) {
-                float v = regB[i] * rstdBranch * (1.0f + float(normGamma[h]));
-                v = qwg_fwht32_lane_f32(v, lane);
-                dst[h] = half(v);
-            }
+            const uint b0 = i * 256u;
+            if (b0 >= hidden) break;
+            const uint h = b0 + tid;
+            float v = (h < hidden) ? (regB[i] * rstdBranch * (1.0f + float(normGamma[h]))) : 0.0f;
+            v = qwg_fwht32_lane_f32(v, lane);
+            if (h < hidden) dst[h] = half(v);
         }
     } else {
-        for (uint h = tid; h < hidden; h += 256u) {
+        const uint lim = (hidden + 255u) & ~255u;
+        for (uint b0 = 0u; b0 < lim; b0 += 256u) {
+            const uint h = b0 + tid;
             float bv = 0.0f;
-            #pragma unroll
-            for (uint c = 0u; c < C; ++c) {
-                bv = fma(pre[c], sBase[c * hidden + h], bv);
+            if (h < hidden) {
+                #pragma unroll
+                for (uint c = 0u; c < C; ++c) {
+                    bv = fma(pre[c], sBase[(size_t)c * hidden + h], bv);
+                }
             }
-            float v = bv * rstdBranch * (1.0f + float(normGamma[h]));
+            float v = (h < hidden) ? (bv * rstdBranch * (1.0f + float(normGamma[h]))) : 0.0f;
             v = qwg_fwht32_lane_f32(v, lane);
-            dst[h] = half(v);
+            if (h < hidden) dst[h] = half(v);
         }
     }
 }

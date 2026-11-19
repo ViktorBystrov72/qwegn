@@ -119,12 +119,12 @@ extension QWEngineDriver {
                                       geometry: geometry)
         let fcOutBuf = prefixRows(psc.o16, rows: pairs, cols: H, dt: .f16)
         let ln1Buf = prefixRows(psc.dn16, rows: pairs, cols: H, dt: .f16)
-        gemmBatchedH16(enc, m: pairs, n: H, k: 2 * H, x: concatBuf, wQ4: mtpWeights.fc, y16: fcOutBuf)
+        try gemmBatchedH16(enc, m: pairs, n: H, k: 2 * H, x: concatBuf, wQ4: mtpWeights.fc, y16: fcOutBuf)
         try encodeRMSNormFast(enc, x: fcOutBuf, gamma: mtpWeights.inputNorm, out: ln1Buf, rows: pairs)
         if let mla = mlaOperator, let mlaW = mtpWeights.mla {
             let latentN = geometry.qLoraRank + geometry.kvLoraRank + geometry.indexerHeadDim
             let latentBuf = prefixRows(mla.mlaLatentScratch, rows: pairs, cols: latentN, dt: .f16)
-            gemmBatchedH16(enc, m: pairs, n: latentN, k: H, x: ln1Buf, wQ4: mtpWeights.qkvProj, y16: latentBuf)
+            try gemmBatchedH16(enc, m: pairs, n: latentN, k: H, x: ln1Buf, wQ4: mtpWeights.qkvProj, y16: latentBuf)
             mla.encodeLatentPrepAndPool(
                 enc, ln1: ln1Buf, mlaW: mlaW,
                 kv: views, fullAttnLayer: attnLayers.count,
@@ -137,7 +137,7 @@ extension QWEngineDriver {
             let qOutBuf = prefixRows(psc.attQR16, rows: pairs, cols: geometry.qProjOut, dt: .f16)
             let kOutBuf = prefixRows(psc.attKR16, rows: pairs, cols: geometry.kvChannels, dt: .f16)
             let vOutBuf = prefixRows(psc.attV16, rows: pairs, cols: geometry.kvChannels, dt: .f16)
-            gemmBatchedH16(enc, m: pairs, n: geometry.attnTotalN, k: H, x: ln1Buf, wQ4: mtpWeights.qkvProj, y16: qkvBuf)
+            try gemmBatchedH16(enc, m: pairs, n: geometry.attnTotalN, k: H, x: ln1Buf, wQ4: mtpWeights.qkvProj, y16: qkvBuf)
             try ropeApply.encodeExtractQK(enc, hal: hal, attnY: qkvBuf,
                                           qOut: qOutBuf, kOut: kOutBuf, vOut: vOutBuf,
                                           wq: wq, wk: wkTiled,

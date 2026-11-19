@@ -162,34 +162,96 @@ public final class QWSystemMetricsSampler: @unchecked Sendable {
     public static let refreshInterval: TimeInterval = 0.5
 
     private let lock = NSLock()
+    private let sampleLock = NSLock()
+    private let samplerQueue = DispatchQueue(label: "com.qwegn.system.metrics.sampler", qos: .utility)
+    private var refreshTimer: DispatchSourceTimer?
+    private var refreshPending = false
     private var lastCpuTicks: (user: UInt32, sys: UInt32, idle: UInt32, nice: UInt32)?
     private var metalDevice: MTLDevice?
-    private var cached: QWSystemHardwareUtilization?
+    private var cached: QWSystemHardwareUtilization
     public let chipIdentifier: String
 
     public init() {
-        self.metalDevice = MTLCreateSystemDefaultDevice()
-        self.chipIdentifier = Self.detectChipIdentifier(device: self.metalDevice)
-        // Prime initial CPU sample
-        _ = sampleCPULoad()
+        let dev = MTLCreateSystemDefaultDevice()
+        let chip = Self.detectChipIdentifier(device: dev)
+        self.metalDevice = dev
+        self.chipIdentifier = chip
+        self.cached = Self.makeFastInitialSnapshot(
+            chipIdentifier: chip,
+            metalDevice: dev,
+            cpu: (nil, "initial background sample pending"),
+            mem: (nil, ProcessInfo.processInfo.physicalMemory, nil, nil, nil, nil, nil),
+            sampledAt: Date()
+        )
+        // Prime initial CPU tick baseline and Mach memory snapshot without IOKit/SMC.
+        let cpu = sampleCPULoadUnchecked()
+        let mem = sampleMemoryAndPressure()
+        self.cached = Self.makeFastInitialSnapshot(
+            chipIdentifier: chip,
+            metalDevice: dev,
+            cpu: cpu,
+            mem: mem,
+            sampledAt: Date()
+        )
+        startBackgroundSamplerLoop()
     }
 
-    /// The last reading, sampled again when it is older than the interval.
-    /// The reading carries its own timestamp, so a consumer can see its age.
+    private func startBackgroundSamplerLoop() {
+        let timer = DispatchSource.makeTimerSource(queue: samplerQueue)
+        timer.schedule(
+            deadline: .now() + .milliseconds(25),
+            repeating: Self.refreshInterval,
+            leeway: .milliseconds(50)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.refreshInBackgroundIfStale(forceInitial: true)
+        }
+        lock.withLock { self.refreshTimer = timer }
+        timer.resume()
+    }
+
+    private func refreshInBackgroundIfStale(forceInitial: Bool = false) {
+        let now = Date()
+        let shouldRun = lock.withLock { () -> Bool in
+            if refreshPending { return false }
+            let age = now.timeIntervalSince(cached.sampledAt)
+            if !forceInitial && age < Self.refreshInterval { return false }
+            refreshPending = true
+            return true
+        }
+        guard shouldRun else { return }
+        defer { lock.withLock { refreshPending = false } }
+        _ = sample()
+    }
+
+    /// Returns the latest immutable cached host reading and triggers an async refresh if stale.
     public func current() -> QWSystemHardwareUtilization {
-        lock.lock()
-        let cached = self.cached
-        let fresh = cached.map { Date().timeIntervalSince($0.sampledAt) < Self.refreshInterval } ?? false
-        lock.unlock()
-        if let cached, fresh { return cached }
-        return sample()
+        let (snap, stale) = lock.withLock { () -> (QWSystemHardwareUtilization, Bool) in
+            let age = Date().timeIntervalSince(cached.sampledAt)
+            return (cached, age >= Self.refreshInterval && !refreshPending)
+        }
+        if stale {
+            let shouldSchedule = lock.withLock { () -> Bool in
+                if refreshPending { return false }
+                refreshPending = true
+                return true
+            }
+            if shouldSchedule {
+                samplerQueue.async { [weak self] in
+                    guard let self else { return }
+                    defer { self.lock.withLock { self.refreshPending = false } }
+                    _ = self.sample()
+                }
+            }
+        }
+        return snap
     }
 
     /// Samples the host now: CPU load, the GPU's own utilization when the
     /// host can be read, and unified memory.
     public func sample() -> QWSystemHardwareUtilization {
-        lock.lock()
-        defer { lock.unlock() }
+        sampleLock.lock()
+        defer { sampleLock.unlock() }
 
         let cpu = sampleCPULoad()
         let mem = sampleMemoryAndPressure()
@@ -223,8 +285,67 @@ public final class QWSystemMetricsSampler: @unchecked Sendable {
             systemPowerUnavailableReason: smc.systemPowerUnavailableReason,
             thermalStateLevel: smc.thermalStateLevel,
             sampledAt: Date())
-        cached = reading
+        lock.withLock { cached = reading }
         return reading
+    }
+
+    private func sampleCPULoadUnchecked() -> (percent: Double?, reason: String?) {
+        sampleLock.withLock { sampleCPULoad() }
+    }
+
+    private static func makeFastInitialSnapshot(
+        chipIdentifier: String,
+        metalDevice: MTLDevice?,
+        cpu: (percent: Double?, reason: String?),
+        mem: (
+            usedBytes: UInt64?,
+            totalBytes: UInt64,
+            usagePercent: Double?,
+            unavailableReason: String?,
+            pressureLevel: String?,
+            pressureUnavailableReason: String?,
+            pressurePercent: Double?
+        ),
+        sampledAt: Date
+    ) -> QWSystemHardwareUtilization {
+        let allocatedBytes = metalDevice.map { UInt64($0.currentAllocatedSize) } ?? 0
+        let maxWorkingSetBytes = metalDevice.map { UInt64($0.recommendedMaxWorkingSetSize) } ?? mem.totalBytes
+        let thermalLevel: String = switch ProcessInfo.processInfo.thermalState {
+        case .nominal: "Nominal"
+        case .fair: "Fair"
+        case .serious: "Serious"
+        case .critical: "Critical"
+        @unknown default: "Nominal"
+        }
+        return QWSystemHardwareUtilization(
+            cpuUsagePercent: cpu.percent,
+            cpuUsageUnavailableReason: cpu.reason,
+            gpuUsagePercent: nil,
+            gpuUsageUnavailableReason: "initial background GPU sample pending",
+            chipIdentifier: chipIdentifier,
+            memoryUsedBytes: mem.usedBytes,
+            memoryTotalBytes: mem.totalBytes,
+            memoryUsedGB: mem.usedBytes.map { Double($0) / (1024.0 * 1024.0 * 1024.0) },
+            memoryTotalGB: Double(mem.totalBytes) / (1024.0 * 1024.0 * 1024.0),
+            memoryUsagePercent: mem.usagePercent,
+            memoryUnavailableReason: mem.unavailableReason,
+            memoryPressureLevel: mem.pressureLevel,
+            memoryPressureUnavailableReason: mem.pressureUnavailableReason,
+            memoryPressurePercent: mem.pressurePercent,
+            metalAllocatedBytes: allocatedBytes,
+            metalMaxWorkingSetBytes: maxWorkingSetBytes,
+            gpuTemperatureCelsius: nil,
+            gpuTemperatureUnavailableReason: "initial background AppleSMC sample pending",
+            cpuTemperatureCelsius: nil,
+            memoryTemperatureCelsius: nil,
+            fanSpeedRPM: nil,
+            fanSpeedUnavailableReason: "initial background AppleSMC sample pending",
+            fanControlStatus: nil,
+            systemPowerWatts: nil,
+            systemPowerUnavailableReason: "initial background AppleSMC sample pending",
+            thermalStateLevel: thermalLevel,
+            sampledAt: sampledAt
+        )
     }
 
     // MARK: - Detect Chip Identifier (e.g. "M5 Max 40GPU")
@@ -242,10 +363,8 @@ public final class QWSystemMetricsSampler: @unchecked Sendable {
                 var props: Unmanaged<CFMutableDictionary>?
                 if IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
                    let p = props?.takeRetainedValue() as? [String: Any] {
-                    if let c = p["gpu-core-count"] as? Int {
+                    if let c = Self.decodeGPUCoreCount(p["gpu-core-count"]) {
                         gpuCores = c
-                    } else if let d = p["gpu-core-count"] as? Data {
-                        gpuCores = d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in raw.load(as: Int.self) }
                     }
                 }
                 IOObjectRelease(entry)
@@ -259,6 +378,34 @@ public final class QWSystemMetricsSampler: @unchecked Sendable {
         } else {
             return cleanName
         }
+    }
+
+    static func decodeGPUCoreCount(_ rawValue: Any?) -> Int? {
+        if let count = rawValue as? Int {
+            return count > 0 ? count : nil
+        }
+        if let num = rawValue as? NSNumber {
+            let count = num.intValue
+            return count > 0 ? count : nil
+        }
+        guard let data = rawValue as? Data else { return nil }
+        if data.count == MemoryLayout<UInt32>.size {
+            var val: UInt32 = 0
+            _ = withUnsafeMutablePointer(to: &val) { ptr in
+                data.copyBytes(to: UnsafeMutableBufferPointer(start: ptr, count: 1))
+            }
+            let count = Int(UInt32(littleEndian: val))
+            return count > 0 ? count : nil
+        }
+        if data.count == MemoryLayout<UInt64>.size {
+            var val: UInt64 = 0
+            _ = withUnsafeMutablePointer(to: &val) { ptr in
+                data.copyBytes(to: UnsafeMutableBufferPointer(start: ptr, count: 1))
+            }
+            guard let count = Int(exactly: UInt64(littleEndian: val)), count > 0 else { return nil }
+            return count
+        }
+        return nil
     }
 
     // MARK: - Private Sampling Helpers

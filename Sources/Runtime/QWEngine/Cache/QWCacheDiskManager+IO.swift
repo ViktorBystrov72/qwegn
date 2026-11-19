@@ -6,41 +6,21 @@ import QWHAL
 import QWKV
 
 extension QWCacheDiskManager {
-    /// Streams shared prefix directly from unified memory / KV pools to an arbitrary `.qwcache` file URL.
-    static func writeStandaloneFile(
-        to fileURL: URL,
+    static func buildMetadataAndHeader(
         tokens: [Int],
         mode: String,
         nextToken: Int,
         state: QWEnginePrefixState,
         logits: Data,
-        trunk: QWKVSharedPrefix,
-        kvCache: QWKVCache,
-        mtp: QWKVSharedPrefix?,
-        mtpCache: QWKVCache?,
-        allowsSuffix: Bool,
-        maxBytes: Int? = nil,
-        onBeforeWrite: ((Int) -> Void)? = nil
-    ) throws -> (metadata: StoredMetadata, totalBytes: Int)? {
-        var trunkPlaneSizes: [Int] = []
-        var trunkPageCounts: [Int: Int] = [:]
-        try kvCache.withSharedPrefixPagePointers(trunk) { planeIdx, _, _, byteCount in
-            trunkPageCounts[planeIdx, default: 0] += byteCount
-        }
-        for i in 0..<(trunkPageCounts.count) {
-            trunkPlaneSizes.append(trunkPageCounts[i] ?? 0)
-        }
-
-        var mtpPlaneSizes: [Int] = []
-        if let mtp, let mtpCache {
-            var mtpPageCounts: [Int: Int] = [:]
-            try mtpCache.withSharedPrefixPagePointers(mtp) { planeIdx, _, _, byteCount in
-                mtpPageCounts[planeIdx, default: 0] += byteCount
-            }
-            for i in 0..<(mtpPageCounts.count) {
-                mtpPlaneSizes.append(mtpPageCounts[i] ?? 0)
-            }
-        }
+        trunkPlaneSizes: [Int],
+        mtpPlaneSizes: [Int],
+        allowsSuffix: Bool
+    ) throws -> (metadata: StoredMetadata, headerBuffer: Data, totalBytes: Int) {
+        let dflashActive = state.dflashCacheOffset > 0
+            && state.dflashKData != nil && state.dflashVData != nil
+        let dflashK = dflashActive ? state.dflashKData : nil
+        let dflashV = dflashActive ? state.dflashVData : nil
+        let dflashOffset = dflashActive ? state.dflashCacheOffset : nil
 
         let meta = StoredMetadata(
             tokens: tokens,
@@ -61,49 +41,143 @@ extension QWCacheDiskManager {
             mtpPlaneSizes: mtpPlaneSizes,
             allowsSuffix: allowsSuffix,
             formatVersion: 2,
-            mlaIndexerBytes: state.mlaIndexerData?.count
+            mlaIndexerBytes: state.mlaIndexerData?.count,
+            dflashKBytes: dflashK?.count,
+            dflashVBytes: dflashV?.count,
+            dflashCacheOffset: dflashOffset
         )
 
         let metaData = try JSONEncoder().encode(meta)
         var metaLen = UInt64(metaData.count)
-        let headerRawLen = MemoryLayout<UInt64>.size + metaData.count +
-            state.recData.count + state.ringData.count + (state.trunkHiddenData?.count ?? 0) +
-            (state.mlaIndexerData?.count ?? 0) + logits.count
+        let headerRawLen = MemoryLayout<UInt64>.size + metaData.count
+            + state.recData.count + state.ringData.count + (state.trunkHiddenData?.count ?? 0)
+            + (state.mlaIndexerData?.count ?? 0) + (dflashK?.count ?? 0) + (dflashV?.count ?? 0)
+            + logits.count
         let alignedHeaderLen = Self.alignUp(headerRawLen)
         let kvPayloadBytes = trunkPlaneSizes.reduce(0, +) + mtpPlaneSizes.reduce(0, +)
         let totalPayloadBytes = alignedHeaderLen + kvPayloadBytes
-
-        if let maxBytes, totalPayloadBytes > maxBytes { return nil }
-        onBeforeWrite?(totalPayloadBytes)
-
-        try? FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        let io = try QWDispatchIO(path: fileURL.path, mode: .writeOnly, directIO: true)
-        defer { io.close() }
 
         var headerBuf = Data(capacity: alignedHeaderLen)
         withUnsafeBytes(of: &metaLen) { (raw: UnsafeRawBufferPointer) in headerBuf.append(contentsOf: raw) }
         headerBuf.append(metaData)
         headerBuf.append(state.recData)
         headerBuf.append(state.ringData)
-        if let hidden = state.trunkHiddenData {
-            headerBuf.append(hidden)
-        }
-        if let mla = state.mlaIndexerData {
-            headerBuf.append(mla)
-        }
+        if let hidden = state.trunkHiddenData { headerBuf.append(hidden) }
+        if let mla = state.mlaIndexerData { headerBuf.append(mla) }
+        if let dflashK { headerBuf.append(dflashK) }
+        if let dflashV { headerBuf.append(dflashV) }
         headerBuf.append(logits)
         if headerBuf.count < alignedHeaderLen {
             headerBuf.append(Data(count: alignedHeaderLen - headerBuf.count))
         }
+        return (meta, headerBuf, totalPayloadBytes)
+    }
 
-        try headerBuf.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            try io.writeSync(offset: 0, buffer: raw.baseAddress!, length: raw.count)
+    private static func readSection(_ io: QWDispatchIO, offset: inout Int64, length: Int) throws -> Data {
+        var buf = Data(count: length)
+        if length > 0 {
+            try buf.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+                if let base = raw.baseAddress {
+                    try Self.readExactly(io, offset: offset, into: base, length: length)
+                }
+            }
         }
+        offset += Int64(length)
+        return buf
+    }
 
-        var writeOffset = Int64(alignedHeaderLen)
+    static func readHeaderSections(
+        io: QWDispatchIO,
+        meta: StoredMetadata,
+        startOffset: Int64
+    ) throws -> (state: QWEnginePrefixState, logits: Data, kvOffset: Int64) {
+        guard meta.recBytes >= 0, meta.ringBytes >= 0, meta.trunkHiddenBytes >= 0, meta.logitsBytes >= 0,
+              (meta.mlaIndexerBytes ?? 0) >= 0,
+              (meta.dflashKBytes ?? 0) >= 0, (meta.dflashVBytes ?? 0) >= 0,
+              meta.trunkPlaneSizes.allSatisfy({ $0 >= 0 }),
+              meta.mtpPlaneSizes.allSatisfy({ $0 >= 0 }) else {
+            throw ReadError.invalidHeader
+        }
+        var offset = startOffset
+        let recData = try readSection(io, offset: &offset, length: meta.recBytes)
+        let ringData = try readSection(io, offset: &offset, length: meta.ringBytes)
+        let trunkHiddenData = meta.trunkHiddenBytes > 0
+            ? try readSection(io, offset: &offset, length: meta.trunkHiddenBytes) : nil
+        let mlaIndexerData = (meta.mlaIndexerBytes ?? 0) > 0
+            ? try readSection(io, offset: &offset, length: meta.mlaIndexerBytes ?? 0) : nil
+        let dflashKData = (meta.dflashKBytes ?? 0) > 0
+            ? try readSection(io, offset: &offset, length: meta.dflashKBytes ?? 0) : nil
+        let dflashVData = (meta.dflashVBytes ?? 0) > 0
+            ? try readSection(io, offset: &offset, length: meta.dflashVBytes ?? 0) : nil
+        let logits = try readSection(io, offset: &offset, length: meta.logitsBytes)
+        if (meta.formatVersion ?? 1) >= 2 {
+            offset = Int64(Self.alignUp(Int(offset)))
+        }
+        let restoredDFlashValid = (meta.dflashCacheOffset ?? 0) > 0 && dflashKData != nil && dflashVData != nil
+        let state = QWEnginePrefixState(
+            position: meta.position,
+            generated: meta.generated,
+            roundRecord: meta.roundRecord,
+            recData: recData,
+            ringData: ringData,
+            trunkHiddenData: trunkHiddenData,
+            trunkHiddenValid: meta.trunkHiddenValid,
+            stochastic: nil,
+            dflashKData: restoredDFlashValid ? dflashKData : nil,
+            dflashVData: restoredDFlashValid ? dflashVData : nil,
+            dflashCacheOffset: restoredDFlashValid ? (meta.dflashCacheOffset ?? 0) : 0,
+            mlaIndexerData: mlaIndexerData
+        )
+        return (state, logits, offset)
+    }
+
+    /// Streams shared prefix directly from unified memory / KV pools to an arbitrary `.qwcache` file URL.
+    static func writeStandaloneFile(
+        to fileURL: URL,
+        tokens: [Int],
+        mode: String,
+        nextToken: Int,
+        state: QWEnginePrefixState,
+        logits: Data,
+        trunk: QWKVSharedPrefix,
+        kvCache: QWKVCache,
+        mtp: QWKVSharedPrefix?,
+        mtpCache: QWKVCache?,
+        allowsSuffix: Bool,
+        maxBytes: Int? = nil,
+        onBeforeWrite: ((Int) -> Void)? = nil
+    ) throws -> (metadata: StoredMetadata, totalBytes: Int)? {
+        func collectPlaneSizes(_ cache: QWKVCache, _ prefix: QWKVSharedPrefix) throws -> [Int] {
+            var counts: [Int: Int] = [:]
+            try cache.withSharedPrefixPagePointers(prefix) { planeIdx, _, _, byteCount in
+                counts[planeIdx, default: 0] += byteCount
+            }
+            return (0..<counts.count).map { counts[$0] ?? 0 }
+        }
+        let trunkPlaneSizes = try collectPlaneSizes(kvCache, trunk)
+        let mtpPlaneSizes = try (mtp.flatMap { p in try mtpCache.map { try collectPlaneSizes($0, p) } }) ?? []
+
+        let built = try buildMetadataAndHeader(
+            tokens: tokens, mode: mode, nextToken: nextToken, state: state,
+            logits: logits, trunkPlaneSizes: trunkPlaneSizes, mtpPlaneSizes: mtpPlaneSizes,
+            allowsSuffix: allowsSuffix
+        )
+        if let maxBytes, built.totalBytes > maxBytes { return nil }
+        onBeforeWrite?(built.totalBytes)
+
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let io = try QWDispatchIO(path: fileURL.path, mode: .writeOnly, directIO: true)
+        defer { io.close() }
+
+        try built.headerBuffer.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            if let base = raw.baseAddress {
+                try io.writeSync(offset: 0, buffer: base, length: raw.count)
+            }
+        }
+        var writeOffset = Int64(built.headerBuffer.count)
         try kvCache.withSharedPrefixPagePointers(trunk) { _, _, ptr, byteCount in
             try io.writeSync(offset: writeOffset, buffer: ptr, length: byteCount)
             writeOffset += Int64(byteCount)
@@ -114,7 +188,7 @@ extension QWCacheDiskManager {
                 writeOffset += Int64(byteCount)
             }
         }
-        return (meta, totalPayloadBytes)
+        return (built.metadata, built.totalBytes)
     }
 
     /// Streams shared prefix directly from unified memory / KV pools to SSD with F_NOCACHE direct I/O.
@@ -130,15 +204,15 @@ extension QWCacheDiskManager {
         mtpCache: QWKVCache?,
         allowsSuffix: Bool
     ) throws -> URL? {
-        lock.lock()
-        defer { lock.unlock() }
-
+        guard config.ssdByteLimit > 0 else { return nil }
         let key = Self.cacheKey(tokens: tokens, mode: mode)
         let filename = "entry_\(key).qwcache"
         let fileURL = config.cacheDirectory.appendingPathComponent(filename)
+        let tempURL = config.cacheDirectory.appendingPathComponent("\(filename).tmp.\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
 
         guard let written = try Self.writeStandaloneFile(
-            to: fileURL,
+            to: tempURL,
             tokens: tokens,
             mode: mode,
             nextToken: nextToken,
@@ -150,23 +224,13 @@ extension QWCacheDiskManager {
             mtpCache: mtpCache,
             allowsSuffix: allowsSuffix,
             maxBytes: config.ssdByteLimit,
-            onBeforeWrite: { [weak self] totalPayloadBytes in
-                guard let self else { return }
-                while self.chargedBytes + totalPayloadBytes > self.config.ssdByteLimit, !self.lru.isEmpty {
-                    self.evictOldest()
-                }
-            }
+            onBeforeWrite: nil
         ) else { return nil }
 
-        if let prevBytes = entryBytes[key] {
-            chargedBytes -= prevBytes
-        }
-        entries[key] = written.metadata
-        entryFiles[key] = fileURL
-        entryBytes[key] = written.totalBytes
-        chargedBytes += written.totalBytes
-        touch(key)
-        return fileURL
+        return try commitWrittenEntry(
+            tempURL: tempURL, fileURL: fileURL, key: key,
+            metadata: written.metadata, totalBytes: written.totalBytes
+        )
     }
 
     /// Reads an arbitrary `.qwcache` file directly into KV pool pages via F_NOCACHE DispatchIO.
@@ -188,59 +252,8 @@ extension QWCacheDiskManager {
 
         let header = try Self.readHeader(io, expected: expectedMetadata)
         let meta = header.meta
-        var offset = header.nextOffset
-
-        var recData = Data(count: meta.recBytes)
-        if meta.recBytes > 0 {
-            try recData.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-                if let base = raw.baseAddress {
-                    try Self.readExactly(io, offset: offset, into: base, length: meta.recBytes)
-                }
-            }
-        }
-        offset += Int64(meta.recBytes)
-
-        var ringData = Data(count: meta.ringBytes)
-        if meta.ringBytes > 0 {
-            try ringData.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-                if let base = raw.baseAddress {
-                    try Self.readExactly(io, offset: offset, into: base, length: meta.ringBytes)
-                }
-            }
-        }
-        offset += Int64(meta.ringBytes)
-
-        var trunkHiddenData: Data? = nil
-        if meta.trunkHiddenBytes > 0 {
-            var hidden = Data(count: meta.trunkHiddenBytes)
-            try hidden.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-                try Self.readExactly(io, offset: offset, into: raw.baseAddress!, length: meta.trunkHiddenBytes)
-            }
-            trunkHiddenData = hidden
-            offset += Int64(meta.trunkHiddenBytes)
-        }
-
-        var mlaIndexerData: Data? = nil
-        if let mlaBytes = meta.mlaIndexerBytes, mlaBytes > 0 {
-            var mla = Data(count: mlaBytes)
-            try mla.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-                try Self.readExactly(io, offset: offset, into: raw.baseAddress!, length: mlaBytes)
-            }
-            mlaIndexerData = mla
-            offset += Int64(mlaBytes)
-        }
-
-        var logits = Data(count: meta.logitsBytes)
-        try logits.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-            if let base = raw.baseAddress {
-                try Self.readExactly(io, offset: offset, into: base, length: meta.logitsBytes)
-            }
-        }
-        offset += Int64(meta.logitsBytes)
-
-        if (meta.formatVersion ?? 1) >= 2 {
-            offset = Int64(Self.alignUp(Int(offset)))
-        }
+        let decoded = try readHeaderSections(io: io, meta: meta, startOffset: header.nextOffset)
+        var offset = decoded.kvOffset
 
         let tokenCount = meta.position
         let tempH = try kvCache.allocate(promptTokens: tokenCount)
@@ -263,19 +276,6 @@ extension QWCacheDiskManager {
             mtpShared = try mtpCache.captureSharedPrefix(tempM)
         }
 
-        let prefixState = QWEnginePrefixState(
-            position: meta.position,
-            generated: meta.generated,
-            roundRecord: meta.roundRecord,
-            recData: recData,
-            ringData: ringData,
-            trunkHiddenData: trunkHiddenData,
-            trunkHiddenValid: meta.trunkHiddenValid,
-            stochastic: nil,
-            mlaIndexerData: mlaIndexerData
-        )
-
-        return (meta, prefixState, meta.nextToken, logits, trunkShared, mtpShared)
+        return (meta, decoded.state, meta.nextToken, decoded.logits, trunkShared, mtpShared)
     }
-
 }

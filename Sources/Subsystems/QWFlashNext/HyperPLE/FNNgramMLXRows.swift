@@ -23,14 +23,17 @@ public final class FNNgramMLXRows: FNNgramRows, @unchecked Sendable {
     private let sOffset: Int
     private let bOffset: Int
 
-    public init(url: URL) throws {
+    public init(url: URL, mapped: Bool = false) throws {
         let opened = Darwin.open(url.path, O_RDONLY)
         guard opened >= 0 else {
             throw QWSafeTensorsError.badHeader("Cannot open \(url.path)")
         }
+        var transferredFd = false
+        defer {
+            if !transferredFd { Darwin.close(opened) }
+        }
         var st = Darwin.stat()
         guard Darwin.fstat(opened, &st) == 0, st.st_size >= 8 else {
-            Darwin.close(opened)
             throw QWSafeTensorsError.badHeader("Cannot stat or short file \(url.path)")
         }
         let fileSize = Int(st.st_size)
@@ -41,7 +44,6 @@ public final class FNNgramMLXRows: FNNgramRows, @unchecked Sendable {
         }
         let hdrLen = Int(UInt64(littleEndian: hdrLenLE))
         guard gotLen == 8, hdrLen > 0, hdrLen <= 100_000_000, 8 + hdrLen <= fileSize else {
-            Darwin.close(opened)
             throw QWSafeTensorsError.badHeader("Invalid safetensors header length in \(url.lastPathComponent)")
         }
         var headerData = Data(count: hdrLen)
@@ -51,7 +53,6 @@ public final class FNNgramMLXRows: FNNgramRows, @unchecked Sendable {
         }
         guard gotHdr == hdrLen,
               let header = (try? JSONSerialization.jsonObject(with: headerData)) as? [String: Any] else {
-            Darwin.close(opened)
             throw QWSafeTensorsError.badHeader("Invalid safetensors JSON header in \(url.lastPathComponent)")
         }
         func parseTensor(_ name: String) throws -> (dtype: QWSafeTensorsDType, shape: [Int], start: Int, end: Int) {
@@ -64,47 +65,58 @@ public final class FNNgramMLXRows: FNNgramRows, @unchecked Sendable {
             }
             return (dtype, shape, offsets[0], offsets[1])
         }
-        let wInfo: (dtype: QWSafeTensorsDType, shape: [Int], start: Int, end: Int)
-        let sInfo: (dtype: QWSafeTensorsDType, shape: [Int], start: Int, end: Int)
-        let bInfo: (dtype: QWSafeTensorsDType, shape: [Int], start: Int, end: Int)
-        do {
-            wInfo = try parseTensor("weight")
-            sInfo = try parseTensor("scales")
-            bInfo = try parseTensor("biases")
-        } catch {
-            Darwin.close(opened)
-            throw error
-        }
+        let wInfo = try parseTensor("weight")
+        let sInfo = try parseTensor("scales")
+        let bInfo = try parseTensor("biases")
         let dataBase = 8 + hdrLen
         guard wInfo.dtype == .u32, wInfo.shape.count == 2,
               (sInfo.dtype == .bf16 || sInfo.dtype == .f16), sInfo.shape.count == 2,
               (bInfo.dtype == .bf16 || bInfo.dtype == .f16), bInfo.shape.count == 2,
               wInfo.shape[0] == sInfo.shape[0], wInfo.shape[0] == bInfo.shape[0],
               sInfo.shape[1] == bInfo.shape[1],
+              wInfo.shape[0] >= 0, wInfo.shape[1] > 0, sInfo.shape[1] > 0,
+              (wInfo.shape[1] * 8) % sInfo.shape[1] == 0 else {
+            throw QWSafeTensorsError.badHeader("Unexpected tensor shapes/dtypes in \(url.lastPathComponent)")
+        }
+        let rows = wInfo.shape[0]
+        let cols = wInfo.shape[1]
+        let groups = sInfo.shape[1]
+        let gSize = (cols * 8) / groups
+        let wRowBytes = cols * 4
+        let sbRowBytes = groups * 2
+        guard gSize >= 8, gSize % 8 == 0,
+              wInfo.start >= 0, sInfo.start >= 0, bInfo.start >= 0,
+              wInfo.end - wInfo.start >= rows * wRowBytes,
+              sInfo.end - sInfo.start >= rows * sbRowBytes,
+              bInfo.end - bInfo.start >= rows * sbRowBytes,
               dataBase + wInfo.end <= fileSize,
               dataBase + sInfo.end <= fileSize,
               dataBase + bInfo.end <= fileSize else {
-            Darwin.close(opened)
-            throw QWSafeTensorsError.badHeader("Unexpected tensor shapes/dtypes in \(url.lastPathComponent)")
+            throw QWSafeTensorsError.badHeader("Invalid tensor sizes or byte bounds in \(url.lastPathComponent)")
         }
-        self.entryCount = wInfo.shape[0]
-        self.wCols = wInfo.shape[1]
-        self.gCols = sInfo.shape[1]
-        self.headDim = wCols * 8
-        self.groupSize = (wCols * 8) / gCols
+        self.entryCount = rows
+        self.wCols = cols
+        self.gCols = groups
+        self.headDim = cols * 8
+        self.groupSize = gSize
         self.isF16 = (sInfo.dtype == .f16)
         self.fd = opened
         self.fileSize = fileSize
         self.wOffset = dataBase + wInfo.start
         self.sOffset = dataBase + sInfo.start
         self.bOffset = dataBase + bInfo.start
-        let mapped = Darwin.mmap(nil, fileSize, PROT_READ, MAP_PRIVATE, opened, 0)
-        if let mapped, mapped != MAP_FAILED {
-            _ = Darwin.posix_madvise(mapped, fileSize, POSIX_MADV_RANDOM)
-            self.mappedPtr = UnsafeRawPointer(mapped)
+        if mapped {
+            let addr = Darwin.mmap(nil, fileSize, PROT_READ, MAP_PRIVATE, opened, 0)
+            if let addr, addr != MAP_FAILED {
+                _ = Darwin.posix_madvise(addr, fileSize, POSIX_MADV_RANDOM)
+                self.mappedPtr = UnsafeRawPointer(addr)
+            } else {
+                self.mappedPtr = nil
+            }
         } else {
             self.mappedPtr = nil
         }
+        transferredFd = true
     }
 
     deinit {
@@ -146,8 +158,10 @@ public final class FNNgramMLXRows: FNNgramRows, @unchecked Sendable {
         }
     }
 
-    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) {
-        precondition(id >= 0 && id < entryCount, "PLE row \(id) outside ngram_table.bin [0..<\(entryCount)]")
+    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) throws {
+        guard id >= 0 && id < entryCount else {
+            throw FNNgramRowsError.rowOutOfBounds(id: id, count: entryCount)
+        }
         let wRowBytes = wCols * 4
         let sbRowBytes = gCols * 2
         let wByteOff = wOffset + id * wRowBytes
@@ -165,18 +179,14 @@ public final class FNNgramMLXRows: FNNgramRows, @unchecked Sendable {
                               into: dst)
             return
         }
-        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: wRowBytes + 2 * sbRowBytes) { scratch in
-            guard let base = scratch.baseAddress else { preconditionFailure("empty scratch buffer") }
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: wRowBytes + 2 * sbRowBytes) { scratch in
+            guard let base = scratch.baseAddress else { throw FNNgramRowsError.emptyScratchBuffer }
             let wRaw = UnsafeMutableRawPointer(base)
             let sRaw = UnsafeMutableRawPointer(base.advanced(by: wRowBytes))
             let bRaw = UnsafeMutableRawPointer(base.advanced(by: wRowBytes + sbRowBytes))
-            do {
-                try QWPOSIX.preadExact(fd: fd, into: wRaw, count: wRowBytes, offset: Int64(wByteOff))
-                try QWPOSIX.preadExact(fd: fd, into: sRaw, count: sbRowBytes, offset: Int64(sByteOff))
-                try QWPOSIX.preadExact(fd: fd, into: bRaw, count: sbRowBytes, offset: Int64(bByteOff))
-            } catch {
-                preconditionFailure("PLE short pread on ngram_table.bin at row \(id): \(error)")
-            }
+            try QWPOSIX.preadExact(fd: fd, into: wRaw, count: wRowBytes, offset: Int64(wByteOff))
+            try QWPOSIX.preadExact(fd: fd, into: sRaw, count: sbRowBytes, offset: Int64(sByteOff))
+            try QWPOSIX.preadExact(fd: fd, into: bRaw, count: sbRowBytes, offset: Int64(bByteOff))
             Self.decodeGroups(
                 wPtr: UnsafeRawPointer(wRaw), sPtr: UnsafeRawPointer(sRaw), bPtr: UnsafeRawPointer(bRaw),
                 gCols: gCols, wordsPerGroup: wordsPerGroup, groupSize: groupSize, isF16: isF16,
@@ -188,7 +198,7 @@ public final class FNNgramMLXRows: FNNgramRows, @unchecked Sendable {
     public func row(_ id: Int) -> [Float] {
         let n = headDim
         return [Float](unsafeUninitializedCapacity: n) { out, count in
-            copyRow(id, to: out.baseAddress!)
+            qwCopyNgramRowBestEffort(self, id: id, to: out.baseAddress!, headDim: n)
             count = n
         }
     }

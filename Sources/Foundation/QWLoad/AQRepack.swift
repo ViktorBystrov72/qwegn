@@ -76,7 +76,7 @@ public enum QWAQRepacker {
         guard sInfo.dtype == bInfo.dtype else {
             throw RepackError.headerMismatch(name: name)
         }
-        guard rows > 0, sElems % rows == 0 else {
+        guard rows > 0, cols > 0, sElems % rows == 0 else {
             throw RepackError.badLayout(name: name, reason: "the scales do not divide into \(rows) rows")
         }
         let groups = sElems / rows
@@ -85,10 +85,13 @@ public enum QWAQRepacker {
         }
         let groupSize = cols / groups
         let packedCols = info.shape.count >= 2 ? info.shape[info.shape.count - 1] : (info.elementCount ?? 0) / rows
-        guard packedCols * 32 % cols == 0 else {
+        let (packedElems, ovElems) = rows.multipliedReportingOverflow(by: packedCols)
+        let (packedBits, ovBits) = packedCols.multipliedReportingOverflow(by: 32)
+        guard packedCols > 0, !ovElems, info.elementCount == packedElems,
+              !ovBits, packedBits % cols == 0 else {
             throw RepackError.badLayout(name: name, reason: "the packed columns do not divide into \(cols)")
         }
-        let bits = (packedCols * 32) / cols
+        let bits = packedBits / cols
         let scaleDType: UInt32
         switch sInfo.dtype {
         case .bf16: scaleDType = 0
@@ -122,8 +125,14 @@ public enum QWAQRepacker {
                 throw RepackError.deviceUnavailable(reason: "cannot allocate the repack's flag word")
             }
             memset(flags.contents(), 0, 4)
-            var rowsU = UInt32(rows), colsU = UInt32(cols), bitsU = UInt32(bits)
-            var groupU = UInt32(group), dtypeU = layout.scaleDType
+            guard rows > 0, cols > 0, bits > 0, group > 0, dstByteOffset >= 0,
+                  var rowsU = UInt32(exactly: rows),
+                  var colsU = UInt32(exactly: cols),
+                  var bitsU = UInt32(exactly: bits),
+                  var groupU = UInt32(exactly: group) else {
+                throw RepackError.badLayout(name: name, reason: "dimensions out of UInt32 range")
+            }
+            var dtypeU = layout.scaleDType
             guard let (cb, enc) = hal.begin() else {
                 throw RepackError.deviceUnavailable(reason: "no command buffer")
             }
@@ -171,7 +180,10 @@ public enum QWAQRepacker {
         into dstBuffer: any MTLBuffer, dstByteOffset: Int
     ) throws {
         try autoreleasepool {
-            let rows = experts * inter
+            let (rows, ovRows) = experts.multipliedReportingOverflow(by: inter)
+            guard experts > 0, inter > 0, cols > 0, bits > 0, group > 0, dstByteOffset >= 0, !ovRows else {
+                throw RepackError.badLayout(name: gateName, reason: "invalid switch dimensions")
+            }
             let gLayout = try layout(container: container, name: gateName, rows: rows, cols: cols)
             let uLayout = try layout(container: container, name: upName, rows: rows, cols: cols)
             guard gLayout.bits == bits, gLayout.group == group else {
@@ -198,8 +210,14 @@ public enum QWAQRepacker {
                 throw RepackError.deviceUnavailable(reason: "cannot allocate the repack's flag word")
             }
             memset(flags.contents(), 0, 4)
-            var expertsU = UInt32(experts), interU = UInt32(inter), colsU = UInt32(cols)
-            var bitsU = UInt32(bits), groupU = UInt32(group), dtypeU = gLayout.scaleDType
+            guard var expertsU = UInt32(exactly: experts),
+                  var interU = UInt32(exactly: inter),
+                  var colsU = UInt32(exactly: cols),
+                  var bitsU = UInt32(exactly: bits),
+                  var groupU = UInt32(exactly: group) else {
+                throw RepackError.badLayout(name: gateName, reason: "dimensions out of UInt32 range")
+            }
+            var dtypeU = gLayout.scaleDType
             guard let (cb, enc) = hal.begin() else {
                 throw RepackError.deviceUnavailable(reason: "no command buffer")
             }
@@ -310,10 +328,12 @@ public enum QWAQRepacker {
         let payloadLen = group * bits / 8
         let stem = String(name.dropLast(".weight".count))
         let header = try container.withBytes(of: stem + ".scales") { raw -> UInt16 in
-            raw.loadUnaligned(as: UInt16.self)
+            guard raw.count >= 2 else { throw RepackError.badLayout(name: name, reason: "empty scales") }
+            return UInt16(littleEndian: raw.loadUnaligned(as: UInt16.self))
         }
         let bias = try container.withBytes(of: stem + ".biases") { raw -> UInt16 in
-            raw.loadUnaligned(as: UInt16.self)
+            guard raw.count >= 2 else { throw RepackError.badLayout(name: name, reason: "empty biases") }
+            return UInt16(littleEndian: raw.loadUnaligned(as: UInt16.self))
         }
         let scaleF: Float = scaleDType == 0
             ? Float(bitPattern: UInt32(header) << 16)
@@ -330,18 +350,22 @@ public enum QWAQRepacker {
             throw RepackError.headersNotExact(name: name, count: 1)
         }
         let payload = try container.withBytes(of: name) { raw -> [UInt8] in
-            Array(raw.prefix(payloadLen))
+            guard raw.count >= payloadLen else {
+                throw RepackError.badLayout(name: name, reason: "short payload")
+            }
+            return Array(raw.prefix(payloadLen))
         }
-        let dst = dstBuffer.contents().advanced(by: dstByteOffset)
-            .assumingMemoryBound(to: UInt8.self)
-        let gotScale = Float16(bitPattern: UInt16(littleEndian: dst.withMemoryRebound(
-            to: UInt16.self, capacity: 1) { $0[0] }))
-        let gotBias = Float16(bitPattern: UInt16(littleEndian: dst.advanced(by: 2)
-            .withMemoryRebound(to: UInt16.self, capacity: 1) { $0[0] }))
+        let (endOff, ovEnd) = dstByteOffset.addingReportingOverflow(4 + payloadLen)
+        guard dstByteOffset >= 0, !ovEnd, endOff <= dstBuffer.length else {
+            throw RepackError.repackFailed(name: name, message: "destination buffer smaller than first group")
+        }
+        let dstRaw = UnsafeRawPointer(dstBuffer.contents().advanced(by: dstByteOffset))
+        let gotScale = Float16(bitPattern: UInt16(littleEndian: dstRaw.loadUnaligned(fromByteOffset: 0, as: UInt16.self)))
+        let gotBias = Float16(bitPattern: UInt16(littleEndian: dstRaw.loadUnaligned(fromByteOffset: 2, as: UInt16.self)))
         guard gotScale == scaleH, gotBias == biasH else {
             throw RepackError.repackFailed(name: name, message: "the repacked header does not match")
         }
-        for (i, byte) in payload.enumerated() where dst[4 + i] != byte {
+        for (i, byte) in payload.enumerated() where dstRaw.loadUnaligned(fromByteOffset: 4 + i, as: UInt8.self) != byte {
             throw RepackError.repackFailed(name: name, message: "the repacked payload does not match")
         }
     }

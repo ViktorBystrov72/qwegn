@@ -43,6 +43,7 @@ struct QWEnginePrivatePrefix: Sendable {
 
     var memoryBytes: Int {
         recData.count + ringData.count + (trunkHiddenData?.count ?? 0) + (mlaIndexerData?.count ?? 0) +
+            (dflashKData?.count ?? 0) + (dflashVData?.count ?? 0) +
             trunk.memoryBytes + (mtp?.memoryBytes ?? 0)
     }
 }
@@ -53,7 +54,7 @@ extension QWEngineSessionState {
                                      mlaIndexerData: Data? = nil) throws -> QWEnginePrivatePrefix {
         try validate(session, cache: cache, mtpCache: mtpCache)
         let stateBytes = session.recSlab.bytes + session.ringSlab.bytes + (session.trunkHidden?.bytes ?? 0) +
-            (mlaIndexerData?.count ?? 0)
+            (mlaIndexerData?.count ?? 0) + (session.dflashSlot.map { $0.kSlab.bytes + $0.vSlab.bytes } ?? 0)
         guard maxBytes >= stateBytes, session.generated >= 0,
               session.position == cache.written(session.kv),
               session.roundRecord.consumedCount == session.position,

@@ -74,16 +74,15 @@ public final class PlaneIO: @unchecked Sendable {
                 self.remainingFirst = remainingFirst
             }
             func record(_ e: Error) {
-                lock.lock()
-                if first == nil { first = e }
-                lock.unlock()
+                lock.withLock {
+                    if first == nil { first = e }
+                }
             }
             func completeFirstJob() -> Bool {
-                lock.lock()
-                remainingFirst -= 1
-                let fire = (remainingFirst == 0 && first == nil)
-                lock.unlock()
-                return fire
+                lock.withLock {
+                    remainingFirst -= 1
+                    return remainingFirst == 0 && first == nil
+                }
             }
         }
         func coalescePhase(_ items: [(name: String, dst: UnsafeMutableRawPointer)]) throws -> (jobs: [Job], bytes: Int) {
@@ -181,9 +180,19 @@ public final class PlaneIO: @unchecked Sendable {
 
     public func load(_ name: String, layout: PlaneLayout) throws -> Data {
         let (offset, count) = try region(name, layout)
+        guard count >= 0 else {
+            throw PlaneIOError.readFailed(name: name, message: "negative byte count \(count)")
+        }
+        if count == 0 {
+            try pack.withRawPointer(at: offset, byteCount: 0) { _ in }
+            return Data()
+        }
         var out = Data(count: count)
         try out.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-            try read(name, offset: offset, count: count, into: raw.baseAddress!)
+            guard let base = raw.baseAddress else {
+                throw PlaneIOError.readFailed(name: name, message: "empty destination buffer")
+            }
+            try read(name, offset: offset, count: count, into: base)
         }
         return out
     }
@@ -194,7 +203,17 @@ public final class PlaneIO: @unchecked Sendable {
         let e = try pack.entry(name)
         guard let base = e.rawOff else { throw PlaneIOError.layoutUnavailable(name: name, layout: "raw") }
         let eb = e.rawElemBytes
-        try read(name, offset: base + elemOffset * eb, count: elems * eb, into: dst)
+        let (byteOff, ov0) = elemOffset.multipliedReportingOverflow(by: eb)
+        let (absOff, ov1) = base.addingReportingOverflow(byteOff)
+        let (byteCount, ov2) = elems.multipliedReportingOverflow(by: eb)
+        guard elemOffset >= 0, elems >= 0, !ov0, !ov1, !ov2 else {
+            throw PlaneIOError.readFailed(name: name, message: "invalid raw slice offset/count")
+        }
+        if byteCount == 0 {
+            try pack.withRawPointer(at: absOff, byteCount: 0) { _ in }
+            return
+        }
+        try read(name, offset: absOff, count: byteCount, into: dst)
     }
 
     private func region(_ name: String, _ layout: PlaneLayout) throws -> (Int, Int) {

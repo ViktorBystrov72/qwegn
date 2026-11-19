@@ -151,7 +151,7 @@ var targets: [Target] = [
     // soak and the CPU-only reference soak. One schema, one producer.
     .executableTarget(name: "m1", dependencies: ["QWCore", "QWEngine", "QWToken", "QWQuant", "QWCli"],
                       path: "Scripts/m1", swiftSettings: swiftWarningsAsErrors),
-    T("QWFlashNext", ["QWCore", "QWQuant", "QWHAL", "QWAlloc", "QWGEMM", "QWGDN", "QWHead", "QWMTP", "QWLoad"]),
+    T("QWFlashNext", ["QWCore", "QWQuant", "QWHAL", "QWAlloc", "QWGEMM", "QWGDN", "QWHead", "QWMTP", "QWLoad", "QWRope"]),
     .target(name: "QWMetalCounterSupport", path: targetPaths["QWMetalCounterSupport"],
             publicHeadersPath: "include"),
 ]
@@ -205,7 +205,7 @@ targets.append(.testTarget(
     name: "QWFlashNextMetalTests",
     dependencies: [.byName(name: "QWFlashNext"), .byName(name: "QWMTP"), .byName(name: "QWCore"), .byName(name: "QWQuant"),
                    .byName(name: "QWHAL"), .byName(name: "QWAlloc"), .byName(name: "QWGEMM"),
-                   .byName(name: "QWGDN")],
+                   .byName(name: "QWGDN"), .byName(name: "QWRope")],
     path: "Tests/QWFlashNextMetalTests",
     swiftSettings: swiftWarningsAsErrors))
 

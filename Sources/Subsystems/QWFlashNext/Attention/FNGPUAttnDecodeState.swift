@@ -96,7 +96,13 @@ public final class FNGPUAttnDecodeState {
     public let fullCapacity: Int, hidden: Int, rows: Int
     public private(set) var capacity: Int
     public let kvMode: FNKVStorageMode
-    public var lsaClusters: LSAClusterState?
+    public var lsaClusters: LSAClusterState? {
+        didSet {
+            if !isPartitioned { fullLSAClusters = lsaClusters }
+        }
+    }
+    private var fullLSAClusters: LSAClusterState?
+    private var isPartitioned: Bool = false
     public private(set) var k: QWTensorValue, v: QWTensorValue
     public private(set) var kMeta: QWTensorValue, vMeta: QWTensorValue     // f16 scales/mins for q8/q4 (1-elem dummy for f32/f16)
     public private(set) var indexK: QWTensorValue                          // f16 [capacity, indexHeadDim]  raw index keys
@@ -203,6 +209,7 @@ public final class FNGPUAttnDecodeState {
         self.hidden = base.hidden
         self.rows = rows
         self.kvMode = base.kvMode
+        self.fullLSAClusters = base.fullLSAClusters ?? base.lsaClusters
         self.lsaClusters = base.lsaClusters
         k = base.k; v = base.v; kMeta = base.kMeta; vMeta = base.vMeta
         indexK = base.indexK; pooled = base.pooled
@@ -230,11 +237,23 @@ public final class FNGPUAttnDecodeState {
     /// Selects a contiguous KV/indexK/pooled partition `slot` out of `totalSlots` (or restores the full capacity when `totalSlots <= 1`).
     public func selectPartition(slot: Int, totalSlots: Int, mixer a: FNGPUAttnMixer) {
         if totalSlots <= 1 {
+            let wasPartitioned = isPartitioned
+            isPartitioned = false
             capacity = fullCapacity
             k = fullK; v = fullV; kMeta = fullKMeta; vMeta = fullVMeta
             indexK = fullIndexK; pooled = fullPooled
+            lsaClusters = fullLSAClusters
+            if wasPartitioned, let cs = fullLSAClusters {
+                memset(cs.bucketSizes.region.pointer.advanced(by: cs.bucketSizes.offset), 0, cs.bucketSizes.bytes)
+                memset(cs.bucketMembers.region.pointer.advanced(by: cs.bucketMembers.offset), 0, cs.bucketMembers.bytes)
+            }
             return
         }
+        if !isPartitioned {
+            fullLSAClusters = lsaClusters
+        }
+        isPartitioned = true
+        lsaClusters = nil
         let slotCap = max(a.compress, ((fullCapacity / totalSlots) / a.compress) * a.compress)
         let pos0 = slot * slotCap
         capacity = fullCapacity

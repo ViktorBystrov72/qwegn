@@ -80,18 +80,18 @@ final class HCALayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
         let zOutRows = driver.prefixRows(hca.zGatedScratch, rows: T, cols: hca.zOutStride, dt: .f16)
 
         _ = mark("hca.in_proj")
-        driver.gemmBatchedH16(enc, m: T, n: wFusedIn.n, k: H, x: activeLn1, wQ4: wFusedIn, y16: fusedInRows)
+        try driver.gemmBatchedH16(enc, m: T, n: wFusedIn.n, k: H, x: activeLn1, wQ4: wFusedIn, y16: fusedInRows)
         _ = mark("hca.in_prep")
         hca.encodeInPrepAndCompress(enc, hcaW: hcaW, hcaLayer: hcaIdx, pos0: pos, rows: T)
         _ = mark("hca.q_up_proj")
-        driver.gemmBatchedH16(enc, m: T, n: wQUpGate.n, k: hca.qLoraRank, x: qrRows, wQ4: wQUpGate, y16: qUpRows)
+        try driver.gemmBatchedH16(enc, m: T, n: wQUpGate.n, k: hca.qLoraRank, x: qrRows, wQ4: wQUpGate, y16: qUpRows)
         hca.encodeQPrepAttendVHAAndWoA(
             enc, hcaW: hcaW, zGatedOut: zOutRows,
             hcaLayer: hcaIdx, pos0: pos, rows: T,
             stage: QWEngineDriver.prefillProfileEnabled ? mark : nil)
         _ = mark("hca.o_proj")
         enc = driver.activeEnc ?? enc
-        driver.gemmBatchedH16(
+        try driver.gemmBatchedH16(
             enc, m: T, n: H, k: hca.zOutStride,
             x: zOutRows, wQ4: woB,
             y16: driver.prefixRows(psc.o16, rows: T, cols: H, dt: .f16))

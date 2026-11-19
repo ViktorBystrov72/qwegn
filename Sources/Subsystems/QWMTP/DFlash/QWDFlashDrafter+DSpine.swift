@@ -222,9 +222,9 @@ extension QWDFlashDrafter {
         input: QWTensorValue,
         output: QWTensorValue,
         rows: Int
-    ) {
+    ) throws {
         if !Self.usesQ4GMKernel(weight) {
-            encodeAQGateUpMatmul(enc, weight: weight, input: input, output: output, rows: rows)
+            try encodeAQGateUpMatmul(enc, weight: weight, input: input, output: output, rows: rows)
             return
         }
         let H = config.hiddenSize
@@ -232,7 +232,7 @@ extension QWDFlashDrafter {
         if isMetal4TensorCapable && rows >= 9 && canUseNAXGateUpScratch(rows: rows, h: H, i: I) {
             let guScratch = QWTensorValue(region: draftLogits.region, offset: draftLogits.offset,
                                           shape: QWTensorShape([rows * 2 * I], .f16))
-            encodeQ4Matmul(enc, weight: weight, input: input, output: guScratch, rows: rows)
+            try encodeQ4Matmul(enc, weight: weight, input: input, output: guScratch, rows: rows)
             encodeSiluMulF16(enc, gu: guScratch, out: output, rows: rows, i: I)
             return
         }
@@ -249,12 +249,14 @@ extension QWDFlashDrafter {
             enc.setBytes(&guK, length: 4, index: 5)
             enc.dispatchThreadgroups(MTLSize(width: (I + 31) / 32, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-        } else if (9...16).contains(rows) {
-            let c0 = rows / 2, c1 = rows - c0
-            encodeGateUpMatmul(enc, weight: weight, input: input.slice(byteOffset: 0, count: c0 * H),
-                               output: output.slice(byteOffset: 0, count: c0 * I), rows: c0)
-            encodeGateUpMatmul(enc, weight: weight, input: input.slice(byteOffset: c0 * H * 2, count: c1 * H),
-                               output: output.slice(byteOffset: c0 * I * 2, count: c1 * I), rows: c1)
+        } else if rows > 8 {
+            let c0 = min(8, rows / 2), c1 = rows - c0
+            try encodeGateUpMatmul(enc, weight: weight, input: input.slice(byteOffset: 0, count: c0 * H),
+                                   output: output.slice(byteOffset: 0, count: c0 * I), rows: c0)
+            try encodeGateUpMatmul(enc, weight: weight, input: input.slice(byteOffset: c0 * H * 2, count: c1 * H),
+                                   output: output.slice(byteOffset: c0 * I * 2, count: c1 * I), rows: c1)
+        } else {
+            throw QWDFlashError.state("QWDFlashDrafter: missing gate_up pipeline for rows=\(rows)")
         }
     }
 

@@ -27,7 +27,8 @@ static inline void qwg_aq_gdn_inproj_store_row(uint row, float vx, device half* 
         y16[row] = half(vx);
     } else if (row < bRow0) {
         const uint h = row - aRow0;
-        const float sp = log(1.0f + exp(vx + dtBias[h]));
+        const float spIn = vx + dtBias[h];
+        const float sp = (spIn > 20.0f) ? spIn : log(1.0f + exp(spIn));
         glog[h] = -exp(aLog[h]) * sp;
         if (y32) y32[row] = vx;
         y16[row] = half(vx);

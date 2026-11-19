@@ -94,19 +94,32 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
     internal let psoProjUVMMA: any MTLComputePipelineState
     internal let psoProjUVMMASub2: any MTLComputePipelineState
     internal let psoVHAGateRot: any MTLComputePipelineState
-    internal let coarsePipelines: QWCoarsePoolIndex.Pipelines?
-    internal let psoEmeansCoarse: (scoreCoarse: any MTLComputePipelineState, scoreCands: any MTLComputePipelineState, flatFallback: any MTLComputePipelineState)?
-    internal let coarseScratch: QWCoarsePoolIndex.Scratch?
-    internal var clusteredMacros: [Int]
+    internal let coarsePipeline: QWCoarseSelectionPipeline?
+    private var emptyClusteredMacros: [Int]
+    internal var coarsePipelines: QWCoarsePoolIndex.Pipelines? { coarsePipeline?.pipelines }
+    internal var psoEmeansCoarse: QWCoarseSelectionPipeline.EmeansPSOTuple? { coarsePipeline?.emeansTuple }
+    internal var coarseScratch: QWCoarsePoolIndex.Scratch? { coarsePipeline?.scratch }
+    internal var clusteredMacros: [Int] {
+        get { coarsePipeline?.watermarks ?? emptyClusteredMacros }
+        set {
+            if let coarsePipeline { coarsePipeline.watermarks = newValue }
+            else { emptyClusteredMacros = newValue }
+        }
+    }
 
     public func resetCoarseWatermarks() {
-        for i in clusteredMacros.indices { clusteredMacros[i] = 0 }
+        coarsePipeline?.resetWatermarks()
+        for i in emptyClusteredMacros.indices { emptyClusteredMacros[i] = 0 }
     }
 
     public func truncatePosition(_ validPosition: Int) {
+        if let coarsePipeline {
+            coarsePipeline.truncatePosition(validPosition, poolShift: poolShift)
+            return
+        }
         let maxMacro = max(0, validPosition) / QWCoarsePoolIndex.macroChunkTokens(poolShift: poolShift)
-        for i in clusteredMacros.indices where clusteredMacros[i] > maxMacro {
-            clusteredMacros[i] = maxMacro
+        for i in emptyClusteredMacros.indices where emptyClusteredMacros[i] > maxMacro {
+            emptyClusteredMacros[i] = maxMacro
         }
     }
 
@@ -228,6 +241,11 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
             : modelBudget
         if dsa {
             let budgetTok = min(2048, max(1, requestedBudget))
+            guard budgetTok + self.windowTokens <= 2560 else {
+                throw QWAttnError.badShape(
+                    "DSA budget (\(budgetTok)) + windowTokens (\(self.windowTokens)) exceeds 2560"
+                )
+            }
             self.topKPools = budgetTok
             self.listStride = max(512, ((budgetTok + self.windowTokens + 127) & ~127))
             self.latentStride = self.qLoraRank + self.kvLoraRank + self.ropeDim + self.idxDim
@@ -298,23 +316,15 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
 
         let coarseMinCtx = dsa ? 16_384 : 32_768
         let useCoarse = (self.psoIndexerSplit != nil) && (self.maxContext >= coarseMinCtx)
-        if useCoarse {
-            self.coarsePipelines = try QWCoarsePoolIndex.Pipelines(hal: hal)
-            self.psoEmeansCoarse = (
-                try hal.pipeline("qwg_emeans_mla_score_coarse"),
-                try hal.pipeline("qwg_emeans_mla_score_cands"),
-                try hal.pipeline("qwg_emeans_mla_flat_fallback")
-            )
-        } else {
-            self.coarsePipelines = nil
-            self.psoEmeansCoarse = nil
-        }
+        let loadedCoarse = useCoarse
+            ? try QWCoarseSelectionPipeline.LoadedPipelines.load(hal: hal, variant: .mla)
+            : nil
         if let rawEnv = ProcessInfo.processInfo.environment["QW_MLA_EMEANS"]?.lowercased() {
             self.emeansCoarseEnabled = useCoarse && rawEnv != "0" && rawEnv != "false" && rawEnv != "off"
         } else {
             self.emeansCoarseEnabled = useCoarse && lsaConfig.mode != .off
         }
-        self.clusteredMacros = Array(repeating: 0, count: numAttnLayers)
+        self.emptyClusteredMacros = Array(repeating: 0, count: numAttnLayers)
 
         var cursor = 0
         func align256(_ x: Int) -> Int { (x + 255) & ~255 }
@@ -326,18 +336,16 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
 
         let candCap = dsa ? Self.dsaEmeansCandCap : Self.emeansCandCap
         let maxMacros = useCoarse ? QWCoarsePoolIndex.maxMacros(forMaxContext: self.maxContext, poolShift: self.poolShift) : 0
-        let csrSizes = QWCoarsePoolIndex.csrBytesPerMacro(indexDim: self.idxDim)
-        var layerOffs: [(kPend: Int, gatePend: Int, pooled: Int, kPe: Int, cCent: Int, cMem: Int, cSpan: Int)] = []
+        var layerOffs: [(kPend: Int, gatePend: Int, pooled: Int, kPe: Int, csr: QWCoarseSelectionPipeline.CSROffsets)] = []
         layerOffs.reserveCapacity(numAttnLayers)
         for _ in 0..<numAttnLayers {
             let kOff = dsa ? 0 : reserve(self.ringCap * self.idxDim * 2)
             let gOff = dsa ? 0 : reserve(self.ringCap * self.idxDim * 2)
             let pOff = reserve(((self.maxBlocks + 7) & ~7) * self.idxDim * 2)
             let peOff = (dsa && self.ropeDim > 0) ? reserve(((self.maxBlocks + 7) & ~7) * self.ropeDim * 2) : 0
-            let cCent = useCoarse ? reserve(maxMacros * csrSizes.centroids) : 0
-            let cMem = useCoarse ? reserve(maxMacros * csrSizes.members) : 0
-            let cSpan = useCoarse ? reserve(maxMacros * csrSizes.spans) : 0
-            layerOffs.append((kOff, gOff, pOff, peOff, cCent, cMem, cSpan))
+            let csr = QWCoarseSelectionPipeline.CSROffsets.reserve(
+                enabled: useCoarse, maxMacros: maxMacros, indexDim: self.idxDim, reserve: reserve)
+            layerOffs.append((kOff, gOff, pOff, peOff, csr))
         }
 
         let maxT = self.maxPrefillChunk
@@ -362,13 +370,9 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
         let partOOff = reserve(self.attnSplits > 1 ? splitRows * self.kvLoraRank * 2 : 0)
         let partMLOff = reserve(self.attnSplits > 1 ? splitRows * 8 : 0)
         let maxClusters = maxMacros * QWCoarsePoolIndex.clustersPerMacro
-        let cScSizes = QWCoarsePoolIndex.scratchByteSizes(
-            maxBatchRows: selectBatch, maxClusters: maxClusters, candCap: candCap)
-        let cScoreOff = useCoarse ? reserve(cScSizes.cScore) : 0
-        let cHistOff = useCoarse ? reserve(cScSizes.uHist) : 0
-        let cStateOff = useCoarse ? reserve(cScSizes.candState) : 0
-        let cPoolsOff = useCoarse ? reserve(cScSizes.candPools) : 0
-        let cUOff = useCoarse ? reserve(cScSizes.candU) : 0
+        let coarseScratchOffs = QWCoarseSelectionPipeline.ScratchOffsets.reserve(
+            enabled: useCoarse, maxBatchRows: selectBatch,
+            maxClusters: maxClusters, candCap: candCap, reserve: reserve)
 
         let totalBytes = max(4096, cursor)
         guard let buf = hal.device.makeBuffer(length: totalBytes, options: .storageModeShared) else {
@@ -394,12 +398,9 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
         builtLayers.reserveCapacity(numAttnLayers)
         for i in 0..<numAttnLayers {
             let o = layerOffs[i]
-            let csr: QWCoarsePoolIndex.LayerCSR? = useCoarse ? QWCoarsePoolIndex.LayerCSR(
-                centroids: QWTensorValue(region: reg, offset: o.cCent, shape: QWTensorShape([maxClusters, self.idxDim], .f16)),
-                memberPools: QWTensorValue(region: reg, offset: o.cMem, shape: QWTensorShape([maxMacros * 512], .i32)),
-                clusterSpans: QWTensorValue(region: reg, offset: o.cSpan, shape: QWTensorShape([maxClusters], .i32)),
-                maxMacros: maxMacros
-            ) : nil
+            let csr: QWCoarsePoolIndex.LayerCSR? = useCoarse
+                ? o.csr.makeLayerCSR(region: reg, maxMacros: maxMacros, indexDim: self.idxDim)
+                : nil
             let kPe: QWTensorValue? = (dsa && self.ropeDim > 0)
                 ? QWTensorValue(region: reg, offset: o.kPe, shape: QWTensorShape([self.maxBlocks, self.ropeDim], .f16))
                 : nil
@@ -413,16 +414,12 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
             ))
         }
         self.layers = builtLayers
-        self.coarseScratch = useCoarse ? QWCoarsePoolIndex.Scratch(
-            cScore: QWTensorValue(region: reg, offset: cScoreOff, shape: QWTensorShape([selectBatch, maxClusters], .i32)),
-            uHist: QWTensorValue(region: reg, offset: cHistOff, shape: QWTensorShape([selectBatch, 512], .i32)),
-            candState: QWTensorValue(region: reg, offset: cStateOff, shape: QWTensorShape([selectBatch * 2], .i32)),
-            candPools: QWTensorValue(region: reg, offset: cPoolsOff, shape: QWTensorShape([selectBatch, candCap], .i32)),
-            candU: QWTensorValue(region: reg, offset: cUOff, shape: QWTensorShape([selectBatch, candCap], .i32)),
-            maxBatchRows: selectBatch,
-            clusterStride: maxClusters,
-            candCap: candCap
-        ) : nil
+        self.coarsePipeline = loadedCoarse.map { loaded in
+            let cScratch = coarseScratchOffs.makeScratch(
+                region: reg, maxBatchRows: selectBatch, maxClusters: maxClusters, candCap: candCap)
+            return QWCoarseSelectionPipeline(
+                variant: .mla, loaded: loaded, scratch: cScratch, layerCount: numAttnLayers)
+        }
 
         self.mlaLatentScratch = QWTensorValue(region: reg, offset: latentOff, shape: QWTensorShape([maxT, self.latentStride], .f16))
         self.qResidScratch = QWTensorValue(region: reg, offset: qResidOff, shape: QWTensorShape([maxT, self.qLoraRank], .f16))

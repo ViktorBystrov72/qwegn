@@ -23,6 +23,16 @@ public final class QWTokenizer: @unchecked Sendable {
         case metaspaceByteFallback(replacement: String, prependScheme: String, splitWords: Bool)
     }
 
+    struct AddedPattern: Sendable {
+        let pat: [UInt8]
+        let ord: Int
+        let id: Int
+        let singleWord: Bool
+        let lstrip: Bool
+        let rstrip: Bool
+        let normalized: Bool
+    }
+
     let mode: Mode
     let usesNFC: Bool
     let stripLeadingSpace: Bool
@@ -30,8 +40,8 @@ public final class QWTokenizer: @unchecked Sendable {
     let byteMap: [Unicode.Scalar]
     /// vocab symbol (ByteLevel string) → token id.
     let vocab: [String: Int]
-    /// merged-pair rank (merges file order). Key = a<<20 | b over interner
-    /// ids (sym count 248k « 2^20 cap).
+    /// merged-pair rank (merges file order). Key = a<<32 | b over interner
+    /// ids (sym count supports full UInt32 range).
     let ranks: [UInt64: Int]
     /// interner: vocab symbol string → dense id (BPE closure stays in vocab)
     let symId: [String: UInt32]
@@ -54,10 +64,11 @@ public final class QWTokenizer: @unchecked Sendable {
     let preSteps: [PreTokenStep]
     /// byte -> symbol interner id (direct O(1) table, zero allocations)
     let byteToSymId: [UInt32]
-    /// pre-encoded added token patterns for fast scanning
-    let addedPats: [(pat: [UInt8], ord: Int, id: Int)]
-    /// 256-entry lookup table marking valid first UTF-8 bytes of `addedPats`
-    let addedFirstByte: [Bool]
+    /// pre-encoded added token patterns sorted longest-first (tie-break file order)
+    let rawAddedPats: [AddedPattern]
+    let rawAddedFirstByte: [Bool]
+    let normAddedPats: [AddedPattern]
+    let normAddedFirstByte: [Bool]
 
     public enum Error: Swift.Error, CustomStringConvertible {
         case badJSON(String), unresolvedByte(String), regex(String)
@@ -143,15 +154,33 @@ public final class QWTokenizer: @unchecked Sendable {
         self.preSteps = compiledSteps
         self.vocab = vocabObj
 
+        struct AddedEntry {
+            let content: String
+            let id: Int
+            let singleWord: Bool
+            let lstrip: Bool
+            let rstrip: Bool
+            let normalized: Bool
+        }
         var addedList: [(String, Int)] = []
+        var addedEntries: [AddedEntry] = []
         var spIds: Set<Int> = []
         if let ats = root["added_tokens"] as? [[String: Any]] {
             for t in ats {
                 guard let c = t["content"] as? String, let id = t["id"] as? Int else {
                     throw Error.badJSON("added_tokens entry")
                 }
+                let isSpecial = (t["special"] as? Bool) ?? false
+                let normalized = (t["normalized"] as? Bool) ?? !isSpecial
+                let singleWord = (t["single_word"] as? Bool) ?? false
+                let lstrip = (t["lstrip"] as? Bool) ?? false
+                let rstrip = (t["rstrip"] as? Bool) ?? false
                 addedList.append((c, id))
-                if (t["special"] as? Bool) == true { spIds.insert(id) }
+                addedEntries.append(AddedEntry(
+                    content: c, id: id, singleWord: singleWord,
+                    lstrip: lstrip, rstrip: rstrip, normalized: normalized
+                ))
+                if isSpecial { spIds.insert(id) }
             }
         }
         self.added = addedList
@@ -198,6 +227,9 @@ public final class QWTokenizer: @unchecked Sendable {
         self.byteFallbackUnmap = bfUnmap
 
         // interner + eager merge-closure tables (load once, encode hot)
+        guard vocabObj.count < Int(UInt32.max) else {
+            throw Error.badJSON("vocab exceeds UInt32 symbol capacity")
+        }
         var sId = [String: UInt32](minimumCapacity: vocabObj.count)
         var sList: [String] = []
         sList.reserveCapacity(vocabObj.count)
@@ -224,7 +256,7 @@ public final class QWTokenizer: @unchecked Sendable {
                 if case .metaspaceByteFallback = detectedMode { continue }
                 throw Error.badJSON("merge refs non-vocab symbol: \(part0) \(part1)")
             }
-            let k = UInt64(a) << 20 | UInt64(b)
+            let k = UInt64(a) << 32 | UInt64(b)
             guard let m = sId[sList[Int(a)] + sList[Int(b)]] else { continue }  // unmergeable pair (see law above)
             if rk[k] == nil { rk[k] = rk.count }   // first rank wins (list order)
             pm[k] = m
@@ -265,17 +297,40 @@ public final class QWTokenizer: @unchecked Sendable {
         }
         self.byteToSymId = b2s
 
-        var pats: [(pat: [UInt8], ord: Int, id: Int)] = []
-        var firstByteTable = [Bool](repeating: false, count: 256)
-        for (ord, a) in addedList.enumerated() {
-            let p = Array(a.0.utf8)
-            if !p.isEmpty {
-                pats.append((p, ord, a.1))
-                firstByteTable[Int(p[0])] = true
+        var rawPats: [AddedPattern] = []
+        var rawFirst = [Bool](repeating: false, count: 256)
+        var normPats: [AddedPattern] = []
+        var normFirst = [Bool](repeating: false, count: 256)
+        let nfcEnabled = (normType == "NFC")
+        for (ord, entry) in addedEntries.enumerated() {
+            if entry.normalized {
+                let patStr = nfcEnabled ? entry.content.precomposedStringWithCanonicalMapping : entry.content
+                let p = Array(patStr.utf8)
+                if !p.isEmpty {
+                    normPats.append(AddedPattern(
+                        pat: p, ord: ord, id: entry.id, singleWord: entry.singleWord,
+                        lstrip: entry.lstrip, rstrip: entry.rstrip, normalized: true
+                    ))
+                    normFirst[Int(p[0])] = true
+                }
+            } else {
+                let p = Array(entry.content.utf8)
+                if !p.isEmpty {
+                    rawPats.append(AddedPattern(
+                        pat: p, ord: ord, id: entry.id, singleWord: entry.singleWord,
+                        lstrip: entry.lstrip, rstrip: entry.rstrip, normalized: false
+                    ))
+                    rawFirst[Int(p[0])] = true
+                }
             }
         }
-        self.addedPats = pats
-        self.addedFirstByte = firstByteTable
+        let sortLongestFirst: (AddedPattern, AddedPattern) -> Bool = {
+            $0.pat.count != $1.pat.count ? $0.pat.count > $1.pat.count : $0.ord < $1.ord
+        }
+        self.rawAddedPats = rawPats.sorted(by: sortLongestFirst)
+        self.rawAddedFirstByte = rawFirst
+        self.normAddedPats = normPats.sorted(by: sortLongestFirst)
+        self.normAddedFirstByte = normFirst
     }
 
     /// Onig/fancy-regex (HF `tokenizers`) parses `<atom>{n}+` as `(?:<atom>{n})+`,

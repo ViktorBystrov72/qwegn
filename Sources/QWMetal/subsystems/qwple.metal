@@ -13,7 +13,7 @@ inline void qwg_ple_gate_impl(device const float* keyNorm, device const float* q
     const uint W = H * hc;
     const uint t = tg / hc, c = tg - t * hc;
     float g = 0.0f;
-    for (uint d = tid; d < H; d += 128u) g += keyNorm[t * W + c * H + d] * queryNorm[t * W + c * H + d];
+    for (uint d = tid; d < H; d += 128u) g += keyNorm[(size_t)t * W + (size_t)c * H + d] * queryNorm[(size_t)t * W + (size_t)c * H + d];
     g = simd_sum(g);
     if ((tid & 31u) == 0u) partial[tid >> 5u] = g;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -24,7 +24,7 @@ inline void qwg_ple_gate_impl(device const float* keyNorm, device const float* q
         sig[0] = 1.0f / (1.0f + exp(-gate));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint d = tid; d < H; d += 128u) gv[t * W + c * H + d] = sig[0] * vals[t * valStride + d];
+    for (uint d = tid; d < H; d += 128u) gv[(size_t)t * W + (size_t)c * H + d] = sig[0] * vals[(size_t)t * valStride + d];
 }
 
 kernel void qwg_ple_gate(device const float* keyNorm [[buffer(0)]], device const float* queryNorm [[buffer(1)]],
@@ -134,11 +134,11 @@ kernel void qwg_ple_conv(device const float* gv         [[buffer(0)]],
     float acc = 0.0f;
     for (uint j = 0u; j < K; j++) {
         const int src = int(t) - int((K - 1u - j) * dilation);
-        if (src >= 0) acc += convWeight[c * K + j] * gvNorm[uint(src) * W + c];
-        else if (HL > 0u) acc += convWeight[c * K + j] * hist[(int(HL) + src) * int(W) + int(c)];
+        if (src >= 0) acc += convWeight[(size_t)c * K + j] * gvNorm[(size_t)uint(src) * W + c];
+        else if (HL > 0u) acc += convWeight[(size_t)c * K + j] * hist[(size_t)(int(HL) + src) * W + c];
     }
-    const float convOut = gv[t * W + c] + acc / (1.0f + exp(-acc));
-    out[t * W + c] = hasRes ? (residual[t * W + c] + convOut) : convOut;
+    const float convOut = gv[(size_t)t * W + c] + acc / (1.0f + exp(-acc));
+    out[(size_t)t * W + c] = hasRes ? (residual[(size_t)t * W + c] + convOut) : convOut;
 }
 
 // History roll: newHist[i] = the last HL rows of [oldHist (HL rows) | gvNorm (T rows)]. dispatch: (W, HL) threads.
@@ -152,7 +152,7 @@ kernel void qwg_ple_hist(device const float* oldHist [[buffer(0)]],
     const uint c = gid.x, i = gid.y;
     if (c >= W || i >= HL) return;
     const uint k = i + T;
-    newHist[i * W + c] = k < HL ? oldHist[k * W + c] : gvNorm[(k - HL) * W + c];
+    newHist[(size_t)i * W + c] = k < HL ? oldHist[(size_t)k * W + c] : gvNorm[(size_t)(k - HL) * W + c];
 }
 
 // inject buffers: 0 base f32 [T, C, H] | 1 src f32 [T, H] | 2 inj f32 [T, C] | 3 out f32 [T, C, H] | 4 H | 5 C
@@ -167,8 +167,8 @@ kernel void qwg_inject(device const float* base [[buffer(0)]],
                        uint2 gid [[thread_position_in_grid]]) {
     const uint c = gid.x / H, d = gid.x - c * H, t = gid.y;
     if (c >= C) return;
-    const uint o = (t * C + c) * H + d;
-    out[o] = base[o] + src[t * H + d] * inj[t * C + c];
+    const size_t o = ((size_t)t * C + c) * H + d;
+    out[o] = base[o] + src[(size_t)t * H + d] * inj[(size_t)t * C + c];
 }
 
 // VQ2_G32 zero-pread PLE gather: loads 256x2 f16 e-means codebook at ngramFile+1024 into threadgroup LUT,

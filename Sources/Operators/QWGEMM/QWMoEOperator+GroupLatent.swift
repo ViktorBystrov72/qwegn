@@ -75,7 +75,14 @@ extension QWMoEOperator {
            let tileE = s.tileE, let tileR = s.tileR, let tileCount = s.tileCount,
            let gu16 = s.gu16, let dnHi = s.dnHi,
            let naxX16 = s.naxX16, let xLatent16 = s.xLatent16, let xe16 = xe16ForNax {
-            let shAct16 = (T >= 64 && ISh > 0 && ISh % 64 == 0)
+            if needsCastXe16 {
+                try QWGemm.encodeCast(enc, hal: hal, x32: xRot, y16: naxX16, count: T * H)
+                enc.memoryBarrier(scope: .buffers)
+            }
+            let canAliasShAct16 = ISh > 0
+                && naxX16.shape.elementCount >= T * (H + ISh)
+                && canUseNaxDenseProj(hal: hal, weight: w.sharedDown, rows: T, maxTileWidth: s.maxTileWidth)
+            let shAct16 = canAliasShAct16
                 ? naxX16.slice(byteOffset: T * H * 2, count: T * ISh, dtype: .f16)
                 : nil
             let dnAcc16 = s.dnAcc.slice(byteOffset: 0, count: T * max(K, NG) * H, dtype: .f16)
@@ -104,14 +111,12 @@ extension QWMoEOperator {
                                             intermediate: ISh, act16: shAct16)
                 let shScratch = shAct16 ?? shScratch0
                 try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shDown, x: actSh, y: s.shared,
-                                              naxX16: shScratch, naxY16: shScratch, maxTileWidth: max(H, ISh),
+                                              naxX16: shScratch, naxY16: shScratch,
+                                              maxTileWidth: shAct16 != nil ? s.maxTileWidth : 0,
                                               rows: T, x16Precast: shAct16)
             } else if concurrentBarriers, let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
                 try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
                                             intermediate: ISh, act16: shAct16)
-            }
-            if needsCastXe16 {
-                try QWGemm.encodeCast(enc, hal: hal, x32: xRot, y16: naxX16, count: T * H)
             }
             barrier()
             guard let rotateEncoder else {
@@ -127,7 +132,8 @@ extension QWMoEOperator {
             if concurrentBarriers, let shDown = w.sharedDown, let actSh = s.actSh32, ISh > 0 {
                 let naxY = s.naxY16 ?? naxX16
                 try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shDown, x: actSh, y: s.shared,
-                                              naxX16: naxX16, naxY16: naxY, maxTileWidth: s.maxTileWidth,
+                                              naxX16: naxX16, naxY16: naxY,
+                                              maxTileWidth: shAct16 != nil ? s.maxTileWidth : 0,
                                               rows: T, x16Precast: shAct16)
             }
             try rotateEncoder(&enc)
@@ -198,7 +204,7 @@ extension QWMoEOperator {
                                           shGateWeight: ISh > 0 ? w.sharedGateScalar : nil,
                                           shGateOut: ISh > 0 ? s.gate : nil)
         }
-        let fuseSh = ISh > 0 && ISh <= 4096 && w.sharedGateUp != nil && s.guSh32 != nil && s.actSh32 != nil
+        let fuseSh = ISh > 0 && ISh <= 4096 && (ISh % 8 == 0) && w.sharedGateUp != nil && s.guSh32 != nil && s.actSh32 != nil
         if let shGU = w.sharedGateUp, let guSh = s.guSh32, ISh > 0 {
             try QWGemm.encodeHQ4F32V4(enc, hal: hal, weight: shGU, x: xRot, y: guSh, rows: T)
         }

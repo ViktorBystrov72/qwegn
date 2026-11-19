@@ -144,28 +144,49 @@ public final class QWLSASidecar: @unchecked Sendable {
 
     /// Fast header-only inspection of a `.qlsa` sidecar file without mapping tensor payloads.
     public static func peekInfo(url: URL, descriptor: QWModelDescriptor? = nil) throws -> QWLSASidecarInfo {
-        guard FileManager.default.fileExists(atPath: url.path) else {
+        let fd = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else {
             throw QWLSASidecarError.fileMissing(url.path)
         }
-        let fh = try FileHandle(forReadingFrom: url)
-        defer { try? fh.close() }
-        guard let prefix = try fh.read(upToCount: 16), prefix.count == 16 else {
+        defer { Darwin.close(fd) }
+        var st = Darwin.stat()
+        guard Darwin.fstat(fd, &st) == 0, let fileSize = UInt64(exactly: st.st_size) else {
+            throw QWLSASidecarError.fileMissing(url.path)
+        }
+        guard fileSize >= 16 else {
+            throw QWLSASidecarError.truncated(url.path)
+        }
+        var prefix = [UInt8](repeating: 0, count: 16)
+        do {
+            try prefix.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+                guard let base = raw.baseAddress else { throw QWLSASidecarError.truncated(url.path) }
+                try QWPOSIX.preadExact(fd: fd, into: base, count: 16, offset: 0)
+            }
+        } catch {
             throw QWLSASidecarError.truncated(url.path)
         }
         guard String(decoding: prefix[0..<8], as: UTF8.self) == magic else {
             throw QWLSASidecarError.badMagic(url.path)
         }
-        var hdrLen: UInt64 = 0
-        for i in 0..<8 {
-            hdrLen |= UInt64(prefix[8 + i]) << (8 * i)
+        let hdrLen = prefix.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> UInt64 in
+            UInt64(littleEndian: raw.loadUnaligned(fromByteOffset: 8, as: UInt64.self))
         }
-        let fileSize = fh.seekToEndOfFile()
-        guard fileSize >= 16 + hdrLen else {
+        let (minSize, ov0) = hdrLen.addingReportingOverflow(16)
+        guard !ov0, fileSize >= minSize,
+              let hdrCount = Int(exactly: hdrLen),
+              let hdrOffset = Int64(exactly: fileSize - hdrLen) else {
             throw QWLSASidecarError.truncated(url.path)
         }
-        try fh.seek(toOffset: fileSize - hdrLen)
-        guard let hdrData = try fh.read(upToCount: Int(hdrLen)), hdrData.count == Int(hdrLen) else {
-            throw QWLSASidecarError.truncated(url.path)
+        var hdrData = Data(count: hdrCount)
+        if hdrCount > 0 {
+            do {
+                try hdrData.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+                    guard let base = raw.baseAddress else { throw QWLSASidecarError.truncated(url.path) }
+                    try QWPOSIX.preadExact(fd: fd, into: base, count: hdrCount, offset: hdrOffset)
+                }
+            } catch {
+                throw QWLSASidecarError.truncated(url.path)
+            }
         }
         let decoded = try JSONDecoder().decode(Header.self, from: hdrData)
         let prov = decoded.provenance
@@ -193,56 +214,50 @@ public final class QWLSASidecar: @unchecked Sendable {
 
     /// Opens a `QLSA0001` sidecar and validates its geometry digest against `descriptor`.
     public init(url: URL, descriptor: QWModelDescriptor? = nil, skipIdentityCheck: Bool = false) throws {
-        self.url = url
-        let fd = open(url.path, O_RDONLY)
+        let fd = open(url.path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else { throw QWLSASidecarError.fileMissing(url.path) }
         defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0 else { throw QWLSASidecarError.fileMissing(url.path) }
-        let size = Int(st.st_size)
-        guard size > 16 else { throw QWLSASidecarError.truncated(url.path) }
+        guard st.st_size > 16, let size = Int(exactly: st.st_size) else {
+            throw QWLSASidecarError.truncated(url.path)
+        }
         let mapped = mmap(nil, size, PROT_READ, MAP_SHARED, fd, 0)
         guard let ptr = mapped, ptr != MAP_FAILED else {
             throw QWLSASidecarError.fileMissing(url.path)
         }
-        self.rawBase = ptr
-        self.rawCount = size
-
-        let bytes = ptr.assumingMemoryBound(to: UInt8.self)
-        let magicSlice = UnsafeBufferPointer(start: bytes, count: 8)
-        guard String(decoding: magicSlice, as: UTF8.self) == Self.magic else {
-            _ = munmap(ptr, size)
+        var mappedOwned = true
+        defer {
+            if mappedOwned, size > 0 {
+                _ = munmap(ptr, size)
+            }
+        }
+        let rawBuf = UnsafeRawBufferPointer(start: ptr, count: size)
+        guard String(decoding: rawBuf[0..<8], as: UTF8.self) == Self.magic else {
             throw QWLSASidecarError.badMagic(url.path)
         }
-        var hdrLen: UInt64 = 0
-        for i in 0..<8 {
-            hdrLen |= UInt64(bytes[8 + i]) << (8 * i)
-        }
-        let hdrStart = size - Int(hdrLen)
-        guard hdrStart >= 16 else {
-            _ = munmap(ptr, size)
+        let hdrLenU64 = UInt64(littleEndian: rawBuf.loadUnaligned(fromByteOffset: 8, as: UInt64.self))
+        guard let hdrLen = Int(exactly: hdrLenU64), hdrLen <= size - 16 else {
             throw QWLSASidecarError.truncated(url.path)
         }
-        let hdrData = Data(bytes: ptr.advanced(by: hdrStart), count: Int(hdrLen))
-        let decoded: Header
-        do {
-            decoded = try JSONDecoder().decode(Header.self, from: hdrData)
-        } catch {
-            _ = munmap(ptr, size)
-            throw error
-        }
+        let hdrStart = size - hdrLen
+        let hdrData = Data(bytes: ptr.advanced(by: hdrStart), count: hdrLen)
+        let decoded = try JSONDecoder().decode(Header.self, from: hdrData)
         if !skipIdentityCheck, let descriptor {
             let matchesDigest = decoded.provenance.geometryDigest == descriptor.geometryDigestV3Hex
                 || decoded.provenance.geometryDigest == descriptor.geometryDigestV2Hex
             guard matchesDigest else {
-                _ = munmap(ptr, size)
                 throw QWLSASidecarError.geometryMismatch(
                     sidecar: decoded.provenance.geometryDigest,
                     expected: descriptor.geometryDigestV3Hex
                 )
             }
         }
+        self.url = url
+        self.rawBase = ptr
+        self.rawCount = size
         self.header = decoded
+        mappedOwned = false
     }
 
     public var info: QWLSASidecarInfo {
@@ -275,14 +290,23 @@ public final class QWLSASidecar: @unchecked Sendable {
         if let expectedShape, e.shape != expectedShape {
             throw QWLSASidecarError.shapeMismatch(tensor: name, got: e.shape, expected: expectedShape)
         }
-        let elems = e.shape.reduce(1, *)
-        let byteCount = elems * 2
-        guard e.rawOff >= 16, e.rawOff + byteCount <= rawCount else {
+        var elems = 1
+        for dim in e.shape {
+            guard dim >= 0 else { throw QWLSASidecarError.truncated(url.path) }
+            let (m, ov) = elems.multipliedReportingOverflow(by: dim)
+            guard !ov else { throw QWLSASidecarError.truncated(url.path) }
+            elems = m
+        }
+        let (byteCount, ov0) = elems.multipliedReportingOverflow(by: 2)
+        let (endOff, ov1) = e.rawOff.addingReportingOverflow(byteCount)
+        guard !ov0, !ov1, e.rawOff >= 16, endOff <= rawCount else {
             throw QWLSASidecarError.truncated(url.path)
         }
+        if elems == 0 { return [] }
         var out = [UInt16](repeating: 0, count: elems)
         out.withUnsafeMutableBytes { (buf: UnsafeMutableRawBufferPointer) in
-            buf.baseAddress!.copyMemory(from: UnsafeRawPointer(rawBase).advanced(by: e.rawOff), byteCount: byteCount)
+            guard let base = buf.baseAddress else { return }
+            base.copyMemory(from: UnsafeRawPointer(rawBase).advanced(by: e.rawOff), byteCount: byteCount)
         }
         return out
     }

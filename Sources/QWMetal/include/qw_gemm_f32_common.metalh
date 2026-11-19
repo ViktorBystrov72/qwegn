@@ -1,0 +1,321 @@
+// qw_gemm_f32_common.metalh — Shared QuantTraits-parameterized f32 GEMM/GEMV bodies.
+// Powers f32_bm/bm32, f32_v4, f32_v4_am, and f32_v4_am2 across HQ4, AQ, and SHVQ.
+#pragma once
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+#include "qw_quant_traits.metalh"
+#include "qw_fastmath_safe.metalh"
+using namespace metal;
+
+#define QWG_F32_BM_TOKENS 64
+#define QWG_F32_BM_ROWS   32
+#define QWG_F32_BM_LD     36
+
+METAL_FUNC float qwg_apply_v4_epi_f32(float v, uint ep, float scale) {
+    if (ep == 1u) { const float z = v / scale; return z / (1.0f + exp(-z)); }
+    if (ep == 2u) { return 1.0f / (1.0f + exp(-v)); }
+    return v;
+}
+
+METAL_FUNC void qwg_gemv_f32_store4(device float* yRow, uint row0, uint N,
+                                    uint ep, float scale, float4 acc) {
+    const float o[4] = { acc.x, acc.y, acc.z, acc.w };
+    for (uint r = 0u; r < 4u; ++r) {
+        const uint row = row0 + r;
+        if (row >= N) break;
+        yRow[row] = qwg_apply_v4_epi_f32(o[r], ep, scale);
+    }
+}
+
+METAL_FUNC void qwg_gemv_am_fold4(float4 acc, uint row0, uint N, uint ep, float scale,
+                                  device float* yRow, thread uint& bh, thread uint& bl) {
+    bh = 0u;
+    bl = 0u;
+    if (row0 >= N) return;
+    const float o[4] = { acc.x, acc.y, acc.z, acc.w };
+    for (uint r = 0u; r < 4u; ++r) {
+        const uint row = row0 + r;
+        if (row >= N) break;
+        const float v = qwg_apply_v4_epi_f32(o[r], ep, scale);
+        yRow[row] = v;
+        const uint hi = qw_sortable_f32_u32(v);
+        const uint lo = ~row;
+        if (r == 0u || hi > bh || (hi == bh && lo > bl)) { bh = hi; bl = lo; }
+    }
+}
+
+METAL_FUNC void qwg_gemv_am_reduce4(threadgroup const uint* bHi, threadgroup const uint* bLo,
+                                    uint base, thread uint& bh, thread uint& bl) {
+    bh = bHi[base];
+    bl = bLo[base];
+    for (uint q = 1u; q < 4u; ++q) {
+        const uint hi = bHi[base + q];
+        const uint lo = bLo[base + q];
+        if (hi > bh || (hi == bh && lo > bl)) { bh = hi; bl = lo; }
+    }
+}
+
+template <typename Traits, int TOKENS = QWG_F32_BM_TOKENS, int THREADS = 256>
+METAL_FUNC void qwg_gemm_f32_bm_body(typename Traits::WeightPtr w,
+                                     device const float* x,
+                                     device float* y,
+                                     QWGemmF32BMParams p,
+                                     uint2 tg, uint tid,
+                                     threadgroup float* As,
+                                     threadgroup float* Bs) {
+    threadgroup float* const Cs = As;
+    const int t0 = int(tg.y) * TOKENS;
+    if (t0 >= int(p.M)) return;
+    const int nBase = int(tg.x) * QWG_F32_BM_ROWS;
+    const uint sg = tid >> 5u, gi = tid >> 3u, dl = tid & 7u;
+    const int nBlocks = int(p.K >> 5u);
+    const size_t rowStride = Traits::row_stride(p.K);
+    const int nRow = min(nBase + int(gi), int(p.N) - 1);
+    typename Traits::WeightPtr wrow = Traits::row_ptr(w, size_t(nRow), rowStride);
+
+    simdgroup_float8x8 acc[4];
+    for (int nb = 0; nb < 4; ++nb) acc[nb] = simdgroup_float8x8(0.0f);
+
+    for (int g = 0; g < nBlocks; ++g) {
+        #pragma unroll
+        for (int pass = 0; pass < TOKENS / (THREADS / 8); ++pass) {
+            const int tk = int(gi) + pass * (THREADS / 8);
+            const int tokAbs = t0 + tk;
+            float4 v = float4(0.0f);
+            if (tokAbs < int(p.M)) {
+                v = *(device const float4*)(x + long(tokAbs) * long(p.K) + (g << 5) + int(dl << 2u));
+            }
+            const int aBase = tk * QWG_F32_BM_LD + int(dl) * 4;
+            As[aBase + 0] = v.x; As[aBase + 1] = v.y; As[aBase + 2] = v.z; As[aBase + 3] = v.w;
+        }
+        if constexpr (THREADS == 256) {
+            float2 w01, w23;
+            Traits::unpack_lane4_f32(wrow, uint(g), dl, w01, w23);
+            const int base = int(gi) * QWG_F32_BM_LD + int(dl) * 4;
+            Bs[base + 0] = w01.x; Bs[base + 1] = w01.y; Bs[base + 2] = w23.x; Bs[base + 3] = w23.y;
+        } else {
+            #pragma unroll
+            for (int pass = 0; pass < QWG_F32_BM_ROWS / (THREADS / 8); ++pass) {
+                const int row = int(gi) + pass * (THREADS / 8);
+                const int weightRow = min(nBase + row, int(p.N) - 1);
+                typename Traits::WeightPtr weights = Traits::row_ptr(w, size_t(weightRow), rowStride);
+                float2 w01, w23;
+                Traits::unpack_lane4_f32(weights, uint(g), dl, w01, w23);
+                const int base = row * QWG_F32_BM_LD + int(dl) * 4;
+                Bs[base + 0] = w01.x; Bs[base + 1] = w01.y; Bs[base + 2] = w23.x; Bs[base + 3] = w23.y;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (int k8 = 0; k8 < 4; ++k8) {
+            simdgroup_float8x8 a;
+            simdgroup_load(a, As + int(sg) * 8 * QWG_F32_BM_LD + k8 * 8, QWG_F32_BM_LD, ulong2(0, 0), false);
+            #pragma unroll
+            for (int nb = 0; nb < 4; ++nb) {
+                simdgroup_float8x8 b;
+                simdgroup_load(b, Bs + nb * 8 * QWG_F32_BM_LD + k8 * 8, QWG_F32_BM_LD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc[nb], a, b, acc[nb]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int nb = 0; nb < 4; ++nb) {
+        simdgroup_store(acc[nb], Cs + int(sg) * 8 * QWG_F32_BM_LD + nb * 8, QWG_F32_BM_LD, ulong2(0, 0), false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int idx = int(tid); idx < TOKENS * QWG_F32_BM_ROWS; idx += THREADS) {
+        const int m = idx / QWG_F32_BM_ROWS, n = idx % QWG_F32_BM_ROWS;
+        const int tokAbs = t0 + m, col = nBase + n;
+        float v = (tokAbs < int(p.M) && col < int(p.N)) ? Cs[m * QWG_F32_BM_LD + n] : 0.0f;
+        if (p.epi == 1u || p.epi == 3u) { const float z = v / p.scale; v = z / (1.0f + exp(-z)); }
+        else if (p.epi == 2u) { v = 1.0f / (1.0f + exp(-v)); }
+        if (p.epi == 3u) v = qwg_fwht32_lane_f32(v, uint(n));
+        if (tokAbs < int(p.M) && col < int(p.N)) y[long(tokAbs) * long(p.N) + col] = v;
+    }
+}
+
+template <typename Traits, uint LS>
+METAL_FUNC void qwg_gemv_v4_rows4_dispatch(typename Traits::WeightPtr w, device const float* x,
+                                           uint M, uint row0, uint N, uint K, uint tgY, uint lane,
+                                           thread float4 (&acc)[4],
+                                           threadgroup const typename Traits::TgLut& tgLut) {
+    if (M == 2u) {
+        Traits::template rows4_m2_f32<LS>(w, x, x + K, row0, N, K, lane, acc[0], acc[1], tgLut);
+    } else if (M > 2u && M <= 4u) {
+        Traits::template rows4_m4_f32<LS>(w, x, M, row0, N, K, lane, acc, tgLut);
+    } else {
+        acc[0] = Traits::template rows4_f32<LS>(w, x + (size_t)tgY * K, row0, N, K, lane, tgLut);
+    }
+}
+
+template <typename Traits>
+METAL_FUNC void qwg_gemv_f32_v4_body(typename Traits::WeightPtr w,
+                                     device const float* x,
+                                     device float* y,
+                                     QWGemmF32V4Params p,
+                                     uint3 tg, uint tid, uint sg, uint lane,
+                                     threadgroup float* tgC,
+                                     threadgroup typename Traits::TgLut& tgLut) {
+    const uint ep = p.epi & 0xFFu;
+    const uint M = max(1u, (p.epi >> 8u) & 0xFFu);
+    const bool halves = ((p.K >> 5u) & 31u) == 16u;
+    const uint tgRows = (ep == 3u || halves) ? 32u : 16u;
+    if (tg.x * tgRows >= p.N) return;
+    if constexpr (Traits::has_tg_lut()) {
+        tgLut.load(tid, 128u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const bool multi = M > 1u && M <= 4u;
+    const uint mN = multi ? M : 1u;
+    if (ep == 3u) {
+        const uint rowBase = tg.x * 32u;
+        for (uint pass = 0u; pass < 2u; ++pass) {
+            const uint row0 = rowBase + pass * 16u + sg * 4u;
+            float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+            if (row0 < p.N) qwg_gemv_v4_rows4_dispatch<Traits, 32u>(w, x, M, row0, p.N, p.K, tg.y, lane, acc, tgLut);
+            if (lane == 0u) {
+                for (uint m = 0u; m < mN; ++m) {
+                    const float o[4] = { acc[m].x, acc[m].y, acc[m].z, acc[m].w };
+                    for (uint r = 0u; r < 4u; ++r) {
+                        const uint col = pass * 16u + sg * 4u + r;
+                        const float v = (rowBase + col < p.N) ? o[r] : 0.0f;
+                        const float z = v / p.scale;
+                        tgC[m * 32u + col] = z / (1.0f + exp(-z));
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg < mN) {
+            const float v = qwg_fwht32_lane_f32(tgC[sg * 32u + lane], lane);
+            const uint row = rowBase + lane;
+            const size_t outRow = multi ? size_t(sg) : size_t(tg.y);
+            if (row < p.N) y[outRow * p.N + row] = v;
+        }
+        return;
+    }
+    if (halves) {
+        const uint hl = lane & 15u;
+        const uint row0 = (tg.x * 4u + sg) * 8u + (lane >> 4u) * 4u;
+        if (row0 >= p.N) return;
+        float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+        qwg_gemv_v4_rows4_dispatch<Traits, 16u>(w, x, M, row0, p.N, p.K, tg.y, hl, acc, tgLut);
+        if (hl != 0u) return;
+        for (uint m = 0u; m < mN; ++m) {
+            qwg_gemv_f32_store4(y + size_t(multi ? m : tg.y) * p.N, row0, p.N, ep, p.scale, acc[m]);
+        }
+        return;
+    }
+    const uint row0 = (tg.x * 4u + sg) * 4u;
+    if (row0 >= p.N) return;
+    if (multi) {
+        float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+        qwg_gemv_v4_rows4_dispatch<Traits, 32u>(w, x, M, row0, p.N, p.K, tg.y, lane, acc, tgLut);
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint m = 0u; m < 4u; ++m) {
+                if (m < M) qwg_gemv_f32_store4(y + size_t(m) * p.N, row0, p.N, ep, p.scale, acc[m]);
+            }
+        }
+        return;
+    }
+    const float4 acc = Traits::template rows4_f32<32u>(w, x + (size_t)tg.y * p.K, row0, p.N, p.K, lane, tgLut);
+    if (lane == 0u) qwg_gemv_f32_store4(y + size_t(tg.y) * p.N, row0, p.N, ep, p.scale, acc);
+}
+
+template <typename Traits>
+METAL_FUNC void qwg_gemv_f32_v4_am_body(typename Traits::WeightPtr w,
+                                        device const float* x,
+                                        device float* y,
+                                        device uint* keysHi,
+                                        device uint* keysLo,
+                                        QWGemmF32V4Params p,
+                                        uint3 tg, uint tid, uint sg, uint lane,
+                                        threadgroup uint* bHi,
+                                        threadgroup uint* bLo,
+                                        threadgroup typename Traits::TgLut& tgLut) {
+    if constexpr (Traits::has_tg_lut()) {
+        tgLut.load(tid, 128u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint ep = p.epi & 0xFFu;
+    const uint M = p.epi >> 8u;
+    const uint row0 = (tg.x * 4u + sg) * 4u;
+    const uint slots = (p.N + 15u) >> 4u;
+    if (M > 1u && M <= 4u) {
+        float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+        if (row0 < p.N) qwg_gemv_v4_rows4_dispatch<Traits, 32u>(w, x, M, row0, p.N, p.K, 0u, lane, acc, tgLut);
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint m = 0u; m < 4u; ++m) {
+                if (m < M) {
+                    uint bh, bl;
+                    qwg_gemv_am_fold4(acc[m], row0, p.N, ep, p.scale, y + size_t(m) * p.N, bh, bl);
+                    bHi[m * 4u + sg] = bh;
+                    bLo[m * 4u + sg] = bl;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < M) {
+            uint bh, bl;
+            qwg_gemv_am_reduce4(bHi, bLo, tid * 4u, bh, bl);
+            keysHi[tid * slots + tg.x] = bh;
+            keysLo[tid * slots + tg.x] = bl;
+        }
+        return;
+    }
+    const float4 acc = (row0 < p.N)
+        ? Traits::template rows4_f32<32u>(w, x + (size_t)tg.y * p.K, row0, p.N, p.K, lane, tgLut)
+        : float4(0.0f);
+    if (lane == 0u) {
+        uint bh, bl;
+        qwg_gemv_am_fold4(acc, row0, p.N, ep, p.scale, y + size_t(tg.y) * p.N, bh, bl);
+        bHi[sg] = bh;
+        bLo[sg] = bl;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint bh, bl;
+        qwg_gemv_am_reduce4(bHi, bLo, 0u, bh, bl);
+        keysHi[tg.y * slots + tg.x] = bh;
+        keysLo[tg.y * slots + tg.x] = bl;
+    }
+}
+
+template <typename Traits>
+METAL_FUNC void qwg_gemv_f32_v4_am2_body(typename Traits::WeightPtr w,
+                                         device const float* x,
+                                         device uint* keysHi,
+                                         device uint* keysLo,
+                                         uint N, uint K,
+                                         device float* y,
+                                         uint3 tg, uint tid, uint sg, uint lane,
+                                         threadgroup uint* bHi0, threadgroup uint* bLo0,
+                                         threadgroup uint* bHi1, threadgroup uint* bLo1,
+                                         threadgroup typename Traits::TgLut& tgLut) {
+    if constexpr (Traits::has_tg_lut()) {
+        tgLut.load(tid, 128u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint row0 = (tg.x * 4u + sg) * 4u;
+    float4 a0 = float4(0.0f), a1 = float4(0.0f);
+    if (row0 < N) Traits::template rows4_m2_f32<32u>(w, x, x + K, row0, N, K, lane, a0, a1, tgLut);
+    if (lane == 0u) {
+        uint bh0, bl0, bh1, bl1;
+        qwg_gemv_am_fold4(a0, row0, N, 0u, 1.0f, y, bh0, bl0);
+        qwg_gemv_am_fold4(a1, row0, N, 0u, 1.0f, y + N, bh1, bl1);
+        bHi0[sg] = bh0; bLo0[sg] = bl0;
+        bHi1[sg] = bh1; bLo1[sg] = bl1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint bh0, bl0, bh1, bl1;
+        qwg_gemv_am_reduce4(bHi0, bLo0, 0u, bh0, bl0);
+        qwg_gemv_am_reduce4(bHi1, bLo1, 0u, bh1, bl1);
+        const uint slots = (N + 15u) >> 4u;
+        keysHi[tg.x] = bh0; keysLo[tg.x] = bl0;
+        keysHi[slots + tg.x] = bh1; keysLo[slots + tg.x] = bl1;
+    }
+}

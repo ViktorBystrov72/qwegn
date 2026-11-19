@@ -30,9 +30,9 @@ static inline void qwg_q4_quant8(XP x, thread half* out8,
         lmn = fmin(lmn, simd_shuffle_xor(lmn, k));
         lmx = fmax(lmx, simd_shuffle_xor(lmx, k));
     }
-    const float sc = float(half(fmax((lmx - lmn) / 15.0f, 1e-8f)));
+    const float sc = float(half(fmax((lmx - lmn) / 15.0f, 6.103515625e-5f)));
     const float mn = float(half(lmn));
-    const float inv = 1.0f / sc;
+    const float inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
     #pragma unroll
     for (uint i = 0; i < 8u; i++) {
         nib[i] = (uint)clamp(round((float(x[i]) - mn) * inv), 0.0f, 15.0f);

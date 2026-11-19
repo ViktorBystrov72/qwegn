@@ -16,7 +16,7 @@ extension QWEngineDriver {
     func waitForPriorCommitCB(_ cb: any MTLCommandBuffer, session: QWEngineSession) throws {
         cb.waitUntilCompleted()
         if cb.status != .completed {
-            commandBufferErrors += 1
+            admission.commandBufferErrors += 1
             session.stateFailed = true
             throw QWEngineDriverError.state("greedy commit GPU failure: \(String(describing: cb.error))")
         }

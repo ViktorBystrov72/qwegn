@@ -11,11 +11,9 @@ import QWCore
 import QWHAL
 import QWHead
 
-private let denseDriverGenerateLock = NSRecursiveLock()
-
 extension QWEngineDriver {
     func withDriverGenerateLock<T>(_ body: () throws -> T) rethrows -> T {
-        try denseDriverGenerateLock.withLock(body)
+        try generateLock.withLock(body)
     }
 
     var maxBatchSlots: Int {
@@ -137,7 +135,7 @@ extension QWEngineDriver: QWSessionInferenceEngine {
         request: QWGenerationRequest,
         onToken: ((Int) -> Bool)?
     ) throws -> QWGenerationResult {
-        try denseDriverGenerateLock.withLock {
+        try withDriverGenerateLock {
             if request.usePrefixCache && !hasPrefixCache {
                 throw QWEngineDriverError.state("the request wants a prefix cache this engine does not have")
             }

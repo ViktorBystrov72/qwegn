@@ -4,6 +4,7 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 #include "include/qw_weight_basis.metalh"
+#include "include/qw_fastmath_safe.metalh"
 
 // 32-point normalized WHT in f32 (8 elements per thread across 4 threads).
 inline void qwg_route_fwht32_f32(thread float (&f)[8], uint lane_id) {
@@ -45,65 +46,104 @@ kernel void qwg_moe_route(device const float* logits     [[buffer(0)]],
     const bool splitFeature = (normTopK & 8u) != 0u;
     const bool hasScaleParam = (normTopK & 16u) != 0u;
     const uint logitStride = splitFeature ? (2u * E) : E;
-    const uint JN = E / 32u;
+    const uint JN = min((E + 31u) >> 5u, 16u);
     float lv[16], ex[16], p[16];
-    float mx = -INFINITY;
-    for (uint j = 0u; j < 16u; j++) {
-        if (j < JN) { lv[j] = logits[t * logitStride + lane + 32u * j]; mx = max(mx, lv[j]); }
+    bool validScore[16];
+    float mx = -3.4e38f;
+    bool hasFiniteLogit = false;
+    for (uint j = 0u; j < JN; j++) {
+        const uint id = lane + 32u * j;
+        if (id < E) {
+            const float v = logits[(size_t)t * logitStride + id];
+            lv[j] = v;
+            if (qw_is_finite_bits(v)) {
+                mx = hasFiniteLogit ? max(mx, v) : v;
+                hasFiniteLogit = true;
+            }
+        }
     }
     if (hasBias || splitFeature) {
-        for (uint j = 0u; j < 16u; j++) {
-            if (j < JN) {
-                const uint id = lane + 32u * j;
+        for (uint j = 0u; j < JN; j++) {
+            const uint id = lane + 32u * j;
+            if (id < E) {
                 float s = 1.0f / (1.0f + exp(-lv[j]));
+                bool sfOk = true;
                 if (splitFeature) {
-                    const float lv1 = logits[t * logitStride + E + id];
+                    const float lv1 = logits[(size_t)t * logitStride + E + id];
                     s += 1.0f / (1.0f + exp(-lv1));
+                    sfOk = qw_is_finite_bits(lv1);
                 }
                 ex[j] = s;
-                p[j] = hasBias ? (s + bias[id]) : s;
+                const float score = hasBias ? (s + bias[id]) : s;
+                p[j] = score;
+                validScore[j] = qw_is_finite_bits(lv[j]) && sfOk && qw_is_finite_bits(s) && qw_is_finite_bits(score);
+            } else {
+                validScore[j] = false;
             }
         }
     } else {
-        const float maxLogit = simd_max(mx);
+        const bool anyFinite = simd_any(hasFiniteLogit);
+        const float maxLogit = anyFinite ? simd_max(hasFiniteLogit ? mx : -3.4e38f) : 0.0f;
         float total = 0.0f;
-        for (uint j = 0u; j < 16u; j++) {
-            if (j < JN) {
-                ex[j] = exp(lv[j] - maxLogit);
-                total += simd_sum(ex[j]);
-            }
+        for (uint j = 0u; j < JN; j++) {
+            const uint id = lane + 32u * j;
+            const float e = (id < E && qw_is_finite_bits(lv[j])) ? exp(lv[j] - maxLogit) : 0.0f;
+            ex[j] = e;
+            total += simd_sum(e);
         }
-        for (uint j = 0u; j < 16u; j++) if (j < JN) p[j] = ex[j] / total;
+        for (uint j = 0u; j < JN; j++) {
+            const uint id = lane + 32u * j;
+            const bool ok = (id < E) && qw_is_finite_bits(lv[j]) && (total > 0.0f);
+            p[j] = ok ? (ex[j] / total) : -1e30f;
+            validScore[j] = ok;
+        }
     }
     bool taken[16];
     for (uint j = 0u; j < 16u; j++) taken[j] = false;
     float wsel[16];
     uint activeMask = 0u;
     for (uint r = 0u; r < K; r++) {
-        float bv = -INFINITY;
+        float bv = -3.4e38f;
         uint bi = 0xFFFFFFFFu;
-        for (uint j = 0u; j < 16u; j++) {
+        bool hasCand = false;
+        for (uint j = 0u; j < JN; j++) {
             const uint id = lane + 32u * j;
-            if (j < JN && !taken[j] && (p[j] > bv || (p[j] == bv && id < bi))) { bv = p[j]; bi = id; }
-        }
-        const float vMax = simd_max(bv);
-        const uint w = simd_min((bv == vMax) ? bi : 0xFFFFFFFFu);
-        if ((w & 31u) == lane) {
-            for (uint j = 0u; j < 16u; j++) if (w >> 5u == j) taken[j] = true;
-        }
-        const uint wj = w >> 5u;
-        float own = 0.0f;
-        for (uint j = 0u; j < 16u; j++) if (wj == j) own = (hasBias || splitFeature) ? ex[j] : p[j];
-        const float pw = simd_broadcast(own, ushort(w & 31u));
-        if (lane == 0u) {
-            if (numGroups > 0u) {
-                const int g = latentLabels[w];
-                activeMask |= (1u << uint(g));
-                idx[t * K + r] = (int(numGroups) << 23) | (g << 16) | int(w);
-            } else {
-                idx[t * K + r] = int(w);
+            if (id < E && !taken[j] && validScore[j]) {
+                if (!hasCand || p[j] > bv || (p[j] == bv && id < bi)) {
+                    bv = p[j];
+                    bi = id;
+                    hasCand = true;
+                }
             }
-            wsel[r] = pw;
+        }
+        const bool anyCand = simd_any(hasCand);
+        const float vMax = simd_max(hasCand ? bv : -3.4e38f);
+        const uint w = anyCand ? simd_min((hasCand && bv == vMax) ? bi : 0xFFFFFFFFu) : 0xFFFFFFFFu;
+        if (w < E && (w & 31u) == lane) {
+            const uint wj = w >> 5u;
+            if (wj < 16u) taken[wj] = true;
+        }
+        const uint wj = (w < E) ? (w >> 5u) : 0u;
+        float own = 0.0f;
+        if (w < E) {
+            for (uint j = 0u; j < JN; j++) if (wj == j) own = (hasBias || splitFeature) ? ex[j] : p[j];
+        }
+        const float pw = (w < E) ? simd_broadcast(own, ushort(w & 31u)) : 0.0f;
+        if (lane == 0u) {
+            const size_t slot = (size_t)t * K + r;
+            if (w < E) {
+                if (numGroups > 0u) {
+                    const int g = latentLabels[w];
+                    activeMask |= (1u << uint(g));
+                    idx[slot] = (int(numGroups) << 23) | (g << 16) | int(w);
+                } else {
+                    idx[slot] = int(w);
+                }
+                wsel[r] = pw;
+            } else {
+                idx[slot] = -1;
+                wsel[r] = 0.0f;
+            }
         }
     }
     if (lane == 0u) {
@@ -114,13 +154,15 @@ kernel void qwg_moe_route(device const float* logits     [[buffer(0)]],
             if (hasBias || splitFeature) acc += 1e-20f;
         }
         for (uint r = 0u; r < K; r++) {
-            const uint eid = uint(idx[t * K + r]) & 0xFFFFu;
-            const float scale = hasScaleParam ? scaleParam[eid] : rScale;
-            wts[t * K + r] = (doNorm ? (wsel[r] / acc) : wsel[r]) * scale;
+            const size_t slot = (size_t)t * K + r;
+            const int rawId = idx[slot];
+            const float scale = (hasScaleParam && rawId >= 0) ? scaleParam[uint(rawId) & 0xFFFFu] : rScale;
+            const float normW = doNorm ? ((acc > 0.0f) ? (wsel[r] / acc) : 0.0f) : wsel[r];
+            wts[slot] = normW * scale;
         }
         if (numGroups > 0u) {
             for (uint g = 0u; g < numGroups; ++g) {
-                groupIds[t * numGroups + g] = ((activeMask & (1u << g)) != 0u) ? int(g) : -1;
+                groupIds[(size_t)t * numGroups + g] = ((activeMask & (1u << g)) != 0u) ? int(g) : -1;
             }
         }
     }
@@ -230,11 +272,11 @@ kernel void qwg_moe_route_decode(device const float* logits0    [[buffer(0)]],
     const bool splitFeature = (normTopK & 8u) != 0u;
     const bool hasScaleParam = (normTopK & 16u) != 0u;
     const uint logitStride = splitFeature ? (2u * E) : E;
-    device const float* logits = logits0 + row * logitStride;
-    device int*         idx    = idx0 + row * K;
-    device float*       wts    = wts0 + row * K;
-    device const float* guSh   = guSh0 + row * 2u * IS;
-    device float*       actSh  = actSh0 + row * IS;
+    device const float* logits = logits0 + (size_t)row * logitStride;
+    device int*         idx    = idx0 + (size_t)row * K;
+    device float*       wts    = wts0 + (size_t)row * K;
+    device const float* guSh   = guSh0 + (size_t)row * 2u * IS;
+    device float*       actSh  = actSh0 + (size_t)row * IS;
     if (tg == 1u) {
         const uint mi = tid * 8u;
         if (mi >= IS) return;
@@ -260,38 +302,46 @@ kernel void qwg_moe_route_decode(device const float* logits0    [[buffer(0)]],
     threadgroup uint  sIdx[2][16];
     threadgroup float wsel[16];
 
-    const uint JN = E >> 5u;
+    const uint JN = min((E + 31u) >> 5u, 16u);
     const bool valid = (tid < E);
-    const float lv = valid ? logits[tid] : -INFINITY;
-    float p = -INFINITY;
+    const float lv = valid ? logits[tid] : -1e30f;
+    const bool lvFinite = valid && qw_is_finite_bits(lv);
+    float p = -1e30f;
+    bool cand = false;
     if (hasBias || splitFeature) {
-        float sig = valid ? (1.0f / (1.0f + exp(-lv))) : 0.0f;
+        float sig = lvFinite ? (1.0f / (1.0f + exp(-lv))) : 0.0f;
+        bool sfOk = true;
         if (splitFeature && valid) {
             const float lv1 = logits[E + tid];
             sig += 1.0f / (1.0f + exp(-lv1));
+            sfOk = qw_is_finite_bits(lv1);
         }
-        p = valid ? (hasBias ? (sig + bias[tid]) : sig) : -INFINITY;
+        const float score = valid ? (hasBias ? (sig + bias[tid]) : sig) : -1e30f;
+        cand = lvFinite && sfOk && qw_is_finite_bits(sig) && qw_is_finite_bits(score);
+        p = cand ? score : -1e30f;
     } else {
-        const float sgMax = simd_max(lv);
-        if (lane == 0u) sMaxArr[sgi] = sgMax;
+        const float sgMax = simd_max(lvFinite ? lv : -3.4e38f);
+        const bool sgHas = simd_any(lvFinite);
+        if (lane == 0u) sMaxArr[sgi] = sgHas ? sgMax : -3.4e38f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const float maxLogit = simd_max((lane < JN) ? sMaxArr[lane] : -INFINITY);
-        const float ex = valid ? exp(lv - maxLogit) : 0.0f;
+        const float maxLogit = simd_max((lane < JN) ? sMaxArr[lane] : -3.4e38f);
+        const float ex = lvFinite ? exp(lv - maxLogit) : 0.0f;
         const float sgSum = simd_sum(ex);
         if (lane == 0u) sSumArr[sgi] = sgSum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float total = 0.0f;
         for (uint j = 0u; j < JN; j++) total += sSumArr[j];
-        p = valid ? (ex / total) : -INFINITY;
+        cand = lvFinite && (total > 0.0f);
+        p = cand ? (ex / total) : -1e30f;
     }
     {
-        const float bMax = simd_max(p);
-        const uint bIdx = simd_min((p == bMax && valid) ? tid : 0xFFFFFFFFu);
+        const float bMax = simd_max(cand ? p : -3.4e38f);
+        const bool sgHas = simd_any(cand);
+        const uint bIdx = sgHas ? simd_min((cand && p == bMax) ? tid : 0xFFFFFFFFu) : 0xFFFFFFFFu;
         if (lane == 0u) {
-            const float v0 = valid ? bMax : -INFINITY;
-            sVal[0][sgi] = v0;
+            sVal[0][sgi] = sgHas ? bMax : -1e30f;
             sIdx[0][sgi] = bIdx;
         }
     }
@@ -302,34 +352,42 @@ kernel void qwg_moe_route_decode(device const float* logits0    [[buffer(0)]],
     for (uint r = 0u; r < K; r++) {
         const uint cur = r & 1u;
         const uint nxt = cur ^ 1u;
-        const float bv = activeSG ? sVal[cur][lane] : -INFINITY;
         const uint bi = activeSG ? sIdx[cur][lane] : 0xFFFFFFFFu;
+        const bool hasSG = (bi != 0xFFFFFFFFu);
+        const float bv = hasSG ? sVal[cur][lane] : -3.4e38f;
+        const bool anyCand = simd_any(hasSG);
         const float vMax = simd_max(bv);
-        const uint w = simd_min((bv == vMax) ? bi : 0xFFFFFFFFu);
+        const uint w = anyCand ? simd_min((hasSG && bv == vMax) ? bi : 0xFFFFFFFFu) : 0xFFFFFFFFu;
         if (tid == 0u) {
-            if (numGroups > 0u) {
-                const int g = latentLabels[w];
-                activeMask |= (1u << uint(g));
-                idx[r] = (int(numGroups) << 23) | (g << 16) | int(w);
+            if (w < E) {
+                if (numGroups > 0u) {
+                    const int g = latentLabels[w];
+                    activeMask |= (1u << uint(g));
+                    idx[r] = (int(numGroups) << 23) | (g << 16) | int(w);
+                } else {
+                    idx[r] = int(w);
+                }
+                if (hasBias || splitFeature) {
+                    float s = 1.0f / (1.0f + exp(-logits[w]));
+                    if (splitFeature) s += 1.0f / (1.0f + exp(-logits[E + w]));
+                    wsel[r] = s;
+                } else {
+                    wsel[r] = vMax;
+                }
             } else {
-                idx[r] = int(w);
-            }
-            if (hasBias || splitFeature) {
-                float s = 1.0f / (1.0f + exp(-logits[w]));
-                if (splitFeature) s += 1.0f / (1.0f + exp(-logits[E + w]));
-                wsel[r] = s;
-            } else {
-                wsel[r] = vMax;
+                idx[r] = -1;
+                wsel[r] = 0.0f;
             }
         }
         if (r + 1u == K) break;
-        const uint winSG = w >> 5u;
+        const uint winSG = (w < E) ? (w >> 5u) : 0xFFFFFFFFu;
         if (sgi == winSG) {
-            if (tid == w) p = -INFINITY;
-            const float bMax = simd_max(p);
-            const uint bIdx = simd_min((p == bMax && p > -INFINITY) ? tid : 0xFFFFFFFFu);
+            if (tid == w) cand = false;
+            const float bMax = simd_max(cand ? p : -3.4e38f);
+            const bool sgHas = simd_any(cand);
+            const uint bIdx = sgHas ? simd_min((cand && p == bMax) ? tid : 0xFFFFFFFFu) : 0xFFFFFFFFu;
             if (lane == 0u) {
-                sVal[nxt][sgi] = bMax;
+                sVal[nxt][sgi] = sgHas ? bMax : -1e30f;
                 sIdx[nxt][sgi] = bIdx;
             }
         } else if (lane == 0u) {
@@ -347,11 +405,13 @@ kernel void qwg_moe_route_decode(device const float* logits0    [[buffer(0)]],
             if (hasBias || splitFeature) acc += 1e-20f;
         }
         for (uint r = 0u; r < K; r++) {
-            const float scale = hasScaleParam ? scaleParam[uint(idx[r]) & 0xFFFFu] : rScale;
-            wts[r] = (doNorm ? (wsel[r] / acc) : wsel[r]) * scale;
+            const int rawId = idx[r];
+            const float scale = (hasScaleParam && rawId >= 0) ? scaleParam[uint(rawId) & 0xFFFFu] : rScale;
+            const float normW = doNorm ? ((acc > 0.0f) ? (wsel[r] / acc) : 0.0f) : wsel[r];
+            wts[r] = normW * scale;
         }
         if (numGroups > 0u) {
-            device int* gOut = groupIds + row * numGroups;
+            device int* gOut = groupIds + (size_t)row * numGroups;
             for (uint g = 0u; g < numGroups; ++g) {
                 gOut[g] = ((activeMask & (1u << g)) != 0u) ? int(g) : -1;
             }
@@ -388,14 +448,14 @@ kernel void qwg_moe_router_bf16_f32(device const ushort* W      [[buffer(0)]],
     const float y = simd_sum(acc);
     if (lane == 0u) {
         if (n < E) {
-            logits[t * E + n] = y;
+            logits[(size_t)t * E + n] = y;
         } else {
             sg[t] = 1.0f / (1.0f + exp(-y));
         }
     }
 }
 
-// Router logits for a batch of rows: Y[t, e] = sum_k X[t, k] * W[e, k] (f32 or bf16 weights). Tiled 32 tokens x 32 experts per
+// Router logits for a batch of rows: Y[t, e] = sum_k X[t, k] * W[e, k] (f32, bf16, or f16 weights). Tiled 32 tokens x 32 experts per
 // threadgroup, so each router weight tile is read once per 32 tokens instead of once per token. K % 32 == 0.
 kernel void qwg_router_gemm(device const float* W [[buffer(0)]],
                             device const float* X [[buffer(1)]],
@@ -403,7 +463,7 @@ kernel void qwg_router_gemm(device const float* W [[buffer(0)]],
                             constant uint&      M [[buffer(3)]],
                             constant uint&      N [[buffer(4)]],
                             constant uint&      K [[buffer(5)]],
-                            constant uint&      isBF16 [[buffer(6)]],
+                            constant uint&      weightMode [[buffer(6)]],
                             device const float* shGateW [[buffer(7)]],
                             device float*       shGateOut [[buffer(8)]],
                             constant uint&      hasShGate [[buffer(9)]],
@@ -424,19 +484,34 @@ kernel void qwg_router_gemm(device const float* W [[buffer(0)]],
         if (e < N) {
             float4 acc0 = float4(0.0f);
             float4 acc1 = float4(0.0f);
-            if (isBF16 != 0u) {
+            if (weightMode == 1u) {
                 device const ushort4* w4p = (device const ushort4*)(W16 + (size_t)e * K);
                 for (uint k4 = lane; k4 < K4; k4 += 32u) {
                     const float4 wv = as_type<float4>(uint4(w4p[k4]) << 16u);
                     acc0.x += dot(wv, X4[k4]);
-                    if (M > 1u) acc0.y += dot(wv, X4[K4 + k4]);
-                    if (M > 2u) acc0.z += dot(wv, X4[2u * K4 + k4]);
-                    if (M > 3u) acc0.w += dot(wv, X4[3u * K4 + k4]);
+                    if (M > 1u) acc0.y += dot(wv, X4[(size_t)K4 + k4]);
+                    if (M > 2u) acc0.z += dot(wv, X4[(size_t)2u * K4 + k4]);
+                    if (M > 3u) acc0.w += dot(wv, X4[(size_t)3u * K4 + k4]);
                     if (M > 4u) {
-                        acc1.x += dot(wv, X4[4u * K4 + k4]);
-                        if (M > 5u) acc1.y += dot(wv, X4[5u * K4 + k4]);
-                        if (M > 6u) acc1.z += dot(wv, X4[6u * K4 + k4]);
-                        if (M > 7u) acc1.w += dot(wv, X4[7u * K4 + k4]);
+                        acc1.x += dot(wv, X4[(size_t)4u * K4 + k4]);
+                        if (M > 5u) acc1.y += dot(wv, X4[(size_t)5u * K4 + k4]);
+                        if (M > 6u) acc1.z += dot(wv, X4[(size_t)6u * K4 + k4]);
+                        if (M > 7u) acc1.w += dot(wv, X4[(size_t)7u * K4 + k4]);
+                    }
+                }
+            } else if (weightMode == 2u) {
+                device const ushort4* w4p = (device const ushort4*)(W16 + (size_t)e * K);
+                for (uint k4 = lane; k4 < K4; k4 += 32u) {
+                    const float4 wv = float4(as_type<half4>(w4p[k4]));
+                    acc0.x += dot(wv, X4[k4]);
+                    if (M > 1u) acc0.y += dot(wv, X4[(size_t)K4 + k4]);
+                    if (M > 2u) acc0.z += dot(wv, X4[(size_t)2u * K4 + k4]);
+                    if (M > 3u) acc0.w += dot(wv, X4[(size_t)3u * K4 + k4]);
+                    if (M > 4u) {
+                        acc1.x += dot(wv, X4[(size_t)4u * K4 + k4]);
+                        if (M > 5u) acc1.y += dot(wv, X4[(size_t)5u * K4 + k4]);
+                        if (M > 6u) acc1.z += dot(wv, X4[(size_t)6u * K4 + k4]);
+                        if (M > 7u) acc1.w += dot(wv, X4[(size_t)7u * K4 + k4]);
                     }
                 }
             } else {
@@ -444,14 +519,14 @@ kernel void qwg_router_gemm(device const float* W [[buffer(0)]],
                 for (uint k4 = lane; k4 < K4; k4 += 32u) {
                     const float4 wv = w4p[k4];
                     acc0.x += dot(wv, X4[k4]);
-                    if (M > 1u) acc0.y += dot(wv, X4[K4 + k4]);
-                    if (M > 2u) acc0.z += dot(wv, X4[2u * K4 + k4]);
-                    if (M > 3u) acc0.w += dot(wv, X4[3u * K4 + k4]);
+                    if (M > 1u) acc0.y += dot(wv, X4[(size_t)K4 + k4]);
+                    if (M > 2u) acc0.z += dot(wv, X4[(size_t)2u * K4 + k4]);
+                    if (M > 3u) acc0.w += dot(wv, X4[(size_t)3u * K4 + k4]);
                     if (M > 4u) {
-                        acc1.x += dot(wv, X4[4u * K4 + k4]);
-                        if (M > 5u) acc1.y += dot(wv, X4[5u * K4 + k4]);
-                        if (M > 6u) acc1.z += dot(wv, X4[6u * K4 + k4]);
-                        if (M > 7u) acc1.w += dot(wv, X4[7u * K4 + k4]);
+                        acc1.x += dot(wv, X4[(size_t)4u * K4 + k4]);
+                        if (M > 5u) acc1.y += dot(wv, X4[(size_t)5u * K4 + k4]);
+                        if (M > 6u) acc1.z += dot(wv, X4[(size_t)6u * K4 + k4]);
+                        if (M > 7u) acc1.w += dot(wv, X4[(size_t)7u * K4 + k4]);
                     }
                 }
             }
@@ -459,14 +534,14 @@ kernel void qwg_router_gemm(device const float* W [[buffer(0)]],
             if (M > 4u) acc1 = simd_sum(acc1);
             if (lane == 0u) {
                 Y[e] = acc0.x;
-                if (M > 1u) Y[N + e] = acc0.y;
-                if (M > 2u) Y[2u * N + e] = acc0.z;
-                if (M > 3u) Y[3u * N + e] = acc0.w;
+                if (M > 1u) Y[(size_t)N + e] = acc0.y;
+                if (M > 2u) Y[(size_t)2u * N + e] = acc0.z;
+                if (M > 3u) Y[(size_t)3u * N + e] = acc0.w;
                 if (M > 4u) {
-                    Y[4u * N + e] = acc1.x;
-                    if (M > 5u) Y[5u * N + e] = acc1.y;
-                    if (M > 6u) Y[6u * N + e] = acc1.z;
-                    if (M > 7u) Y[7u * N + e] = acc1.w;
+                    Y[(size_t)4u * N + e] = acc1.x;
+                    if (M > 5u) Y[(size_t)5u * N + e] = acc1.y;
+                    if (M > 6u) Y[(size_t)6u * N + e] = acc1.z;
+                    if (M > 7u) Y[(size_t)7u * N + e] = acc1.w;
                 }
             }
         } else if (computeSh) {
@@ -475,14 +550,14 @@ kernel void qwg_router_gemm(device const float* W [[buffer(0)]],
             for (uint k4 = lane; k4 < K4; k4 += 32u) {
                 const float4 wv = shW4[k4];
                 sh0.x += dot(wv, X4[k4]);
-                if (M > 1u) sh0.y += dot(wv, X4[K4 + k4]);
-                if (M > 2u) sh0.z += dot(wv, X4[2u * K4 + k4]);
-                if (M > 3u) sh0.w += dot(wv, X4[3u * K4 + k4]);
+                if (M > 1u) sh0.y += dot(wv, X4[(size_t)K4 + k4]);
+                if (M > 2u) sh0.z += dot(wv, X4[(size_t)2u * K4 + k4]);
+                if (M > 3u) sh0.w += dot(wv, X4[(size_t)3u * K4 + k4]);
                 if (M > 4u) {
-                    sh1.x += dot(wv, X4[4u * K4 + k4]);
-                    if (M > 5u) sh1.y += dot(wv, X4[5u * K4 + k4]);
-                    if (M > 6u) sh1.z += dot(wv, X4[6u * K4 + k4]);
-                    if (M > 7u) sh1.w += dot(wv, X4[7u * K4 + k4]);
+                    sh1.x += dot(wv, X4[(size_t)4u * K4 + k4]);
+                    if (M > 5u) sh1.y += dot(wv, X4[(size_t)5u * K4 + k4]);
+                    if (M > 6u) sh1.z += dot(wv, X4[(size_t)6u * K4 + k4]);
+                    if (M > 7u) sh1.w += dot(wv, X4[(size_t)7u * K4 + k4]);
                 }
             }
             sh0 = simd_sum(sh0);
@@ -517,9 +592,12 @@ kernel void qwg_router_gemm(device const float* W [[buffer(0)]],
         const float4 xv = (t0 + r < M) ? *(device const float4*)(X + (size_t)(t0 + r) * K + k0 + c) : float4(0.0f);
         float4 wv = float4(0.0f);
         if (e0 + r < N) {
-            if (isBF16 != 0u) {
+            if (weightMode == 1u) {
                 const ushort4 w16 = *(device const ushort4*)(W16 + (size_t)(e0 + r) * K + k0 + c);
                 wv = as_type<float4>(uint4(w16) << 16u);
+            } else if (weightMode == 2u) {
+                const ushort4 w16 = *(device const ushort4*)(W16 + (size_t)(e0 + r) * K + k0 + c);
+                wv = float4(as_type<half4>(w16));
             } else {
                 wv = *(device const float4*)(W + (size_t)(e0 + r) * K + k0 + c);
             }

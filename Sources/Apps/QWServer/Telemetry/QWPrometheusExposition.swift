@@ -31,10 +31,10 @@ extension QWEngineTelemetryRegistry {
         // A tier the engine cannot measure is left out: a gauge with no
         // value says nothing, and a zero would say it is empty.
         if let warmBytes = s.cache.warmBytes {
-            out += "qwegine_cache_bytes{tier=\"warm_ram\",limit=\"\(s.cache.warmLimitBytes)\") \(warmBytes)\n"
+            out += "qwegine_cache_bytes{tier=\"warm_ram\",limit=\"\(s.cache.warmLimitBytes)\"} \(warmBytes)\n"
         }
         if let ssdBytes = s.cache.ssdBytes {
-            out += "qwegine_cache_bytes{tier=\"cold_ssd\",limit=\"\(s.cache.ssdLimitBytes)\") \(ssdBytes)\n"
+            out += "qwegine_cache_bytes{tier=\"cold_ssd\",limit=\"\(s.cache.ssdLimitBytes)\"} \(ssdBytes)\n"
         }
         out += "\n"
 

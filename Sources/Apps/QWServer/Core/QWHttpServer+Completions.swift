@@ -37,59 +37,26 @@ extension QWHttpServer {
         let extraHeaders = ["x-request-id: \(reqId)"]
 
         if req.stream ?? false {
-            final class CompletionSSEBox: @unchecked Sendable {
-                private let lock = NSLock()
-                private var started = false
-                private var gate: QWStreamKeepaliveGate?
-                private var task: Task<Void, Never>?
-                var isStarted: Bool { lock.withLock { started } }
-                func markStarted(gate: QWStreamKeepaliveGate, task: Task<Void, Never>) {
-                    lock.withLock { started = true; self.gate = gate; self.task = task }
-                }
-                func stopKeepaliveIfRunning() {
-                    let t = lock.withLock { () -> Task<Void, Never>? in
-                        guard let g = gate, g.stopIfRunning() else { return nil }
-                        return task
-                    }
-                    t?.cancel()
-                }
-                func stopAll() {
-                    let (g, t) = lock.withLock { (gate, task) }
-                    g?.stop()
-                    t?.cancel()
-                }
-            }
-
-            let box = CompletionSSEBox()
-            defer { box.stopAll() }
-            let ssePrefix = Data("data: ".utf8)
-            let sseSuffix = Data("\n\n".utf8)
+            let session = makeSSESession(for: connection, format: .sse, extraHeaders: extraHeaders)
+            defer { session.stopAll() }
             @Sendable func sendChunk(_ chunk: CompletionResponse) {
-                guard let data = try? JSONEncoder().encode(chunk) else { return }
-                var frame = Data(capacity: ssePrefix.count + data.count + sseSuffix.count)
-                frame.append(ssePrefix)
-                frame.append(data)
-                frame.append(sseSuffix)
-                connection.send(content: frame, isComplete: false, completion: .idempotent)
+                session.sendSSEDataFrame(chunk)
             }
 
             let result: CompletionExecutionResult
             do {
                 result = try await actor.handleTextCompletion(
                     request: req,
-                    onStreamReady: { [weak self] in
-                        guard let self else { return }
-                        self.sendSSEHeaders(connection, extraHeaders: extraHeaders)
-                        let (gate, task) = self.startSSEKeepalive(connection: connection)
-                        box.markStarted(gate: gate, task: task)
+                    onStreamReady: {
+                        session.begin()
                     },
                     onEchoPrompt: { idx, text, logprobs in
-                        box.stopKeepaliveIfRunning()
+                        session.stopKeepaliveIfRunning()
                         let choice = CompletionChoice(text: text, index: idx, logprobs: logprobs, finishReason: nil)
                         sendChunk(CompletionResponse(id: reqId, model: replyModel, choices: [choice], created: created))
                     },
                     onChoiceToken: { idx, piece, logprobs in
-                        box.stopKeepaliveIfRunning()
+                        session.stopKeepaliveIfRunning()
                         let choice = CompletionChoice(text: piece, index: idx, logprobs: logprobs, finishReason: nil)
                         sendChunk(CompletionResponse(id: reqId, model: replyModel, choices: [choice], created: created))
                     },
@@ -97,21 +64,11 @@ extension QWHttpServer {
                 )
             } catch {
                 if shouldStop() { return }
-                if !box.isStarted {
+                if !session.isStarted {
                     sendCompletionError(connection, error: error)
                     return
                 }
-                let errPayload = ServerErrorPayload(message: "\(error)", type: "server_error", code: 500)
-                if let errData = try? JSONEncoder().encode(errPayload) {
-                    var frame = Data(capacity: ssePrefix.count + errData.count + sseSuffix.count)
-                    frame.append(ssePrefix)
-                    frame.append(errData)
-                    frame.append(sseSuffix)
-                    connection.send(content: frame, isComplete: false, completion: .idempotent)
-                }
-                connection.send(content: Data("data: [DONE]\n\n".utf8), isComplete: true, completion: .contentProcessed({ _ in
-                    connection.cancel()
-                }))
+                session.finishWithOpenAIError(error)
                 return
             }
 
@@ -128,9 +85,7 @@ extension QWHttpServer {
                 choices: finalChoices.isEmpty ? [CompletionChoice(text: "", index: 0, finishReason: "stop")] : finalChoices,
                 usage: usage, created: created
             ))
-            connection.send(content: Data("data: [DONE]\n\n".utf8), isComplete: true, completion: .contentProcessed({ _ in
-                connection.cancel()
-            }))
+            session.finish(doneMarker: true)
         } else {
             let result: CompletionExecutionResult
             do {

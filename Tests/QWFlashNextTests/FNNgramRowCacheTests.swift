@@ -21,7 +21,7 @@ final class FNNgramRowCacheTests: XCTestCase {
             return [Float](repeating: Float(id), count: headDim)
         }
 
-        func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) {
+        func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) throws {
             lock.lock(); reads_ += 1; lock.unlock()
             for i in 0..<headDim { dst[i] = Float(id) }
         }
@@ -174,13 +174,13 @@ final class FNNgramRowCacheTests: XCTestCase {
         XCTAssertEqual(cached.cache.storedRowCount, 1)
     }
 
-    func testCopyRowIsServedFromTheCacheToo() {
+    func testCopyRowIsServedFromTheCacheToo() throws {
         let rows = CountingRows(headDim: 8)
         let cached = FNNgramCachedRows(backing: rows, capacityBytes: 1 << 20)
         var buf = [Float](repeating: -1, count: 8)
-        buf.withUnsafeMutableBufferPointer { cached.copyRow(5, to: $0.baseAddress!) }
+        try buf.withUnsafeMutableBufferPointer { try cached.copyRow(5, to: $0.baseAddress!) }
         XCTAssertEqual(buf, [Float](repeating: 5, count: 8))
-        buf.withUnsafeMutableBufferPointer { cached.copyRow(5, to: $0.baseAddress!) }
+        try buf.withUnsafeMutableBufferPointer { try cached.copyRow(5, to: $0.baseAddress!) }
         XCTAssertEqual(rows.reads, 1, "the second copy must not touch the source")
         XCTAssertEqual(buf, [Float](repeating: 5, count: 8))
     }
@@ -222,12 +222,14 @@ private final class FNCacheFileRows: FNNgramRows, @unchecked Sendable {
 
     func closeFile() { if fd >= 0 { Darwin.close(fd) } }
 
-    func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) {
+    func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) throws {
         let n = headDim
         let off = off_t(id * rowBytes)
         let raw = UnsafeMutableRawPointer(dst).assumingMemoryBound(to: UInt16.self).advanced(by: n)
         let got = pread(fd, raw, rowBytes, off)
-        precondition(got == rowBytes, "short read at row \(id)")
+        guard got == rowBytes else {
+            throw NSError(domain: "FNCacheFileRows", code: 2, userInfo: [NSLocalizedDescriptionKey: "short read at row \(id)"])
+        }
         for i in 0..<n {
             dst[i] = Float(bitPattern: UInt32(UInt16(littleEndian: raw[i])) << 16)
         }
@@ -235,7 +237,7 @@ private final class FNCacheFileRows: FNNgramRows, @unchecked Sendable {
 
     func row(_ id: Int) -> [Float] {
         [Float](unsafeUninitializedCapacity: headDim) { out, count in
-            copyRow(id, to: out.baseAddress!)
+            do { try copyRow(id, to: out.baseAddress!) } catch { for i in 0..<headDim { out[i] = 0 } }
             count = headDim
         }
     }
@@ -288,10 +290,10 @@ final class FNNgramRowCachePerfTests: XCTestCase {
 
         let ids = FNNgramRowCachePerfTests.skewedIds(count: 12_240, span: rowCount, hot: 256)
         var buf = [Float](repeating: 0, count: headDim)
-        func sweep(_ source: any FNNgramRows) -> Double {
+        func sweep(_ source: any FNNgramRows) throws -> Double {
             let t0 = DispatchTime.now().uptimeNanoseconds
             for id in ids {
-                buf.withUnsafeMutableBufferPointer { source.copyRow(id, to: $0.baseAddress!) }
+                try buf.withUnsafeMutableBufferPointer { try source.copyRow(id, to: $0.baseAddress!) }
             }
             let t1 = DispatchTime.now().uptimeNanoseconds
             return Double(t1 - t0) / Double(ids.count)
@@ -300,7 +302,7 @@ final class FNNgramRowCachePerfTests: XCTestCase {
         // Warm the file's pages first. Without this the FIRST sweep pays the
         // page faults for the whole table and every later sweep looks
         // impossibly fast next to it.
-        _ = sweep(source)
+        _ = try sweep(source)
 
         let cached = FNNgramCachedRows(backing: source, capacityBytes: 1 << 20)
         // Interleave the arms and keep the best of each, so a machine that
@@ -310,8 +312,8 @@ final class FNNgramRowCachePerfTests: XCTestCase {
         var fillNs = Double.infinity
         var steadyNs = Double.infinity
         for round in 0..<3 {
-            rawNs = min(rawNs, sweep(source))
-            let pass = sweep(cached)
+            rawNs = min(rawNs, try sweep(source))
+            let pass = try sweep(cached)
             if round == 0 { fillNs = pass } else { steadyNs = min(steadyNs, pass) }
         }
         let hitRate = cached.cache.hitRate
@@ -348,10 +350,10 @@ final class FNNgramRowCachePerfTests: XCTestCase {
         // Every id is distinct, so nothing is ever reused.
         let ids = Array(0..<rowCount)
         var buf = [Float](repeating: 0, count: headDim)
-        func sweep(_ source: any FNNgramRows, _ ids: [Int]) -> Double {
+        func sweep(_ source: any FNNgramRows, _ ids: [Int]) throws -> Double {
             let t0 = DispatchTime.now().uptimeNanoseconds
             for id in ids {
-                buf.withUnsafeMutableBufferPointer { source.copyRow(id, to: $0.baseAddress!) }
+                try buf.withUnsafeMutableBufferPointer { try source.copyRow(id, to: $0.baseAddress!) }
             }
             let t1 = DispatchTime.now().uptimeNanoseconds
             return Double(t1 - t0) / Double(ids.count)
@@ -364,8 +366,8 @@ final class FNNgramRowCachePerfTests: XCTestCase {
         // A cache far smaller than the working set: almost every read misses.
         let small = FNNgramCachedRows(backing: source, capacityBytes: 64 * rowBytes)
 
-        _ = sweep(source, ids)
-        _ = sweep(big, ids)
+        _ = try sweep(source, ids)
+        _ = try sweep(big, ids)
         // Interleave the three arms and keep the best of each: a miss does
         // strictly more work than a raw read, so a miss that measured
         // cheaper than the raw read would mean the measurement is broken.
@@ -373,9 +375,9 @@ final class FNNgramRowCachePerfTests: XCTestCase {
         var hitNs = Double.infinity
         var missNs = Double.infinity
         for _ in 0..<3 {
-            rawNs = min(rawNs, sweep(source, ids))
-            hitNs = min(hitNs, sweep(big, ids))
-            missNs = min(missNs, sweep(small, ids))
+            rawNs = min(rawNs, try sweep(source, ids))
+            hitNs = min(hitNs, try sweep(big, ids))
+            missNs = min(missNs, try sweep(small, ids))
         }
 
         // The hit rate at which the cache breaks even against the raw read.

@@ -2,18 +2,33 @@ import Foundation
 
 // FlashNext PLE layer (HF Qwen4ExpTextPLELayer): N-gram embedding lookup -> gated value -> causal dilated conv.
 
+public enum FNNgramRowsError: Error, Equatable {
+    case rowOutOfBounds(id: Int, count: Int)
+    case emptyScratchBuffer
+    case shortRead(id: Int, message: String)
+}
+
 public protocol FNNgramRows: Sendable {
     var headDim: Int { get }
     func row(_ id: Int) -> [Float]
-    func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>)
+    func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) throws
 }
 
 extension FNNgramRows {
-    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) {
+    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) throws {
         let r = row(id)
         r.withUnsafeBufferPointer { src in
             dst.update(from: src.baseAddress!, count: headDim)
         }
+    }
+}
+
+@usableFromInline
+func qwCopyNgramRowBestEffort(_ rows: any FNNgramRows, id: Int, to dst: UnsafeMutablePointer<Float>, headDim: Int) {
+    do {
+        try rows.copyRow(id, to: dst)
+    } catch {
+        for i in 0..<headDim { dst[i] = 0 }
     }
 }
 
@@ -49,7 +64,7 @@ public struct FNNgramEmbedding: Sendable {
         let addr = Int(bitPattern: base)
         DispatchQueue.concurrentPerform(iterations: hc) { h in
             let dst = UnsafeMutablePointer<Float>(bitPattern: addr + h * hd * 4)!
-            r.copyRow(Int(lastIds[h]), to: dst)
+            qwCopyNgramRowBestEffort(r, id: Int(lastIds[h]), to: dst, headDim: hd)
         }
     }
 
@@ -88,7 +103,7 @@ public struct FNNgramEmbedding: Sendable {
         var residue = mixed % size
         if residue < 0 { residue += size }
         let dst = UnsafeMutablePointer<Float>(bitPattern: addr + (t * hc + head) * hd * 4)!
-        r.copyRow(Int(residue + offset), to: dst)
+        qwCopyNgramRowBestEffort(r, id: Int(residue + offset), to: dst, headDim: hd)
     }
 
     @inlinable
@@ -127,7 +142,7 @@ public struct FNNgramEmbedding: Sendable {
                         var residue = mixed % size
                         if residue < 0 { residue += size }
                         let dst = UnsafeMutablePointer<Float>(bitPattern: addr + (t * hc + head) * hd * 4)!
-                        r.copyRow(Int(residue + offset), to: dst)
+                        qwCopyNgramRowBestEffort(r, id: Int(residue + offset), to: dst, headDim: hd)
                     }
                 }
             }
@@ -168,7 +183,7 @@ public struct FNNgramEmbedding: Sendable {
                         var residue = mixed % size
                         if residue < 0 { residue += size }
                         let dst = UnsafeMutablePointer<Float>(bitPattern: addr + (t * hc + head) * hd * 4)!
-                        r.copyRow(Int(residue + offset), to: dst)
+                        qwCopyNgramRowBestEffort(r, id: Int(residue + offset), to: dst, headDim: hd)
                     }
                 }
             }
@@ -203,7 +218,7 @@ public struct FNNgramEmbedding: Sendable {
                     var residue = mixed % size
                     if residue < 0 { residue += size }
                     let dst = UnsafeMutablePointer<Float>(bitPattern: addr + (t * hc + head) * hd * 4)!
-                    r.copyRow(Int(residue + offset), to: dst)
+                    qwCopyNgramRowBestEffort(r, id: Int(residue + offset), to: dst, headDim: hd)
                 }
             }
         }

@@ -125,54 +125,31 @@ extension QWEngineDriver {
         hal: QWHal, arena: QWArena, attnLayers: [Int], kvMode: QWKVMode,
         geometry: QWModelGeometry, mtpDrafts: Int, trunkKVBytes: Int, mtpKVBytes: Int
     ) throws -> (kvCache: QWKVCache, mtpCache: QWKVCache?) {
-        if mtpDrafts > 0 {
-            if let kvV = arena.kvVSub {
-                let trunkVLen = ((trunkKVBytes / 2) / 256) * 256
-                let trunkKLen = trunkKVBytes - trunkVLen
-                let trunkKOff = try arena.kvRegion().allocate(bytes: trunkKLen)
-                let trunkVOff = try kvV.allocate(bytes: trunkVLen)
-                let trunkKSub = QWSubAllocator(region: QWMRegion(buffer: arena.kvRegion().region.buffer,
-                                                                 base: arena.kvRegion().region.base + trunkKOff,
-                                                                 length: trunkKLen))
-                let trunkVSub = QWSubAllocator(region: QWMRegion(buffer: kvV.region.buffer,
-                                                                 base: kvV.region.base + trunkVOff,
-                                                                 length: trunkVLen))
-                let kv = try QWKVCache(hal: hal, subAllocator: trunkKSub, vSubAllocator: trunkVSub,
-                                       layers: attnLayers, mode: kvMode, arena: arena, geometry: geometry)
-
-                let mtpVLen = ((mtpKVBytes / 2) / 256) * 256
-                let mtpKLen = mtpKVBytes - mtpVLen
-                let mtpKOff = try arena.kvRegion().allocate(bytes: mtpKLen)
-                let mtpVOff = try kvV.allocate(bytes: mtpVLen)
-                let mtpKSub = QWSubAllocator(region: QWMRegion(buffer: arena.kvRegion().region.buffer,
-                                                               base: arena.kvRegion().region.base + mtpKOff,
-                                                               length: mtpKLen))
-                let mtpVSub = QWSubAllocator(region: QWMRegion(buffer: kvV.region.buffer,
-                                                               base: kvV.region.base + mtpVOff,
-                                                               length: mtpVLen))
-                let mtp = try QWKVCache(hal: hal, subAllocator: mtpKSub, vSubAllocator: mtpVSub,
-                                        layers: [0], mode: kvMode, arena: arena, geometry: geometry)
-                return (kv, mtp)
-            } else {
-                let trunkOff = try arena.kvRegion().allocate(bytes: trunkKVBytes)
-                let trunkSub = QWSubAllocator(region: QWMRegion(buffer: arena.kvRegion().region.buffer,
-                                                                base: arena.kvRegion().region.base + trunkOff,
-                                                                length: trunkKVBytes))
-                let kv = try QWKVCache(hal: hal, subAllocator: trunkSub, layers: attnLayers,
-                                       mode: kvMode, arena: arena, geometry: geometry)
-
-                let mtpOff = try arena.kvRegion().allocate(bytes: mtpKVBytes)
-                let mtpSub = QWSubAllocator(region: QWMRegion(buffer: arena.kvRegion().region.buffer,
-                                                              base: arena.kvRegion().region.base + mtpOff,
-                                                              length: mtpKVBytes))
-                let mtp = try QWKVCache(hal: hal, subAllocator: mtpSub, layers: [0],
-                                        mode: kvMode, arena: arena, geometry: geometry)
-                return (kv, mtp)
-            }
-        } else {
+        func carveSub(_ parent: QWSubAllocator, bytes: Int) throws -> QWSubAllocator {
+            let off = try parent.allocate(bytes: bytes)
+            return QWSubAllocator(region: QWMRegion(buffer: parent.region.buffer,
+                                                    base: parent.region.base + off, length: bytes))
+        }
+        guard mtpDrafts > 0 else {
             let kv = try QWKVCache(hal: hal, arena: arena, layers: attnLayers, mode: kvMode, geometry: geometry)
             return (kv, nil)
         }
+        func makeSplitOrSingle(layers: [Int], totalBytes: Int) throws -> QWKVCache {
+            if let kvV = arena.kvVSub {
+                let vLen = ((totalBytes / 2) / 256) * 256
+                let kLen = totalBytes - vLen
+                let kSub = try carveSub(arena.kvRegion(), bytes: kLen)
+                let vSub = try carveSub(kvV, bytes: vLen)
+                return try QWKVCache(hal: hal, subAllocator: kSub, vSubAllocator: vSub,
+                                     layers: layers, mode: kvMode, arena: arena, geometry: geometry)
+            }
+            let sub = try carveSub(arena.kvRegion(), bytes: totalBytes)
+            return try QWKVCache(hal: hal, subAllocator: sub, layers: layers,
+                                 mode: kvMode, arena: arena, geometry: geometry)
+        }
+        let kv = try makeSplitOrSingle(layers: attnLayers, totalBytes: trunkKVBytes)
+        let mtp = try makeSplitOrSingle(layers: [0], totalBytes: mtpKVBytes)
+        return (kv, mtp)
     }
 
     static func makeDecodeAndPrefillScratch(

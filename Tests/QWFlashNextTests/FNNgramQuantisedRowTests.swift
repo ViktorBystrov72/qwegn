@@ -205,8 +205,8 @@ final class FNNgramQuantisedRowTests: XCTestCase {
             let format = g.formats[index]
             let rows = try table(format)
             var buf = [Float](repeating: 0, count: rows.headDim)
-            buf.withUnsafeMutableBufferPointer { p in
-                rows.copyRow(0, to: p.baseAddress!)
+            try buf.withUnsafeMutableBufferPointer { p in
+                try rows.copyRow(0, to: p.baseAddress!)
             }
             assertRow(buf, Array(format.expected[0..<rows.headDim]), "\(format.name) row 0")
         }
@@ -222,8 +222,8 @@ final class FNNgramQuantisedRowTests: XCTestCase {
             let rows = try table(format)
             let n = rows.headDim
             var buf = [Float](repeating: -1, count: n + 1)
-            buf.withUnsafeMutableBufferPointer { p in
-                rows.copyRow(0, to: p.baseAddress!)
+            try buf.withUnsafeMutableBufferPointer { p in
+                try rows.copyRow(0, to: p.baseAddress!)
             }
             XCTAssertEqual(buf[n], -1, "\(format.name): the row wrote past its own end")
             assertRow(Array(buf[0..<n]), Array(format.expected[0..<n]),

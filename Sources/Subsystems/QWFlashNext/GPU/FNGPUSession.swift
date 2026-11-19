@@ -46,102 +46,102 @@ public struct FNGPUSessionData {
     /// the session's own.
     public var sampler: QWSampler
     /// How far the prefill has consumed the prompt.
-    public var prefillPos: Int
+    public var prefillPos: Int = 0
     /// Balanced prefill chunk size locked once per prompt so outer slices do not create small tail slivers.
-    public var prefillStepChunk: Int
+    public var prefillStepChunk: Int = 0
     /// The head's token for the last prefill row.
-    public var lastArgmax: Int
+    public var lastArgmax: Int = 0
     /// The rows the last prefill chunk ran.
-    public var lastRows: Int
+    public var lastRows: Int = 1
     /// The PLE parity the next chunk needs.
-    public var pleParity: Int
+    public var pleParity: Int = 0
     /// Whether the PLE for the next chunk is already computed.
-    public var plePrecomputed: Bool
+    public var plePrecomputed: Bool = false
     /// The MTP draft the last prefill chunk produced.
-    public var mtpDraft: Int
+    public var mtpDraft: Int = 0
     /// Chained MTP drafts `[d1, d2, ...]` and the history length they are valid for.
-    public var mtpChain: [Int]
-    public var mtpChainPos: Int
+    public var mtpChain: [Int] = []
+    public var mtpChainPos: Int = -1
     /// How many leading drafts of the current round came from the MTP head or its chain.
     /// Only these rows use variational acceptance; context-copy drafts verify exactly.
-    var mtpSourcedDrafts: Int
+    var mtpSourcedDrafts: Int = 0
     /// The current drafts continue a detected period; they verify by exact argmax.
-    var periodicDrafts: Bool
+    var periodicDrafts: Bool = false
     /// Online cost/acceptance model that picks the MTP chain depth each round.
-    var chainPolicy: FNChainPolicy
+    var chainPolicy = FNChainPolicy()
     /// Whether the session runs the speculative path.
     public var useSpec: Bool
     /// The first generated token, sampled once and kept. The prefill is
     /// chunked, and the token must not be drawn twice.
-    public var firstToken: Int
+    public var firstToken: Int = 0
     /// Whether the first token has been drawn.
-    public var hasFirstToken: Bool
+    public var hasFirstToken: Bool = false
     /// The GPU seconds the prefill spent.
-    public var prefillGPUSec: Double
+    public var prefillGPUSec: Double = 0
     /// Tokens a speculative round already committed but has not handed back
     /// yet. The round fed them to the model; the caller still has to see
     /// them, so they wait here instead of being drawn twice.
-    public var pendingTokens: [Int]
+    public var pendingTokens: [Int] = []
     /// What `head.token` holds on the device. The gather reads it, so the
     /// session tracks it instead of re-reading the device every step.
-    public var headToken: Int
+    public var headToken: Int = 0
     /// Whether the context-copy drafter has taken the wheel from the MTP.
-    public var mtpActive: Bool
+    public var mtpActive: Bool = true
     /// Which drafter the session runs: "hybrid", "ngram" or the MTP itself.
-    public var draftMode: QWDraftStrategy
+    public var draftMode: QWDraftStrategy = .hybrid
     /// Maximum draft tokens per speculative verification round (`1...draftCapacity`).
-    public var maxDrafts: Int
+    public var maxDrafts: Int = FNGPUSessionData.defaultMTPDrafts
     /// Verify-window ceiling: the 8-slot GDN state ring holds the verified row plus
     /// up to seven drafts for dynamic wide context-copy (PLD) rounds.
     public static let draftCapacity = 7
     /// Default neural MTP draft ceiling on novel text (`1...defaultMTPDrafts`).
     public static let defaultMTPDrafts = 3
     /// Variational MTP relaxed acceptance log-logit margin in nats (`0` disables relaxation).
-    public var relaxedMargin: Float
+    public var relaxedMargin: Float = 0
     /// Variational MTP relaxed acceptance floor: a non-argmax draft also needs `p_target(draft) >= relaxedMinProb` (`0` disables the floor).
-    public var relaxedMinProb: Float
+    public var relaxedMinProb: Float = 0
     /// Whether verified hidden states seed the MTP on all-accept rounds.
-    public var quadraticSeeding: Bool
+    public var quadraticSeeding: Bool = true
     /// Whether the prefix cache has been consulted for this prompt.
-    public var restoreDone: Bool
+    public var restoreDone: Bool = false
     /// Whether the prefix cache served this prompt.
-    public var prefixCacheHit: Bool
+    public var prefixCacheHit: Bool = false
     /// How many tokens the restore reused.
-    public var prefixCacheMatchedTokens: Int
+    public var prefixCacheMatchedTokens: Int = 0
     /// The tier that served the prefix: the RAM or the disk. Absent
     /// when no prefix was served.
-    public var prefixCacheTier: FNPrefixCacheTier?
+    public var prefixCacheTier: FNPrefixCacheTier? = nil
     /// The wall time, in milliseconds, the engine attributes to the token
     /// the last step produced. A speculative round splits its time across
     /// the tokens it committed, so no token is reported as free.
-    public var stepMs: Double
+    public var stepMs: Double = 0
     /// The GPU time, in milliseconds, of this session's last step. It
     /// belongs to the session: another session's step has its own.
-    public var lastStepGPUMillis: Double
+    public var lastStepGPUMillis: Double = 0
     /// Tokens committed per speculative verification round in this session.
-    public var roundTokenCounts: [Int]
+    public var roundTokenCounts: [Int] = []
     /// Window size (trailing generated tokens) used for repetition-penalty tracking.
     public static let repetitionPenaltyWindow = 64
     /// Trailing generated token IDs used to populate `seenTokens` and `seenTokenList`.
-    public var recentGeneratedTokens: [Int]
+    public var recentGeneratedTokens: [Int] = []
     /// Unique valid token IDs seen in recent generated tokens, maintained incrementally
     /// so repetition-penalty sampling is O(unique) instead of O(history.count) per step.
-    public var seenTokens: Set<Int>
+    public var seenTokens: Set<Int> = []
     /// Deterministic insertion-ordered unique token IDs matching `seenTokens`
     /// so `Array(seenTokens)` heap allocations and Set hash iteration variance are avoided.
-    public var seenTokenList: [Int]
+    public var seenTokenList: [Int] = []
     /// Total speculative draft proposals in this session.
-    public var specProposals: Int
+    public var specProposals: Int = 0
     /// Total accepted speculative draft tokens in this session.
-    public var specAccepted: Int
+    public var specAccepted: Int = 0
     /// Whether the prefix cache snapshot from prefill is pending persistence after first-token emission.
-    public var pendingPrefixSave: Bool
+    public var pendingPrefixSave: Bool = false
     /// Whether per-token log-probabilities are collected for this session.
     public var collectLogprobs: Bool
     /// Number of top candidate logprobs (`0..20`) to collect per token when `collectLogprobs` is true.
     public var topLogprobsCount: Int
     /// Collected per-token log-probabilities in generation order.
-    public var tokenLogprobs: [QWTokenLogprob]
+    public var tokenLogprobs: [QWTokenLogprob] = []
     /// The request's token constraint (structured output). A constrained
     /// session never speculates: drafts are not grammar-verified.
     public var constraint: (any QWTokenConstraint)?
@@ -157,17 +157,17 @@ public struct FNGPUSessionData {
     /// Optional prefill progress callback invoked with `(completedComputedTokens, totalComputedTokens)`.
     public var onPrefillProgress: (@Sendable (Int, Int) -> Void)?
     /// Starting prefill position after prefix-cache restoration so progress excludes reused tokens.
-    public var prefillProgressBasePos: Int
+    public var prefillProgressBasePos: Int = 0
     /// Online DFlash adaptive window selector (MoE-calibrated priors).
-    var dflashPolicy: QWDFlashAdaptivePolicy
+    var dflashPolicy = QWDFlashAdaptivePolicy(isSparseMoE: true)
     /// Committed token position cached in the DFlash drafter's sliding-window KV.
-    public var dflashCacheOffset: Int
+    public var dflashCacheOffset: Int = 0
     /// Deferred verify-row context update position (`vStack` captured into `targetHidden`).
-    var dflashPendingCtxPos: Int
+    var dflashPendingCtxPos: Int = 0
     /// Deferred verify-row context update count (`1 + accepted`).
-    var dflashPendingCtxCount: Int
+    var dflashPendingCtxCount: Int = 0
     /// Persistent random stream state for stochastic DFlash Gumbel coupling rounds.
-    var dflashStreamState: QWMTPRandomStream.State?
+    var dflashStreamState: QWMTPRandomStream.State? = nil
     /// Online bigram/trigram recycler used alongside PLD context-copy bypass.
     let tokenRecycler = QWTokenRecycler()
 
@@ -188,51 +188,8 @@ public struct FNGPUSessionData {
         self.cacheSalt = cacheSalt
         self.onPrefillProgress = onPrefillProgress
         self.useSpec = useSpec && !collectLogprobs && (constraint?.allowsSpeculation ?? true)
-        prefillPos = 0
-        prefillStepChunk = 0
-        lastArgmax = 0
-        lastRows = 1
-        pleParity = 0
-        plePrecomputed = false
-        mtpDraft = 0
-        mtpChain = []
-        mtpChainPos = -1
-        mtpSourcedDrafts = 0
-        periodicDrafts = false
-        chainPolicy = FNChainPolicy()
-        firstToken = 0
-        hasFirstToken = false
-        prefillGPUSec = 0
-        pendingTokens = []
-        headToken = 0
-        mtpActive = true
-        draftMode = .hybrid
-        maxDrafts = Self.defaultMTPDrafts
-        relaxedMargin = 0
-        relaxedMinProb = 0
-        quadraticSeeding = true
-        restoreDone = false
-        prefixCacheHit = false
-        prefixCacheMatchedTokens = 0
-        prefixCacheTier = nil
-        stepMs = 0
-        lastStepGPUMillis = 0
-        roundTokenCounts = []
-        recentGeneratedTokens = []
-        seenTokens = []
-        seenTokenList = []
-        specProposals = 0
-        specAccepted = 0
-        pendingPrefixSave = false
         self.collectLogprobs = collectLogprobs
         self.topLogprobsCount = topLogprobsCount
-        self.tokenLogprobs = []
-        self.prefillProgressBasePos = 0
-        self.dflashPolicy = QWDFlashAdaptivePolicy(isSparseMoE: true)
-        self.dflashCacheOffset = 0
-        self.dflashPendingCtxPos = 0
-        self.dflashPendingCtxCount = 0
-        self.dflashStreamState = nil
     }
 
     mutating func ensureDFlashStreamState() throws -> QWMTPRandomStream.State {
@@ -317,7 +274,6 @@ struct FNChainPolicy {
 enum FNMTPChain {
     /// Chained single-row MTP passes after each verify round (d2/d3 drafts); capped by maxDrafts - 1.
     static let passes = Int(ProcessInfo.processInfo.environment["QWG_MTP_CHAIN"] ?? "") ?? 2
-    nonisolated(unsafe) static var ms = 0.0
     static let debug = ProcessInfo.processInfo.environment["QWG_CHAIN_DEBUG"] != nil
 }
 
@@ -340,6 +296,27 @@ extension FNGPUEngine {
         }
     }
 
+    @inline(__always)
+    static func zeroAttentionTail(_ a: FNGPUAttnDecodeState, from startPos: Int, to endPos: Int,
+                                  blockStart: Int, arena: QWArena) {
+        let cap = max(1, a.capacity)
+        let u = min(cap, endPos), s = min(cap, startPos)
+        if u > s {
+            let rowStride = a.indexK.bytes / cap
+            memset(arena.cpuPointer(of: a.indexK).advanced(by: s * rowStride), 0, (u - s) * rowStride)
+        }
+        let bStart = min(cap / 4, blockStart)
+        let bEnd = (u + 3) / 4
+        if bEnd > bStart {
+            let blockStride = a.pooled.bytes / max(1, cap / 4)
+            let startByte = min(a.pooled.bytes, bStart * blockStride)
+            let endByte = min(a.pooled.bytes, bEnd * blockStride)
+            if endByte > startByte {
+                memset(arena.cpuPointer(of: a.pooled).advanced(by: startByte), 0, endByte - startByte)
+            }
+        }
+    }
+
     /// Wipes the recurrent state this session used: the GDN states, the PLE
     /// history, the attention KV rows above the water mark and the MTP's
     /// positions. The wipe belongs to the session, not to the engine.
@@ -353,22 +330,7 @@ extension FNGPUEngine {
             // Recurrent/conv/PLE state at parity 0 must always clear even when highWaterPos == 0.
             Self.wipeRecurrentLayer(gdn: rec.gdn, ple: rec.weights.ple, arena: arena)
             if used > 0, let a = rec.attnState {
-                let cap = max(1, a.capacity)
-                let u = min(cap, used), s = min(cap, skipIdx)
-                if u > s {
-                    let rowStride = a.indexK.bytes / cap
-                    memset(arena.cpuPointer(of: a.indexK).advanced(by: s * rowStride), 0, (u - s) * rowStride)
-                }
-                let bStart = min(cap / 4, skipBlocks)
-                let bEnd = (u + 3) / 4
-                if bEnd > bStart {
-                    let blockStride = a.pooled.bytes / max(1, cap / 4)
-                    let startByte = min(a.pooled.bytes, bStart * blockStride)
-                    let endByte = min(a.pooled.bytes, bEnd * blockStride)
-                    if endByte > startByte {
-                        memset(arena.cpuPointer(of: a.pooled).advanced(by: startByte), 0, endByte - startByte)
-                    }
-                }
+                Self.zeroAttentionTail(a, from: skipIdx, to: used, blockStart: skipBlocks, arena: arena)
             }
         }
         if used > 0 {
@@ -391,24 +353,8 @@ extension FNGPUEngine {
         let e = max(s, used)
         guard e > s || (e + 3) / 4 > s / 4 else { return }
         DispatchQueue.concurrentPerform(iterations: layerRecords.count) { idx in
-            let rec = layerRecords[idx]
-            if let a = rec.attnState {
-                let cap = max(1, a.capacity)
-                let se = min(cap, e), ss = min(cap, s)
-                if se > ss {
-                    let rowStride = a.indexK.bytes / cap
-                    memset(arena.cpuPointer(of: a.indexK).advanced(by: ss * rowStride), 0, (se - ss) * rowStride)
-                }
-                let bStart = ss / 4
-                let bEnd = (se + 3) / 4
-                if bEnd > bStart {
-                    let blockStride = a.pooled.bytes / max(1, cap / 4)
-                    let startByte = min(a.pooled.bytes, bStart * blockStride)
-                    let endByte = min(a.pooled.bytes, bEnd * blockStride)
-                    if endByte > startByte {
-                        memset(arena.cpuPointer(of: a.pooled).advanced(by: startByte), 0, endByte - startByte)
-                    }
-                }
+            if let a = layerRecords[idx].attnState {
+                Self.zeroAttentionTail(a, from: s, to: e, blockStart: s / 4, arena: arena)
             }
         }
         mtp?.resetStateTail(from: s, usedPositions: e)
@@ -546,44 +492,32 @@ extension FNGPUEngine {
         let v = head.argmaxTokens(count: activeRows)
         let mTok = stepMTP?.mtpHead.argmaxToken() ?? session.mtpDraft
         session.specProposals += dCount
-        var tok0 = 0
-        var accepted = 0
-        let boundaryTok = session.constraint?.speculationBoundaryToken
-        for r in 0..<dCount {
-            let draftTok = drafts[r]
-            let sampled: Int
-            if v[r] == draftTok && session.sampler.config.isGreedy && !session.seenTokens.contains(draftTok) && (session.constraint?.isUnconstrainedNow ?? true) {
-                try session.constraint?.accept(draftTok)
-                sampled = draftTok
-            } else {
-                sampled = try sampleFromHead(argmaxToken: v[r], seenTokens: session.seenTokens,
-                                             seenTokenList: session.seenTokenList,
-                                             sampler: session.sampler, row: r,
-                                             constraint: session.constraint)
+        let resolution = try QWSpeculativeTokenResolver.resolveVerifiedRound(
+            drafts: drafts,
+            targetArgmaxes: v,
+            vocabulary: vocab,
+            isGreedy: session.sampler.config.isGreedy,
+            isUnconstrainedNow: { session.constraint?.isUnconstrainedNow ?? true },
+            boundaryToken: session.constraint?.speculationBoundaryToken,
+            isRepetitionBlocked: { session.seenTokens.contains($0) },
+            acceptConstrained: { try session.constraint?.accept($0) },
+            sampleRow: { row, argmaxTok in
+                try sampleFromHead(argmaxToken: argmaxTok, seenTokens: session.seenTokens,
+                                   seenTokenList: session.seenTokenList,
+                                   sampler: session.sampler, row: row,
+                                   constraint: session.constraint)
+            },
+            onCommittedToken: { committedTok in
+                if trackRep { session.recordSeenToken(committedTok, vocab: vocab) }
             }
-            if r == 0 {
-                tok0 = sampled
-            } else {
-                session.pendingTokens.append(sampled)
-            }
-            let hitBoundary = (boundaryTok != nil && sampled == boundaryTok) || !(session.constraint?.isUnconstrainedNow ?? true)
-            if sampled == draftTok && v[r] == draftTok && !hitBoundary {
-                accepted += 1
-                if trackRep { session.recordSeenToken(draftTok, vocab: vocab) }
-            } else {
-                if trackRep { session.recordSeenToken(sampled, vocab: vocab) }
-                break
-            }
+        )
+        let tok0 = resolution.firstToken
+        if !resolution.trailingTokens.isEmpty {
+            session.pendingTokens.append(contentsOf: resolution.trailingTokens)
         }
-        if accepted == dCount {
-            let bonusTok = try sampleFromHead(argmaxToken: v[dCount], seenTokens: session.seenTokens,
-                                              seenTokenList: session.seenTokenList,
-                                              sampler: session.sampler, row: dCount,
-                                              constraint: session.constraint)
-            if trackRep { session.recordSeenToken(bonusTok, vocab: vocab) }
-            session.pendingTokens.append(bonusTok)
-        } else {
-            let rejected = dCount - accepted
+        let accepted = resolution.acceptedDrafts
+        if resolution.rollbackCount > 0 {
+            let rejected = resolution.rollbackCount
             session.history.removeLast(rejected)
             if residentKVHistory.count == prevCount + activeRows {
                 residentKVHistory.removeLast(rejected)
@@ -596,15 +530,14 @@ extension FNGPUEngine {
         session.mtpDraft = mTok
         session.mtpChain = []
         var chainGPUMs = 0.0
+        var localChainMs = 0.0
         if let stepMTP {
-            var sel = 0
-            while sel < dCount && v[sel] == drafts[sel] { sel += 1 }
-            let lastTok = session.pendingTokens.last ?? tok0
+            let lastTok = resolution.pendingToken ?? tok0
             let mtpMax = min(FNGPUSessionData.defaultMTPDrafts, session.maxDrafts)
             let passes = (FNMTPChain.passes > 0 && mtpMax > 1 && session.mtpActive && !session.periodicDrafts)
                 ? session.chainPolicy.passes(maxPasses: min(FNMTPChain.passes, mtpMax - 1))
                 : 0
-            let needsResync = sel != accepted || lastTok != v[accepted]
+            let needsResync = resolution.needsResync(targetArgmaxes: v)
             if passes > 0 || needsResync {
                 let chainT0 = Date()
                 guard let pair = ctx.hal.begin(.concurrent) else {
@@ -654,7 +587,7 @@ extension FNGPUEngine {
                 if passes > 0 && !session.sampler.config.hasExplicitSeed && !session.sampler.config.isGreedy {
                     session.chainPolicy.observeChain(passes: passes, ms: chainMs)
                 }
-                FNMTPChain.ms += chainMs
+                localChainMs += chainMs
             }
         }
         session.headToken = -1
@@ -664,8 +597,7 @@ extension FNGPUEngine {
         session.lastStepGPUMillis = (vStack.lastGPUMillis + chainGPUMs) / divisor
         session.roundTokenCounts.append(1)
         if FNMTPChain.debug {
-            FileHandle.standardError.write("R rows=\(activeRows) acc=\(accepted) gpu=\(String(format: "%.2f", vStack.lastGPUMillis)) wall=\(String(format: "%.2f", roundMs)) chain=\(String(format: "%.2f", FNMTPChain.ms))\n".data(using: .utf8)!)
-            FNMTPChain.ms = 0
+            FileHandle.standardError.write("R rows=\(activeRows) acc=\(accepted) gpu=\(String(format: "%.2f", vStack.lastGPUMillis)) wall=\(String(format: "%.2f", roundMs)) chain=\(String(format: "%.2f", localChainMs))\n".data(using: .utf8)!)
         }
         return tok0
     }

@@ -1,4 +1,5 @@
 import Foundation
+import QWRope
 @testable import QWFlashNext
 
 // FlashNext full attention (HF Qwen4ExpTextAttention): q/k RMSNorm (1+w), partial RoPE, GQA,
@@ -17,10 +18,10 @@ public struct FNAttention: Sendable {
     public let qNorm: [Float]     // headDim
     public let kNorm: [Float]     // headDim
     public let indexer: FNQSAIndexer
-    public let rope: FNRope
+    public let rope: QWRopeCPU
 
     public init(hidden: Int, heads: Int, kvHeads: Int, headDim: Int, eps: Float, qProj: [Float], kProj: [Float],
-                vProj: [Float], oProj: [Float], qNorm: [Float], kNorm: [Float], indexer: FNQSAIndexer, rope: FNRope) {
+                vProj: [Float], oProj: [Float], qNorm: [Float], kNorm: [Float], indexer: FNQSAIndexer, rope: QWRopeCPU) {
         self.hidden = hidden; self.heads = heads; self.kvHeads = kvHeads; self.headDim = headDim; self.eps = eps
         self.qProj = qProj; self.kProj = kProj; self.vProj = vProj; self.oProj = oProj
         self.qNorm = qNorm; self.kNorm = kNorm; self.indexer = indexer; self.rope = rope

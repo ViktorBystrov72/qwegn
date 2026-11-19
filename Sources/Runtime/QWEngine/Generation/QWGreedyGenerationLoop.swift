@@ -87,7 +87,11 @@ enum QWGreedyGenerationLoop {
         }
         var tokens: [Int] = [], stepMs: [Double] = [], counts: [Int] = []
         func result() -> Result { Result(tokens: tokens, stepMs: stepMs, stepTokenCounts: counts) }
-        guard maxNew > 0, !stopIDs.contains(first) else { return result() }
+        guard maxNew > 0 else { return result() }
+        if stopIDs.contains(first) {
+            onStopToken?(first)
+            return result()
+        }
         tokens.append(first)
         if onToken?(first) == false { return result() }
         var pending = first

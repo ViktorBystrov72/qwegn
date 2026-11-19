@@ -147,14 +147,17 @@ public enum QWGemm {
         guard plan.epilogue != .siluMulPair || wQ4.n % 2 == 0 else {
             throw QWGemmError.badWeights("silu_pair needs even N")
         }
-        if !wQ4.isIncumbentContainer {
+        switch wQ4.containerKind {
+        case .incumbentHQ4G32:
+            break
+        case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
             guard y32 == nil else {
                 throw QWGemmError.badWeights("dual-store encodeH16 requires incumbent container")
             }
             if plan.epilogue == .siluMulPair {
-                guard let name = QWGemmAQ.siluPairKernelName(bits: wQ4.bits, group: wQ4.groupSize,
-                                                             isSHVQ: wQ4.isSHVQ) else {
-                    throw QWGemmError.badWeights("no affine-quantised silu_pair kernel for \(wQ4.bits)-bit group \(wQ4.groupSize)")
+                guard let name = QWGemmAQ.siluPairKernelName(bits: bits, group: group,
+                                                             isSHVQ: wQ4.containerKind.isSHVQ) else {
+                    throw QWGemmError.badWeights("no affine-quantised silu_pair kernel for \(bits)-bit group \(group)")
                 }
                 let pso = try hal.pipeline(name)
                 enc.setComputePipelineState(pso)
@@ -172,8 +175,8 @@ public enum QWGemm {
                 return
             } else {
                 try QWGemmAQ.encodeDecodeT4(enc, hal: hal, blocks: wQ4.blocks, x: x, y16: y16,
-                                            n: wQ4.n, k: wQ4.k, bits: wQ4.bits, group: wQ4.groupSize,
-                                            isSHVQ: wQ4.isSHVQ)
+                                            n: wQ4.n, k: wQ4.k, bits: bits, group: group,
+                                            isSHVQ: wQ4.containerKind.isSHVQ)
                 return
             }
         }
@@ -228,11 +231,38 @@ public enum QWGemm {
         guard plan.epilogue != .siluMulPair || wQ4.n % 2 == 0 else {
             throw QWGemmError.badWeights("silu_pair needs even N")
         }
-        if !wQ4.isIncumbentContainer && plan.epilogue == .none {
-            try QWGemmAQ.encode(enc, hal: hal, blocks: wQ4.blocks, x: x, y: y,
-                                n: wQ4.n, k: wQ4.k, bits: wQ4.bits, group: wQ4.groupSize,
-                                isSHVQ: wQ4.isSHVQ)
-            return
+        switch wQ4.containerKind {
+        case .incumbentHQ4G32:
+            break
+        case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
+            if plan.epilogue == .none {
+                let mRows = (plan.backend == .handQ4gSkinny) ? (plan.kernel == "qwg_skinny_m3" ? 3 : 2) : 1
+                try QWGemmAQ.encode(enc, hal: hal, blocks: wQ4.blocks, x: x, y: y,
+                                    n: wQ4.n, k: wQ4.k, bits: bits, group: group,
+                                    rows: mRows, isSHVQ: wQ4.containerKind.isSHVQ)
+                return
+            }
+            if plan.epilogue == .siluMulPair, y.shape.dtype == .f16 {
+                guard let name = QWGemmAQ.siluPairKernelName(bits: bits, group: group,
+                                                             isSHVQ: wQ4.containerKind.isSHVQ) else {
+                    throw QWGemmError.badWeights("no affine-quantised silu_pair kernel for \(bits)-bit group \(group)")
+                }
+                let pso = try hal.pipeline(name)
+                enc.setComputePipelineState(pso)
+                wQ4.blocks.bind(enc, index: 0)
+                x.bind(enc, index: 1)
+                y.bind(enc, index: 3)
+                var nPacked = UInt32(wQ4.n) | 0x8000_0000
+                var kk = UInt32(wQ4.k)
+                enc.setBytes(&nPacked, length: 4, index: 4)
+                enc.setBytes(&kk, length: 4, index: 5)
+                y.bind(enc, index: 8)
+                let intermediate = wQ4.n / 2
+                enc.dispatchThreadgroups(MTLSize(width: (intermediate + 7) / 8, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                return
+            }
+            throw QWGemmError.badWeights("non-incumbent silu_pair requires f16 output, got \(y.shape.dtype)")
         }
         let pso = try hal.pipeline(plan.kernel)
         enc.setComputePipelineState(pso)

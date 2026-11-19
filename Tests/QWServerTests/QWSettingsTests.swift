@@ -5,7 +5,7 @@ import QWCore
 private extension QWSettingsManager {
     func invalidateCache() {
         lock.lock(); defer { lock.unlock() }
-        cachedSettings = nil; cachedBytes = nil; cachedURL = nil
+        cachedSettings = nil; cachedKeys = nil; cachedStat = nil; cachedURL = nil
     }
 }
 

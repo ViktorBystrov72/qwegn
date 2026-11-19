@@ -401,7 +401,15 @@ public final class QWDFlashDrafter: @unchecked Sendable {
         self.psoDownRowPairedAQ4 = downRowPairedAQ4Map
         self.psoGateUpFwht32Batched = guMap
         self.psoGateUpFwht32BatchedAQ4 = guAQ4Map
-        self.quantPSOs = try Self.loadQuantPipelines(hal: hal, fc: self.fc, layers: loadedLayers)
+        let qPSOs = try Self.loadQuantPipelines(hal: hal, fc: self.fc, layers: loadedLayers)
+        for w in [self.fc] + loadedLayers.flatMap({ [$0.qkvProj, $0.kvProj, $0.oProj, $0.gateUpProj, $0.downProj] })
+            where !Self.usesQ4GMKernel(w) {
+            let key = DrafterQuantKey(bits: w.bits, group: w.groupSize, isSHVQ: w.isSHVQ)
+            guard qPSOs[key] != nil else {
+                throw QWDFlashError.state("QWDFlashDrafter: missing quant pipelines for \(w.formatName)")
+            }
+        }
+        self.quantPSOs = qPSOs
     }
 
     private static func computeScratchCapacity(

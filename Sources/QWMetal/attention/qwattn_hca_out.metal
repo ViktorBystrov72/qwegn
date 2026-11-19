@@ -131,6 +131,7 @@ kernel void qwg_hca_vha_invrope(
     }
 }
 
+template <bool SUB2 = false>
 METAL_FUNC void qw_hca_unpack_wo_a_32(device const char* woABlocks,
                                       uint row, uint col0,
                                       constant HCAGroupedWoAParams& p,
@@ -144,9 +145,10 @@ METAL_FUNC void qw_hca_unpack_wo_a_32(device const char* woABlocks,
         return;
     }
     MLAAbsorbParams mp = {p.T, p.oGroups, 0u, p.oLoraRank, p.groupIn, 0u, p.bits, p.group, inc};
-    qw_mla_unpack_slice32<false>(woABlocks, row, col0, mp, tgLut, dst, dstStride);
+    qw_mla_unpack_slice32<SUB2>(woABlocks, row, col0, mp, tgLut, dst, dstStride);
 }
 
+template <bool SUB2 = false>
 METAL_FUNC void qw_hca_unpack_wo_a_reg32(device const char* woABlocks,
                                          uint row, uint col0,
                                          constant HCAGroupedWoAParams& p,
@@ -164,7 +166,7 @@ METAL_FUNC void qw_hca_unpack_wo_a_reg32(device const char* woABlocks,
         return;
     }
     MLAAbsorbParams mp = {p.T, p.oGroups, 0u, p.oLoraRank, p.groupIn, 0u, p.bits, p.group, inc};
-    qw_mla_unpack_slice32_reg<false>(woABlocks, row, col0, mp, tgLut, wLo, wHi);
+    qw_mla_unpack_slice32_reg<SUB2>(woABlocks, row, col0, mp, tgLut, wLo, wHi);
 }
 
 METAL_FUNC void qw_hca_accum32_row(thread float& acc,
@@ -199,30 +201,34 @@ METAL_FUNC void qw_hca_reduce_t(const thread float (&acc)[4],
 
 // 6a. 3D-batched grouped wo_a GEMV + sigmoid(o_gate) + H_32 exit (decode/verify T <= 15).
 // Grid: (oLoraRank / 32, oGroups, T), Threadgroup: (256, 1, 1).
-kernel void qwg_hca_grouped_wo_a_gemv(
-    device const half*          zIn        [[buffer(0)]],
-    device const char*          woABlocks  [[buffer(1)]],
-    device const half*          qUpGate    [[buffer(2)]],
-    device half*                zGatedOut  [[buffer(3)]],
-    constant HCAGroupedWoAParams& p        [[buffer(4)]],
-    uint3                       tg         [[threadgroup_position_in_grid]],
-    uint                        tid        [[thread_index_in_threadgroup]],
-    uint                        sg         [[simdgroup_index_in_threadgroup]],
-    uint                        lane       [[thread_index_in_simdgroup]]
+struct HCAWoAGemvTg {
+    half shX[1024];
+    float shOut[32];
+    ShvqMlaTgLut lut;
+};
+
+template <bool SUB2>
+METAL_FUNC void qw_hca_grouped_wo_a_gemv_body(
+    device const half*          zIn,
+    device const char*          woABlocks,
+    device const half*          qUpGate,
+    device half*                zGatedOut,
+    constant HCAGroupedWoAParams& p,
+    threadgroup HCAWoAGemvTg&   st,
+    uint3                       tg,
+    uint                        tid,
+    uint                        sg,
+    uint                        lane
 ) {
     const uint cBase = tg.x * 32u;
     const uint g = tg.y;
     const uint t = tg.z;
     if (t >= p.T || g >= p.oGroups || cBase >= p.oLoraRank) return;
 
-    threadgroup half shX[1024];
-    threadgroup float shOut[32];
-    threadgroup ShvqMlaTgLut tgLut;
-
     const uint inc = p.isIncumbent & 0xFFu;
     const bool skipFwht = (p.isIncumbent & 0x10000u) != 0u;
     if (inc == 2u) {
-        qw_mla_load_shvq_lut<false>(tgLut, p.bits, tid, 256u);
+        qw_mla_load_shvq_lut<SUB2>(st.lut, p.bits, tid, 256u);
     }
 
     const uint baseRow = g * p.oLoraRank + cBase + sg * 4u;
@@ -233,7 +239,7 @@ kernel void qwg_hca_grouped_wo_a_gemv(
         device const half4* src4 = (device const half4*)(
             zIn + ((size_t)t * p.oGroups + g) * p.groupIn + kBase);
         for (uint i = tid; i < vecCols; i += 256u) {
-            *(threadgroup half4*)(shX + i * 4u) = src4[i];
+            *(threadgroup half4*)(st.shX + i * 4u) = src4[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -243,8 +249,8 @@ kernel void qwg_hca_grouped_wo_a_gemv(
             #pragma unroll
             for (uint r = 0u; r < 4u; ++r) {
                 float4 wLo[4], wHi[4];
-                qw_hca_unpack_wo_a_reg32(woABlocks, baseRow + r, col0, p, tgLut, wLo, wHi);
-                qw_hca_accum32_row(acc[r], wLo, wHi, shX + colOff);
+                qw_hca_unpack_wo_a_reg32<SUB2>(woABlocks, baseRow + r, col0, p, st.lut, wLo, wHi);
+                qw_hca_accum32_row(acc[r], wLo, wHi, st.shX + colOff);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -252,16 +258,38 @@ kernel void qwg_hca_grouped_wo_a_gemv(
     #pragma unroll
     for (uint r = 0u; r < 4u; ++r) {
         const float sum = simd_sum(acc[r]);
-        if (lane == 0u) shOut[sg * 4u + r] = sum;
+        if (lane == 0u) st.shOut[sg * 4u + r] = sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (sg == 0u) {
         const uint globalCol = g * p.oLoraRank + cBase + lane;
         const float gate = float(qUpGate[(size_t)t * p.qUpStride + p.oGateOffset + globalCol]);
-        const float gated = shOut[lane] / (1.0f + exp(-gate));
+        const float gated = st.shOut[lane] / (1.0f + exp(-gate));
         zGatedOut[(size_t)t * (p.oGroups * p.oLoraRank) + globalCol] = half(skipFwht ? gated : qwg_fwht32_lane_f32(gated, lane));
     }
+}
+
+kernel void qwg_hca_grouped_wo_a_gemv(
+    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
+    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
+    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup HCAWoAGemvTg st;
+    qw_hca_grouped_wo_a_gemv_body<false>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
+}
+
+kernel void qwg_hca_grouped_wo_a_gemv_sub2(
+    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
+    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
+    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup HCAWoAGemvTg st;
+    qw_hca_grouped_wo_a_gemv_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
 }
 
 // 6b. 3D-batched grouped wo_a 8x8 MMA + sigmoid(o_gate) + H_32 exit (prefill T >= 16).
@@ -278,28 +306,28 @@ union HCAWoATgStage {
     float os[HCA_WOA_TM * (HCA_WOA_TN + 4u)];
 };
 
-kernel void qwg_hca_grouped_wo_a_mma(
-    device const half*          zIn        [[buffer(0)]],
-    device const char*          woABlocks  [[buffer(1)]],
-    device const half*          qUpGate    [[buffer(2)]],
-    device half*                zGatedOut  [[buffer(3)]],
-    constant HCAGroupedWoAParams& p        [[buffer(4)]],
-    uint3                       tg         [[threadgroup_position_in_grid]],
-    uint                        tid        [[thread_index_in_threadgroup]],
-    uint                        sg         [[simdgroup_index_in_threadgroup]],
-    uint                        lane       [[thread_index_in_simdgroup]]
+template <bool SUB2>
+METAL_FUNC void qw_hca_grouped_wo_a_mma_body(
+    device const half*          zIn,
+    device const char*          woABlocks,
+    device const half*          qUpGate,
+    device half*                zGatedOut,
+    constant HCAGroupedWoAParams& p,
+    threadgroup HCAWoATgStage&  st,
+    threadgroup ShvqMlaTgLut&   tgLut,
+    uint3                       tg,
+    uint                        tid,
+    uint                        sg,
+    uint                        lane
 ) {
     const uint g = tg.x;
     const uint tBase = tg.y * HCA_WOA_TM;
     const uint cBase = tg.z * HCA_WOA_TN;
     if (g >= p.oGroups || tBase >= p.T || cBase >= p.oLoraRank) return;
 
-    threadgroup HCAWoATgStage st;
-    threadgroup ShvqMlaTgLut tgLut;
-
     const uint inc = p.isIncumbent & 0xFFu;
     const bool skipFwht = (p.isIncumbent & 0x10000u) != 0u;
-    if (inc == 2u && qw_mla_load_shvq_lut<false>(tgLut, p.bits, tid, 128u)) {
+    if (inc == 2u && qw_mla_load_shvq_lut<SUB2>(tgLut, p.bits, tid, 128u)) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const uint usStride = HCA_WOA_TK + 8u, wsStride = HCA_WOA_TN + 8u, osStride = HCA_WOA_TN + 4u;
@@ -324,7 +352,7 @@ kernel void qwg_hca_grouped_wo_a_mma(
         }
         *(threadgroup half4*)(st.tile.us + uRow * usStride + uCol) = a;
         *(threadgroup half4*)(st.tile.us + uRow * usStride + uCol + 4u) = b;
-        qw_hca_unpack_wo_a_32(woABlocks, wRow, k0, p, tgLut, st.tile.ws + tid, wsStride);
+        qw_hca_unpack_wo_a_32<SUB2>(woABlocks, wRow, k0, p, tgLut, st.tile.ws + tid, wsStride);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         #pragma unroll
@@ -361,32 +389,60 @@ kernel void qwg_hca_grouped_wo_a_mma(
     }
 }
 
+kernel void qwg_hca_grouped_wo_a_mma(
+    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
+    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
+    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup HCAWoATgStage st;
+    threadgroup ShvqMlaTgLut tgLut;
+    qw_hca_grouped_wo_a_mma_body<false>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tgLut, tg, tid, sg, lane);
+}
+
+kernel void qwg_hca_grouped_wo_a_mma_sub2(
+    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
+    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
+    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup HCAWoATgStage st;
+    threadgroup ShvqMlaTgLut tgLut;
+    qw_hca_grouped_wo_a_mma_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tgLut, tg, tid, sg, lane);
+}
+
 // 6c. Multi-row grouped wo_a GEMV (2 <= T <= 8 verify) reusing woABlocks across all T tokens.
 // Grid: (oLoraRank / 32, oGroups, 1), Threadgroup: (256, 1, 1).
-kernel void qwg_hca_grouped_wo_a_gemv_mr(
-    device const half*          zIn        [[buffer(0)]],
-    device const char*          woABlocks  [[buffer(1)]],
-    device const half*          qUpGate    [[buffer(2)]],
-    device half*                zGatedOut  [[buffer(3)]],
-    constant HCAGroupedWoAParams& p        [[buffer(4)]],
-    uint3                       tg         [[threadgroup_position_in_grid]],
-    uint                        tid        [[thread_index_in_threadgroup]],
-    uint                        sg         [[simdgroup_index_in_threadgroup]],
-    uint                        lane       [[thread_index_in_simdgroup]]
+struct HCAWoAGemvMRTg {
+    half shX[8][1024];
+    float shOut[8][32];
+    ShvqMlaTgLut lut;
+};
+
+template <bool SUB2>
+METAL_FUNC void qw_hca_grouped_wo_a_gemv_mr_body(
+    device const half*          zIn,
+    device const char*          woABlocks,
+    device const half*          qUpGate,
+    device half*                zGatedOut,
+    constant HCAGroupedWoAParams& p,
+    threadgroup HCAWoAGemvMRTg& st,
+    uint3                       tg,
+    uint                        tid,
+    uint                        sg,
+    uint                        lane
 ) {
     const uint cBase = tg.x * 32u;
     const uint g = tg.y;
     const uint rowsT = min(p.T, 8u);
     if (rowsT == 0u || g >= p.oGroups || cBase >= p.oLoraRank) return;
 
-    threadgroup half shX[8][1024];
-    threadgroup float shOut[8][32];
-    threadgroup ShvqMlaTgLut tgLut;
-
     const uint inc = p.isIncumbent & 0xFFu;
     const bool skipFwht = (p.isIncumbent & 0x10000u) != 0u;
     if (inc == 2u) {
-        qw_mla_load_shvq_lut<false>(tgLut, p.bits, tid, 256u);
+        qw_mla_load_shvq_lut<SUB2>(st.lut, p.bits, tid, 256u);
     }
 
     const uint baseRow = g * p.oLoraRank + cBase + sg * 4u;
@@ -406,7 +462,7 @@ kernel void qwg_hca_grouped_wo_a_gemv_mr(
             device const half4* src4 = (device const half4*)(
                 zIn + ((size_t)t * p.oGroups + g) * p.groupIn + kBase);
             for (uint i = tid; i < vecCols; i += 256u) {
-                *(threadgroup half4*)(shX[t] + i * 4u) = src4[i];
+                *(threadgroup half4*)(st.shX[t] + i * 4u) = src4[i];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -417,44 +473,66 @@ kernel void qwg_hca_grouped_wo_a_gemv_mr(
             #pragma unroll
             for (uint r = 0u; r < 4u; ++r) {
                 float4 wLo[4], wHi[4];
-                qw_hca_unpack_wo_a_reg32(woABlocks, baseRow + r, col0, p, tgLut, wLo, wHi);
-                qw_hca_accum32_row(acc0[r], wLo, wHi, shX[0] + colOff);
-                if (rowsT > 1u) qw_hca_accum32_row(acc1[r], wLo, wHi, shX[1] + colOff);
-                if (rowsT > 2u) qw_hca_accum32_row(acc2[r], wLo, wHi, shX[2] + colOff);
-                if (rowsT > 3u) qw_hca_accum32_row(acc3[r], wLo, wHi, shX[3] + colOff);
-                if (rowsT > 4u) qw_hca_accum32_row(acc4[r], wLo, wHi, shX[4] + colOff);
-                if (rowsT > 5u) qw_hca_accum32_row(acc5[r], wLo, wHi, shX[5] + colOff);
-                if (rowsT > 6u) qw_hca_accum32_row(acc6[r], wLo, wHi, shX[6] + colOff);
-                if (rowsT > 7u) qw_hca_accum32_row(acc7[r], wLo, wHi, shX[7] + colOff);
+                qw_hca_unpack_wo_a_reg32<SUB2>(woABlocks, baseRow + r, col0, p, st.lut, wLo, wHi);
+                qw_hca_accum32_row(acc0[r], wLo, wHi, st.shX[0] + colOff);
+                if (rowsT > 1u) qw_hca_accum32_row(acc1[r], wLo, wHi, st.shX[1] + colOff);
+                if (rowsT > 2u) qw_hca_accum32_row(acc2[r], wLo, wHi, st.shX[2] + colOff);
+                if (rowsT > 3u) qw_hca_accum32_row(acc3[r], wLo, wHi, st.shX[3] + colOff);
+                if (rowsT > 4u) qw_hca_accum32_row(acc4[r], wLo, wHi, st.shX[4] + colOff);
+                if (rowsT > 5u) qw_hca_accum32_row(acc5[r], wLo, wHi, st.shX[5] + colOff);
+                if (rowsT > 6u) qw_hca_accum32_row(acc6[r], wLo, wHi, st.shX[6] + colOff);
+                if (rowsT > 7u) qw_hca_accum32_row(acc7[r], wLo, wHi, st.shX[7] + colOff);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    qw_hca_reduce_t(acc0, shOut[0], sg, lane);
-    if (rowsT > 1u) qw_hca_reduce_t(acc1, shOut[1], sg, lane);
-    if (rowsT > 2u) qw_hca_reduce_t(acc2, shOut[2], sg, lane);
-    if (rowsT > 3u) qw_hca_reduce_t(acc3, shOut[3], sg, lane);
-    if (rowsT > 4u) qw_hca_reduce_t(acc4, shOut[4], sg, lane);
-    if (rowsT > 5u) qw_hca_reduce_t(acc5, shOut[5], sg, lane);
-    if (rowsT > 6u) qw_hca_reduce_t(acc6, shOut[6], sg, lane);
-    if (rowsT > 7u) qw_hca_reduce_t(acc7, shOut[7], sg, lane);
+    qw_hca_reduce_t(acc0, st.shOut[0], sg, lane);
+    if (rowsT > 1u) qw_hca_reduce_t(acc1, st.shOut[1], sg, lane);
+    if (rowsT > 2u) qw_hca_reduce_t(acc2, st.shOut[2], sg, lane);
+    if (rowsT > 3u) qw_hca_reduce_t(acc3, st.shOut[3], sg, lane);
+    if (rowsT > 4u) qw_hca_reduce_t(acc4, st.shOut[4], sg, lane);
+    if (rowsT > 5u) qw_hca_reduce_t(acc5, st.shOut[5], sg, lane);
+    if (rowsT > 6u) qw_hca_reduce_t(acc6, st.shOut[6], sg, lane);
+    if (rowsT > 7u) qw_hca_reduce_t(acc7, st.shOut[7], sg, lane);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (sg < rowsT) {
         const uint outStride = p.oGroups * p.oLoraRank;
         const uint globalCol = g * p.oLoraRank + cBase + lane;
         const float gate = float(qUpGate[(size_t)sg * p.qUpStride + p.oGateOffset + globalCol]);
-        const float gated = shOut[sg][lane] / (1.0f + exp(-gate));
+        const float gated = st.shOut[sg][lane] / (1.0f + exp(-gate));
         zGatedOut[(size_t)sg * outStride + globalCol] =
             half(skipFwht ? gated : qwg_fwht32_lane_f32(gated, lane));
     }
 }
 
+kernel void qwg_hca_grouped_wo_a_gemv_mr(
+    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
+    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
+    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup HCAWoAGemvMRTg st;
+    qw_hca_grouped_wo_a_gemv_mr_body<false>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
+}
+
+kernel void qwg_hca_grouped_wo_a_gemv_mr_sub2(
+    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
+    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
+    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup HCAWoAGemvMRTg st;
+    qw_hca_grouped_wo_a_gemv_mr_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
+}
+
 // 6d. Apple10+ NAX 3D-batched grouped wo_a + sigmoid(o_gate) + H_32 exit (T >= 16).
 #define HCA_WOA_NAX_OS 32u
 
-template <int MODE>
+template <int MODE, bool SUB2 = false>
 METAL_FUNC void qw_hca_wo_a_nax_run(
     device const half*          zIn,
     device const char*          woABlocks,
@@ -555,8 +633,8 @@ METAL_FUNC void qw_hca_wo_a_nax_run(
                     device const char* gp = rPtr + (size_t)gIdx * groupBytes;
                     const half shvqScale = *(device const half*)gp;
                     device const uchar* pay = (device const uchar*)(gp + 2u + payOff);
-                    vLo = qw_mla_shvq_quad4<false>(pay, q0, p.bits, tgLut) * shvqScale;
-                    vHi = qw_mla_shvq_quad4<false>(pay, q1, p.bits, tgLut) * shvqScale;
+                    vLo = qw_mla_shvq_quad4<SUB2>(pay, q0, p.bits, tgLut) * shvqScale;
+                    vHi = qw_mla_shvq_quad4<SUB2>(pay, q1, p.bits, tgLut) * shvqScale;
                 } else if constexpr (MODE == 8) {
                     device const char* gp = rPtr + (size_t)gIdx * groupBytes;
                     const half2 sb = *(device const half2*)gp;
@@ -634,38 +712,28 @@ METAL_FUNC void qw_hca_wo_a_nax_run(
     }
 }
 
-// Grid: (oLoraRank / 64, (T + 63) / 64, oGroups), Threadgroup: (128, 1, 1).
-kernel void qwg_hca_grouped_wo_a_nax(
-    device const half*          zIn        [[buffer(0)]],
-    device const char*          woABlocks  [[buffer(1)]],
-    device const half*          qUpGate    [[buffer(2)]],
-    device half*                zGatedOut  [[buffer(3)]],
-    constant HCAGroupedWoAParams& p        [[buffer(4)]],
-    uint3                       tg         [[threadgroup_position_in_grid]],
-    uint                        tid        [[thread_index_in_threadgroup]],
-    uint                        sg         [[simdgroup_index_in_threadgroup]],
-    uint                        lane       [[thread_index_in_simdgroup]]
+union HCAWoANaxTg {
+    ShvqMlaTgLut tgLut;
+    float os[4][32u * HCA_WOA_NAX_OS];
+};
+
+template <bool SUB2>
+METAL_FUNC void qw_hca_grouped_wo_a_nax_body(
+    device const half* zIn, device const char* woABlocks,
+    device const half* qUpGate, device half* zGatedOut,
+    constant HCAGroupedWoAParams& p, threadgroup HCAWoANaxTg& st,
+    uint3 tg, uint tid, uint sg, uint lane
 ) {
-    const uint cBase = tg.x * 64u;
-    const uint tBase = tg.y * 64u;
-    const uint g = tg.z;
+    const uint cBase = tg.x * 64u, tBase = tg.y * 64u, g = tg.z;
     if (g >= p.oGroups || tBase >= p.T || cBase >= p.oLoraRank) return;
 
-    union HCAWoANaxTg {
-        ShvqMlaTgLut tgLut;
-        float os[4][32u * HCA_WOA_NAX_OS];
-    };
-    threadgroup HCAWoANaxTg st;
-
     const uint inc = p.isIncumbent & 0xFFu;
-    if (inc == 2u && qw_mla_load_shvq_lut<false>(st.tgLut, p.bits, tid, 128u)) {
+    if (inc == 2u && qw_mla_load_shvq_lut<SUB2>(st.tgLut, p.bits, tid, 128u)) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const uint wm = sg >> 1u;
-    const uint wn = sg & 1u;
-    const uint warpT0 = tBase + wm * 32u;
-    const uint warpC0 = cBase + wn * 32u;
+    const uint wm = sg >> 1u, wn = sg & 1u;
+    const uint warpT0 = tBase + wm * 32u, warpC0 = cBase + wn * 32u;
     const int sgpSm = min(32, int(p.T) - int(warpT0));
 
     if (inc == 2u) {
@@ -673,8 +741,8 @@ kernel void qwg_hca_grouped_wo_a_nax(
             threadgroup_barrier(mem_flags::mem_threadgroup);
             return;
         }
-        qw_hca_wo_a_nax_run<2>(zIn, woABlocks, qUpGate, zGatedOut, p,
-                               &st.os[0][0], st.tgLut, g, warpT0, warpC0, sgpSm, sg, lane);
+        qw_hca_wo_a_nax_run<2, SUB2>(zIn, woABlocks, qUpGate, zGatedOut, p,
+                                     &st.os[0][0], st.tgLut, g, warpT0, warpC0, sgpSm, sg, lane);
         return;
     }
 
@@ -696,4 +764,27 @@ kernel void qwg_hca_grouped_wo_a_nax(
         qw_hca_wo_a_nax_run<0>(zIn, woABlocks, qUpGate, zGatedOut, p,
                                &st.os[0][0], st.tgLut, g, warpT0, warpC0, sgpSm, sg, lane);
     }
+}
+
+// Grid: (oLoraRank / 64, (T + 63) / 64, oGroups), Threadgroup: (128, 1, 1).
+kernel void qwg_hca_grouped_wo_a_nax(
+    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
+    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
+    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup HCAWoANaxTg st;
+    qw_hca_grouped_wo_a_nax_body<false>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
+}
+
+kernel void qwg_hca_grouped_wo_a_nax_sub2(
+    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
+    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
+    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup HCAWoANaxTg st;
+    qw_hca_grouped_wo_a_nax_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
 }

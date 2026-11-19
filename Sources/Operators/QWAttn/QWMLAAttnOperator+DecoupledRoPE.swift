@@ -357,6 +357,7 @@ extension QWMLAAttnOperator {
                     enc.setComputePipelineState(psoIndexerScoreSelect)
                 }
                 enc.dispatchThreadgroups(MTLSize(width: batchRows, height: 1, depth: 1), threadsPerThreadgroup: tg256)
+                QWCoarsePoolIndex.barrierIfConcurrent(enc)
             } else if !isDecoupledDSA {
                 var idxP = IndexerParams(
                     T: UInt32(batchRows),
@@ -377,6 +378,7 @@ extension QWMLAAttnOperator {
                 enc.setBytes(&idxP, length: MemoryLayout<IndexerParams>.stride, index: 6)
                 enc.setComputePipelineState(psoIndexerSplit?.select ?? psoIndexerScoreSelect)
                 enc.dispatchThreadgroups(MTLSize(width: batchRows, height: 1, depth: 1), threadsPerThreadgroup: tg256)
+                QWCoarsePoolIndex.barrierIfConcurrent(enc)
             }
             rowStart += batchRows
         }
@@ -473,6 +475,7 @@ extension QWMLAAttnOperator {
         enc.setBytes(&qrP, length: MemoryLayout<QRopeIdxPrepParams>.stride, index: 2)
         enc.dispatchThreadgroups(MTLSize(width: qHeads + idxHeads, height: rows, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        QWCoarsePoolIndex.barrierIfConcurrent(enc)
 
         // 1. Exact dense bypass at seqLen <= topK + windowTokens; split MMA or e-means above.
         mark("mla.score_select")
@@ -501,6 +504,7 @@ extension QWMLAAttnOperator {
         let absorbMMA = encodeAbsorbQ(enc, kvBProj: mlaW.kvBProj, absP: &absP, rows: rows, mTiles: mTiles)
 
         // 3. Decoupled-RoPE DSA attention (c_KV + k_pe + attn_sink) -> uLat
+        QWCoarsePoolIndex.barrierIfConcurrent(enc)
         let sinkTensor = mlaW.attnSink ?? zeroSinkBuf
         var attnP = DSASparseAttnParams(
             T: UInt32(rows),
@@ -539,6 +543,7 @@ extension QWMLAAttnOperator {
             enc.dispatchThreadgroups(MTLSize(width: rows, height: qHeads / 16, depth: attnSplits),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
             var nSplitU = UInt32(attnSplits)
+            QWCoarsePoolIndex.barrierIfConcurrent(enc)
             enc.setComputePipelineState(split.combine)
             partOScratch.bind(enc, index: 0)
             partMLScratch.bind(enc, index: 1)
@@ -563,12 +568,14 @@ extension QWMLAAttnOperator {
         }
 
         // 4. Value up-projection -> yVhaScratch (if VHA/o_gate active) or directly attOut
+        QWCoarsePoolIndex.barrierIfConcurrent(enc)
         mark("mla.proj_uv")
         let projDst = needsPostEpilogue ? yVhaScratch : attOut
         encodeProjUV(enc, kvBProj: mlaW.kvBProj, dst: projDst, absP: &absP,
                      absorbMMA: absorbMMA, rows: rows, mTiles: mTiles)
 
         if needsPostEpilogue {
+            QWCoarsePoolIndex.barrierIfConcurrent(enc)
             mark("mla.vha_gate")
             var vgP = VHAGateParams(
                 T: UInt32(rows),

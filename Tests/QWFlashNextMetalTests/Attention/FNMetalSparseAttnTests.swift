@@ -4,6 +4,7 @@ import QWCore
 import QWHAL
 import QWAlloc
 import QWGEMM
+import QWRope
 @testable import QWFlashNext
 
 /// Sparse gated attention (one query, selected 4-token blocks plus the causal tail) at decode depth, against a CPU
@@ -260,7 +261,7 @@ final class FNMetalSparseAttnTests: XCTestCase {
             qNorm: dummyNorm, kNorm: dummyNorm, iqNorm: dummyNorm, ikNorm: dummyNorm,
             heads: nh, kvHeads: nkv, headDim: D, indexHeads: idxH, indexKVHeads: idxKV, indexHeadDim: idxD,
             rotaryDim: rot, compress: 4, blockTopK: 512, bankRows: bankRows,
-            rope: FNRope(rotaryDim: rot, theta: 10000.0)
+            rope: QWRopeCPU(rotaryDim: rot, theta: 10000.0)
         )
         let state = try FNGPUAttnDecodeState(arena: arena, mixer: mixer, hidden: 2560, capacity: cap, kvMode: .f16)
         XCTAssertEqual(state.fullCapacity, cap)
@@ -303,7 +304,7 @@ final class FNMetalSparseAttnTests: XCTestCase {
             qNorm: dummyNorm, kNorm: dummyNorm, iqNorm: dummyNorm, ikNorm: dummyNorm,
             heads: 16, kvHeads: 4, headDim: 256, indexHeads: NI, indexKVHeads: 1, indexHeadDim: DI,
             rotaryDim: 64, compress: 4, blockTopK: topK, bankRows: 16 * 512 + 8 * 256 + 5 * 128,
-            rope: FNRope(rotaryDim: 64, theta: 10000.0))
+            rope: QWRopeCPU(rotaryDim: 64, theta: 10000.0))
         let dummyState = try FNGPUAttnDecodeState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
 
         let wardReg = try FNGPUAttnDecodeState.allocateLSAClusters(
@@ -414,7 +415,7 @@ final class FNMetalSparseAttnTests: XCTestCase {
             qNorm: dummyNorm, kNorm: dummyNorm, iqNorm: dummyNorm, ikNorm: dummyNorm,
             heads: 16, kvHeads: 4, headDim: 256, indexHeads: NI, indexKVHeads: 1, indexHeadDim: DI,
             rotaryDim: 64, compress: 4, blockTopK: topK, bankRows: 16 * 512 + 8 * 256 + 5 * 128,
-            rope: FNRope(rotaryDim: 64, theta: 10000.0))
+            rope: QWRopeCPU(rotaryDim: 64, theta: 10000.0))
         let stWard = try FNGPUAttnDecodeState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
         let stEm = try FNGPUAttnDecodeState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
         _ = try FNGPUAttnDecodeState.allocateLSAClusters(

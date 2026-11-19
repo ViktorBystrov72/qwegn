@@ -163,7 +163,7 @@ extension QWEngineDriver {
                 stochastic: owner.map { ($0.config.isGreedy ? Float(1e-6) : Float($0.config.temperature), $0.stream) },
                 completed: draftCompleted)
         } catch {
-            commandBufferErrors += 1
+            admission.commandBufferErrors += 1
             throw error
         }
         mtpDraftProposals += proposed.drafts.count
@@ -548,7 +548,7 @@ extension QWEngineDriver {
         let pairRewind: UInt64
         if let mtpCache, let handle = session.mtpKV {
             pairRewind = try mtpCache.rollbackGeneration(handle)
-        } else if isWeightFreeSpeculation {
+        } else if isWeightFreeSpeculation || dflashDrafter != nil {
             pairRewind = 0
         } else {
             throw QWEngineDriverError.state("greedy round pair cache is absent")

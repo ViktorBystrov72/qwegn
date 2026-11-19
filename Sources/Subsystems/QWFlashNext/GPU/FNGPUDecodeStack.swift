@@ -205,6 +205,13 @@ public final class FNGPUDecodeStack {
         }
         trace?.preparedPLE()
         var cbs: [any MTLCommandBuffer] = []
+        var openEnc: (any MTLComputeCommandEncoder)?
+        defer {
+            openEnc?.endEncoding()
+            if let g = pleGroup { g.wait() }
+            cbs.last?.waitUntilCompleted()
+            withExtendedLifetime(arena) {}
+        }
         var cur = streamA, nxt = streamB
         for c in 0..<(cuts.count - 1) {
             let lo = cuts[c], hi = cuts[c + 1]
@@ -214,6 +221,7 @@ public final class FNGPUDecodeStack {
             }
             let cb = pair.0
             var enc = pair.1
+            openEnc = enc
             if c == 0 {
                 switch stage {
                 case .host(let streamIn):
@@ -234,8 +242,8 @@ public final class FNGPUDecodeStack {
                                                     numTargets: gple.embeddings.count)
                 }
                 if let pre = preContextUpdate, let dflash {
-                    dflash.encodeContextUpdate(enc, slot: pre.slot, startPosition: pre.startPosition,
-                                               totalCount: pre.totalCount)
+                    try dflash.encodeContextUpdate(enc, slot: pre.slot, startPosition: pre.startPosition,
+                                                   totalCount: pre.totalCount)
                 }
                 enc.memoryBarrier(scope: .buffers)
             }
@@ -286,7 +294,7 @@ public final class FNGPUDecodeStack {
                         try mtp.encode(&enc, cb: cb, streamPrev: cur, tokens: head.token, pos: pos, rows: 1, projectRows: 1)
                     } else if let dflash, let dflashSlot, k == 1 {
                         enc.memoryBarrier(scope: .buffers)
-                        dflash.encodeContextUpdate(enc, slot: dflashSlot, startPosition: pos, totalCount: 1)
+                        try dflash.encodeContextUpdate(enc, slot: dflashSlot, startPosition: pos, totalCount: 1)
                     }
                 }
             }
@@ -305,6 +313,7 @@ public final class FNGPUDecodeStack {
                     }
                 case .commit:
                     trace?.submitting(cb, lower: lo, upper: hi, encodeStart: encodeStart)
+                    openEnc = nil
                     ctx.hal.end(cb, enc)
                     cbs.append(cb)
                 }
@@ -378,7 +387,13 @@ public final class FNGPUDecodeStack {
                              embedTable: FNGPUEmbedTable, head: FNGPUHead) throws -> [Int] {
         let B = activeSlots.count
         precondition(B >= 1 && B <= rows && histories.count == B && embedTable.hc * embedTable.hidden == width)
-        let toks = histories.map { Int32($0.last!) }
+        let toks: [Int32] = try histories.map { history in
+            guard let last = history.last else {
+                throw NSError(domain: "FNGPUDecodeStack", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "forwardBatch received empty history"])
+            }
+            return Int32(last)
+        }
         let positions = histories.map { $0.count - 1 }
         let numPLE = pleTargets.count
         var pleGroup: DispatchGroup? = nil
@@ -398,6 +413,13 @@ public final class FNGPUDecodeStack {
             pleGroup = grp
         }
         var cbs: [any MTLCommandBuffer] = []
+        var openEnc: (any MTLComputeCommandEncoder)?
+        defer {
+            openEnc?.endEncoding()
+            if let g = pleGroup { g.wait() }
+            cbs.last?.waitUntilCompleted()
+            withExtendedLifetime(arena) {}
+        }
         var cur = streamA, nxt = streamB
         for c in 0..<(cuts.count - 1) {
             let lo = cuts[c], hi = cuts[c + 1]
@@ -406,6 +428,7 @@ public final class FNGPUDecodeStack {
             }
             let cb = pair.0
             let enc = pair.1
+            openEnc = enc
             if c == 0 {
                 arena.write(tokensBuf, from: toks)
                 try embedTable.gather(enc: enc, hal: ctx.hal, token: tokensBuf, out: streamA,
@@ -442,6 +465,7 @@ public final class FNGPUDecodeStack {
                 case .waitForPLE:
                     if let g = pleGroup { g.wait(); pleGroup = nil }
                 case .commit:
+                    openEnc = nil
                     ctx.hal.end(cb, enc)
                     cbs.append(cb)
                 }

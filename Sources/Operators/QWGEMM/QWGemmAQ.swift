@@ -222,32 +222,55 @@ public enum QWGemmAQ {
         guard y.shape.elementCount >= rows * n else {
             throw QWGemmError.badWeights("output holds \(y.shape.elementCount), \(rows * n) needed")
         }
+        if f32Activations {
+            guard n < (1 << 30) else {
+                throw QWGemmError.badWeights("a bank of \(n) rows does not fit row-count flags")
+            }
+            let pso = try hal.pipeline(name)
+            enc.setComputePipelineState(pso)
+            blocks.bind(enc, index: 0)
+            var n32 = UInt32(n)
+            var k32 = UInt32(k)
+            enc.setBytes(&n32, length: 4, index: 4)
+            enc.setBytes(&k32, length: 4, index: 5)
+            for row in 0..<rows {
+                let xRow = rows == 1 ? x : x.slice(byteOffset: row * k * 4, count: k, dtype: .f32)
+                let yRow = rows == 1 ? y : y.slice(byteOffset: row * n * 4, count: n, dtype: .f32)
+                xRow.bind(enc, index: 1)
+                yRow.bind(enc, index: 3)
+                enc.dispatchThreadgroups(MTLSize(width: n, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+            return
+        }
+        guard n < (rows > 1 ? (1 << 24) : (1 << 30)) else {
+            throw QWGemmError.badWeights("a bank of \(n) rows does not fit row-count flags")
+        }
         let pso = try hal.pipeline(name)
         enc.setComputePipelineState(pso)
         blocks.bind(enc, index: 0)
-        x.bind(enc, index: 1)
-        y.bind(enc, index: 3)
-        let useMultiRow = !f32Activations && rows >= 2 && rows <= 8 && n < (1 << 24)
-        let useRows4 = !f32Activations && n < (1 << 30)
-        var n32: UInt32
-        if useMultiRow {
-            n32 = UInt32(n) | 0x8000_0000 | (UInt32(rows) << 24)
-        } else if useRows4 {
-            n32 = UInt32(n) | 0x4000_0000
-        } else {
-            n32 = UInt32(n)
-        }
         var k32 = UInt32(k)
-        enc.setBytes(&n32, length: 4, index: 4)
         enc.setBytes(&k32, length: 4, index: 5)
-        if useRows4 {
+        var rowOffset = 0
+        while rowOffset < rows {
+            let chunk = min(8, rows - rowOffset)
+            let xChunk = (rowOffset == 0 && chunk == rows)
+                ? x
+                : x.slice(byteOffset: rowOffset * k * 2, count: chunk * k, dtype: .f16)
+            let yChunk = (rowOffset == 0 && chunk == rows)
+                ? y
+                : y.slice(byteOffset: rowOffset * n * 4, count: chunk * n, dtype: .f32)
+            xChunk.bind(enc, index: 1)
+            yChunk.bind(enc, index: 3)
+            var n32 = chunk >= 2
+                ? (UInt32(n) | 0x8000_0000 | (UInt32(chunk) << 24))
+                : (UInt32(n) | 0x4000_0000)
+            enc.setBytes(&n32, length: 4, index: 4)
             let groups = (n + decodeRowsPerThreadgroup - 1) / decodeRowsPerThreadgroup
             enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: decodeThreadsPerThreadgroup,
                                                                    height: 1, depth: 1))
-        } else {
-            enc.dispatchThreadgroups(MTLSize(width: n, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            rowOffset += chunk
         }
     }
 
@@ -265,11 +288,9 @@ public enum QWGemmAQ {
         guard k % group == 0, n > 0 else {
             throw QWGemmError.badWeights("k must be a multiple of \(group) and n positive")
         }
-        // The row count rides in N's flags, so the count itself must leave
-        // the top two bits alone: a bank of more than 2^30 rows would have
-        // its count read back as a flag and the kernel would write the
-        // wrong rows.
-        guard n < (1 << 30) else {
+        // The row-count encoding reserves bits 24..29 for multi-row alongside bit 30,
+        // so rows >= 2^24 would collide with mRows in dx_h16_t4.
+        guard n < (1 << 24) else {
             throw QWGemmError.badWeights("a bank of \(n) rows does not fit the row-count flags")
         }
         guard let rowBytes = rowBytes(bits: bits, group: group, k: k, isSHVQ: isSHVQ) else {

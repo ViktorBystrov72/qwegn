@@ -2,12 +2,17 @@
 
 import Foundation
 import Darwin
+import Synchronization
 import QWEngine
 
 public final class QWEngineTelemetryRegistry: @unchecked Sendable {
     public static let shared = QWEngineTelemetryRegistry()
 
     let lock = NSLock()
+    private let liveDecodeCountAtomic = Atomic<Int>(0)
+    private let liveDecodeLastNsAtomic = Atomic<Int>(0)
+    private var lastDrainedLiveCount: Int = 0
+    private var lastDrainedLiveNs: Int = 0
 
     // Cache Counters
     /// The cache bytes the engine reported. Nil means the engine cannot
@@ -233,6 +238,11 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
             // The first token has arrived, so the gap to the next one is a
             // measurement: the rate exists once the turn has two tokens.
             lastTokenAt = now
+            let monoNow = Self.monotonicNsNow()
+            liveDecodeCountAtomic.store(0, ordering: .releasing)
+            liveDecodeLastNsAtomic.store(monoNow, ordering: .releasing)
+            lastDrainedLiveCount = 0
+            lastDrainedLiveNs = monoNow
             nextTraceTickAt = now.addingTimeInterval(Self.traceTickIntervalSec)
         }
         if self === Self.shared {
@@ -240,13 +250,37 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         }
     }
 
+    private static func monotonicNsNow() -> Int {
+        Int(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) & 0x7FFF_FFFF_FFFF_FFFF)
+    }
+
+    private func flushLiveDecodeAtomicsLocked(now: Date) {
+        let count = liveDecodeCountAtomic.load(ordering: .acquiring)
+        let lastNs = liveDecodeLastNsAtomic.load(ordering: .acquiring)
+        let deltaTokens = count - lastDrainedLiveCount
+        let deltaNs = lastNs - lastDrainedLiveNs
+        if deltaTokens > 0 && deltaNs > 0 {
+            let perTokenMs = (Double(deltaNs) / 1_000_000.0) / Double(deltaTokens)
+            itlDecodeTokPerSec = 1000.0 / perTokenMs
+            lastDecodeSampledAt = now
+            lastDrainedLiveCount = count
+            lastDrainedLiveNs = lastNs
+        }
+    }
+
     /// `at` exists for tests only: macOS Thread.sleep overshoots by 3-5x under
     /// scheduler load, so timing behavior is verified with injected timestamps
-    /// instead of wall-clock sleeps. Production always passes nil.
+    /// instead of wall-clock sleeps. Production always passes nil for lock-free updates.
     public func recordDecodeToken(at date: Date? = nil) {
+        guard let date else {
+            let nowNs = Self.monotonicNsNow()
+            liveDecodeLastNsAtomic.store(nowNs, ordering: .releasing)
+            liveDecodeCountAtomic.wrappingAdd(1, ordering: .releasing)
+            return
+        }
         lock.lock()
         defer { lock.unlock() }
-        let now = date ?? Date()
+        let now = date
         if let last = lastTokenAt {
             let latency = now.timeIntervalSince(last) * 1000.0
             if latency > 0 {
@@ -330,6 +364,7 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
                            at date: Date? = nil) {
         lock.withLock {
             let now = date ?? Date()
+            flushLiveDecodeAtomicsLocked(now: now)
             if phase == .prefill || phase == .decode {
                 advanceActiveTraceIfNeeded(now: now)
             }
@@ -454,19 +489,25 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
         if series.count > traceWindowCapacity { series.removeFirst(series.count - traceWindowCapacity) }
     }
 
-    public func resetToIdle() {
+    public func resetToIdle(resetCacheCounters: Bool = false) {
         lock.withLock {
             phase = .idle
-            // The cache counters belong to the model that filled the cache: a
-            // new model starts with its own counters.
-            cacheLookupsTotal = 0
-            cacheHitsWarmTotal = 0
-            cacheHitsSSDTotal = 0
-            cacheHitsUnclassifiedTotal = 0
-            cacheMissesTotal = 0
-            cacheTokensReusedTotal = 0
-            cacheEvictionsWarmTotal = 0
-            cacheEvictionsSSDTotal = 0
+            // Preserve lifetime cache hit/lookup counters across per-request completion/errors;
+            // only clear them explicitly when releasing/reloading the resident model.
+            if resetCacheCounters {
+                cacheLookupsTotal = 0
+                cacheHitsWarmTotal = 0
+                cacheHitsSSDTotal = 0
+                cacheHitsUnclassifiedTotal = 0
+                cacheMissesTotal = 0
+                cacheTokensReusedTotal = 0
+                cacheEvictionsWarmTotal = 0
+                cacheEvictionsSSDTotal = 0
+            }
+            liveDecodeCountAtomic.store(0, ordering: .releasing)
+            liveDecodeLastNsAtomic.store(0, ordering: .releasing)
+            lastDrainedLiveCount = 0
+            lastDrainedLiveNs = 0
             itlDecodeTokPerSec = 0.0
             itlFifo.removeAll(keepingCapacity: true)
             itlFifoHead = 0
@@ -535,12 +576,13 @@ public final class QWEngineTelemetryRegistry: @unchecked Sendable {
     }
 
     public func snapshot(at date: Date? = nil) -> MetricsSnapshot {
+        let hw = QWSystemMetricsSampler.shared.current()
+        let busy = QWTelemetryRegistry.shared.value("gpu.busy_ratio")
         lock.lock()
         defer { lock.unlock() }
         let now = date ?? Date()
+        flushLiveDecodeAtomicsLocked(now: now)
         advanceActiveTraceIfNeeded(now: now)
-        let hw = QWSystemMetricsSampler.shared.current()
-        let busy = QWTelemetryRegistry.shared.value("gpu.busy_ratio")
 
         let livePrefill: Double? = phase == .prefill && livePrefillTokPerSec > 0 ? livePrefillTokPerSec : nil
         let liveDecode: Double? = phase == .decode && itlDecodeTokPerSec > 0 ? itlDecodeTokPerSec : nil

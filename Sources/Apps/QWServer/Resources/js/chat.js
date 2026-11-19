@@ -123,11 +123,11 @@ function renderChatSessionList() {
     const turns = s.messages.length;
     const stamp = s.updatedAt ? new Date(s.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
     return `<div class="chat-session-item ${s.id === chatState.activeSessionId ? "is-active" : ""}" role="listitem">
-      <button type="button" class="chat-session-select-btn" onclick="selectChatSession('${escapeHtml(s.id)}')">
+      <button type="button" class="chat-session-select-btn" data-chat-action="select-session" data-session-id="${escapeHtml(s.id)}">
         <div class="chat-session-title">${escapeHtml(s.title || "Untitled Chat")}</div>
         <div class="chat-session-meta mono">${turns} ${turns === 1 ? "turn" : "turns"} · ${escapeHtml(stamp)}</div>
       </button>
-      <button type="button" class="chat-session-del" onclick="deleteChatSession('${escapeHtml(s.id)}')" aria-label="Delete session ${escapeHtml(s.title || "Untitled")}">×</button>
+      <button type="button" class="chat-session-del" data-chat-action="delete-session" data-session-id="${escapeHtml(s.id)}" aria-label="Delete session ${escapeHtml(s.title || "Untitled")}">×</button>
     </div>`;
   }).join("");
 }
@@ -456,21 +456,25 @@ function renderChatTranscript() {
   msgs.forEach((m) => { if (m.role === "tool" && m.toolCallId) answeredIds.add(m.toolCallId); });
   host.innerHTML = msgs.map((m, idx) => renderSingleChatTurnHtml(m, idx, msgs.length, answeredIds)).join("");
 }
+function safeChatImageDataUrl(rawUrl) {
+  const s = String(rawUrl ?? "").trim();
+  return /^data:image\/[a-z0-9.+-]+;base64,/i.test(s) ? s : "";
+}
 function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
   const session = getActiveChatSession();
   const isAssistant = msg.role === "assistant"; const isUser = msg.role === "user"; const isTool = msg.role === "tool";
   const isJsonMode = session.presetId === "json-extractor" || (session.params && session.params.responseFormat !== "text");
   const roleLabel = isUser ? "You" : (isTool ? `Tool (${msg.toolName || msg.toolCallId || "output"})` : "Assistant");
   const btns = [];
-  if (isUser) btns.push(`<button type="button" class="chat-turn-btn" onclick="beginEditChatTurn('${escapeHtml(msg.id)}')">Edit &amp; Fork</button>`);
+  if (isUser) btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="edit-turn" data-msg-id="${escapeHtml(msg.id)}">Edit &amp; Fork</button>`);
   if (isAssistant) {
-    btns.push(`<button type="button" class="chat-turn-btn" onclick="regenerateChatTurn('${escapeHtml(msg.id)}')">Regenerate</button>`);
-    if (idx === totalCount - 1 && !chatState.isGenerating) btns.push(`<button type="button" class="chat-turn-btn" onclick="continueChatAssistantTurn('${escapeHtml(msg.id)}')">Continue</button>`);
-    if (!msg.isStreaming && msg.content && isJsonMode) btns.push(`<button type="button" class="chat-turn-btn" onclick="formatJsonChatTurn('${escapeHtml(msg.id)}')">Format JSON</button>`);
-    btns.push(`<button type="button" class="chat-turn-btn" onclick="toggleChatTurnRaw('${escapeHtml(msg.id)}')">${msg.isRaw ? "Rendered" : "Raw"}</button>`);
+    btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="regen-turn" data-msg-id="${escapeHtml(msg.id)}">Regenerate</button>`);
+    if (idx === totalCount - 1 && !chatState.isGenerating) btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="continue-turn" data-msg-id="${escapeHtml(msg.id)}">Continue</button>`);
+    if (!msg.isStreaming && msg.content && isJsonMode) btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="format-json-turn" data-msg-id="${escapeHtml(msg.id)}">Format JSON</button>`);
+    btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="toggle-raw-turn" data-msg-id="${escapeHtml(msg.id)}">${msg.isRaw ? "Rendered" : "Raw"}</button>`);
   }
-  btns.push(`<button type="button" class="chat-turn-btn" onclick="copyChatTurnContent('${escapeHtml(msg.id)}')">Copy</button>`);
-  btns.push(`<button type="button" class="chat-turn-btn" onclick="deleteChatTurn('${escapeHtml(msg.id)}')" aria-label="Delete turn">×</button>`);
+  btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="copy-turn" data-msg-id="${escapeHtml(msg.id)}">Copy</button>`);
+  btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="delete-turn" data-msg-id="${escapeHtml(msg.id)}" aria-label="Delete turn">×</button>`);
 
   let jsonBadgeHtml = "";
   if (isAssistant && !msg.isStreaming && msg.content && isJsonMode && typeof validateJsonTurnContent === "function") {
@@ -481,8 +485,8 @@ function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
   let bodyHtml = "";
   if (chatState.editingMsgId === msg.id) {
     bodyHtml = `<div class="chat-edit-wrap"><textarea id="chat-edit-textarea-${escapeHtml(msg.id)}" rows="3" class="input chat-textarea mono">${escapeHtml(msg.content || "")}</textarea>
-      <div class="chat-edit-actions"><button type="button" class="btn btn-primary btn-sm" onclick="saveAndResendChatTurn('${escapeHtml(msg.id)}')">Save &amp; Resend</button>
-      <button type="button" class="btn btn-sm" onclick="cancelEditChatTurn()">Cancel</button></div></div>`;
+      <div class="chat-edit-actions"><button type="button" class="btn btn-primary btn-sm" data-chat-action="save-edit-turn" data-msg-id="${escapeHtml(msg.id)}">Save &amp; Resend</button>
+      <button type="button" class="btn btn-sm" data-chat-action="cancel-edit-turn">Cancel</button></div></div>`;
   } else {
     if (isAssistant && msg.reasoning) {
       bodyHtml += `<details class="md-thinking"${msg.isStreaming && !msg.content ? " open" : ""}><summary>Reasoning trace (${msg.reasoning.length} chars)</summary><pre>${escapeHtml(msg.reasoning)}</pre></details>`;
@@ -493,7 +497,7 @@ function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
       else if (!msg.toolCalls || !msg.toolCalls.length) bodyHtml += `<div class="panel-sub mono">${msg.isStreaming ? "Streaming…" : "—"}</div>`;
     } else bodyHtml += `<div class="chat-user-text">${escapeHtml(msg.content || "")}</div>`;
     if (Array.isArray(msg.images) && msg.images.length > 0) {
-      bodyHtml += `<div class="chat-turn-images">${msg.images.map((img) => `<img class="chat-turn-thumb" src="${escapeHtml(img.dataUrl)}" alt="${escapeHtml(img.name || "Attached image")}" />`).join("")}</div>`;
+      bodyHtml += `<div class="chat-turn-images">${msg.images.map((img) => `<img class="chat-turn-thumb" src="${escapeHtml(safeChatImageDataUrl(img.dataUrl))}" alt="${escapeHtml(img.name || "Attached image")}" />`).join("")}</div>`;
     }
     if (Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0) bodyHtml += msg.toolCalls.map((tc) => renderToolCallCardHtml(msg.id, tc, answeredToolCallIds)).join("");
     if (msg.error) bodyHtml += `<div class="chat-turn-error">${escapeHtml(msg.error)}</div>`;
@@ -513,8 +517,8 @@ function renderToolCallCardHtml(msgId, tc, answeredToolCallIds) {
     : `<div class="chat-tool-reply-form"><label for="tool-out-${escapeHtml(callId)}" class="chat-field-label">Submit Tool Output (<code>role: "tool"</code>)</label>
         <textarea id="tool-out-${escapeHtml(callId)}" rows="2" class="input chat-textarea mono" placeholder='{"status":"ok"}…'></textarea>
         <div class="chat-tool-reply-actions">
-          <button type="button" class="btn btn-primary btn-sm" onclick="submitToolResultForCall('${escapeHtml(msgId)}','${escapeHtml(callId)}','${escapeHtml(fnName)}',true)">Send Tool Output &amp; Continue</button>
-          <button type="button" class="btn btn-sm" onclick="submitToolResultForCall('${escapeHtml(msgId)}','${escapeHtml(callId)}','${escapeHtml(fnName)}',false)">Append Only</button>
+          <button type="button" class="btn btn-primary btn-sm" data-chat-action="submit-tool-result" data-msg-id="${escapeHtml(msgId)}" data-call-id="${escapeHtml(callId)}" data-tool-name="${escapeHtml(fnName)}" data-run-continue="true">Send Tool Output &amp; Continue</button>
+          <button type="button" class="btn btn-sm" data-chat-action="submit-tool-result" data-msg-id="${escapeHtml(msgId)}" data-call-id="${escapeHtml(callId)}" data-tool-name="${escapeHtml(fnName)}" data-run-continue="false">Append Only</button>
         </div></div>`;
   return `<div class="chat-tool-call-card"><div class="chat-tool-call-head"><strong class="mono">tool_call: ${escapeHtml(fnName)}</strong><span class="knob-pill mono">${escapeHtml(callId)}</span></div><pre class="chat-tool-args mono">${escapeHtml(formattedArgs)}</pre>${replyForm}</div>`;
 }
@@ -559,8 +563,8 @@ function renderChatAttachments() {
   const hasVision = connected && modelObj && Array.isArray(modelObj.capabilities) && modelObj.capabilities.includes("vision");
   const warnHtml = connected && modelObj && !hasVision ? `<div class="chat-attachment-warn">Note: active model capabilities do not include vision; image parts may be rejected.</div>` : "";
   strip.innerHTML = warnHtml + chatState.pendingImages.map((img) =>
-    `<div class="chat-attachment-chip"><img src="${escapeHtml(img.dataUrl)}" alt="${escapeHtml(img.name)}" /><span class="mono">${escapeHtml(img.name)}</span>
-      <button type="button" class="chat-session-del" onclick="removePendingChatImage('${escapeHtml(img.id)}')" aria-label="Remove image ${escapeHtml(img.name)}">×</button></div>`
+    `<div class="chat-attachment-chip"><img src="${escapeHtml(safeChatImageDataUrl(img.dataUrl))}" alt="${escapeHtml(img.name)}" /><span class="mono">${escapeHtml(img.name)}</span>
+      <button type="button" class="chat-session-del" data-chat-action="remove-image" data-img-id="${escapeHtml(img.id)}" aria-label="Remove image ${escapeHtml(img.name)}">×</button></div>`
   ).join("");
 }
 function renderChatComposerState() {
@@ -739,4 +743,31 @@ function openSmokeProbeInChat() {
   notifyChat("Opened Smoke Probe conversation in Chat.");
 }
 
-if (typeof document !== "undefined") { document.addEventListener("DOMContentLoaded", () => { initChatWorkspace(); }); }
+function handleChatActionClick(e) {
+  const el = e.target && e.target.closest ? e.target.closest("[data-chat-action]") : null;
+  if (!el) return;
+  const action = el.getAttribute("data-chat-action");
+  const id = el.getAttribute("data-msg-id") || el.getAttribute("data-session-id") || el.getAttribute("data-img-id") || "";
+  const map = {
+    "select-session": () => selectChatSession(id),
+    "delete-session": () => deleteChatSession(id),
+    "edit-turn": () => beginEditChatTurn(id),
+    "regen-turn": () => regenerateChatTurn(id),
+    "continue-turn": () => continueChatAssistantTurn(id),
+    "format-json-turn": () => formatJsonChatTurn(id),
+    "toggle-raw-turn": () => toggleChatTurnRaw(id),
+    "copy-turn": () => copyChatTurnContent(id),
+    "delete-turn": () => deleteChatTurn(id),
+    "save-edit-turn": () => saveAndResendChatTurn(id),
+    "cancel-edit-turn": () => cancelEditChatTurn(),
+    "remove-image": () => removePendingChatImage(id),
+    "submit-tool-result": () => submitToolResultForCall(id, el.getAttribute("data-call-id") || "", el.getAttribute("data-tool-name") || "tool", el.getAttribute("data-run-continue") === "true")
+  };
+  if (map[action]) map[action]();
+}
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", () => {
+    document.addEventListener("click", handleChatActionClick);
+    initChatWorkspace();
+  });
+}

@@ -144,8 +144,10 @@ public final class FNNgramBinRows: FNNgramRows, @unchecked Sendable {
         return fallback
     }
 
-    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) {
-        precondition(id >= 0 && id < entryCount, "PLE row \(id) outside ngram.bin [0..<\(entryCount)]")
+    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) throws {
+        guard id >= 0 && id < entryCount else {
+            throw FNNgramRowsError.rowOutOfBounds(id: id, count: entryCount)
+        }
         let off = off_t(dataOffset + (id / rowsPerSector) * QWNgramFormat.sectorSize
                         + (id % rowsPerSector) * rowBytes)
         if let mappedPtr {
@@ -163,11 +165,7 @@ public final class FNNgramBinRows: FNNgramRows, @unchecked Sendable {
         if dtype == .bf16 {
             let n = headDim
             let u16 = UnsafeMutableRawPointer(dst).assumingMemoryBound(to: UInt16.self).advanced(by: n)
-            do {
-                try QWPOSIX.preadExact(fd: fd, into: UnsafeMutableRawPointer(u16), count: rowBytes, offset: Int64(off))
-            } catch {
-                preconditionFailure("PLE short read on ngram.bin at row \(id): \(error)")
-            }
+            try QWPOSIX.preadExact(fd: fd, into: UnsafeMutableRawPointer(u16), count: rowBytes, offset: Int64(off))
             for i in 0..<n {
                 dst[i] = Float(bitPattern: UInt32(u16[i]) << 16)
             }
@@ -175,13 +173,9 @@ public final class FNNgramBinRows: FNNgramRows, @unchecked Sendable {
         }
         // The row bytes land in a scratch buffer of their own: the
         // caller's buffer holds the row's values and nothing else.
-        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: rowBytes) { scratch in
-            guard let base = scratch.baseAddress else { preconditionFailure("empty scratch buffer") }
-            do {
-                try QWPOSIX.preadExact(fd: fd, into: UnsafeMutableRawPointer(base), count: rowBytes, offset: Int64(off))
-            } catch {
-                preconditionFailure("PLE short read on ngram.bin at row \(id): \(error)")
-            }
+        try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: rowBytes) { scratch in
+            guard let base = scratch.baseAddress else { throw FNNgramRowsError.emptyScratchBuffer }
+            try QWPOSIX.preadExact(fd: fd, into: UnsafeMutableRawPointer(base), count: rowBytes, offset: Int64(off))
             let rawPtr = UnsafeRawPointer(base)
             if codebook.isEmpty {
                 QWNgramFormat.decodeRow(dtype: dtype, from: rawPtr,
@@ -198,7 +192,7 @@ public final class FNNgramBinRows: FNNgramRows, @unchecked Sendable {
     public func row(_ id: Int) -> [Float] {
         let n = headDim
         return [Float](unsafeUninitializedCapacity: n) { out, count in
-            copyRow(id, to: out.baseAddress!)
+            qwCopyNgramRowBestEffort(self, id: id, to: out.baseAddress!, headDim: n)
             count = n
         }
     }

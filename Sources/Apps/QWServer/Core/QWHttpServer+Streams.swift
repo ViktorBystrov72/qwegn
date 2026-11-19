@@ -1,30 +1,9 @@
+// QWHttpServer+Streams.swift — Live telemetry/log SSE streams, EOF cancellation
+// watcher, static WebUI bundle serving, and model-name reply resolution.
+
 import Foundation
 import Network
-
-/// Thread-safe gate that stops SSE keepalive comments once the first token arrives.
-public final class QWStreamKeepaliveGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stopped = false
-
-    public init() {}
-
-    public func stop() {
-        lock.withLock { stopped = true }
-    }
-
-    @discardableResult
-    public func stopIfRunning() -> Bool {
-        lock.withLock {
-            if stopped { return false }
-            stopped = true
-            return true
-        }
-    }
-
-    public func isStopped() -> Bool {
-        lock.withLock { stopped }
-    }
-}
+import os
 
 /// The streaming endpoints, shared wire-protocol helpers, and the static UI.
 extension QWHttpServer {
@@ -71,60 +50,54 @@ extension QWHttpServer {
         )
     }
 
-    func sendSSEHeaders(_ connection: NWConnection, extraHeaders: [String] = []) {
-        var sseHeaders = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n"
-        for line in extraHeaders {
-            sseHeaders += "\(line)\r\n"
-        }
-        sseHeaders += "\(corsHeaderLines(for: connection))\r\n"
-        connection.send(content: Data(sseHeaders.utf8), isComplete: false, completion: .contentProcessed({ _ in }))
+    func makeSSEWriter(
+        for connection: NWConnection,
+        dateEncodingStrategy: JSONEncoder.DateEncodingStrategy? = nil,
+        onError: (@Sendable () -> Void)? = nil
+    ) -> QWSSEWriter {
+        let id = ObjectIdentifier(connection)
+        let flag = connectionStateLock.withLock { cancellationHubs[id]?.cancelFlag }
+        return QWSSEWriter(
+            connection: connection,
+            cancelFlag: flag,
+            dateEncodingStrategy: dateEncodingStrategy,
+            onError: onError
+        )
     }
 
-    func sendNDJSONHeaders(_ connection: NWConnection) {
-        let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\(corsHeaderLines(for: connection))\r\n"
-        connection.send(content: Data(headers.utf8), isComplete: false, completion: .contentProcessed({ _ in }))
-    }
-
-    func startSSEKeepalive(connection: NWConnection) -> (gate: QWStreamKeepaliveGate, task: Task<Void, Never>) {
-        let gate = QWStreamKeepaliveGate()
-        let keepaliveComment = Data(": keepalive\n\n".utf8)
-        let task = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                guard !Task.isCancelled, !gate.isStopped() else { break }
-                if self?.isPeerGone(connection) == true { break }
-                connection.send(content: keepaliveComment, isComplete: false, completion: .idempotent)
+    func armEOFWatcher(on connection: NWConnection, id: ObjectIdentifier) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { [weak self, weak connection] _, _, isComplete, error in
+            guard let self, let connection else { return }
+            if isComplete || error != nil {
+                let hub = self.connectionStateLock.withLock { self.cancellationHubs[id] }
+                hub?.fire()
+                connection.cancel()
+                return
+            }
+            if !self.isConnectionTerminated(connection) {
+                self.armEOFWatcher(on: connection, id: id)
             }
         }
-        return (gate, task)
     }
 
     func handleMetricsStream(connection: NWConnection) {
-        sendSSEHeaders(connection)
+        let session = makeSSESession(for: connection, format: .sse, enableKeepalive: false)
+        session.begin(startKeepalive: false)
 
-        Task {
+        let streamTask = Task {
             while !Task.isCancelled {
-                // The peer can leave at any time. When it does, the loop
-                // stops: a stream that keeps building a payload for a
-                // client that is gone is work nobody asked for.
-                if self.isPeerGone(connection) { break }
+                if session.isClosed { break }
                 let snapshot = QWEngineTelemetryRegistry.shared.snapshot()
-                if let data = try? JSONEncoder().encode(snapshot),
-                   let jsonStr = String(data: data, encoding: .utf8) {
-                    let msg = "data: \(jsonStr)\n\n"
-                    guard let msgData = msg.data(using: .utf8) else { break }
-                    connection.send(content: msgData, isComplete: false, completion: .contentProcessed({ error in
-                        if error != nil {
-                            connection.cancel()
-                        }
-                    }))
-                }
+                session.sendSSEDataFrame(snapshot)
                 let intervalNs: UInt64 = (snapshot.throughput.phase == "prefill" || snapshot.throughput.phase == "decode")
                     ? 150_000_000
                     : 500_000_000
                 try? await Task.sleep(nanoseconds: intervalNs)
             }
             connection.cancel()
+        }
+        registerCancellationHandler(for: connection) {
+            streamTask.cancel()
         }
     }
 
@@ -138,27 +111,19 @@ extension QWHttpServer {
     /// receives the same model the dashboard endpoint serves.
     /// `/v1/metrics/stream` still serves the raw metrics.
     func handleDashboardStream(connection: NWConnection) {
-        sendSSEHeaders(connection)
+        let session = makeSSESession(
+            for: connection,
+            format: .sse,
+            enableKeepalive: false,
+            dateEncodingStrategy: .iso8601
+        )
+        session.begin(startKeepalive: false)
 
-        Task {
+        let streamTask = Task {
             while !Task.isCancelled {
-                // The peer can leave at any time. When it does, the loop
-                // stops: a stream that keeps building a model for a
-                // client that is gone is work nobody asked for.
-                if self.isPeerGone(connection) { break }
+                if session.isClosed { break }
                 let model = self.dashboardModel()
-                let encoder = JSONEncoder()
-                encoder.dateEncodingStrategy = .iso8601
-                if let data = try? encoder.encode(model),
-                   let jsonStr = String(data: data, encoding: .utf8) {
-                    let msg = "data: \(jsonStr)\n\n"
-                    guard let msgData = msg.data(using: .utf8) else { break }
-                    connection.send(content: msgData, isComplete: false, completion: .contentProcessed({ error in
-                        if error != nil {
-                            connection.cancel()
-                        }
-                    }))
-                }
+                session.sendSSEDataFrame(model)
                 let intervalNs: UInt64 = (model.generation == .prefill || model.generation == .decode)
                     ? 150_000_000
                     : 500_000_000
@@ -166,32 +131,50 @@ extension QWHttpServer {
             }
             connection.cancel()
         }
+        registerCancellationHandler(for: connection) {
+            streamTask.cancel()
+        }
     }
 
     func handleLogsStream(connection: NWConnection) {
-        sendSSEHeaders(connection)
-
-        // Send recent logs first
-        let recent = self.logger.getRecentLogs()
-        for line in recent {
-            if let json = try? JSONEncoder().encode(["line": line]),
-               let str = String(data: json, encoding: .utf8) {
-                let msg = "data: \(str)\n\n"
-                connection.send(content: Data(msg.utf8), isComplete: false, completion: .contentProcessed({ _ in }))
+        let subState = OSAllocatedUnfairLock<(id: UUID?, unsubscribed: Bool)>(initialState: (nil, false))
+        let unsubscribeOnce: @Sendable () -> Void = { [weak self] in
+            let id = subState.withLock { state -> UUID? in
+                state.unsubscribed = true
+                let current = state.id
+                state.id = nil
+                return current
             }
+            if let id { self?.logger.unsubscribe(id) }
+        }
+        let session = makeSSESession(
+            for: connection,
+            format: .sse,
+            enableKeepalive: false,
+            onError: unsubscribeOnce
+        )
+        session.begin(startKeepalive: false)
+
+        for line in self.logger.getRecentLogs() {
+            if session.isClosed { break }
+            session.sendSSEDataFrame(["line": line])
         }
 
-        let subId = self.logger.subscribe { [weak connection] line in
-            guard let connection else { return }
-            if let json = try? JSONEncoder().encode(["line": line]),
-               let str = String(data: json, encoding: .utf8) {
-                let msg = "data: \(str)\n\n"
-                connection.send(content: Data(msg.utf8), isComplete: false, completion: .contentProcessed({ _ in }))
-            }
+        let subId = self.logger.subscribe { line in
+            session.sendSSEDataFrame(["line": line])
+        }
+        let alreadyUnsubscribed = subState.withLock { state -> Bool in
+            if state.unsubscribed { return true }
+            state.id = subId
+            return false
+        }
+        if alreadyUnsubscribed || session.isClosed {
+            unsubscribeOnce()
+            self.logger.unsubscribe(subId)
         }
 
-        registerCancellationHandler(for: connection) { [weak self] in
-            self?.logger.unsubscribe(subId)
+        registerCancellationHandler(for: connection) {
+            unsubscribeOnce()
         }
     }
 

@@ -1,15 +1,38 @@
 // QWSettingsManager.swift — Persistent atomic settings & per-model profile coordinator.
 
 import Foundation
+import Darwin
 import QWCore
 import QWEngine
+
+struct SettingsStatFingerprint: Equatable {
+    let dev: dev_t
+    let ino: UInt64
+    let size: off_t
+    let sec: Int
+    let nsec: Int
+
+    static func probe(path: String) -> SettingsStatFingerprint? {
+        var st = Darwin.stat()
+        let rc: Int32 = stat(path, &st)
+        guard rc == 0 else { return nil }
+        return SettingsStatFingerprint(
+            dev: st.st_dev,
+            ino: UInt64(st.st_ino),
+            size: st.st_size,
+            sec: st.st_mtimespec.tv_sec,
+            nsec: st.st_mtimespec.tv_nsec
+        )
+    }
+}
 
 /// Manager for loading and saving settings to ~/.qwg/settings.json
 public final class QWSettingsManager: @unchecked Sendable {
     public static let shared = QWSettingsManager()
     let lock = NSLock()
     var cachedSettings: QWServerSettings?
-    var cachedBytes: Data?
+    var cachedKeys: Set<String>?
+    var cachedStat: SettingsStatFingerprint?
     var cachedURL: URL?
 
     public static var defaultSettingsFileURL: URL { QWPaths.settingsFileURL }
@@ -95,40 +118,52 @@ public final class QWSettingsManager: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        let stdURL = url.standardizedFileURL
+        guard let fp = SettingsStatFingerprint.probe(path: stdURL.path) else {
+            if cachedURL == stdURL {
+                cachedSettings = nil
+                cachedKeys = nil
+                cachedStat = nil
+                cachedURL = nil
+            }
+            return (QWServerSettings(), [])
+        }
+        if cachedURL == stdURL, cachedStat == fp, let cachedSettings, let cachedKeys {
+            return (cachedSettings, cachedKeys)
+        }
+
         let data: Data
         do {
-            data = try Data(contentsOf: url)
+            data = try Data(contentsOf: stdURL)
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            cachedSettings = nil
-            cachedBytes = nil
-            cachedURL = nil
+            if cachedURL == stdURL {
+                cachedSettings = nil
+                cachedKeys = nil
+                cachedStat = nil
+                cachedURL = nil
+            }
             return (QWServerSettings(), [])
         }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw QWServerConfigurationResolver.Error.invalidSettingsFile(url.path)
+            throw QWServerConfigurationResolver.Error.invalidSettingsFile(stdURL.path)
         }
         let keys = Set(object.keys)
-        if let cached = cachedSettings, cachedBytes == data, cachedURL == url.standardizedFileURL {
-            return (cached, keys)
-        }
-
         var settings = try JSONDecoder().decode(QWServerSettings.self, from: data)
-        var persistedBytes = data
-        if url.standardizedFileURL == Self.defaultSettingsFileURL.standardizedFileURL && settings.pruneRemovedModels() {
+        if stdURL == Self.defaultSettingsFileURL.standardizedFileURL && settings.pruneRemovedModels() {
             do {
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                 let prunedData = try encoder.encode(settings)
-                try prunedData.write(to: url, options: .atomic)
-                QWPaths.setPrivateFilePermissions(atPath: url.path)
-                persistedBytes = prunedData
+                try prunedData.write(to: stdURL, options: .atomic)
+                QWPaths.setPrivateFilePermissions(atPath: stdURL.path)
             } catch {
-                QWServerLogger.shared.log(.warn, "Failed to prune settings at \(url.path): \(error)")
+                QWServerLogger.shared.log(.warn, "Failed to prune settings at \(stdURL.path): \(error)")
             }
         }
         cachedSettings = settings
-        cachedBytes = persistedBytes
-        cachedURL = url.standardizedFileURL
+        cachedKeys = keys
+        cachedStat = SettingsStatFingerprint.probe(path: stdURL.path) ?? fp
+        cachedURL = stdURL
         return (settings, keys)
     }
 
@@ -139,21 +174,24 @@ public final class QWSettingsManager: @unchecked Sendable {
 
         var normalized = settings
         normalized.syncActiveModelAlias()
-        if url == Self.defaultSettingsFileURL {
+        let stdURL = url.standardizedFileURL
+        if stdURL == Self.defaultSettingsFileURL.standardizedFileURL {
             normalized.pruneRemovedModels()
         }
 
-        try QWPaths.ensurePrivateDirectory(url.deletingLastPathComponent())
+        try QWPaths.ensurePrivateDirectory(stdURL.deletingLastPathComponent())
         try? QWPaths.ensurePrivateDirectory(normalized.logDir.canonicalFileURL)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(normalized)
-        try data.write(to: url, options: .atomic)
-        QWPaths.setPrivateFilePermissions(atPath: url.path)
-        try? saveModelProfile(for: normalized, to: url)
+        try data.write(to: stdURL, options: .atomic)
+        QWPaths.setPrivateFilePermissions(atPath: stdURL.path)
+        try? saveModelProfile(for: normalized, to: stdURL)
+        let keys = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]).map { Set($0.keys) }
         cachedSettings = normalized
-        cachedBytes = data
-        cachedURL = url.standardizedFileURL
+        cachedKeys = keys
+        cachedStat = SettingsStatFingerprint.probe(path: stdURL.path)
+        cachedURL = stdURL
     }
 }

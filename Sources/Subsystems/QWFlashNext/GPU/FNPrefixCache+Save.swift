@@ -17,6 +17,28 @@ extension FNGPUEngine {
         isSharedBase: Bool = false,
         customOutputFileURL: URL? = nil
     ) {
+        try? savePrefixCacheOrThrow(
+            history: history,
+            lastChunkRows: lastChunkRows,
+            useSpec: useSpec,
+            lastArgmax: lastArgmax,
+            mtpDraft: mtpDraft,
+            cacheDir: cacheDir,
+            isSharedBase: isSharedBase,
+            customOutputFileURL: customOutputFileURL
+        )
+    }
+
+    func savePrefixCacheOrThrow(
+        history: [Int64],
+        lastChunkRows: Int,
+        useSpec: Bool,
+        lastArgmax: Int,
+        mtpDraft: Int,
+        cacheDir: URL?,
+        isSharedBase: Bool = false,
+        customOutputFileURL: URL? = nil
+    ) throws {
         let N = history.count
         guard N > 0 else { return }
         if customOutputFileURL == nil {
@@ -269,10 +291,13 @@ extension FNGPUEngine {
             if isSharedBase ? (out.count <= warm.byteLimit) : warm.canHold(bytes: out.count) {
                 if isSharedBase {
                     warm.store(name: filename, blob: out, slot: nil, rootHash: nil, history: history, isSharedBase: true)
+                } else if let resolvedSlot {
+                    warm.store(name: filename, blob: out, slot: resolvedSlot, rootHash: rootHash, history: history, isSharedBase: false)
                 } else {
-                    let slot = resolvedSlot ?? warm.resolveSlot(rootHash: rootHash, history: history, kvMode: kvMode,
-                                                                hasMTP: hasMTP, dflashMarker: dflashPrefixMarker)
-                    warm.store(name: filename, blob: out, slot: slot, rootHash: rootHash, history: history, isSharedBase: false)
+                    _ = warm.storeWithSlotPinning(
+                        name: filename, blob: out, history: history,
+                        kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashPrefixMarker, isSharedBase: false
+                    )
                 }
                 onCacheRetained?(N, out.count, warm.state.bytes, warm.byteLimit)
             } else {
@@ -280,10 +305,18 @@ extension FNGPUEngine {
             }
         }
         if let customOutputFileURL {
-            try? fm.createDirectory(at: customOutputFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? out.write(to: customOutputFileURL, options: .atomic)
+            try fm.createDirectory(at: customOutputFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try out.write(to: customOutputFileURL, options: .atomic)
         }
-        if !isCompactInPlace, prefixCacheWarmStore?.hasSharedBase != true, prefixCacheSSDByteLimit > 0, let cacheDir, customOutputFileURL == nil {
+        if !isCompactInPlace,
+           QWTwoTierPrefixCache.shouldSpillToCold(
+               isSharedBase: isSharedBase,
+               warmHasSharedBase: prefixCacheWarmStore?.hasSharedBase == true,
+               ssdByteLimit: prefixCacheSSDByteLimit,
+               entryBytes: out.count,
+               maxSpillBytes: Int.max
+           ),
+           let cacheDir, customOutputFileURL == nil {
             if out.count <= prefixCacheSSDByteLimit {
                 let limit = prefixCacheSSDByteLimit
                 let snapshot = out
@@ -322,7 +355,7 @@ extension FNGPUEngine {
         highWaterPos = max(highWaterPos, min(activeCapacity, tokens.count + 4))
         beginSession(&session, maxNew: 1)
         let first = try encodePrefillChunk(&session, chunk: 0..<tokens.count, runsHead: true)
-        savePrefixCache(
+        try savePrefixCacheOrThrow(
             history: session.history,
             lastChunkRows: max(1, session.lastRows),
             useSpec: mtp != nil || dflash != nil,
@@ -335,7 +368,7 @@ extension FNGPUEngine {
         evictPrefillScratchIfNeeded()
         let writtenBytes = Self.fileSize(at: outputURL)
         if pinAsSharedBase {
-            _ = try? mountStandalonePrefixCache(from: outputURL)
+            _ = try mountStandalonePrefixCache(from: outputURL)
         }
         return writtenBytes
     }
@@ -351,18 +384,35 @@ extension FNGPUEngine {
         var hdr = FNPrefixHeader(magic: 0, version: 0, tokenCount: 0, kvModeCode: 0,
                                  hasMTP: 0, lastArgmax: 0, mtpDraft: 0,
                                  vocabCount: 0, hiddenSize: 0, widthSize: 0, hcSize: 0)
-        _ = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            memcpy(&hdr, raw.baseAddress!, hdrSize)
+        let copiedHdr = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Bool in
+            guard let base = raw.baseAddress else { return false }
+            memcpy(&hdr, base, hdrSize)
+            return true
+        }
+        guard copiedHdr else {
+            throw NSError(domain: "QWFlashNext", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "empty FlashNext .qwcache payload"])
         }
         let n = Int(hdr.tokenCount)
-        let tokBytes = n * MemoryLayout<Int64>.size
         guard hdr.magic == FNPrefixHeader.magic, hdr.version == FNPrefixHeader.version,
-              hdr.kvModeCode == kvModeCode(kvMode), data.count >= hdrSize + tokBytes else {
+              hdr.kvModeCode == kvModeCode(kvMode),
+              Int(hdr.vocabCount) == vocab, Int(hdr.hiddenSize) == hidden,
+              Int(hdr.widthSize) == width, Int(hdr.hcSize) == hc,
+              n > 0, n <= activeCapacity else {
             throw NSError(domain: "QWFlashNext", code: 3,
-                          userInfo: [NSLocalizedDescriptionKey: "FlashNext .qwcache geometry or kvMode mismatch"])
+                          userInfo: [NSLocalizedDescriptionKey: "FlashNext .qwcache geometry, capacity, or kvMode mismatch"])
         }
-        let history: [Int64] = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            let ptr = raw.baseAddress!.advanced(by: hdrSize).assumingMemoryBound(to: Int64.self)
+        let tokBytes = n * MemoryLayout<Int64>.size
+        guard data.count >= hdrSize + tokBytes else {
+            throw NSError(domain: "QWFlashNext", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "truncated FlashNext .qwcache token table"])
+        }
+        let history: [Int64] = try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else {
+                throw NSError(domain: "QWFlashNext", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "empty FlashNext .qwcache payload"])
+            }
+            let ptr = base.advanced(by: hdrSize).assumingMemoryBound(to: Int64.self)
             return Array(UnsafeBufferPointer(start: ptr, count: n))
         }
         let hasMTP = (hdr.hasMTP & 1) != 0

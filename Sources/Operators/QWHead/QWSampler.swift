@@ -111,13 +111,22 @@ public final class QWSampler {
             throw QWSamplerError.invalid("repetition history contains token outside the logit vocabulary")
         }
         if penaltyScratch.count != n { penaltyScratch = [Float](repeating: 0, count: n) }
+        var penaltyOverflow = false
         penaltyScratch.withUnsafeMutableBufferPointer { dst in
             dst.baseAddress!.update(from: logits.baseAddress!, count: n)
             for token in repetitionHistory {
                 let value = dst[token]
-                dst[token] = value < 0 ? value * config.repetitionPenalty
-                                       : value / config.repetitionPenalty
+                let nextVal = value < 0 ? value * config.repetitionPenalty
+                                        : value / config.repetitionPenalty
+                if !nextVal.isFinite {
+                    penaltyOverflow = true
+                    break
+                }
+                dst[token] = nextVal
             }
+        }
+        guard !penaltyOverflow else {
+            throw QWSamplerError.invalid("repetition penalty produced non-finite logits")
         }
         return try QWSampler.greedyToken(logits: penaltyScratch)
     }
@@ -175,21 +184,28 @@ public final class QWSampler {
             return allowed[best]
         }
         let temperature = config.temperature
-        guard temperature.isFinite, temperature > 0, config.topK > 0,
+        guard temperature.isFinite, temperature > 0, (1 / temperature).isFinite, config.topK > 0,
               config.topP.isFinite, config.topP > 0, config.topP <= 1 else {
             throw QWSamplerError.invalid("invalid temperature, top-k or top-p")
         }
         guard callIndex < UInt64.max else { throw QWSamplerError.invalid("draw counter exhausted") }
-        let maxValue = values.max()!
-        let invT = 1 / Double(temperature)
-        var weights = [Double](repeating: 0, count: values.count)
-        var fullMass = 0.0
-        for index in values.indices {
-            let w = Foundation.exp(Double(values[index] - maxValue) * invT)
-            weights[index] = w
-            fullMass += w
-        }
-        guard fullMass.isFinite, fullMass > 0 else {
+        let count = values.count
+        var maxValue: Float = 0
+        vDSP_maxv(values, 1, &maxValue, vDSP_Length(count))
+        var negMax = -maxValue
+        var invT = 1 / temperature
+        var bias: Float = 0
+        var scaled = [Float](repeating: 0, count: count)
+        var exps = [Float](repeating: 0, count: count)
+        vDSP_vsadd(values, 1, &negMax, &scaled, 1, vDSP_Length(count))
+        vDSP_vsmsa(scaled, 1, &invT, &bias, &scaled, 1, vDSP_Length(count))
+        var nu = Int32(count)
+        vvexpf(&exps, scaled, &nu)
+        let weights = exps.map { Double($0) }
+        var sumF: Float = 0
+        vDSP_sve(exps, 1, &sumF, vDSP_Length(count))
+        let fullMass = Double(sumF)
+        guard fullMass.isFinite, fullMass > 0, weights.allSatisfy({ $0.isFinite && $0 >= 0 }) else {
             throw QWSamplerError.invalid("invalid constrained softmax mass")
         }
         let order = Self.topIndices(weights, count: min(config.topK, weights.count))

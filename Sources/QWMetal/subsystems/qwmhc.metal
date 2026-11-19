@@ -22,7 +22,7 @@ inline void qwg_mhc_enter_f16_impl(device const half* x,
     const size_t base = (size_t)t * (C * hidden);
     #pragma unroll
     for (uint c = 0u; c < C; ++c) {
-        mhcStream[base + c * hidden + h] = v;
+        mhcStream[base + (size_t)c * hidden + h] = v;
     }
 }
 
@@ -82,7 +82,7 @@ inline void qwg_mhc_router_norm_f16_impl(device float*       mhcStream,
         for (uint h = tid; h < hidden; h += 256u) {
             float v[C];
             #pragma unroll
-            for (uint c = 0u; c < C; ++c) v[c] = sBase[c * hidden + h];
+            for (uint c = 0u; c < C; ++c) v[c] = sBase[(size_t)c * hidden + h];
             const float b = float(bo[h]);
             #pragma unroll
             for (uint i = 0u; i < C; ++i) {
@@ -91,7 +91,7 @@ inline void qwg_mhc_router_norm_f16_impl(device float*       mhcStream,
                 for (uint j = 0u; j < C; ++j) {
                     ns = fma(mix[i * C + j], v[j], ns);
                 }
-                sBase[i * hidden + h] = ns;
+                sBase[(size_t)i * hidden + h] = ns;
             }
         }
         threadgroup_barrier(mem_flags::mem_device);
@@ -234,7 +234,7 @@ inline void qwg_mhc_router_partial_impl(device float*       mhcStream,
     for (uint c = 0u; c < C; ++c) v[c] = 0.0f;
     if (h < hidden) {
         #pragma unroll
-        for (uint c = 0u; c < C; ++c) v[c] = sBase[c * hidden + h];
+        for (uint c = 0u; c < C; ++c) v[c] = sBase[(size_t)c * hidden + h];
         if (hasMerge) {
             device const float* prevCtrl = mhcControls + (size_t)t * NUM_CTRL;
             const float b = float(mergeBranchOut[(size_t)t * hidden + h]);
@@ -255,7 +255,7 @@ inline void qwg_mhc_router_partial_impl(device float*       mhcStream,
         threadgroup_barrier(mem_flags::mem_device);
         if (rg == 0u && h < hidden) {
             #pragma unroll
-            for (uint i = 0u; i < C; ++i) sBase[i * hidden + h] = v[i];
+            for (uint i = 0u; i < C; ++i) sBase[(size_t)i * hidden + h] = v[i];
         }
     }
 
@@ -404,7 +404,7 @@ inline void qwg_mhc_router_finalize_impl(device const float* mhcStream,
     float bv = 0.0f;
     if (h < hidden) {
         #pragma unroll
-        for (uint c = 0u; c < C; ++c) bv = fma(pre[c], sBase[c * hidden + h], bv);
+        for (uint c = 0u; c < C; ++c) bv = fma(pre[c], sBase[(size_t)c * hidden + h], bv);
     }
     float v = bv * rstdBranch * (1.0f + (h < hidden ? float(normGamma[h]) : 0.0f));
     v = qwg_fwht32_lane_f32(v, lane);
@@ -531,7 +531,7 @@ inline void qwg_mhc_merge_f16_impl(device float*       mhcStream,
     for (uint h = tid; h < hidden; h += 256u) {
         float v[C];
         #pragma unroll
-        for (uint c = 0u; c < C; ++c) v[c] = sBase[c * hidden + h];
+        for (uint c = 0u; c < C; ++c) v[c] = sBase[(size_t)c * hidden + h];
         const float b = float(bo[h]);
         float sumS = 0.0f;
         #pragma unroll
@@ -541,7 +541,7 @@ inline void qwg_mhc_merge_f16_impl(device float*       mhcStream,
             for (uint j = 0u; j < C; ++j) {
                 ns = fma(mix[i * C + j], v[j], ns);
             }
-            sBase[i * hidden + h] = ns;
+            sBase[(size_t)i * hidden + h] = ns;
             sumS += ns;
         }
         if (isLeave) {
@@ -560,11 +560,13 @@ inline void qwg_mhc_merge_f16_impl(device float*       mhcStream,
         for (uint i = 0u; i < 8u; ++i) totSS += partSS[i];
         const float rstd = rsqrt(totSS / float(hidden) + eps);
         device half* dst = nextNormOut + (size_t)t * hidden;
-        for (uint h = tid; h < hidden; h += 256u) {
-            const float xf = float(xOut[(size_t)t * hidden + h]);
-            float v = xf * rstd * (1.0f + float(nextGamma[h]));
+        const uint lim = (hidden + 255u) & ~255u;
+        for (uint b0 = 0u; b0 < lim; b0 += 256u) {
+            const uint h = b0 + tid;
+            const float xf = (h < hidden) ? float(xOut[(size_t)t * hidden + h]) : 0.0f;
+            float v = (h < hidden) ? (xf * rstd * (1.0f + float(nextGamma[h]))) : 0.0f;
             v = qwg_fwht32_lane_f32(v, lane);
-            dst[h] = half(v);
+            if (h < hidden) dst[h] = half(v);
         }
     }
 }
@@ -670,7 +672,7 @@ inline void qwg_mhc_exit_head_f16_impl(device const float* mhcStream,
         for (uint h = tid; h < hidden; h += 256u) {
             float bv = 0.0f;
             #pragma unroll
-            for (uint c = 0u; c < C; ++c) bv = fma(pre[c], sBase[c * hidden + h], bv);
+            for (uint c = 0u; c < C; ++c) bv = fma(pre[c], sBase[(size_t)c * hidden + h], bv);
             dst16[h] = half(bv);
             if (writeRot32) dst32[h] = bv;
         }
@@ -681,7 +683,7 @@ inline void qwg_mhc_exit_head_f16_impl(device const float* mhcStream,
     for (uint h = tid; h < hidden; h += 256u) {
         float bv = 0.0f;
         #pragma unroll
-        for (uint c = 0u; c < C; ++c) bv = fma(pre[c], sBase[c * hidden + h], bv);
+        for (uint c = 0u; c < C; ++c) bv = fma(pre[c], sBase[(size_t)c * hidden + h], bv);
         bss = fma(bv, bv, bss);
     }
     bss = simd_sum(bss);
@@ -696,7 +698,7 @@ inline void qwg_mhc_exit_head_f16_impl(device const float* mhcStream,
         float bv = 0.0f;
         if (h < hidden) {
             #pragma unroll
-            for (uint c = 0u; c < C; ++c) bv = fma(pre[c], sBase[c * hidden + h], bv);
+            for (uint c = 0u; c < C; ++c) bv = fma(pre[c], sBase[(size_t)c * hidden + h], bv);
         }
         float v = bv * rstdOut * (1.0f + (h < hidden ? float(normGamma[h]) : 0.0f));
         v = qwg_fwht32_lane_f32(v, lane);

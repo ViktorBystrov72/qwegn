@@ -137,9 +137,9 @@ extension QWEngineLifecycleActor {
         let indexStart = Date()
         let rootURL = try resolveInspectionRootURL(at: request.path)
         try await selectModelIfNeeded(request.model)
-        await waitForInFlightRequests()
-        beginInFlightRequest()
-        defer { endInFlightRequest() }
+        return try await withExclusiveTransition {
+            await waitForInFlightRequests()
+            defer { memoryDeltaCache.invalidate() }
 
         let existingManifest = try? QWMemoryManifest.load(from: rootURL)
         let reqPackName = request.packName?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -280,8 +280,9 @@ extension QWEngineLifecycleActor {
                 lsaConfig: updatedLSA,
                 sourceSummary: updatedSources
             )
-            _ = try await unloadExplicit(waitForInFlight: false)
+            _ = try await unloadModel(waitForInFlight: false, forReconfigure: true)
             self.config = indexConfig
+            self.configRevision &+= 1
             self.statusBox.updateConfig(indexConfig)
         } else if case .unloaded = state {
             onProgress?(QWMemoryIndexProgressEvent(
@@ -415,10 +416,15 @@ extension QWEngineLifecycleActor {
                 progressFraction: 0.97,
                 message: "Mounting .qwcache in warm RAM..."
             ))
-            mountedInfo = try await mountMemoryPack(at: rootURL.path)
+            mountedInfo = try await mountMemoryPackHoldingTransition(
+                at: rootURL.path,
+                waitForInFlight: false,
+                skipIfAlreadyMounted: false
+            )
         } else if needsConfigReload {
-            _ = try? await unloadExplicit(waitForInFlight: false)
+            _ = try? await unloadModel(waitForInFlight: false, forReconfigure: true)
             self.config = savedPreConfig
+            self.configRevision &+= 1
             self.statusBox.updateConfig(savedPreConfig)
         }
 
@@ -451,9 +457,10 @@ extension QWEngineLifecycleActor {
             progressFraction: 1.0,
             message: String(format: "Indexed %d files (%d tokens, %.2f MiB) in %.1fs",
                             builtFilesTotal, totalPrefillTokens, mib, elapsed),
-            result: result
-        ))
-        return result
+                result: result
+            ))
+            return result
+        }
     }
 
     private func resolveInspectionRootURL(at rawPath: String) throws -> URL {

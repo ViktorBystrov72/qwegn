@@ -72,10 +72,7 @@ public final class QWLSAOperator: @unchecked Sendable {
     let psoSelectHist2: any MTLComputePipelineState
     let psoSelectExpand: any MTLComputePipelineState
     let psoSelectFinalize: any MTLComputePipelineState
-    let coarsePipelines: QWCoarsePoolIndex.Pipelines?
-    let psoEmeansScoreCoarse: (any MTLComputePipelineState)?
-    let psoEmeansScoreCands: (any MTLComputePipelineState)?
-    let psoEmeansFlatFallback: (any MTLComputePipelineState)?
+    let coarsePipeline: QWCoarseSelectionPipeline?
 
     /// Parallel selector scratch (zero at rest; restored by `qwg_lsa_select_finalize`).
     let selCScore: QWTensorValue
@@ -141,17 +138,9 @@ public final class QWLSAOperator: @unchecked Sendable {
         self.psoSelectHist2 = try hal.pipeline("qwg_lsa_select_hist2")
         self.psoSelectExpand = try hal.pipeline("qwg_lsa_select_expand")
         self.psoSelectFinalize = try hal.pipeline("qwg_lsa_select_finalize")
-        if emeans {
-            self.coarsePipelines = try QWCoarsePoolIndex.Pipelines(hal: hal)
-            self.psoEmeansScoreCoarse = try hal.pipeline("qwg_emeans_lsa_score_coarse")
-            self.psoEmeansScoreCands = try hal.pipeline("qwg_emeans_lsa_score_cands")
-            self.psoEmeansFlatFallback = try hal.pipeline("qwg_emeans_lsa_flat_fallback")
-        } else {
-            self.coarsePipelines = nil
-            self.psoEmeansScoreCoarse = nil
-            self.psoEmeansScoreCands = nil
-            self.psoEmeansFlatFallback = nil
-        }
+        let loadedCoarse = emeans
+            ? try QWCoarseSelectionPipeline.LoadedPipelines.load(hal: hal, variant: .lsa)
+            : nil
 
         let nAttnLayers = layerWeights.count
         var cursor = 0
@@ -269,8 +258,19 @@ public final class QWLSAOperator: @unchecked Sendable {
                                       shape: QWTensorShape([selectBatch, markStride], .i32))
         self.selCandM = QWTensorValue(region: reg, offset: selCandMOff,
                                       shape: QWTensorShape([selectBatch, candCap], .i32))
-        self.selCandU = QWTensorValue(region: reg, offset: selCandUOff,
-                                      shape: QWTensorShape([selectBatch, candCap], .i32))
+        let candUVal = QWTensorValue(region: reg, offset: selCandUOff,
+                                     shape: QWTensorShape([selectBatch, candCap], .i32))
+        self.selCandU = candUVal
+        if let loadedCoarse {
+            let scratch = QWCoarsePoolIndex.Scratch(
+                cScore: selCScore, uHist: selHist, candState: selCount,
+                candPools: selCandM, candU: candUVal,
+                maxBatchRows: Self.maxSelectBatchRows, clusterStride: maxBuckets, candCap: candCap)
+            self.coarsePipeline = QWCoarseSelectionPipeline(
+                variant: .lsa, loaded: loadedCoarse, scratch: scratch, layerCount: nAttnLayers)
+        } else {
+            self.coarsePipeline = nil
+        }
     }
 
     /// Mirrors `LSASelParams` in qwlsa.metal.

@@ -152,9 +152,10 @@ static inline void qwg_shvq_silu_pair_rows4_m(device const char* blocks,
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sgi < mRows && rBase + lane < I) {
-        const half val = tgAct[sgi * 32u + lane];
-        h16[(size_t)sgi * I + rBase + lane] = fuseFwht ? simd_fwht32(val, lane) : val;
+    if (sgi < mRows) {
+        const half val = (rBase + lane < I) ? tgAct[sgi * 32u + lane] : half(0.0h);
+        const half rot = fuseFwht ? simd_fwht32(val, lane) : val;
+        if (rBase + lane < I) h16[(size_t)sgi * I + rBase + lane] = rot;
     }
 }
 
@@ -197,7 +198,8 @@ static inline void qwg_shvq_gdn_store_row(uint row, float vx, device half* y16,
         y16[row] = half(vx);
     } else if (row < bRow0) {
         const uint h = row - aRow0;
-        const float sp = log(1.0f + exp(vx + dtBias[h]));
+        const float spIn = vx + dtBias[h];
+        const float sp = (spIn > 20.0f) ? spIn : log(1.0f + exp(spIn));
         glog[h] = -exp(aLog[h]) * sp;
         if (y32) y32[row] = vx;
         y16[row] = half(vx);
@@ -341,9 +343,10 @@ static inline void qwg_gemv_shvq_gdn_rows4_m_body(device const char* blocks,
                 }                                                                      \
             }                                                                          \
             threadgroup_barrier(mem_flags::mem_threadgroup);                           \
-            if (sgi == 0u && rBase + lane < I) {                                       \
-                const half val = tgAct[lane];                                          \
-                h16[rBase + lane] = fuseFwht ? simd_fwht32(val, lane) : val;           \
+            if (sgi == 0u) {                                                           \
+                const half val = (rBase + lane < I) ? tgAct[lane] : half(0.0h);        \
+                const half rot = fuseFwht ? simd_fwht32(val, lane) : val;              \
+                if (rBase + lane < I) h16[rBase + lane] = rot;                         \
             }                                                                          \
             return;                                                                    \
         }                                                                              \

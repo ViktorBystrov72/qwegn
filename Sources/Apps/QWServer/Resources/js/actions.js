@@ -23,8 +23,7 @@ function renderModelsCards() {
   container.innerHTML = supported.map((m) => {
     const isActive = activeName && (m.name === activeName);
     const caps = (m.capabilities || []).map((c) => `<span class="knob-pill mono">${escapeHtml(c)}</span>`).join("");
-    const encodedName = encodeURIComponent(m.name || "");
-    const encodedPath = encodeURIComponent(m.packPath || "");
+    const modelName = String(m.name || "");
     const fullPath = String(m.packPath || "");
     return `
       <div class="model-card">
@@ -39,7 +38,7 @@ function renderModelsCards() {
           ${caps ? `<div class="model-card-caps">${caps}</div>` : ""}
         </div>
         <div class="model-card-foot">
-          <button type="button" class="btn ${isActive ? "" : "btn-primary"} btn-sm" style="white-space:nowrap;" onclick="selectAndApplyModel(decodeURIComponent('${encodedName}'), decodeURIComponent('${encodedPath}'))">
+          <button type="button" class="btn ${isActive ? "" : "btn-primary"} btn-sm" style="white-space:nowrap;" data-select-model-name="${escapeHtml(modelName)}" data-select-model-path="${escapeHtml(fullPath)}">
             ${isActive ? "Reload Model" : "Activate"}
           </button>
         </div>
@@ -88,10 +87,10 @@ function openSwitchModelModal() {
   loadDiscoveredModels().then(() => {
     const supported = discoveredModelsList.filter((m) => m.supported !== false);
     list.innerHTML = supported.map((m) => {
-      const encodedName = encodeURIComponent(m.name || "");
-      const encodedPath = encodeURIComponent(m.packPath || "");
+      const modelName = String(m.name || "");
+      const packPath = String(m.packPath || "");
       return `
-        <button type="button" class="btn" style="justify-content:space-between;width:100%;" onclick="selectAndApplyModel(decodeURIComponent('${encodedName}'), decodeURIComponent('${encodedPath}')); closeSwitchModelModal();">
+        <button type="button" class="btn" style="justify-content:space-between;width:100%;" data-select-model-name="${escapeHtml(modelName)}" data-select-model-path="${escapeHtml(packPath)}" data-close-switch-modal="true">
           <span>${escapeHtml(m.name)}</span>
           <span class="ink-primary mono">Select</span>
         </button>`;
@@ -108,7 +107,10 @@ function closeSwitchModelModal() {
 async function unloadModel() {
   if (!confirm("Unload active model weights from unified memory? The HTTP server will remain available.")) return;
   try {
-    const res = await fetch(`${API_BASE}/v1/models/unload`, { method: "POST" });
+    const res = await fetch(`${API_BASE}/v1/models/unload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const reclaimed = typeof data.memoryReclaimedMB === "number"
@@ -121,7 +123,10 @@ async function unloadModel() {
 
 async function reloadOrLoadModel() {
   try {
-    const res = await fetch(`${API_BASE}/v1/models/load`, { method: "POST" });
+    const res = await fetch(`${API_BASE}/v1/models/load`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     showToast("Model load triggered.");
   } catch (e) {
@@ -132,7 +137,10 @@ async function reloadOrLoadModel() {
 async function restartEngine() {
   if (!confirm("Restart the resident model? Active requests will be interrupted.")) return;
   try {
-    const res = await fetch(`${API_BASE}/v1/engine/restart`, { method: "POST" });
+    const res = await fetch(`${API_BASE}/v1/engine/restart`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     showToast("Model restart requested.");
   } catch (e) {
@@ -285,7 +293,10 @@ function clearVisibleLogs() {
 
 async function revealLogsInFinder() {
   try {
-    const res = await fetch(`${API_BASE}/v1/logs/reveal`, { method: "POST" });
+    const res = await fetch(`${API_BASE}/v1/logs/reveal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
   } catch (err) {
     showToast("Reveal logs failed: " + err.message, true);
@@ -699,7 +710,10 @@ async function openSettingsMemoryPackModal() {
 
 async function unmountMemoryPackFromSettings() {
   try {
-    const res = await fetch(`${API_BASE}/v1/memory/unmount`, { method: "POST" });
+    const res = await fetch(`${API_BASE}/v1/memory/unmount`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }
+    });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
     showToast("Unmounted active .qwcache Memory Pack.");
@@ -712,11 +726,23 @@ async function unmountMemoryPackFromSettings() {
 
 async function revealSettingsInFinder() {
   try {
-    const res = await fetch(`${API_BASE}/v1/settings/reveal`, { method: "POST" });
+    const res = await fetch(`${API_BASE}/v1/settings/reveal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
   } catch (err) {
     showToast("Reveal settings failed: " + err.message, true);
   }
+}
+
+function handleDelegatedActionClick(event) {
+  const btn = event.target && event.target.closest ? event.target.closest("[data-select-model-name]") : null;
+  if (!btn) return;
+  const name = btn.getAttribute("data-select-model-name") || "";
+  const packPath = btn.getAttribute("data-select-model-path") || "";
+  selectAndApplyModel(name, packPath);
+  if (btn.getAttribute("data-close-switch-modal") === "true") closeSwitchModelModal();
 }
 
 if (typeof window !== "undefined") {
@@ -727,6 +753,10 @@ if (typeof window !== "undefined") {
 
     const tabParam = new URLSearchParams(window.location.search).get("tab");
     if (tabParam) switchTab(tabParam, false);
+
+    if (typeof document !== "undefined") {
+      document.addEventListener("click", handleDelegatedActionClick);
+    }
 
     wireSparklineHover();
     window.addEventListener("resize", syncHeroTitleMarquee);

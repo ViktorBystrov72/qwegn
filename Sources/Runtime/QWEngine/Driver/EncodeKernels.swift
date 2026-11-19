@@ -38,6 +38,28 @@ extension QWEngineDriver {
         y16.bind(enc, index: 8)
     }
 
+    static func resolveWeightPSO(
+        for wQ4: QWWeightView,
+        weightFormat: QWWeightFormat,
+        hal: QWHal,
+        defaultPSO: any MTLComputePipelineState,
+        opName: String,
+        incumbentKernel: String,
+        aqKernel: () -> String?
+    ) throws -> any MTLComputePipelineState {
+        let matchesDefault = wQ4.isIncumbentContainer == weightFormat.denseIsIncumbentContainer
+            && wQ4.bits == weightFormat.bits
+            && wQ4.groupSize == weightFormat.groupSize
+            && wQ4.isSHVQ == weightFormat.denseIsSHVQ
+        if matchesDefault { return defaultPSO }
+        let name = wQ4.isIncumbentContainer ? incumbentKernel : aqKernel()
+        guard let kernelName = name else {
+            throw QWEngineDriverError.unsupportedModel(
+                "no \(opName) kernel for \(wQ4.bits)-bit group \(wQ4.groupSize)")
+        }
+        return try hal.pipeline(kernelName)
+    }
+
     func gemvH16T4(_ enc: any MTLComputeCommandEncoder,
                    n: Int, k: Int, x: QWTensorValue, gs: QWTensorValue,
                    wQ4: QWWeightView, y16: QWTensorValue, y32: QWTensorValue? = nil) throws {
@@ -50,13 +72,13 @@ extension QWEngineDriver {
         let pso: any MTLComputePipelineState
         if y32 != nil {
             pso = psoGEMVDxH16DualT4
-        } else if !wQ4.isIncumbentContainer,
-                  (wQ4.bits != weightFormat.bits || wQ4.groupSize != weightFormat.groupSize
-                      || wQ4.isSHVQ != weightFormat.denseIsSHVQ || weightFormat.denseIsIncumbentContainer),
-                  let name = QWGemmAQ.decodeKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ) {
-            pso = try hal.pipeline(name)
         } else {
-            pso = psoGEMVDxH16T4
+            pso = try Self.resolveWeightPSO(
+                for: wQ4, weightFormat: weightFormat, hal: hal,
+                defaultPSO: psoGEMVDxH16T4, opName: "decode GEMV",
+                incumbentKernel: "qwg_gemv_q4g_dx_h16_t4",
+                aqKernel: { QWGemmAQ.decodeKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ) }
+            )
         }
         if wQ4.isIncumbentContainer {
             encodeGemvH16(enc, pso: pso, n: n, k: k, x: x, wQ4: wQ4, y16: y16, y32: y32)
@@ -75,20 +97,18 @@ extension QWEngineDriver {
                             aLog: QWTensorValue, dtBias: QWTensorValue,
                             betas: QWTensorValue, glog: QWTensorValue) throws {
         _ = gs
+        let pso = try Self.resolveWeightPSO(
+            for: wQ4, weightFormat: weightFormat, hal: hal,
+            defaultPSO: psoGEMVDxH16GdnInProjT4, opName: "GDN decode",
+            incumbentKernel: "qwg_gemv_q4g_dx_h16_gdn_inproj_t4",
+            aqKernel: { QWGemmAQ.gdnInProjDecodeKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ) }
+        )
         if wQ4.isIncumbentContainer {
-            encodeGemvH16(enc, pso: psoGEMVDxH16GdnInProjT4, n: n, k: k, x: x, wQ4: wQ4, y16: y16, y32: y32)
+            encodeGemvH16(enc, pso: pso, n: n, k: k, x: x, wQ4: wQ4, y16: y16, y32: y32)
             enc.bindTensors(aLog, dtBias, betas, glog, startIndex: 9)
             enc.dispatchThreadgroups(MTLSize(width: (n + 3) / 4, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
         } else {
-            let pso: any MTLComputePipelineState
-            if wQ4.bits != weightFormat.bits || wQ4.groupSize != weightFormat.groupSize
-                || wQ4.isSHVQ != weightFormat.denseIsSHVQ || weightFormat.denseIsIncumbentContainer,
-               let name = QWGemmAQ.gdnInProjDecodeKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ) {
-                pso = try hal.pipeline(name)
-            } else {
-                pso = psoGEMVDxH16GdnInProjT4
-            }
             encodeGemvH16(enc, pso: pso, n: n | 0x4000_0000, k: k, x: x, wQ4: wQ4, y16: y16, y32: y32)
             enc.bindTensors(aLog, dtBias, betas, glog, startIndex: 9)
             enc.dispatchThreadgroups(MTLSize(width: (n + 15) / 16, height: 1, depth: 1),
@@ -100,18 +120,14 @@ extension QWEngineDriver {
                         m: Int, n: Int, k: Int,
                         x: QWTensorValue, wQ4: QWWeightView,
                         y16: QWTensorValue,
-                        xStride: Int? = nil, yStride: Int? = nil) {
+                        xStride: Int? = nil, yStride: Int? = nil) throws {
         // BM64 beats BM128 at every M (QWGemm.encodeNaxF32); rows are chunked to keep x in the SLC.
-        let pso: any MTLComputePipelineState
-        if !wQ4.isIncumbentContainer,
-           (wQ4.bits != weightFormat.bits || wQ4.groupSize != weightFormat.groupSize
-               || wQ4.isSHVQ != weightFormat.denseIsSHVQ || weightFormat.denseIsIncumbentContainer),
-           let name = QWGemmAQ.gemmKernelName(bits: wQ4.bits, group: wQ4.groupSize, bm128: false, isSHVQ: wQ4.isSHVQ),
-           let customPSO = try? hal.pipeline(name) {
-            pso = customPSO
-        } else {
-            pso = psoGemmBatchedH16
-        }
+        let pso = try Self.resolveWeightPSO(
+            for: wQ4, weightFormat: weightFormat, hal: hal,
+            defaultPSO: psoGemmBatchedH16, opName: "prefill GEMM",
+            incumbentKernel: "qwg_gemm_q4g_h16",
+            aqKernel: { QWGemmAQ.gemmKernelName(bits: wQ4.bits, group: wQ4.groupSize, bm128: false, isSHVQ: wQ4.isSHVQ) }
+        )
         enc.setComputePipelineState(pso)
         enc.bindTensors(wQ4.blocks, x, y16, y16, startIndex: 0) // index 3 is dummy slot for unused y32
         enc.setUInt32s(n, k, startIndex: 5)
@@ -141,18 +157,13 @@ extension QWEngineDriver {
                               m: Int, i: Int, k: Int,
                               x: QWTensorValue, wQ4: QWWeightView,
                               out16: QWTensorValue,
-                              xStride: Int? = nil, yStride: Int? = nil) {
-        let pso: any MTLComputePipelineState
-        if wQ4.isIncumbentContainer != weightFormat.denseIsIncumbentContainer
-            || wQ4.bits != weightFormat.bits || wQ4.groupSize != weightFormat.groupSize
-            || wQ4.isSHVQ != weightFormat.denseIsSHVQ {
-            let name = wQ4.isIncumbentContainer
-                ? "qwg_gemm_q4g_h16_swiglu"
-                : QWGemmAQ.swigluGemmKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ)
-            pso = (name.flatMap { try? hal.pipeline($0) }) ?? psoGemmBatchedH16SwiGLU
-        } else {
-            pso = psoGemmBatchedH16SwiGLU
-        }
+                              xStride: Int? = nil, yStride: Int? = nil) throws {
+        let pso = try Self.resolveWeightPSO(
+            for: wQ4, weightFormat: weightFormat, hal: hal,
+            defaultPSO: psoGemmBatchedH16SwiGLU, opName: "fused SwiGLU GEMM",
+            incumbentKernel: "qwg_gemm_q4g_h16_swiglu",
+            aqKernel: { QWGemmAQ.swigluGemmKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ) }
+        )
         enc.setComputePipelineState(pso)
         enc.bindTensors(wQ4.blocks, x, out16, startIndex: 0)
         let xs = xStride ?? k, ys = yStride ?? i
@@ -286,18 +297,14 @@ extension QWEngineDriver {
 
     func mlpSiluPairH16(_ enc: any MTLComputeCommandEncoder,
                         x: QWTensorValue, gs: QWTensorValue, wQ4: QWWeightView,
-                        h16: QWTensorValue, fuseFwht32: Bool = false) {
+                        h16: QWTensorValue, fuseFwht32: Bool = false) throws {
         _ = gs
-        let pso: any MTLComputePipelineState
-        if !wQ4.isIncumbentContainer,
-           (wQ4.bits != weightFormat.bits || wQ4.groupSize != weightFormat.groupSize
-               || wQ4.isSHVQ != weightFormat.denseIsSHVQ || weightFormat.denseIsIncumbentContainer),
-           let name = QWGemmAQ.siluPairKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ),
-           let customPSO = try? hal.pipeline(name) {
-            pso = customPSO
-        } else {
-            pso = psoGEMVSiluPairH16
-        }
+        let pso = try Self.resolveWeightPSO(
+            for: wQ4, weightFormat: weightFormat, hal: hal,
+            defaultPSO: psoGEMVSiluPairH16, opName: "MLP SiLU pair GEMV",
+            incumbentKernel: "qwg_gemv_q4g_silu_pair_dx_h16",
+            aqKernel: { QWGemmAQ.siluPairKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ) }
+        )
         enc.setComputePipelineState(pso)
         enc.bindTensors(wQ4.blocks, x, startIndex: 0)
         h16.bind(enc, index: 3)

@@ -373,7 +373,7 @@ kernel void qwg_mla_sparse_attn(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float localMax = -INFINITY;
+    float localMax = -1e30f;
     for (uint s = d; s < slots; s += 256u) {
         localMax = max(localMax, score[s]);
     }
@@ -381,7 +381,7 @@ kernel void qwg_mla_sparse_attn(
     if (lane == 0u) sgScratch[sg] = localMax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0u) {
-        float vMax = (lane < 8u) ? sgScratch[lane] : -INFINITY;
+        float vMax = (lane < 8u) ? sgScratch[lane] : -1e30f;
         vMax = simd_max(vMax);
         if (lane == 0u) sgScratch[0] = vMax;
     }

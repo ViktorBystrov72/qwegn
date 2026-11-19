@@ -112,6 +112,7 @@ public enum QWPaths {
 public enum QWEngineInstanceError: Error, LocalizedError, CustomStringConvertible, Equatable {
     case engineAlreadyRunning(pid: Int32)
     case menuAlreadyRunning(pid: Int32)
+    case lockOpenFailed(path: String, errno: Int32)
 
     public var description: String {
         switch self {
@@ -119,6 +120,8 @@ public enum QWEngineInstanceError: Error, LocalizedError, CustomStringConvertibl
             return "Refusing to start a second engine instance: another qwg engine is already running (PID \(pid)). Stop it first before launching a new engine."
         case .menuAlreadyRunning(let pid):
             return "Another qwg-menu instance is already running (PID \(pid))."
+        case .lockOpenFailed(let path, let err):
+            return "Failed to acquire instance lock at '\(path)': \(String(cString: strerror(err)))"
         }
     }
 
@@ -136,98 +139,121 @@ public enum QWEngineInstanceLock {
     /// Idempotent within the same process. Throws `QWEngineInstanceError.engineAlreadyRunning`
     /// if another OS process currently holds the engine lock.
     public static func acquireEngineLock() throws {
-        lock.lock()
-        defer { lock.unlock() }
-        if engineLockFD >= 0 { return }
-
-        try? QWPaths.ensurePrivateDirectory(QWPaths.rootDirectoryURL)
-        let path = QWPaths.engineLockFilePath
-        let fd = open(path, O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else { return }
-        _ = fchmod(fd, 0o600)
-
-        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            let existingPid = readPID(fromPath: path) ?? readPID(fromPath: QWPaths.pidFilePath) ?? -1
-            close(fd)
-            throw QWEngineInstanceError.engineAlreadyRunning(pid: existingPid)
+        try lock.withLock {
+            if engineLockFD >= 0 { return }
+            try QWPaths.ensurePrivateDirectory(QWPaths.rootDirectoryURL)
+            let fd = try acquireLockFile(
+                at: QWPaths.engineLockFilePath,
+                fallbackPIDPath: QWPaths.pidFilePath,
+                alreadyRunning: { QWEngineInstanceError.engineAlreadyRunning(pid: $0) }
+            )
+            try? "\(ProcessInfo.processInfo.processIdentifier)".write(
+                toFile: QWPaths.pidFilePath, atomically: true, encoding: .utf8
+            )
+            QWPaths.setPrivateFilePermissions(atPath: QWPaths.pidFilePath)
+            engineLockFD = fd
         }
-
-        let pidStr = "\(ProcessInfo.processInfo.processIdentifier)\n"
-        _ = ftruncate(fd, 0)
-        _ = lseek(fd, 0, SEEK_SET)
-        pidStr.withCString { ptr in
-            _ = write(fd, ptr, strlen(ptr))
-        }
-        try? "\(ProcessInfo.processInfo.processIdentifier)".write(
-            toFile: QWPaths.pidFilePath, atomically: true, encoding: .utf8
-        )
-        QWPaths.setPrivateFilePermissions(atPath: QWPaths.pidFilePath)
-        engineLockFD = fd
     }
 
     /// Releases the engine lock held by this process, if any.
     public static func releaseEngineLock() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard engineLockFD >= 0 else { return }
-        _ = flock(engineLockFD, LOCK_UN)
-        close(engineLockFD)
-        engineLockFD = -1
-        try? FileManager.default.removeItem(atPath: QWPaths.pidFilePath)
+        lock.withLock {
+            guard engineLockFD >= 0 else { return }
+            _ = ftruncate(engineLockFD, 0)
+            _ = flock(engineLockFD, LOCK_UN)
+            close(engineLockFD)
+            engineLockFD = -1
+            try? FileManager.default.removeItem(atPath: QWPaths.pidFilePath)
+        }
     }
 
-    /// Returns the PID of a currently running `qwg` engine process if another process holds the lock, or `nil`.
+    /// Returns the PID of a currently running `qwg` engine process if another process is running, or `nil`.
     public static func runningEnginePID() -> Int32? {
-        lock.lock()
-        let heldHere = engineLockFD >= 0
-        lock.unlock()
+        let heldHere = lock.withLock { engineLockFD >= 0 }
         if heldHere {
             return ProcessInfo.processInfo.processIdentifier
         }
-        let path = QWPaths.engineLockFilePath
-        let fd = open(path, O_RDONLY)
-        if fd >= 0 {
-            if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-                close(fd)
-                if let pid = readPID(fromPath: path), pid > 0, kill(pid, 0) == 0 {
-                    return pid
-                }
-            } else {
-                _ = flock(fd, LOCK_UN)
-                close(fd)
-            }
-        }
-        if let pid = readPID(fromPath: QWPaths.pidFilePath), pid > 0, kill(pid, 0) == 0 {
-            return pid
-        }
-        return nil
+        return runningEnginePID(
+            lockFilePath: QWPaths.engineLockFilePath,
+            pidFilePath: QWPaths.pidFilePath
+        )
     }
 
     /// Acquires an exclusive kernel lock for `qwg-menu` so two menu bar apps never run simultaneously.
     public static func acquireMenuLock() throws {
-        lock.lock()
-        defer { lock.unlock() }
-        if menuLockFD >= 0 { return }
-
-        try? QWPaths.ensurePrivateDirectory(QWPaths.rootDirectoryURL)
-        let path = QWPaths.menuLockFilePath
-        let fd = open(path, O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else { return }
-        _ = fchmod(fd, 0o600)
-
-        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            let existingPid = readPID(fromPath: path) ?? -1
-            close(fd)
-            throw QWEngineInstanceError.menuAlreadyRunning(pid: existingPid)
+        try lock.withLock {
+            if menuLockFD >= 0 { return }
+            try QWPaths.ensurePrivateDirectory(QWPaths.rootDirectoryURL)
+            menuLockFD = try acquireLockFile(
+                at: QWPaths.menuLockFilePath,
+                fallbackPIDPath: nil,
+                alreadyRunning: { QWEngineInstanceError.menuAlreadyRunning(pid: $0) }
+            )
         }
+    }
 
+    static func acquireLockFile(
+        at path: String,
+        fallbackPIDPath: String?,
+        alreadyRunning: (Int32) -> QWEngineInstanceError
+    ) throws -> Int32 {
+        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            throw QWEngineInstanceError.lockOpenFailed(path: path, errno: errno)
+        }
+        _ = fchmod(fd, 0o600)
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let lockErr = errno
+            let fallbackPid = fallbackPIDPath.flatMap { readPID(fromPath: $0) }
+            let existingPid = readPID(fromPath: path) ?? fallbackPid ?? -1
+            close(fd)
+            if lockErr == EWOULDBLOCK || lockErr == EAGAIN {
+                throw alreadyRunning(existingPid)
+            }
+            throw QWEngineInstanceError.lockOpenFailed(path: path, errno: lockErr)
+        }
         let pidStr = "\(ProcessInfo.processInfo.processIdentifier)\n"
         _ = ftruncate(fd, 0)
         _ = lseek(fd, 0, SEEK_SET)
         pidStr.withCString { ptr in
-            _ = write(fd, ptr, strlen(ptr))
+            var remaining = strlen(ptr)
+            var offset = 0
+            while remaining > 0 {
+                let wrote = write(fd, ptr.advanced(by: offset), remaining)
+                if wrote < 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
+                if wrote == 0 { break }
+                offset += wrote
+                remaining -= wrote
+            }
         }
-        menuLockFD = fd
+        return fd
+    }
+
+    static func runningEnginePID(
+        lockFilePath: String,
+        pidFilePath: String,
+        processVerifier: (Int32) -> Bool = isVerifiedEngineProcess(pid:)
+    ) -> Int32? {
+        for path in [lockFilePath, pidFilePath] {
+            if let pid = readPID(fromPath: path),
+               pid > 0,
+               kill(pid, 0) == 0,
+               processVerifier(pid) {
+                return pid
+            }
+        }
+        return nil
+    }
+
+    static func isVerifiedEngineProcess(pid: Int32) -> Bool {
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return false }
+        let path = String(decoding: buffer.prefix(Int(length)), as: UTF8.self)
+        return URL(fileURLWithPath: path).lastPathComponent == "qwg"
     }
 
     private static func readPID(fromPath path: String) -> Int32? {

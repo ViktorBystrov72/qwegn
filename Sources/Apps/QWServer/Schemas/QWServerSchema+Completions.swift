@@ -293,3 +293,50 @@ public struct DetokenizeResponse: Codable, Sendable, Equatable {
         self.prompt = prompt
     }
 }
+
+public struct CompletionInvalidInputError: Error, CustomStringConvertible, Sendable {
+    public let message: String
+    public init(_ message: String) { self.message = message }
+    public var description: String { message }
+}
+
+public struct CompletionExecutionChoice: Sendable {
+    public let index: Int
+    public let text: String
+    public let finishReason: String
+    public let promptTokens: Int
+    public let completionTokens: Int
+    public let logprobs: CompletionLogprobs?
+
+    public init(
+        index: Int,
+        text: String,
+        finishReason: String,
+        promptTokens: Int,
+        completionTokens: Int,
+        logprobs: CompletionLogprobs?
+    ) {
+        self.index = index
+        self.text = text
+        self.finishReason = finishReason
+        self.promptTokens = promptTokens
+        self.completionTokens = completionTokens
+        self.logprobs = logprobs
+    }
+}
+
+public struct CompletionExecutionResult: Sendable {
+    public let choices: [CompletionExecutionChoice]
+    public let totalPromptTokens: Int
+    public let totalCompletionTokens: Int
+
+    public init(
+        choices: [CompletionExecutionChoice],
+        totalPromptTokens: Int,
+        totalCompletionTokens: Int
+    ) {
+        self.choices = choices
+        self.totalPromptTokens = totalPromptTokens
+        self.totalCompletionTokens = totalCompletionTokens
+    }
+}

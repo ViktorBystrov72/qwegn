@@ -98,6 +98,9 @@ public struct QWVisionGrid: Equatable, Sendable {
     public let t: Int, h: Int, w: Int
     public let spec: QWMMSpec
     public init(t: Int, h: Int, w: Int, spec: QWMMSpec = .qwen3VLReference) throws {
+        guard t > 0, h > 0, w > 0, spec.merge > 0, spec.patch > 0, spec.temporal > 0, spec.posSide > 0 else {
+            throw QWGridError.mergeShape(t: t, h: h, w: w)
+        }
         guard h % spec.merge == 0, w % spec.merge == 0 else {
             throw QWGridError.mergeShape(t: t, h: h, w: w)
         }
@@ -135,22 +138,47 @@ public enum QWMMConfig {
         maxPixels: Int? = nil,
         spec: QWMMSpec = .qwen3VLReference
     ) throws -> (h: Int, w: Int) {
+        guard height > 0, width > 0 else {
+            throw QWGridError.pixelDimensions(
+                expectedH: max(1, height), expectedW: max(1, width), actualH: height, actualW: width
+            )
+        }
+        guard spec.factor > 0 else {
+            throw QWGridError.mergeShape(t: 1, h: spec.patch, w: spec.merge)
+        }
         guard Double(max(height, width)) / Double(min(height, width)) < 200 else {
             throw QWGridError.aspectRatio(max: max(height, width), min: min(height, width))
         }
         let factor = Double(spec.factor)
         let budgetMax = maxPixels ?? spec.maxPixels
         let budgetMin = spec.minPixels
-        var hBar = pyRound(Double(height) / factor) * factor
-        var wBar = pyRound(Double(width) / factor) * factor
+        guard budgetMax >= spec.factor * spec.factor, budgetMin >= 0 else {
+            throw QWGridError.pixelDimensions(
+                expectedH: spec.factor, expectedW: spec.factor, actualH: height, actualW: width
+            )
+        }
+        var hBar = max(factor, pyRound(Double(height) / factor) * factor)
+        var wBar = max(factor, pyRound(Double(width) / factor) * factor)
+        let area = Double(height) * Double(width)
         if hBar * wBar > Double(budgetMax) {
-            let beta = (Double(height * width) / Double(budgetMax)).squareRoot()
+            let beta = (area / Double(budgetMax)).squareRoot()
             hBar = max(factor, (Double(height) / beta / factor).rounded(.down) * factor)
             wBar = max(factor, (Double(width) / beta / factor).rounded(.down) * factor)
         } else if hBar * wBar < Double(budgetMin) {
-            let beta = (Double(budgetMin) / Double(height * width)).squareRoot()
-            hBar = (Double(height) * beta / factor).rounded(.up) * factor
-            wBar = (Double(width) * beta / factor).rounded(.up) * factor
+            let beta = (Double(budgetMin) / area).squareRoot()
+            hBar = max(factor, (Double(height) * beta / factor).rounded(.up) * factor)
+            wBar = max(factor, (Double(width) * beta / factor).rounded(.up) * factor)
+        }
+        while hBar * wBar > Double(budgetMax) {
+            if wBar >= hBar && wBar > factor {
+                wBar = max(factor, min(wBar - factor, (Double(budgetMax) / hBar / factor).rounded(.down) * factor))
+            } else if hBar > factor {
+                hBar = max(factor, min(hBar - factor, (Double(budgetMax) / wBar / factor).rounded(.down) * factor))
+            } else {
+                throw QWGridError.pixelDimensions(
+                    expectedH: spec.factor, expectedW: spec.factor, actualH: height, actualW: width
+                )
+            }
         }
         return (Int(hBar), Int(wBar))
     }
@@ -160,6 +188,7 @@ public enum QWMMConfig {
 
 /// Bilinear align_corners=True axis taps into a `side`-element embedding grid.
 func axisTaps(_ index: Int, size: Int, side: Int) -> (taps: [Int], weights: [Float]) {
+    guard side > 0 else { return ([0, 0], [1, 0]) }
     let denom = max(Float(size - 1), 1)
     let src = Float(index) * Float(side - 1) / denom
     let floorv = src.rounded(.down)
@@ -216,36 +245,41 @@ public func qwVisionRopePositions(grid: QWVisionGrid) -> [Int32] {
 
 // MARK: - F: mRope 3D positions
 
-public struct QWMMBlock: Equatable, Sendable {
-    public enum Kind: Equatable, Sendable { case text, image, video }
-    public let kind: Kind
-    public let tokens: [Int]
-    public let grid: QWVisionGrid?
-    public init(kind: Kind, tokens: [Int], grid: QWVisionGrid?) { self.kind = kind; self.tokens = tokens; self.grid = grid }
+public enum QWMMBlock: Equatable, Sendable {
+    case text([Int])
+    case image(tokens: [Int], grid: QWVisionGrid)
+    case video(tokens: [Int], grid: QWVisionGrid)
+
+    public var tokens: [Int] {
+        switch self {
+        case .text(let tokens), .image(let tokens, _), .video(let tokens, _):
+            return tokens
+        }
+    }
 }
 
 /// Builds 3-plane (t, h, w) mRope coordinates over text, image, and video blocks.
 public func qwMRopePositions(blocks: [QWMMBlock], merge: Int? = nil) -> (pos: [Int32], delta: Int) {
     var S = 0; for b in blocks { S += b.tokens.count }
+    guard S > 0 else { return ([], 0) }
     var pT = [Int32](), pH = [Int32](), pW = [Int32]()
     pT.reserveCapacity(S); pH.reserveCapacity(S); pW.reserveCapacity(S)
     var cur = 0
     for b in blocks {
-        switch b.kind {
-        case .text:
-            for i in 0..<b.tokens.count {
+        switch b {
+        case .text(let tokens):
+            for i in 0..<tokens.count {
                 let p = Int32(cur + i); pT.append(p); pH.append(p); pW.append(p)
             }
-            cur += b.tokens.count
-        case .image:
-            guard let g = b.grid else { preconditionFailure("qwMRopePositions: image block missing grid") }
+            cur += tokens.count
+        case .image(let tokens, let g):
             let m = merge ?? g.spec.merge
+            precondition(tokens.count == g.tokens, "image block token count ≠ grid tokens")
             emitCube(t: g.t, h: g.h, w: g.w, merge: m, cur: cur, &pT, &pH, &pW)
             cur += max(g.h, g.w) / m
-        case .video:
-            guard let g = b.grid else { preconditionFailure("qwMRopePositions: video block missing grid") }
+        case .video(let tokens, let g):
             let m = merge ?? g.spec.merge
-            precondition(b.tokens.count == g.tokens, "video block token count ≠ grid tokens")
+            precondition(tokens.count == g.tokens, "video block token count ≠ grid tokens")
             for _ in 0..<g.t {
                 emitCube(t: 1, h: g.h, w: g.w, merge: m, cur: cur, &pT, &pH, &pW)
                 cur += max(g.h, g.w) / m
@@ -283,6 +317,9 @@ private func buildPatchSlab(
     sampleCount: Int,
     readValue: (Int) -> Float
 ) throws -> [Float] {
+    guard grid.t == 1 else {
+        throw QWGridError.mergeShape(t: grid.t, h: grid.h, w: grid.w)
+    }
     let spec = grid.spec
     let expectedH = grid.h * spec.patch
     let expectedW = grid.w * spec.patch
@@ -391,7 +428,7 @@ public struct QWX0Plan: Equatable, Sendable {
         func flushText() {
             guard !textRun.isEmpty else { return }
             spans.append(QWX0Span(content: .text(tokenStart: out.count, count: textRun.count), rowStart: row))
-            blocks.append(QWMMBlock(kind: .text, tokens: textRun, grid: nil))
+            blocks.append(.text(textRun))
             out.append(contentsOf: textRun); row += textRun.count; textRun = []
         }
         for t in tokens {
@@ -401,7 +438,7 @@ public struct QWX0Plan: Equatable, Sendable {
                 flushText()
                 let exp = g.tokens
                 spans.append(QWX0Span(content: .vision(grid: g, patches: g.patches, rows: exp), rowStart: row))
-                blocks.append(QWMMBlock(kind: .image, tokens: Array(repeating: t, count: exp), grid: g))
+                blocks.append(.image(tokens: Array(repeating: t, count: exp), grid: g))
                 out.append(contentsOf: Array(repeating: t, count: exp)); row += exp
             } else if t == spec.videoToken {
                 guard vi < videos.count else { throw QWGridError.placeholderOverflow }
@@ -409,13 +446,16 @@ public struct QWX0Plan: Equatable, Sendable {
                 flushText()
                 let exp = g.tokens
                 spans.append(QWX0Span(content: .vision(grid: g, patches: g.patches, rows: exp), rowStart: row))
-                blocks.append(QWMMBlock(kind: .video, tokens: Array(repeating: t, count: exp), grid: g))
+                blocks.append(.video(tokens: Array(repeating: t, count: exp), grid: g))
                 out.append(contentsOf: Array(repeating: t, count: exp)); row += exp
             } else {
                 textRun.append(t)
             }
         }
         flushText()
+        guard ii == images.count, vi == videos.count else {
+            throw QWGridError.placeholderOverflow
+        }
         let rope = qwMRopePositions(blocks: blocks, merge: spec.merge)
         precondition(rope.pos.count == 3 * out.count)
         self.tokens = out; self.spans = spans; self.positions = rope.pos; self.mropeDelta = rope.delta
@@ -444,12 +484,16 @@ public func qwInterleaveX0(
     plan: QWX0Plan,
     hiddenDim: Int
 ) throws {
-    guard x0.count == plan.rows * hiddenDim else {
-        throw QWGridError.bufferLength(expected: plan.rows * hiddenDim, actual: x0.count)
+    guard hiddenDim >= 0 else {
+        throw QWGridError.bufferLength(expected: 0, actual: x0.count)
     }
-    x0.withUnsafeMutableBufferPointer { x0Buf in
-        textEmbeddings.withUnsafeBufferPointer { textBuf in
-            visualTokens.withUnsafeBufferPointer { visBuf in
+    let (expectedTotal, totalOverflow) = plan.rows.multipliedReportingOverflow(by: hiddenDim)
+    guard !totalOverflow, x0.count == expectedTotal else {
+        throw QWGridError.bufferLength(expected: totalOverflow ? Int.max : expectedTotal, actual: x0.count)
+    }
+    try x0.withUnsafeMutableBufferPointer { x0Buf in
+        try textEmbeddings.withUnsafeBufferPointer { textBuf in
+            try visualTokens.withUnsafeBufferPointer { visBuf in
                 var textOffset = 0
                 var visOffset = 0
                 for span in plan.spans {
@@ -459,13 +503,17 @@ public func qwInterleaveX0(
                     let count = rowCount * hiddenDim
                     switch span.content {
                     case .text:
-                        guard textOffset + count <= textBuf.count else { return }
+                        guard textOffset + count <= textBuf.count else {
+                            throw QWGridError.bufferLength(expected: textOffset + count, actual: textBuf.count)
+                        }
                         for i in 0..<count {
                             x0Buf[dstOffset + i] = textBuf[textOffset + i]
                         }
                         textOffset += count
                     case .vision:
-                        guard visOffset + count <= visBuf.count else { return }
+                        guard visOffset + count <= visBuf.count else {
+                            throw QWGridError.bufferLength(expected: visOffset + count, actual: visBuf.count)
+                        }
                         for i in 0..<count {
                             x0Buf[dstOffset + i] = visBuf[visOffset + i]
                         }

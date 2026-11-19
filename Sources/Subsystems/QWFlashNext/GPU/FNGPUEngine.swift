@@ -494,4 +494,46 @@ public final class FNGPUEngine: @unchecked Sendable {
         if let b = gpuPLETable?.buffer { hal.evictResident([b]) }
     }
 
+    /// Evaluates log-probabilities for prompt tokens `[1..<count]` in a single incremental pass.
+    public func computeEchoPromptLogprobs(
+        promptTokens: [Int],
+        sampling: QWSamplerConfig,
+        topLogprobsCount: Int,
+        shouldStop: (@Sendable () -> Bool)? = nil
+    ) throws -> [QWTokenLogprob] {
+        guard promptTokens.count >= 2 else { return [] }
+        return try batchScheduler.runExclusive {
+            let activeCap = activeCapacity
+            guard promptTokens.count < activeCap else {
+                throw FNGPUError.contextDoesNotFit(
+                    requested: promptTokens.count + 1,
+                    maxFitting: FNGPUDFlash.maxFittingContext(activeCapacity: activeCap)
+                )
+            }
+            wipeSessionState()
+            defer { wipeSessionState() }
+            var session = FNGPUSessionData(
+                history: [Int64(promptTokens[0])],
+                sampler: QWSampler(config: sampling),
+                useSpec: false,
+                collectLogprobs: false,
+                topLogprobsCount: max(0, min(20, topLogprobsCount)),
+                usePrefixCache: false
+            )
+            beginSession(&session, maxNew: 0)
+            _ = try encodePrefillChunk(&session, chunk: 0..<1, runsHead: true)
+            var out: [QWTokenLogprob] = []
+            out.reserveCapacity(promptTokens.count - 1)
+            recordTokenLogprob(&session, token: promptTokens[1], row: 0)
+            if let lp = session.tokenLogprobs.last { out.append(lp) }
+            for i in 1..<(promptTokens.count - 1) {
+                if shouldStop?() == true { break }
+                _ = try encodeDecodeToken(&session, token: promptTokens[i], position: i)
+                recordTokenLogprob(&session, token: promptTokens[i + 1], row: 0)
+                if let lp = session.tokenLogprobs.last { out.append(lp) }
+            }
+            return out
+        }
+    }
+
 }

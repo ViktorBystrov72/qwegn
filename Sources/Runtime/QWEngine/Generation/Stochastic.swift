@@ -184,11 +184,14 @@ extension QWEngineDriver {
             committedRound: { remaining in
                 let round = try self.prepareGreedyRound(session, maxNew: remaining, stopIDs: stopIds, permit: permit)
                 try self.commitGreedyVerification(session, round: round, drain: false, permit: permit)
-                if let cb = session.lastCommitCB, cb.status == .error {
-                    session.lastCommitCB = nil
-                    self.commandBufferErrors += 1
-                    session.stateFailed = true
-                    throw QWEngineDriverError.state("commit GPU failure during streaming speculative generation")
+                if let cb = session.lastCommitCB {
+                    let failed = cb.status == .error || self.syncCommitFailure(for: session, cb: nil)
+                    if failed {
+                        session.lastCommitCB = nil
+                        self.recordCommandBufferError(for: cb)
+                        session.stateFailed = true
+                        throw QWEngineDriverError.state("commit GPU failure during streaming speculative generation")
+                    }
                 }
                 return round.decision
             }, streamsCommittedRounds: true, onStopToken: onStopToken,
@@ -197,8 +200,13 @@ extension QWEngineDriver {
                 self.canRunSpeculativeRound(session)
                     && (self.activeConstraint?.constraint.isUnconstrainedNow ?? true)
             })
-        session.lastCommitCB?.waitUntilCompleted()
-        session.lastCommitCB = nil
+        if let cb = session.lastCommitCB {
+            session.lastCommitCB = nil
+            cb.waitUntilCompleted()
+            _ = syncCommitFailure(for: session, cb: cb)
+        } else {
+            _ = syncCommitFailure(for: session, cb: nil)
+        }
         guard !session.stateFailed else {
             throw QWEngineDriverError.state("commit GPU failure during experimental generation")
         }

@@ -50,6 +50,7 @@ kernel void qwg_mla_latent_prep(
 ) {
     if (t >= p.T) return;
     threadgroup float sgScratch[8];
+    threadgroup float sgMinScratch[8];
     threadgroup half shX[4096];
 
     const uint pos = p.pos0 + t;
@@ -129,18 +130,18 @@ kernel void qwg_mla_latent_prep(
                 float mVal = (lane < 8u) ? sgScratch[lane] : 0.0f;
                 mVal = simd_max(mVal);
                 if (lane == 0u) {
-                    const half scH = half(max(mVal / 127.0f, 1e-8f));
+                    const half scH = half(max(mVal / 127.0f, 6.103515625e-5f));
                     sgScratch[0] = float(scH);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const half scH = half(sgScratch[0]);
-            const float invSc = 1.0f / float(scH);
+            const float invSc = (float(scH) > 0.0f) ? (1.0f / float(scH)) : 0.0f;
             const size_t dataBytes = 256ul * halfRank;
             const size_t pageBytes = dataBytes + 256ul * 2ul;
             device uchar* pageBase = poolBytes + (size_t)pageID * pageBytes;
             device char* qRow = (device char*)(pageBase + (size_t)pageOff * halfRank);
-            qRow[col] = char(clamp(rint(v * invSc), -127.0f, 127.0f));
+            qRow[col] = char(clamp(round(v * invSc), -127.0f, 127.0f));
             if (col == 0u) {
                 *((device half*)(pageBase + dataBytes + (size_t)pageOff * 2ul)) = scH;
             }
@@ -150,20 +151,20 @@ kernel void qwg_mla_latent_prep(
             float minV = simd_min(v);
             float maxV = simd_max(v);
             if (lane == 0u) {
-                shX[sg] = half(minV);
+                sgMinScratch[sg] = minV;
                 sgScratch[sg] = maxV;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sg < 2u && lane < 4u) {
                 const uint sgIdx = sg * 4u + lane;
-                float gMin = float(shX[sgIdx]);
+                float gMin = sgMinScratch[sgIdx];
                 float gMax = sgScratch[sgIdx];
                 for (uint off = 2u; off >= 1u; off >>= 1u) {
                     gMin = min(gMin, simd_shuffle_xor(gMin, ushort(off)));
                     gMax = max(gMax, simd_shuffle_xor(gMax, ushort(off)));
                 }
                 if (lane == 0u) {
-                    const half scH = half(max((gMax - gMin) / 15.0f, 1e-8f));
+                    const half scH = half(max((gMax - gMin) / 15.0f, 6.103515625e-5f));
                     const half mnH = half(gMin);
                     sgScratch[sg * 2u + 0u] = float(scH);
                     sgScratch[sg * 2u + 1u] = float(mnH);
@@ -172,7 +173,8 @@ kernel void qwg_mla_latent_prep(
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const half scH = half(sgScratch[grp * 2u + 0u]);
             const half mnH = half(sgScratch[grp * 2u + 1u]);
-            const uint qNib = uint(clamp(rint((v - float(mnH)) / float(scH)), 0.0f, 15.0f));
+            const float invSc4 = (float(scH) > 0.0f) ? (1.0f / float(scH)) : 0.0f;
+            const uint qNib = uint(clamp(round((v - float(mnH)) * invSc4), 0.0f, 15.0f));
             shX[col] = half(qNib);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 

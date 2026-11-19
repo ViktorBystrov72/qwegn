@@ -15,7 +15,10 @@ extension QWLSASidecar {
         cols hidden: Int,
         rank indexDim: Int = QWLSAConfig.defaultIndexDim
     ) throws -> [UInt16] {
-        guard inDim >= indexDim, hidden > 0, matrix.count == inDim * hidden else {
+        let (matCount, ovMat) = inDim.multipliedReportingOverflow(by: hidden)
+        let (_, ovGram) = inDim.multipliedReportingOverflow(by: inDim)
+        guard indexDim > 0, inDim >= indexDim, hidden > 0,
+              !ovMat, !ovGram, matrix.count == matCount else {
             throw QWLSASidecarError.svdFailed("invalid dimensions rows=\(inDim) cols=\(hidden) rank=\(indexDim)")
         }
         // Form symmetric Gram matrix G = (1 / hidden) * W * W^T of shape [inDim, inDim]
@@ -23,10 +26,11 @@ extension QWLSASidecar {
         let scale: Float = 1.0 / Float(max(1, hidden))
         matrix.withUnsafeBufferPointer { wPtr in
             gram.withUnsafeMutableBufferPointer { gPtr in
+                guard let wBase = wPtr.baseAddress else { return }
                 for i in 0..<inDim {
-                    let rowI = wPtr.baseAddress!.advanced(by: i * hidden)
+                    let rowI = wBase.advanced(by: i * hidden)
                     for j in i..<inDim {
-                        let rowJ = wPtr.baseAddress!.advanced(by: j * hidden)
+                        let rowJ = wBase.advanced(by: j * hidden)
                         var dot: Float = 0
                         vDSP_dotpr(rowI, 1, rowJ, 1, &dot, vDSP_Length(hidden))
                         let val = dot * scale
@@ -78,9 +82,12 @@ extension QWLSASidecar {
             q.withUnsafeBufferPointer { qPtr in
                 gram.withUnsafeBufferPointer { gPtr in
                     y.withUnsafeMutableBufferPointer { yPtr in
-                        vDSP_mmul(qPtr.baseAddress!, 1,
-                                  gPtr.baseAddress!, 1,
-                                  yPtr.baseAddress!, 1,
+                        guard let qBase = qPtr.baseAddress,
+                              let gBase = gPtr.baseAddress,
+                              let yBase = yPtr.baseAddress else { return }
+                        vDSP_mmul(qBase, 1,
+                                  gBase, 1,
+                                  yBase, 1,
                                   vDSP_Length(indexDim), vDSP_Length(inDim), vDSP_Length(inDim))
                     }
                 }
@@ -93,22 +100,30 @@ extension QWLSASidecar {
         q.withUnsafeBufferPointer { qPtr in
             gram.withUnsafeBufferPointer { gPtr in
                 y.withUnsafeMutableBufferPointer { yPtr in
-                    vDSP_mmul(qPtr.baseAddress!, 1,
-                              gPtr.baseAddress!, 1,
-                              yPtr.baseAddress!, 1,
+                    guard let qBase = qPtr.baseAddress,
+                          let gBase = gPtr.baseAddress,
+                          let yBase = yPtr.baseAddress else { return }
+                    vDSP_mmul(qBase, 1,
+                              gBase, 1,
+                              yBase, 1,
                               vDSP_Length(indexDim), vDSP_Length(inDim), vDSP_Length(inDim))
                 }
             }
         }
         var rMat = [Float](repeating: 0, count: indexDim * indexDim)
-        for i in 0..<indexDim {
-            for j in i..<indexDim {
-                var dot: Float = 0
-                vDSP_dotpr(y.withUnsafeBufferPointer { $0.baseAddress! + i * inDim }, 1,
-                           q.withUnsafeBufferPointer { $0.baseAddress! + j * inDim }, 1,
-                           &dot, vDSP_Length(inDim))
-                rMat[i * indexDim + j] = dot
-                rMat[j * indexDim + i] = dot
+        y.withUnsafeBufferPointer { yPtr in
+            q.withUnsafeBufferPointer { qPtr in
+                guard let yBase = yPtr.baseAddress, let qBase = qPtr.baseAddress else { return }
+                for i in 0..<indexDim {
+                    let yRow = yBase.advanced(by: i * inDim)
+                    for j in i..<indexDim {
+                        let qRow = qBase.advanced(by: j * inDim)
+                        var dot: Float = 0
+                        vDSP_dotpr(yRow, 1, qRow, 1, &dot, vDSP_Length(inDim))
+                        rMat[i * indexDim + j] = dot
+                        rMat[j * indexDim + i] = dot
+                    }
+                }
             }
         }
         // Cyclic Jacobi on rMat [indexDim, indexDim]
@@ -183,6 +198,9 @@ extension QWLSASidecar {
         normPlusOne: Bool,
         loadLayerWeights: @Sendable (Int, QWModelDescriptor.LSAKeyProjectionSpec) throws -> (kProj: [Float], kNorm: [Float]?)
     ) throws -> [Int: (wq: [UInt16], wk: [UInt16])] {
+        guard indexDim > 0 else {
+            throw QWLSASidecarError.svdFailed("invalid indexDim=\(indexDim)")
+        }
         let layerSpecs: [(layer: Int, spec: QWModelDescriptor.LSAKeyProjectionSpec)] =
             (0..<descriptor.numLayers).compactMap { l in
                 descriptor.lsaKeyProjectionSpec(layer: l).map { (l, $0) }
@@ -196,9 +214,7 @@ extension QWLSASidecar {
         }
         let box = LayerBox()
         DispatchQueue.concurrentPerform(iterations: layerSpecs.count) { idx in
-            box.lock.lock()
-            let failed = box.firstError != nil
-            box.lock.unlock()
+            let failed = box.lock.withLock { box.firstError != nil }
             if failed { return }
             let (layer, spec) = layerSpecs[idx]
             let kvHeads = spec.headCount
@@ -208,10 +224,22 @@ extension QWLSASidecar {
             let inDim = kvHeads * sliceDim
             let cols = spec.inputDim
             do {
+                guard kvHeads > 0, headDim > 0, cols > 0,
+                      sliceStart >= 0, sliceDim > 0, sliceStart + sliceDim <= headDim else {
+                    throw QWLSASidecarError.svdFailed(
+                        "layer \(layer) invalid LSA projection spec"
+                    )
+                }
                 let (kProjFull, kNorm) = try loadLayerWeights(layer, spec)
                 guard kProjFull.count >= kvHeads * headDim * cols else {
                     throw QWLSASidecarError.svdFailed(
                         "layer \(layer) key proj count \(kProjFull.count) < \(kvHeads * headDim * cols)"
+                    )
+                }
+                if let kNorm, !kNorm.isEmpty,
+                   kNorm.count != headDim, kNorm.count < kvHeads * headDim {
+                    throw QWLSASidecarError.svdFailed(
+                        "layer \(layer) kNorm count \(kNorm.count) < required \(headDim) or \(kvHeads * headDim)"
                     )
                 }
                 var unrotMatrix = [Float](repeating: 0, count: inDim * cols)
@@ -241,13 +269,13 @@ extension QWLSASidecar {
                     cols: cols,
                     rank: indexDim
                 )
-                box.lock.lock()
-                box.outputs[layer] = (wq: basis, wk: basis)
-                box.lock.unlock()
+                box.lock.withLock {
+                    box.outputs[layer] = (wq: basis, wk: basis)
+                }
             } catch {
-                box.lock.lock()
-                if box.firstError == nil { box.firstError = error }
-                box.lock.unlock()
+                box.lock.withLock {
+                    if box.firstError == nil { box.firstError = error }
+                }
             }
         }
         if let err = box.firstError { throw err }
@@ -348,7 +376,12 @@ extension QWLSASidecar {
             guard let kProjName = names.proj.first(where: { container.tensor($0) != nil }) else {
                 throw QWLSASidecarError.tensorMissing(spec.tensorName)
             }
-            let kProjFull = try container.readFloats(kProjName)
+            let (projRows, ov0) = spec.headCount.multipliedReportingOverflow(by: spec.headDim)
+            let (expectedElems, ov1) = projRows.multipliedReportingOverflow(by: spec.inputDim)
+            guard !ov0, !ov1, expectedElems > 0 else {
+                throw QWLSASidecarError.svdFailed("layer \(layer) invalid key projection dimensions")
+            }
+            let kProjFull = try container.readFloats(kProjName, expectedElementCount: expectedElems)
             let kNorm = names.norm.compactMap { try? container.readFloats($0) }.first
             return (kProjFull, kNorm)
         }
@@ -379,6 +412,7 @@ extension QWLSASidecar {
         indexDim: Int = QWLSAConfig.defaultIndexDim,
         seed: UInt64 = 0x5157_4C53_4130_3031
     ) -> [UInt16] {
+        guard inDim > 0, indexDim > 0 else { return [] }
         var basis = [Float](repeating: 0, count: indexDim * inDim)
         var state = seed
         for d in 0..<indexDim {

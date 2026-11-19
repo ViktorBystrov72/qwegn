@@ -13,6 +13,7 @@ import QWQuant
 func qwLayerNormRow(_ x: UnsafePointer<Float>, _ out: UnsafeMutablePointer<Float>,
                     _ gamma: UnsafePointer<Float>?, _ beta: UnsafePointer<Float>?,
                     dim: Int, eps: Float) {
+    guard dim > 0 else { return }
     let vDim = vDSP_Length(dim)
     var m: Float = 0
     vDSP_meanv(x, 1, &m, vDim)
@@ -20,8 +21,13 @@ func qwLayerNormRow(_ x: UnsafePointer<Float>, _ out: UnsafeMutablePointer<Float
     vDSP_vsadd(x, 1, &negM, out, 1, vDim)
     var s2: Float = 0
     vDSP_svesq(out, 1, &s2, vDim)
-    var inv = Float(1.0 / (Double(s2) / Double(dim) + Double(eps)).squareRoot())
-    vDSP_vsmul(out, 1, &inv, out, 1, vDim)
+    let denom = (Double(s2) / Double(dim) + Double(eps)).squareRoot()
+    if denom > 0 && denom.isFinite {
+        var inv = Float(1.0 / denom)
+        vDSP_vsmul(out, 1, &inv, out, 1, vDim)
+    } else {
+        vDSP_vclr(out, 1, vDim)
+    }
     if let g = gamma, let b = beta {
         vDSP_vmul(out, 1, g, 1, out, 1, vDim)
         vDSP_vadd(out, 1, b, 1, out, 1, vDim)
@@ -31,6 +37,7 @@ func qwLayerNormRow(_ x: UnsafePointer<Float>, _ out: UnsafeMutablePointer<Float
 func qwLayerNormRows(_ x: UnsafePointer<Float>, _ out: UnsafeMutablePointer<Float>,
                      _ gamma: UnsafePointer<Float>?, _ beta: UnsafePointer<Float>?,
                      rows: Int, dim: Int, eps: Float) {
+    guard rows > 0, dim > 0 else { return }
     nonisolated(unsafe) let xPtr = x, oPtr = out, gPtr = gamma, bPtr = beta
     if rows >= 64 {
         let chunks = min(16, rows), perChunk = (rows + chunks - 1) / chunks
@@ -46,11 +53,16 @@ func qwLayerNormRows(_ x: UnsafePointer<Float>, _ out: UnsafeMutablePointer<Floa
 
 func qwLayerNorm(_ x: [Float], into out: inout [Float], gamma: [Float], beta: [Float],
                  rows: Int, dim: Int, eps: Float) {
+    guard rows > 0, dim > 0,
+          x.count >= rows * dim, out.count >= rows * dim,
+          gamma.count >= dim, beta.count >= dim else { return }
     x.withUnsafeBufferPointer { xb in
         out.withUnsafeMutableBufferPointer { ob in
             gamma.withUnsafeBufferPointer { g in
                 beta.withUnsafeBufferPointer { b in
-                    qwLayerNormRows(xb.baseAddress!, ob.baseAddress!, g.baseAddress!, b.baseAddress!,
+                    guard let xBase = xb.baseAddress, let oBase = ob.baseAddress,
+                          let gBase = g.baseAddress, let bBase = b.baseAddress else { return }
+                    qwLayerNormRows(xBase, oBase, gBase, bBase,
                                     rows: rows, dim: dim, eps: eps)
                 }
             }
@@ -215,7 +227,7 @@ public final class QWVisionWeights: @unchecked Sendable {
             f[i] = Float(1.0 / pow(cfg.ropeTheta, Double(2 * i) / Double(cfg.spatial)))
         }
         self.invFreq = f
-        ck.shards.removeAll(); ck.pack?.adviseDontNeed(); ck.pack = nil
+        ck.releaseBacking()
     }
 }
 
@@ -306,11 +318,13 @@ public final class QWVisionRef: @unchecked Sendable {
         let c = w.config
         let n = plan.nPatch, d = c.dim
         precondition(x.count == n * c.patchChannels && bins.nPatch == n && posIds.count == 2 * n)
+        guard n > 0, d > 0 else { return [] }
         let encodeStart = profileStart()
         var stageStart = profileStart()
         var s = [Float](repeating: 0, count: n * d)
         s.withUnsafeMutableBufferPointer { sb in
-            qwGemmRef(y: sb.baseAddress!, ldY: d, yBase: 0,
+            guard let sPtr = sb.baseAddress else { return }
+            qwGemmRef(y: sPtr, ldY: d, yBase: 0,
                       x: x, rows: n, w: w.patchW, nOut: d, nIn: c.patchChannels, bias: w.patchB)
         }
         profileEnd("patch_embed", since: stageStart)
@@ -349,18 +363,24 @@ public final class QWVisionRef: @unchecked Sendable {
 
     private func foldPosEmbed(into s: inout [Float], bins: InterpBins) {
         let d = w.config.dim
-        let n = bins.nPatch, vDim = vDSP_Length(d)
+        let n = bins.nPatch
+        guard n > 0, d > 0 else { return }
+        let numPos = w.posEmbed.count / d
+        guard numPos > 0 else { return }
+        let vDim = vDSP_Length(d)
         bins.idx.withUnsafeBufferPointer { ib in
             bins.wgt.withUnsafeBufferPointer { wb in
                 w.posEmbed.withUnsafeBufferPointer { tb in
                     s.withUnsafeMutableBufferPointer { sb in
-                        let sBase = sb.baseAddress!, tBase = tb.baseAddress!
-                        let iBase = ib.baseAddress!, wBase = wb.baseAddress!
+                        guard let sBase = sb.baseAddress, let tBase = tb.baseAddress,
+                              let iBase = ib.baseAddress, let wBase = wb.baseAddress else { return }
                         for p in 0..<n {
                             let sRow = sBase + p * d
                             for c in 0..<4 {
+                                let rawIdx = Int(iBase[p * 4 + c])
+                                guard rawIdx >= 0, rawIdx < numPos else { continue }
                                 var wc = wBase[p * 4 + c]
-                                let tc = tBase + Int(iBase[p * 4 + c]) * d
+                                let tc = tBase + rawIdx * d
                                 vDSP_vsma(tc, 1, &wc, sRow, 1, sRow, 1, vDim)
                             }
                         }
@@ -399,16 +419,18 @@ public final class QWVisionRef: @unchecked Sendable {
                        attnQBuf: inout [Float], attnKBuf: inout [Float], attnScoresBuf: inout [Float], maxSeg: Int) {
         let cfg = w.config
         let n = plan.nPatch, d = cfg.dim, qkvDim = cfg.qkvDim, mlpInner = cfg.mlpInner
+        let heads = cfg.heads, hd = cfg.headDim
+        guard n > 0, d > 0, heads > 0, hd > 0, qkvDim > 0, mlpInner > 0 else { return }
         var stageStart = profileStart()
         qwLayerNorm(s, into: &normedBuf, gamma: blk.norm1G, beta: blk.norm1B, rows: n, dim: d, eps: cfg.eps)
         profileEnd("\(profileTag ?? "block").norm1", since: stageStart)
         stageStart = profileStart()
         qkvBuf.withUnsafeMutableBufferPointer { qb in
-            qwGemmRef(y: qb.baseAddress!, ldY: qkvDim, yBase: 0,
+            guard let qPtr = qb.baseAddress else { return }
+            qwGemmRef(y: qPtr, ldY: qkvDim, yBase: 0,
                       x: normedBuf, rows: n, w: blk.qkvW, nOut: qkvDim, nIn: d, bias: blk.qkvB)
         }
         profileEnd("\(profileTag ?? "block").qkv", since: stageStart)
-        let heads = cfg.heads, hd = cfg.headDim
         let scale: Float = Float(1.0 / Double(hd).squareRoot())
         let vOffset = 2 * d
         stageStart = profileStart()
@@ -419,10 +441,14 @@ public final class QWVisionRef: @unchecked Sendable {
                         attnQBuf.withUnsafeMutableBufferPointer { aqb in
                             attnKBuf.withUnsafeMutableBufferPointer { akb in
                                 attnScoresBuf.withUnsafeMutableBufferPointer { ascb in
-                                    nonisolated(unsafe) let qkvBase = qkvB.baseAddress!, cosBase = cosB.baseAddress!
-                                    nonisolated(unsafe) let sinBase = sinB.baseAddress!, attnBase = ab.baseAddress!
-                                    nonisolated(unsafe) let qWorkBase = aqb.baseAddress!, kWorkBase = akb.baseAddress!
-                                    nonisolated(unsafe) let scWorkBase = ascb.baseAddress!
+                                    guard let qkvBaseRaw = qkvB.baseAddress, let cosBaseRaw = cosB.baseAddress,
+                                          let sinBaseRaw = sinB.baseAddress, let attnBaseRaw = ab.baseAddress,
+                                          let qWorkBaseRaw = aqb.baseAddress, let kWorkBaseRaw = akb.baseAddress,
+                                          let scWorkBaseRaw = ascb.baseAddress else { return }
+                                    nonisolated(unsafe) let qkvBase = qkvBaseRaw, cosBase = cosBaseRaw
+                                    nonisolated(unsafe) let sinBase = sinBaseRaw, attnBase = attnBaseRaw
+                                    nonisolated(unsafe) let qWorkBase = qWorkBaseRaw, kWorkBase = kWorkBaseRaw
+                                    nonisolated(unsafe) let scWorkBase = scWorkBaseRaw
                                     for seg in 0..<(cu.count - 1) {
                                         let lo = cu[seg], hi = cu[seg + 1], m = hi - lo
                                         guard m > 0 else { continue }
@@ -451,11 +477,19 @@ public final class QWVisionRef: @unchecked Sendable {
                                                 let row = scPtr + qi * m
                                                 var mx: Float = -.greatestFiniteMagnitude
                                                 vDSP_maxv(row, 1, &mx, vM)
+                                                guard mx.isFinite else {
+                                                    vDSP_vclr(row, 1, vM)
+                                                    continue
+                                                }
                                                 var negMx = -mx
                                                 vDSP_vsadd(row, 1, &negMx, row, 1, vM)
                                                 vvexpf(row, row, &m32)
                                                 var sum: Float = 0
                                                 vDSP_sve(row, 1, &sum, vM)
+                                                guard sum > 0, sum.isFinite else {
+                                                    vDSP_vclr(row, 1, vM)
+                                                    continue
+                                                }
                                                 var inv = 1.0 / sum
                                                 vDSP_vsmul(row, 1, &inv, row, 1, vM)
                                             }
@@ -476,12 +510,14 @@ public final class QWVisionRef: @unchecked Sendable {
         profileEnd("\(profileTag ?? "block").attention", since: stageStart)
         stageStart = profileStart()
         normedBuf.withUnsafeMutableBufferPointer { pb in
-            qwGemmRef(y: pb.baseAddress!, ldY: d, yBase: 0,
+            guard let pPtr = pb.baseAddress else { return }
+            qwGemmRef(y: pPtr, ldY: d, yBase: 0,
                       x: attnBuf, rows: n, w: blk.projW, nOut: d, nIn: d, bias: blk.projB)
         }
         s.withUnsafeMutableBufferPointer { sb in
             normedBuf.withUnsafeBufferPointer { pb in
-                vDSP_vadd(sb.baseAddress!, 1, pb.baseAddress!, 1, sb.baseAddress!, 1, vDSP_Length(n * d))
+                guard let sPtr = sb.baseAddress, let pPtr = pb.baseAddress else { return }
+                vDSP_vadd(sPtr, 1, pPtr, 1, sPtr, 1, vDSP_Length(n * d))
             }
         }
         profileEnd("\(profileTag ?? "block").attention_projection", since: stageStart)
@@ -491,19 +527,23 @@ public final class QWVisionRef: @unchecked Sendable {
         stageStart = profileStart()
         let mlpCount = n * mlpInner
         mlpHBuf.withUnsafeMutableBufferPointer { hb in
-            qwGemmRef(y: hb.baseAddress!, ldY: mlpInner, yBase: 0,
+            guard let hPtr = hb.baseAddress else { return }
+            qwGemmRef(y: hPtr, ldY: mlpInner, yBase: 0,
                       x: normedBuf, rows: n, w: blk.l1W, nOut: mlpInner, nIn: d, bias: blk.l1B)
             mlpScratchBuf.withUnsafeMutableBufferPointer { scb in
-                qwApplyGeluTanhInPlace(hb.baseAddress!, count: mlpCount, scratch: scb.baseAddress!)
+                guard let scPtr = scb.baseAddress else { return }
+                qwApplyGeluTanhInPlace(hPtr, count: mlpCount, scratch: scPtr)
             }
         }
         normedBuf.withUnsafeMutableBufferPointer { yb in
-            qwGemmRef(y: yb.baseAddress!, ldY: d, yBase: 0,
+            guard let yPtr = yb.baseAddress else { return }
+            qwGemmRef(y: yPtr, ldY: d, yBase: 0,
                       x: mlpHBuf, rows: n, w: blk.l2W, nOut: d, nIn: mlpInner, bias: blk.l2B)
         }
         s.withUnsafeMutableBufferPointer { sb in
             normedBuf.withUnsafeBufferPointer { yb in
-                vDSP_vadd(sb.baseAddress!, 1, yb.baseAddress!, 1, sb.baseAddress!, 1, vDSP_Length(n * d))
+                guard let sPtr = sb.baseAddress, let yPtr = yb.baseAddress else { return }
+                vDSP_vadd(sPtr, 1, yPtr, 1, sPtr, 1, vDSP_Length(n * d))
             }
         }
         profileEnd("\(profileTag ?? "block").mlp", since: stageStart)
@@ -513,17 +553,20 @@ public final class QWVisionRef: @unchecked Sendable {
     func merger(_ s: inout [Float], plan: QWVisionGridPlan) {
         let cfg = w.config
         let n = plan.nPatch, d = cfg.dim, nt = plan.nToken, merged = cfg.merged
+        guard n > 0, d > 0, nt > 0, merged > 0, w.fc2Out > 0 else { s = []; return }
         var normed = [Float](repeating: 0, count: n * d)
         qwLayerNorm(s, into: &normed, gamma: w.mergerGamma, beta: w.mergerBeta, rows: n, dim: d, eps: cfg.eps)
         var h = [Float](repeating: 0, count: nt * merged)
         var y = [Float](repeating: 0, count: nt * w.fc2Out)
         h.withUnsafeMutableBufferPointer { hb in
-            qwGemmRef(y: hb.baseAddress!, ldY: merged, yBase: 0,
+            guard let hPtr = hb.baseAddress else { return }
+            qwGemmRef(y: hPtr, ldY: merged, yBase: 0,
                       x: normed, rows: nt, w: w.fc1W, nOut: merged, nIn: merged,
                       bias: w.fc1B, act: qwGeluErf)
         }
         y.withUnsafeMutableBufferPointer { yb in
-            qwGemmRef(y: yb.baseAddress!, ldY: w.fc2Out, yBase: 0,
+            guard let yPtr = yb.baseAddress else { return }
+            qwGemmRef(y: yPtr, ldY: w.fc2Out, yBase: 0,
                       x: h, rows: nt, w: w.fc2W, nOut: w.fc2Out, nIn: merged,
                       bias: w.fc2B)
         }

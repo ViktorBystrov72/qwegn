@@ -39,6 +39,12 @@ public final class FNNgramShardRows: FNNgramRows, @unchecked Sendable {
         let list = try Self.shards(in: root)
         var fileToFd: [String: Int32] = [:]
         var openedFds: [Int32] = []
+        var transferredFds = false
+        defer {
+            if !transferredFds {
+                for fd in openedFds where fd >= 0 { close(fd) }
+            }
+        }
         var built: [Shard] = []
         for s in list {
             let file = try Self.string(s, "file", in: locations)
@@ -72,6 +78,7 @@ public final class FNNgramShardRows: FNNgramRows, @unchecked Sendable {
         headDim = table.headDim
         rowCount = table.rowCount
         uniqueFds = openedFds
+        transferredFds = true
     }
 
     /// Reads the rows straight out of a safetensors payload. The **header**
@@ -231,25 +238,23 @@ public final class FNNgramShardRows: FNNgramRows, @unchecked Sendable {
         for fd in uniqueFds where fd >= 0 { close(fd) }
     }
 
-    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) {
+    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) throws {
         var lo = 0, hi = shards.count - 1
         while lo < hi {
             let mid = (lo + hi + 1) / 2
             if shards[mid].firstRow <= id { lo = mid } else { hi = mid - 1 }
         }
         let s = shards[lo]
-        precondition(id >= s.firstRow && id < s.firstRow + s.rows, "PLE row \(id) outside the shard table")
+        guard id >= s.firstRow && id < s.firstRow + s.rows else {
+            throw FNNgramRowsError.rowOutOfBounds(id: id, count: rowCount)
+        }
         let rowInShard = id - s.firstRow
         let n = headDim
         switch s.source {
         case .file(let fd, let baseOffset):
             let off = Int64(baseOffset + rowInShard * s.rowBytes)
             let u16 = UnsafeMutableRawPointer(dst).assumingMemoryBound(to: UInt16.self).advanced(by: n)
-            do {
-                try QWPOSIX.preadExact(fd: fd, into: UnsafeMutableRawPointer(u16), count: s.rowBytes, offset: off)
-            } catch {
-                preconditionFailure("PLE short read on \(s.file): \(error)")
-            }
+            try QWPOSIX.preadExact(fd: fd, into: UnsafeMutableRawPointer(u16), count: s.rowBytes, offset: off)
             for i in 0..<n {
                 dst[i] = Float(bitPattern: UInt32(u16[i]) << 16)
             }
@@ -265,7 +270,7 @@ public final class FNNgramShardRows: FNNgramRows, @unchecked Sendable {
     public func row(_ id: Int) -> [Float] {
         let n = headDim
         return [Float](unsafeUninitializedCapacity: n) { out, count in
-            copyRow(id, to: out.baseAddress!)
+            qwCopyNgramRowBestEffort(self, id: id, to: out.baseAddress!, headDim: n)
             count = n
         }
     }
@@ -281,7 +286,7 @@ public enum FNNgramRowsLoader {
         }
         let ngramTableBin = assetsURL.appendingPathComponent("ngram_table.bin")
         if FileManager.default.fileExists(atPath: ngramTableBin.path) {
-            return try FNNgramMLXRows(url: ngramTableBin)
+            return try FNNgramMLXRows(url: ngramTableBin, mapped: mapped)
         }
         let locations = assetsURL.appendingPathComponent("ple_ngram_locations.json")
         let snapshot = snapshotDirectory()

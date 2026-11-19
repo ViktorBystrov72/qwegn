@@ -118,7 +118,7 @@ final class FNLatentMoETests: XCTestCase {
 
         let arena = try QWArena(hal: hal, weights: weightBytes, activations: 16 << 20, kv: 256, gdnStates: 256)
         let wReg = arena.weightsRegion()
-        let routerAndSharedBF16 = try wReg.allocate(QWTensorShape([gateW.count + shGateScalarW.count], .f16))
+        let routerAndSharedBF16 = try wReg.allocate(QWTensorShape([gateW.count + shGateScalarW.count], .bf16))
         arena.write(routerAndSharedBF16, from: (gateW + shGateScalarW).map(QWBF16.fromFloatRNE))
         let shScalarF32 = try wReg.allocate(QWTensorShape([H], .f32))
         arena.write(shScalarF32, from: shGateScalarW)

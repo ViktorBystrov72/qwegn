@@ -54,8 +54,11 @@ extension Repl {
             print("\(cliColor.systemNotice)[Conversation history cleared.]\(cliColor.reset)\n")
             return .continueLoop
         case "/image":
-            pendingTurnImage = arg.isEmpty ? nil : arg
-            print("\(cliColor.systemNotice)[Next turn image: \(pendingTurnImage ?? "none")]\(cliColor.reset)\n")
+            let outcome = Self.resolveSlashImageCommand(
+                arg: arg, hasVisionController: visionController != nil, currentPending: pendingTurnImage
+            )
+            pendingTurnImage = outcome.nextPending
+            print("\(cliColor.systemNotice)\(outcome.notice)\(cliColor.reset)\n")
             return .continueLoop
         case "/help", "/h", "/?":
             print("""
@@ -176,5 +179,21 @@ extension Repl {
             print("\(cliColor.systemNotice)Unknown command '\(cmd)'. Type '/help' for available commands.\(cliColor.reset)\n")
             return .continueLoop
         }
+    }
+
+    static func resolveSlashImageCommand(
+        arg: String,
+        hasVisionController: Bool,
+        currentPending: String?
+    ) -> (accepted: Bool, nextPending: String?, notice: String) {
+        guard hasVisionController else {
+            return (
+                false,
+                nil,
+                "[Cannot attach image: vision is disabled (--no-load-vision) or unsupported by this model.]"
+            )
+        }
+        let next = arg.isEmpty ? nil : arg
+        return (true, next, "[Next turn image: \(next ?? "none")]")
     }
 }

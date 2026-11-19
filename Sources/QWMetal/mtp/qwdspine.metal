@@ -6,6 +6,7 @@
 #include <metal_simdgroup>
 #include "include/qw_dequant.metalh"
 #include "include/qw_dequant_shvq.metalh"
+#include "include/qw_fastmath_safe.metalh"
 using namespace metal;
 
 struct DSpineH8 { half v[8]; } __attribute__((__packed__, __aligned__(16)));
@@ -82,16 +83,17 @@ kernel void qwg_dspine_bridge_write_add(
     const uint chunks = R >> 3u;
     device const uint4* wr = W + (size_t)row * chunks;
     float acc[16] = {0.0f};
+    const uint safeD = min(D, 16u);
     for (uint c = lane; c < chunks; c += 32u) {
         DSpineH8 wv = asDSpineH8(wr[c]);
-        for (uint d = 0; d < D; ++d) {
+        for (uint d = 0; d < safeD; ++d) {
             DSpineH8 mv = asDSpineH8(msg[(size_t)d * chunks + c]);
             float s = 0.0f;
             for (int i = 0; i < 8; ++i) s += float(wv.v[i]) * float(mv.v[i]);
             acc[d] += s;
         }
     }
-    for (uint d = 0; d < D; ++d) {
+    for (uint d = 0; d < safeD; ++d) {
         float val = simd_sum(acc[d]);
         if (lane == 0u) {
             size_t idx = (size_t)d * H + row;
@@ -119,6 +121,7 @@ kernel void qwg_dspine_refine_code_to_msg(
     const uint r = tg.x * 4u + simd_id;
     const uint d = tg.y;
     if (r >= R) return;
+    const uint safeTopK = min(topK, 16u);
 
     const float qVal = bridgePacked[(size_t)(d + 1u) * (3u * R) + r];
     const float bVal = float(gateBias[r]);
@@ -127,8 +130,8 @@ kernel void qwg_dspine_refine_code_to_msg(
             float s0 = bridgePacked[R + r];
             float v0 = bridgePacked[2u * R + r];
             float g0 = 1.0f / (1.0f + exp(-(qVal + s0 + bVal)));
-            refineMsg[r] = half(g0 * v0);
-            for (uint k = 1u; k < topK; ++k) refineMsg[(size_t)k * R + r] = half(0.0f);
+            if (safeTopK > 0u) refineMsg[r] = half(g0 * v0);
+            for (uint k = 1u; k < safeTopK; ++k) refineMsg[(size_t)k * R + r] = half(0.0f);
         }
         return;
     }
@@ -145,7 +148,7 @@ kernel void qwg_dspine_refine_code_to_msg(
         DSpineH8 gp8 = asDSpineH8(wGp[c]);
         DSpineH8 pv8 = asDSpineH8(wPrev[c]);
         const uint colOff = c << 3u;
-        for (uint k = 0; k < topK; ++k) {
+        for (uint k = 0; k < safeTopK; ++k) {
             int rawSid = predIds[k];
             uint sid = (rawSid >= 0 && rawSid != 0x7fffffff) ? uint(rawSid) : 0u;
             device const ushort* cb = codebook + (size_t)sid * C + colOff;
@@ -160,7 +163,7 @@ kernel void qwg_dspine_refine_code_to_msg(
             accPrev[k] += sPv;
         }
     }
-    for (uint k = 0; k < topK; ++k) {
+    for (uint k = 0; k < safeTopK; ++k) {
         float s = simd_sum(accGp[k]) * sqrtC;
         float v = simd_sum(accPrev[k]) * sqrtC;
         if (lane == 0u) {
@@ -190,7 +193,8 @@ kernel void qwg_dspine_refine_write(
     if (row >= H) return;
 
     const uint chunks = R >> 3u;
-    const uint kLimit = (d == 0u) ? 1u : topK;
+    const uint safeTopK = min(topK, 16u);
+    const uint kLimit = (d == 0u) ? (safeTopK > 0u ? 1u : 0u) : safeTopK;
     device const uint4* wr = W + (size_t)row * chunks;
     device const uint4* msgBase = refineMsg + (size_t)d * 16u * chunks;
     float acc[16] = {0.0f};
@@ -228,7 +232,8 @@ static inline void qwg_dspine_refine_scores_impl(
         uint lane) {
     const uint kCurr = tg.x;
     const uint d = tg.y;
-    if (kCurr >= topK) return;
+    const uint safeTopK = min(topK, 16u);
+    if (kCurr >= safeTopK) return;
 
     const int rawCand = candidates[d * 16u + kCurr];
     const uint cand = (rawCand >= 0 && rawCand != 0x7fffffff) ? uint(rawCand) : 0u;
@@ -236,7 +241,7 @@ static inline void qwg_dspine_refine_scores_impl(
 
     if (headMode == 0u) {
         const uint chunks = H >> 3u;
-        const uint kLimit = (d == 0u) ? 1u : topK;
+        const uint kLimit = (d == 0u) ? (safeTopK > 0u ? 1u : 0u) : safeTopK;
         device const uint4* wr = (device const uint4*)headWeights + (size_t)cand * chunks;
         device const uint4* x4 = (device const uint4*)xBase;
         float acc[16] = {0.0f};
@@ -260,7 +265,7 @@ static inline void qwg_dspine_refine_scores_impl(
         const uint sliceBytes = qwg_shvq_slice_bytes(int(bits));
         const uint rowBytes = (H / group) * groupBytes;
         device const char* wRow = (device const char*)headWeights + (size_t)cand * rowBytes;
-        const uint kLimit = (d == 0u) ? 1u : topK;
+        const uint kLimit = (d == 0u) ? (safeTopK > 0u ? 1u : 0u) : safeTopK;
         const uint nSlices = H >> 5u;
         float acc[16] = {0.0f};
         for (uint g = lane; g < nSlices; g += 32u) {
@@ -306,7 +311,7 @@ static inline void qwg_dspine_refine_scores_impl(
         float out16[16];
         qwg_gemv_hq4_row_m<16>((device const Block_HQ4_G32*)headWeights, xBase, cand, H, lane, out16, headMode == 2u);
         if (lane == 0u) {
-            for (uint kp = 0; kp < topK; ++kp) {
+            for (uint kp = 0; kp < safeTopK; ++kp) {
                 refineTable[(d * 16u + kp) * 16u + kCurr] = out16[kp];
             }
         }
@@ -351,8 +356,8 @@ kernel void qwg_dspine_refine_chain(
     uint sender = 0u;
     const uint safeTopK = min(topK, 16u);
     for (uint d = 0u; d < draftCount; ++d) {
-        float rawVal = (lane < safeTopK) ? refineTable[(d * 16u + sender) * 16u + lane] : -INFINITY;
-        float val = (lane < safeTopK) ? (isfinite(rawVal) ? max(rawVal, -1e30f) : -1e30f) : -INFINITY;
+        float rawVal = (lane < safeTopK) ? refineTable[(d * 16u + sender) * 16u + lane] : -3.4e38f;
+        float val = (lane < safeTopK) ? (qw_is_finite_bits(rawVal) ? max(rawVal, -1e30f) : -1e30f) : -3.4e38f;
         uint bestK = lane;
         for (ushort offset = 16; offset > 0; offset >>= 1) {
             float otherVal = simd_shuffle_down(val, offset);

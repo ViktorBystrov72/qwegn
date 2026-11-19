@@ -52,13 +52,11 @@ public final class QWTokenRecycler: @unchecked Sendable {
     }
 
     public func recordTransition(previous: Int?, current: Int, next: Int) {
-        guard current >= 0, next >= 0,
-              current <= Int(Int32.max), next <= Int(Int32.max) else { return }
-        let cur32 = Int32(current)
-        let next32 = Int32(next)
+        guard let cur32 = Int32(exactly: current), cur32 >= 0,
+              let next32 = Int32(exactly: next), next32 >= 0 else { return }
         recordUnigram(key: cur32, next: next32)
-        if let previous, previous >= 0, previous <= Int(Int32.max) {
-            recordBigram(k0: Int32(previous), k1: cur32, next: next32)
+        if let previous, let prev32 = Int32(exactly: previous), prev32 >= 0 {
+            recordBigram(k0: prev32, k1: cur32, next: next32)
         }
     }
 
@@ -72,7 +70,8 @@ public final class QWTokenRecycler: @unchecked Sendable {
         pendingToken: Int,
         maxUnigramFallbacks: Int = 2
     ) -> Int {
-        guard maxCount > drafts.count, pendingToken >= 0 else { return 0 }
+        guard maxCount > drafts.count,
+              let pending32 = Int32(exactly: pendingToken), pending32 >= 0 else { return 0 }
         let initialCount = drafts.count
         var prev: Int?
         var cur: Int
@@ -88,8 +87,10 @@ public final class QWTokenRecycler: @unchecked Sendable {
         }
         var unigramUsed = 0
         while drafts.count < maxCount {
-            if let prevVal = prev, prevVal >= 0,
-               let biHit = lookupBigram(k0: Int32(prevVal), k1: Int32(cur)) {
+            guard let k1 = Int32(exactly: cur), k1 >= 0 else { break }
+            if let prevVal = prev,
+               let k0 = Int32(exactly: prevVal), k0 >= 0,
+               let biHit = lookupBigram(k0: k0, k1: k1) {
                 let candidate = Int(biHit)
                 if hasConsecutivePair(first: cur, second: candidate, pendingToken: pendingToken, drafts: drafts) {
                     break
@@ -100,7 +101,7 @@ public final class QWTokenRecycler: @unchecked Sendable {
                 continue
             }
             if unigramUsed < maxUnigramFallbacks,
-               let uniHit = lookupUnigram(key: Int32(cur)) {
+               let uniHit = lookupUnigram(key: k1) {
                 let candidate = Int(uniHit)
                 if candidate == cur || drafts.contains(candidate) {
                     break

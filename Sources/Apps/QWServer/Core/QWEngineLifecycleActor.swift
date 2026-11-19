@@ -230,14 +230,176 @@ public actor QWEngineLifecycleActor {
     /// result while its own number is still the current one — so an unload
     /// that arrives while the weights are in flight keeps the last word.
     var loadGeneration: UInt64 = 0
-    struct CachedTokenPrefixEntry {
+    struct CachedTokenPrefixEntry: Sendable {
         let packPath: String
         let cacheSalt: String
         let prefixWire: String
         let prefixTokens: [Int]
         let systemTokenCount: Int?
     }
-    var cachedTokenPrefixes: [CachedTokenPrefixEntry] = []
+
+    final class TokenPrefixCacheBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [CachedTokenPrefixEntry] = []
+
+        func lookupBestPrefix(
+            newPrefixWire: String,
+            packPath: String,
+            saltKey: String,
+            markerUTF8: [UInt8]
+        ) -> CachedTokenPrefixEntry? {
+            let newUTF8Count = newPrefixWire.utf8.count
+            return lock.withLock {
+                var bestIdx: Int? = nil
+                var bestLen = 0
+                for (idx, entry) in entries.enumerated()
+                where entry.packPath == packPath && entry.cacheSalt == saltKey && !entry.prefixWire.isEmpty {
+                    let count = entry.prefixWire.utf8.count
+                    guard count > bestLen, count <= newUTF8Count,
+                          newPrefixWire.utf8.starts(with: entry.prefixWire.utf8) else { continue }
+                    if count == newUTF8Count {
+                        bestIdx = idx; bestLen = count
+                    } else {
+                        let deltaStart = newPrefixWire.utf8.index(newPrefixWire.utf8.startIndex, offsetBy: count)
+                        if newPrefixWire.utf8[deltaStart...].starts(with: markerUTF8) {
+                            bestIdx = idx; bestLen = count
+                        }
+                    }
+                }
+                guard let idx = bestIdx else { return nil }
+                let matched = entries.remove(at: idx)
+                entries.append(matched)
+                return matched
+            }
+        }
+
+        func store(_ entry: CachedTokenPrefixEntry, maxEntries: Int) {
+            lock.withLock {
+                entries.removeAll {
+                    $0.packPath == entry.packPath && $0.cacheSalt == entry.cacheSalt && $0.prefixWire == entry.prefixWire
+                }
+                entries.append(entry)
+                if entries.count > maxEntries {
+                    entries.removeFirst(entries.count - maxEntries)
+                }
+            }
+        }
+
+        func clear() {
+            lock.withLock { entries.removeAll(keepingCapacity: true) }
+        }
+    }
+
+    final class MemoryDeltaCacheBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cachedRoot: String = ""
+        private var cachedStamp: String = ""
+        private var cachedCount: Int = 0
+        private var cachedAt: Date = .distantPast
+        private static let ttlSeconds: TimeInterval = 2.0
+
+        func cachedOrCompute(for manifest: QWMemoryManifest, rootPath: String) -> Int {
+            let stamp = "\(manifest.packName)|\(manifest.gitHeadSHA ?? "")|\(manifest.files.count)|\(manifest.caches.count)"
+            let now = Date()
+            if let hit = lock.withLock({ () -> Int? in
+                guard cachedRoot == rootPath,
+                      cachedStamp == stamp,
+                      now.timeIntervalSince(cachedAt) < Self.ttlSeconds else {
+                    return nil
+                }
+                return cachedCount
+            }) {
+                return hit
+            }
+            let delta = QWMemoryPack.computeDelta(for: manifest)
+            let count = delta.modifiedFiles.count + delta.deletedFiles.count
+            lock.withLock {
+                cachedRoot = rootPath
+                cachedStamp = stamp
+                cachedCount = count
+                cachedAt = Date()
+            }
+            return count
+        }
+
+        func store(rootPath: String, manifest: QWMemoryManifest, modifiedFileCount: Int) {
+            let stamp = "\(manifest.packName)|\(manifest.gitHeadSHA ?? "")|\(manifest.files.count)|\(manifest.caches.count)"
+            lock.withLock {
+                cachedRoot = rootPath
+                cachedStamp = stamp
+                cachedCount = modifiedFileCount
+                cachedAt = Date()
+            }
+        }
+
+        func invalidate() {
+            lock.withLock {
+                cachedRoot = ""
+                cachedStamp = ""
+                cachedAt = .distantPast
+            }
+        }
+    }
+
+    /// Non-reentrant FIFO async mutex protecting serialized vision weights access.
+    final class VisionAccessLock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var busy = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func withLock<T>(_ operation: () async throws -> T) async rethrows -> T {
+            await acquire()
+            defer { release() }
+            return try await operation()
+        }
+
+        private func acquire() async {
+            let acquiredImmediately = lock.withLock { () -> Bool in
+                if !busy {
+                    busy = true
+                    return true
+                }
+                return false
+            }
+            if acquiredImmediately { return }
+            await withCheckedContinuation { cont in
+                let resumeNow = lock.withLock { () -> Bool in
+                    if !busy {
+                        busy = true
+                        return true
+                    }
+                    waiters.append(cont)
+                    return false
+                }
+                if resumeNow { cont.resume() }
+            }
+        }
+
+        private func release() {
+            let next: CheckedContinuation<Void, Never>? = lock.withLock {
+                if waiters.isEmpty {
+                    busy = false
+                    return nil
+                }
+                return waiters.removeFirst()
+            }
+            next?.resume()
+        }
+    }
+
+    struct AdmittedRequest: @unchecked Sendable {
+        let loaded: LoadedState
+        let config: Config
+        let loadGeneration: UInt64
+    }
+
+    let tokenPrefixCache = TokenPrefixCacheBox()
+    let memoryDeltaCache = MemoryDeltaCacheBox()
+    let visionCoordinator = VisionAccessLock()
+    var modelTransitionActive: Bool = false
+    var modelTransitionWaiters: [CheckedContinuation<Void, Never>] = []
+    var userUnloadSequence: UInt64 = 0
+    var configRevision: UInt64 = 0
     struct ActiveMemoryPackState: Sendable {
         let rootURL: URL
         let manifest: QWMemoryManifest
@@ -251,6 +413,38 @@ public actor QWEngineLifecycleActor {
     var preMountMaxContext: Int? = nil
     var inFlightRequests: Int = 0
     var inFlightDrainWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func withExclusiveTransition<T>(_ operation: () async throws -> T) async rethrows -> T {
+        while modelTransitionActive {
+            await withCheckedContinuation { cont in
+                modelTransitionWaiters.append(cont)
+            }
+        }
+        modelTransitionActive = true
+        defer {
+            modelTransitionActive = false
+            let waiters = modelTransitionWaiters
+            modelTransitionWaiters.removeAll(keepingCapacity: true)
+            for waiter in waiters { waiter.resume() }
+        }
+        return try await operation()
+    }
+
+    func waitForModelTransitionsIfNeeded() async {
+        while modelTransitionActive {
+            await withCheckedContinuation { cont in
+                modelTransitionWaiters.append(cont)
+            }
+        }
+    }
+
+    func waitForModelTransitionsAndSelectIfNeeded(
+        requestedModel: String?,
+        allowSameFamilyQuantSwitch: Bool = false
+    ) async throws {
+        await waitForModelTransitionsIfNeeded()
+        try await selectModelIfNeeded(requestedModel, allowSameFamilyQuantSwitch: allowSameFamilyQuantSwitch)
+    }
 
     func beginInFlightRequest() { inFlightRequests += 1 }
     func endInFlightRequest() {
@@ -431,11 +625,39 @@ public actor QWEngineLifecycleActor {
                         _ = try? result.loaded.modelBackend.mountStandalonePrefixCache(from: active.cacheFileURL)
                     }
                     transition(to: .loaded(result.loaded), since: result.arrivedAt)
+                    return result.loaded
                 }
-                return result.loaded
+                throw QWEngineError.unloading
             } catch {
                 if loadGeneration == generation { transition(to: .failed(Self.detail(for: error))) }
                 throw error
+            }
+        }
+    }
+
+    /// Atomically resolves model selection, ensures loaded state under current generation, and retains an in-flight lease.
+    func beginAdmittedRequest(
+        requestedModel: String?,
+        allowSameFamilyQuantSwitch: Bool = false
+    ) async throws -> AdmittedRequest {
+        while true {
+            await waitForModelTransitionsIfNeeded()
+            let preUnloadSeq = userUnloadSequence
+            try await selectModelIfNeeded(requestedModel, allowSameFamilyQuantSwitch: allowSameFamilyQuantSwitch)
+            if userUnloadSequence != preUnloadSeq {
+                throw QWEngineError.unloading
+            }
+            let preConfigRev = configRevision
+            _ = try await ensureLoaded()
+            await waitForModelTransitionsIfNeeded()
+            if userUnloadSequence != preUnloadSeq {
+                throw QWEngineError.unloading
+            }
+            if case .loaded(let currentLoaded) = state,
+               !modelTransitionActive,
+               configRevision == preConfigRev {
+                beginInFlightRequest()
+                return AdmittedRequest(loaded: currentLoaded, config: config, loadGeneration: loadGeneration)
             }
         }
     }
@@ -447,6 +669,20 @@ public actor QWEngineLifecycleActor {
     /// Lets go of the resident model and reports the memory that came
     /// back — measured, never assumed.
     public func unloadExplicit(waitForInFlight: Bool = true) async throws -> Double? {
+        guard waitForInFlight else {
+            return try await unloadModel(waitForInFlight: false, forReconfigure: false)
+        }
+        return try await withExclusiveTransition {
+            try await self.unloadModel(waitForInFlight: true, forReconfigure: false)
+        }
+    }
+
+    func unloadModel(waitForInFlight: Bool = true, forReconfigure: Bool = false) async throws -> Double? {
+        if !forReconfigure {
+            userUnloadSequence &+= 1
+        }
+        tokenPrefixCache.clear()
+        memoryDeltaCache.invalidate()
         switch state {
         case .unloaded:
             // Nothing was resident, so there is nothing to reclaim and
@@ -462,7 +698,7 @@ public actor QWEngineLifecycleActor {
             switch state {
             case .loaded:
                 // The loader published it before the unload arrived.
-                return try await unloadExplicit(waitForInFlight: waitForInFlight)
+                return try await unloadModel(waitForInFlight: waitForInFlight, forReconfigure: forReconfigure)
             case .failed:
                 // The load failed; the failure is still the last truth.
                 return nil

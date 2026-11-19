@@ -319,11 +319,15 @@ public final class QWFanController: @unchecked Sendable {
 
     private let client = QWSMCClient()
     private let lock = NSLock()
+    private let ioLock = NSLock()
+    private let reconcileQueue = DispatchQueue(label: "com.qwegn.smc.reconcile", qos: .utility)
     private var policy: QWCoolingPolicy = .auto
     private var inferencePhase: String = "idle"
     private var lastActiveInferenceAt: Date?
     private var didApplyManualOverride = false
     private var lastWriteAuthorized: Bool?
+    private var cachedSnapshot: QWSMCSnapshot?
+    private var pendingReconcile = false
 
     public init() {
         atexit { QWFanController.shared.restoreAutoOnExit() }
@@ -337,21 +341,62 @@ public final class QWFanController: @unchecked Sendable {
         lock.withLock {
             policy = newPolicy
         }
-        _ = sampleAndReconcile()
+        scheduleReconcileAsync()
     }
 
     public func updateInferencePhase(_ phase: String) {
         let now = Date()
-        lock.withLock {
+        let changed = lock.withLock { () -> Bool in
+            let prev = inferencePhase
             inferencePhase = phase
             if phase == "prefill" || phase == "decode" {
                 lastActiveInferenceAt = now
             }
+            return prev != phase
         }
-        _ = sampleAndReconcile()
+        if changed {
+            scheduleReconcileAsync()
+        }
+    }
+
+    public func currentCachedSnapshot() -> QWSMCSnapshot {
+        if let snap = lock.withLock({ cachedSnapshot }) {
+            return snap
+        }
+        scheduleReconcileAsync()
+        return QWSMCSnapshot(
+            gpuTemperatureCelsius: nil,
+            gpuTemperatureUnavailableReason: "AppleSMC telemetry initial background sample pending",
+            cpuTemperatureCelsius: nil,
+            memoryTemperatureCelsius: nil,
+            fanSpeedRPM: nil,
+            fanSpeedUnavailableReason: "AppleSMC telemetry initial background sample pending",
+            fanMinRPM: nil,
+            fanMaxRPM: nil,
+            fanControlStatus: "System Auto",
+            systemPowerWatts: nil,
+            systemPowerUnavailableReason: "AppleSMC telemetry initial background sample pending",
+            thermalStateLevel: Self.currentThermalState()
+        )
+    }
+
+    public func scheduleReconcileAsync() {
+        let shouldDispatch = lock.withLock { () -> Bool in
+            if pendingReconcile { return false }
+            pendingReconcile = true
+            return true
+        }
+        guard shouldDispatch else { return }
+        reconcileQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.withLock { self.pendingReconcile = false }
+            _ = self.sampleAndReconcile()
+        }
     }
 
     public func sampleAndReconcile(now: Date = Date()) -> QWSMCSnapshot {
+        ioLock.lock()
+        defer { ioLock.unlock() }
         let gpuTemp = Self.maxSensor(keys: Self.gpuTempKeys, client: client)
         let cpuTemp = Self.maxSensor(keys: Self.cpuTempKeys, client: client)
         let memTemp = Self.maxSensor(keys: Self.memTempKeys, client: client)
@@ -385,7 +430,7 @@ public final class QWFanController: @unchecked Sendable {
             now: now
         )
 
-        return QWSMCSnapshot(
+        let snap = QWSMCSnapshot(
             gpuTemperatureCelsius: gpuTemp,
             gpuTemperatureUnavailableReason: gpuTemp == nil ? "this host does not publish AppleSMC GPU thermal sensors" : nil,
             cpuTemperatureCelsius: cpuTemp,
@@ -399,6 +444,8 @@ public final class QWFanController: @unchecked Sendable {
             systemPowerUnavailableReason: power == nil ? "this host does not publish AppleSMC system power (PSTR)" : nil,
             thermalStateLevel: thermalState
         )
+        lock.withLock { cachedSnapshot = snap }
+        return snap
     }
 
     private func reconcileFans(

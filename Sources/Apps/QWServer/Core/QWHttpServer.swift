@@ -15,6 +15,10 @@ public final class QWHttpServer: @unchecked Sendable {
     let apiKey: String?
     let corsAllowedOrigins: [String]
     let allowUnauthenticatedPublicBind: Bool
+    let allowedWorkspaceRoots: [String]
+    let maxConcurrentConnections: Int
+    let requestReadTimeoutSeconds: TimeInterval
+    let finderRevealRunner: (@Sendable ([String]) async throws -> Int32)?
     let logger: QWServerLogger
     var listener: NWListener?
     let queue = DispatchQueue(label: "qwg.server.nw", qos: .userInitiated)
@@ -23,14 +27,49 @@ public final class QWHttpServer: @unchecked Sendable {
     var connectionOrigins: [ObjectIdentifier: String] = [:]
     let responsesStore = QWResponsesStore()
 
-    public init(
+    var activeConnectionCount: Int {
+        connectionStateLock.withLock { cancellationHubs.count }
+    }
+
+    public convenience init(
         actor: QWEngineLifecycleActor,
         host: String = "127.0.0.1",
         port: Int = 8080,
         logger: QWServerLogger = .shared,
         apiKey: String? = nil,
         corsAllowedOrigins: [String] = [],
-        allowUnauthenticatedPublicBind: Bool = false
+        allowUnauthenticatedPublicBind: Bool = false,
+        allowedWorkspaceRoots: [String] = [],
+        maxConcurrentConnections: Int = 64,
+        requestReadTimeoutSeconds: TimeInterval = 30.0
+    ) {
+        self.init(
+            actor: actor,
+            host: host,
+            port: port,
+            logger: logger,
+            apiKey: apiKey,
+            corsAllowedOrigins: corsAllowedOrigins,
+            allowUnauthenticatedPublicBind: allowUnauthenticatedPublicBind,
+            allowedWorkspaceRoots: allowedWorkspaceRoots,
+            maxConcurrentConnections: maxConcurrentConnections,
+            requestReadTimeoutSeconds: requestReadTimeoutSeconds,
+            finderRevealRunner: nil
+        )
+    }
+
+    init(
+        actor: QWEngineLifecycleActor,
+        host: String = "127.0.0.1",
+        port: Int = 8080,
+        logger: QWServerLogger = .shared,
+        apiKey: String? = nil,
+        corsAllowedOrigins: [String] = [],
+        allowUnauthenticatedPublicBind: Bool = false,
+        allowedWorkspaceRoots: [String] = [],
+        maxConcurrentConnections: Int = 64,
+        requestReadTimeoutSeconds: TimeInterval = 30.0,
+        finderRevealRunner: (@Sendable ([String]) async throws -> Int32)?
     ) {
         self.actor = actor
         self.host = host
@@ -40,6 +79,13 @@ public final class QWHttpServer: @unchecked Sendable {
         self.apiKey = (trimmedKey?.isEmpty == false) ? trimmedKey : nil
         self.corsAllowedOrigins = corsAllowedOrigins
         self.allowUnauthenticatedPublicBind = allowUnauthenticatedPublicBind
+        self.allowedWorkspaceRoots = allowedWorkspaceRoots
+        self.maxConcurrentConnections = max(1, maxConcurrentConnections)
+        self.requestReadTimeoutSeconds = max(0.05, requestReadTimeoutSeconds)
+        self.finderRevealRunner = finderRevealRunner
+        if !allowedWorkspaceRoots.isEmpty {
+            actor.configureAllowedWorkspaceRoots(allowedWorkspaceRoots)
+        }
     }
 
     public func start() throws {
@@ -127,29 +173,52 @@ public final class QWHttpServer: @unchecked Sendable {
     private func handleConnection(_ connection: NWConnection) {
         let id = ObjectIdentifier(connection)
         let hub = QWConnectionCancellationHub()
-        connectionStateLock.lock()
-        cancellationHubs[id] = hub
-        connectionStateLock.unlock()
+        let accepted = connectionStateLock.withLock { () -> Bool in
+            guard cancellationHubs.count < maxConcurrentConnections else {
+                return false
+            }
+            cancellationHubs[id] = hub
+            return true
+        }
+        guard accepted else {
+            logger.log(.warn, "Rejecting connection: max concurrent connections (\(maxConcurrentConnections)) reached")
+            connection.start(queue: queue)
+            let body = Data("Service Unavailable\n".utf8)
+            let header = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+            connection.send(content: Data(header.utf8) + body, completion: .contentProcessed({ _ in
+                connection.cancel()
+            }))
+            queue.asyncAfter(deadline: .now() + 2.0) {
+                connection.cancel()
+            }
+            return
+        }
+        let readTimeout = QWRequestReadTimeout(seconds: requestReadTimeoutSeconds, queue: queue) { [weak self, weak connection] in
+            guard let self, let connection, !self.isConnectionTerminated(connection) else { return }
+            self.sendSimpleResponse(connection, status: 408, body: "Request Timeout\n")
+            self.queue.asyncAfter(deadline: .now() + 1.0) {
+                connection.cancel()
+            }
+        }
         hub.attach(to: connection)
         hub.register { [weak self] in
+            readTimeout.cancel()
             self?.cleanupConnectionState(for: id)
         }
         connection.start(queue: queue)
-        receiveNextChunk(connection: connection, parser: QWHttpIncrementalParser())
+        receiveNextChunk(connection: connection, parser: QWHttpIncrementalParser(), readTimeout: readTimeout, emptyFrames: 0)
     }
 
     private func cleanupConnectionState(for id: ObjectIdentifier) {
-        connectionStateLock.lock()
-        cancellationHubs.removeValue(forKey: id)
-        connectionOrigins.removeValue(forKey: id)
-        connectionStateLock.unlock()
+        connectionStateLock.withLock {
+            cancellationHubs.removeValue(forKey: id)
+            connectionOrigins.removeValue(forKey: id)
+        }
     }
 
     func registerCancellationHandler(for connection: NWConnection, _ handler: @escaping @Sendable () -> Void) {
         let id = ObjectIdentifier(connection)
-        connectionStateLock.lock()
-        let hub = cancellationHubs[id]
-        connectionStateLock.unlock()
+        let hub = connectionStateLock.withLock { cancellationHubs[id] }
         if let hub {
             hub.register(handler)
             return
@@ -164,9 +233,7 @@ public final class QWHttpServer: @unchecked Sendable {
 
     func isConnectionTerminated(_ connection: NWConnection) -> Bool {
         let id = ObjectIdentifier(connection)
-        connectionStateLock.lock()
-        let hub = cancellationHubs[id]
-        connectionStateLock.unlock()
+        let hub = connectionStateLock.withLock { cancellationHubs[id] }
         if let hub {
             return hub.isTerminated
         }
@@ -179,31 +246,49 @@ public final class QWHttpServer: @unchecked Sendable {
     }
 
     func generationShouldStop(for connection: NWConnection) -> (@Sendable () -> Bool) {
-        { [weak self] in
+        let id = ObjectIdentifier(connection)
+        if let flag = connectionStateLock.withLock({ cancellationHubs[id]?.cancelFlag }) {
+            return { Task.isCancelled || flag.isCancelled }
+        }
+        return { [weak self] in
             Task.isCancelled || self?.isPeerGone(connection) == true
         }
     }
 
     func corsHeaderLines(for connection: NWConnection) -> String {
         let id = ObjectIdentifier(connection)
-        connectionStateLock.lock()
-        let origin = connectionOrigins[id]
-        connectionStateLock.unlock()
+        let origin = connectionStateLock.withLock { connectionOrigins[id] }
         guard let allowed = QWHttpSecurity.resolvedAllowedOrigin(origin, allowlist: corsAllowedOrigins) else {
             return ""
         }
         return "Access-Control-Allow-Origin: \(allowed)\r\nVary: Origin\r\n"
     }
 
-    private func receiveNextChunk(connection: NWConnection, parser: QWHttpIncrementalParser) {
+    private func receiveNextChunk(
+        connection: NWConnection,
+        parser: QWHttpIncrementalParser,
+        readTimeout: QWRequestReadTimeout,
+        emptyFrames: Int
+    ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if error != nil {
+                readTimeout.cancel()
                 connection.cancel()
                 return
             }
             guard let data, !data.isEmpty else {
-                if isComplete { connection.cancel() }
+                if isComplete || emptyFrames >= 4 {
+                    readTimeout.cancel()
+                    connection.cancel()
+                    return
+                }
+                self.receiveNextChunk(
+                    connection: connection,
+                    parser: parser,
+                    readTimeout: readTimeout,
+                    emptyFrames: emptyFrames + 1
+                )
                 return
             }
             var nextParser = parser
@@ -211,17 +296,20 @@ public final class QWHttpServer: @unchecked Sendable {
                 switch try nextParser.append(data) {
                 case .needMoreData:
                     if isComplete {
+                        readTimeout.cancel()
                         self.sendSimpleResponse(connection, status: 400, body: "Incomplete HTTP request\n")
                         return
                     }
-                    self.receiveNextChunk(connection: connection, parser: nextParser)
+                    self.receiveNextChunk(connection: connection, parser: nextParser, readTimeout: readTimeout, emptyFrames: 0)
                 case .complete(let request):
+                    readTimeout.cancel()
                     let id = ObjectIdentifier(connection)
                     if let origin = request.headers["origin"] {
-                        self.connectionStateLock.lock()
-                        self.connectionOrigins[id] = origin
-                        self.connectionStateLock.unlock()
+                        self.connectionStateLock.withLock {
+                            self.connectionOrigins[id] = origin
+                        }
                     }
+                    self.armEOFWatcher(on: connection, id: id)
                     self.dispatchRoute(
                         connection: connection,
                         method: request.method.uppercased(),
@@ -231,8 +319,10 @@ public final class QWHttpServer: @unchecked Sendable {
                     )
                 }
             } catch let parseError as QWHttpParseError {
+                readTimeout.cancel()
                 self.sendSimpleResponse(connection, status: parseError.httpStatus, body: "\(parseError.message)\n")
             } catch {
+                readTimeout.cancel()
                 self.sendSimpleResponse(connection, status: 400, body: "Malformed HTTP request\n")
             }
         }
@@ -267,6 +357,16 @@ public final class QWHttpServer: @unchecked Sendable {
 
         // Clean path (strip query params)
         let cleanPath = path.components(separatedBy: "?").first ?? path
+
+        guard validateMutationRequest(
+            connection: connection,
+            method: method,
+            cleanPath: cleanPath,
+            headers: headers,
+            body: body
+        ) else {
+            return
+        }
 
         let routeTask = Task {
             do {
@@ -338,138 +438,23 @@ public final class QWHttpServer: @unchecked Sendable {
                     self.sendJsonResponse(connection, status: 200, object: resp)
 
                 case ("GET", "/v1/models"), ("GET", "/models"):
-                    let modelName = self.actor.getModelName()
-                    let isLoaded = self.actor.isLoaded()
-                    let settings = QWSettingsManager.shared.loadSettings()
-                    var seenIds = Set<String>()
-                    var models: [ModelObject] = []
-                    // Each entry carries the one fact the model really
-                    // has: when its bytes last changed on disk.
-                    func addModel(id: String, loaded: Bool, path: String?) {
-                        guard !id.isEmpty, seenIds.insert(id).inserted else { return }
-                        models.append(ModelObject(id: id, loaded: loaded,
-                                                  created: QWModelDiskStats.modifiedUnix(of: path)))
-                    }
-                    let activeAlias = settings.alias(for: modelName)
-                    if !activeAlias.isEmpty {
-                        addModel(id: activeAlias, loaded: isLoaded, path: settings.modelPackPath)
-                    }
-                    addModel(id: modelName, loaded: isLoaded, path: settings.modelPackPath)
-                    for disc in QWServerSettings.scanModelsDirectory() where !disc.packPath.isEmpty && disc.supported {
-                        let loadedHere = isLoaded && disc.name == modelName
-                        let alias = settings.alias(for: disc.name)
-                        if !alias.isEmpty {
-                            addModel(id: alias, loaded: loadedHere, path: disc.packPath)
-                        }
-                        addModel(id: disc.name, loaded: loadedHere, path: disc.packPath)
-                    }
-                    let resp = ModelListResponse(models: models)
-                    self.sendJsonResponse(connection, status: 200, object: resp)
+                    self.handleModelsListRoute(connection: connection)
 
                 case ("GET", "/v1/models/discovered"):
-                    struct DiscoveredInventoryResponse: Encodable {
-                        let models: [QWServerSettings.DiscoveredModel]
-                        let drafters: [QWServerSettings.DiscoveredDrafter]
-                    }
-                    let models = QWServerSettings.scanModelsDirectory()
-                    let drafters = QWServerSettings.scanDrafterSummaries(primaryModels: models)
-                    self.sendJsonResponse(
-                        connection,
-                        status: 200,
-                        object: DiscoveredInventoryResponse(models: models, drafters: drafters)
-                    )
+                    self.handleDiscoveredModelsRoute(connection: connection)
 
                 case ("GET", let path) where path.hasPrefix("/v1/models/") || path.hasPrefix("/models/"):
                     let prefix = path.hasPrefix("/v1/models/") ? "/v1/models/" : "/models/"
-                    let requestedId = String(path.dropFirst(prefix.count))
-                    let modelName = self.actor.getModelName()
-                    let isLoaded = self.actor.isLoaded()
-                    let settings = QWSettingsManager.shared.loadSettings()
-                    // The model is known when it is the resident one,
-                    // or a supported model the scan found. Anything
-                    // else is a 404 naming it (OpenAI's shape).
-                    let activeAlias = settings.alias(for: modelName)
-                    let displayModel = activeAlias.isEmpty ? modelName : activeAlias
-                    var path2: String?
-                    var loaded = false
-                    if requestedId.isEmpty {
-                        path2 = settings.modelPackPath
-                        loaded = isLoaded
-                    } else if requestedId == modelName || requestedId == activeAlias {
-                        path2 = settings.modelPackPath
-                        loaded = isLoaded
-                    } else if let disc = QWServerSettings.scanModelsDirectory().first(where: {
-                        $0.name == requestedId || settings.alias(for: $0.name) == requestedId
-                    }), disc.supported {
-                        path2 = disc.packPath
-                        loaded = isLoaded && disc.name == modelName
-                    } else {
-                        let err = ServerErrorPayload(message: "The model '\(requestedId)' does not exist.",
-                                                      type: "invalid_request_error", code: 404)
-                        self.sendJsonResponse(connection, status: 404, object: err)
-                        return
-                    }
-                    let resp = ModelObject(id: requestedId.isEmpty ? displayModel : requestedId,
-                                           loaded: loaded,
-                                           created: QWModelDiskStats.modifiedUnix(of: path2))
-                    self.sendJsonResponse(connection, status: 200, object: resp)
+                    self.handleGetModelRoute(connection: connection, requestedId: String(path.dropFirst(prefix.count)))
 
                 case ("GET", "/api/version"):
                     self.sendJsonResponse(connection, status: 200, object: ["engine": "qwegine", "version": QWVersion.current])
 
                 case ("POST", "/api/show"):
-                    let modelName = self.actor.getModelName()
-                    let params = self.actor.getLoadedParamsInfo()
-                    let details: [String: Any] = [
-                        "format": "qwg",
-                        "family": "qwen3",
-                        "parameter_size": "27B",
-                        "quantization_level": params?.headStorage ?? "Q4g"
-                    ]
-                    let resp: [String: Any] = [
-                        "modelfile": "# Modelfile for Qwegine\nFROM \(modelName)",
-                        "parameters": "context_length \(params?.contextBudget ?? 131072)",
-                        "details": details
-                    ]
-                    if let data = try? JSONSerialization.data(withJSONObject: resp) {
-                        self.sendRawData(connection, status: 200, contentType: "application/json", data: data)
-                    } else {
-                        self.sendJsonResponse(connection, status: 200, object: ["status": "ok"])
-                    }
+                    self.handleOllamaShow(connection: connection, body: body)
 
                 case ("GET", "/api/tags"), ("GET", "/api/ps"):
-                    let modelName = self.actor.getModelName()
-                    let isLoaded = self.actor.isLoaded()
-                    let settings = QWSettingsManager.shared.loadSettings()
-                    let activeAlias = settings.alias(for: modelName)
-                    let displayModel = activeAlias.isEmpty ? modelName : activeAlias
-                    if cleanPath == "/api/ps" {
-                        // The size of a resident model is the bytes its
-                        // files occupy on disk, read now; the date is
-                        // when those bytes last changed.
-                        let models = isLoaded ? [OllamaPsResponse.RunningModel(
-                            name: displayModel, model: displayModel,
-                            size: QWModelDiskStats.sizeBytes(of: settings.modelPackPath),
-                            expiresAt: "never")] : []
-                        self.sendJsonResponse(connection, status: 200, object: OllamaPsResponse(models: models))
-                    } else {
-                        var seen = Set<String>()
-                        var tags: [OllamaModelTag] = []
-                        func addTag(_ name: String, path: String?) {
-                            guard !name.isEmpty, seen.insert(name).inserted else { return }
-                            tags.append(OllamaModelTag(name: name, model: name,
-                                                       modifiedAt: QWModelDiskStats.modifiedRFC3339(of: path),
-                                                       size: QWModelDiskStats.sizeBytes(of: path)))
-                        }
-                        if !activeAlias.isEmpty { addTag(activeAlias, path: settings.modelPackPath) }
-                        addTag(modelName, path: settings.modelPackPath)
-                        for disc in QWServerSettings.scanModelsDirectory() where !disc.packPath.isEmpty && disc.supported {
-                            let alias = settings.alias(for: disc.name)
-                            if !alias.isEmpty { addTag(alias, path: disc.packPath) }
-                            addTag(disc.name, path: disc.packPath)
-                        }
-                        self.sendJsonResponse(connection, status: 200, object: OllamaTagsResponse(models: tags))
-                    }
+                    self.handleOllamaTagsOrPsRoute(connection: connection, isPs: cleanPath == "/api/ps")
 
                 case ("GET", "/metrics"):
                     let body = QWEngineTelemetryRegistry.shared.formatPrometheus()
@@ -487,55 +472,7 @@ public final class QWHttpServer: @unchecked Sendable {
                     self.sendJsonResponse(connection, status: 200, object: settings)
 
                 case ("POST", "/v1/settings"), ("POST", "/api/settings"):
-                    let decoder = JSONDecoder()
-                    do {
-                        let oldSettings = QWSettingsManager.shared.loadSettings()
-                        var newSettings = try decoder.decode(QWServerSettings.self, from: body)
-                        let rawObj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
-                        if newSettings.apiKey == "********" || rawObj?["apiKey"] == nil {
-                            newSettings.apiKey = oldSettings.apiKey
-                        }
-                        let modelChanged = (newSettings.modelPackPath != oldSettings.modelPackPath)
-                            || (newSettings.modelName != oldSettings.modelName)
-                        let resolvedPackPath: String
-                        if modelChanged {
-                            let ref = newSettings.resolveModelReference(
-                                newSettings.modelPackPath.isEmpty ? newSettings.modelName : newSettings.modelPackPath
-                            )
-                            resolvedPackPath = ref.packPath
-                            let targetModelName = ref.modelName.isEmpty ? newSettings.modelName : ref.modelName
-                            if let profile = QWSettingsManager.shared.loadProfile(forModel: targetModelName) {
-                                newSettings.applyModelConfigDefaults(packPath: ref.packPath)
-                                newSettings.apply(knobProfile: profile)
-                            } else if newSettings.maxContext == oldSettings.maxContext {
-                                newSettings.applyModelConfigDefaults(packPath: ref.packPath)
-                            }
-                        } else {
-                            resolvedPackPath = newSettings.resolveModelReference(
-                                newSettings.modelPackPath.isEmpty ? newSettings.modelName : newSettings.modelPackPath
-                            ).packPath
-                        }
-                        let backendChanged = newSettings.mtpBackend.lowercased() != oldSettings.mtpBackend.lowercased()
-                        let packExplicitlyChanged = newSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-                            != oldSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if modelChanged || (backendChanged && !packExplicitlyChanged) {
-                            let desc = QWServerSettings.loadPrimaryDescriptor(packPath: resolvedPackPath)
-                            newSettings.reconcileStaleDrafterSelection(for: desc)
-                        }
-                        if let mounted = self.actor.getMountedMemoryPackInfo(), mounted.enforcesKVMode {
-                            newSettings.kvMode = mounted.enforcedKVMode
-                        }
-                        try newSettings.validateBeforeLaunch()
-                        try QWSettingsManager.shared.saveSettings(newSettings)
-                        QWFanController.shared.setPolicy(QWCoolingPolicy(rawValue: newSettings.coolingPolicy) ?? .auto)
-                        if !modelChanged {
-                            try await self.actor.setVisionLoaded(newSettings.loadVision)
-                        }
-                        self.sendJsonResponse(connection, status: 200, object: ["status": "ok", "message": "Settings saved successfully"])
-                    } catch {
-                        let err = ServerErrorPayload(message: "Failed to parse or save settings: \(error.localizedDescription)", code: 400)
-                        self.sendJsonResponse(connection, status: 400, object: err)
-                    }
+                    await self.handleSaveSettingsRoute(connection: connection, body: body)
 
                 case ("POST", "/v1/memory/inspect"), ("POST", "/api/memory/inspect"):
                     try await self.handleMemoryInspectRoute(connection: connection, body: body)
@@ -544,65 +481,26 @@ public final class QWHttpServer: @unchecked Sendable {
                     try await self.handleMemoryIndexRoute(connection: connection, body: body)
 
                 case ("POST", "/v1/memory/mount"), ("POST", "/api/memory/mount"):
-                    guard !body.isEmpty,
-                          let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-                          let repoPath = payload["path"] as? String,
-                          !repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                        let err = ServerErrorPayload(message: "Missing 'path' in memory mount request.", code: 400)
-                        self.sendJsonResponse(connection, status: 400, object: err)
-                        return
-                    }
-                    let mounted = try await self.actor.mountMemoryPack(at: repoPath)
-                    self.sendJsonResponse(connection, status: 200, object: mounted)
+                    try await self.handleMemoryMountRoute(connection: connection, body: body)
 
                 case ("POST", "/v1/memory/unmount"), ("POST", "/api/memory/unmount"):
                     await self.actor.unmountMemoryPack()
                     self.sendJsonResponse(connection, status: 200, object: ["status": "ok"])
 
                 case ("POST", "/v1/settings/reveal"), ("POST", "/api/settings/reveal"):
-                    let path = QWPaths.settingsFilePath
-                    let p = Process()
-                    p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                    p.arguments = ["-R", path]
-                    // The reveal either happened or it did not. An
-                    // unconditional 200 would report success the
-                    // process never established.
-                    do {
-                        try p.run()
-                    } catch {
-                        let err = ServerErrorPayload(message: "Could not open the Finder window: \(error.localizedDescription)", code: 500)
-                        self.sendJsonResponse(connection, status: 500, object: err)
-                        return
-                    }
-                    p.waitUntilExit()
-                    if p.terminationStatus != 0 {
-                        let err = ServerErrorPayload(message: "Finder rejected the request (exit status \(p.terminationStatus)).", code: 500)
-                        self.sendJsonResponse(connection, status: 500, object: err)
-                        return
-                    }
-                    self.sendJsonResponse(connection, status: 200, object: ["status": "ok"])
+                    await self.revealDirectoryInFinder(
+                        connection: connection,
+                        rawDirectoryPath: QWPaths.rootDirectoryURL.path,
+                        createIfInQwgRoot: true
+                    )
 
                 case ("POST", "/v1/logs/reveal"), ("POST", "/api/logs/reveal"):
                     let settings = QWSettingsManager.shared.loadSettings()
-                    let logDir = settings.logDir.expandingTildePath
-                    try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
-                    let p = Process()
-                    p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                    p.arguments = [logDir]
-                    do {
-                        try p.run()
-                    } catch {
-                        let err = ServerErrorPayload(message: "Could not open the Finder window: \(error.localizedDescription)", code: 500)
-                        self.sendJsonResponse(connection, status: 500, object: err)
-                        return
-                    }
-                    p.waitUntilExit()
-                    if p.terminationStatus != 0 {
-                        let err = ServerErrorPayload(message: "Finder rejected the request (exit status \(p.terminationStatus)).", code: 500)
-                        self.sendJsonResponse(connection, status: 500, object: err)
-                        return
-                    }
-                    self.sendJsonResponse(connection, status: 200, object: ["status": "ok"])
+                    await self.revealDirectoryInFinder(
+                        connection: connection,
+                        rawDirectoryPath: settings.logDir,
+                        createIfInQwgRoot: true
+                    )
 
                 case ("POST", "/v1/engine/restart"), ("POST", "/api/restart"):
                     _ = try await self.actor.restartExplicit()
@@ -630,22 +528,20 @@ public final class QWHttpServer: @unchecked Sendable {
                     self.sendIsoJsonResponse(connection, status: 200, object: dashboard)
 
                 case ("GET", "/health"), ("GET", "/"):
-                    let engineState = self.actor.engineState()
-                    let modelName = self.actor.getModelName()
-                    // The server is alive and answering, so the status
-                    // code says so. What the engine is doing is the
-                    // phase — a failed engine is not an unreachable one.
-                    let health = QWHealthResponse(status: engineState.lifecycle.phase.rawValue,
-                                                  engine: "qwegine",
-                                                  model: modelName, loaded: engineState.isLoaded,
-                                                  lifecycle: engineState.lifecycle)
-                    let data = try JSONEncoder().encode(health)
-                    self.sendRawData(connection, status: 200, contentType: "application/json", data: data)
+                    try self.handleHealthRoute(connection: connection)
 
                 default:
                     let err = ServerErrorPayload(message: "Not found: \(method) \(cleanPath)", type: "invalid_request_error", code: 404)
                     self.sendJsonResponse(connection, status: 404, object: err)
                 }
+            } catch let accessErr as QWMemoryWorkspaceAccessError {
+                let err = ServerErrorPayload(message: accessErr.message, type: "invalid_request_error", code: 403)
+                self.logger.log(.warn, "HTTP \(method) \(cleanPath) workspace forbidden: \(accessErr.message)")
+                self.sendJsonResponse(connection, status: 403, object: err)
+            } catch let valErr as QWMetadataValidationError {
+                let err = ServerErrorPayload(message: valErr.description, type: "invalid_request_error", code: 400)
+                self.logger.log(.warn, "HTTP \(method) \(cleanPath) invalid request: \(valErr.description)")
+                self.sendJsonResponse(connection, status: 400, object: err)
             } catch let memError as QWMemoryPackError {
                 let code: Int
                 switch memError {

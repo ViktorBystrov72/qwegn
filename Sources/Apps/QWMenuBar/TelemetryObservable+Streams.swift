@@ -5,37 +5,71 @@ import QWServer
 
 /// Thread-safe UTF-8 byte accumulator splitting complete newline-delimited lines.
 final class ChildPipeLineBuffer: @unchecked Sendable {
+    static let defaultMaxBufferBytes = 64 * 1024
+
     private let lock = NSLock()
+    private let maxBufferBytes: Int
     private var buffer = Data()
 
+    init(maxBufferBytes: Int = ChildPipeLineBuffer.defaultMaxBufferBytes) {
+        self.maxBufferBytes = max(1, maxBufferBytes)
+    }
+
+    var bufferedByteCount: Int {
+        lock.withLock { buffer.count }
+    }
+
     func append(_ chunk: Data, emit: (String) -> Void) {
-        var ready: [String] = []
-        lock.lock()
-        buffer.append(chunk)
-        while let newlineIndex = buffer.firstIndex(of: 0x0A) {
-            var lineData = buffer.subdata(in: buffer.startIndex..<newlineIndex)
-            if lineData.last == 0x0D {
-                lineData.removeLast()
+        let ready: [String] = lock.withLock {
+            var lines: [String] = []
+            buffer.append(chunk)
+            while let newlineIndex = buffer.firstIndex(of: 0x0A) {
+                var lineData = buffer.subdata(in: buffer.startIndex..<newlineIndex)
+                if lineData.last == 0x0D {
+                    lineData.removeLast()
+                }
+                buffer.removeSubrange(buffer.startIndex...newlineIndex)
+                let decoded = String(decoding: lineData, as: UTF8.self)
+                if !decoded.isEmpty { lines.append(decoded) }
             }
-            buffer.removeSubrange(buffer.startIndex...newlineIndex)
-            let decoded = String(decoding: lineData, as: UTF8.self)
-            if !decoded.isEmpty { ready.append(decoded) }
+            while buffer.count > maxBufferBytes {
+                var splitIdx = buffer.index(buffer.startIndex, offsetBy: maxBufferBytes)
+                var backedUp = 0
+                while backedUp < 3
+                    && splitIdx > buffer.startIndex
+                    && splitIdx < buffer.endIndex
+                    && (buffer[splitIdx] & 0xC0) == 0x80 {
+                    splitIdx = buffer.index(before: splitIdx)
+                    backedUp += 1
+                }
+                if splitIdx == buffer.startIndex {
+                    splitIdx = buffer.index(buffer.startIndex, offsetBy: maxBufferBytes)
+                }
+                var lineData = buffer.subdata(in: buffer.startIndex..<splitIdx)
+                if lineData.last == 0x0D {
+                    lineData.removeLast()
+                }
+                buffer.removeSubrange(buffer.startIndex..<splitIdx)
+                let decoded = String(decoding: lineData, as: UTF8.self)
+                if !decoded.isEmpty { lines.append(decoded) }
+            }
+            if buffer.isEmpty {
+                buffer = Data()
+            }
+            return lines
         }
-        lock.unlock()
         for line in ready { emit(line) }
     }
 
     func flush(emit: (String) -> Void) {
-        var trailing: String?
-        lock.lock()
-        if !buffer.isEmpty {
+        let trailing: String? = lock.withLock {
+            guard !buffer.isEmpty else { return nil }
             var remainder = buffer
             if remainder.last == 0x0D { remainder.removeLast() }
             let decoded = String(decoding: remainder, as: UTF8.self)
-            if !decoded.isEmpty { trailing = decoded }
             buffer.removeAll(keepingCapacity: false)
+            return decoded.isEmpty ? nil : decoded
         }
-        lock.unlock()
         if let trailing { emit(trailing) }
     }
 }
@@ -45,6 +79,63 @@ private struct SSELogLinePayload: Decodable {
 }
 
 extension TelemetryObservable {
+    static func urlHost(for rawHost: String) -> String {
+        let trimmed = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed == "0.0.0.0" || trimmed == "::" || trimmed == "*" {
+            return "127.0.0.1"
+        }
+        if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+            return trimmed
+        }
+        if trimmed.contains(":") {
+            let escaped = trimmed.replacingOccurrences(of: "%", with: "%25")
+            return "[\(escaped)]"
+        }
+        return trimmed
+    }
+
+    static func serverURL(host: String, port: Int, path: String) -> URL? {
+        guard (1...65535).contains(port) else { return nil }
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+        return URL(string: "http://\(urlHost(for: host)):\(port)\(normalizedPath)")
+    }
+
+    func serverURL(path: String) -> URL? {
+        Self.serverURL(host: settings.host, port: settings.port, path: path)
+    }
+
+    static func authorizedRequest(
+        url: URL,
+        apiKey: String,
+        method: String = "GET",
+        timeoutInterval: TimeInterval? = nil
+    ) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        if let timeoutInterval {
+            req.timeoutInterval = timeoutInterval
+        }
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedKey.isEmpty {
+            req.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
+        }
+        return req
+    }
+
+    func authorizedRequest(
+        path: String,
+        method: String = "GET",
+        timeoutInterval: TimeInterval? = nil
+    ) -> URLRequest? {
+        guard let url = serverURL(path: path) else { return nil }
+        return Self.authorizedRequest(
+            url: url,
+            apiKey: settings.apiKey,
+            method: method,
+            timeoutInterval: timeoutInterval
+        )
+    }
+
     public func setPopoverVisible(_ visible: Bool) {
         guard isPopoverVisible != visible else { return }
         isPopoverVisible = visible
@@ -131,15 +222,14 @@ extension TelemetryObservable {
 
     private func startDashboardStreamIfNeeded() {
         guard dashboardStreamTask == nil,
-              let url = URL(string: "http://\(settings.host):\(settings.port)/v1/dashboard/stream") else {
+              var req = authorizedRequest(path: "/v1/dashboard/stream", timeoutInterval: 3600) else {
             return
         }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 3600
         req.cachePolicy = .reloadIgnoringLocalCacheData
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
+        let request = req
 
         dashboardStreamTask = Task { @MainActor [weak self] in
             defer {
@@ -147,7 +237,7 @@ extension TelemetryObservable {
                 self?.lastDashboardStreamAt = nil
             }
             do {
-                let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                let (bytes, response) = try await URLSession.shared.bytes(for: request)
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return }
                 for try await rawLine in bytes.lines {
                     if Task.isCancelled { break }
@@ -165,11 +255,12 @@ extension TelemetryObservable {
 
     private func startRemoteLogStreamIfNeeded() {
         guard logStreamTask == nil,
-              let url = URL(string: "http://\(settings.host):\(settings.port)/v1/logs/stream") else {
+              var req = authorizedRequest(path: "/v1/logs/stream", timeoutInterval: 3600) else {
             return
         }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 3600
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        let request = req
 
         logStreamTask = Task { @MainActor [weak self] in
             defer {
@@ -177,7 +268,7 @@ extension TelemetryObservable {
                 self?.isLogStreamConnected = false
             }
             do {
-                let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                let (bytes, response) = try await URLSession.shared.bytes(for: request)
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return }
                 self?.isLogStreamConnected = true
                 for try await rawLine in bytes.lines {
@@ -198,15 +289,13 @@ extension TelemetryObservable {
         path: String,
         onComplete: (@MainActor (Result<QWEngineInfoResponse.MountedMemoryPackInfo, Error>) -> Void)? = nil
     ) {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/v1/memory/mount") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
+        guard var req = authorizedRequest(path: "/v1/memory/mount", method: "POST", timeoutInterval: 120.0) else { return }
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["path": path])
-        req.timeoutInterval = 120.0
+        let request = req
         Task {
             do {
-                let (data, res) = try await URLSession.shared.data(for: req)
+                let (data, res) = try await URLSession.shared.data(for: request)
                 guard let http = res as? HTTPURLResponse, http.statusCode == 200 else {
                     let body = String(data: data, encoding: .utf8) ?? "mount failed"
                     throw NSError(domain: "QWMemoryPack", code: 1, userInfo: [NSLocalizedDescriptionKey: body])
@@ -223,12 +312,11 @@ extension TelemetryObservable {
     }
 
     public func unmountMemoryPack(onComplete: (@MainActor () -> Void)? = nil) {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/v1/memory/unmount") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 30.0
+        guard var req = authorizedRequest(path: "/v1/memory/unmount", method: "POST", timeoutInterval: 30.0) else { return }
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let request = req
         Task {
-            _ = try? await URLSession.shared.data(for: req)
+            _ = try? await URLSession.shared.data(for: request)
             self.fetchHttpEngineInfo()
             self.fetchDashboard()
             onComplete?()
@@ -251,9 +339,7 @@ extension TelemetryObservable {
     }
 
     func checkServerHealth() async -> Bool {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/health") else { return false }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 1.0
+        guard let req = authorizedRequest(path: "/health", timeoutInterval: 1.0) else { return false }
         do {
             let (_, res) = try await URLSession.shared.data(for: req)
             return (res as? HTTPURLResponse)?.statusCode == 200

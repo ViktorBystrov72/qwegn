@@ -546,16 +546,39 @@ public struct QWModelDescriptor: Sendable, Hashable {
         f.append("family=\(d.family.rawValue)")
         f.append("role=\(d.role.rawValue)")
         f.append("env_type=\(d.envelopeModelType ?? "-")")
-        f.append("kda=\(d.gdnVectorDecay ? 1 : 0),\(d.gdnLowRankDim ?? 0)")
+        let gateBoundHex = d.gdnGateLowerBound.map { "0x" + String($0.bitPattern, radix: 16, uppercase: false) } ?? "-"
+        f.append("kda=\(d.gdnVectorDecay ? 1 : 0),\(d.gdnLowRankDim ?? 0),\(d.gdnSeparateConv ? 1 : 0),\(gateBoundHex)")
         f.append("mla=\(d.mlaUseNoPE ? 1 : 0),\(d.kvLoraRank ?? 0),\(d.qLoraRank ?? 0),\(d.hybridMLAConfig != nil ? 1 : 0)")
         f.append("loop=\(d.loopSettings.map { "\($0.start),\($0.end),\($0.evalCount)" } ?? "-")")
         f.append("mhc=\(d.mhcConfig.map { "\($0.start),\($0.end),\($0.streams),\($0.iterations)" } ?? "-")")
+        switch d.activationKind {
+        case .silu:
+            f.append("act=silu")
+        case .situ(let beta, let linearBeta):
+            let bHex = String(beta.bitPattern, radix: 16, uppercase: false)
+            let lbHex = String(linearBeta.bitPattern, radix: 16, uppercase: false)
+            f.append("act=situ,0x\(bHex),0x\(lbHex)")
+        }
+        let swigluHex = d.swigluLimit.map { "0x" + String($0.bitPattern, radix: 16, uppercase: false) } ?? "-"
+        f.append("swiglu_lim=\(swigluHex)")
+        f.append("route_scale=0x\(String(d.routedScalingFactor.bitPattern, radix: 16, uppercase: false))")
+        f.append("norm_topk=\(d.normTopKProb ? 1 : 0)")
+        f.append("tie_emb=\(d.tieWordEmbeddings ? 1 : 0)")
+        f.append("qk_norm=\(d.hasQKNorm ? 1 : 0)")
+        f.append("plus1_rms=\(d.usesPlusOneRMSNorm ? 1 : 0)")
         if let bsa = d.blockSparseGQAConfig {
             f.append("bsa=\(bsa.blockSize),\(bsa.prefixBlocks),\(bsa.localBlocks),\(bsa.remoteBlocks)")
         }
-        if let y = d.yarnRopeConfig {
-            f.append("yarn=\(y.factor),\(y.originalMaxPositionEmbeddings)")
+        func appendYarn(_ label: String, _ y: YarnRopeConfig?) {
+            guard let y else { return }
+            let vals = [y.factor, y.betaFast, y.betaSlow, y.mscale, y.mscaleAllDim]
+                .map { "0x" + String($0.bitPattern, radix: 16, uppercase: false) }
+                .joined(separator: ",")
+            f.append("\(label)=\(vals),\(y.originalMaxPositionEmbeddings)")
         }
+        appendYarn("yarn", d.yarnRopeConfig)
+        appendYarn("hca_yarn", d.hcaConfig?.yarn)
+        appendYarn("mla_yarn", d.hybridMLAConfig?.yarn)
         if d.capabilities.contains(.vision) {
             f.append("vis=\(d.visDepth),\(d.visHidden),\(d.visHeads),\(d.visIntermediate),\(d.visPatch),\(d.visMerge),\(d.visPosEmbeds),\(d.visOut),\(d.imageTokenId),\(d.videoTokenId)")
         } else {
@@ -627,21 +650,43 @@ public struct QWModelDescriptor: Sendable, Hashable {
             mtpLayers: 1, mtpUseDedicatedEmbeddings: false, eosTokenId: 248044, hasQKNorm: true)
     }
 
-    /// Re-derives dependent counts; returns violated identities (empty = sane).
+    /// Validates core positive dimensions, divisibility, layer kinds, and dependent counts.
     public func verifyInternalConsistency() -> [String] {
         var bad: [String] = []
-        if qProjOut != (attnOutputGate ? 2 : 1) * qHeads * headDim { bad.append("qProjOut") }
-        if rotaryDims != Int(Double(headDim) * partialRotaryFactor) { bad.append("rotaryDims") }
+        if hidden <= 0 { bad.append("hidden") }
+        if vocab <= 0 { bad.append("vocab") }
+        if numLayers <= 0 { bad.append("numLayers") }
+        if qHeads <= 0 { bad.append("qHeads") }
+        if kvHeads <= 0 { bad.append("kvHeads") }
+        if headDim <= 0 { bad.append("headDim") }
+        if qHeads > 0, kvHeads > 0, qHeads % kvHeads != 0 { bad.append("qHeads%kvHeads") }
+        if maxPositionEmbeddings <= 0 { bad.append("maxPositionEmbeddings") }
+        if !(rmsEps > 0 && rmsEps.isFinite) { bad.append("rmsEps") }
+        if !(ropeTheta > 0 && ropeTheta.isFinite) { bad.append("ropeTheta") }
+        if !(partialRotaryFactor > 0 && partialRotaryFactor <= 1.0 && partialRotaryFactor.isFinite) {
+            bad.append("partialRotaryFactor")
+        }
+        if let n = numExperts {
+            if n <= 0 { bad.append("numExperts") }
+            if let k = expertsPerTok, k <= 0 || k > n { bad.append("expertsPerTok") }
+        }
+        var validKinds: Set<String> = ["full_attention", "linear_attention", "compressed_attention"]
+        if role == .speculativeDrafter { validKinds.insert("sliding_attention") }
+        if layerTypes.count != numLayers { bad.append("layerTypes.count") }
+        if !layerTypes.allSatisfy({ validKinds.contains($0) }) { bad.append("layerTypes") }
         if hasMropeSection, mropeW + mropeH + mropeT != rotaryDims / 2 { bad.append("mropeSection") }
+        if !linearAttentionLayers.isEmpty, (gdnQKHeads <= 0 || gdnVHeads <= 0 || gdnHeadDim <= 0) {
+            bad.append("gdnDims")
+        }
         if gdnQKVChannels != (2 * gdnQKHeads + gdnVHeads) * gdnHeadDim { bad.append("gdnQKVChannels") }
         if gdnZChannels != gdnVHeads * gdnHeadDim { bad.append("gdnZChannels") }
-        if fullAttentionLayers.count != layerTypes.filter({ $0 == "full_attention" }).count { bad.append("full-layer count") }
-        if fullAttentionInterval > 0 {
+        if fullAttentionInterval > 0, layerTypes.count == numLayers {
             let every = fullAttentionLayers.allSatisfy { ($0 + 1) % fullAttentionInterval == 0 }
             if !every { bad.append("full-layer cadence vs interval") }
         }
         if let ids = pleLayerIds {
-            for id in ids where id < 1 || id > numLayers || layerTypes[id - 1] != "linear_attention" {
+            for id in ids where id < 1 || id > numLayers || id - 1 >= layerTypes.count
+                || layerTypes[id - 1] != "linear_attention" {
                 bad.append("ple id \(id)")
             }
         }

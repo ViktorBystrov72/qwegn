@@ -710,7 +710,7 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_body(
     uint3 tg,
     threadgroup half*   kvblk,
     threadgroup half*   vblk) {
-    if ((QW_HEAD_DIM & (QW_HEAD_DIM - 1u)) == 0u) {
+    if (MODE != 0u && (QW_HEAD_DIM & (QW_HEAD_DIM - 1u)) == 0u) {
         threadgroup int8_t* kvblk_i8 = (threadgroup int8_t*)kvblk;
         threadgroup float* kScale = (threadgroup float*)(kvblk_i8 + QW_BK * (QW_NAX_HDIM + 16u));
         qwg_attn_prefill_paged_nax_pair_i8_body<MODE>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, tid, sgi, tg, kvblk_i8, kScale, vblk, kvblk);

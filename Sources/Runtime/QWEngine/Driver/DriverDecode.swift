@@ -23,60 +23,53 @@ extension QWEngineDriver {
 
     func decodeStep(_ session: QWEngineSession, token: Int,
                             permit: QWGenerationPermit?) throws -> Int {
-        guard flight.try() else { throw QWEngineDriverError.busy }
-        defer { flight.unlock() }
-        try requestGate.validate(permit)
-        guard permit != nil || session.stochastic == nil else {
-            throw QWEngineDriverError.state("use the stochastic request door for a sampled session")
-        }
-        guard verifiedSession == nil else { throw QWEngineDriverError.state("resolve verification before using driver scratch") }
-        guard let next = try forwardStep(session, token: token) else {
-            throw QWEngineDriverError.state("ordinary forward did not produce a token")
-        }
-        if session.stochastic == nil {
-            if (activeConstraint?.constraint.isUnconstrainedNow ?? true), let prev1 = session.tokenHistory.last {
-                let prev2 = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
-                session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: next)
+        try admission.withFlight {
+            try admission.requestGate.validate(permit)
+            guard permit != nil || session.stochastic == nil else {
+                throw QWEngineDriverError.state("use the stochastic request door for a sampled session")
             }
-            session.tokenHistory.append(next)
+            guard speculativeCoordinator.verifiedSession == nil else {
+                throw QWEngineDriverError.state("resolve verification before using driver scratch")
+            }
+            guard let next = try forwardStep(session, token: token) else {
+                throw QWEngineDriverError.state("ordinary forward did not produce a token")
+            }
+            if session.stochastic == nil {
+                if (activeConstraint?.constraint.isUnconstrainedNow ?? true), let prev1 = session.tokenHistory.last {
+                    let prev2 = session.tokenHistory.count >= 2 ? session.tokenHistory[session.tokenHistory.count - 2] : nil
+                    session.tokenRecycler.recordTransition(previous: prev2, current: prev1, next: next)
+                }
+                session.tokenHistory.append(next)
+            }
+            return next
         }
-        return next
     }
 
     /// Ordinary single-token forward pass across the 64-layer trunk.
     func forwardStep(_ session: QWEngineSession, token: Int) throws -> Int? {
-        // The step's wall time, from the first work to the last wait. The
-        // GPU's share of it is the engine's own busy ratio: measured, never
-        // estimated from the token rate.
         let tStep0 = Date()
         if let prevCB = session.lastCommitCB {
             session.lastCommitCB = nil
             prevCB.waitUntilCompleted()
             if prevCB.status != .completed {
-                commandBufferErrors += 1
+                admission.commandBufferErrors += 1
                 session.stateFailed = true
                 throw QWEngineDriverError.state("prior speculative commit GPU failure before serial step")
             }
         }
         let pos = session.position
         guard pos < ropeRows else { throw QWEngineDriverError.posBeyondTable(pos) }
-        // C5 guard UP FRONT (C16 law): a throw after hal.begin() would
-        // SIGABRT via encoder dealloc — validate before the encoder opens.
         guard token >= 0, token < geometry.vocab else { throw QWEngineDriverError.badToken(token) }
         try claimMLAIndexerState(session)
         let seedMTP = (mtpScratch != nil || dflashDrafter != nil) && !session.batchedDecodeTouched
         let mtpRows = seedMTP ? try prepareMTPSeeding(session, count: 1) : 0
-        // KV capacity: grow a page ahead so the C09 fused page write never
-        // overruns (grow() is page-granular; tokenCapacity = pages·256).
         if session.kv.tokenCapacity <= pos {
             try kvCache.grow(session.kv, to: pos + QWKVCache.pageTokens)
             session.attnKVViews = try kvCache.layerViewsAll(session.kv, layers: attnLayers)
         }
         try kvCache.prepareWrites(session.kv, positions: pos..<(pos + 1))
 
-        let tEncode0 = Date()   // CPU-tail ledger: begin→end only (the wait
-        // below is GPU time and never belongs to the ≤1%-of-step encode gate)
-        // x = embed[token] (CPU memcpy of one f16 row — 10 KiB, sub-ms).
+        let tEncode0 = Date()
         try copyEmbedRow(token, to: sc.x)
         if session.generated == 0 && !activeVisualSpans.isEmpty {
             applyVisualSpans(start: pos, count: 1, to: sc.x)
@@ -86,24 +79,20 @@ extension QWEngineDriver {
             let dst = mtpScratch.embedding.region.buffer.contents().advanced(by: mtpScratch.embedding.region.base + mtpScratch.embedding.offset)
             memcpy(dst, src, sc.x.bytes)
         }
-        guard let pair = hal.begin() else { throw QWEngineDriverError.state("cmdbuffer") }
-        var cb: any MTLCommandBuffer = pair.0
-        var enc: any MTLComputeCommandEncoder = pair.1
-        activeCB = cb
-        activeEnc = enc
-        stepCBs = []
-        decodeTel.coldStageUs = 0
-        decodeTel.coldWaitUs = 0
-        decodeTel.coldIOUs = 0
-        decodeTel.coldStaged = 0
-        beginDecodeProfileStep()
+        var (cb, enc) = try commandFrame.begin(hal: hal)
+        commandFrame.resetColdTelemetry()
+        commandFrame.beginDecodeProfileStep(device: hal.device, enabled: Self.decodeProfileEnabled)
         profileStage("embed")
-        var encoderEnded = false
+        var allCBsDrained = false
         defer {
-            if !encoderEnded { (activeEnc ?? enc).endEncoding() }
-            activeCB = nil
-            activeEnc = nil
-            stepCBs = nil
+            if allCBsDrained {
+                commandFrame.closeActiveEncoder()
+                commandFrame.clearActiveBindings()
+            } else {
+                commandFrame.abortIncomplete(
+                    admission: admission, session: nil,
+                    resetDecodeProfiler: Self.decodeProfileEnabled)
+            }
         }
         // The residual stream is sc.x for the WHOLE step: the shipping norm
         // door (qwg_rmsnorm_residual) advances it IN PLACE (residual :=
@@ -126,30 +115,48 @@ extension QWEngineDriver {
         try encodeTargetHeadGreedy(enc, x: sc.ln1,
                                    writeLogits: session.stochastic != nil || activeCollectLogprobs || activeConstraint != nil)
         if seedMTP, (mtpScratch != nil || dflashDrafter != nil) {
+            activeEnc = nil
             enc.endEncoding()
-            encoderEnded = true
             let seedEmbeddings = mtpScratch?.embedding ?? sc.x
             let seedHidden: QWTensorValue = echoDrafter != nil ? sc.mhcStream! : sc.ln1
             try encodeMTPSeeding(cb, session: session, embeddings: seedEmbeddings,
                                  hidden: seedHidden, count: 1, cacheRows: mtpRows)
+            activeCB = nil
             cb.commit()
         } else {
-            encoderEnded = true
+            activeEnc = nil
+            activeCB = nil
             hal.end(cb, enc)
         }
+        stepCBs?.append(cb)
         let encodeUs = Date().timeIntervalSince(tEncode0) * 1e6
         cpuEncodeLedger.record(micros: encodeUs)
-        cb.waitUntilCompleted()          // end BEFORE wait (20-min-hang law)
-        if let pipe = coldEvents {
-            let r = pipe.takeStepResult()
-            pipe.tuneBridge()
-            decodeTel.coldWaitUs += r.waitUs
-            decodeTel.coldIOUs += r.ioUs
-            decodeTel.coldStaged += r.staged
-            if let f = r.failure { throw QWEngineDriverError.state("cold event staging: \(f)") }
+        let allCbs = stepCBs ?? [cb]
+        for stepCb in allCbs {
+            stepCb.waitUntilCompleted()
         }
-        flushPendingColdUnloads()
-        endDecodeProfileStep()
+        let coldFailure = commandFrame.drainColdEvents(waitUntilIdle: true)
+        commandFrame.flushPendingColdUnloads()
+        commandFrame.endDecodeProfileStep(enabled: Self.decodeProfileEnabled)
+        allCBsDrained = true
+        for stepCb in allCbs where stepCb.status != .completed || stepCb.error != nil {
+            commandBufferErrors += 1   // M1 triad
+        }
+        let hasSpecState = mtpCache != nil || verifyWindow != nil
+        if let coldFailure {
+            if hasSpecState { session.stateFailed = true }
+            throw QWEngineDriverError.state("cold event staging: \(coldFailure)")
+        }
+        for stepCb in allCbs {
+            if let e = stepCb.error {
+                if hasSpecState { session.stateFailed = true }
+                throw QWEngineDriverError.state("step cb: \(e.localizedDescription)")
+            }
+            if stepCb.status != .completed {
+                if hasSpecState { session.stateFailed = true }
+                throw QWEngineDriverError.state("step cb completion failed (status=\(stepCb.status.rawValue))")
+            }
+        }
         if ColdExpertStreamer.verifyPromotions {
             var bad = 0, checked = 0
             for lw in layersW {
@@ -162,12 +169,10 @@ extension QWEngineDriver {
             }
             FileHandle.standardError.write(Data("[expert-cache] verified=\(checked) mismatched=\(bad)\n".utf8))
         }
-        if cb.error != nil { commandBufferErrors += 1 }   // M1 triad (the
-        stepCBs?.append(cb)
         // GPU time = union of every CB's GPU interval in this step (cold
         // staging splits the step into one CB per MoE layer); host-wait gaps
         // between CBs are idle, not busy.
-        let gpuUs = Self.gpuBusyMicros(stepCBs ?? [cb])
+        let gpuUs = Self.gpuBusyMicros(allCbs)
         if gpuUs.isFinite, gpuUs > 0 { decodeGpuLedger.record(micros: gpuUs) }
         // The engine's own GPU busy ratio: the step's GPU busy time over the
         // wall time the step took. A ratio, not a percentage the host had to
@@ -189,20 +194,6 @@ extension QWEngineDriver {
                 format: "[decode]   cold: wait=%.2fms io=%.2fms staged=%d bridge=%u\n",
                 decodeTel.coldWaitUs / 1000, decodeTel.coldIOUs / 1000, decodeTel.coldStaged,
                 coldEvents?.bridgeIters ?? 0).utf8))
-        }
-        let hasSpecState = mtpCache != nil || verifyWindow != nil
-        // H3 FIX: a failed command buffer leaves sc.token STALE (last
-        // step's id) and position untouched — returning it silently
-        // corrupts the stream and every parity ledger after it. The count
-        // stays (the triad gate); the caller now gets a throw instead of
-        // garbage. Session state stays consistent: nothing was committed.
-        if hasSpecState, cb.status != .completed {
-            session.stateFailed = true
-            throw QWEngineDriverError.state("MTP step GPU completion failed: \(String(describing: cb.error))")
-        }
-        if let e = cb.error {
-            if hasSpecState { session.stateFailed = true }
-            throw QWEngineDriverError.state("step cb: \(e.localizedDescription)")
         }
 
         session.position += 1
@@ -257,98 +248,23 @@ extension QWEngineDriver {
 
     /// Start a new timed encoder for `stage` on the active CB (no-op unless profiling).
     func profileStage(_ stage: String) {
-        guard Self.decodeProfileEnabled || Self.prefillProfileEnabled,
-              let p = decodeTel.profiler, p.hasSegmentCapacity,
-              let cb = activeCB, let cur = activeEnc else { return }
-        cur.endEncoding()
-        guard let enc = try? p.makeEncoder(commandBuffer: cb, stage: stage) else {
-            fatalError("QW_DECODE_PROFILE: encoder creation failed after ending the active encoder")
-        }
-        hal.touchKeepAlive(enc)
-        activeEnc = enc
+        commandFrame.profileStage(stage, hal: hal,
+                                  enabled: Self.decodeProfileEnabled || Self.prefillProfileEnabled)
     }
 
     /// Rotates `enc` to a fresh compute encoder on `activeCB` (preserving stage profiling when enabled).
     func rotateActiveEncoder(_ enc: inout any MTLComputeCommandEncoder, stage: String = "moe.experts_nax") throws {
-        if (Self.decodeProfileEnabled || Self.prefillProfileEnabled),
-           let p = decodeTel.profiler, p.hasSegmentCapacity,
-           let cb = activeCB {
-            enc.endEncoding()
-            guard let next = try? p.makeEncoder(commandBuffer: cb, stage: stage) else {
-                throw QWEngineDriverError.state("profile encoder rotation failed")
-            }
-            hal.touchKeepAlive(next)
-            activeEnc = next
-            enc = next
-            return
-        }
-        guard let cb = activeCB else {
-            throw QWEngineDriverError.state("rotateActiveEncoder requires activeCB")
-        }
-        try hal.rotateEncoder(cb, &enc)
-        activeEnc = enc
-    }
-
-    private func beginDecodeProfileStep() {
-        guard Self.decodeProfileEnabled, decodeTel.profiler == nil else { return }
-        guard QWGPUStageProfiler<String>.isSupported(on: hal.device) else {
-            FileHandle.standardError.write(Data("[decode-profile] stage sampling unsupported\n".utf8))
-            return
-        }
-        decodeTel.profiler = try? QWGPUStageProfiler<String>(device: hal.device, segmentCapacity: 4096)
-    }
-
-    private func endDecodeProfileStep() {
-        guard Self.decodeProfileEnabled, let p = decodeTel.profiler else { return }
-        defer { p.reset() }
-        guard let pairs = try? p.resolveByStage() else { return }
-        var stepTotal: [String: Double] = [:]
-        for (stage, us) in pairs { stepTotal[stage, default: 0] += us }
-        for (stage, us) in stepTotal {
-            let e = decodeTel.stageTotals[stage] ?? (0, 0)
-            decodeTel.stageTotals[stage] = (e.us + us, e.n + 1)
-        }
-        decodeTel.profiledSteps += 1
-        guard decodeTel.profiledSteps % 32 == 0 else { return }
-        let n = Double(decodeTel.profiledSteps)
-        let total = decodeTel.stageTotals.values.reduce(0) { $0 + $1.us } / n
-        var s = String(format: "[decode-profile] steps=%d sampled_gpu=%.2fms/token\n", decodeTel.profiledSteps, total / 1000)
-        for (k, v) in decodeTel.stageTotals.sorted(by: { $0.value.us > $1.value.us }) {
-            s += String(format: "[decode-profile]   %-28@ %7.3f ms/token  %5.1f%%\n",
-                        k as NSString, v.us / n / 1000, 100 * v.us / n / total)
-        }
-        FileHandle.standardError.write(Data(s.utf8))
+        try commandFrame.rotateActiveEncoder(
+            &enc, stage: stage, hal: hal,
+            profilingEnabled: Self.decodeProfileEnabled || Self.prefillProfileEnabled)
     }
 
     func beginPrefillProfileChunk() {
-        guard Self.prefillProfileEnabled, decodeTel.profiler == nil,
-              QWGPUStageProfiler<String>.isSupported(on: hal.device) else { return }
-        decodeTel.profiler = try? QWGPUStageProfiler<String>(device: hal.device, segmentCapacity: 4096)
-        decodeTel.prefillChunkStart = (decodeTel.coldStageUs, decodeTel.coldWaitUs, decodeTel.coldIOUs,
-                                       decodeTel.coldStaged, Date())
+        commandFrame.beginPrefillProfileChunk(device: hal.device, enabled: Self.prefillProfileEnabled)
     }
 
     func endPrefillProfileChunk(tokens: Int) {
-        guard Self.prefillProfileEnabled, let p = decodeTel.profiler else { return }
-        defer { decodeTel.profiler = nil }
-        guard let pairs = try? p.resolveByStage() else { return }
-        var totals: [String: Double] = [:]
-        for (stage, us) in pairs { totals[stage, default: 0] += us }
-        let total = totals.values.reduce(0, +)
-        var s = String(format: "[prefill-profile] tokens=%d sampled_gpu=%.2fms (%.1f tok/s)\n",
-                       tokens, total / 1000, Double(tokens) / max(total, 1) * 1e6)
-        if let c = decodeTel.prefillChunkStart {
-            // Cold expert CBs run outside the stage sampler; wall vs sampled shows their share.
-            s += String(format: "[prefill-profile]   wall=%.2fms cold: staged=%d stage=%.2fms (gpu-wait %.2fms, io %.2fms)\n",
-                        Date().timeIntervalSince(c.t0) * 1000, decodeTel.coldStaged - c.staged,
-                        (decodeTel.coldStageUs - c.stageUs) / 1000, (decodeTel.coldWaitUs - c.waitUs) / 1000,
-                        (decodeTel.coldIOUs - c.ioUs) / 1000)
-        }
-        for (k, us) in totals.sorted(by: { $0.value > $1.value }) {
-            s += String(format: "[prefill-profile]   %-28@ %8.2f ms  %5.1f%%\n",
-                        k as NSString, us / 1000, 100 * us / max(total, 1))
-        }
-        FileHandle.standardError.write(Data(s.utf8))
+        commandFrame.endPrefillProfileChunk(tokens: tokens, enabled: Self.prefillProfileEnabled)
     }
 
     /// QW_ROUTE_DUMP=<path> appends every cold-staged MoE layer's routed ids (diagnostic).
@@ -383,8 +299,27 @@ extension QWEngineDriver {
         return total * 1e6
     }
 
+    private final class CommittedCBBox: @unchecked Sendable {
+        let cb: any MTLCommandBuffer
+        private let lock = NSLock()
+        private var isCommitted = false
+
+        init(_ cb: any MTLCommandBuffer) { self.cb = cb }
+
+        var committed: Bool { lock.withLock { isCommitted } }
+
+        func commit() {
+            lock.withLock {
+                guard !isCommitted else { return }
+                isCommitted = true
+                cb.commit()
+            }
+        }
+    }
+
     func stageColdExpertsSpan(
         moe: MoEW, s: MoEScratch, startRow: Int, totalRows: Int,
+        isVerifyWindow: Bool = false,
         onBeforeIO: ((inout any MTLComputeCommandEncoder, any MTLCommandBuffer, Int) throws -> Void)? = nil,
         onAfterGateUpIO: ((any MTLComputeCommandEncoder, Int) throws -> Void)? = nil
     ) throws -> (nextRow: Int, stagedCount: Int) {
@@ -392,21 +327,24 @@ extension QWEngineDriver {
               let curCB = activeCB, let curEnc = activeEnc else { return (totalRows, 0) }
         let tStage0 = Date()
         defer { decodeTel.coldStageUs += Date().timeIntervalSince(tStage0) * 1e6 }
+        activeEnc = nil
+        activeCB = nil
         hal.end(curCB, curEnc)
         stepCBs?.append(curCB)
-        var resCB: (any MTLCommandBuffer)?
-        // A dynamic-residency streamer maps router ids to bank slots on the CPU,
-        // so resident compute cannot be encoded before the route readback.
+        let effectiveColdSlots = streamer.effectiveColdBudget(isVerifyWindow: isVerifyWindow).slots
         let canPrecommitResident = !streamer.isDynamic
-            && (totalRows - startRow) * moe.expertsPerTok <= streamer.stagingSlots
+            && (totalRows - startRow) * moe.expertsPerTok <= effectiveColdSlots
         if canPrecommitResident, let onBeforeIO {
             guard let resPair = hal.begin() else {
                 throw QWEngineDriverError.state("cold expert resident overlap cmdbuffer")
             }
             var resEnc = resPair.1
+            var resOpen = true
+            defer { if resOpen { resEnc.endEncoding() } }
             try onBeforeIO(&resEnc, resPair.0, totalRows)
+            resOpen = false
             hal.end(resPair.0, resEnc)
-            resCB = resPair.0
+            stepCBs?.append(resPair.0)
         }
         let tWait0 = Date()
         curCB.waitUntilCompleted()
@@ -415,23 +353,31 @@ extension QWEngineDriver {
             commandBufferErrors += 1
             throw QWEngineDriverError.state("cold expert route cb: \(err.localizedDescription)")
         }
+        if curCB.status != .completed {
+            commandBufferErrors += 1
+            throw QWEngineDriverError.state("cold expert route cb completion failed (status=\(curCB.status.rawValue))")
+        }
+        flushPendingColdUnloads()
         let idxPtr = s.idx.region.buffer.contents()
             .advanced(by: s.idx.region.base + s.idx.offset)
             .assumingMemoryBound(to: UInt32.self)
         dumpRoute(streamer: streamer, ids: idxPtr + startRow * moe.expertsPerTok,
                   rows: totalRows - startRow, routes: moe.expertsPerTok)
         let prep = try streamer.prepareSpan(
-            idxPtr: idxPtr, startRow: startRow, totalRows: totalRows, routes: moe.expertsPerTok)
+            idxPtr: idxPtr, startRow: startRow, totalRows: totalRows,
+            routes: moe.expertsPerTok, isVerifyWindow: isVerifyWindow)
         if !canPrecommitResident, prep.stagedCount > 0, let onBeforeIO {
             guard let resPair = hal.begin() else {
                 throw QWEngineDriverError.state("cold expert resident overlap cmdbuffer")
             }
             var resEnc = resPair.1
+            var resOpen = true
+            defer { if resOpen { resEnc.endEncoding() } }
             try onBeforeIO(&resEnc, resPair.0, prep.nextRow)
+            resOpen = false
             hal.end(resPair.0, resEnc)
-            resCB = resPair.0
+            stepCBs?.append(resPair.0)
         }
-        var coldGuCB: (any MTLCommandBuffer)?
         decodeTel.coldStaged += prep.stagedCount
         let tIO0 = Date()
         defer { decodeTel.coldIOUs += Date().timeIntervalSince(tIO0) * 1e6 }
@@ -440,35 +386,28 @@ extension QWEngineDriver {
                 guard let guPair = hal.begin() else {
                     throw QWEngineDriverError.state("cold expert gateup overlap cmdbuffer")
                 }
+                var guOpen = true
+                defer { if guOpen { guPair.1.endEncoding() } }
                 try onAfterGateUpIO(guPair.1, prep.nextRow)
+                guOpen = false
                 guPair.1.endEncoding()
-                struct BoxedCB: @unchecked Sendable { let cb: any MTLCommandBuffer }
-                let guCB = BoxedCB(cb: guPair.0)
-                coldGuCB = guPair.0
+                let guBox = CommittedCBBox(guPair.0)
+                defer { if guBox.committed { stepCBs?.append(guBox.cb) } }
                 try streamer.executeTwoPhaseBatch(
                     guBatch: prep.guBatch,
                     downBatch: prep.downBatch,
                     onGateUpLoaded: {
-                        guCB.cb.commit()
+                        guBox.commit()
                     }
                 )
             } else {
-                try streamer.executeBatch(prep.guBatch + prep.downBatch)
+                try streamer.executeBatch(guBatch: prep.guBatch, downBatch: prep.downBatch)
             }
-        }
-        if let resCB { stepCBs?.append(resCB) }
-        if let coldGuCB { stepCBs?.append(coldGuCB) }
-        if let resCB, let err = resCB.error {
-            commandBufferErrors += 1
-            throw QWEngineDriverError.state("cold expert resident overlap cb: \(err.localizedDescription)")
-        }
-        if let coldGuCB, let err = coldGuCB.error {
-            commandBufferErrors += 1
-            throw QWEngineDriverError.state("cold expert gateup overlap cb: \(err.localizedDescription)")
         }
         guard let nextPair = hal.begin() else {
             throw QWEngineDriverError.state("cold expert cmdbuffer")
         }
+        streamer.commitPromotion(prep.transaction)
         activeCB = nextPair.0
         activeEnc = nextPair.1
         return (prep.nextRow, prep.stagedCount)
@@ -484,11 +423,11 @@ extension QWEngineDriver {
     }
 
     /// Whether `stageColdExpertsMapped` can stage this MoE's whole span in one pass.
-    func canStageColdExpertsMapped(moe: MoEW) -> Bool {
+    func canStageColdExpertsMapped(moe: MoEW, isVerifyWindow: Bool = false) -> Bool {
         // GPU span map + resident/cold overlap (tuning.prefillSpanMap); off restores the host-mapped `stageColdExpertsSpan`.
         guard tuning.prefillSpanMap, let st = moe.coldStreamer,
               activeCB != nil, activeEnc != nil else { return false }
-        return st.canMapWholeSpan()
+        return st.canMapWholeSpan(isVerifyWindow: isVerifyWindow)
     }
 
     /// Whole-span dynamic-residency staging with no host round trip before the resident pass: the route CB maps
@@ -518,6 +457,8 @@ extension QWEngineDriver {
                                    offset: 0, shape: QWTensorShape([count], .i32))
         try QWGemm.encodeMoESpanIds(curEnc, hal: hal, ids: s.idx, slotMap: slotMap, out: mapped, count: count,
                                     experts: streamer.totalExperts, residentExperts: streamer.residentExperts)
+        activeEnc = nil
+        activeCB = nil
         hal.end(curCB, curEnc)
         stepCBs?.append(curCB)
         guard let resPair = hal.begin() else {
@@ -525,8 +466,12 @@ extension QWEngineDriver {
         }
         let resCB = resPair.0
         var resEnc = resPair.1
+        var resOpen = true
+        defer { if resOpen { resEnc.endEncoding() } }
         try resident(&resEnc, resCB, mapped)
+        resOpen = false
         hal.end(resCB, resEnc)
+        stepCBs?.append(resCB)
 
         let tWait0 = Date()
         curCB.waitUntilCompleted()
@@ -534,6 +479,10 @@ extension QWEngineDriver {
         if let err = curCB.error {
             commandBufferErrors += 1
             throw QWEngineDriverError.state("cold expert route cb: \(err.localizedDescription)")
+        }
+        if curCB.status != .completed {
+            commandBufferErrors += 1
+            throw QWEngineDriverError.state("cold expert route cb completion failed (status=\(curCB.status.rawValue))")
         }
         let idxPtr = s.idx.region.buffer.contents()
             .advanced(by: s.idx.region.base + s.idx.offset)
@@ -543,34 +492,26 @@ extension QWEngineDriver {
             ids: idxPtr, mapped: mapBuf.contents().assumingMemoryBound(to: Int32.self), count: count)
         decodeTel.coldStaged += prep.stagedCount
 
-        var coldGuCB: (any MTLCommandBuffer)?
         let tIO0 = Date()
+        defer { decodeTel.coldIOUs += Date().timeIntervalSince(tIO0) * 1e6 }
         if prep.stagedCount > 0 {
             guard let (guCB, guEnc) = hal.begin() else {
                 throw QWEngineDriverError.state("span map cold gateup cmdbuffer")
             }
+            var guOpen = true
+            defer { if guOpen { guEnc.endEncoding() } }
             try coldGateUp(guEnc)
+            guOpen = false
             guEnc.endEncoding()
-            struct BoxedCB: @unchecked Sendable { let cb: any MTLCommandBuffer }
-            let boxed = BoxedCB(cb: guCB)
-            coldGuCB = guCB
+            let guBox = CommittedCBBox(guCB)
+            defer { if guBox.committed { stepCBs?.append(guBox.cb) } }
             try streamer.executeTwoPhaseBatch(guBatch: prep.guBatch, downBatch: prep.downBatch,
-                                              onGateUpLoaded: { boxed.cb.commit() })
-        }
-        decodeTel.coldIOUs += Date().timeIntervalSince(tIO0) * 1e6
-        stepCBs?.append(resCB)
-        if let coldGuCB { stepCBs?.append(coldGuCB) }
-        if let err = resCB.error {
-            commandBufferErrors += 1
-            throw QWEngineDriverError.state("span map resident cb: \(err.localizedDescription)")
-        }
-        if let coldGuCB, let err = coldGuCB.error {
-            commandBufferErrors += 1
-            throw QWEngineDriverError.state("span map cold gateup cb: \(err.localizedDescription)")
+                                              onGateUpLoaded: { guBox.commit() })
         }
         guard let nextPair = hal.begin() else {
             throw QWEngineDriverError.state("cold expert cmdbuffer")
         }
+        streamer.commitPromotion(prep.transaction)
         activeCB = nextPair.0
         activeEnc = nextPair.1
         return prep.stagedCount

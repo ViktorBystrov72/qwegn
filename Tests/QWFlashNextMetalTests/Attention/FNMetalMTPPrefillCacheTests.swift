@@ -5,6 +5,7 @@ import QWQuant
 import QWHAL
 import QWAlloc
 import QWGEMM
+import QWRope
 @testable import QWFlashNext
 
 final class FNMetalMTPPrefillCacheTests: XCTestCase {
@@ -39,7 +40,7 @@ final class FNMetalMTPPrefillCacheTests: XCTestCase {
             bank: bank, oProj: outWeight, qNorm: norm, kNorm: norm, iqNorm: norm, ikNorm: norm,
             heads: heads, kvHeads: kvHeads, headDim: headDim, indexHeads: indexHeads,
             indexKVHeads: 1, indexHeadDim: indexDim, rotaryDim: 64, compress: 4,
-            blockTopK: 512, bankRows: bankRows, rope: FNRope(rotaryDim: 64, theta: 10000)
+            blockTopK: 512, bankRows: bankRows, rope: QWRopeCPU(rotaryDim: 64, theta: 10000)
         )
         let moe = FNGPUMoE(gateAndSharedBF16: norm, gateUp: bank, down: bank,
                            sharedGateUp: bank, sharedDown: bank, sharedGateScalar: norm,

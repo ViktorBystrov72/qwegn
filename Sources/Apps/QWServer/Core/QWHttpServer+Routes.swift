@@ -228,6 +228,152 @@ extension QWHttpServer {
         }
     }
 
+    private static let jsonRequiredPostRoutes: Set<String> = [
+        "/v1/chat/completions", "/chat/completions",
+        "/v1/completions", "/completions",
+        "/tokenize", "/v1/tokenize",
+        "/detokenize", "/v1/detokenize",
+        "/v1/responses", "/responses",
+        "/api/chat", "/api/generate",
+        "/v1/messages/count_tokens", "/messages/count_tokens",
+        "/v1/messages", "/messages",
+        "/v1/settings", "/api/settings",
+        "/v1/memory/inspect", "/api/memory/inspect",
+        "/v1/memory/index", "/api/memory/index",
+        "/v1/memory/mount", "/api/memory/mount",
+    ]
+
+    func validateMutationRequest(
+        connection: NWConnection,
+        method: String,
+        cleanPath: String,
+        headers: [String: String],
+        body: Data
+    ) -> Bool {
+        guard method != "GET" && method != "HEAD" && method != "OPTIONS" else {
+            return true
+        }
+        let originHeader = headers["origin"]
+        let secFetchSite = headers["sec-fetch-site"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let originAllowed: Bool = if let originHeader {
+            QWHttpSecurity.resolvedAllowedOrigin(originHeader, allowlist: corsAllowedOrigins) != nil
+        } else {
+            secFetchSite != "cross-site"
+        }
+        guard originAllowed else {
+            let err = ServerErrorPayload(message: "Forbidden cross-origin request", type: "invalid_request_error", code: 403)
+            sendJsonResponse(connection, status: 403, object: err)
+            return false
+        }
+        let requireJSON = Self.jsonRequiredPostRoutes.contains(cleanPath) || !body.isEmpty
+        if !QWHttpSecurity.isValidMutationOrigin(
+            headers: headers,
+            allowlist: corsAllowedOrigins,
+            requireJSONContentType: requireJSON
+        ) {
+            let err = ServerErrorPayload(
+                message: "Unsupported Media Type: Content-Type must be application/json",
+                type: "invalid_request_error",
+                code: 415
+            )
+            sendJsonResponse(connection, status: 415, object: err)
+            return false
+        }
+        return true
+    }
+
+    func revealDirectoryInFinder(
+        connection: NWConnection,
+        rawDirectoryPath: String,
+        createIfInQwgRoot: Bool
+    ) async {
+        let resolvedDir: URL
+        do {
+            resolvedDir = try QWHttpSecurity.validateSafeLogDirectory(
+                rawDirectoryPath,
+                createIfInQwgRoot: createIfInQwgRoot
+            )
+        } catch let err as QWHttpServerError {
+            let payload = ServerErrorPayload(message: err.localizedDescription, code: 400)
+            sendJsonResponse(connection, status: 400, object: payload)
+            return
+        } catch {
+            let payload = ServerErrorPayload(
+                message: "Could not prepare directory for reveal: \(error.localizedDescription)",
+                code: 500
+            )
+            sendJsonResponse(connection, status: 500, object: payload)
+            return
+        }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolvedDir.path, isDirectory: &isDir), isDir.boolValue else {
+            let payload = ServerErrorPayload(
+                message: "Directory does not exist: \(resolvedDir.path)",
+                code: 404
+            )
+            sendJsonResponse(connection, status: 404, object: payload)
+            return
+        }
+        do {
+            let status = try await runFinderReveal(arguments: ["--", resolvedDir.path])
+            if status != 0 {
+                let payload = ServerErrorPayload(
+                    message: "Finder rejected the request (exit status \(status)).",
+                    code: 500
+                )
+                sendJsonResponse(connection, status: 500, object: payload)
+                return
+            }
+            sendJsonResponse(connection, status: 200, object: ["status": "ok"])
+        } catch {
+            let payload = ServerErrorPayload(
+                message: "Could not open the Finder window: \(error.localizedDescription)",
+                code: 500
+            )
+            sendJsonResponse(connection, status: 500, object: payload)
+        }
+    }
+
+    private func runFinderReveal(arguments: [String]) async throws -> Int32 {
+        if let runner = finderRevealRunner {
+            return try await runner(arguments)
+        }
+        return try await runProcessAsync(executablePath: "/usr/bin/open", arguments: arguments)
+    }
+
+    func runProcessAsync(executablePath: String, arguments: [String]) async throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        return try await withCheckedThrowingContinuation { continuation in
+            let lock = NSLock()
+            nonisolated(unsafe) var resumed = false
+            process.terminationHandler = { proc in
+                let shouldResume = lock.withLock {
+                    guard !resumed else { return false }
+                    resumed = true
+                    return true
+                }
+                if shouldResume {
+                    continuation.resume(returning: proc.terminationStatus)
+                }
+            }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                let shouldResume = lock.withLock {
+                    guard !resumed else { return false }
+                    resumed = true
+                    return true
+                }
+                if shouldResume {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     func handleMemoryInspectRoute(connection: NWConnection, body: Data) async throws {
         guard !body.isEmpty,
               let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
@@ -237,7 +383,8 @@ extension QWHttpServer {
             sendJsonResponse(connection, status: 400, object: err)
             return
         }
-        let info = try await actor.inspectMemoryPack(at: repoPath)
+        let validatedRoot = try actor.resolveValidatedMemoryRootURL(at: repoPath, overrideRoots: allowedWorkspaceRoots)
+        let info = try await actor.inspectMemoryPack(at: validatedRoot.path)
         sendJsonResponse(connection, status: 200, object: info)
     }
 
@@ -249,36 +396,36 @@ extension QWHttpServer {
             sendJsonResponse(connection, status: 400, object: err)
             return
         }
-        guard req.stream ?? true else {
-            let result = try await actor.indexMemoryPack(request: req)
+        let validatedRoot = try actor.resolveValidatedMemoryRootURL(at: req.path, overrideRoots: allowedWorkspaceRoots)
+        let validatedReq = QWMemoryIndexRequest(
+            path: validatedRoot.path,
+            packName: req.packName,
+            model: req.model,
+            kvMode: req.kvMode,
+            lsaMode: req.lsaMode,
+            scope: req.scope,
+            maxCortexTokens: req.maxCortexTokens,
+            includeTests: req.includeTests,
+            mountAfterIndex: req.mountAfterIndex,
+            stream: req.stream,
+            mtpBackend: req.mtpBackend,
+            dflashDraftPackPath: req.dflashDraftPackPath
+        )
+        guard validatedReq.stream ?? true else {
+            let result = try await actor.indexMemoryPack(request: validatedReq)
             sendJsonResponse(connection, status: 200, object: result)
             return
         }
 
-        sendSSEHeaders(connection)
-        let keepalive = startSSEKeepalive(connection: connection)
-        defer {
-            keepalive.gate.stop()
-            keepalive.task.cancel()
-        }
-        let lock = NSLock()
-        let sendProgress: @Sendable (QWMemoryIndexProgressEvent) -> Void = { [weak self] event in
-            guard let self, !self.isPeerGone(connection) else { return }
-            let encoder = JSONEncoder()
-            guard let jsonData = try? encoder.encode(event),
-                  let jsonStr = String(data: jsonData, encoding: .utf8) else {
-                return
-            }
-            let frame = Data("data: \(jsonStr)\n\n".utf8)
-            lock.withLock {
-                connection.send(content: frame, isComplete: false, completion: .contentProcessed({ err in
-                    if err != nil { connection.cancel() }
-                }))
-            }
+        let session = makeSSESession(for: connection, format: .sse, enableKeepalive: true)
+        session.begin()
+        defer { session.stopAll() }
+        let sendProgress: @Sendable (QWMemoryIndexProgressEvent) -> Void = { event in
+            session.sendSSEDataFrame(event)
         }
 
         do {
-            _ = try await actor.indexMemoryPack(request: req, onProgress: sendProgress)
+            _ = try await actor.indexMemoryPack(request: validatedReq, onProgress: sendProgress)
         } catch {
             sendProgress(QWMemoryIndexProgressEvent(
                 phase: "error",
@@ -287,10 +434,212 @@ extension QWHttpServer {
                 error: "\(error)"
             ))
         }
-        lock.withLock {
-            connection.send(content: Data("data: [DONE]\n\n".utf8), isComplete: true, completion: .contentProcessed({ _ in
-                connection.cancel()
-            }))
+        session.finish(doneMarker: true)
+    }
+
+    private func catalogModelEntries() -> [(id: String, loaded: Bool, path: String?)] {
+        let modelName = actor.getModelName()
+        let isLoaded = actor.isLoaded()
+        let settings = QWSettingsManager.shared.loadSettings()
+        var seen = Set<String>()
+        var entries: [(id: String, loaded: Bool, path: String?)] = []
+        func appendIfNew(id: String, loaded: Bool, path: String?) {
+            guard !id.isEmpty, seen.insert(id).inserted else { return }
+            entries.append((id: id, loaded: loaded, path: path))
         }
+        let activeAlias = settings.alias(for: modelName)
+        if !activeAlias.isEmpty {
+            appendIfNew(id: activeAlias, loaded: isLoaded, path: settings.modelPackPath)
+        }
+        appendIfNew(id: modelName, loaded: isLoaded, path: settings.modelPackPath)
+        for disc in QWServerSettings.scanModelsDirectory() where !disc.packPath.isEmpty && disc.supported {
+            let loadedHere = isLoaded && disc.name == modelName
+            let alias = settings.alias(for: disc.name)
+            if !alias.isEmpty {
+                appendIfNew(id: alias, loaded: loadedHere, path: disc.packPath)
+            }
+            appendIfNew(id: disc.name, loaded: loadedHere, path: disc.packPath)
+        }
+        return entries
+    }
+
+    func handleModelsListRoute(connection: NWConnection) {
+        let models = catalogModelEntries().map {
+            ModelObject(id: $0.id, loaded: $0.loaded, created: QWModelDiskStats.modifiedUnix(of: $0.path))
+        }
+        sendJsonResponse(connection, status: 200, object: ModelListResponse(models: models))
+    }
+
+    func handleDiscoveredModelsRoute(connection: NWConnection) {
+        struct DiscoveredInventoryResponse: Encodable {
+            let models: [QWServerSettings.DiscoveredModel]
+            let drafters: [QWServerSettings.DiscoveredDrafter]
+        }
+        let models = QWServerSettings.scanModelsDirectory()
+        let drafters = QWServerSettings.scanDrafterSummaries(primaryModels: models)
+        sendJsonResponse(
+            connection,
+            status: 200,
+            object: DiscoveredInventoryResponse(models: models, drafters: drafters)
+        )
+    }
+
+    func handleGetModelRoute(connection: NWConnection, requestedId: String) {
+        let modelName = actor.getModelName()
+        let isLoaded = actor.isLoaded()
+        let settings = QWSettingsManager.shared.loadSettings()
+        let activeAlias = settings.alias(for: modelName)
+        let displayModel = activeAlias.isEmpty ? modelName : activeAlias
+        let resolvedPath: String?
+        let loaded: Bool
+        if requestedId.isEmpty || requestedId == modelName || requestedId == activeAlias {
+            resolvedPath = settings.modelPackPath
+            loaded = isLoaded
+        } else if let disc = QWServerSettings.scanModelsDirectory().first(where: {
+            $0.name == requestedId || settings.alias(for: $0.name) == requestedId
+        }), disc.supported {
+            resolvedPath = disc.packPath
+            loaded = isLoaded && disc.name == modelName
+        } else {
+            let err = ServerErrorPayload(
+                message: "The model '\(requestedId)' does not exist.",
+                type: "invalid_request_error",
+                code: 404
+            )
+            sendJsonResponse(connection, status: 404, object: err)
+            return
+        }
+        let resp = ModelObject(
+            id: requestedId.isEmpty ? displayModel : requestedId,
+            loaded: loaded,
+            created: QWModelDiskStats.modifiedUnix(of: resolvedPath)
+        )
+        sendJsonResponse(connection, status: 200, object: resp)
+    }
+
+    func handleOllamaTagsOrPsRoute(connection: NWConnection, isPs: Bool) {
+        if isPs {
+            let modelName = actor.getModelName()
+            let isLoaded = actor.isLoaded()
+            let settings = QWSettingsManager.shared.loadSettings()
+            let activeAlias = settings.alias(for: modelName)
+            let displayModel = activeAlias.isEmpty ? modelName : activeAlias
+            let models = isLoaded ? [OllamaPsResponse.RunningModel(
+                name: displayModel, model: displayModel,
+                size: QWModelDiskStats.sizeBytes(of: settings.modelPackPath),
+                expiresAt: "never"
+            )] : []
+            sendJsonResponse(connection, status: 200, object: OllamaPsResponse(models: models))
+            return
+        }
+        let tags = catalogModelEntries().map {
+            OllamaModelTag(
+                name: $0.id,
+                model: $0.id,
+                modifiedAt: QWModelDiskStats.modifiedRFC3339(of: $0.path),
+                size: QWModelDiskStats.sizeBytes(of: $0.path)
+            )
+        }
+        sendJsonResponse(connection, status: 200, object: OllamaTagsResponse(models: tags))
+    }
+
+    func handleSaveSettingsRoute(connection: NWConnection, body: Data) async {
+        do {
+            let oldSettings = QWSettingsManager.shared.loadSettings()
+            var newSettings = try JSONDecoder().decode(QWServerSettings.self, from: body)
+            let rawObj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+            if newSettings.apiKey == "********" || rawObj?["apiKey"] == nil {
+                newSettings.apiKey = oldSettings.apiKey
+            }
+            let resolvedLogDir = try QWHttpSecurity.validateSafeLogDirectory(newSettings.logDir, createIfInQwgRoot: false)
+            try QWHttpSecurity.validateSafeLogFileName(newSettings.logFileName)
+            newSettings.logDir = resolvedLogDir.path
+            newSettings.logFileName = newSettings.logFileName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let modelChanged = (newSettings.modelPackPath != oldSettings.modelPackPath)
+                || (newSettings.modelName != oldSettings.modelName)
+            let allowUnregistered = ProcessInfo.processInfo.environment["QWG_ALLOW_UNREGISTERED_MODEL_PATHS"] == "1"
+            let resolvedPackPath: String
+            if modelChanged {
+                let targetRefInput = newSettings.modelPackPath.isEmpty ? newSettings.modelName : newSettings.modelPackPath
+                let ref = newSettings.resolveModelReference(
+                    targetRefInput,
+                    allowArbitraryFilesystemPaths: allowUnregistered
+                )
+                if !allowUnregistered && !targetRefInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let packCand = ref.packPath.isEmpty ? targetRefInput.expandingTildePath : ref.packPath
+                    let candURL = URL(fileURLWithPath: packCand)
+                    let inRegistered = QWHttpSecurity.canonicalDirectoryContainment(candURL, inside: QWPaths.modelsDirectoryURL)
+                    let matchesExisting = !oldSettings.modelPackPath.isEmpty
+                        && candURL.resolvingSymlinksInPath().standardizedFileURL.path
+                        == URL(fileURLWithPath: oldSettings.modelPackPath.expandingTildePath).resolvingSymlinksInPath().standardizedFileURL.path
+                    guard inRegistered || matchesExisting else {
+                        throw QWMetadataValidationError("Selected model pack must reside under ~/.qwg/models")
+                    }
+                }
+                resolvedPackPath = ref.packPath.isEmpty ? targetRefInput.expandingTildePath : ref.packPath
+                let targetModelName = ref.modelName.isEmpty ? newSettings.modelName : ref.modelName
+                if let profile = QWSettingsManager.shared.loadProfile(forModel: targetModelName) {
+                    newSettings.applyModelConfigDefaults(packPath: resolvedPackPath)
+                    newSettings.apply(knobProfile: profile)
+                } else if newSettings.maxContext == oldSettings.maxContext {
+                    newSettings.applyModelConfigDefaults(packPath: resolvedPackPath)
+                }
+            } else {
+                resolvedPackPath = newSettings.resolveModelReference(
+                    newSettings.modelPackPath.isEmpty ? newSettings.modelName : newSettings.modelPackPath
+                ).packPath
+            }
+            let backendChanged = newSettings.mtpBackend.lowercased() != oldSettings.mtpBackend.lowercased()
+            let packExplicitlyChanged = newSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                != oldSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            if modelChanged || (backendChanged && !packExplicitlyChanged) {
+                let desc = QWModelCatalog.loadPrimaryDescriptor(at: resolvedPackPath)
+                newSettings.reconcileStaleDrafterSelection(for: desc)
+            }
+            if let mounted = actor.getMountedMemoryPackInfo(), mounted.enforcesKVMode {
+                newSettings.kvMode = mounted.enforcedKVMode
+            }
+            try newSettings.validateBeforeLaunch()
+            try QWSettingsManager.shared.saveSettings(newSettings)
+            QWFanController.shared.setPolicy(QWCoolingPolicy(rawValue: newSettings.coolingPolicy) ?? .auto)
+            if !modelChanged {
+                try await actor.setVisionLoaded(newSettings.loadVision)
+            }
+            sendJsonResponse(connection, status: 200, object: ["status": "ok", "message": "Settings saved successfully"])
+        } catch {
+            let err = ServerErrorPayload(message: "Failed to parse or save settings: \(error.localizedDescription)", code: 400)
+            sendJsonResponse(connection, status: 400, object: err)
+        }
+    }
+
+    func handleMemoryMountRoute(connection: NWConnection, body: Data) async throws {
+        guard !body.isEmpty,
+              let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let repoPath = payload["path"] as? String,
+              !repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let err = ServerErrorPayload(message: "Missing 'path' in memory mount request.", code: 400)
+            sendJsonResponse(connection, status: 400, object: err)
+            return
+        }
+        let validatedRoot = try actor.resolveValidatedMemoryRootURL(
+            at: repoPath,
+            overrideRoots: allowedWorkspaceRoots
+        )
+        let mounted = try await actor.mountMemoryPack(at: validatedRoot.path)
+        sendJsonResponse(connection, status: 200, object: mounted)
+    }
+
+    func handleHealthRoute(connection: NWConnection) throws {
+        let engineState = actor.engineState()
+        let modelName = actor.getModelName()
+        let health = QWHealthResponse(
+            status: engineState.lifecycle.phase.rawValue,
+            engine: "qwegine",
+            model: modelName,
+            loaded: engineState.isLoaded,
+            lifecycle: engineState.lifecycle
+        )
+        let data = try JSONEncoder().encode(health)
+        sendRawData(connection, status: 200, contentType: "application/json", data: data)
     }
 }

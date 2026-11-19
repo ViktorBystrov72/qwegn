@@ -283,9 +283,10 @@ static inline void qwg_decode_shared(
                     for (uint i = 0; i < 8u; ++i) { km = fmax(km, fabs(float(kp[i])));
                                                    vm = fmax(vm, fabs(float(vp[i]))); }
                     km = simd_max(km); vm = simd_max(vm);
-                    const float ks = float(half(fmax(km / 127.0f, 1e-8f)));
-                    const float vs = float(half(fmax(vm / 127.0f, 1e-8f)));
-                    const float kinv = 1.0f / ks, vinv = 1.0f / vs;
+                    const float ks = float(half(fmax(km / 127.0f, 6.103515625e-5f)));
+                    const float vs = float(half(fmax(vm / 127.0f, 6.103515625e-5f)));
+                    const float kinv = (ks > 0.0f) ? (1.0f / ks) : 0.0f;
+                    const float vinv = (vs > 0.0f) ? (1.0f / vs) : 0.0f;
                     #pragma unroll
                     for (uint i = 0; i < 8u; ++i) {
                         kk[i] = half(clamp(round(float(kp[i]) * kinv), -127.0f, 127.0f) * ks);
@@ -525,13 +526,14 @@ static inline void qwg_decode_body(const device half* qgate [[buffer(0)]],   // 
             for (uint i = 0; i < 8u; i++) { km = fmax(km, fabs(float(kb[i])));
                                            vm = fmax(vm, fabs(float(vb[i]))); }
             km = simd_max(km); vm = simd_max(vm);
-            const float ks = float(half(fmax(km / 127.0f, 1e-8f)));
-            const float vs = float(half(fmax(vm / 127.0f, 1e-8f)));
+            const float ks = float(half(fmax(km / 127.0f, 6.103515625e-5f)));
+            const float vs = float(half(fmax(vm / 127.0f, 6.103515625e-5f)));
             // Deterministically byte-identical to qwg_q8_store_seg's and the
             // Swift quantizeQ8/dequantizeQ8 reference (all three: scale=f16,
             // round(x * (1/s16)), clamp ±127, dequant q*scale) — only then is
             // the new-row score equal to what every later step reads back.
-            const float kinv = 1.0f / ks, vinv = 1.0f / vs;
+            const float kinv = (ks > 0.0f) ? (1.0f / ks) : 0.0f;
+            const float vinv = (vs > 0.0f) ? (1.0f / vs) : 0.0f;
             #pragma unroll
             for (uint i = 0; i < 8u; i++) {
                 kk[i] = half(clamp(round(float(kb[i]) * kinv), -127.0f, 127.0f) * ks);

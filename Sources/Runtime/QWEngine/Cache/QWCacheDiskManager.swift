@@ -49,6 +49,9 @@ public final class QWCacheDiskManager: @unchecked Sendable {
         public let allowsSuffix: Bool
         public var formatVersion: Int? = nil
         public var mlaIndexerBytes: Int? = nil
+        public var dflashKBytes: Int? = nil
+        public var dflashVBytes: Int? = nil
+        public var dflashCacheOffset: Int? = nil
     }
 
     public struct DiskHit: Sendable {
@@ -58,20 +61,16 @@ public final class QWCacheDiskManager: @unchecked Sendable {
     }
 
     public let config: QWCacheConfig
-    let lock = NSLock()
-    var entries: [String: StoredMetadata] = [:]
-    var entryFiles: [String: URL] = [:]
-    var entryBytes: [String: Int] = [:]
-    var lru: [String] = []
-    public internal(set) var chargedBytes: Int = 0
-    public var entryCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return entries.count
-    }
+    let index: QWColdCacheIndex<StoredMetadata>
+    public var chargedBytes: Int { index.chargedBytes }
+    public var entryCount: Int { index.entryCount }
 
     public init(config: QWCacheConfig) {
         self.config = config
+        self.index = QWColdCacheIndex<StoredMetadata>(
+            ssdByteLimit: config.ssdByteLimit,
+            entryLimit: Int.max
+        )
         prepareDirectory()
         if config.wipeOnStart {
             purgeAll()
@@ -94,8 +93,6 @@ public final class QWCacheDiskManager: @unchecked Sendable {
 
     /// Rebuilds the in-memory index from existing `.qwcache` files on SSD.
     public func loadDiskIndex() {
-        lock.lock()
-        defer { lock.unlock() }
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(
             at: config.cacheDirectory,
@@ -103,7 +100,7 @@ public final class QWCacheDiskManager: @unchecked Sendable {
         ) else { return }
 
         let decoder = JSONDecoder()
-        var discovered: [(key: String, meta: StoredMetadata, url: URL, bytes: Int, date: Date)] = []
+        var discovered: [(key: String, metadata: StoredMetadata, fileURL: URL, bytes: Int, date: Date)] = []
 
         for file in files where file.pathExtension == "qwcache" && file.lastPathComponent.hasPrefix("entry_") {
             guard let io = try? QWDispatchIO(path: file.path, mode: .readOnly, directIO: false) else { continue }
@@ -124,7 +121,8 @@ public final class QWCacheDiskManager: @unchecked Sendable {
             let resourceValues = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             let fileSize = resourceValues?.fileSize ?? (
                 MemoryLayout<UInt64>.size + Int(metaLen) + meta.recBytes + meta.ringBytes +
-                meta.trunkHiddenBytes + meta.logitsBytes +
+                meta.trunkHiddenBytes + (meta.mlaIndexerBytes ?? 0) +
+                (meta.dflashKBytes ?? 0) + (meta.dflashVBytes ?? 0) + meta.logitsBytes +
                 meta.trunkPlaneSizes.reduce(0, +) + meta.mtpPlaneSizes.reduce(0, +)
             )
             let modDate = resourceValues?.contentModificationDate ?? Date.distantPast
@@ -132,34 +130,21 @@ public final class QWCacheDiskManager: @unchecked Sendable {
         }
 
         discovered.sort { $0.date < $1.date }
-        for item in discovered {
-            guard item.bytes <= config.ssdByteLimit else { continue }
-            while chargedBytes + item.bytes > config.ssdByteLimit, !lru.isEmpty {
-                evictOldest()
-            }
-            entries[item.key] = item.meta
-            entryFiles[item.key] = item.url
-            entryBytes[item.key] = item.bytes
-            chargedBytes += item.bytes
-            touch(item.key)
-        }
+        index.bootstrap(
+            items: discovered.map { ($0.key, $0.metadata, $0.fileURL, $0.bytes) },
+            onEvict: { try? FileManager.default.removeItem(at: $0) }
+        )
     }
 
     /// Purges all cache files and resets index.
     public func purgeAll() {
-        lock.lock()
-        defer { lock.unlock() }
         let fm = FileManager.default
         if let files = try? fm.contentsOfDirectory(at: config.cacheDirectory, includingPropertiesForKeys: nil) {
             for file in files where file.pathExtension == "qwcache" || file.lastPathComponent.hasPrefix("entry_") {
                 try? fm.removeItem(at: file)
             }
         }
-        entries.removeAll()
-        entryFiles.removeAll()
-        entryBytes.removeAll()
-        lru.removeAll()
-        chargedBytes = 0
+        index.purgeAll { try? fm.removeItem(at: $0) }
     }
 
     /// Deterministic FNV-1a-64 hash across process restarts.
@@ -193,45 +178,38 @@ public final class QWCacheDiskManager: @unchecked Sendable {
 
     /// Look up a matching prefix on SSD (exact or longest prefix if allowed).
     public func lookup(tokens: [Int], mode: String) -> DiskHit? {
-        lock.lock()
-        defer { lock.unlock() }
         let exact = Self.cacheKey(tokens: tokens, mode: mode)
-        if let meta = entries[exact], let url = entryFiles[exact] {
-            touch(exact)
-            return DiskHit(metadata: meta, fileURL: url, matchedTokens: tokens.count)
+        if let hit = index.lookupExact(exact, verify: { $0.tokens == tokens && $0.mode == mode }) {
+            return DiskHit(metadata: hit.metadata, fileURL: hit.fileURL, matchedTokens: tokens.count)
         }
-        var bestKey: String?
-        var bestCount = 0
-        for (key, meta) in entries where meta.allowsSuffix && meta.mode == mode &&
-            meta.tokens.count < tokens.count && meta.tokens.count > bestCount {
-            if tokens.starts(with: meta.tokens) {
-                bestKey = key
-                bestCount = meta.tokens.count
-            }
-        }
-        guard let bestKey, let meta = entries[bestKey], let url = entryFiles[bestKey] else {
+        guard let prefix = index.lookupBestPrefix(scoreMatch: { _, meta in
+            guard meta.allowsSuffix, meta.mode == mode, meta.tokens.count < tokens.count,
+                  tokens.starts(with: meta.tokens) else { return nil }
+            return meta.tokens.count
+        }) else {
             return nil
         }
-        touch(bestKey)
-        return DiskHit(metadata: meta, fileURL: url, matchedTokens: bestCount)
+        return DiskHit(metadata: prefix.metadata, fileURL: prefix.fileURL, matchedTokens: prefix.matchedTokens)
     }
 
-    func touch(_ key: String) {
-        lru.removeAll { $0 == key }
-        lru.append(key)
-    }
-
-    @discardableResult
-    func evictOldest() -> Bool {
-        guard let oldest = lru.first else { return false }
-        lru.removeFirst()
-        if let file = entryFiles.removeValue(forKey: oldest) {
-            try? FileManager.default.removeItem(at: file)
-        }
-        entries.removeValue(forKey: oldest)
-        if let bytes = entryBytes.removeValue(forKey: oldest) {
-            chargedBytes -= bytes
-        }
-        return true
+    func commitWrittenEntry(
+        tempURL: URL,
+        fileURL: URL,
+        key: String,
+        metadata: StoredMetadata,
+        totalBytes: Int
+    ) throws -> URL? {
+        let stored = try index.record(
+            key: key,
+            metadata: metadata,
+            fileURL: fileURL,
+            bytes: totalBytes,
+            beforeInstall: {
+                _ = try? FileManager.default.removeItem(at: fileURL)
+                try FileManager.default.moveItem(at: tempURL, to: fileURL)
+            },
+            onEvict: { try? FileManager.default.removeItem(at: $0) }
+        )
+        return stored ? fileURL : nil
     }
 }

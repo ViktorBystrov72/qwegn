@@ -125,10 +125,8 @@ public struct QWAdmissionPlan: Sendable, Equatable {
         let gdnLayers = d.linearAttentionLayers.count
         t += hq4(attnLayers.count * (d.qProjOut * d.hidden
                                      + 2 * d.kvHeads * d.headDim * d.hidden
-                                     + d.qProjOut * d.hidden))
-        t += hq4(gdnLayers * (d.gdnQKVChannels * d.hidden
-                              + d.gdnConvKernel * d.gdnQKVChannels
-                              + d.hidden * d.gdnVHeads * d.gdnHeadDim))
+                                     + d.qHeads * d.headDim * d.hidden))
+        t += hq4(gdnLayers * gdnLayerWeightElems(d))
         let mlpPerLayerElems: Int
         if let numE = d.numExperts, let moeI = d.moeIntermediate {
             let denseLayers = min(d.numLayers, max(0, d.firstKDenseReplace))
@@ -145,25 +143,41 @@ public struct QWAdmissionPlan: Sendable, Equatable {
             throw QWAdmissionError.bad("admission: descriptor has neither dense nor MoE MLP intermediate size")
         }
         let mtpBlock = d.qProjOut * d.hidden + 2 * d.kvHeads * d.headDim * d.hidden
-            + d.qProjOut * d.hidden + mlpPerLayerElems + 2 * d.hidden * d.hidden
+            + d.qHeads * d.headDim * d.hidden + mlpPerLayerElems + 2 * d.hidden * d.hidden
         t += hq4(d.mtpLayers * mtpBlock)
         return t
     }
 
+    private static func gdnLayerWeightElems(_ d: QWModelDescriptor) -> Int {
+        let base = d.gdnQKVChannels * d.hidden
+            + d.gdnConvKernel * d.gdnQKVChannels
+            + d.hidden * d.gdnVHeads * d.gdnHeadDim
+        if d.gdnVectorDecay {
+            let lr = d.gdnLowRankDim ?? d.gdnHeadDim
+            return base + (2 * lr + d.gdnVHeads) * d.hidden + 2 * d.gdnZChannels * lr
+        }
+        return base + (d.gdnZChannels + 2 * d.gdnVHeads) * d.hidden
+    }
+
     private static func hybridModelResidentBytes(descriptor d: QWModelDescriptor) throws -> Int {
         let hq8 = { (elems: Int) in (elems / 32) * 34 }
-        let shvqBlockBytes = { (tag: String?, fallback: Int) -> Int in
-            switch tag?.lowercased() {
-            case "shvq1_g64", "shvq1g64": return 10
-            case "shvq15_g64", "shvq15g64": return 14
-            case "shvq2_g64", "shvq2g64": return 18
-            case "shvq3_g64", "shvq3g64": return 26
-            case "shvq4_g64", "shvq4g64": return 34
-            default: return fallback
+        let parseSHVQ = { (tag: String?, fallbackBits: Int) -> (group: Int, blockBytes: Int) in
+            let fallbackPayload = fallbackBits == 15 ? (64 * 3) / 16 : (64 * fallbackBits) / 8
+            guard let raw = tag?.lowercased(), raw.hasPrefix("shvq") else {
+                return (64, 2 + fallbackPayload)
             }
+            let suffix = raw.dropFirst(4).replacingOccurrences(of: "_", with: "")
+            let parts = suffix.split(separator: "g")
+            guard parts.count == 2, let bits = Int(parts[0]), let group = Int(parts[1]),
+                  group > 0, group % 32 == 0,
+                  bits == 1 || bits == 15 || (2...4).contains(bits) else {
+                return (64, 2 + fallbackPayload)
+            }
+            let payload = bits == 15 ? (group * 3) / 16 : (group * bits) / 8
+            return (group, 2 + payload)
         }
-        let guBlock = shvqBlockBytes(d.quantization?.expertGateUp, 14)
-        let dnBlock = shvqBlockBytes(d.quantization?.expertDown, 26)
+        let guSpec = parseSHVQ(d.quantization?.expertGateUp, 15)
+        let dnSpec = parseSHVQ(d.quantization?.expertDown, 3)
 
         var bytes = d.vocab * d.hidden * 2 + hq8(d.vocab * d.hidden)
         var trunkElems = 0
@@ -199,9 +213,7 @@ public struct QWAdmissionPlan: Sendable, Equatable {
 
         let gdnCount = d.linearAttentionLayers.count
         if gdnCount > 0 {
-            trunkElems += gdnCount * (d.gdnQKVChannels * d.hidden
-                + d.gdnConvKernel * d.gdnQKVChannels
-                + d.hidden * d.gdnVHeads * d.gdnHeadDim)
+            trunkElems += gdnCount * gdnLayerWeightElems(d)
         }
 
         if let numE = d.numExperts, let moeI = d.moeIntermediate {
@@ -217,7 +229,7 @@ public struct QWAdmissionPlan: Sendable, Equatable {
             trunkElems += moeCount * 3 * sharedI * d.hidden
             let gateUpElems = moeCount * numE * 2 * moeI * routedDim
             let downElems = moeCount * numE * moeI * routedDim
-            bytes += (gateUpElems / 64) * guBlock + (downElems / 64) * dnBlock
+            bytes += (gateUpElems / guSpec.group) * guSpec.blockBytes + (downElems / dnSpec.group) * dnSpec.blockBytes
             let routerSplits = d.moeSplitFeatureRouting ? 2 : 1
             rawBytes += moeCount * routerSplits * numE * d.hidden * 4
         } else if let mlpI = d.denseIntermediate {
@@ -243,8 +255,9 @@ public struct QWAdmissionPlan: Sendable, Equatable {
                                              contextTokens: Int,
                                              scratchPerSeq: Int)
         -> (kv: Int, gdn: Int, scratch: Int) {
-        let attnLayers = (0..<d.numLayers).filter { d.isFullAttention($0) }.count
-        let hcaLayers = d.compressedAttentionLayers.count
+        let execPlan = d.executionPlan
+        let attnLayers = execPlan.filter { d.isFullAttention($0) }.count
+        let hcaLayers = execPlan.filter { d.isCompressedAttention($0) }.count
         let kv: Int
         if hcaLayers > 0 || d.hybridMLAConfig != nil {
             var totalKV = 0
@@ -269,10 +282,10 @@ public struct QWAdmissionPlan: Sendable, Equatable {
                 : 2 * attnLayers * contextTokens * d.kvHeads * d.headDim
             kv = kvDtype.kvBytes(elements: kvElems)
         }
-        let gdnLayers = d.linearAttentionLayers.count
+        let gdnLayers = execPlan.filter { d.isLinearAttention($0) }.count
         let rec = d.gdnVHeads * d.gdnHeadDim * d.gdnHeadDim
         let ring = max(0, d.gdnConvKernel - 1) * d.gdnQKVChannels
-        let gdn = gdnLayers * (rec + ring) * 4
+        let gdn = gdnLayers * (rec * 4 + ring * 2)
         return (kv, gdn, scratchPerSeq)
     }
 
@@ -285,7 +298,7 @@ public struct QWAdmissionPlan: Sendable, Equatable {
         let dtype: QWAdmissionDtype = kvBytesPerParam >= 2 ? .f16 : .q8
         var res = perSequenceStateBytes(descriptor: d, kvDtype: dtype, contextTokens: contextTokens, scratchPerSeq: scratchPerSeq)
         if kvBytesPerParam > 0 && kvBytesPerParam != dtype.bytesPerParam {
-            let attnLayers = (0..<d.numLayers).filter { d.isFullAttention($0) }.count
+            let attnLayers = d.executionPlan.filter { d.isFullAttention($0) }.count
             res.kv = 2 * attnLayers * contextTokens * d.kvHeads * d.headDim * kvBytesPerParam
         }
         return res

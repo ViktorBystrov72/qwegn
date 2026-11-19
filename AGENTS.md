@@ -121,6 +121,14 @@ the owner's private `docs/agent-retrospective-*.md`.
 27. **AGX 32 KiB constant-cache ceiling & mixed-plane capacity sizing**:
     Apple Silicon AGX spills `constant` address space to device DRAM when a single PSO references `> 32 KiB` of constant arrays; keep per-PSO constant LUTs `<= 32 KiB` by isolating new codebook families into separate `.metalh` headers and PSOs rather than unioning all tables into shared kernels.
     When sizing mixed raw/quant weight buffers (such as `DFlash` / `DSpine` drafters), always resolve per-entry byte counts via `PlaneLayout.resolve(e)` (`rawOff != nil` checked before quant plane tags, `16 KiB`-aligned).
+28. **Multi-turn & multi-knob coherence gate**:
+    Single-turn greedy checks never certify a runtime, sampling, cache,
+    speculation, or server change. Validate live `QWServer` multi-turn chats
+    with warm prefix cache hits, stochastic sampling (`temperature > 0`,
+    `repetition_penalty > 1.0`), thinking off and across `reasoning.effort`
+    budgets, uncached streaming, structured/tool calls, multi-protocol
+    endpoints, and concurrent `B=4` batches across flagship architectures
+    (follow `.agents/skills/qwegine-inference-qa-and-sampling/SKILL.md`).
 
 Verification footer: when you finish and merge to `master`, bump the semantic
 version in `Sources/Foundation/QWCore/QWVersion.swift`, `CHANGELOG.md`,

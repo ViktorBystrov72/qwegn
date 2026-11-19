@@ -206,9 +206,11 @@ extension QWDFlashDrafter {
         input: QWTensorValue,
         output: QWTensorValue,
         rows: Int
-    ) {
+    ) throws {
         let key = DrafterQuantKey(bits: weight.bits, group: weight.groupSize, isSHVQ: weight.isSHVQ)
-        guard let qps = quantPSOs[key] else { return }
+        guard let qps = quantPSOs[key] else {
+            throw QWDFlashError.state("QWDFlashDrafter: missing quant pipelines for \(weight.formatName)")
+        }
         let n = weight.n, k = weight.k
         let useNaxSmall = isMetal4TensorCapable && rows >= 8 && n % 64 == 0 && k % 64 == 0
         if rows == 1 {
@@ -253,15 +255,17 @@ extension QWDFlashDrafter {
         input: QWTensorValue,
         output: QWTensorValue,
         rows: Int
-    ) {
+    ) throws {
         let key = DrafterQuantKey(bits: weight.bits, group: weight.groupSize, isSHVQ: weight.isSHVQ)
-        guard let qps = quantPSOs[key] else { return }
+        guard let qps = quantPSOs[key] else {
+            throw QWDFlashError.state("QWDFlashDrafter: missing quant pipelines for \(weight.formatName)")
+        }
         let H = config.hiddenSize
         let I = config.intermediateSize
         if isMetal4TensorCapable && rows >= 8 && canUseNAXGateUpScratch(rows: rows, h: H, i: I) {
             let guScratch = QWTensorValue(region: draftLogits.region, offset: draftLogits.offset,
                                           shape: QWTensorShape([rows * 2 * I], .f16))
-            encodeAQMatmul(enc, weight: weight, input: input, output: guScratch, rows: rows)
+            try encodeAQMatmul(enc, weight: weight, input: input, output: guScratch, rows: rows)
             encodeSiluMulF16(enc, gu: guScratch, out: output, rows: rows, i: I)
             return
         }

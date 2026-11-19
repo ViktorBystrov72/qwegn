@@ -32,18 +32,7 @@ kernel void qwg_gemm_q4g_h16(device const Block_HQ4_G32* blocks [[buffer(0)]],
                              uint lid [[thread_index_in_threadgroup]],
                              uint simd_gid [[simdgroup_index_in_threadgroup]],
                              uint simd_lid [[thread_index_in_simdgroup]]) {
-    const uint mode = (M >> 29u) & 3u;
-    const int realM = int(M & 0x1FFFFFFFu);
-    if (mode == 1u) {
-        qmm_t_nax_tgp_dual_impl<half, half, false, 16, 64, 128, 1, 4, false>(
-            (const device char*)blocks, x, y16, y32, nullptr, int(K), int(N), realM, tg, lid, simd_gid, simd_lid);
-    } else if (mode == 2u) {
-        qmm_t_nax_tgp_dual_impl<half, half, false, 32, 64, 64, 2, 2, false>(
-            (const device char*)blocks, x, y16, y32, nullptr, int(K), int(N), realM, tg, lid, simd_gid, simd_lid);
-    } else {
-        qmm_t_nax_tgp_dual_impl<half, half, false, 64, 64, 64, 2, 2, false>(
-            (const device char*)blocks, x, y16, y32, nullptr, int(K), int(N), realM, tg, lid, simd_gid, simd_lid);
-    }
+    qwg_gemm_h16_mode_dispatch((const device char*)blocks, x, y16, y32, M, N, K, tg, lid, simd_gid, simd_lid);
 }
 
 kernel void qwg_gemm_q4g_h16_bm128(device const Block_HQ4_G32* blocks [[buffer(0)]],
@@ -268,13 +257,6 @@ kernel void qwg_zero_pad_attn_f16(device half*   q  [[buffer(0)]],
     }
 }
 
-// Grouped NAX/MPP GEMM over MoE experts: one dispatch sweeps every expert.
-// Threadgroup (tile, expert): the expert's rows are contiguous in the expert-major
-// activation matrix, so each expert is a dense GEMM with its own weight slab.
-struct QWGemmGroupedParams { uint experts; uint n; uint k; uint blocksPerRow; uint rowTiles; uint colTiles; };
-
-// One threadgroup per (expert, 64-row tile), tiles listed by qwg_moe_group_pairs_f32. No threadgroup
-// loops over tiles: a second impl call in the same threadgroup raced the first's staging.
 kernel void qwg_moe_nax_gemm(device const Block_HQ4_G32* w [[buffer(0)]],
                              device const half* x [[buffer(1)]],
                              device half* y [[buffer(2)]],
@@ -291,138 +273,8 @@ kernel void qwg_moe_nax_gemm(device const Block_HQ4_G32* w [[buffer(0)]],
                              uint lid [[thread_index_in_threadgroup]],
                              uint simd_gid [[simdgroup_index_in_threadgroup]],
                              uint simd_lid [[thread_index_in_simdgroup]]) {
-    uint t = tg.y + ((tileBlock >> 8) & 0x7FFFFFu);
-    if (int(t) >= tileCount[0]) return;
-    uint e = uint(tileE[t]);
-    int rowBase = int(expertOff[e]);
-    int rowCount = int(expertOff[e + 1]) - rowBase;
-    const uint residentE = p.experts >> 16u;
-    const bool isCold = (residentE > 0u) && (e >= residentE);
-    if (((tileBlock & 0x40u) != 0u && isCold) || ((tileBlock & 0x80u) != 0u && !isCold)) return;
-    const uint wExp = isCold ? (e - residentE) : e;
-    device const Block_HQ4_G32* we = (isCold ? coldW : w) + size_t(wExp) * size_t(p.n) * size_t(p.blocksPerRow);
-    device half* ye = y + size_t(rowBase) * size_t(p.n);
-    int bm;
-    uint tidY;
-    qw_moe_decode_tile(tileR[t], rowCount, int(tileBlock & 0x3Fu), bm, tidY);
-    uint3 tid = uint3(tg.x, tidY, 0);
-    if (hasGather != 0u) {
-        device const int32_t* st = sortedTok + rowBase;
-        if (bm == 16) {
-            qmm_t_nax_tgp_dual_impl<half, half, true, 16, 64, 64, 1, 4, false, false, true>(
-                (const device char*)we, x, ye, nullptr, nullptr, int(p.k), int(p.n), rowCount, tid, lid, simd_gid, simd_lid, nullptr, st);
-        } else if (bm == 32) {
-            qmm_t_nax_tgp_dual_impl<half, half, true, 32, 64, 64, 2, 2, false, false, true>(
-                (const device char*)we, x, ye, nullptr, nullptr, int(p.k), int(p.n), rowCount, tid, lid, simd_gid, simd_lid, nullptr, st);
-        } else {
-            qmm_t_nax_tgp_dual_impl<half, half, true, 64, 64, 64, 2, 2, false, false, true>(
-                (const device char*)we, x, ye, nullptr, nullptr, int(p.k), int(p.n), rowCount, tid, lid, simd_gid, simd_lid, nullptr, st);
-        }
-    } else {
-        device const half* xe = x + size_t(rowBase) * size_t(p.k);
-        if (bm == 16) {
-            qmm_t_nax_tgp_dual_impl<half, half, true, 16, 64, 64, 1, 4, false>(
-                (const device char*)we, xe, ye, nullptr, nullptr, int(p.k), int(p.n), rowCount, tid, lid, simd_gid, simd_lid);
-        } else if (bm == 32) {
-            qmm_t_nax_tgp_dual_impl<half, half, true, 32, 64, 64, 2, 2, false>(
-                (const device char*)we, xe, ye, nullptr, nullptr, int(p.k), int(p.n), rowCount, tid, lid, simd_gid, simd_lid);
-        } else {
-            qmm_t_nax_tgp_dual_impl<half, half, true, 64, 64, 64, 2, 2, false>(
-                (const device char*)we, xe, ye, nullptr, nullptr, int(p.k), int(p.n), rowCount, tid, lid, simd_gid, simd_lid);
-        }
-    }
-}
-
-// Grouped NAX/MPP GEMM over an expert bank with a split activation: y = (xh + xl) . W^T, fp32 accumulate.
-// The hi and lo halves feed one accumulator in the same K loop, so each weight tile is dequantized once.
-template <const int BM, const int WM, const int WN, const bool splitLo = true, typename OutT = float>
-METAL_FUNC void qmm_t_nax_split_impl(
-    const device Block_HQ4_G32* w,
-    const device half* xh,
-    const device half* xl,
-    device OutT* y,
-    int K,
-    int N,
-    int M,
-    uint3 tid,
-    uint simd_gid) {
-  constexpr int BN = 64;
-  constexpr short SM = BM / WM;
-  constexpr short SN = BN / WN;
-  constexpr short TM = SM / 16;
-  constexpr short TN = SN / 16;
-  constexpr short TK = 2;
-  const int K_g = K / 32;
-  const int y_row = int(tid.y) * BM;
-  const int y_col = int(tid.x) * BN;
-  const short tm = SM * short(simd_gid / WN);
-  const short tn = SN * short(simd_gid % WN);
-  const short sgp_sm = short(min(int(SM), M - (y_row + int(tm))));
-  if (sgp_sm <= 0) return;
-
-  xh += y_row * static_cast<int64_t>(K);
-  if constexpr (splitLo) xl += y_row * static_cast<int64_t>(K);
-  y += y_row * static_cast<int64_t>(N) + y_col;
-  const device Block_HQ4_G32* wt = w + static_cast<int64_t>(y_col) * K_g;
-
-  const short2 sc = BaseNAXFrag::get_coord();
-  const ushort w_sub = ushort(sc.x >> 3);
-  const ushort shift = ushort((sc.x & 4) << 1);
-
-  NAXTile<float, TM, TN> Dtile;
-  Dtile.clear();
-  xh += tm * K;
-  if constexpr (splitLo) xl += tm * K;
-
-  dispatch_bool(sgp_sm == SM, [&](auto kAlignedM) {
-    STEEL_PRAGMA_NO_UNROLL
-    for (int g = 0; g < K_g; ++g) {
-      NAXTile<half, TM, TK> Ah;
-      NAXTile<half, TM, TK> Al;
-      NAXTile<half, TN, TK> Btile;
-      if constexpr (kAlignedM.value) {
-        Ah.load(xh, K);
-        if constexpr (splitLo) Al.load(xl, K);
-      } else {
-        Ah.load_safe(xh, K, short2(32, sgp_sm));
-        if constexpr (splitLo) Al.load_safe(xl, K, short2(32, sgp_sm));
-      }
-      const_for_loop<0, TN, 1>([&](auto idx_row) {
-        thread auto& f0 = Btile.template frag_at<idx_row.value, 0>();
-        thread auto& f1 = Btile.template frag_at<idx_row.value, 1>();
-        STEEL_PRAGMA_UNROLL
-        for (short i = 0; i < 2; ++i) {
-          const int r_tile = int(tn) + idx_row.value * 16 + int(sc.y) + int(i) * 8;
-          const device Block_HQ4_G32& blk = wt[r_tile * K_g];
-          const half2 dm = *(const device half2*)(&blk);
-          const half2 s2 = half2(dm.x);
-          const half2 b2 = half2(dm.y);
-          const ushort2 raw0 = as_type<ushort2>(blk.qs[w_sub]) >> shift;
-          const ushort2 raw1 = as_type<ushort2>(blk.qs[2u + w_sub]) >> shift;
-          const half2 w01 = fma(as_type<half2>((raw0 & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-          const half2 w23 = fma(as_type<half2>(((raw0 >> 4) & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-          const half2 w45 = fma(as_type<half2>((raw1 & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-          const half2 w67 = fma(as_type<half2>(((raw1 >> 4) & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-          f0[i * 4 + 0] = w01.x; f0[i * 4 + 1] = w01.y;
-          f0[i * 4 + 2] = w23.x; f0[i * 4 + 3] = w23.y;
-          f1[i * 4 + 0] = w45.x; f1[i * 4 + 1] = w45.y;
-          f1[i * 4 + 2] = w67.x; f1[i * 4 + 3] = w67.y;
-        }
-      });
-      tile_matmad_nax(Dtile, Ah, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
-      if constexpr (splitLo) {
-        tile_matmad_nax(Dtile, Al, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
-      }
-      xh += 32;
-      if constexpr (splitLo) xl += 32;
-      wt += 1;
-    }
-    if constexpr (kAlignedM.value) {
-      Dtile.store(y + tm * N + tn, N);
-    } else {
-      Dtile.store_safe(y + tm * N + tn, N, short2(SN, sgp_sm));
-    }
-  });
+    qwg_moe_nax_gemm_body((device const char*)w, x, y, expertOff, tileE, tileR, tileCount, p, tileBlock,
+                          sortedTok, hasGather, (device const char*)coldW, tg, lid, simd_gid, simd_lid);
 }
 
 // Dense NAX/MPP GEMM with single-pass f16 activations (xh) and fp32 accumulate/output (or f16 when M bit 31 is set).
@@ -435,25 +287,8 @@ kernel void qwg_gemm_q4g_nax_f32(device const Block_HQ4_G32* blocks [[buffer(0)]
                                  constant uint& K [[buffer(6)]],
                                  uint3 tg [[threadgroup_position_in_grid]],
                                  uint simd_gid [[simdgroup_index_in_threadgroup]]) {
-    const uint mode = (M >> 29u) & 3u;
-    const int realM = int(M & 0x1FFFFFFFu);
-    if ((M & 0x80000000u) != 0u) {
-        if (mode == 1u) {
-            qmm_t_nax_split_impl<16, 1, 4, false, half>(blocks, xh, xl, (device half*)y32, int(K), int(N), realM, tg, simd_gid);
-        } else if (mode == 2u) {
-            qmm_t_nax_split_impl<32, 2, 2, false, half>(blocks, xh, xl, (device half*)y32, int(K), int(N), realM, tg, simd_gid);
-        } else {
-            qmm_t_nax_split_impl<64, 2, 2, false, half>(blocks, xh, xl, (device half*)y32, int(K), int(N), realM, tg, simd_gid);
-        }
-    } else {
-        if (mode == 1u) {
-            qmm_t_nax_split_impl<16, 1, 4, false, float>(blocks, xh, xl, y32, int(K), int(N), realM, tg, simd_gid);
-        } else if (mode == 2u) {
-            qmm_t_nax_split_impl<32, 2, 2, false, float>(blocks, xh, xl, y32, int(K), int(N), realM, tg, simd_gid);
-        } else {
-            qmm_t_nax_split_impl<64, 2, 2, false, float>(blocks, xh, xl, y32, int(K), int(N), realM, tg, simd_gid);
-        }
-    }
+    (void)xl;
+    qwg_gemm_nax_f32_dispatch((const device char*)blocks, xh, xl, y32, M, N, K, tg, simd_gid);
 }
 
 kernel void qwg_moe_nax_split_f32(device const Block_HQ4_G32* w [[buffer(0)]],
@@ -469,39 +304,7 @@ kernel void qwg_moe_nax_split_f32(device const Block_HQ4_G32* w [[buffer(0)]],
                                   device const Block_HQ4_G32* coldW [[buffer(10)]],
                                   uint3 tg [[threadgroup_position_in_grid]],
                                   uint simd_gid [[simdgroup_index_in_threadgroup]]) {
-    uint t = tg.y + ((tileBlock >> 8) & 0x7FFFFFu);
-    if (int(t) >= tileCount[0]) return;
-    uint e = uint(tileE[t]);
-    int rowBase = int(expertOff[e]);
-    int rowCount = int(expertOff[e + 1]) - rowBase;
-    const uint residentE = p.experts >> 16u;
-    const bool isCold = (residentE > 0u) && (e >= residentE);
-    if (((tileBlock & 0x40u) != 0u && isCold) || ((tileBlock & 0x80u) != 0u && !isCold)) return;
-    const uint wExp = isCold ? (e - residentE) : e;
-    device const Block_HQ4_G32* we = (isCold ? coldW : w) + size_t(wExp) * size_t(p.n) * size_t(p.blocksPerRow);
-    device const half* xhe = xh + size_t(rowBase) * size_t(p.k);
-    device const half* xle = xl + size_t(rowBase) * size_t(p.k);
-    int bm;
-    uint tidY;
-    qw_moe_decode_tile(tileR[t], rowCount, int(tileBlock & 0x3Fu), bm, tidY);
-    uint3 tid = uint3(tg.x, tidY, 0);
-    if ((tileBlock & 0x80000000u) != 0u) {
-        device half* ye16 = ((device half*)y32) + size_t(rowBase) * size_t(p.n);
-        if (bm == 16) {
-            qmm_t_nax_split_impl<16, 1, 4, false, half>(we, xhe, xle, ye16, int(p.k), int(p.n), rowCount, tid, simd_gid);
-        } else if (bm == 32) {
-            qmm_t_nax_split_impl<32, 2, 2, false, half>(we, xhe, xle, ye16, int(p.k), int(p.n), rowCount, tid, simd_gid);
-        } else {
-            qmm_t_nax_split_impl<64, 2, 2, false, half>(we, xhe, xle, ye16, int(p.k), int(p.n), rowCount, tid, simd_gid);
-        }
-    } else {
-        device float* ye = y32 + size_t(rowBase) * size_t(p.n);
-        if (bm == 16) {
-            qmm_t_nax_split_impl<16, 1, 4, false, float>(we, xhe, xle, ye, int(p.k), int(p.n), rowCount, tid, simd_gid);
-        } else if (bm == 32) {
-            qmm_t_nax_split_impl<32, 2, 2, false, float>(we, xhe, xle, ye, int(p.k), int(p.n), rowCount, tid, simd_gid);
-        } else {
-            qmm_t_nax_split_impl<64, 2, 2, false, float>(we, xhe, xle, ye, int(p.k), int(p.n), rowCount, tid, simd_gid);
-        }
-    }
+    (void)xl;
+    qwg_moe_nax_split_f32_body((device const char*)w, xh, xl, y32, expertOff, tileE, tileR, tileCount,
+                               p, tileBlock, (device const char*)coldW, tg, simd_gid);
 }

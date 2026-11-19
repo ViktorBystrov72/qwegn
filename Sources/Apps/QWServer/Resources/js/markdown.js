@@ -1,7 +1,14 @@
 function sanitizeMarkdownUrl(rawUrl) {
   const trimmed = String(rawUrl ?? "").trim();
   if (!trimmed) return null;
-  return /^(?:https?:|mailto:|\/|#)/i.test(trimmed) ? trimmed : null;
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const code = trimmed.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) return null;
+  }
+  if (/^https?:\/\//i.test(trimmed) || /^mailto:/i.test(trimmed)) return trimmed;
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//") && !trimmed.startsWith("/\\")) return trimmed;
+  if (trimmed.startsWith("#")) return trimmed;
+  return null;
 }
 
 function splitMarkdownTableCells(line) {
@@ -133,7 +140,7 @@ function renderSmokeProbeMarkdown(rawMarkdown) {
         codeLines.push(lines[i]);
         i += 1;
       }
-      const langHeader = `<div class="md-code-lang mono"><span>${lang ? escapeHtml(lang) : "text"}</span><button type="button" class="md-code-copy-btn" onclick="copyMarkdownCodeBlock(this)" aria-label="Copy code snippet">Copy</button></div>`;
+      const langHeader = `<div class="md-code-lang mono"><span>${lang ? escapeHtml(lang) : "text"}</span><button type="button" class="md-code-copy-btn" aria-label="Copy code snippet">Copy</button></div>`;
       blocks.push(`<div class="md-code-block">${langHeader}<pre class="mono"><code>${escapeHtml(codeLines.join("\n"))}</code></pre></div>`);
       continue;
     }
@@ -448,4 +455,11 @@ function copyMarkdownCodeBlock(btn) {
   } else {
     showToast("Clipboard unavailable.", true);
   }
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("click", (event) => {
+    const btn = event.target && event.target.closest ? event.target.closest(".md-code-copy-btn") : null;
+    if (btn) copyMarkdownCodeBlock(btn);
+  });
 }

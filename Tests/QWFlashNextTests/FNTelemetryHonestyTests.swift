@@ -7,6 +7,7 @@ import XCTest
 @testable import QWFlashNext
 import QWHAL
 import QWQuant
+import QWRope
 
 final class FNTelemetryHonestyTests: XCTestCase {
     func testStandaloneUniqueBufferBytesDeduplicatesAndExcludesArenaBuffers() throws {
@@ -57,7 +58,7 @@ final class FNTelemetryHonestyTests: XCTestCase {
             qNorm: arenaTensor, kNorm: arenaTensor, iqNorm: arenaTensor, ikNorm: arenaTensor,
             heads: 1, kvHeads: 1, headDim: 32, indexHeads: 1, indexKVHeads: 1, indexHeadDim: 32,
             rotaryDim: 32, compress: 1, blockTopK: 1, bankRows: 4,
-            rope: FNRope(rotaryDim: 32, theta: 10000, yarnFactor: nil, originalMaxPosition: 4096))
+            rope: QWRopeCPU(rotaryDim: 32, theta: 10000, yarnFactor: nil, originalMaxPosition: 4096))
         let moe = FNGPUMoE(gateAndSharedBF16: arenaTensor, gateUp: slabWeight, down: slabWeight,
                            sharedGateUp: arenaWeight, sharedDown: arenaWeight, sharedGateScalar: arenaTensor,
                            experts: 1, topK: 1, intermediate: 32, sharedIntermediate: 32)

@@ -38,11 +38,18 @@ extension QWModelDescriptor {
             throw DescriptorError.drafterModel("DFlash2 drafter model (cannot be loaded as a primary model)")
         }
         if QWStandardConfigDecoder.isStandardSchema(data) {
-            return try decodeStandard(data)
+            let desc = try decodeStandard(data)
+            let issues = desc.verifyInternalConsistency()
+            if !issues.isEmpty {
+                throw DescriptorError.invariant(issues.joined(separator: "; "))
+            }
+            return desc
         }
         if let feature = QWStandardConfigDecoder.standardFamilyRefusal(data) {
             throw QWStandardConfigDecoder.Error.unsupported(feature)
         }
+        let rawRoot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let rawText = (rawRoot?["text_config"] as? [String: Any]) ?? rawRoot ?? [:]
         let env = try JSONDecoder().decode(ConfigEnvelope.self, from: data)
         let t: ConfigEnvelope.Text
         if let tc = env.text_config {
@@ -60,6 +67,14 @@ extension QWModelDescriptor {
         func inv(_ cond: Bool, _ msg: String) throws {
             if !cond { throw DescriptorError.invariant(msg) }
         }
+        try inv(t.hidden_size > 0, "hidden_size \(t.hidden_size) <= 0")
+        try inv(t.vocab_size > 0, "vocab_size \(t.vocab_size) <= 0")
+        try inv(t.num_hidden_layers > 0, "num_hidden_layers \(t.num_hidden_layers) <= 0")
+        try inv(t.num_attention_heads > 0, "num_attention_heads \(t.num_attention_heads) <= 0")
+        try inv(t.num_key_value_heads > 0 && t.num_attention_heads % t.num_key_value_heads == 0,
+                "num_attention_heads \(t.num_attention_heads) not divisible by num_key_value_heads \(t.num_key_value_heads)")
+        try inv(t.max_position_embeddings > 0, "max_position_embeddings \(t.max_position_embeddings) <= 0")
+        try inv(t.rms_norm_eps > 0 && t.rms_norm_eps.isFinite, "rms_norm_eps \(t.rms_norm_eps) invalid")
         let rawLayerTypes: [String]
         if let explicitTypes = t.layer_types {
             rawLayerTypes = explicitTypes
@@ -121,7 +136,11 @@ extension QWModelDescriptor {
             throw DescriptorError.invariant("flat config missing partial_rotary_factor")
         }
 
+        // Documented test fallback: minimal synthetic hybrid unit fixtures omit `rope_theta`.
         let ropeTheta = t.rope_theta ?? t.rope_parameters?.rope_theta ?? 10000.0
+        try inv(resolvedPartialRotary > 0 && resolvedPartialRotary <= 1.0 && resolvedPartialRotary.isFinite,
+                "partial_rotary_factor \(resolvedPartialRotary) invalid")
+        try inv(ropeTheta > 0 && ropeTheta.isFinite, "rope_theta \(ropeTheta) invalid")
         let mropeSec: (w: Int, h: Int, t: Int)
         let hasMrope: Bool
         if let sec = t.rope_parameters?.mrope_section {
@@ -134,7 +153,11 @@ extension QWModelDescriptor {
             hasMrope = (rotHalf == 32)
         }
 
-        let resolvedNumExperts = t.num_experts ?? t.n_routed_experts
+        let rawNumExperts = t.num_experts ?? t.n_routed_experts
+        if let rawNumExperts {
+            try inv(rawNumExperts >= 0, "num_experts \(rawNumExperts) < 0")
+        }
+        let resolvedNumExperts = rawNumExperts.flatMap { $0 > 0 ? $0 : nil }
         if resolvedNumExperts == nil && resolvedFAInterval > 0 {
             for l in 0..<t.num_hidden_layers {
                 let want = (l + 1) % resolvedFAInterval == 0
@@ -158,7 +181,7 @@ extension QWModelDescriptor {
         let isKDA = hasLinearLayers && (linType == "kda" || linCfg?.gate_lower_bound != nil)
         let gdnLowRank = linCfg?.low_rank_dim ?? (isKDA ? gHeadDim : nil)
 
-        if let n = resolvedNumExperts, let k = t.num_experts_per_tok {
+        if let n = rawNumExperts, let k = t.num_experts_per_tok {
             try inv(n > 0 && k > 0 && k <= n, "MoE top-k \(k) > experts \(n)")
         }
         let resolvedIdxHeads = t.indexer_n_heads ?? t.index_n_heads
@@ -249,24 +272,43 @@ extension QWModelDescriptor {
             return nil
         }()
 
-        let parsedHCA: HCAConfig? = {
+        let parsedHCA: HCAConfig? = try {
             guard normalizedLayerTypes.contains("compressed_attention"),
                   let ratios = t.compress_ratios else { return nil }
-            let defRatio = ratios.first(where: { $0 > 0 }) ?? 128
+            guard let defRatio = ratios.first(where: { $0 > 0 }) else {
+                throw DescriptorError.invariant("compressed_attention missing positive compress_ratios entry")
+            }
+            guard let qLoraRank = t.q_lora_rank else {
+                throw DescriptorError.invariant("HCA missing q_lora_rank")
+            }
+            guard let kvLoraRank = t.kv_lora_rank else {
+                throw DescriptorError.invariant("HCA missing kv_lora_rank")
+            }
+            guard let qkNope = t.qk_nope_head_dim ?? (rawText["compress_qk_nope_head_dim"] as? Int) else {
+                throw DescriptorError.invariant("HCA missing qk_nope_head_dim")
+            }
+            guard let qkRope = t.qk_rope_head_dim ?? (rawText["compress_qk_rope_head_dim"] as? Int) else {
+                throw DescriptorError.invariant("HCA missing qk_rope_head_dim")
+            }
+            guard let slidingWindow = t.sliding_window else {
+                throw DescriptorError.invariant("HCA missing sliding_window")
+            }
+            let hcaVDim = t.v_head_dim ?? (rawText["compress_v_head_dim"] as? Int) ?? resolvedHeadDim
+            // Documented test fallback: minimal HCA unit fixtures omit `o_groups`/`o_lora_rank`.
             return HCAConfig(
                 compressRatios: ratios,
                 defaultCompressRatio: defRatio,
                 qHeads: t.num_attention_heads,
                 kvHeads: t.num_key_value_heads,
                 headDim: resolvedHeadDim,
-                qLoraRank: t.q_lora_rank ?? 1024,
-                kvLoraRank: t.kv_lora_rank ?? 512,
-                qkNopeHeadDim: t.qk_nope_head_dim ?? 448,
-                qkRopeHeadDim: t.qk_rope_head_dim ?? 64,
-                vHeadDim: t.v_head_dim ?? resolvedHeadDim,
+                qLoraRank: qLoraRank,
+                kvLoraRank: kvLoraRank,
+                qkNopeHeadDim: qkNope,
+                qkRopeHeadDim: qkRope,
+                vHeadDim: hcaVDim,
                 oGroups: t.o_groups ?? 8,
                 oLoraRank: t.o_lora_rank ?? 1024,
-                slidingWindow: t.sliding_window ?? 128,
+                slidingWindow: slidingWindow,
                 compressRopeTheta: t.compress_rope_theta ?? ropeTheta,
                 yarn: (t.hca_rope_type == nil || t.hca_rope_type?.lowercased() == "yarn") ? parsedYarn : nil,
                 useAttnMerger: t.use_attn_merger ?? true,
@@ -276,18 +318,31 @@ extension QWModelDescriptor {
             )
         }()
 
-        let parsedHybridMLA: HybridMLAConfig? = {
+        let parsedHybridMLA: HybridMLAConfig? = try {
             guard hasHybridMLA else { return nil }
-            let nope = t.hybrid_mla_qk_nope_head_dim ?? t.qk_nope_head_dim ?? 192
-            let rope = t.hybrid_mla_qk_rope_head_dim ?? t.qk_rope_head_dim ?? 64
+            guard let qLora = t.hybrid_mla_q_lora_rank ?? t.q_lora_rank else {
+                throw DescriptorError.invariant("HybridMLA missing q_lora_rank")
+            }
+            guard let kvLora = t.hybrid_mla_kv_lora_rank ?? t.kv_lora_rank else {
+                throw DescriptorError.invariant("HybridMLA missing kv_lora_rank")
+            }
+            guard let nope = t.hybrid_mla_qk_nope_head_dim ?? t.qk_nope_head_dim else {
+                throw DescriptorError.invariant("HybridMLA missing qk_nope_head_dim")
+            }
+            guard let rope = t.hybrid_mla_qk_rope_head_dim ?? t.qk_rope_head_dim else {
+                throw DescriptorError.invariant("HybridMLA missing qk_rope_head_dim")
+            }
+            guard let vDim = t.hybrid_mla_v_head_dim ?? t.v_head_dim else {
+                throw DescriptorError.invariant("HybridMLA missing v_head_dim")
+            }
             let mlaYarn: YarnRopeConfig? = (t.rope_type?.lowercased() == "yarn") ? parsedYarn : nil
             return HybridMLAConfig(
                 qHeads: t.hybrid_mla_num_attention_heads ?? t.num_attention_heads,
-                qLoraRank: t.hybrid_mla_q_lora_rank ?? t.q_lora_rank ?? 1024,
-                kvLoraRank: t.hybrid_mla_kv_lora_rank ?? t.kv_lora_rank ?? 512,
+                qLoraRank: qLora,
+                kvLoraRank: kvLora,
                 qkNopeHeadDim: nope,
                 qkRopeHeadDim: rope,
-                vHeadDim: t.hybrid_mla_v_head_dim ?? t.v_head_dim ?? 256,
+                vHeadDim: vDim,
                 decoupledRope: !isNoPEMLA && rope > 0,
                 ropeInterleave: t.rope_interleave ?? t.indexer_rope_interleave ?? false,
                 slidingWindow: t.sliding_window ?? 0,
@@ -358,16 +413,18 @@ extension QWModelDescriptor {
         let attnGate: Bool = t.attn_output_gate ?? t.use_gated_attn ?? (gateDeclared || familySpec.defaultAttnOutputGate)
         let resolvedGateType = t.scoring_func ?? t.router_score_function ?? familySpec.defaultExpertGateType
         let vc = env.vision_config
+        // Documented test fallback: unit fixtures (e.g. glm5_next plan test) omit Qwen-VL patch/token fields.
         let resolvedVisPatch = vc?.patch_size ?? (vc != nil ? 16 : 0)
-        let resolvedVisPosEmbeds: Int = {
-            if let explicit = vc?.num_position_embeddings { return explicit }
-            if let img = vc?.image_size, resolvedVisPatch > 0 {
+        let resolvedVisPosEmbeds: Int = try {
+            guard let vc else { return 0 }
+            if let explicit = vc.num_position_embeddings { return explicit }
+            if let img = vc.image_size, resolvedVisPatch > 0 {
                 let side = max(1, img / resolvedVisPatch)
                 return side * side
             }
-            return vc != nil ? 2304 : 0
+            throw DescriptorError.invariant("vision_config missing num_position_embeddings and image_size")
         }()
-        return QWModelDescriptor(
+        let descriptor = QWModelDescriptor(
             family: family, modelType: t.model_type, capabilities: caps,
             hidden: t.hidden_size, vocab: t.vocab_size, denseIntermediate: t.intermediate_size,
             numLayers: t.num_hidden_layers, layerTypes: normalizedLayerTypes, fullAttentionInterval: resolvedFAInterval,
@@ -439,6 +496,11 @@ extension QWModelDescriptor {
             multimaxHead: (t.multimax?.lowercased() == "lm_head"),
             mtpSharedLastLayer: t.mtp_shared_last_layer ?? false,
             role: caps.contains(.vision) ? .multimodalConditionalLM : .causalLM)
+        let issues = descriptor.verifyInternalConsistency()
+        if !issues.isEmpty {
+            throw DescriptorError.invariant(issues.joined(separator: "; "))
+        }
+        return descriptor
     }
 
 }

@@ -44,19 +44,95 @@ public struct QWChatTemplate: Sendable {
     }
 
     /// Normalizes Python Jinja2 integer attribute accesses (e.g. `m.content.0.type`)
-    /// into subscript indexing (`m.content[0].type`) required by Swift Jinja.
+    /// into subscript indexing (`m.content[0].type`) outside quoted string literals.
     private static func normalizePythonJinjaSyntax(_ source: String) -> String {
         guard let regex = try? NSRegularExpression(pattern: #"(\b[A-Za-z_][A-Za-z0-9_]*|\])\.([0-9]+)\b"#) else {
             return source
         }
-        var current = source
-        for _ in 0..<4 {
-            let range = NSRange(current.startIndex..<current.endIndex, in: current)
-            let next = regex.stringByReplacingMatches(in: current, range: range, withTemplate: "$1[$2]")
-            if next == current { break }
-            current = next
+        func rewriteCodeSegment(_ segment: Substring) -> String {
+            var current = String(segment)
+            for _ in 0..<8 {
+                let range = NSRange(current.startIndex..<current.endIndex, in: current)
+                let next = regex.stringByReplacingMatches(in: current, range: range, withTemplate: "$1[$2]")
+                if next == current { break }
+                current = next
+            }
+            return current
         }
-        return current
+
+        var out = ""
+        out.reserveCapacity(source.count)
+        var i = source.startIndex
+        var inTag = false
+        var tagClose = ""
+        var codeStart = source.startIndex
+
+        while i < source.endIndex {
+            if !inTag {
+                let rest = source[i...]
+                if rest.hasPrefix("{{") || rest.hasPrefix("{%") {
+                    out += source[codeStart..<i]
+                    tagClose = rest.hasPrefix("{{") ? "}}" : "%}"
+                    let tagOpenEnd = source.index(i, offsetBy: 2)
+                    out += source[i..<tagOpenEnd]
+                    i = tagOpenEnd
+                    codeStart = i
+                    inTag = true
+                    continue
+                }
+                if rest.hasPrefix("{#") {
+                    out += source[codeStart..<i]
+                    if let commentEnd = rest.range(of: "#}")?.upperBound {
+                        out += source[i..<commentEnd]
+                        i = commentEnd
+                        codeStart = i
+                        continue
+                    }
+                    out += source[i...]
+                    return out
+                }
+                i = source.index(after: i)
+                continue
+            }
+
+            let ch = source[i]
+            if ch == "\"" || ch == "'" {
+                out += rewriteCodeSegment(source[codeStart..<i])
+                let quoteStart = i
+                var escaped = false
+                i = source.index(after: i)
+                while i < source.endIndex {
+                    let c = source[i]
+                    if escaped {
+                        escaped = false
+                    } else if c == "\\" {
+                        escaped = true
+                    } else if c == ch {
+                        i = source.index(after: i)
+                        break
+                    }
+                    i = source.index(after: i)
+                }
+                out += source[quoteStart..<i]
+                codeStart = i
+                continue
+            }
+
+            if source[i...].hasPrefix(tagClose) {
+                out += rewriteCodeSegment(source[codeStart..<i])
+                let tagEnd = source.index(i, offsetBy: 2)
+                out += source[i..<tagEnd]
+                i = tagEnd
+                codeStart = i
+                inTag = false
+                continue
+            }
+            i = source.index(after: i)
+        }
+        if codeStart < source.endIndex {
+            out += inTag ? rewriteCodeSegment(source[codeStart..<source.endIndex]) : String(source[codeStart..<source.endIndex])
+        }
+        return out
     }
 
     public func render(messages: [QWJson],

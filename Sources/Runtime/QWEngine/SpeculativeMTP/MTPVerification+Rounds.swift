@@ -87,19 +87,19 @@ extension QWEngineDriver {
         if let cb = session.lastCommitCB {
             session.lastCommitCB = nil
             if canOverlapPriorCommit {
-                if cb.status == .error {
-                    commandBufferErrors += 1
+                if cb.status == .error || syncCommitFailure(for: session) {
+                    recordCommandBufferError(for: cb)
                     session.stateFailed = true
                 }
                 pendingCommitCB = cb
             } else if echoDrafter != nil || mtpDraftEncoder != nil || dflashDrafter != nil || isWeightFreeSpeculation {
                 cb.waitUntilCompleted()
-                if cb.status != .completed {
-                    session.stateFailed = true
-                }
-            } else if cb.status == .error {
-                session.stateFailed = true
+                _ = syncCommitFailure(for: session, cb: cb)
+            } else {
+                _ = syncCommitFailure(for: session, cb: cb.status == .error ? cb : nil)
             }
+        } else {
+            _ = syncCommitFailure(for: session)
         }
         func drainPendingCommitIfNeeded() throws {
             if let cb = pendingCommitCB {
@@ -109,7 +109,7 @@ extension QWEngineDriver {
         }
         let dflashReady = (dflashDrafter == nil) || (session.dflashSlot != nil && session.dflashCacheOffset == session.position)
         let hasValidMTPCache = (mtpCache != nil && session.mtpKV != nil)
-            || (isWeightFreeSpeculation && mtpCache == nil && session.mtpKV == nil)
+            || ((isWeightFreeSpeculation || dflashDrafter != nil) && mtpCache == nil && session.mtpKV == nil)
         guard (session.stochastic != nil) == stochastic,
               session.stochastic?.stream.isRoundActive != true,
               session.stochastic?.stream.drawsConsumed == (stochastic ? session.roundRecord.samplerDrawIndex : nil),
@@ -163,9 +163,9 @@ extension QWEngineDriver {
             basePairs + pairSlotsNeeded > session.mtpKV!.tokenCapacity
             || mtpCache!.hasSharedPages(session.mtpKV!, positions: basePairs..<(basePairs + pairSlotsNeeded))
         )
-        if needsSparseClaim
-            || session.position + verifyWindow.rows > session.kv.tokenCapacity
-            || needsMTPCacheWait {
+        let needsTrunkCacheWait = session.position + verifyWindow.rows > session.kv.tokenCapacity
+            || kvCache.hasSharedPages(session.kv, positions: session.position..<(session.position + verifyWindow.rows))
+        if needsSparseClaim || needsTrunkCacheWait || needsMTPCacheWait {
             try drainPendingCommitIfNeeded()
         }
         try claimMLAIndexerState(session)
@@ -197,12 +197,7 @@ extension QWEngineDriver {
             views = nil
         }
         let boundary = try greedyRoundBoundary(session)
-        lastMTPRoundProfile = nil
-        pendingMTPProfile = nil
-        pendingMTPAdaptiveEntropy = (mtpAdaptiveDepth && !stochastic) ? [] : nil
-        preparedStochasticWitness = nil
-        lastRoundUsedPLD = false
-        lastDraftedPairs = 0
+        speculativeCoordinator.beginRoundPreparation(collectAdaptiveEntropy: mtpAdaptiveDepth && !stochastic)
         do {
             let owner = session.stochastic
             var proposals: [QWMTPGumbelProposal] = []
@@ -376,7 +371,7 @@ extension QWEngineDriver {
                let idx = rawDecision.tokens.firstIndex(of: boundaryTok),
                idx + 1 < rawDecision.tokens.count {
                 rawDecision = QWGreedyRoundDecision(
-                    acceptedDrafts: rawDecision.acceptedDrafts,
+                    acceptedDrafts: min(rawDecision.acceptedDrafts, idx),
                     tokens: Array(rawDecision.tokens.prefix(idx + 1)),
                     stopped: false,
                     stoppedToken: nil
@@ -385,22 +380,10 @@ extension QWEngineDriver {
             let decision = rawDecision
             let lease = QWGreedyRoundLease(boundary: boundary, decision: decision,
                                            stochasticEvidence: evidence, rawTargets: rawTargetsForLease)
-            if let profileStart, let verifyStart, let draftAccumulator, let verifyAccumulator {
-                let rawDraftHostMs = Double(verifyStart - profileStart) / 1_000_000
-                let rawVerifyHostMs = Double(DispatchTime.now().uptimeNanoseconds - verifyStart) / 1_000_000
-                let draftTiming: QWMTPStageTiming
-                if isWeightFreeSpeculation && draftAccumulator.commandBuffers == 0 {
-                    draftTiming = try QWMTPStageTiming.hostOnly(hostMs: rawDraftHostMs)
-                } else {
-                    draftTiming = try QWMTPStageTiming(
-                        hostMs: max(draftAccumulator.gpuMs, rawDraftHostMs),
-                        gpuMs: draftAccumulator.gpuMs, commandBuffers: draftAccumulator.commandBuffers)
-                }
-                pendingMTPProfile = (
-                    draftTiming,
-                    try QWMTPStageTiming(hostMs: max(verifyAccumulator.gpuMs, rawVerifyHostMs),
-                                         gpuMs: verifyAccumulator.gpuMs, commandBuffers: verifyAccumulator.commandBuffers))
-            }
+            try speculativeCoordinator.recordPendingProfile(
+                profileStart: profileStart, verifyStart: verifyStart,
+                draftAccumulator: draftAccumulator, verifyAccumulator: verifyAccumulator,
+                isWeightFree: isWeightFreeSpeculation)
             preparedGreedyLease = lease
             return lease.prepared
         } catch {
@@ -422,21 +405,25 @@ extension QWEngineDriver {
         try requestGate.validate(permit)
         let profileStart = mtpStageProfiling ? DispatchTime.now().uptimeNanoseconds : nil
         let hasValidMTPCache = (mtpCache != nil && session.mtpKV != nil)
-            || (isWeightFreeSpeculation && mtpCache == nil && session.mtpKV == nil)
+            || ((isWeightFreeSpeculation || dflashDrafter != nil) && mtpCache == nil && session.mtpKV == nil)
         guard (preparedStochasticWitness != nil) == stochastic,
               (session.stochastic != nil) == stochastic,
               verifiedSession === session, session.verificationPending,
               !session.stateFailed, !session.sessionFinished,
               let verifyWindow, let gdnReplayCheckpoint, hasValidMTPCache,
-              let preparedGreedyLease,
+              let lease = preparedGreedyLease,
               let trunkHidden = session.trunkHidden, (2...verifyWindow.rows).contains(verifiedInputs.count),
               verifiedInputs.first == session.roundRecord.pendingToken else {
             throw QWEngineDriverError.state("greedy commit requires a live verified draft round")
         }
-        try preparedGreedyLease.validate(round, current: greedyRoundBoundary(session))
+        try lease.validate(round, current: greedyRoundBoundary(session))
         try preparedStochasticWitness?.validate(session)
         guard !mtpStageProfiling || pendingMTPProfile != nil else {
             throw QWEngineDriverError.state("MTP profile is missing its prepared stages")
+        }
+        defer {
+            session.verificationPending = false
+            speculativeCoordinator.clearActiveVerification(matching: session)
         }
         let decision = round.decision
         let drafts = Array(verifiedInputs.dropFirst())
@@ -444,7 +431,7 @@ extension QWEngineDriver {
             let commitMargin: Float = lastRoundUsedPLD ? 0 : effectiveRelaxedMargin
             let commitMinProb: Float = commitMargin > 0 ? effectiveRelaxedMinProb : 0
             let rawTargets: [Int]
-            if let cachedTargets = preparedGreedyLease.rawTargets, cachedTargets.count == verifiedInputs.count {
+            if let cachedTargets = lease.rawTargets, cachedTargets.count == verifiedInputs.count {
                 rawTargets = cachedTargets
             } else {
                 let (full, computedTargets) = try verifyWindow.greedyDecisionWithTargets(
@@ -539,8 +526,7 @@ extension QWEngineDriver {
             session.lastCommitCB = cb
             cb.addCompletedHandler { [weak self, weak session] buffer in
                 if buffer.status != .completed {
-                    self?.commandBufferErrors += 1
-                    session?.stateFailed = true
+                    self?.recordAsyncCommandBufferFailure(buffer, session: session)
                 }
             }
         }
@@ -548,7 +534,7 @@ extension QWEngineDriver {
         if mtpStageProfiling || drain {
             cb.waitUntilCompleted()
             guard cb.status == .completed else {
-                commandBufferErrors += 1
+                recordCommandBufferError(for: cb)
                 session.stateFailed = true
                 throw QWEngineDriverError.state("greedy commit GPU failure: \(String(describing: cb.error))")
             }
@@ -579,8 +565,6 @@ extension QWEngineDriver {
             }
             lastRoundUsedPLD = false
             lastDraftedPairs = 0
-        
-
         } catch {
             // GPU state has already resolved; partly changed host tables cannot
             // be retried as a fresh round.
@@ -589,23 +573,10 @@ extension QWEngineDriver {
         }
         let profile: QWMTPRoundProfile?
         do {
-            if let profileStart, let resolutionGPU {
-                guard let pendingMTPProfile else {
-                    throw QWEngineDriverError.state("MTP profile is missing its prepared stages")
-                }
-                let rawResHostMs = Double(DispatchTime.now().uptimeNanoseconds - profileStart) / 1_000_000
-                profile = QWMTPRoundProfile(drafts: drafts.count, retainedRows: retained,
-                    draft: pendingMTPProfile.draft, verification: pendingMTPProfile.verification,
-                    resolution: try QWMTPStageTiming(
-                        hostMs: max(resolutionGPU, rawResHostMs),
-                        gpuMs: resolutionGPU, commandBuffers: 1),
-                    draftTokens: drafts, acceptedDrafts: decision.acceptedDrafts,
-                    backend: mtpBackend.rawValue,
-                    verificationGpuMsByStage: verificationGpuMsByStage,
-                    adaptiveEntropyByDraft: pendingMTPAdaptiveEntropy)
-            } else {
-                profile = nil
-            }
+            profile = try speculativeCoordinator.buildCommittedProfile(
+                profileStart: profileStart, resolutionGPU: resolutionGPU,
+                retainedRows: retained, drafts: drafts,
+                acceptedDrafts: decision.acceptedDrafts, backend: mtpBackend.rawValue)
         } catch {
             session.stateFailed = true
             throw error
@@ -654,13 +625,7 @@ extension QWEngineDriver {
             session.roundRecord.trunkHiddenSeed = nil // GPU carry is authoritative.
         }
         session.verificationPending = false
-        verifiedSession = nil
-        verifiedInputs.removeAll(keepingCapacity: true)
-        self.preparedGreedyLease = nil
-        preparedStochasticWitness = nil
-        pendingMTPProfile = nil
-        pendingMTPAdaptiveEntropy = nil
-        lastMTPRoundProfile = profile
+        speculativeCoordinator.finishCommit(profile: profile)
     }
 
 }

@@ -37,7 +37,58 @@ public struct QWModelCatalogEntry: Equatable, Sendable {
     public var supported: Bool { reason == nil }
 }
 
-/// Scans a models directory. Classification uses config.json alone; no folder-name rules.
+/// Parsed `config.json` geometry and backend metadata for a DFlash 2 or DSpine drafter pack.
+public struct QWDrafterMetadata: Equatable, Sendable {
+    public let hiddenSize: Int
+    public let vocabSize: Int
+    public let numLayers: Int
+    public let targetLayerIds: [Int]
+    public let numTargetLayers: Int?
+    public let backend: String
+    public let maxDrafts: Int
+
+    public init(
+        hiddenSize: Int,
+        vocabSize: Int,
+        numLayers: Int,
+        targetLayerIds: [Int],
+        numTargetLayers: Int?,
+        backend: String,
+        maxDrafts: Int
+    ) {
+        self.hiddenSize = hiddenSize
+        self.vocabSize = vocabSize
+        self.numLayers = numLayers
+        self.targetLayerIds = targetLayerIds
+        self.numTargetLayers = numTargetLayers
+        self.backend = backend
+        self.maxDrafts = maxDrafts
+    }
+
+    /// Returns true when drafter metadata matches target `hidden`, `vocab`, and `target_layer_ids` range/count.
+    public func isCompatible(with target: QWModelDescriptor) -> Bool {
+        hiddenSize == target.hidden
+            && vocabSize == target.vocab
+            && !targetLayerIds.isEmpty
+            && targetLayerIds.count == numLayers
+            && targetLayerIds.allSatisfy { (0..<target.numLayers).contains($0) }
+    }
+}
+
+/// One installed DFlash 2 or DSpine drafter folder discovered from its `config.json`.
+public struct QWDrafterCatalogEntry: Equatable, Sendable {
+    public let name: String
+    public let path: String
+    public let metadata: QWDrafterMetadata?
+
+    public init(name: String, path: String, metadata: QWDrafterMetadata?) {
+        self.name = name
+        self.path = path
+        self.metadata = metadata
+    }
+}
+
+/// Scans model directories and probes primary and drafter pack descriptors from `config.json`.
 public enum QWModelCatalog {
     public static func scan(directory: String) -> [QWModelCatalogEntry] {
         guard let items = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return [] }
@@ -60,10 +111,25 @@ public enum QWModelCatalog {
         }
     }
 
+    /// Scans local `~/.qwg/models` and the Hugging Face hub cache, preferring local packs on name collisions.
+    public static func scanInstalledPrimaryModels(
+        localDirectory: String = QWPaths.modelsDirectoryPath,
+        hfHubDirectory: String = QWPaths.hfHubCacheDirectoryURL.path,
+        createLocalDirectoryIfMissing: Bool = true
+    ) -> [QWModelCatalogEntry] {
+        let fm = FileManager.default
+        if createLocalDirectoryIfMissing && !fm.fileExists(atPath: localDirectory) {
+            try? fm.createDirectory(atPath: localDirectory, withIntermediateDirectories: true)
+        }
+        let local = scan(directory: localDirectory)
+        let hub = scanHuggingFaceHub(directory: hfHubDirectory)
+        let localNames = Set(local.map(\.name))
+        return local + hub.filter { !localNames.contains($0.name) }
+    }
+
+    /// Classifies one installed model folder or snapshot directory from its `config.json`.
     public static func classify(name: String, path: String) -> QWModelCatalogEntry {
-        let root = QWModelRoot(url: URL(fileURLWithPath: path))
-        guard let configURL = root.configURL,
-              let data = try? Data(contentsOf: configURL) else {
+        guard let data = readConfigData(at: path) else {
             return QWModelCatalogEntry(name: name, path: path, modelType: nil, family: nil,
                                        nativeWindow: nil, reason: "no config.json")
         }
@@ -96,6 +162,113 @@ public enum QWModelCatalog {
             return QWModelCatalogEntry(name: name, path: path, modelType: modelType, family: nil,
                                        nativeWindow: nil, reason: "not runnable: \(error)")
         }
+    }
+
+    /// Decodes a primary model's `QWModelDescriptor` from its `config.json` without reading tokenizer assets.
+    public static func loadPrimaryDescriptor(at packPath: String) -> QWModelDescriptor? {
+        guard let data = readConfigData(at: packPath) else { return nil }
+        return try? QWModelDescriptor.decode(configJSON: data)
+    }
+
+    /// Returns true when `packPath` holds a DFlash 2 or DSpine drafter `config.json`.
+    public static func isDrafterPack(at packPath: String) -> Bool {
+        guard let root = readConfigJSONObject(at: packPath) else { return false }
+        return isDrafterConfigJSON(root)
+    }
+
+    /// Reads drafter geometry and backend metadata from `packPath`'s `config.json`.
+    public static func drafterMetadata(at packPath: String) -> QWDrafterMetadata? {
+        guard let root = readConfigJSONObject(at: packPath),
+              isDrafterConfigJSON(root) else {
+            return nil
+        }
+        return parseDrafterMetadata(from: root)
+    }
+
+    /// Scans `directory` (defaults to `~/.qwg/models`) for installed DFlash 2 and DSpine drafter packs.
+    public static func scanDrafters(
+        in directory: String = QWPaths.modelsDirectoryPath
+    ) -> [QWDrafterCatalogEntry] {
+        guard let items = try? FileManager.default.contentsOfDirectory(atPath: directory) else {
+            return []
+        }
+        var out: [QWDrafterCatalogEntry] = []
+        for item in items.sorted() where !item.hasPrefix(".") {
+            let itemPath = (directory as NSString).appendingPathComponent(item)
+            guard let root = readConfigJSONObject(at: itemPath),
+                  isDrafterConfigJSON(root) else {
+                continue
+            }
+            let name = QWModelRoot.canonicalModelName(for: URL(fileURLWithPath: itemPath))
+            out.append(QWDrafterCatalogEntry(
+                name: name,
+                path: itemPath,
+                metadata: parseDrafterMetadata(from: root)
+            ))
+        }
+        return out
+    }
+
+    private static func readConfigData(at packPath: String) -> Data? {
+        let trimmed = packPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let root = QWModelRoot(url: URL(fileURLWithPath: trimmed.expandingTildePath))
+        guard let cfgURL = root.configURL else { return nil }
+        return try? Data(contentsOf: cfgURL)
+    }
+
+    private static func readConfigJSONObject(at packPath: String) -> [String: Any]? {
+        guard let data = readConfigData(at: packPath) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private static func isDrafterConfigJSON(_ root: [String: Any]) -> Bool {
+        if QWModelDescriptor.isDrafterJSON(root) { return true }
+        let tc = (root["text_config"] as? [String: Any]) ?? root
+        if tc["dflash_config"] != nil || tc["selected_prefix_code_bridge"] != nil { return true }
+        if let mt = (tc["model_type"] as? String)?.lowercased(),
+           mt.contains("dflash") || mt.contains("dspine") {
+            return true
+        }
+        return false
+    }
+
+    private static func parseDrafterMetadata(from root: [String: Any]) -> QWDrafterMetadata? {
+        let tc = (root["text_config"] as? [String: Any]) ?? root
+        let dflash = (root["dflash_config"] as? [String: Any])
+            ?? (tc["dflash_config"] as? [String: Any])
+            ?? [:]
+        guard let hiddenSize = tc["hidden_size"] as? Int, hiddenSize > 0,
+              let vocabSize = tc["vocab_size"] as? Int, vocabSize > 0,
+              let numLayers = tc["num_hidden_layers"] as? Int, numLayers > 0 else {
+            return nil
+        }
+        let targetLayerIds = (dflash["target_layer_ids"] as? [Int])
+            ?? (tc["target_layer_ids"] as? [Int])
+            ?? (root["target_layer_ids"] as? [Int])
+            ?? []
+        let numTargetLayers = (tc["num_target_layers"] as? Int)
+            ?? (dflash["num_target_layers"] as? Int)
+            ?? (root["num_target_layers"] as? Int)
+        let bridgeObj = dflash["selected_prefix_code_bridge"]
+            ?? tc["selected_prefix_code_bridge"]
+            ?? root["selected_prefix_code_bridge"]
+        let modelTypeLower = ((tc["model_type"] as? String) ?? (root["model_type"] as? String) ?? "").lowercased()
+        let isDSpine = (bridgeObj != nil && !(bridgeObj is NSNull) && (bridgeObj as? Bool) != false)
+            || modelTypeLower.contains("dspine")
+        let blockSize = (dflash["block_size"] as? Int)
+            ?? (tc["block_size"] as? Int)
+            ?? (root["block_size"] as? Int)
+            ?? (isDSpine ? 16 : 8)
+        return QWDrafterMetadata(
+            hiddenSize: hiddenSize,
+            vocabSize: vocabSize,
+            numLayers: numLayers,
+            targetLayerIds: targetLayerIds,
+            numTargetLayers: numTargetLayers,
+            backend: isDSpine ? "dspine" : "dflash2",
+            maxDrafts: max(7, min(15, blockSize - 1))
+        )
     }
 
     private static func readModelType(_ data: Data) -> String? {

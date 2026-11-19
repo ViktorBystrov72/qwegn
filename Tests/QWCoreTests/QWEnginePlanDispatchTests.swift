@@ -60,7 +60,7 @@ final class QWEnginePlanDispatchTests: XCTestCase {
         // Pinned so a plan without a map keeps its deterministic V3 digest
         // when no winner map is attached (updated for geometryDigestV3Hex under D1).
         let plan = try plan(with: nil)
-        XCTAssertEqual(plan.digest, "845cfab9b2a555c0436c12c954e5607f8e3750b6b98f5824e8c67dfa631aacd5")
+        XCTAssertEqual(plan.digest, "247fda11257cd732df7f31b0847621c3de09dad9736365ea775051509282a33b")
     }
 
     func testTwoMapsThatSelectDifferentKernelsHaveDifferentDigests() throws {

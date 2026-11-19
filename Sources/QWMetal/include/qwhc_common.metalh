@@ -11,7 +11,7 @@ static inline void qwg_hc_inject_bf16_f32_impl(device const ushort* injW, device
     const uint tid = sg * 32u + lane, K4 = K >> 2u;
     device const ushort4* wRow4 = (device const ushort4*)(injW + (size_t)n * K);
     float acc = 0.0f;
-    device const float4* xRow4 = (device const float4*)(xXn + rw * K);
+    device const float4* xRow4 = (device const float4*)(xXn + (size_t)rw * K);
     for (uint k4 = tid; k4 < K4; k4 += 128u) {
         const ushort4 u = wRow4[k4];
         const float4 w = float4(as_type<float>(uint(u.x) << 16u), as_type<float>(uint(u.y) << 16u),
@@ -23,7 +23,7 @@ static inline void qwg_hc_inject_bf16_f32_impl(device const ushort* injW, device
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         const float y = (partial[0] + partial[1]) + (partial[2] + partial[3]);
-        yInj[rw * realCH + n] = 2.0f / (1.0f + exp(-(y / scale)));
+        yInj[(size_t)rw * realCH + n] = 2.0f / (1.0f + exp(-(y / scale)));
     }
 }
 
@@ -38,7 +38,7 @@ static inline void qwg_hc_down_rows4_store(float4 acc, device float* yLow, uint 
         const uint row = row0 + lane;
         if (row < NDown) {
             const float z = s[lane] / scale;
-            yLow[rw * NDown + row] = z / (1.0f + exp(-z));
+            yLow[(size_t)rw * NDown + row] = z / (1.0f + exp(-z));
         }
     }
 }

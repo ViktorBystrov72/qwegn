@@ -38,15 +38,14 @@ extension QWEngineDriver {
         completed: ((any MTLCommandBuffer) throws -> Void)? = nil
     ) throws -> (window: QWVerifyWindow, resolvedTokens: [Int]) {
         func drainUpstreamCBsOnError() {
-            priorCommitCB?.waitUntilCompleted()
-            if let priorCommitCB, priorCommitCB.status != .completed {
-                commandBufferErrors += 1
-                session.stateFailed = true
+            if let priorCommitCB {
+                priorCommitCB.waitUntilCompleted()
+                _ = syncCommitFailure(for: session, cb: priorCommitCB)
             }
             for cb in inFlightDraftCBs {
                 cb.waitUntilCompleted()
                 if cb.status != .completed {
-                    commandBufferErrors += 1
+                    recordCommandBufferError(for: cb)
                     session.stateFailed = true
                 }
             }
@@ -105,14 +104,18 @@ extension QWEngineDriver {
             let tVerify0 = Self.decodeTraceEnabled ? Date() : nil
             self.activeCB = cb
             self.stepCBs = stageProfiler == nil ? [] : nil
-            decodeTel.coldStageUs = 0
-            decodeTel.coldWaitUs = 0
-            decodeTel.coldIOUs = 0
-            decodeTel.coldStaged = 0
+            commandFrame.resetColdTelemetry()
+            var finishedCleanly = false
             defer {
-                self.activeCB = nil
-                self.activeEnc = nil
-                self.stepCBs = nil
+                if finishedCleanly {
+                    commandFrame.closeActiveEncoder()
+                    commandFrame.clearActiveBindings()
+                } else {
+                    commandFrame.abortIncomplete(
+                        admission: admission, session: session,
+                        includeActiveCB: true, markSessionFailed: true,
+                        onDrainUpstream: drainUpstreamCBsOnError)
+                }
             }
             verificationGpuMsByStage = nil
             try verifyWindow.encode(cb, hal: hal, head: head,
@@ -135,29 +138,26 @@ extension QWEngineDriver {
             let finalCB = self.activeCB ?? cb
             finalCB.commit()
             finalCB.waitUntilCompleted()
-            priorCommitCB?.waitUntilCompleted()
-            if let priorCommitCB, priorCommitCB.status != .completed {
-                commandBufferErrors += 1
-                session.stateFailed = true
-                throw QWEngineDriverError.state("greedy commit GPU failure: \(String(describing: priorCommitCB.error))")
+            if let priorCommitCB {
+                priorCommitCB.waitUntilCompleted()
+                if syncCommitFailure(for: session, cb: priorCommitCB) {
+                    throw QWEngineDriverError.state("greedy commit GPU failure: \(String(describing: priorCommitCB.error))")
+                }
+            } else if syncCommitFailure(for: session) {
+                throw QWEngineDriverError.state("greedy commit GPU failure")
             }
             for draftCB in inFlightDraftCBs {
                 draftCB.waitUntilCompleted()
                 guard draftCB.status == .completed else {
-                    commandBufferErrors += 1
+                    recordCommandBufferError(for: draftCB)
                     session.stateFailed = true
                     throw QWEngineDriverError.state("draft GPU failure: \(String(describing: draftCB.error))")
                 }
             }
-            if let pipe = coldEvents {
-                let r = pipe.takeStepResult()
-                pipe.tuneBridge()
-                decodeTel.coldWaitUs += r.waitUs
-                decodeTel.coldIOUs += r.ioUs
-                decodeTel.coldStaged += r.staged
-                if let f = r.failure { throw QWEngineDriverError.state("cold event staging: \(f)") }
+            if let f = commandFrame.drainColdEvents(waitUntilIdle: false) {
+                throw QWEngineDriverError.state("cold event staging: \(f)")
             }
-            flushPendingColdUnloads()
+            commandFrame.flushPendingColdUnloads()
             if let tVerify0 {
                 let allCBs = (self.stepCBs ?? []) + [finalCB]
                 let gpuUs = Self.gpuBusyMicros(allCBs)
@@ -168,10 +168,11 @@ extension QWEngineDriver {
                     decodeTel.coldStageUs / 1000, decodeTel.coldWaitUs / 1000, decodeTel.coldIOUs / 1000, decodeTel.coldStaged).utf8))
             }
             guard finalCB.status == .completed else {
-                commandBufferErrors += 1
+                recordCommandBufferError(for: finalCB)
                 session.stateFailed = true
                 throw QWEngineDriverError.state("verify GPU failure: \(String(describing: finalCB.error))")
             }
+            finishedCleanly = true
             let resolvedTokens: [Int]
             if let explicitTokens {
                 resolvedTokens = explicitTokens
@@ -379,7 +380,8 @@ extension QWEngineDriver {
                     dn32: prefixRows(moeDn32, rows: activeRows, cols: h, dt: .f32),
                     dn16: prefixRows(mtpBatchedMLP.downRows, rows: activeRows, cols: h, dt: .f16),
                     rows: activeRows, geometry: geometry, driver: self, skipOut32: true,
-                    preBridgedF32: moeBridge.map { (plain: $0.xPlain32, rotated: $0.xRot32) })
+                    preBridgedF32: moeBridge.map { (plain: $0.xPlain32, rotated: $0.xRot32) },
+                    isVerifyWindow: true)
                 if let active = self.activeEnc { enc = active }
                 if let activeBuf = self.activeCB { currentCB = activeBuf }
                 enc.memoryBarrier(scope: .buffers)
@@ -387,7 +389,8 @@ extension QWEngineDriver {
                 try beginStage(.mlpGateUp)
                 let activeMlpRows = prefixRows(mlpRows, rows: activeRows,
                                                cols: geometry.intermediate, dt: .f16)
-                let fuseFwht = !weights.gu.view.isIncumbentContainer && geometry.intermediate > 0 && (geometry.intermediate % 32 == 0)
+                let fuseFwht = weights.gu.view.containerKind != .incumbentHQ4G32
+                    && geometry.intermediate > 0 && (geometry.intermediate % 32 == 0)
                 try mtpBatchedMLP.encodeGateUp(enc,
                     input: prefixRows(normalized, rows: activeRows, cols: h, dt: .f16),
                     weight: weights.gu.view,

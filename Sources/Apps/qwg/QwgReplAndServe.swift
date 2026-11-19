@@ -38,9 +38,21 @@ struct Repl: ParsableCommand {
     /// where the error can name the flag, instead of being ignored later.
     func validate() throws {
         try knobs.requireHonoured("qwg repl")
+        try Self.validateImageOption(image: image, allowVision: knobs.loadVision ?? true)
+    }
+
+    static func validateImageOption(image: String?, allowVision: Bool) throws {
+        if image != nil && !allowVision {
+            throw ValidationError("image input provided but vision loading disabled via --no-load-vision")
+        }
     }
 
     func run() throws {
+        let allowVision = knobs.loadVision ?? true
+        if image != nil && !allowVision {
+            FileHandle.standardError.write("qwg repl: error: image input provided but vision loading disabled via --no-load-vision\n".data(using: .utf8)!)
+            throw ExitCode(2)
+        }
         let settings = QWSettingsManager.shared.loadSettings()
         let (resolvedPack, initialMtpDrafts, effectiveMtpBackend, resolvedBackend) =
             try QWResolvedCliEngineConfig.resolvePackAndMTP(
@@ -136,11 +148,14 @@ struct Repl: ParsableCommand {
 
         defer { conversation?.reset() }
 
-        let allowVision = knobs.loadVision ?? true
         let visionController: QWCLIVisionController? = (allowVision && engine.capabilities.contains(.vision) && runtimeAssets.descriptor.visDepth > 0)
             ? (try? QWCLIVisionController(modelPath: resolvedPack))
             : nil
-        var pendingTurnImage: String? = allowVision ? image : nil
+        if image != nil && visionController == nil {
+            FileHandle.standardError.write("qwg repl: error: image input provided but this model pack has no active vision tower\n".data(using: .utf8)!)
+            throw ExitCode(2)
+        }
+        var pendingTurnImage: String? = (visionController != nil) ? image : nil
         var activeImageHistory: [String] = []
 
         var history: [QWJson] = []
@@ -242,6 +257,9 @@ struct Repl: ParsableCommand {
                     wire = try runtimeAssets.chatTemplate.render(messages: history, options: tplOpts)
                     promptIds = try tok.encode(wire)
                     FileHandle.standardError.write("\(cliColor.systemNotice)[qwg repl: trimmed older context to fit window]\(cliColor.reset)\n".data(using: .utf8)!)
+                }
+                if !activeImageHistory.isEmpty && visionController == nil {
+                    throw QWMultimodalError.badArgument("Vision tower is disabled or unavailable for this model.")
                 }
                 let mmTurn = try visionController?.prepareTurn(
                     promptTokens: promptIds,
@@ -406,6 +424,7 @@ struct Serve: AsyncParsableCommand {
     }
 
     func run() async throws {
+        signal(SIGPIPE, SIG_IGN)
         if let bs = dflashWindow, !(2...16).contains(bs) {
             FileHandle.standardError.write("qwg serve: error: --dflash-window must be 2...16 (got \(bs))\n".data(using: .utf8)!)
             throw ExitCode(2)
@@ -482,6 +501,12 @@ struct Serve: AsyncParsableCommand {
 
         let logger = QWServerLogger.shared
         logger.setLevel(QWLogLevel.fromString(resolved.logLevel))
+        let expandedLogDir = resolved.logDir.expandingTildePath
+        let trimmedLogFile = resolved.logFileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !expandedLogDir.isEmpty, !trimmedLogFile.isEmpty {
+            let logPath = (expandedLogDir as NSString).appendingPathComponent(trimmedLogFile)
+            logger.configureFileSink(path: logPath)
+        }
 
         let warmBytes = Int(resolved.warmRAMLimitGB * 1024 * 1024 * 1024)
         let ssdBytes = resolved.ssdCacheEnabled ? Int(resolved.ssdCacheLimitGB * 1024 * 1024 * 1024) : 0
@@ -596,6 +621,7 @@ struct Serve: AsyncParsableCommand {
             Darwin.exit(0)
         }
 
+        signal(SIGPIPE, SIG_IGN)
         signal(SIGINT, SIG_IGN)
         signal(SIGTERM, SIG_IGN)
         let sigintSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)

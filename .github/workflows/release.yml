@@ -59,6 +59,7 @@ jobs:
       - name: Build (metallib + release binaries)
         run: |
           make metallib
+          python3 Scripts/check_metallib_target.py
           swift build -c release --product qwg
           swift build -c release --product qwg-menu
 

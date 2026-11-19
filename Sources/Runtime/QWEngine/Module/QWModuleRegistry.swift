@@ -1,66 +1,67 @@
-// QWModuleRegistry.swift — Which module serves which model family.
-// The one admission point: a pack is served by the module its family names,
-// and nothing else loads a model.
-//
-// This is the only place in the tree that switches on the family. Every
-// other consumer asks the registry, so a new family is one case here.
-
+// QWModuleRegistry.swift — Data-driven registry mapping model families & traits to modules.
 import Foundation
 import QWCore
 import QWHAL
 import QWKV
 
-/// Maps a model family to the module that serves it.
+/// Maps a model family and `QWModelFamilyRegistry` traits to the module that serves it.
 public enum QWModuleRegistry {
+    private static let registeredModules: [any QWInferenceModule.Type] = [
+        DenseModule.self,
+        Qwen38MoEModule.self,
+        FlashNextModule.self,
+        SenseNovaLoopModule.self,
+        Glm5NextModule.self,
+        Ernie55MoEModule.self,
+        MaxwellMoEModule.self,
+        Qwen2DenseModule.self,
+        LlamaModule.self,
+        MistralModule.self,
+        Qwen3DenseModule.self,
+        Qwen3MoEModule.self,
+    ]
+
+    private static let modulesByFamily: [QWModelDescriptor.Family: any QWInferenceModule.Type] =
+        Dictionary(uniqueKeysWithValues: registeredModules.map { ($0.family, $0) })
+
     /// The module type for a family, or nil when no module serves it.
     public static func moduleType(for family: QWModelDescriptor.Family) -> (any QWInferenceModule.Type)? {
-        switch family {
-        case .qwen38Dense: return DenseModule.self
-        case .qwen38MoE: return Qwen38MoEModule.self
-        case .qwen38FlashNext: return FlashNextModule.self
-        case .senseNovaLoop: return SenseNovaLoopModule.self
-        case .glm5Next: return Glm5NextModule.self
-        case .ernie55MoE: return Ernie55MoEModule.self
-        case .maxwellMoE: return MaxwellMoEModule.self
-        case .qwen2Dense: return Qwen2DenseModule.self
-        case .llamaDense: return LlamaModule.self
-        case .mistralDense: return MistralModule.self
-        case .qwen3Dense: return Qwen3DenseModule.self
-        case .qwen3MoE: return Qwen3MoEModule.self
-        }
+        modulesByFamily[family]
     }
 
-    /// Every family a module serves. Derived from the family list and the
-    /// module map, so a new family cannot slip past either one.
+    /// Family specification from `QWModelFamilyRegistry`, when registered.
+    public static func familySpec(for family: QWModelDescriptor.Family) -> QWModelFamilySpec? {
+        QWModelFamilyRegistry.shared.spec(for: family)
+    }
+
+    /// Every family a module serves. Derived from `Family.allCases` and registered modules.
     public static var supportedFamilies: [QWModelDescriptor.Family] {
-        QWModelDescriptor.Family.allCases.filter { moduleType(for: $0) != nil }
+        QWModelDescriptor.Family.allCases.filter { modulesByFamily[$0] != nil }
     }
 
-    /// The family a pack declares, when it declares one we know.
+    /// The family a pack declares, resolved directly or via `QWModelFamilyRegistry`.
     public static func family(forPackModelId modelId: String) -> QWModelDescriptor.Family? {
         if let direct = supportedFamilies.first(where: { $0.rawValue == modelId }) {
             return direct
         }
         if let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelId),
-           supportedFamilies.contains(spec.family) {
+           modulesByFamily[spec.family] != nil {
             return spec.family
         }
         return nil
     }
 
-    /// The module that serves a pack's declared model id.
+    /// The module that serves a pack's declared model id or HuggingFace `model_type`.
     public static func moduleType(forPackModelId modelId: String) -> (any QWInferenceModule.Type)? {
         family(forPackModelId: modelId).flatMap(moduleType(for:))
     }
 
-    /// The capabilities the module that serves a family offers. A model
-    /// that is not served by any module offers none.
+    /// The capabilities the module that serves a family offers.
     public static func capabilities(for family: QWModelDescriptor.Family) -> Set<QWKnobCapability> {
         moduleType(for: family)?.capabilities ?? []
     }
 
-    /// Builds the engine that serves a family. The caller names no
-    /// engine type: the registry asks the module that serves the family.
+    /// Builds the engine that serves a family without naming a concrete engine type.
     public static func makeEngine(for family: QWModelDescriptor.Family,
                                   options: QWEngineBuildOptions) throws -> any QWInferenceEngine {
         guard let type = moduleType(for: family) else {

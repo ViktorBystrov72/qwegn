@@ -180,7 +180,7 @@ kernel void qwg_mla_sparse_attn_mma(
         device const int* rowList = blockList + (size_t)t * p.listStride;
         for (uint i = tid; i < cnt; i += 128u) blkIdx[i] = uint(rowList[i]) << 2u;
     }
-    if (tid < MLA_MMA_HG) { mH[tid] = -INFINITY; lH[tid] = 0.0f; }
+    if (tid < MLA_MMA_HG) { mH[tid] = -1e30f; lH[tid] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint rl = qw_mla_row(lane), cl = qw_mla_col(lane);
@@ -232,7 +232,7 @@ kernel void qwg_mla_sparse_attn_mma(
             #pragma unroll
             for (uint i = 0u; i < 2u; ++i) {
                 const uint col = sTb * 8u + cl + i;
-                sbuf[hr * MLA_MMA_TK + col] = (s0 + col < slots) ? e[i] * scale : -INFINITY;
+                sbuf[hr * MLA_MMA_TK + col] = (s0 + col < slots) ? e[i] * scale : -1e30f;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -248,14 +248,15 @@ kernel void qwg_mla_sparse_attn_mma(
             mx = max(mx, simd_shuffle_xor(mx, 4u));
             const float mOld = mH[hr];
             const float mNew = max(mOld, mx);
-            const float pa = exp(a - mNew), pb = exp(b - mNew);
+            const float pa = (mNew <= -1e29f) ? 0.0f : exp(a - mNew);
+            const float pb = (mNew <= -1e29f) ? 0.0f : exp(b - mNew);
             pbuf[hr * MLA_MMA_TK + c0] = half(pa);
             pbuf[hr * MLA_MMA_TK + c0 + 1u] = half(pb);
             float sm = pa + pb;
             sm += simd_shuffle_xor(sm, 1u);
             sm += simd_shuffle_xor(sm, 2u);
             sm += simd_shuffle_xor(sm, 4u);
-            const float corr = (mOld == -INFINITY) ? 0.0f : exp(mOld - mNew);
+            const float corr = (mOld <= -1e29f) ? 0.0f : exp(mOld - mNew);
             // Every lane reads mH/lH above before lane 0 of the group writes; the barrier
             // below orders these writes before the next tile's reads.
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -478,8 +479,8 @@ kernel void qwg_mla_dsa_sparse_attn_mma(
         for (uint i = tid; i < slots; i += 128u) blkIdx[i] = min(uint(max(rowList[i], 0)), seqLen - 1u);
     }
     if (tid < MLA_MMA_HG) {
-        const float sk = (p.hasSink != 0u) ? attnSink[h0 + tid] : -INFINITY;
-        mH[tid] = (sk > -1e29f) ? sk : -INFINITY;
+        const float sk = (p.hasSink != 0u) ? attnSink[h0 + tid] : -1e30f;
+        mH[tid] = (sk > -1e29f) ? sk : -1e30f;
         lH[tid] = (sk > -1e29f) ? 1.0f : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -547,7 +548,7 @@ kernel void qwg_mla_dsa_sparse_attn_mma(
             #pragma unroll
             for (uint i = 0u; i < 2u; ++i) {
                 const uint col = sTb * 8u + cl + i;
-                sbuf[hr * MLA_MMA_TK + col] = (s0 + col < slots) ? e[i] * scale : -INFINITY;
+                sbuf[hr * MLA_MMA_TK + col] = (s0 + col < slots) ? e[i] * scale : -1e30f;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -562,14 +563,15 @@ kernel void qwg_mla_dsa_sparse_attn_mma(
             mx = max(mx, simd_shuffle_xor(mx, 4u));
             const float mOld = mH[hr];
             const float mNew = max(mOld, mx);
-            const float pa = exp(a - mNew), pb = exp(b - mNew);
+            const float pa = (mNew <= -1e29f) ? 0.0f : exp(a - mNew);
+            const float pb = (mNew <= -1e29f) ? 0.0f : exp(b - mNew);
             pbuf[hr * MLA_MMA_TK + c0] = half(pa);
             pbuf[hr * MLA_MMA_TK + c0 + 1u] = half(pb);
             float sm = pa + pb;
             sm += simd_shuffle_xor(sm, 1u);
             sm += simd_shuffle_xor(sm, 2u);
             sm += simd_shuffle_xor(sm, 4u);
-            const float corr = (mOld == -INFINITY) ? 0.0f : exp(mOld - mNew);
+            const float corr = (mOld <= -1e29f) ? 0.0f : exp(mOld - mNew);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             if ((tid & 7u) == 0u) {
                 corrH[hr] = corr;

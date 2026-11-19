@@ -194,6 +194,7 @@ final class QWServerMemoryPackTests: XCTestCase {
                 return QWEngineLifecycleActor.LoadedState(modelBackend: backend, tokenizer: tok, chatTemplate: tpl)
             }
         )
+        actor.configureAllowedWorkspaceRoots([tempRoot.path])
 
         XCTAssertEqual(actor.getConfig().kvMode, .f16)
         XCTAssertEqual(actor.getConfig().maxContext, 4096)
@@ -263,7 +264,7 @@ final class QWServerMemoryPackTests: XCTestCase {
             }
         )
 
-        let req = try JSONDecoder().decode(
+        let promptOnlyReq = try JSONDecoder().decode(
             ChatCompletionRequest.self,
             from: Data("""
             {
@@ -276,7 +277,27 @@ final class QWServerMemoryPackTests: XCTestCase {
             """.utf8)
         )
 
-        let state = await actor.autoMountAndPrepareMemoryState(for: req)
+        // System-prompt path scraping must stay disabled even for an allowed root.
+        actor.configureAllowedWorkspaceRoots([tempRoot.path])
+        let blockedPromptState = await actor.autoMountAndPrepareMemoryState(for: promptOnlyReq)
+        XCTAssertTrue(blockedPromptState.mountedTokens.isEmpty)
+        XCTAssertTrue(blockedPromptState.deltaTokens.isEmpty)
+        XCTAssertNil(actor.getMountedMemoryPackInfo())
+        XCTAssertEqual(actor.getConfig().kvMode, .f16)
+
+        let explicitReq = try JSONDecoder().decode(
+            ChatCompletionRequest.self,
+            from: Data("""
+            {
+              "model": "test-model",
+              "metadata": { "workspace_path": "\(subDir.path)" },
+              "messages": [
+                { "role": "user", "content": "Hello" }
+              ]
+            }
+            """.utf8)
+        )
+        let state = await actor.autoMountAndPrepareMemoryState(for: explicitReq)
         let prefixTokens = state.mountedTokens + state.deltaTokens
         XCTAssertEqual(prefixTokens.count, 2048)
         XCTAssertEqual(actor.getConfig().kvMode, .q4)
@@ -536,7 +557,13 @@ final class QWServerMemoryPackTests: XCTestCase {
                 return QWEngineLifecycleActor.LoadedState(modelBackend: backend, tokenizer: tok, chatTemplate: tpl)
             }
         )
-        let server = QWHttpServer(actor: actor, host: "127.0.0.1", port: 0, logger: QWServerLogger(level: .none))
+        let server = QWHttpServer(
+            actor: actor,
+            host: "127.0.0.1",
+            port: 0,
+            logger: QWServerLogger(level: .none),
+            allowedWorkspaceRoots: [tempRoot.path]
+        )
         try server.start()
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 50_000_000)
@@ -628,6 +655,7 @@ final class QWServerMemoryPackTests: XCTestCase {
             ),
             logger: QWServerLogger(level: .none)
         )
+        otherActor.configureAllowedWorkspaceRoots([tempRoot.path])
         let insp4 = try await otherActor.inspectMemoryPack(at: tempRoot.path)
         XCTAssertEqual(insp4.status, "wrong_model")
         XCTAssertEqual(insp4.availableArtifacts.count, 1)

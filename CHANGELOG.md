@@ -8,6 +8,22 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.27.4] - 2026-11-19
+
+What's changed since `v0.27.3`: fixed silent Metal 4 NAX `matmul2d` cooperative-tensor prefill corruption in macOS 26 release builds by pinning `-mmacosx-version-min=26.2`, added compile-time and CI metallib deployment-target guards, and landed Wave 1–4 security, memory-safety, kernel, concurrency, and architecture hardening across the runtime and server.
+
+### Fixed
+- **Metal 4 NAX Deployment Target (`-mmacosx-version-min=26.2`) & Compile-Time/CI Target Guards (`Scripts/build_metallib.sh`, `Scripts/check_basis.py`, `Scripts/check_toolchain.sh`, `Scripts/check_metallib_target.py`, `Scripts/ci.sh`, `.github/workflows/release.yml`, `nax.h`, `qwattn_sparse_nax.metal`)**:
+  - Fixed silent NAX `matmul2d` cooperative-tensor prefill corruption in GitHub Actions `macos-26` (Xcode 26.6) release metallibs: compiling `.metal` sources with `-std=metal4.0` without `-mmacosx-version-min` defaulted to `macOS 26.0` (`__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ == 260000`), triggering Apple `MetalPerformancePrimitives` (`MPPTensorOpsAvailability.h`) pre-26.2 cooperative-tensor fallback codegen without `operand_index` and corrupting prefill across NAX models (`SenseNova-Loop-9B`, `Qwen3.8-27B`, `GLM-5.3-Flash`, etc.).
+  - Pinned `-mmacosx-version-min=26.2` across `build_metallib.sh`, `check_basis.py`, and `check_toolchain.sh` (which also keeps `macOS 27.x`-built metallibs loadable on `macOS 26.2+`), added `< 260200` compile-time `#error` guards in `nax.h` and `qwattn_sparse_nax.metal`, and added `Platform >= 26.2` + negative-guard verification in `build_metallib.sh`, `Scripts/ci.sh`, and `.github/workflows/release.yml`.
+- **SSE Keepalive Stop/Send Synchronization (`QWSSESession`, `QWStreamKeepaliveGate`)**:
+  - Synchronized keepalive emission with gate shutdown via `QWStreamKeepaliveGate.runIfActive` so an in-flight keepalive tick can never emit `: keepalive` after `stopKeepaliveIfRunning()` returns.
+- **DFlash 2 / DSpine Prefill Context Seeding (`DriverPrefill`, `MTPVerification`)**:
+  - Restored DFlash 2 / DSpine prefill context seeding and hardened the `hasValidMTPCache` guard.
+- **Wave 1–4 Security, Memory-Safety, GPU Kernel & Architecture Hardening**:
+  - **Security & Foundation (`QWServer`, `QWToken`, `QWMenuBar`, `QWAlloc`, `QWPosixIO`, `QWCore`)**: Hardened HTTP/CSRF/SSRF/image and `#modal-memory-pack` validation, grammar arena bounds, `QWJson`, POSIX FD/pointer lifetimes, `FNRope` consolidation into `QWRopeCPU`, and extracted `QWBatchScheduler`, `QWSpeculativeTokenResolver`, and `QWTwoTierPrefixCache` control seams.
+  - **GPU Operators, Cold Streaming & Concurrency (`QWMetal`, `QWAttn`, `QWGEMM`, `QWKV`, `QWMTP`, `QWEngine`, `QWFlashNext`)**: Hardened attention, KV cache, RoPE, RMSNorm, GDN, MoE/BF16 router dtype, cold expert/event/drain RAII (`ColdEventPipeline`, `ColdExpertStreamer`), speculative/`DFlash` residency & `num_experts == 0` normalization, non-blocking telemetry & SSE/EOF backpressure, and unified GEMM/MoE/NAX `QuantTraits`, `QWScratchArenaBuilder`, `QWSessionAdmissionManager`, `QWCoarseSelectionPipeline`, and `QWSSESession` abstractions.
+
 ## [0.27.3] - 2026-11-19
 
 What's changed since `v0.27.2`: tightened `QWFlashNext` repetition tracking, expanded stochastic and repetition-penalized speculative decoding coverage, hardened `.naive` prefill and async-commit fallback synchronization, and capped unbounded fallback thinking budgets at large `max_tokens`.

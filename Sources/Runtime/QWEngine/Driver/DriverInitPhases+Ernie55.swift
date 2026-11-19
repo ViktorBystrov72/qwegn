@@ -99,93 +99,165 @@ extension QWEngineDriver {
     }
 
     func allResidentBuffers() -> [any MTLBuffer] {
-        var resident: [any MTLBuffer] = arena.allBuffers
-        if let lsa = lsaOperator { resident.append(lsa.region.buffer) }
-        if let mla = mlaOperator { resident.append(mla.region.buffer) }
-        if let mbsa = mbsaOperator { resident.append(mbsa.region.buffer) }
-        if let hca = hcaOperator { resident.append(hca.region.buffer) }
-        if let hcaLsa = hcaLsaBuffer { resident.append(hcaLsa) }
-        if let echo = echoDrafter { resident.append(echo.region.buffer) }
-        if let ew = echoWeights { resident += ew.residentBuffers }
-        switch headStorage {
-        case .f16(let t): resident.append(t.region.buffer)
-        case .q4g(let w): resident.append(w.view.blocks.region.buffer)
-        }
-        if let emb = mtpDeviceEmbedding { resident += [emb.buffer, emb.tokens] }
-        if let dh = mtpDraftHead { resident += dh.mappedBuffers }
-        for lw in layersW {
-            resident += [lw.gu.view.blocks.region.buffer, lw.down.blocks.region.buffer]
-            if let g = lw.gdn { resident += [g.inProj.blocks.region.buffer, g.out.blocks.region.buffer] }
-            if let a = lw.attn {
-                resident += [a.qkvProj.blocks.region.buffer, a.o.blocks.region.buffer]
-                if let q = a.mbsa?.qkvIdxProj { resident.append(q.blocks.region.buffer) }
-            }
-            if let hc = lw.hca {
-                if let f = hc.wFusedIn { resident.append(f.blocks.region.buffer) }
-                if let q = hc.wQUpGate { resident.append(q.blocks.region.buffer) }
-                if let oa = hc.woA { resident.append(oa.blocks.region.buffer) }
-                if let ob = hc.woB { resident.append(ob.blocks.region.buffer) }
-            }
-            if let m = lw.moe, let lat = m.latent {
-                resident += [lat.fc1.blocks.region.buffer, lat.fc2.blocks.region.buffer]
+        var resident: [any MTLBuffer] = []
+        var seen: Set<ObjectIdentifier> = []
+        func appendUnique(_ buf: any MTLBuffer) {
+            if seen.insert(ObjectIdentifier(buf)).inserted {
+                resident.append(buf)
             }
         }
-        if let mw = mtpWeights {
-            resident += [mw.fc.blocks.region.buffer, mw.qkvProj.blocks.region.buffer, mw.o.blocks.region.buffer,
-                         mw.gu.view.blocks.region.buffer, mw.down.blocks.region.buffer]
+        for buf in arena.allBuffers { appendUnique(buf) }
+        if let lsa = lsaOperator { appendUnique(lsa.region.buffer) }
+        if let mla = mlaOperator { appendUnique(mla.region.buffer) }
+        if let mbsa = mbsaOperator { appendUnique(mbsa.region.buffer) }
+        if let hca = hcaOperator { appendUnique(hca.region.buffer) }
+        if let hcaLsa = hcaLsaBuffer { appendUnique(hcaLsa) }
+        if let mhc = mhcSplit { appendUnique(mhc.partials) }
+        if let ce = coldEvents {
+            appendUnique(ce.promoList)
+            appendUnique(ce.bridgeTick)
+            appendUnique(ce.residentIds)
         }
-        return resident
-    }
-
-    func bindResidentResources(_ enc: any MTLComputeCommandEncoder) {
-        for buf in arena.allBuffers { enc.useResource(buf, usage: [.read, .write]) }
-        if let lsa = lsaOperator { enc.useResource(lsa.region.buffer, usage: [.read, .write]) }
-        if let mla = mlaOperator { enc.useResource(mla.region.buffer, usage: [.read, .write]) }
-        if let mbsa = mbsaOperator { enc.useResource(mbsa.region.buffer, usage: [.read, .write]) }
-        if let hca = hcaOperator { enc.useResource(hca.region.buffer, usage: [.read, .write]) }
-        if let hcaLsa = hcaLsaBuffer { enc.useResource(hcaLsa, usage: .read) }
-        if let echo = echoDrafter { enc.useResource(echo.region.buffer, usage: [.read, .write]) }
+        if let sm = spanMapIds { appendUnique(sm) }
+        if mlaOperator == nil, geometry.hcaConfig == nil, geometry.hybridMLAConfig == nil,
+           geometry.blockSparseGQAConfig == nil, let bmlp = try? sharedBatchMLP() {
+            appendUnique(bmlp.sums.region.buffer)
+            appendUnique(bmlp.downRows.region.buffer)
+        }
+        if let df = dflashDrafter {
+            appendUnique(df.targetHidden.region.buffer)
+            for slot in df.sessionSlots {
+                appendUnique(slot.kSlab.region.buffer)
+                appendUnique(slot.vSlab.region.buffer)
+            }
+        }
+        if let echo = echoDrafter { appendUnique(echo.region.buffer) }
         if let ew = echoWeights {
-            for b in ew.residentBuffers { enc.useResource(b, usage: .read) }
+            for b in ew.residentBuffers { appendUnique(b) }
         }
         switch headStorage {
-        case .f16(let t): enc.useResource(t.region.buffer, usage: .read)
-        case .q4g(let w): enc.useResource(w.view.blocks.region.buffer, usage: .read)
+        case .f16(let t): appendUnique(t.region.buffer)
+        case .q4g(let w): appendUnique(w.view.blocks.region.buffer)
         }
         if let emb = mtpDeviceEmbedding {
-            enc.useResource(emb.buffer, usage: .read)
-            enc.useResource(emb.tokens, usage: [.read, .write])
+            appendUnique(emb.buffer)
+            appendUnique(emb.tokens)
         }
         if let dh = mtpDraftHead {
-            for buf in dh.mappedBuffers { enc.useResource(buf, usage: .read) }
+            for buf in dh.mappedBuffers { appendUnique(buf) }
         }
         for lw in layersW {
-            enc.useResource(lw.gu.view.blocks.region.buffer, usage: .read)
-            enc.useResource(lw.down.blocks.region.buffer, usage: .read)
+            appendUnique(lw.gu.view.blocks.region.buffer)
+            appendUnique(lw.down.blocks.region.buffer)
             if let g = lw.gdn {
-                enc.useResource(g.inProj.blocks.region.buffer, usage: .read)
-                enc.useResource(g.out.blocks.region.buffer, usage: .read)
+                appendUnique(g.inProj.blocks.region.buffer)
+                appendUnique(g.out.blocks.region.buffer)
             }
             if let a = lw.attn {
-                enc.useResource(a.qkvProj.blocks.region.buffer, usage: .read)
-                enc.useResource(a.o.blocks.region.buffer, usage: .read)
-                if let q = a.mbsa?.qkvIdxProj { enc.useResource(q.blocks.region.buffer, usage: .read) }
+                appendUnique(a.qkvProj.blocks.region.buffer)
+                appendUnique(a.o.blocks.region.buffer)
+                if let q = a.mbsa?.qkvIdxProj { appendUnique(q.blocks.region.buffer) }
             }
             if let hc = lw.hca {
-                if let f = hc.wFusedIn { enc.useResource(f.blocks.region.buffer, usage: .read) }
-                if let q = hc.wQUpGate { enc.useResource(q.blocks.region.buffer, usage: .read) }
-                if let oa = hc.woA { enc.useResource(oa.blocks.region.buffer, usage: .read) }
-                if let ob = hc.woB { enc.useResource(ob.blocks.region.buffer, usage: .read) }
+                if let f = hc.wFusedIn { appendUnique(f.blocks.region.buffer) }
+                if let q = hc.wQUpGate { appendUnique(q.blocks.region.buffer) }
+                if let oa = hc.woA { appendUnique(oa.blocks.region.buffer) }
+                if let ob = hc.woB { appendUnique(ob.blocks.region.buffer) }
             }
-            if let m = lw.moe, let lat = m.latent {
-                enc.useResource(lat.fc1.blocks.region.buffer, usage: .read)
-                enc.useResource(lat.fc2.blocks.region.buffer, usage: .read)
+            if let m = lw.moe {
+                if let lat = m.latent {
+                    appendUnique(lat.fc1.blocks.region.buffer)
+                    appendUnique(lat.fc2.blocks.region.buffer)
+                }
+                if let gm = m.coldStreamer?.gpuSlotMap { appendUnique(gm) }
             }
         }
         if let mw = mtpWeights {
             for b in [mw.fc.blocks.region.buffer, mw.qkvProj.blocks.region.buffer, mw.o.blocks.region.buffer,
                       mw.gu.view.blocks.region.buffer, mw.down.blocks.region.buffer] {
-                enc.useResource(b, usage: .read)
+                appendUnique(b)
+            }
+        }
+        return resident
+    }
+
+    func bindResidentResources(_ enc: any MTLComputeCommandEncoder) {
+        var seen: Set<ObjectIdentifier> = []
+        func useUnique(_ buf: any MTLBuffer, usage: MTLResourceUsage) {
+            if seen.insert(ObjectIdentifier(buf)).inserted {
+                enc.useResource(buf, usage: usage)
+            }
+        }
+        for buf in arena.allBuffers { useUnique(buf, usage: [.read, .write]) }
+        if let lsa = lsaOperator { useUnique(lsa.region.buffer, usage: [.read, .write]) }
+        if let mla = mlaOperator { useUnique(mla.region.buffer, usage: [.read, .write]) }
+        if let mbsa = mbsaOperator { useUnique(mbsa.region.buffer, usage: [.read, .write]) }
+        if let hca = hcaOperator { useUnique(hca.region.buffer, usage: [.read, .write]) }
+        if let hcaLsa = hcaLsaBuffer { useUnique(hcaLsa, usage: .read) }
+        if let mhc = mhcSplit { useUnique(mhc.partials, usage: [.read, .write]) }
+        if let ce = coldEvents {
+            useUnique(ce.promoList, usage: [.read, .write])
+            useUnique(ce.bridgeTick, usage: [.read, .write])
+            useUnique(ce.residentIds, usage: [.read, .write])
+        }
+        if let sm = spanMapIds { useUnique(sm, usage: [.read, .write]) }
+        if mlaOperator == nil, geometry.hcaConfig == nil, geometry.hybridMLAConfig == nil,
+           geometry.blockSparseGQAConfig == nil, let bmlp = try? sharedBatchMLP() {
+            useUnique(bmlp.sums.region.buffer, usage: [.read, .write])
+            useUnique(bmlp.downRows.region.buffer, usage: [.read, .write])
+        }
+        if let df = dflashDrafter {
+            useUnique(df.targetHidden.region.buffer, usage: [.read, .write])
+            for slot in df.sessionSlots {
+                useUnique(slot.kSlab.region.buffer, usage: [.read, .write])
+                useUnique(slot.vSlab.region.buffer, usage: [.read, .write])
+            }
+        }
+        if let echo = echoDrafter { useUnique(echo.region.buffer, usage: [.read, .write]) }
+        if let ew = echoWeights {
+            for b in ew.residentBuffers { useUnique(b, usage: .read) }
+        }
+        switch headStorage {
+        case .f16(let t): useUnique(t.region.buffer, usage: .read)
+        case .q4g(let w): useUnique(w.view.blocks.region.buffer, usage: .read)
+        }
+        if let emb = mtpDeviceEmbedding {
+            useUnique(emb.buffer, usage: .read)
+            useUnique(emb.tokens, usage: [.read, .write])
+        }
+        if let dh = mtpDraftHead {
+            for buf in dh.mappedBuffers { useUnique(buf, usage: .read) }
+        }
+        for lw in layersW {
+            useUnique(lw.gu.view.blocks.region.buffer, usage: .read)
+            useUnique(lw.down.blocks.region.buffer, usage: .read)
+            if let g = lw.gdn {
+                useUnique(g.inProj.blocks.region.buffer, usage: .read)
+                useUnique(g.out.blocks.region.buffer, usage: .read)
+            }
+            if let a = lw.attn {
+                useUnique(a.qkvProj.blocks.region.buffer, usage: .read)
+                useUnique(a.o.blocks.region.buffer, usage: .read)
+                if let q = a.mbsa?.qkvIdxProj { useUnique(q.blocks.region.buffer, usage: .read) }
+            }
+            if let hc = lw.hca {
+                if let f = hc.wFusedIn { useUnique(f.blocks.region.buffer, usage: .read) }
+                if let q = hc.wQUpGate { useUnique(q.blocks.region.buffer, usage: .read) }
+                if let oa = hc.woA { useUnique(oa.blocks.region.buffer, usage: .read) }
+                if let ob = hc.woB { useUnique(ob.blocks.region.buffer, usage: .read) }
+            }
+            if let m = lw.moe {
+                if let lat = m.latent {
+                    useUnique(lat.fc1.blocks.region.buffer, usage: .read)
+                    useUnique(lat.fc2.blocks.region.buffer, usage: .read)
+                }
+                if let gm = m.coldStreamer?.gpuSlotMap { useUnique(gm, usage: [.read, .write]) }
+            }
+        }
+        if let mw = mtpWeights {
+            for b in [mw.fc.blocks.region.buffer, mw.qkvProj.blocks.region.buffer, mw.o.blocks.region.buffer,
+                      mw.gu.view.blocks.region.buffer, mw.down.blocks.region.buffer] {
+                useUnique(b, usage: .read)
             }
         }
     }

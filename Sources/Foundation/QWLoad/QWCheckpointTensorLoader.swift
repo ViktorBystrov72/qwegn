@@ -172,19 +172,28 @@ public enum QWCheckpointTensorLoader {
             throw QWCheckpointLoaderError.notHQ4(name)
         }
         let grp = e.hqGroup, blk = e.hqBlockBytes
-        guard cols % grp == 0 else { throw QWCheckpointLoaderError.notHQ4(name) }
-        return PackSpan(off: off, bytes: rows * (cols / grp) * blk, rows: rows, cols: cols,
+        guard off >= 0, rows >= 0, cols > 0, grp > 0, cols % grp == 0 else {
+            throw QWCheckpointLoaderError.notHQ4(name)
+        }
+        let (ng, ov0) = rows.multipliedReportingOverflow(by: cols / grp)
+        let (bytes, ov1) = ng.multipliedReportingOverflow(by: blk)
+        guard !ov0, !ov1 else { throw QWCheckpointLoaderError.notHQ4(name) }
+        return PackSpan(off: off, bytes: bytes, rows: rows, cols: cols,
                         bits: e.hqBits, group: grp, isIncumbent: e.isIncumbentHQ4, isSHVQ: e.isSHVQ)
     }
 
     public static func stackedSpan(_ pack: QWQuant.Pack, _ name: String) throws -> (span: PackSpan, n: Int, k: Int) {
         let e = try pack.entry(name)
-        guard e.quantized, e.shape.count == 3, let off = e.hq4Off, let count = e.experts, let per = e.eHq4 else {
+        guard e.quantized, e.shape.count == 3, let off = e.hq4Off, let count = e.experts, let per = e.eHq4,
+              off >= 0, count >= 0, per >= 0, e.shape[1] >= 0, e.shape[2] > 0 else {
             throw QWCheckpointLoaderError.notHQ4(name)
         }
-        let s = PackSpan(off: off, bytes: count * per, rows: count * e.shape[1], cols: e.shape[2],
+        let (bytes, ov0) = count.multipliedReportingOverflow(by: per)
+        let (n, ov1) = count.multipliedReportingOverflow(by: e.shape[1])
+        guard !ov0, !ov1 else { throw QWCheckpointLoaderError.notHQ4(name) }
+        let s = PackSpan(off: off, bytes: bytes, rows: n, cols: e.shape[2],
                          bits: e.hqBits, group: e.hqGroup, isIncumbent: e.isIncumbentHQ4, isSHVQ: e.isSHVQ)
-        return (s, count * e.shape[1], e.shape[2])
+        return (s, n, e.shape[2])
     }
 
     public static func mappedBank(_ arena: QWArena, _ pack: QWQuant.Pack, _ s: PackSpan, n: Int, k: Int) -> QWWeightView? {
@@ -316,22 +325,29 @@ public enum QWCheckpointTensorLoader {
     private static let stageLock = NSLock()
     nonisolated(unsafe) private static var sharedRepackStage: (any MTLBuffer)?
 
-    private static func acquireRepackStage(device: any MTLDevice, minBytes: Int) -> (any MTLBuffer)? {
-        stageLock.lock()
-        defer { stageLock.unlock() }
-        if let existing = sharedRepackStage, existing.length >= minBytes {
-            return existing
+    private static func withRepackStage<R>(
+        device: any MTLDevice,
+        minBytes: Int,
+        _ body: (any MTLBuffer) throws -> R
+    ) throws -> R? {
+        guard minBytes > 0 else { return nil }
+        return try stageLock.withLock {
+            if let existing = sharedRepackStage, existing.length >= minBytes {
+                return try body(existing)
+            }
+            sharedRepackStage = nil
+            guard let buf = device.makeBuffer(length: minBytes, options: .storageModeShared) else {
+                return nil
+            }
+            sharedRepackStage = buf
+            return try body(buf)
         }
-        sharedRepackStage = nil
-        let buf = device.makeBuffer(length: minBytes, options: .storageModeShared)
-        sharedRepackStage = buf
-        return buf
     }
 
     public static func releaseRepackStageBuffer() {
-        stageLock.lock()
-        sharedRepackStage = nil
-        stageLock.unlock()
+        stageLock.withLock {
+            sharedRepackStage = nil
+        }
     }
 
     private static func moeSlabCacheDirectory(for st: QWSafeTensorsContainer, isRotated: Bool) -> URL? {
@@ -367,14 +383,14 @@ public enum QWCheckpointTensorLoader {
     private static func mapCachedMoESlab(at url: URL, alignedGU: Int, alignedDN: Int,
                                          device: any MTLDevice) -> (guBuf: any MTLBuffer, dnBuf: any MTLBuffer)? {
         let pageSize = Int(sysconf(_SC_PAGESIZE))
-        guard pageSize > 0, alignedGU > 0, alignedDN > 0,
+        let (totalBytes, ov) = alignedGU.addingReportingOverflow(alignedDN)
+        guard pageSize > 0, alignedGU > 0, alignedDN > 0, !ov,
               alignedGU % pageSize == 0, alignedDN % pageSize == 0 else { return nil }
-        let totalBytes = alignedGU + alignedDN
-        let fd = Darwin.open(url.path, O_RDONLY)
+        let fd = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else { return nil }
         defer { Darwin.close(fd) }
         var st = Darwin.stat()
-        guard Darwin.fstat(fd, &st) == 0, Int(st.st_size) == totalBytes else { return nil }
+        guard Darwin.fstat(fd, &st) == 0, let stSize = Int(exactly: st.st_size), stSize == totalBytes else { return nil }
         let raw = Darwin.mmap(nil, totalBytes, PROT_READ, MAP_SHARED, fd, 0)
         guard let basePtr = raw, basePtr != MAP_FAILED else { return nil }
         _ = Darwin.posix_madvise(basePtr, totalBytes, POSIX_MADV_RANDOM)
@@ -399,15 +415,30 @@ public enum QWCheckpointTensorLoader {
     }
 
     private static func pwriteAllNoCache(fd: Int32, from src: UnsafeRawPointer, count: Int, offset: Int) -> Bool {
+        guard fd >= 0, count >= 0, offset >= 0 else { return false }
+        let (_, ov) = offset.addingReportingOverflow(count)
+        guard !ov else { return false }
         let chunkLimit = 64 << 20
         var written = 0
         while written < count {
             let chunk = min(chunkLimit, count - written)
             let w = Darwin.pwrite(fd, src.advanced(by: written), chunk, off_t(offset + written))
-            if w <= 0 { return false }
+            if w < 0 {
+                if errno == EINTR { continue }
+                return false
+            }
+            if w == 0 { return false }
             written += w
         }
         return true
+    }
+
+    private static func fsyncFD(_ fd: Int32) -> Bool {
+        while true {
+            if Darwin.fsync(fd) == 0 { return true }
+            if errno == EINTR { continue }
+            return false
+        }
     }
 
     public static func stackedExpertBanks(
@@ -459,12 +490,27 @@ public enum QWCheckpointTensorLoader {
                                                    bits: dnLayout.bits, groupSize: dnLayout.group,
                                                    isRotated: false, name: downName))
                     }
-                    if let stageBuf = acquireRepackStage(device: arena.hal.device, minBytes: max(alignedGU, alignedDN)) {
-                        let tmpURL = slabURL.appendingPathExtension("tmp.\(getpid())")
-                        let tmpFD = Darwin.open(tmpURL.path, O_RDWR | O_CREAT | O_TRUNC, 0o600)
-                        if tmpFD >= 0 {
-                            _ = Darwin.fcntl(tmpFD, F_NOCACHE, 1)
-                            if Darwin.ftruncate(tmpFD, off_t(alignedGU + alignedDN)) == 0 {
+                    let tmpURL = slabURL.appendingPathExtension("tmp.\(getpid()).\(UUID().uuidString)")
+                    var tmpFD = Darwin.open(tmpURL.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+                    if tmpFD >= 0 {
+                        var renameDone = false
+                        defer {
+                            if tmpFD >= 0 {
+                                _ = Darwin.close(tmpFD)
+                                tmpFD = -1
+                            }
+                            if !renameDone {
+                                _ = Darwin.unlink(tmpURL.path)
+                            }
+                        }
+                        _ = Darwin.fcntl(tmpFD, F_NOCACHE, 1)
+                        let (totalAligned, ovAligned) = alignedGU.addingReportingOverflow(alignedDN)
+                        if !ovAligned, Darwin.ftruncate(tmpFD, off_t(totalAligned)) == 0 {
+                            let writeFD = tmpFD
+                            let wroteAll: Bool = try withRepackStage(
+                                device: arena.hal.device,
+                                minBytes: max(alignedGU, alignedDN)
+                            ) { stageBuf in
                                 if st.tensor(mp + "experts.gate_up_proj") != nil {
                                     try QWAQRepacker.repackMLXAffine(
                                         hal: arena.hal, container: st, name: mp + "experts.gate_up_proj",
@@ -479,30 +525,34 @@ public enum QWCheckpointTensorLoader {
                                         bits: guLayout.bits, group: guLayout.group,
                                         into: stageBuf, dstByteOffset: 0)
                                 }
-                                let okGU = pwriteAllNoCache(fd: tmpFD, from: stageBuf.contents(), count: guBytes, offset: 0)
+                                guard pwriteAllNoCache(fd: writeFD, from: stageBuf.contents(), count: guBytes, offset: 0) else {
+                                    return false
+                                }
                                 try QWAQRepacker.repackMLXAffine(
                                     hal: arena.hal, container: st, name: downName,
                                     rows: dnRows, cols: inter, bits: dnLayout.bits, group: dnLayout.group,
                                     into: stageBuf, dstByteOffset: 0)
-                                let okDN = okGU && pwriteAllNoCache(fd: tmpFD, from: stageBuf.contents(), count: dnBytes, offset: alignedGU)
-                                Darwin.close(tmpFD)
-                                if okDN, Darwin.rename(tmpURL.path, slabURL.path) == 0,
-                                   let mapped = mapCachedMoESlab(at: slabURL, alignedGU: alignedGU, alignedDN: alignedDN, device: arena.hal.device) {
-                                    let guTensor = QWTensorValue(region: QWMRegion(buffer: mapped.guBuf, base: 0, length: guBytes),
-                                                                 offset: 0, shape: QWTensorShape([guBytes / 2], .f16))
-                                    let dnTensor = QWTensorValue(region: QWMRegion(buffer: mapped.dnBuf, base: 0, length: dnBytes),
-                                                                 offset: 0, shape: QWTensorShape([dnBytes / 2], .f16))
-                                    return (try makeWeightView(blocks: guTensor, n: guRows, k: hidden,
-                                                               bits: guLayout.bits, groupSize: guLayout.group,
-                                                               isRotated: false, name: mp + "experts.gate_up_proj"),
-                                            try makeWeightView(blocks: dnTensor, n: dnRows, k: inter,
-                                                               bits: dnLayout.bits, groupSize: dnLayout.group,
-                                                               isRotated: false, name: downName))
+                                return pwriteAllNoCache(fd: writeFD, from: stageBuf.contents(), count: dnBytes, offset: alignedGU)
+                            } ?? false
+                            if wroteAll, fsyncFD(tmpFD) {
+                                _ = Darwin.close(tmpFD)
+                                tmpFD = -1
+                                if Darwin.rename(tmpURL.path, slabURL.path) == 0 {
+                                    renameDone = true
+                                    if let mapped = mapCachedMoESlab(at: slabURL, alignedGU: alignedGU, alignedDN: alignedDN, device: arena.hal.device) {
+                                        let guTensor = QWTensorValue(region: QWMRegion(buffer: mapped.guBuf, base: 0, length: guBytes),
+                                                                     offset: 0, shape: QWTensorShape([guBytes / 2], .f16))
+                                        let dnTensor = QWTensorValue(region: QWMRegion(buffer: mapped.dnBuf, base: 0, length: dnBytes),
+                                                                     offset: 0, shape: QWTensorShape([dnBytes / 2], .f16))
+                                        return (try makeWeightView(blocks: guTensor, n: guRows, k: hidden,
+                                                                   bits: guLayout.bits, groupSize: guLayout.group,
+                                                                   isRotated: false, name: mp + "experts.gate_up_proj"),
+                                                try makeWeightView(blocks: dnTensor, n: dnRows, k: inter,
+                                                                   bits: dnLayout.bits, groupSize: dnLayout.group,
+                                                                   isRotated: false, name: downName))
+                                    }
                                 }
-                            } else {
-                                Darwin.close(tmpFD)
                             }
-                            _ = Darwin.unlink(tmpURL.path)
                         }
                     }
                 }

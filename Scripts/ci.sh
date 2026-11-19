@@ -21,6 +21,7 @@ python3 Scripts/lint_style.py Sources Tests Scripts || { echo "FAIL: style gate"
 echo "== kernel reachability (metallib vs dispatch sites)"
 python3 Scripts/test_kernel_inventory.py || { echo "FAIL: kernel inventory tests"; exit 1; }
 ./Scripts/build_metallib.sh > "$CI_TMP_DIR/metallib.log" 2>&1 || { cat "$CI_TMP_DIR/metallib.log"; echo "FAIL: metallib build"; exit 1; }
+python3 Scripts/check_metallib_target.py || { echo "FAIL: metallib target gate"; exit 1; }
 python3 Scripts/lint_kernels.py || { echo "FAIL: kernel reachability gate"; exit 1; }
 python3 Scripts/check_basis.py || { echo "FAIL: basis gate"; exit 1; }
 echo "== geometry defaults & package DAG gates"

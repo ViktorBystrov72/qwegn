@@ -2,6 +2,7 @@
 
 import Foundation
 import QWCore
+import QWRope
 @testable import QWQuant
 @testable import QWFlashNext
 
@@ -99,7 +100,7 @@ extension FNPackLoader {
             qProj: try tensor(p + "q_proj.weight"), kProj: try tensor(p + "k_proj.weight"),
             vProj: try tensor(p + "v_proj.weight"), oProj: try tensor(p + "o_proj.weight"),
             qNorm: try tensor(p + "q_norm.weight"), kNorm: try tensor(p + "k_norm.weight"),
-            indexer: indexer, rope: FNRope(rotaryDim: d.rotaryDims, theta: d.ropeTheta))
+            indexer: indexer, rope: QWRopeCPU(rotaryDim: d.rotaryDims, theta: d.ropeTheta))
     }
 
     public func moe(layer: Int, normTopK: Bool, prefix: String? = nil) throws -> FNSparseMoE {

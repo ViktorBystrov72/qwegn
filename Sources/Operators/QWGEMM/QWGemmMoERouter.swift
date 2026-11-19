@@ -82,7 +82,7 @@ extension QWGemm {
         precondition(k % 32 == 0, "router GEMM needs K % 32 == 0")
         let hasShGate = (shGateWeight != nil && shGateOut != nil) ? 1 : 0
         // NAX path: bf16 W exact, f32 X as three bf16 terms; ~3x the simdgroup kernel at prefill sizes.
-        if (weight.shape.dtype == .bf16 || weight.shape.dtype == .f16) && n % 64 == 0 && rows >= 128 {
+        if hal.caps.isMetal4TensorCapable && weight.shape.dtype == .bf16 && n % 64 == 0 && rows >= 128 {
             enc.setComputePipelineState(try hal.pipeline("qwg_router_nax"))
             enc.bindTensors(weight, x, y, startIndex: 0)
             enc.setUInt32s(rows, n, k, startIndex: 3)
@@ -95,8 +95,8 @@ extension QWGemm {
         }
         enc.setComputePipelineState(try hal.pipeline("qwg_router_gemm"))
         enc.bindTensors(weight, x, y, startIndex: 0)
-        let isBF16 = (weight.shape.dtype == .f16 || weight.shape.dtype == .bf16) ? 1 : 0
-        enc.setUInt32s(rows, n, k, isBF16, startIndex: 3)
+        let weightMode = (weight.shape.dtype == .bf16) ? 1 : (weight.shape.dtype == .f16 ? 2 : 0)
+        enc.setUInt32s(rows, n, k, weightMode, startIndex: 3)
         (shGateWeight ?? weight).bind(enc, index: 7)
         (shGateOut ?? y).bind(enc, index: 8)
         enc.setUInt32s(hasShGate, startIndex: 9)

@@ -17,27 +17,37 @@ public enum QWNgramDType: UInt32, Sendable, Equatable, CaseIterable {
         guard headDim > 0 else { throw QWNgramFormatError.badRowSize(headDim) }
         switch self {
         case .bf16:
-            return headDim * 2
+            let (bytes, ov) = headDim.multipliedReportingOverflow(by: 2)
+            guard !ov else { throw QWNgramFormatError.badRowSize(headDim) }
+            return bytes
         case .q8g32:
             guard headDim % QWNgramFormat.group == 0 else {
                 throw QWNgramFormatError.badRowSize(headDim)
             }
-            return (headDim / QWNgramFormat.group) * (32 + 2)
+            let (bytes, ov) = (headDim / QWNgramFormat.group).multipliedReportingOverflow(by: 34)
+            guard !ov else { throw QWNgramFormatError.badRowSize(headDim) }
+            return bytes
         case .q4g32:
             guard headDim % QWNgramFormat.group == 0 else {
                 throw QWNgramFormatError.badRowSize(headDim)
             }
-            return (headDim / QWNgramFormat.group) * 20
+            let (bytes, ov) = (headDim / QWNgramFormat.group).multipliedReportingOverflow(by: 20)
+            guard !ov else { throw QWNgramFormatError.badRowSize(headDim) }
+            return bytes
         case .vq2g32:
             guard headDim % QWNgramFormat.group == 0 else {
                 throw QWNgramFormatError.badRowSize(headDim)
             }
-            return (headDim / QWNgramFormat.group) * 18
+            let (bytes, ov) = (headDim / QWNgramFormat.group).multipliedReportingOverflow(by: 18)
+            guard !ov else { throw QWNgramFormatError.badRowSize(headDim) }
+            return bytes
         case .vq4g32:
             guard headDim % QWNgramFormat.group == 0 else {
                 throw QWNgramFormatError.badRowSize(headDim)
             }
-            return (headDim / QWNgramFormat.group) * 10
+            let (bytes, ov) = (headDim / QWNgramFormat.group).multipliedReportingOverflow(by: 10)
+            guard !ov else { throw QWNgramFormatError.badRowSize(headDim) }
+            return bytes
         }
     }
 }
@@ -204,9 +214,15 @@ public enum QWNgramFormat {
         // A row must fit in a sector, or the table has zero rows per sector
         // and every row index divides by zero.
         _ = try rowsPerSector(rowBytes: rowBytes)
-        let entryCount = Int(u64(16))
-        let l1Hot = Int(u32(28))
-        let dataOffset = Int(u64(32))
+        guard let entryCount = Int(exactly: u64(16)) else {
+            throw QWNgramFormatError.badHeader("entryCount overflows Int")
+        }
+        guard let l1Hot = Int(exactly: u32(28)) else {
+            throw QWNgramFormatError.badHeader("l1Hot overflows Int")
+        }
+        guard let dataOffset = Int(exactly: u64(32)) else {
+            throw QWNgramFormatError.badHeader("dataOffset overflows Int")
+        }
         guard entryCount > 0 else { throw QWNgramFormatError.badHeader("entryCount is zero") }
         guard l1Hot <= entryCount else {
             throw QWNgramFormatError.badHeader("l1Hot \(l1Hot) exceeds entryCount \(entryCount)")

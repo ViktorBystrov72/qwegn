@@ -48,8 +48,10 @@ public final class QWDispatchIO: @unchecked Sendable {
     public let directIO: Bool
     public let fd: Int32
 
-    private let lock = NSLock()
+    private let stateCondition = NSCondition()
     private var isClosed = false
+    private var didCloseFD = false
+    private var activeIO = 0
 
     public init(path: String,
                 mode: AccessMode = .readOnly,
@@ -58,7 +60,7 @@ public final class QWDispatchIO: @unchecked Sendable {
         self.mode = mode
         self.directIO = directIO
 
-        let openFlags = mode.posixFlags
+        let openFlags = mode.posixFlags | O_CLOEXEC
         let fd = open(path, openFlags, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
         guard fd >= 0 else {
             throw QWDispatchIOError.openFailed(path: path, errno: errno)
@@ -75,56 +77,102 @@ public final class QWDispatchIO: @unchecked Sendable {
         close()
     }
 
-    /// Explicitly close the underlying POSIX file descriptor.
+    /// Explicitly close the underlying POSIX file descriptor after waiting for in-flight I/O.
     public func close() {
-        lock.lock()
-        defer { lock.unlock() }
-        if !isClosed {
-            isClosed = true
-            Darwin.close(fd)
+        stateCondition.withLock {
+            if !isClosed {
+                isClosed = true
+            }
+            while activeIO > 0 {
+                stateCondition.wait()
+            }
+            if !didCloseFD {
+                didCloseFD = true
+                Darwin.close(fd)
+            }
         }
     }
 
-    private func checkOpen() throws {
-        lock.lock()
-        defer { lock.unlock() }
-        if isClosed {
-            throw QWDispatchIOError.channelClosed
+    private func withActiveFD<R>(_ body: (Int32) throws -> R) throws -> R {
+        let activeFD = try stateCondition.withLock { () -> Int32 in
+            if isClosed {
+                throw QWDispatchIOError.channelClosed
+            }
+            activeIO += 1
+            return fd
+        }
+        defer {
+            stateCondition.withLock {
+                activeIO -= 1
+                if isClosed && activeIO == 0 {
+                    stateCondition.broadcast()
+                }
+            }
+        }
+        return try body(activeFD)
+    }
+
+    private static func mapPOSIXError(_ posixErr: QWPOSIXError, offset: Int64, length: Int) -> QWDispatchIOError {
+        switch posixErr {
+        case .ioFailed(let off, let len, let err):
+            return .readFailed(offset: off, length: len, errno: err)
+        case .shortRead(_, let expected, let actual):
+            return .shortRead(expected: expected, actual: actual)
+        case .invalidArgument:
+            return .readFailed(offset: offset, length: length, errno: EINVAL)
         }
     }
 
     /// Synchronous read using POSIX `pread` with an `EINTR` and partial-read retry loop.
     public func readSync(offset: Int64, into dst: UnsafeMutableRawPointer, length: Int) throws -> Int {
-        try checkOpen()
-        do {
-            return try QWPOSIX.preadUpTo(fd: fd, into: dst, count: length, offset: offset)
-        } catch let posixErr as QWPOSIXError {
-            switch posixErr {
-            case .ioFailed(let off, let len, let err):
-                throw QWDispatchIOError.readFailed(offset: off, length: len, errno: err)
-            case .shortRead(_, let expected, let actual):
-                throw QWDispatchIOError.shortRead(expected: expected, actual: actual)
-            case .invalidArgument:
-                throw QWDispatchIOError.readFailed(offset: offset, length: length, errno: EINVAL)
+        try withActiveFD { activeFD in
+            do {
+                return try QWPOSIX.preadUpTo(fd: activeFD, into: dst, count: length, offset: offset)
+            } catch let posixErr as QWPOSIXError {
+                throw Self.mapPOSIXError(posixErr, offset: offset, length: length)
+            }
+        }
+    }
+
+    /// Synchronous exact-count read using `QWPOSIX.preadExact`, throwing `.shortRead` on premature EOF.
+    public func readExactSync(offset: Int64, into dst: UnsafeMutableRawPointer, length: Int) throws {
+        try withActiveFD { activeFD in
+            do {
+                try QWPOSIX.preadExact(fd: activeFD, into: dst, count: length, offset: offset)
+            } catch let posixErr as QWPOSIXError {
+                throw Self.mapPOSIXError(posixErr, offset: offset, length: length)
             }
         }
     }
 
     /// Synchronous write fallback using POSIX `pwrite` with an `EINTR` retry loop.
     public func writeSync(offset: Int64, buffer: UnsafeRawPointer, length: Int) throws {
-        try checkOpen()
-        var totalWritten = 0
-        var ptr = buffer
-
-        while totalWritten < length {
-            let toWrite = length - totalWritten
-            let bytesWritten = pwrite(fd, ptr, toWrite, off_t(offset + Int64(totalWritten)))
-            if bytesWritten < 0 {
-                if errno == EINTR { continue }
-                throw QWDispatchIOError.writeFailed(offset: offset + Int64(totalWritten), length: toWrite, errno: errno)
+        guard offset >= 0, length >= 0 else {
+            throw QWDispatchIOError.writeFailed(offset: offset, length: length, errno: EINVAL)
+        }
+        let (_, endOv) = offset.addingReportingOverflow(Int64(length))
+        guard !endOv else {
+            throw QWDispatchIOError.writeFailed(offset: offset, length: length, errno: EOVERFLOW)
+        }
+        try withActiveFD { activeFD in
+            var totalWritten = 0
+            while totalWritten < length {
+                let (curOff, offOv) = offset.addingReportingOverflow(Int64(totalWritten))
+                guard !offOv else {
+                    throw QWDispatchIOError.writeFailed(offset: offset, length: length - totalWritten, errno: EOVERFLOW)
+                }
+                let toWrite = length - totalWritten
+                let bytesWritten = Darwin.pwrite(activeFD, buffer.advanced(by: totalWritten), toWrite, off_t(curOff))
+                if bytesWritten < 0 {
+                    let err = errno
+                    if err == EINTR { continue }
+                    throw QWDispatchIOError.writeFailed(offset: curOff, length: toWrite, errno: err)
+                }
+                if bytesWritten == 0 {
+                    throw QWDispatchIOError.writeFailed(offset: curOff, length: toWrite, errno: EIO)
+                }
+                totalWritten += bytesWritten
             }
-            totalWritten += bytesWritten
-            ptr = ptr.advanced(by: bytesWritten)
         }
     }
 }

@@ -186,7 +186,7 @@ kernel void qwg_moe_gateup_group_f32(device const Block_HQ4_G32* blocks [[buffer
     const uint dl = tid & 7u;    // lane inside the group
     const int nBlocks = int(K >> 5u);
     const int nRow = min(nBase + int(gi), int(N) - 1);
-    device const Block_HQ4_G32* const wrowBase = blocks + long(e * int(N) + nRow) * long(nBlocks);
+    device const Block_HQ4_G32* const wrowBase = blocks + (long(e) * long(N) + long(nRow)) * long(nBlocks);
 
     for (int p0 = lo; p0 < hi; p0 += QWG_MG_BM) {
         const int cnt = min(QWG_MG_BM, hi - p0);

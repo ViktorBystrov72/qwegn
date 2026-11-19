@@ -44,19 +44,9 @@ struct QWMTPGreedySelector {
                        destination: QWTensorValue) throws {
         guard (1...maxRows).contains(rows),
               logits.shape.dtype == .f32, logits.shape.elementCount == rows * vocabulary,
-              logits.offset >= 0, logits.region.base >= 0,
-              logits.offset <= logits.region.length,
-              logits.bytes <= logits.region.length - logits.offset,
-              logits.region.base <= logits.region.buffer.length,
-              logits.region.length <= logits.region.buffer.length - logits.region.base,
-              (logits.region.base + logits.offset) % 4 == 0,
+              Self.hasValidWordExtent(logits),
               destination.shape.dtype == .i32, destination.shape.elementCount >= rows,
-              destination.offset >= 0, destination.region.base >= 0,
-              destination.offset <= destination.region.length,
-              destination.bytes <= destination.region.length - destination.offset,
-              destination.region.base <= destination.region.buffer.length,
-              destination.region.length <= destination.region.buffer.length - destination.region.base,
-              (destination.region.base + destination.offset) % 4 == 0 else {
+              Self.hasValidWordExtent(destination) else {
             throw QWEngineDriverError.state("draft argmax logits geometry or extent is invalid")
         }
         for dest in [keysHi, keysLo, destination] where logits.region.buffer === dest.region.buffer {
@@ -87,12 +77,65 @@ struct QWMTPGreedySelector {
                                  threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
     }
 
+    private static func hasValidWordExtent(_ tensor: QWTensorValue) -> Bool {
+        tensor.offset >= 0 && tensor.region.base >= 0
+            && tensor.offset <= tensor.region.length
+            && tensor.bytes <= tensor.region.length - tensor.offset
+            && tensor.region.base <= tensor.region.buffer.length
+            && tensor.region.length <= tensor.region.buffer.length - tensor.region.base
+            && (tensor.region.base + tensor.offset) % 4 == 0
+    }
+
     /// Call only after successful command-buffer completion.
     func completedToken() throws -> Int {
         let id = Int(token.region.pointer.advanced(by: token.offset).assumingMemoryBound(to: Int32.self).pointee)
-        guard (0..<vocabulary).contains(id) else {
+        do {
+            return try QWSpeculativeTokenResolver.validateToken(id, vocabulary: vocabulary)
+        } catch {
             throw QWEngineDriverError.state("draft argmax rejected non-finite logits or invalid token \(id)")
         }
-        return id
+    }
+
+    /// Reads and validates `count` completed target tokens written by `encodeBatched`.
+    func completedTokens(from destination: QWTensorValue, count: Int) throws -> [Int] {
+        guard count > 0, count <= destination.shape.elementCount else {
+            throw QWEngineDriverError.state("GPU target active row count is invalid")
+        }
+        let ids = destination.region.pointer.advanced(by: destination.offset).assumingMemoryBound(to: Int32.self)
+        var out: [Int] = []
+        out.reserveCapacity(count)
+        for row in 0..<count {
+            let id = Int(ids[row])
+            do {
+                out.append(try QWSpeculativeTokenResolver.validateToken(id, vocabulary: vocabulary))
+            } catch {
+                throw QWEngineDriverError.state("GPU target row \(row) rejected non-finite logits or invalid token \(id)")
+            }
+        }
+        return out
+    }
+
+    /// Resolves draft acceptance, bonus token, and rollback count via shared `QWSpeculativeTokenResolver`.
+    func resolveGreedyRound(
+        drafts: [Int],
+        targetBuffer: QWTensorValue,
+        logits: QWTensorValue,
+        maxNew: Int,
+        stopIDs: Set<Int> = [],
+        relaxedMargin: Float = 0,
+        relaxedMinProb: Float = 0
+    ) throws -> QWSpeculativeResolution {
+        let targets = try completedTokens(from: targetBuffer, count: drafts.count + 1)
+        let p = logits.region.pointer.advanced(by: logits.offset).assumingMemoryBound(to: Float.self)
+        return try QWSpeculativeTokenResolver.resolveGreedy(
+            drafts: drafts,
+            targetArgmaxes: targets,
+            vocabulary: vocabulary,
+            maxNew: maxNew,
+            stopIDs: stopIDs,
+            relaxedMargin: relaxedMargin,
+            relaxedMinProb: relaxedMinProb,
+            logitRow: { row in UnsafeBufferPointer(start: p + row * vocabulary, count: vocabulary) }
+        )
     }
 }

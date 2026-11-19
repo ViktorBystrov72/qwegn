@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import QWRope
 @testable import QWFlashNext
 
 // Full-model golden: 4 layers (GDN, full attention, GDN+PLE, full attention), HF Qwen4ExpForCausalLM at small dims.
@@ -51,7 +52,7 @@ final class FNModelGoldenTests: XCTestCase {
                     qProj: w.data(p + "q_proj.weight"), kProj: w.data(p + "k_proj.weight"),
                     vProj: w.data(p + "v_proj.weight"), oProj: w.data(p + "o_proj.weight"),
                     qNorm: w.data(p + "q_norm.weight"), kNorm: w.data(p + "k_norm.weight"),
-                    indexer: indexer, rope: FNRope(rotaryDim: 4, theta: 1e7)))
+                    indexer: indexer, rope: QWRopeCPU(rotaryDim: 4, theta: 1e7)))
             }
             let m = base + "mlp."
             let moe = FNSparseMoE(

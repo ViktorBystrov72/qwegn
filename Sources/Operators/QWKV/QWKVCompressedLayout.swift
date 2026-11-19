@@ -65,10 +65,10 @@ public struct QWKVCompressedLayout: Sendable {
                 let v = abs(input[offset + d])
                 if v > maxAbs { maxAbs = v }
             }
-            let scale = max(maxAbs / 127.0, 1e-8)
+            let scale = max(maxAbs / 127.0, 6.103515625e-5)
             let s16 = Float16(scale)
             scalesOut[h] = s16
-            let invScale = 1.0 / Float(s16)
+            let invScale: Float = Float(s16) > 0.0 ? 1.0 / Float(s16) : 0.0
             for d in 0..<headDim {
                 let scaled = round(input[offset + d] * invScale)
                 let clamped = max(-127.0, min(127.0, scaled))
@@ -109,13 +109,13 @@ public struct QWKVCompressedLayout: Sendable {
                     if v < minVal { minVal = v }
                     if v > maxVal { maxVal = v }
                 }
-                let scale = max((maxVal - minVal) / 15.0, 1e-8)
+                let scale = max((maxVal - minVal) / 15.0, 6.103515625e-5)
                 let s16 = Float16(scale)
                 let m16 = Float16(minVal)
                 scalesOut[gIdx] = s16
                 minsOut[gIdx] = m16
 
-                let invScale = 1.0 / Float(s16)
+                let invScale: Float = Float(s16) > 0.0 ? 1.0 / Float(s16) : 0.0
                 let baseMin = Float(m16)
 
                 for i in 0..<(groupLen / 2) {

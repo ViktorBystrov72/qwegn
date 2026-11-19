@@ -27,7 +27,8 @@ enum QWMoEChain {
                        driver: QWEngineDriver? = nil,
                        cb: (any MTLCommandBuffer)? = nil,
                        skipOut32: Bool = false,
-                       preBridgedF32: (plain: QWTensorValue, rotated: QWTensorValue)? = nil) throws {
+                       preBridgedF32: (plain: QWTensorValue, rotated: QWTensorValue)? = nil,
+                       isVerifyWindow: Bool = false) throws {
         // QW_COLD_TIMING_PROXY=1 (benchmark only): skip SSD staging and read cold ids from the
         // stale cold bank (experts - K slots, so ids stay in bounds). Same bytes and dispatches
         // as an all-resident pack; the output is not meaningful.
@@ -53,7 +54,7 @@ enum QWMoEChain {
                 sharedIntermediate: geometry.sharedExpertIntermediate,
                 normTopK: geometry.normTopKProb,
                 reuseExpertsAcrossTokens: true,
-                moeSpecExpertBudget: driver?.activeMoESpecExpertBudget(rows: rows) ?? 0
+                moeSpecExpertBudget: isVerifyWindow ? (driver?.activeMoESpecExpertBudget(rows: rows) ?? 0) : 0
             )
             let scratch = QWMoEOperator.Scratch(
                 xRot32: s.xRot32, xPlain32: s.xPlain32,
@@ -96,6 +97,9 @@ enum QWMoEChain {
             throw QWEngineDriverError.unsupportedModel(
                 "SSD cold expert streaming does not support Latent-MoE or split-feature routers; keep experts resident")
         }
+        guard let driver else {
+            throw QWEngineDriverError.state("cold expert streaming requires a driver")
+        }
         let H = geometry.hidden
         let I = geometry.moeIntermediate
         let E = geometry.numExperts
@@ -137,7 +141,10 @@ enum QWMoEChain {
             let shScratch0 = naxX16.slice(byteOffset: 0, count: rows * H, dtype: .f16)
             let dnAcc16 = s.dnAcc.slice(byteOffset: 0, count: rows * K * H, dtype: .f16)
 
-            let shAct16 = (rows >= 64 && ISh > 0 && ISh % 64 == 0)
+            let maxShTileWidth = max(H, ISh)
+            let shAct16 = (ISh > 0
+                && naxX16.shape.elementCount >= rows * (H + ISh)
+                && QWMoEOperator.canUseNaxDenseProj(hal: hal, weight: moe.sharedDown, rows: rows, maxTileWidth: maxShTileWidth))
                 ? naxX16.slice(byteOffset: rows * H * 2, count: rows * ISh, dtype: .f16)
                 : nil
             let encodeSharedExpert: (any MTLComputeCommandEncoder) throws -> Void = { targetEnc in
@@ -150,74 +157,72 @@ enum QWMoEChain {
                                                 intermediate: ISh, act16: shAct16)
                     let shScratch = shAct16 ?? shScratch0
                     try QWGemm.encodeDenseProjF32(targetEnc, hal: hal, weight: shDown, x: actSh, y: s.shared,
-                                                  naxX16: shScratch, naxY16: shScratch, maxTileWidth: max(H, ISh),
+                                                  naxX16: shScratch, naxY16: shScratch,
+                                                  maxTileWidth: shAct16 != nil ? maxShTileWidth : 0,
                                                   rows: rows, x16Precast: shAct16)
                 }
             }
 
-            let tilePlan = QWGemm.MoETilePlan(experts: E, pairs: rows * K, gateUpRows: 2 * I, downRows: H)
-            let encodeResidentPass: (inout any MTLComputeCommandEncoder, any MTLCommandBuffer, QWTensorValue) throws -> Void = {
-                resEnc, resCB, ids in
-                try encodeSharedExpert(resEnc)
-                try QWGemm.encodeMoEGroupPairsF32(resEnc, hal: hal, ids: ids, expertOff: expOff,
-                                                  sortedPairIdx: sortedPair, sortedTok: sortedTok,
-                                                  experts: E, totalPairs: rows * K, routes: K,
-                                                  invPerm: invPerm, tileE: tileE, tileR: tileR,
-                                                  tileCount: tileCount, tilePlan: tilePlan)
-                try hal.rotateEncoder(resCB, &resEnc)
-                try QWGemm.encodeMoEGateUpNax(resEnc, hal: hal, xe: x16, bank: moe.gateUp, expertOff: expOff,
-                                              tileE: tileE, tileR: tileR, tileCount: tileCount,
-                                              gu16: gu16, rowsPerExpert: 2 * I, tilePlan: tilePlan,
-                                              sortedTok: sortedTok, coldBank: moe.coldGateUp,
-                                              tileFilter: .residentOnly)
-                try QWGemm.encodeSiluMulSplitF16(resEnc, hal: hal, gu: gu16, outHi: dnHi, outLo: dnHi,
-                                                 rows: rows * K, intermediate: I)
-                try QWGemm.encodeMoENaxSplitF32(resEnc, hal: hal, xHi: dnHi, xLo: dnHi, bank: moe.down,
-                                                expertOff: expOff, tileE: tileE, tileR: tileR,
-                                                tileCount: tileCount, y32: dnAcc16, rowsPerExpert: H,
-                                                tilePlan: tilePlan, coldBank: moe.coldDown,
-                                                tileFilter: .residentOnly)
+            var shEncoded = false
+            let encodeSharedOnce: (any MTLComputeCommandEncoder) throws -> Void = { targetEnc in
+                guard !shEncoded else { return }
+                shEncoded = true
+                try encodeSharedExpert(targetEnc)
             }
-            let encodeColdGateUp: (any MTLComputeCommandEncoder) throws -> Void = { guEnc in
-                try QWGemm.encodeMoEGateUpNax(guEnc, hal: hal, xe: x16, bank: moe.gateUp, expertOff: expOff,
-                                              tileE: tileE, tileR: tileR, tileCount: tileCount,
-                                              gu16: gu16, rowsPerExpert: 2 * I, tilePlan: tilePlan,
-                                              sortedTok: sortedTok, coldBank: moe.coldGateUp,
-                                              tileFilter: .coldOnly)
+            let sliceSpan: (Int, Int) -> (
+                spanRows: Int, spanPairs: Int, plan: QWGemm.MoETilePlan,
+                x: QWTensorValue, ids: QWTensorValue, inv: QWTensorValue,
+                gu: QWTensorValue, dnHi: QWTensorValue, dnAcc: QWTensorValue
+            ) = { sRow, eRow in
+                let sr = eRow - sRow
+                let sp = sr * K
+                return (
+                    sr, sp,
+                    QWGemm.MoETilePlan(experts: E, pairs: sp, gateUpRows: 2 * I, downRows: H),
+                    x16.slice(byteOffset: sRow * H * 2, count: sr * H, dtype: .f16),
+                    s.idx.slice(byteOffset: sRow * K * 4, count: sp),
+                    invPerm.slice(byteOffset: 0, count: sp),
+                    gu16.slice(byteOffset: 0, count: sp * 2 * I, dtype: .f16),
+                    dnHi.slice(byteOffset: 0, count: sp * I, dtype: .f16),
+                    s.dnAcc.slice(byteOffset: 0, count: sp * H, dtype: .f16)
+                )
             }
 
-            var stagedCount = 0
-            var overlappedResident = false
-            var overlappedColdGateUp = false
-            if streamer != nil, let driver, driver.canStageColdExpertsMapped(moe: moe) {
-                stagedCount = try driver.stageColdExpertsMapped(
-                    moe: moe, s: s, rows: rows, resident: encodeResidentPass, coldGateUp: encodeColdGateUp)
-                overlappedResident = true
-                overlappedColdGateUp = true
-                if let active = driver.activeEnc { enc = active }
-            } else if streamer != nil, let driver {
-                let res = try driver.stageColdExpertsSpan(
-                    moe: moe, s: s, startRow: 0, totalRows: rows,
-                    onBeforeIO: { resEnc, resCB, _ in
-                        overlappedResident = true
-                        try encodeResidentPass(&resEnc, resCB, s.idx)
+            if driver.canStageColdExpertsMapped(moe: moe, isVerifyWindow: isVerifyWindow) {
+                let tilePlan = QWGemm.MoETilePlan(experts: E, pairs: rows * K, gateUpRows: 2 * I, downRows: H)
+                let stagedCount = try driver.stageColdExpertsMapped(
+                    moe: moe, s: s, rows: rows,
+                    resident: { resEnc, resCB, ids in
+                        try encodeSharedOnce(resEnc)
+                        try QWGemm.encodeMoEGroupPairsF32(resEnc, hal: hal, ids: ids, expertOff: expOff,
+                                                          sortedPairIdx: sortedPair, sortedTok: sortedTok,
+                                                          experts: E, totalPairs: rows * K, routes: K,
+                                                          invPerm: invPerm, tileE: tileE, tileR: tileR,
+                                                          tileCount: tileCount, tilePlan: tilePlan)
+                        try hal.rotateEncoder(resCB, &resEnc)
+                        try QWGemm.encodeMoEGateUpNax(resEnc, hal: hal, xe: x16, bank: moe.gateUp, expertOff: expOff,
+                                                      tileE: tileE, tileR: tileR, tileCount: tileCount,
+                                                      gu16: gu16, rowsPerExpert: 2 * I, tilePlan: tilePlan,
+                                                      sortedTok: sortedTok, coldBank: moe.coldGateUp,
+                                                      tileFilter: .residentOnly)
+                        try QWGemm.encodeSiluMulSplitF16(resEnc, hal: hal, gu: gu16, outHi: dnHi, outLo: dnHi,
+                                                         rows: rows * K, intermediate: I)
+                        try QWGemm.encodeMoENaxSplitF32(resEnc, hal: hal, xHi: dnHi, xLo: dnHi, bank: moe.down,
+                                                        expertOff: expOff, tileE: tileE, tileR: tileR,
+                                                        tileCount: tileCount, y32: dnAcc16, rowsPerExpert: H,
+                                                        tilePlan: tilePlan, coldBank: moe.coldDown,
+                                                        tileFilter: .residentOnly)
                     },
-                    onAfterGateUpIO: { guEnc, _ in
-                        overlappedColdGateUp = true
-                        try encodeColdGateUp(guEnc)
+                    coldGateUp: { guEnc in
+                        try QWGemm.encodeMoEGateUpNax(guEnc, hal: hal, xe: x16, bank: moe.gateUp, expertOff: expOff,
+                                                      tileE: tileE, tileR: tileR, tileCount: tileCount,
+                                                      gu16: gu16, rowsPerExpert: 2 * I, tilePlan: tilePlan,
+                                                      sortedTok: sortedTok, coldBank: moe.coldGateUp,
+                                                      tileFilter: .coldOnly)
                     }
                 )
-                stagedCount = res.stagedCount
                 if let active = driver.activeEnc { enc = active }
-            }
-
-            if overlappedResident {
-                // No staged expert means the resident pass already covered every pair.
-                let hasCold = stagedCount > 0
-                if hasCold && !overlappedColdGateUp {
-                    try encodeColdGateUp(enc)
-                }
-                if hasCold {
+                if stagedCount > 0 {
                     try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: gu16, outHi: dnHi, outLo: dnHi,
                                                      rows: rows * K, intermediate: I)
                     try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: dnHi, xLo: dnHi, bank: moe.down,
@@ -226,45 +231,121 @@ enum QWMoEChain {
                                                     tilePlan: tilePlan, coldBank: moe.coldDown,
                                                     tileFilter: .coldOnly)
                 }
-            } else {
-                try encodeSharedExpert(enc)
-                try QWGemm.encodeMoEGroupPairsF32(enc, hal: hal, ids: s.idx, expertOff: expOff,
-                                                  sortedPairIdx: sortedPair, sortedTok: sortedTok,
-                                                  experts: E, totalPairs: rows * K, routes: K,
-                                                  invPerm: invPerm, tileE: tileE, tileR: tileR,
-                                                  tileCount: tileCount, tilePlan: tilePlan)
-                if let driver {
-                    try driver.rotateActiveEncoder(&enc)
-                } else if let cb {
-                    try hal.rotateEncoder(cb, &enc)
+                try QWGemm.encodeMoEDownReduceCombineF32(enc, hal: hal, dnAcc: dnAcc16, invPerm: invPerm,
+                                                         weights: s.wts, shared: s.shared, gate: s.gate,
+                                                         out: dn32, hidden: H, routes: K, tokens: rows,
+                                                         out16: dn16, skipOut32: skipOut32)
+                if stagedCount > 0 {
+                    try driver.unloadColdExpertsIfNeeded(moe: moe, stagedCount: stagedCount)
+                    if let active = driver.activeEnc { enc = active }
                 }
-                try QWGemm.encodeMoEGateUpNax(enc, hal: hal, xe: x16, bank: moe.gateUp, expertOff: expOff,
-                                              tileE: tileE, tileR: tileR, tileCount: tileCount,
-                                              gu16: gu16, rowsPerExpert: 2 * I, tilePlan: tilePlan,
-                                              sortedTok: sortedTok, coldBank: moe.coldGateUp)
-                try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: gu16, outHi: dnHi, outLo: dnHi,
-                                                 rows: rows * K, intermediate: I)
-                try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: dnHi, xLo: dnHi, bank: moe.down,
-                                                expertOff: expOff, tileE: tileE, tileR: tileR,
-                                                tileCount: tileCount, y32: dnAcc16, rowsPerExpert: H,
-                                                tilePlan: tilePlan, coldBank: moe.coldDown)
-            }
-
-            try QWGemm.encodeMoEDownReduceCombineF32(enc, hal: hal, dnAcc: dnAcc16, invPerm: invPerm,
-                                                     weights: s.wts, shared: s.shared, gate: s.gate,
-                                                     out: dn32, hidden: H, routes: K, tokens: rows,
-                                                     out16: dn16, skipOut32: skipOut32)
-            if stagedCount > 0, let driver {
-                try driver.unloadColdExpertsIfNeeded(moe: moe, stagedCount: stagedCount)
-                if let active = driver.activeEnc { enc = active }
+            } else {
+                var startRow = 0
+                while startRow < rows {
+                    var overlappedResident = false
+                    var overlappedColdGateUp = false
+                    let res = try driver.stageColdExpertsSpan(
+                        moe: moe, s: s, startRow: startRow, totalRows: rows,
+                        isVerifyWindow: isVerifyWindow,
+                        onBeforeIO: { resEnc, resCB, spanEnd in
+                            overlappedResident = true
+                            let sp = sliceSpan(startRow, spanEnd)
+                            try encodeSharedOnce(resEnc)
+                            try QWGemm.encodeMoEGroupPairsF32(resEnc, hal: hal, ids: sp.ids, expertOff: expOff,
+                                                              sortedPairIdx: sortedPair, sortedTok: sortedTok,
+                                                              experts: E, totalPairs: sp.spanPairs, routes: K,
+                                                              invPerm: sp.inv, tileE: tileE, tileR: tileR,
+                                                              tileCount: tileCount, tilePlan: sp.plan)
+                            try hal.rotateEncoder(resCB, &resEnc)
+                            try QWGemm.encodeMoEGateUpNax(resEnc, hal: hal, xe: sp.x, bank: moe.gateUp, expertOff: expOff,
+                                                          tileE: tileE, tileR: tileR, tileCount: tileCount,
+                                                          gu16: sp.gu, rowsPerExpert: 2 * I, tilePlan: sp.plan,
+                                                          sortedTok: sortedTok, coldBank: moe.coldGateUp,
+                                                          tileFilter: .residentOnly)
+                            try QWGemm.encodeSiluMulSplitF16(resEnc, hal: hal, gu: sp.gu, outHi: sp.dnHi, outLo: sp.dnHi,
+                                                             rows: sp.spanPairs, intermediate: I)
+                            try QWGemm.encodeMoENaxSplitF32(resEnc, hal: hal, xHi: sp.dnHi, xLo: sp.dnHi, bank: moe.down,
+                                                            expertOff: expOff, tileE: tileE, tileR: tileR,
+                                                            tileCount: tileCount, y32: sp.dnAcc, rowsPerExpert: H,
+                                                            tilePlan: sp.plan, coldBank: moe.coldDown,
+                                                            tileFilter: .residentOnly)
+                        },
+                        onAfterGateUpIO: { guEnc, spanEnd in
+                            overlappedColdGateUp = true
+                            let sp = sliceSpan(startRow, spanEnd)
+                            try QWGemm.encodeMoEGateUpNax(guEnc, hal: hal, xe: sp.x, bank: moe.gateUp, expertOff: expOff,
+                                                          tileE: tileE, tileR: tileR, tileCount: tileCount,
+                                                          gu16: sp.gu, rowsPerExpert: 2 * I, tilePlan: sp.plan,
+                                                          sortedTok: sortedTok, coldBank: moe.coldGateUp,
+                                                          tileFilter: .coldOnly)
+                        }
+                    )
+                    if let active = driver.activeEnc { enc = active }
+                    let nextRow = res.nextRow
+                    let stagedCount = res.stagedCount
+                    guard nextRow > startRow else {
+                        throw QWEngineDriverError.state("cold expert span made no forward progress at row \(startRow)")
+                    }
+                    let sp = sliceSpan(startRow, nextRow)
+                    if overlappedResident {
+                        if stagedCount > 0 {
+                            if !overlappedColdGateUp {
+                                try QWGemm.encodeMoEGateUpNax(enc, hal: hal, xe: sp.x, bank: moe.gateUp, expertOff: expOff,
+                                                              tileE: tileE, tileR: tileR, tileCount: tileCount,
+                                                              gu16: sp.gu, rowsPerExpert: 2 * I, tilePlan: sp.plan,
+                                                              sortedTok: sortedTok, coldBank: moe.coldGateUp,
+                                                              tileFilter: .coldOnly)
+                            }
+                            try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: sp.gu, outHi: sp.dnHi, outLo: sp.dnHi,
+                                                             rows: sp.spanPairs, intermediate: I)
+                            try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: sp.dnHi, xLo: sp.dnHi, bank: moe.down,
+                                                            expertOff: expOff, tileE: tileE, tileR: tileR,
+                                                            tileCount: tileCount, y32: sp.dnAcc, rowsPerExpert: H,
+                                                            tilePlan: sp.plan, coldBank: moe.coldDown,
+                                                            tileFilter: .coldOnly)
+                        }
+                    } else {
+                        try encodeSharedOnce(enc)
+                        try QWGemm.encodeMoEGroupPairsF32(enc, hal: hal, ids: sp.ids, expertOff: expOff,
+                                                          sortedPairIdx: sortedPair, sortedTok: sortedTok,
+                                                          experts: E, totalPairs: sp.spanPairs, routes: K,
+                                                          invPerm: sp.inv, tileE: tileE, tileR: tileR,
+                                                          tileCount: tileCount, tilePlan: sp.plan)
+                        try driver.rotateActiveEncoder(&enc)
+                        try QWGemm.encodeMoEGateUpNax(enc, hal: hal, xe: sp.x, bank: moe.gateUp, expertOff: expOff,
+                                                      tileE: tileE, tileR: tileR, tileCount: tileCount,
+                                                      gu16: sp.gu, rowsPerExpert: 2 * I, tilePlan: sp.plan,
+                                                      sortedTok: sortedTok, coldBank: moe.coldGateUp)
+                        try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: sp.gu, outHi: sp.dnHi, outLo: sp.dnHi,
+                                                         rows: sp.spanPairs, intermediate: I)
+                        try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: sp.dnHi, xLo: sp.dnHi, bank: moe.down,
+                                                        expertOff: expOff, tileE: tileE, tileR: tileR,
+                                                        tileCount: tileCount, y32: sp.dnAcc, rowsPerExpert: H,
+                                                        tilePlan: sp.plan, coldBank: moe.coldDown)
+                    }
+                    let wtsSpan = s.wts.slice(byteOffset: startRow * K * 4, count: sp.spanPairs, dtype: .f32)
+                    let shSpan = s.shared.slice(byteOffset: startRow * H * 4, count: sp.spanRows * H, dtype: .f32)
+                    let gateSpan = s.gate.slice(byteOffset: startRow * 4, count: sp.spanRows, dtype: .f32)
+                    let dn32Span = dn32.slice(byteOffset: startRow * H * 4, count: sp.spanRows * H, dtype: .f32)
+                    let dn16Span = dn16.slice(byteOffset: startRow * H * 2, count: sp.spanRows * H, dtype: .f16)
+                    try QWGemm.encodeMoEDownReduceCombineF32(enc, hal: hal, dnAcc: sp.dnAcc, invPerm: sp.inv,
+                                                             weights: wtsSpan, shared: shSpan, gate: gateSpan,
+                                                             out: dn32Span, hidden: H, routes: K, tokens: sp.spanRows,
+                                                             out16: dn16Span, skipOut32: skipOut32)
+                    if stagedCount > 0 {
+                        try driver.unloadColdExpertsIfNeeded(moe: moe, stagedCount: stagedCount)
+                        if let active = driver.activeEnc { enc = active }
+                    }
+                    startRow = nextRow
+                }
             }
         } else {
             // Rank-1 GEMV decode / cold-streaming path
-            let fuseSh = ISh > 0 && ISh <= 4096 && moe.sharedGateUp != nil && s.guSh32 != nil && s.actSh32 != nil
+            let fuseSh = ISh > 0 && ISh <= 4096 && (ISh % 8 == 0) && moe.sharedGateUp != nil && s.guSh32 != nil && s.actSh32 != nil
             if let shGU = moe.sharedGateUp, let guSh = s.guSh32, ISh > 0 {
                 try QWGemm.encodeHQ4F32V4(enc, hal: hal, weight: shGU, x: s.xRot32, y: guSh, rows: rows)
             }
-            let moeSpecBudget = driver?.activeMoESpecExpertBudget(rows: rows) ?? 0
+            let moeSpecBudget = isVerifyWindow ? driver.activeMoESpecExpertBudget(rows: rows) : 0
             try QWGemm.encodeFnMoeRoute(enc, hal: hal, logits: s.logits, idx: s.idx, wts: s.wts,
                                         rows: rows, experts: E, topK: K,
                                         normTopK: geometry.normTopKProb,
@@ -286,8 +367,7 @@ enum QWMoEChain {
                 }
             }
             let fuseRoutedGU = I > 0 && (I % 32 == 0)
-            if let driver, driver.coldEventsUsable(moe, rows: rows) {
-                let routeOutput = streamer != nil
+            if driver.coldEventsUsable(moe, rows: rows, isVerifyWindow: isVerifyWindow) {
                 let xSlice = s.xRot32.slice(byteOffset: 0, count: rows * H, dtype: .f32)
                 let actSlice = s.act32.slice(byteOffset: 0, count: rows * K * I, dtype: .f32)
                 let guSlice = s.gu32.slice(byteOffset: 0, count: rows * K * 2 * I, dtype: .f32)
@@ -295,8 +375,6 @@ enum QWMoEChain {
                 let shSlice = s.shared.slice(byteOffset: 0, count: rows * H, dtype: .f32)
                 let gateSlice = s.gate.slice(byteOffset: 0, count: rows, dtype: .f32)
                 let dn32Slice = s.dnAcc.slice(byteOffset: 0, count: rows * K * H, dtype: .f32)
-                let downOut = routeOutput ? dn32Slice : dn32.slice(byteOffset: 0, count: rows * H, dtype: .f32)
-                let downOut16 = routeOutput ? nil : dn16.slice(byteOffset: 0, count: rows * H, dtype: .f16)
                 let encodeExperts: (any MTLComputeCommandEncoder, QWTensorValue, QWGemm.MoETileFilter) throws -> Void = {
                     targetEnc, ids, filter in
                     try QWGemm.encodeMoEGateUpF32R1(targetEnc, hal: hal, x: xSlice, bank: moe.gateUp,
@@ -310,13 +388,15 @@ enum QWMoEChain {
                     }
                     try QWGemm.encodeMoEDownSharedCombineF32(targetEnc, hal: hal, x: actSlice, bank: moe.down,
                                                             rowsPerRoute: H, routes: K, weights: wtsSlice,
-                                                            shared: shSlice, gate: gateSlice, out: downOut,
-                                                            ids: ids, tokens: rows, out16: downOut16,
+                                                            shared: shSlice, gate: gateSlice, out: dn32Slice,
+                                                            ids: ids, tokens: rows, out16: nil,
                                                             coldBank: moe.coldDown, tileFilter: filter,
-                                                            routeOutput: routeOutput)
+                                                            routeOutput: true)
                 }
                 // Resident experts run on GPU-mapped slots while the host stages the misses.
-                let overlapped = try driver.stageColdExpertsEvent(moe: moe, s: s, rows: rows) { resEnc, resIds in
+                let overlapped = try driver.stageColdExpertsEvent(
+                    moe: moe, s: s, rows: rows, isVerifyWindow: isVerifyWindow
+                ) { resEnc, resIds in
                     try encodeSharedDown(resEnc)
                     try encodeExperts(resEnc, resIds, .residentOnly)
                 }
@@ -324,13 +404,14 @@ enum QWMoEChain {
                 try encodeSharedDown(enc)
                 try encodeExperts(enc, s.idx.slice(byteOffset: 0, count: rows * K), overlapped ? .coldOnly : .all)
                 try driver.encodeEventPromotions(moe: moe)
-            } else if streamer != nil, let driver {
+            } else {
                 var startRow = 0
                 while startRow < rows {
                     var overlappedSpan = false
                     var overlappedColdGateUp = false
                     let (nextRow, stagedCount) = try driver.stageColdExpertsSpan(
                         moe: moe, s: s, startRow: startRow, totalRows: rows,
+                        isVerifyWindow: isVerifyWindow,
                         onBeforeIO: { resEnc, _, spanEnd in
                             overlappedSpan = true
                             try encodeSharedDown(resEnc)
@@ -379,6 +460,9 @@ enum QWMoEChain {
                         }
                     )
                     if let active = driver.activeEnc { enc = active }
+                    guard nextRow > startRow else {
+                        throw QWEngineDriverError.state("cold expert span made no forward progress at row \(startRow)")
+                    }
                     if !shDownEncoded {
                         try encodeSharedDown(enc)
                     }
@@ -420,40 +504,12 @@ enum QWMoEChain {
                     }
                     startRow = nextRow
                 }
-            } else {
-                let draftFilter: QWGemm.MoETileFilter = streamer != nil ? .residentOnly : .all
-                let routeOutput = streamer != nil
-                driver?.profileStage("moe.shared_down")
-                if let a = driver?.activeEnc { enc = a }
-                try encodeSharedDown(enc)
-                driver?.profileStage("moe.experts_gate_up")
-                if let a = driver?.activeEnc { enc = a }
-                try QWGemm.encodeMoEGateUpF32R1(enc, hal: hal, x: s.xRot32, bank: moe.gateUp,
-                                               ids: s.idx, out: fuseRoutedGU ? s.act32 : s.gu32,
-                                               rowsPerExpert: 2 * I, routes: K, tokens: rows,
-                                               fuseSiluFwht: fuseRoutedGU, coldBank: moe.coldGateUp,
-                                               tileFilter: draftFilter)
-                if !fuseRoutedGU {
-                    try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: s.gu32, act: s.act32,
-                                                rows: rows * K, intermediate: I)
-                }
-                driver?.profileStage("moe.experts_down")
-                if let a = driver?.activeEnc { enc = a }
-                try QWGemm.encodeMoEDownSharedCombineF32(enc, hal: hal, x: s.act32, bank: moe.down,
-                                                        rowsPerRoute: H, routes: K, weights: s.wts,
-                                                        shared: s.shared, gate: s.gate,
-                                                        out: routeOutput ? s.dnAcc : dn32,
-                                                        ids: s.idx, tokens: rows,
-                                                        out16: routeOutput ? nil : dn16, coldBank: moe.coldDown,
-                                                        tileFilter: draftFilter, routeOutput: routeOutput)
             }
-            if streamer != nil {
-                if let active = driver?.activeEnc { enc = active }
-                try QWGemm.encodeMoEDownReduceCombineF32(enc, hal: hal, dnAcc: s.dnAcc, invPerm: nil,
-                                                         weights: s.wts, shared: s.shared, gate: s.gate,
-                                                         out: dn32, hidden: H, routes: K, tokens: rows,
-                                                         out16: dn16, skipOut32: skipOut32)
-            }
+            if let active = driver.activeEnc { enc = active }
+            try QWGemm.encodeMoEDownReduceCombineF32(enc, hal: hal, dnAcc: s.dnAcc, invPerm: nil,
+                                                     weights: s.wts, shared: s.shared, gate: s.gate,
+                                                     out: dn32, hidden: H, routes: K, tokens: rows,
+                                                     out16: dn16, skipOut32: skipOut32)
         }
     }
 }

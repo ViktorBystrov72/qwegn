@@ -95,7 +95,7 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
     const uint prefixBlks = p1.x, localBlks = p1.y, remoteBlks = p1.z, listStride = p1.w;
     const uint curBlk = pos / blockSize;
     const uint localStartBlk = (curBlk + 1u > localBlks) ? (curBlk + 1u - localBlks) : 0u;
-    const uint slotBase = ((size_t)qi * kvHeads + kvh) * listStride;
+    const size_t slotBase = ((size_t)qi * kvHeads + kvh) * listStride;
 
     if (curBlk < prefixBlks + localBlks + remoteBlks || localStartBlk <= prefixBlks + remoteBlks) {
         const uint totalBlks = min(curBlk + 1u, listStride);
@@ -112,11 +112,12 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint sg = tid >> 5u, lane = tid & 31u;
+    const uint rKeep = min(remoteBlks, 32u);
     float topScores[32];
     int   topIds[32];
-    for (uint r = 0u; r < remoteBlks; r++) { topScores[r] = -INFINITY; topIds[r] = -1; }
+    for (uint r = 0u; r < rKeep; r++) { topScores[r] = -1e30f; topIds[r] = -1; }
     uint worstSlot = 0u;
-    float worstScore = -INFINITY;
+    float worstScore = -1e30f;
 
     if (headDim == 128u) {
         const uint hp = lane >> 4u, d8 = (lane & 15u) << 3u;
@@ -124,12 +125,12 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
         const float4 qHi = *(threadgroup const float4*)(sharedQ + d8 + 4u);
         for (uint bBase = prefixBlks; bBase < localStartBlk; bBase += 8u) {
             const uint b = bBase + sg;
-            float tokMax = -INFINITY;
+            float tokMax = -1e30f;
             if (b < localStartBlk) {
                 const uint tStart = b * blockSize;
                 for (uint off = 0u; off < blockSize; off += 2u) {
                     const uint kOff = off + hp;
-                    float dotv = -INFINITY;
+                    float dotv = -1e30f;
                     if (kOff < blockSize) {
                         const uint4 raw = *(const device uint4*)(idxKCache + (size_t)(tStart + kOff) * 128u + d8);
                         const half4 kh0 = as_type<half4>(raw.xy), kh1 = as_type<half4>(raw.zw);
@@ -147,14 +148,14 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
             }
             if (lane == 0u) sgMax[sg] = tokMax;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0u) {
+            if (tid == 0u && rKeep > 0u) {
                 for (uint s = 0u; s < 8u && bBase + s < localStartBlk; s++) {
                     const float bScore = sgMax[s];
                     if (topIds[worstSlot] < 0 || bScore > worstScore) {
                         topScores[worstSlot] = bScore;
                         topIds[worstSlot] = int(bBase + s);
                         uint ws = 0u;
-                        for (uint i = 1u; i < remoteBlks; i++) {
+                        for (uint i = 1u; i < rKeep; i++) {
                             if (topIds[ws] >= 0 && (topIds[i] < 0 || topScores[i] < topScores[ws] || (topScores[i] == topScores[ws] && topIds[i] > topIds[ws]))) {
                                 ws = i;
                             }
@@ -178,14 +179,14 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
             }
             if (lane == 0u) sgMax[sg] = tokMax;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0u) {
+            if (tid == 0u && rKeep > 0u) {
                 float bScore = sgMax[0];
                 for (uint i = 1u; i < 8u; i++) bScore = max(bScore, sgMax[i]);
                 if (topIds[worstSlot] < 0 || bScore > worstScore) {
                     topScores[worstSlot] = bScore;
                     topIds[worstSlot] = int(b);
                     uint ws = 0u;
-                    for (uint i = 1u; i < remoteBlks; i++) {
+                    for (uint i = 1u; i < rKeep; i++) {
                         if (topIds[ws] >= 0 && (topIds[i] < 0 || topScores[i] < topScores[ws] || (topScores[i] == topScores[ws] && topIds[i] > topIds[ws]))) {
                             ws = i;
                         }
@@ -199,8 +200,8 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
     }
 
     if (tid == 0u) {
-        for (uint i = 0u; i < remoteBlks; i++) {
-            for (uint j = i + 1u; j < remoteBlks; j++) {
+        for (uint i = 0u; i < rKeep; i++) {
+            for (uint j = i + 1u; j < rKeep; j++) {
                 if (topIds[j] >= 0 && (topIds[i] < 0 || topIds[j] < topIds[i])) {
                     int tmp = topIds[i]; topIds[i] = topIds[j]; topIds[j] = tmp;
                 }
@@ -209,7 +210,7 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
         uint outIdx = 0u;
         const uint prefixEnd = min(prefixBlks, localStartBlk);
         for (uint p = 0u; p < prefixEnd && outIdx < listStride; p++) blockList[slotBase + outIdx++] = int(p);
-        for (uint r = 0u; r < remoteBlks && outIdx < listStride; r++) {
+        for (uint r = 0u; r < rKeep && outIdx < listStride; r++) {
             if (topIds[r] >= 0) blockList[slotBase + outIdx++] = topIds[r];
         }
         for (uint l = localStartBlk; l <= curBlk && outIdx < listStride; l++) blockList[slotBase + outIdx++] = int(l);
@@ -237,7 +238,7 @@ static inline void qwg_mbsa_attn_body(const device half* qgate, device half* kpo
         for (uint i = 0; i < 8u; i++) gf[i] = 1.0f / (1.0f + metal::exp(-float(grow[d0 + i])));
     }
 
-    const uint slotBase = ((size_t)qi * QW_KV_HEADS + kvh) * listStride;
+    const size_t slotBase = ((size_t)qi * QW_KV_HEADS + kvh) * listStride;
     const uint nBlks = (uint)blockCount[(size_t)qi * QW_KV_HEADS + kvh];
     const uint kvRow = QW_FC_KV_ROW, kvPgel = QW_FC_KV_PGEL;
     float m = -1e30f, lsum = 0.0f;
@@ -356,7 +357,7 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
         sIsDense[tid] = qDenseSelf ? 1 : 0;
         sCurBlk[tid] = qCurBlkSelf;
         sLocalStart[tid] = qLocalStartSelf;
-        sBlkMax[tid] = -INFINITY;
+        sBlkMax[tid] = -1e30f;
     }
     for (uint e = tid; e < 32u * kPadded; e += 256u) {
         const uint q = e / kPadded;
@@ -371,9 +372,9 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
 
     float topScores[32];
     int   topIds[32];
-    for (uint r = 0u; r < rKeep; ++r) { topScores[r] = -INFINITY; topIds[r] = -1; }
+    for (uint r = 0u; r < rKeep; ++r) { topScores[r] = -1e30f; topIds[r] = -1; }
     uint worstSlot = 0u;
-    float worstScore = -INFINITY;
+    float worstScore = -1e30f;
 
     if (anySparse && maxLocalStart > prefixBlks && rKeep > 0u) {
         const uint sgRow = (sg >> 1u) * 8u;
@@ -417,7 +418,7 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
                 simdgroup_store(acc1, &sScores[sgRow][sgCol + 8u], 34, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                float subMax = -INFINITY;
+                float subMax = -1e30f;
                 if (redRow < R) {
                     const uint c0 = lane8 * 4u;
                     for (uint c = 0u; c < 4u; ++c) {
@@ -459,7 +460,7 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint slotBase = ((size_t)tileIdx * kvHeads + kvh) * tileListStride;
+    const size_t slotBase = ((size_t)tileIdx * kvHeads + kvh) * tileListStride;
     uint outCount = 0u;
     for (uint winBase = 0u; winBase <= maxCurBlk; winBase += 512u) {
         const uint winLen = min(512u, maxCurBlk + 1u - winBase);

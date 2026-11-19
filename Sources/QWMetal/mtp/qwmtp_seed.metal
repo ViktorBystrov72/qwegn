@@ -43,12 +43,14 @@ kernel void qwg_mtp_seed_kv(
         for (uint i = 1u; i < 8u; i++) { km = fmax(km, sK[head][i]); vm = fmax(vm, sV[head][i]); }
         const float ks = float(half(fmax(km / 127.0f, 1e-8f)));
         const float vs = float(half(fmax(vm / 127.0f, 1e-8f)));
+        const float invKs = (ks > 0.0f) ? (1.0f / ks) : 0.0f;
+        const float invVs = (vs > 0.0f) ? (1.0f / vs) : 0.0f;
         device char* kd = (device char*)kPool + (uint64_t)kTable[page] * Q8_PAGE
                           + (uint64_t)slot * 1024u + (uint64_t)head * 256u + dim;
         device char* vd = (device char*)vPool + (uint64_t)vTable[page] * Q8_PAGE
                           + (uint64_t)slot * 1024u + (uint64_t)head * 256u + dim;
-        *kd = (char)(int)clamp(round(float(kx) * (1.0f / ks)), -127.0f, 127.0f);
-        *vd = (char)(int)clamp(round(float(vx) * (1.0f / vs)), -127.0f, 127.0f);
+        *kd = (char)(int)clamp(round(float(kx) * invKs), -127.0f, 127.0f);
+        *vd = (char)(int)clamp(round(float(vx) * invVs), -127.0f, 127.0f);
         if (dim == 0u) {   // one scale word per (slot, head)
             *(device half*)((device char*)kPool + (uint64_t)kTable[page] * Q8_PAGE
                             + 262144ull + (uint64_t)slot * 8u + (uint64_t)head * 2u) = half(ks);
@@ -80,8 +82,10 @@ kernel void qwg_mtp_seed_kv(
     const float kmn = float(half(kmin));
     const float vsc = float(half(fmax((vmax - vmin) / 15.0f, 1e-8f)));
     const float vmn = float(half(vmin));
-    const float knib = clamp(round((float(kx) - kmn) * (1.0f / ksc)), 0.0f, 15.0f);
-    const float vnib = clamp(round((float(vx) - vmn) * (1.0f / vsc)), 0.0f, 15.0f);
+    const float invKsc = (ksc > 0.0f) ? (1.0f / ksc) : 0.0f;
+    const float invVsc = (vsc > 0.0f) ? (1.0f / vsc) : 0.0f;
+    const float knib = clamp(round((float(kx) - kmn) * invKsc), 0.0f, 15.0f);
+    const float vnib = clamp(round((float(vx) - vmn) * invVsc), 0.0f, 15.0f);
     // Odd dim borrows the EVEN neighbour's nibble (same aligned simdgroup:
     // dim parity == lane parity within the head). Even lanes write the byte.
     const uint dInGrp = dim & 127u;

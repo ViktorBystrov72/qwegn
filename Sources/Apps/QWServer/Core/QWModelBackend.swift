@@ -148,6 +148,12 @@ public protocol QWModelBackend: Sendable {
     ) throws -> Int
     func mountStandalonePrefixCache(from fileURL: URL) throws -> (tokens: [Int], byteCount: Int)
     func unmountSharedBasePrefixes()
+    func computePromptLogprobs(
+        promptTokens: [Int],
+        topLogprobsCount: Int,
+        sampling: QWSamplingParameters,
+        shouldStop: (@Sendable () -> Bool)?
+    ) throws -> [QWTokenLogprob]?
 }
 
 /// The builder that makes a `QWModelBackend` for a module.
@@ -165,6 +171,14 @@ extension QWModelBackend {
         ([], 0)
     }
     public func unmountSharedBasePrefixes() {}
+    public func computePromptLogprobs(
+        promptTokens: [Int],
+        topLogprobsCount: Int,
+        sampling: QWSamplingParameters,
+        shouldStop: (@Sendable () -> Bool)?
+    ) throws -> [QWTokenLogprob]? {
+        nil
+    }
 }
 
 public typealias QWModelBackendBuilder = @Sendable (
@@ -385,7 +399,7 @@ public struct QWUnifiedModelBackend: QWModelBackend {
         }
         let clock = ContinuousClock()
         let vt0 = clock.now
-        let eager = loadVision || ProcessInfo.processInfo.environment["QW_VISION_EAGER"] == "1"
+        let eager = loadVision
         do {
             let vb = try QWVisionOnDemandBackend(
                 modelPath: packPath,
@@ -473,6 +487,22 @@ public struct QWUnifiedModelBackend: QWModelBackend {
 
     public func unmountSharedBasePrefixes() {
         engine.unmountSharedBasePrefixes()
+    }
+
+    public func computePromptLogprobs(
+        promptTokens: [Int],
+        topLogprobsCount: Int,
+        sampling: QWSamplingParameters,
+        shouldStop: (@Sendable () -> Bool)?
+    ) throws -> [QWTokenLogprob]? {
+        guard let unified = engine as? QWEngine else { return nil }
+        let samplerConfig = QWSamplerConfig(sampling, vocabulary: descriptor.vocab)
+        return try unified.computePromptLogprobs(
+            promptTokens: promptTokens,
+            sampling: samplerConfig,
+            topLogprobsCount: topLogprobsCount,
+            shouldStop: shouldStop
+        )
     }
 }
 

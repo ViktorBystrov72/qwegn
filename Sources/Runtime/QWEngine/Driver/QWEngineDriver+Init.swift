@@ -106,22 +106,7 @@ extension QWEngineDriver {
     }
 
     func flushPendingColdUnloads() {
-        guard !pendingColdUnloads.isEmpty else { return }
-        var maxByPtr: [UnsafeMutableRawPointer: (streamer: ColdExpertStreamer, maxCount: Int)] = [:]
-        for item in pendingColdUnloads {
-            let key = item.streamer.guBasePtr
-            if let cur = maxByPtr[key] {
-                if item.stagedCount > cur.maxCount {
-                    maxByPtr[key] = (item.streamer, item.stagedCount)
-                }
-            } else {
-                maxByPtr[key] = (item.streamer, item.stagedCount)
-            }
-        }
-        for (_, entry) in maxByPtr {
-            entry.streamer.unload(stagedCount: entry.maxCount)
-        }
-        pendingColdUnloads.removeAll(keepingCapacity: true)
+        commandFrame.flushPendingColdUnloads()
     }
 
     static func prepareContainersAndGeometry(
@@ -168,13 +153,12 @@ extension QWEngineDriver {
         let choice = try Self.weightFormatChoice(for: root, quantization: rawGeometry.descriptor.quantization,
                                                  geometry: rawGeometry, mtpDrafts: mtpWeightDrafts, pack: pack)
         let prelimHal = try QWHal(geometry: rawGeometry, weightBasis: choice.format.basis)
-        let clampedChunk = max(32, min(QWPrefillLimits.maxRows, (prefillChunkSize / 32) * 32))
-        let (geometry, plannedChunk) = (explicitResE != nil || rawGeometry.numExperts == 0)
-            ? (rawGeometry, clampedChunk)
-            : Self.planResidencyAndChunk(
-                raw: rawGeometry, cfg: cfg, hal: prelimHal, format: choice.format, tuning: tuning,
-                osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize, maxTokens: maxTokens,
-                ropeRows: ropeRows, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts, kvMode: kvMode)
+        let allowExpertReduction = (explicitResE == nil && rawGeometry.numExperts > 0)
+        let (geometry, plannedChunk) = try Self.planResidencyAndChunk(
+            raw: rawGeometry, cfg: cfg, hal: prelimHal, format: choice.format, tuning: tuning,
+            osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize, maxTokens: maxTokens,
+            ropeRows: ropeRows, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts, kvMode: kvMode,
+            allowExpertReduction: allowExpertReduction)
         return StartupContainers(
             tuning: tuning, osReserveGiB: osReserveGiB, geometry: geometry, hal: prelimHal,
             pack: pack, stContainer: stContainer, weightFormat: choice.format,
@@ -248,94 +232,13 @@ extension QWEngineDriver {
         attnLayerCount: Int, gdnLayerCount: Int, cfg: StartupConfig,
         mtpDrafts: Int, mtpWeightDrafts: Int
     ) throws -> ArenaBudgetPlan {
-        let useGroupedNAX = hal.caps.isMetal4TensorCapable
-        let bytesPerToken = Self.prefillBytesPerToken(
-            geometry: geometry, maxPrefillChunk: prefillChunkSize, useGroupedNAX: useGroupedNAX)
-        let pscBytes = prefillChunkSize * bytesPerToken
-        let decodeActBytes = Self.decodeAndMTPScratchBytes(
-            geometry: geometry, prefillChunkRows: prefillChunkSize,
-            mtpDrafts: mtpDrafts, maxTokens: maxTokens, useGroupedNAX: useGroupedNAX)
-        let actBytes = pscBytes + decodeActBytes
-        let slotCount = Self.gdnSlotCount()
-        let recB = QWSlotGeometry.recElems(geometry: geometry) * 4
-        let ringB = QWSlotGeometry.ringElems(geometry: geometry) * 2
-        let slotBytes = gdnLayerCount * (recB + ringB)
-        let trunkHidBytes = geometry.usesMultiStreamMTPHidden
-            ? geometry.mhcConfig!.streams * geometry.hidden * 4 : geometry.hidden * 2
-        let needsMTPCache = (mtpWeightDrafts > 0 || cfg.mtpBackend == .dflash2) && mtpDrafts > 0
-        let gdnBytes = slotCount * slotBytes + Self.partialsScratchBytes(geometry: geometry, mtpDrafts: mtpWeightDrafts > 0 ? mtpDrafts : 0, maxTokens: maxTokens)
-            + (mtpDrafts > 0 ? QWGDNReplayCheckpoint.allocationBytes(geometry: geometry, layers: gdnLayerCount, rows: mtpDrafts + 1) : 0)
-            + (mtpDrafts > 0 ? slotCount * trunkHidBytes : 0) + (1 << 20)
-        let activeAttnLayers = attnLayerCount + (needsMTPCache ? 1 : 0)
-        let mlaPerTokBytes: Int
-        if geometry.usesNoPEMLA {
-            mlaPerTokBytes = activeAttnLayers * ((geometry.indexerHeadDim * 2) / 4)
-        } else if geometry.usesDecoupledRopeMLA {
-            let ropeDim = geometry.hybridMLAConfig?.qkRopeHeadDim ?? 64
-            mlaPerTokBytes = activeAttnLayers * ((geometry.indexerHeadDim + ropeDim) * 2)
-        } else {
-            mlaPerTokBytes = 0
-        }
-        let hcaPerTokBytes = Self.hcaPerTokenBytes(geometry: geometry)
-        let mbsaPerTokBytes = Self.mbsaPerTokenBytes(geometry: geometry, attnLayerCount: attnLayerCount)
-        let mlaFixedBytes = Self.mlaFixedScratchBytes(
-            geometry: geometry, prefillChunkRows: prefillChunkSize, activeAttnLayers: activeAttnLayers)
-        let extraFixedBytes = mlaFixedBytes
-            + Self.hcaFixedScratchBytes(geometry: geometry, prefillChunkRows: prefillChunkSize)
-            + Self.mbsaFixedScratchBytes(geometry: geometry, prefillChunkRows: prefillChunkSize, attnLayerCount: attnLayerCount)
-            + (mtpWeightDrafts > 0 && (geometry.mtpSharedLastLayer || geometry.hasDedicatedMHCMTP) ? (112 << 20) : 0)
-        let perTokBytes = 2 * activeAttnLayers * (QWKVCache.pageBytes(mode: kvMode, geometry: geometry) / QWKVCache.pageTokens)
-            + mlaPerTokBytes + hcaPerTokBytes + mbsaPerTokBytes
-        let maxMTP = cfg.mtpBackend == .dflash2 ? 15 : 7
-        let prelimPlan = try QWWeightAllocationPlan(geometry: geometry, ropeRows: max(ropeRows, maxTokens),
-                                                    mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP,
-                                                    format: weightFormat)
-        let arenaCap = max(1 << 30, hal.caps.maxWorkingSetBytes - (64 << 20))
-        let isMoE = geometry.numExperts > 0
-        let isColdStreamingMoE = isMoE && geometry.effectiveResidentExperts < geometry.numExperts
-        let effectiveReserveGiB = isMoE
-            ? Self.effectiveOSReserveGiB(policy: tuning.memoryPolicy, explicitReserveGiB: osReserveGiB) : osReserveGiB
-        let availBytes = isMoE
-            ? Self.residencyBudgetBytes(policy: tuning.memoryPolicy, osReserveGiB: osReserveGiB, arenaCap: arenaCap)
-            : min(QWCapacityBudget.availableBytes(osReserveGiB: osReserveGiB), arenaCap)
-        let requestedMaxTokens = (isColdStreamingMoE && maxTokens == geometry.maxPositionEmbeddings)
-            ? max(16_384, min(maxTokens, 32_768)) : maxTokens
-        let prelimCap = try QWCapacityPlan.plan(
-            nativeWindow: geometry.maxPositionEmbeddings, requested: requestedMaxTokens,
-            perTokenBytes: perTokBytes, fixedBytes: prelimPlan.bytes + actBytes + gdnBytes + extraFixedBytes,
-            availableBytes: availBytes, yarnAllowed: true)
-        let effectiveMaxTokens = (!prelimCap.fits && requestedMaxTokens == geometry.maxPositionEmbeddings && prelimCap.maxFittingContext >= QWCapacityPlan.kvStepTokens)
-            ? (prelimCap.maxFittingContext / QWCapacityPlan.kvStepTokens) * QWCapacityPlan.kvStepTokens : requestedMaxTokens
-        let effectiveRopeRows = max(ropeRows, effectiveMaxTokens)
-        let weightPlan = try QWWeightAllocationPlan(geometry: geometry, ropeRows: effectiveRopeRows, mtpDrafts: mtpWeightDrafts,
-                                                    headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP, format: weightFormat)
-        let weightsBytes = weightPlan.bytes
-        let trunkKVBytes = Self.kvBudgetBytes(maxTokens: effectiveMaxTokens, mtpDrafts: 0, kvMode: kvMode, geometry: geometry)
-        let mtpKVBytes = needsMTPCache
-            ? (Self.kvBudgetBytes(maxTokens: effectiveMaxTokens, mtpDrafts: mtpDrafts, kvMode: kvMode, geometry: geometry) - trunkKVBytes)
-            : 0
-        let kvBytes = trunkKVBytes + mtpKVBytes
-        let fixedBytes = weightsBytes + actBytes + gdnBytes + extraFixedBytes
-        let capPlan = try QWCapacityPlan.plan(
-            nativeWindow: geometry.maxPositionEmbeddings, requested: effectiveMaxTokens,
-            perTokenBytes: perTokBytes, fixedBytes: fixedBytes, availableBytes: availBytes, yarnAllowed: true)
-        let formatSuffix = " weights_format=\(weightFormat.name) weights_bpw="
-            + String(format: "%.2f", weightFormat.effectiveBitsPerWeight(geometry: geometry))
-            + (weightFormatDeclineReason.map { " weights_declined=\($0)" } ?? "")
-        let capLog = try QWEngineBootstrap.admit(
-            weightsBytes: weightsBytes, fixedScratchBytes: actBytes + gdnBytes + extraFixedBytes,
-            kvMode: String(describing: kvMode), perTokenBytes: perTokBytes,
-            maxTokens: effectiveMaxTokens, totalPlannedBytes: fixedBytes + kvBytes,
-            availableBytes: availBytes, osReserveGiB: effectiveReserveGiB, logSuffix: formatSuffix)
-        let arena = try QWArena(hal: hal, weights: weightsBytes, activations: actBytes,
-                                kv: kvBytes, gdnStates: gdnBytes)
-        return ArenaBudgetPlan(
-            effectiveMaxTokens: effectiveMaxTokens, effectiveRopeRows: effectiveRopeRows,
-            weightPlan: weightPlan, trunkKVBytes: trunkKVBytes, mtpKVBytes: mtpKVBytes,
-            actBytes: actBytes, gdnBytes: gdnBytes, fixedBytes: fixedBytes, mtpPartialsOff: nil,
-            pCarveBytes: Self.partialsCarveBytes(geometry: geometry, maxTokens: effectiveMaxTokens),
-            useGroupedNAX: useGroupedNAX, capacityPlan: capPlan, capacityLogMessage: capLog,
-            arena: arena, availBytes: availBytes)
+        try QWScratchArenaBuilder.planArenaAndBudget(
+            geometry: geometry, hal: hal, weightFormat: weightFormat,
+            weightFormatDeclineReason: weightFormatDeclineReason, tuning: tuning,
+            osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize,
+            maxTokens: maxTokens, ropeRows: ropeRows, kvMode: kvMode,
+            attnLayerCount: attnLayerCount, gdnLayerCount: gdnLayerCount,
+            cfg: cfg, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts)
     }
 
     static func loadEmbeddingsAndHead(
@@ -403,11 +306,17 @@ extension QWEngineDriver {
             mtpDraftHead = nil
         }
         let headStorage = try Self.loadHead(loader: &L, headIsQ4g: cfg.headIsQ4g, geometry: geometry)
-        if case .q4g(let hw) = headStorage, !hw.view.isIncumbentContainer {
-            for name in [QWGemmAQ.kernelName(bits: hw.view.bits, group: hw.view.groupSize, isSHVQ: hw.view.isSHVQ),
-                         QWGemmAQ.decodeKernelName(bits: hw.view.bits, group: hw.view.groupSize, isSHVQ: hw.view.isSHVQ),
-                         QWGemmAQ.headArgmaxKernelName(bits: hw.view.bits, group: hw.view.groupSize, isSHVQ: hw.view.isSHVQ)].compactMap({ $0 }) {
-                _ = try hal.pipeline(name)
+        if case .q4g(let hw) = headStorage {
+            switch hw.view.containerKind {
+            case .incumbentHQ4G32:
+                break
+            case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
+                let isSHVQ = hw.view.containerKind.isSHVQ
+                for name in [QWGemmAQ.kernelName(bits: bits, group: group, isSHVQ: isSHVQ),
+                             QWGemmAQ.decodeKernelName(bits: bits, group: group, isSHVQ: isSHVQ),
+                             QWGemmAQ.headArgmaxKernelName(bits: bits, group: group, isSHVQ: isSHVQ)].compactMap({ $0 }) {
+                    _ = try hal.pipeline(name)
+                }
             }
         }
         return EmbeddingAndHeadSetup(
@@ -464,11 +373,11 @@ extension QWEngineDriver {
                 && geometry.blockSparseGQAConfig == nil else {
             return
         }
-        for m in 2...4 {
+        for m in 2...8 {
             _ = try hal.pipeline("qwm_mlp_gate_up_m\(m)")
             _ = try hal.pipeline("qwm_mlp_gate_up_fwht32_m\(m)")
             _ = try hal.pipeline("qwm_mlp_down_m\(m)")
-            if m == 4 {
+            if m >= 4 {
                 _ = try hal.pipeline("qwm_mlp_gate_up_rp_m\(m)")
                 _ = try hal.pipeline("qwm_mlp_down_rp_m\(m)")
             }
@@ -478,26 +387,33 @@ extension QWEngineDriver {
         var seenAqDecode = Set<String>()
         var seenAqSilu = Set<String>()
         func prewarmWeight(_ w: QWWeightView) throws {
-            guard !w.isIncumbentContainer,
-                  let name = QWGemmAQ.gemmKernelName(bits: w.bits, group: w.groupSize, bm128: false, isSHVQ: w.isSHVQ),
-                  seenGemms.insert(name).inserted else { return }
-            _ = try hal.pipeline(name)
+            switch w.containerKind {
+            case .incumbentHQ4G32:
+                return
+            case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
+                guard let name = QWGemmAQ.gemmKernelName(bits: bits, group: group, bm128: false,
+                                                         isSHVQ: w.containerKind.isSHVQ),
+                      seenGemms.insert(name).inserted else { return }
+                _ = try hal.pipeline(name)
+            }
         }
         func prewarmBatchedProj(_ w: QWWeightView) throws {
             if QWMTPBatchedMLP.usesQ4GMKernel(w) {
-                if !w.isIncumbentContainer && !mlpAQ4Prewarmed {
-                    for m in 2...4 {
+                if w.containerKind != .incumbentHQ4G32 && !mlpAQ4Prewarmed {
+                    for m in 2...8 {
                         _ = try hal.pipeline("qwm_mlp_gate_up_m\(m)", isAQ4: true)
                         _ = try hal.pipeline("qwm_mlp_gate_up_fwht32_m\(m)", isAQ4: true)
                         _ = try hal.pipeline("qwm_mlp_down_m\(m)", isAQ4: true)
-                        if m == 4 {
+                        if m >= 4 {
                             _ = try hal.pipeline("qwm_mlp_gate_up_rp_m\(m)", isAQ4: true)
                             _ = try hal.pipeline("qwm_mlp_down_rp_m\(m)", isAQ4: true)
                         }
                     }
                     mlpAQ4Prewarmed = true
                 }
-            } else if let name = QWGemmAQ.decodeKernelName(bits: w.bits, group: w.groupSize, isSHVQ: w.isSHVQ),
+            } else if let name = QWGemmAQ.decodeKernelName(bits: w.containerKind.bits,
+                                                           group: w.containerKind.groupSize,
+                                                           isSHVQ: w.containerKind.isSHVQ),
                       seenAqDecode.insert(name).inserted {
                 _ = try hal.pipeline(name)
             }
@@ -535,18 +451,22 @@ extension QWEngineDriver {
                 try prewarmBatchedProj(g.out)
                 if !geometry.gdnVectorDecay {
                     let v = g.inProj
-                    if v.isIncumbentContainer || (v.bits == 4 && v.groupSize == 32 && !v.isSHVQ) {
-                        let isAQ4 = !v.isIncumbentContainer
+                    switch v.containerKind {
+                    case .incumbentHQ4G32, .rotatedHQ(4, 32), .nativeAffine(4, 32):
+                        let isAQ4 = v.containerKind != .incumbentHQ4G32
                         if (isAQ4 && !gdnAQ4Prewarmed) || (!isAQ4 && !gdnHQ4Prewarmed) {
-                            for m in 2...4 {
+                            for m in 2...8 {
                                 _ = try hal.pipeline("qwm_gdn_projection_m\(m)", isAQ4: isAQ4)
-                                if m == 4 { _ = try hal.pipeline("qwm_gdn_projection_rp_m\(m)", isAQ4: isAQ4) }
+                                if m >= 4 { _ = try hal.pipeline("qwm_gdn_projection_rp_m\(m)", isAQ4: isAQ4) }
                             }
                             if isAQ4 { gdnAQ4Prewarmed = true } else { gdnHQ4Prewarmed = true }
                         }
-                    } else if let name = QWGemmAQ.gdnInProjDecodeKernelName(bits: v.bits, group: v.groupSize, isSHVQ: v.isSHVQ),
-                              seenGdnInProj.insert(name).inserted {
-                        _ = try hal.pipeline(name)
+                    case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
+                        if let name = QWGemmAQ.gdnInProjDecodeKernelName(bits: bits, group: group,
+                                                                         isSHVQ: v.containerKind.isSHVQ),
+                           seenGdnInProj.insert(name).inserted {
+                            _ = try hal.pipeline(name)
+                        }
                     }
                 }
             }
@@ -562,7 +482,8 @@ extension QWEngineDriver {
         headIsQ4g: Bool, verifyHeadQ4Enabled: Bool, useGroupedNAX: Bool,
         scratch: Scratch, ropeApply: QWRopeApply, effectiveRopeRows: Int, kvMode: QWKVMode
     ) throws -> MTPVerificationResources {
-        let headAQ4 = (hal.weightBasis == .standard) || (layersW.first.map { !$0.gu.view.isIncumbentContainer } ?? false)
+        let headAQ4 = (hal.weightBasis == .standard)
+            || (layersW.first.map { $0.gu.view.containerKind != .incumbentHQ4G32 } ?? false)
         try Self.prewarmBatchedDecodePipelines(hal: hal, geometry: geometry, layersW: layersW,
                                                headAQ4: headAQ4, hasMLA: mlaOperator != nil)
         guard mtpDrafts > 0 else {
@@ -595,7 +516,7 @@ extension QWEngineDriver {
         let mtpScratch = needsNeuralScratch
             ? try MTPScratch(geometry: geometry, allocator: asub, partials: partials)
             : nil
-        let mtpPromptEmbeddings = (needsNeuralScratch || dflashDrafter != nil)
+        let mtpPromptEmbeddings = needsNeuralScratch
             ? try asub.allocate(QWTensorShape([maxT * geometry.hidden], .f16))
             : nil
         let mtpDraftEncoder: QWMTPDraftEncoder? = try mtpWeights.flatMap { w in

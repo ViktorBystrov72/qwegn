@@ -96,15 +96,20 @@ extension QWEngineDriver.WeightLoader {
     /// The family's concatenated plane: each tensor repacked into its own row
     /// slice. The family's rows are uniform, so the slices are the same bytes
     /// the incumbent's are — only the row size differs.
-    mutating func aqConcatPlane(_ tensors: [(name: String, n: Int)], k: Int) throws -> QWTensorValue {
+    mutating func aqConcatPlane(_ tensors: [(name: String, n: Int)], k: Int, extraZeroRows: Int = 0) throws -> QWTensorValue {
         let rowBytes = format.rowBytes(k: k)
-        let totalN = tensors.reduce(0) { $0 + $1.n }
+        let dataRows = tensors.reduce(0) { $0 + $1.n }
+        let totalN = dataRows + extraZeroRows
         let t = try allocateWeight(QWTensorShape([(totalN * rowBytes) / 2], .f16))
         var row0 = 0
         for (name, n) in tensors {
             try repackSafetensorsToAQ(name, n: n, k: k, into: t.region.buffer,
                                       dstByteOffset: t.region.base + t.offset + row0 * rowBytes)
             row0 += n
+        }
+        if extraZeroRows > 0 {
+            let tail = t.region.buffer.contents().advanced(by: t.region.base + t.offset + dataRows * rowBytes)
+            memset(tail, 0, extraZeroRows * rowBytes)
         }
         return t
     }

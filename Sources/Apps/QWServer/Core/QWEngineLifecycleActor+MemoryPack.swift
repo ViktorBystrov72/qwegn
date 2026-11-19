@@ -99,6 +99,35 @@ extension QWEngineLifecycleActor.Config {
 
 extension QWEngineLifecycleActor {
 
+    /// Configures explicit allowed workspace roots for `/v1/memory/*` and `metadata.workspace_path` mounting.
+    nonisolated public func configureAllowedWorkspaceRoots(_ roots: [String]) {
+        QWWorkspacePolicyRegistry.shared.setAllowedRoots(roots, for: self)
+    }
+
+    nonisolated func effectiveAllowedWorkspaceRoots(override: [String] = []) -> [String] {
+        QWWorkspacePolicyRegistry.shared.allowedRoots(for: self) + override
+    }
+
+    nonisolated func resolveValidatedMemoryRootURL(at rawPath: String, overrideRoots: [String] = []) throws -> URL {
+        let configured = effectiveAllowedWorkspaceRoots(override: overrideRoots)
+        let canonicalStart = try QWHttpSecurity.validateAllowedWorkspacePath(rawPath, configuredRoots: configured)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: canonicalStart.path, isDirectory: &isDir), isDir.boolValue else {
+            throw QWMemoryPackError.directoryNotFound(canonicalStart.path)
+        }
+        if let discovered = QWMemoryPack.discoverManifestRoot(walkingUpFrom: canonicalStart) {
+            let canonicalDiscovered = discovered.resolvingSymlinksInPath().standardizedFileURL
+            let allowed = QWHttpSecurity.resolvedAllowedWorkspaceRootURLs(configuredRoots: configured)
+            guard allowed.contains(where: { QWHttpSecurity.canonicalDirectoryContainment(canonicalDiscovered, inside: $0) }) else {
+                throw QWMemoryWorkspaceAccessError(
+                    "Discovered manifest root '\(canonicalDiscovered.path)' escapes allowed workspace roots"
+                )
+            }
+            return canonicalDiscovered
+        }
+        return canonicalStart
+    }
+
     /// Strips `<org>/` prefix and trailing quantization/packaging tags (`-hq8g32-hq4g64`, `-mlx-serve-mixed-4-8bit`, etc.).
     public static func canonicalModelFamilyStem(_ raw: String) -> String {
         let leaf = (raw.split(separator: "/").last.map(String.init) ?? raw)
@@ -140,6 +169,24 @@ extension QWEngineLifecycleActor {
             || (!activeAlias.isEmpty && req.caseInsensitiveCompare(activeAlias) == .orderedSame) {
             return
         }
+        let curCanonical = URL(fileURLWithPath: config.packPath.expandingTildePath)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        let allowOptIn = ProcessInfo.processInfo.environment["QWG_ALLOW_UNREGISTERED_MODEL_PATHS"] == "1"
+        if !allowOptIn && QWServerSettings.isArbitraryFilesystemModelPath(req) {
+            let reqCanonical = URL(fileURLWithPath: req.expandingTildePath)
+                .resolvingSymlinksInPath().standardizedFileURL
+            if reqCanonical.path == curCanonical {
+                return
+            }
+            let inRegisteredRoot = QWHttpSecurity.canonicalDirectoryContainment(
+                reqCanonical, inside: QWPaths.modelsDirectoryURL
+            )
+            if !allowSameFamilyQuantSwitch || !inRegisteredRoot {
+                throw QWMetadataValidationError(
+                    "Filesystem model path '\(req)' is not permitted; use a registered model under ~/.qwg/models"
+                )
+            }
+        }
         if !allowSameFamilyQuantSwitch, !config.packPath.isEmpty {
             let reqStem = Self.canonicalModelFamilyStem(req)
             let curStem = Self.canonicalModelFamilyStem(config.modelName)
@@ -148,9 +195,33 @@ extension QWEngineLifecycleActor {
                 return
             }
         }
-        let ref = settings.resolveModelReference(req)
-        let refCanonical = URL(fileURLWithPath: ref.packPath).resolvingSymlinksInPath().path
-        let curCanonical = URL(fileURLWithPath: config.packPath.expandingTildePath).resolvingSymlinksInPath().path
+        let ref: (packPath: String, modelName: String, alias: String)
+        if allowOptIn {
+            ref = settings.resolveModelReference(req, allowArbitraryFilesystemPaths: true)
+        } else if allowSameFamilyQuantSwitch && QWServerSettings.isArbitraryFilesystemModelPath(req) {
+            let reqCanonical = URL(fileURLWithPath: req.expandingTildePath)
+                .resolvingSymlinksInPath().standardizedFileURL
+            let discovered = QWServerSettings.scanModelsDirectory()
+            if let match = discovered.first(where: {
+                !$0.packPath.isEmpty &&
+                URL(fileURLWithPath: $0.packPath).resolvingSymlinksInPath().standardizedFileURL.path == reqCanonical.path
+            }) {
+                ref = (match.packPath, match.name, settings.alias(for: match.name))
+            } else {
+                let resolved = QWModelRoot.resolveSnapshotDirectory(reqCanonical)
+                ref = (resolved.path, QWModelRoot.canonicalModelName(for: resolved), "")
+            }
+        } else {
+            ref = settings.resolveModelReference(req, allowArbitraryFilesystemPaths: false)
+        }
+        let refCanonical = URL(fileURLWithPath: ref.packPath).resolvingSymlinksInPath().standardizedFileURL.path
+        if !allowOptIn && !ref.packPath.isEmpty && refCanonical != curCanonical {
+            guard QWHttpSecurity.canonicalDirectoryContainment(
+                URL(fileURLWithPath: refCanonical), inside: QWPaths.modelsDirectoryURL
+            ) else {
+                return
+            }
+        }
         guard !ref.packPath.isEmpty,
               refCanonical != curCanonical,
               FileManager.default.fileExists(atPath: ref.packPath) else {
@@ -231,27 +302,52 @@ extension QWEngineLifecycleActor {
         )
         newConfig.engineTuning = effectiveSettings.resolvedEngineTuning
         logger.log(.info, "Switching active model to '\(ref.modelName)' (pack: '\(ref.packPath)')...")
-        await waitForInFlightRequests()
-        _ = try await unloadExplicit(waitForInFlight: false)
-        self.activeMemoryPack = nil
-        self.preMountKVMode = nil
-        self.preMountMaxContext = nil
-        self.statusBox.updateMountedMemoryPack(nil)
-        self.config = newConfig
-        self.statusBox.updateConfig(newConfig)
-        transition(to: .unloaded)
+        try await withExclusiveTransition {
+            let curAfterWait = URL(fileURLWithPath: config.packPath.expandingTildePath)
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            guard refCanonical != curAfterWait else { return }
+            await waitForInFlightRequests()
+            _ = try await unloadModel(waitForInFlight: false, forReconfigure: true)
+            self.activeMemoryPack = nil
+            self.preMountKVMode = nil
+            self.preMountMaxContext = nil
+            self.statusBox.updateMountedMemoryPack(nil)
+            self.config = newConfig
+            self.configRevision &+= 1
+            self.statusBox.updateConfig(newConfig)
+            transition(to: .unloaded)
+        }
     }
 
     /// Mounts a `<root>/.qwg/manifest.json` codebase/knowledge memory pack as a shared base prefix,
     /// enforcing its `kvMode` and required context capacity.
     @discardableResult
-    public func mountMemoryPack(at rawPath: String) async throws -> QWEngineInfoResponse.MountedMemoryPackInfo {
-        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw QWMemoryPackError.directoryNotFound(rawPath)
+    public func mountMemoryPack(
+        at rawPath: String,
+        waitForInFlight: Bool = true,
+        skipIfAlreadyMounted: Bool = false
+    ) async throws -> QWEngineInfoResponse.MountedMemoryPackInfo {
+        try await withExclusiveTransition {
+            try await self.mountMemoryPackHoldingTransition(
+                at: rawPath,
+                waitForInFlight: waitForInFlight,
+                skipIfAlreadyMounted: skipIfAlreadyMounted
+            )
         }
-        let startURL = URL(fileURLWithPath: trimmed.expandingTildePath).standardizedFileURL
-        let rootURL = QWMemoryPack.discoverManifestRoot(walkingUpFrom: startURL) ?? startURL
+    }
+
+    func mountMemoryPackHoldingTransition(
+        at rawPath: String,
+        waitForInFlight: Bool,
+        skipIfAlreadyMounted: Bool
+    ) async throws -> QWEngineInfoResponse.MountedMemoryPackInfo {
+        let rootURL = try resolveValidatedMemoryRootURL(at: rawPath)
+        if skipIfAlreadyMounted,
+           let cur = activeMemoryPack,
+           cur.rootURL.standardizedFileURL == rootURL.standardizedFileURL,
+           let curInfo = statusBox.getMountedMemoryPackInfo() {
+            return curInfo
+        }
         let manifest = try QWMemoryManifest.load(from: rootURL)
 
         var geometryDigest: String? = nil
@@ -282,6 +378,9 @@ extension QWEngineLifecycleActor {
         )
         let requiredContext = max(config.maxContext, minMemoryContext)
 
+        if waitForInFlight {
+            await waitForInFlightRequests()
+        }
         if config.kvMode != enforcedKVMode || config.maxContext < requiredContext {
             if preMountKVMode == nil { preMountKVMode = config.kvMode }
             if preMountMaxContext == nil { preMountMaxContext = config.maxContext }
@@ -300,8 +399,9 @@ extension QWEngineLifecycleActor {
                 sourceSummary: updatedSources
             )
             logger.log(.info, "[MemoryPack] Enforcing kvMode=\(artifact.kvMode) and maxContext=\(requiredContext) for '\(manifest.packName)'")
-            _ = try await unloadExplicit(waitForInFlight: false)
+            _ = try await unloadModel(waitForInFlight: false, forReconfigure: true)
             self.config = newConfig
+            self.configRevision &+= 1
             self.statusBox.updateConfig(newConfig)
         }
 
@@ -326,11 +426,15 @@ extension QWEngineLifecycleActor {
             ssdLimit: config.cacheConfig.ssdByteLimit
         )
 
-        let delta = QWMemoryPack.computeDelta(for: manifest)
-        let modCount = delta.modifiedFiles.count + delta.deletedFiles.count
+        let deltaCache = self.memoryDeltaCache
+        let rootPath = rootURL.path
+        let modCount = await Task.detached(priority: .utility) {
+            deltaCache.invalidate()
+            return deltaCache.cachedOrCompute(for: manifest, rootPath: rootPath)
+        }.value
         let info = QWEngineInfoResponse.MountedMemoryPackInfo(
             packName: manifest.packName,
-            rootPath: rootURL.path,
+            rootPath: rootPath,
             enforcedKVMode: artifact.kvMode,
             lsaMode: artifact.lsaMode,
             tokenCount: effectiveTokens.count,
@@ -358,77 +462,77 @@ extension QWEngineLifecycleActor {
 
     /// Unmounts the active codebase/knowledge memory pack and unlocks `kvMode`.
     public func unmountMemoryPack() async {
-        if case .loaded(let loaded) = state {
-            loaded.modelBackend.unmountSharedBasePrefixes()
-            let cacheState = loaded.modelBackend.prefixCache
-            QWEngineTelemetryRegistry.shared.updateCacheUsage(
-                warmBytes: cacheState.warmBytes,
-                warmLimit: config.cacheConfig.warmByteLimit,
-                ssdBytes: cacheState.ssdBytes,
-                ssdLimit: config.cacheConfig.ssdByteLimit
-            )
-        }
-        let oldName = activeMemoryPack?.manifest.packName
-        activeMemoryPack = nil
-        statusBox.updateMountedMemoryPack(nil)
-        if let savedKV = preMountKVMode {
-            let savedCtx = preMountMaxContext ?? config.maxContext
-            preMountKVMode = nil
-            preMountMaxContext = nil
-            var updatedSources = config.sourceSummary
-            updatedSources.removeValue(forKey: "kvMode")
-            let restored = config.updating(
-                maxContext: savedCtx,
-                kvMode: savedKV,
-                sourceSummary: updatedSources
-            )
-            self.config = restored
-            self.statusBox.updateConfig(restored)
-        }
-        if let oldName {
-            logger.log(.info, "[MemoryPack] Unmounted '\(oldName)' and unlocked kvMode")
+        await withExclusiveTransition {
+            await waitForInFlightRequests()
+            memoryDeltaCache.invalidate()
+            if case .loaded(let loaded) = state {
+                loaded.modelBackend.unmountSharedBasePrefixes()
+                let cacheState = loaded.modelBackend.prefixCache
+                QWEngineTelemetryRegistry.shared.updateCacheUsage(
+                    warmBytes: cacheState.warmBytes,
+                    warmLimit: config.cacheConfig.warmByteLimit,
+                    ssdBytes: cacheState.ssdBytes,
+                    ssdLimit: config.cacheConfig.ssdByteLimit
+                )
+            }
+            let oldName = activeMemoryPack?.manifest.packName
+            activeMemoryPack = nil
+            statusBox.updateMountedMemoryPack(nil)
+            if let savedKV = preMountKVMode {
+                let savedCtx = preMountMaxContext ?? config.maxContext
+                preMountKVMode = nil
+                preMountMaxContext = nil
+                var updatedSources = config.sourceSummary
+                updatedSources.removeValue(forKey: "kvMode")
+                let restored = config.updating(
+                    maxContext: savedCtx,
+                    kvMode: savedKV,
+                    sourceSummary: updatedSources
+                )
+                self.config = restored
+                self.configRevision &+= 1
+                self.statusBox.updateConfig(restored)
+            }
+            if let oldName {
+                logger.log(.info, "[MemoryPack] Unmounted '\(oldName)' and unlocked kvMode")
+            }
         }
     }
 
     /// Auto-discovers a repository memory pack and returns its mounted Cortex tokens, live delta tokens, and manifest.
-    func autoMountAndPrepareMemoryState(
+    nonisolated func autoMountAndPrepareMemoryState(
         for request: ChatCompletionRequest
     ) async -> (mountedTokens: [Int], deltaTokens: [Int], manifest: QWMemoryManifest?) {
         guard request.effectiveUseMemoryPack else {
             return ([], [], nil)
         }
         var discoveredRoot: URL? = nil
-        if let explicitWs = request.effectiveWorkspacePath {
-            let candidateURL = URL(fileURLWithPath: explicitWs.expandingTildePath).standardizedFileURL
-            discoveredRoot = QWMemoryPack.discoverManifestRoot(walkingUpFrom: candidateURL)
+        if let explicitWs = request.effectiveWorkspacePath,
+           let root = try? resolveValidatedMemoryRootURL(at: explicitWs),
+           FileManager.default.fileExists(atPath: QWMemoryManifest.manifestURL(in: root).path) {
+            discoveredRoot = root
         }
         if discoveredRoot == nil,
            let rawModel = request.model,
            let atIdx = rawModel.firstIndex(of: "@") {
             let repoSpec = String(rawModel[rawModel.index(after: atIdx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !repoSpec.isEmpty {
-                let candidateURL = URL(fileURLWithPath: repoSpec.expandingTildePath).standardizedFileURL
-                discoveredRoot = QWMemoryPack.discoverManifestRoot(walkingUpFrom: candidateURL)
+            if !repoSpec.isEmpty,
+               let root = try? resolveValidatedMemoryRootURL(at: repoSpec),
+               FileManager.default.fileExists(atPath: QWMemoryManifest.manifestURL(in: root).path) {
+                discoveredRoot = root
             }
         }
-        if discoveredRoot == nil {
-            for msg in request.messages where msg.role == "system" || msg.role == "developer" {
-                let text = msg.extractTextContent()
-                if let root = QWMemoryPack.discoverManifestRoot(inSystemPrompt: text) {
-                    discoveredRoot = root
-                    break
-                }
-            }
-        }
-        if let root = discoveredRoot,
-           activeMemoryPack?.rootURL.standardizedFileURL != root.standardizedFileURL {
-            _ = try? await mountMemoryPack(at: root.path)
-        }
-        guard let active = activeMemoryPack else {
+        if discoveredRoot == nil && statusBox.getMountedMemoryPackInfo() == nil {
             return ([], [], nil)
         }
-        let delta = QWMemoryPack.computeDelta(for: active.manifest)
-        let modCount = delta.modifiedFiles.count + delta.deletedFiles.count
+        let active = await resolveActiveMemoryPack(mountingIfNeeded: discoveredRoot)
+        guard let active else {
+            return ([], [], nil)
+        }
+        let deltaCache = self.memoryDeltaCache
+        let modCount = await Task.detached(priority: .utility) {
+            deltaCache.cachedOrCompute(for: active.manifest, rootPath: active.rootURL.path)
+        }.value
         if let curInfo = statusBox.getMountedMemoryPackInfo(), curInfo.modifiedFileCount != modCount {
             statusBox.updateMountedMemoryPack(QWEngineInfoResponse.MountedMemoryPackInfo(
                 packName: curInfo.packName,
@@ -445,5 +549,13 @@ extension QWEngineLifecycleActor {
         // Live working-tree delta is injected at the active conversation tail in QWChatTurnPreparer
         // so file edits never invalidate the 0 ..< N_mem + N_history KV prefix cache.
         return (active.tokens, [], active.manifest)
+    }
+
+    private func resolveActiveMemoryPack(mountingIfNeeded discoveredRoot: URL?) async -> ActiveMemoryPackState? {
+        if let root = discoveredRoot,
+           activeMemoryPack?.rootURL.standardizedFileURL != root.standardizedFileURL {
+            _ = try? await mountMemoryPack(at: root.path, waitForInFlight: true, skipIfAlreadyMounted: true)
+        }
+        return activeMemoryPack
     }
 }

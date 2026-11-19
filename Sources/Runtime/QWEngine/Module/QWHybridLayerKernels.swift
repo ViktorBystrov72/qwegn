@@ -88,11 +88,11 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
            let fB = w.fB, let gB = w.gB {
             let activeLn1 = driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16)
             mark("kda.in_proj")
-            driver.gemmBatchedH16(enc, m: T, n: qkvC, k: H, x: activeLn1, wQ4: w.inProj,
-                                  y16: driver.prefixRows(psc.qkv16, rows: T, cols: qkvC, dt: .f16))
+            try driver.gemmBatchedH16(enc, m: T, n: qkvC, k: H, x: activeLn1, wQ4: w.inProj,
+                                      y16: driver.prefixRows(psc.qkv16, rows: T, cols: qkvC, dt: .f16))
             mark("kda.fgb_proj")
-            driver.gemmBatchedH16(enc, m: T, n: fgbProj.n, k: H, x: activeLn1, wQ4: fgbProj,
-                                  y16: driver.prefixRows(fgb16, rows: T, cols: fgbProj.n, dt: .f16))
+            try driver.gemmBatchedH16(enc, m: T, n: fgbProj.n, k: H, x: activeLn1, wQ4: fgbProj,
+                                      y16: driver.prefixRows(fgb16, rows: T, cols: fgbProj.n, dt: .f16))
             mark("kda.gates")
             try driver.gdnDecode.encodeKDAGates(
                 enc,
@@ -187,7 +187,7 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
                                                T: T)
         }
         mark("gdn.out_proj")
-        driver.gemmBatchedH16(enc, m: T, n: H, k: zC,
+        try driver.gemmBatchedH16(enc, m: T, n: H, k: zC,
                        x: driver.prefixRows(psc.oOut, rows: T, cols: zC, dt: .f16),
                        wQ4: w.out,
                        y16: driver.prefixRows(psc.o16, rows: T, cols: H, dt: .f16))
@@ -469,14 +469,14 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                 return driver.activeEnc
             }
             _ = mark("mla.qkv_a_proj")
-            driver.gemmBatchedH16(enc, m: T, n: w.qkvProj.n, k: H, x: activeLn1, wQ4: w.qkvProj, y16: latRows)
+            try driver.gemmBatchedH16(enc, m: T, n: w.qkvProj.n, k: H, x: activeLn1, wQ4: w.qkvProj, y16: latRows)
             _ = mark("mla.latent_prep")
             mla.encodeLatentPrepAndPool(
                 enc, ln1: activeLn1,
                 mlaW: mlaW, kv: views,
                 fullAttnLayer: fullAttnIdx, pos0: pos, rows: T)
             _ = mark("mla.q_b_proj")
-            driver.gemmBatchedH16(enc, m: T, n: mlaW.qBProj.n, k: geometry.qLoraRank, x: qResRows, wQ4: mlaW.qBProj, y16: qFullRows)
+            try driver.gemmBatchedH16(enc, m: T, n: mlaW.qBProj.n, k: geometry.qLoraRank, x: qResRows, wQ4: mlaW.qBProj, y16: qFullRows)
             mla.encodeScoreSelectAbsorbAttendAndProjUV(
                 enc, mlaW: mlaW, kv: views,
                 attOut: attOutRows,
@@ -484,7 +484,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                 stage: QWEngineDriver.prefillProfileEnabled ? mark : nil)
             _ = mark("mla.o_proj")
             enc = driver.activeEnc ?? enc
-            driver.gemmBatchedH16(enc, m: T, n: H, k: vCols,
+            try driver.gemmBatchedH16(enc, m: T, n: H, k: vCols,
                            x: attOutRows,
                            wQ4: w.o,
                            y16: driver.prefixRows(psc.o16, rows: T, cols: H, dt: .f16))
@@ -496,7 +496,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
         }
         let qkvCols = w.qkvProj.n
         let attnYSlice = driver.prefixRows(psc.attnY16, rows: T, cols: qkvCols, dt: .f16)
-        driver.gemmBatchedH16(enc, m: T, n: qkvCols, k: H,
+        try driver.gemmBatchedH16(enc, m: T, n: qkvCols, k: H,
                        x: driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16),
                        wQ4: w.qkvProj,
                        y16: attnYSlice)
@@ -511,7 +511,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
         if let mbsa = driver.mbsaOperator, let mbsaW = w.mbsa, pos + T <= mbsa.maxContext {
             let idxCols = (geometry.kvHeads + 1) * geometry.headDim
             if let idxProj = mbsaW.qkvIdxProj {
-                driver.gemmBatchedH16(
+                try driver.gemmBatchedH16(
                     enc, m: T, n: idxCols, k: H,
                     x: driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16),
                     wQ4: idxProj,
@@ -622,7 +622,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                                                out: driver.prefixRows(psc.attOut, rows: T, cols: qC, dt: .f16),
                                                pos: pos, T: T)
         }
-        driver.gemmBatchedH16(enc, m: T, n: H, k: qC,
+        try driver.gemmBatchedH16(enc, m: T, n: H, k: qC,
                        x: driver.prefixRows(psc.attOut, rows: T, cols: qC, dt: .f16),
                        wQ4: w.o,
                        y16: driver.prefixRows(psc.o16, rows: T, cols: H, dt: .f16))

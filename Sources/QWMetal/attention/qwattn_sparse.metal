@@ -144,7 +144,7 @@ inline void qwg_attn_sparse_gated_impl(device const float* q,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float localMax = -INFINITY;
+    float localMax = -1e30f;
     for (uint s = d; s < slots; s += 256u) {
         localMax = max(localMax, score[s]);
     }
@@ -152,7 +152,7 @@ inline void qwg_attn_sparse_gated_impl(device const float* q,
     if (lane == 0u) sgScratch[sg] = localMax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0u) {
-        float vMax = (lane < 8u) ? sgScratch[lane] : -INFINITY;
+        float vMax = (lane < 8u) ? sgScratch[lane] : -1e30f;
         vMax = simd_max(vMax);
         if (lane == 0u) sgScratch[0] = vMax;
     }
@@ -284,7 +284,7 @@ inline void qwg_attn_sparse_gated_gqa3_impl(device const float* q,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float max0 = -INFINITY, max1 = -INFINITY, max2 = -INFINITY;
+    float max0 = -1e30f, max1 = -1e30f, max2 = -1e30f;
     for (uint s = d; s < slots; s += 256u) {
         max0 = max(max0, score[s]);
         max1 = max(max1, score[STRIDE + s]);
@@ -300,9 +300,9 @@ inline void qwg_attn_sparse_gated_gqa3_impl(device const float* q,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0u) {
-        float v0 = (lane < 8u) ? sgScratch[lane]       : -INFINITY;
-        float v1 = (lane < 8u) ? sgScratch[8u + lane]  : -INFINITY;
-        float v2 = (lane < 8u) ? sgScratch[16u + lane] : -INFINITY;
+        float v0 = (lane < 8u) ? sgScratch[lane]       : -1e30f;
+        float v1 = (lane < 8u) ? sgScratch[8u + lane]  : -1e30f;
+        float v2 = (lane < 8u) ? sgScratch[16u + lane] : -1e30f;
         v0 = simd_max(v0);
         v1 = simd_max(v1);
         v2 = simd_max(v2);

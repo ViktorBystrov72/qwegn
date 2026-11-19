@@ -370,7 +370,7 @@ function openMemoryPackModalWithInspection(info, fromSettings = false) {
       } else if (entry.matchesActiveModel) {
         actionHtml = `<span class="panel-sub mono">Active model</span>`;
       } else if (entry.modelInstalled && targetModel) {
-        actionHtml = `<button type="button" class="btn btn-sm" onclick="switchModelAndMountMemoryPack('${encodeURIComponent(targetModel)}')">Switch &amp; Mount</button>`;
+        actionHtml = `<button type="button" class="btn btn-sm" data-mempack-switch-model="${escapeHtml(targetModel)}">Switch &amp; Mount</button>`;
       }
       return `<div class="mempack-artifact-row">
         <div class="mempack-artifact-meta">
@@ -445,10 +445,10 @@ async function mountExistingFromMemoryPackModal() {
   await performDirectMemoryPackMount(info.rootPath, fromSettings);
 }
 
-async function switchModelAndMountMemoryPack(encodedModelName) {
+async function switchModelAndMountMemoryPack(rawModelName) {
   const info = mempackModalState.info;
   if (!info || mempackModalState.indexing) return;
-  const modelName = decodeURIComponent(encodedModelName || "");
+  const modelName = String(rawModelName || "");
   if (!modelName) return;
   mempackModalState.indexing = true;
   setMemoryPackControlsDisabled(true);
@@ -606,4 +606,11 @@ async function startMemoryPackIndexing() {
     renderMemoryPackProgressFrame({ phase: "error", progressFraction: 0, message: "Error: " + err.message });
     notifyMemoryPackStatus("Memory Pack indexing failed: " + err.message, true);
   }
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("click", (event) => {
+    const btn = event.target && event.target.closest ? event.target.closest("[data-mempack-switch-model]") : null;
+    if (btn) switchModelAndMountMemoryPack(btn.getAttribute("data-mempack-switch-model") || "");
+  });
 }

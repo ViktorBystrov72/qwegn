@@ -180,12 +180,13 @@ extension QWGemm {
                                       x: QWTensorValue, y: QWTensorValue, rows: Int = 1,
                                       epi: UInt32 = 0, scale: Float = 1) throws {
         let name: String
-        if weight.isIncumbentContainer {
+        switch weight.containerKind {
+        case .incumbentHQ4G32:
             name = "qwg_gemv_q4g_f32_v4"
-        } else {
-            guard let aqName = QWGemmAQ.f32V4KernelName(bits: weight.bits, group: weight.groupSize,
-                                                        isSHVQ: weight.isSHVQ) else {
-                throw QWGemmError.badWeights("no affine-quantised f32 v4 kernel for \(weight.bits)-bit group \(weight.groupSize)")
+        case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
+            guard let aqName = QWGemmAQ.f32V4KernelName(bits: bits, group: group,
+                                                        isSHVQ: weight.containerKind.isSHVQ) else {
+                throw QWGemmError.badWeights("no affine-quantised f32 v4 kernel for \(bits)-bit group \(group)")
             }
             name = aqName
         }
@@ -212,12 +213,13 @@ extension QWGemm {
                      "v4 argmax key buffers need \(rows * slots) slots")
         if rows == 2 && epi == 0 {
             let name: String
-            if weight.isIncumbentContainer {
+            switch weight.containerKind {
+            case .incumbentHQ4G32:
                 name = "qwg_gemv_q4g_f32_v4_am2"
-            } else {
-                guard let aqName = QWGemmAQ.f32V4Argmax2KernelName(bits: weight.bits, group: weight.groupSize,
-                                                                   isSHVQ: weight.isSHVQ) else {
-                    throw QWGemmError.badWeights("no affine-quantised f32 v4_am2 kernel for \(weight.bits)-bit group \(weight.groupSize)")
+            case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
+                guard let aqName = QWGemmAQ.f32V4Argmax2KernelName(bits: bits, group: group,
+                                                                   isSHVQ: weight.containerKind.isSHVQ) else {
+                    throw QWGemmError.badWeights("no affine-quantised f32 v4_am2 kernel for \(bits)-bit group \(group)")
                 }
                 name = aqName
             }
@@ -230,12 +232,13 @@ extension QWGemm {
             return
         }
         let name: String
-        if weight.isIncumbentContainer {
+        switch weight.containerKind {
+        case .incumbentHQ4G32:
             name = "qwg_gemv_q4g_f32_v4_am"
-        } else {
-            guard let aqName = QWGemmAQ.f32V4ArgmaxKernelName(bits: weight.bits, group: weight.groupSize,
-                                                              isSHVQ: weight.isSHVQ) else {
-                throw QWGemmError.badWeights("no affine-quantised f32 v4_am kernel for \(weight.bits)-bit group \(weight.groupSize)")
+        case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
+            guard let aqName = QWGemmAQ.f32V4ArgmaxKernelName(bits: bits, group: group,
+                                                              isSHVQ: weight.containerKind.isSHVQ) else {
+                throw QWGemmError.badWeights("no affine-quantised f32 v4_am kernel for \(bits)-bit group \(group)")
             }
             name = aqName
         }
@@ -309,28 +312,30 @@ extension QWGemm {
                                       x: QWTensorValue, y: QWTensorValue, rows: Int,
                                       epi: UInt32 = 0, scale: Float = 1) throws {
         let smallRows = rows == 32 || (rows > 32 && rows < 64 && weight.k / 2 >= weight.n)
-        let smallQ4G = smallRows && epi <= 3 && weight.isIncumbentContainer && hal.caps.familyApple10
-        let smallAQ4 = smallRows && epi <= 3 && !weight.isIncumbentContainer &&
-            !weight.isSHVQ && weight.bits == 4 && (weight.groupSize == 32 || weight.groupSize == 64) && hal.caps.familyApple10
-        let smallAQ8 = smallRows && epi <= 3 && !weight.isIncumbentContainer &&
-            !weight.isSHVQ && weight.bits == 8 && weight.groupSize == 32 && hal.caps.familyApple10
-        let smallSHVQ4 = smallRows && epi <= 3 && !weight.isIncumbentContainer &&
-            weight.isSHVQ && weight.bits == 4 && (weight.groupSize == 32 || weight.groupSize == 64) && hal.caps.familyApple10
-        let smallTile = smallQ4G || smallAQ4 || smallAQ8 || smallSHVQ4
+        let smallEligible = smallRows && epi <= 3 && hal.caps.familyApple10
+        let bm32Name: String? = switch weight.containerKind {
+        case .incumbentHQ4G32 where smallEligible:
+            "qwg_gemm_q4g_f32_bm32"
+        case .nativeAffine(4, let g) where smallEligible && (g == 32 || g == 64),
+             .rotatedHQ(4, let g) where smallEligible && (g == 32 || g == 64):
+            "qwg_gemm_aq4_g\(g)_f32_bm32"
+        case .nativeAffine(8, 32) where smallEligible,
+             .rotatedHQ(8, 32) where smallEligible:
+            "qwg_gemm_aq8_g32_f32_bm32"
+        case .shvq(4, let g) where smallEligible && (g == 32 || g == 64):
+            "qwg_gemm_shvq4_g\(g)_f32_bm32"
+        default:
+            nil
+        }
+        let smallTile = bm32Name != nil
         let name: String
-        if smallQ4G {
-            name = "qwg_gemm_q4g_f32_bm32"
-        } else if smallAQ4 {
-            name = "qwg_gemm_aq4_g\(weight.groupSize)_f32_bm32"
-        } else if smallAQ8 {
-            name = "qwg_gemm_aq8_g32_f32_bm32"
-        } else if smallSHVQ4 {
-            name = "qwg_gemm_shvq4_g\(weight.groupSize)_f32_bm32"
-        } else if weight.isIncumbentContainer {
+        if let bm32Name {
+            name = bm32Name
+        } else if weight.containerKind == .incumbentHQ4G32 {
             name = "qwg_gemm_q4g_f32_bm"
         } else {
             guard let aqName = QWGemmAQ.f32BMKernelName(bits: weight.bits, group: weight.groupSize,
-                                                        isSHVQ: weight.isSHVQ) else {
+                                                        isSHVQ: weight.containerKind.isSHVQ) else {
                 throw QWGemmError.badWeights("no affine-quantised f32 bm kernel for \(weight.bits)-bit group \(weight.groupSize)")
             }
             name = aqName
@@ -363,12 +368,13 @@ extension QWGemm {
         precondition(weight.n % 64 == 0 && weight.k % 64 == 0, "dense NAX needs N and K multiples of 64")
         // BM64 measures faster than BM128 at every M for both containers (M5 Max: 60-64 vs 26-56 TFLOPS).
         let name: String
-        if weight.isIncumbentContainer {
+        switch weight.containerKind {
+        case .incumbentHQ4G32:
             name = "qwg_gemm_q4g_nax_f32"
-        } else {
-            guard let aqName = QWGemmAQ.naxF32KernelName(bits: weight.bits, group: weight.groupSize,
-                                                         isSHVQ: weight.isSHVQ) else {
-                throw QWGemmError.badWeights("no affine-quantised nax f32 kernel for \(weight.bits)-bit group \(weight.groupSize)")
+        case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
+            guard let aqName = QWGemmAQ.naxF32KernelName(bits: bits, group: group,
+                                                         isSHVQ: weight.containerKind.isSHVQ) else {
+                throw QWGemmError.badWeights("no affine-quantised nax f32 kernel for \(bits)-bit group \(group)")
             }
             name = aqName
         }

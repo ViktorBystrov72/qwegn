@@ -127,7 +127,7 @@ public enum QWToolCallParser {
         return matchingToolCallClose(in: text[open.upperBound...])?.upperBound
     }
 
-    private static func isBalancedToolPayload(_ raw: Substring) -> Bool {
+    static func isBalancedToolPayload(_ raw: Substring) -> Bool {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
             var depth = 0
@@ -167,7 +167,7 @@ public enum QWToolCallParser {
         return false
     }
 
-    private static func hasUnclosedLiteralContainer(_ raw: Substring) -> Bool {
+    static func hasUnclosedLiteralContainer(_ raw: Substring) -> Bool {
         let trimmed = raw.drop(while: { $0.isWhitespace })
         if trimmed.hasPrefix("{") {
             var depth = 0, inString = false, escaped = false
@@ -186,7 +186,7 @@ public enum QWToolCallParser {
         return false
     }
 
-    private static func matchingToolCallClose(in afterOpen: Substring) -> Range<String.Index>? {
+    static func matchingToolCallClose(in afterOpen: Substring) -> Range<String.Index>? {
         var searchFrom = afterOpen.startIndex
         while let close = afterOpen[searchFrom...].range(of: "</tool_call>") {
             let prefix = afterOpen[..<close.lowerBound]
@@ -255,40 +255,37 @@ public enum QWToolCallParser {
 
         // Format B: XML tag format (function/parameter open-close pairs);
         // Format A above is the JSON-object variant.
-        let funcRegex = try? NSRegularExpression(pattern: "<function=([^>\\n]+)>([\\s\\S]*?)(?:</function>|$)", options: [])
-        let nsInner = inner as NSString
-        let funcMatches = funcRegex?.matches(in: inner, options: [], range: NSRange(location: 0, length: nsInner.length)) ?? []
+        if let funcOpen = inner.range(of: "<function="),
+           let gtIdx = inner[funcOpen.upperBound...].firstIndex(of: ">") {
+            let name = String(inner[funcOpen.upperBound..<gtIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty, !name.contains("\n") {
+                let bodyStart = inner.index(after: gtIdx)
+                let afterOpen = inner[bodyStart...]
+                let body: String
+                if let funcClose = afterOpen.range(of: "</function>", options: .backwards),
+                   afterOpen[funcClose.upperBound...].allSatisfy(\.isWhitespace) {
+                    body = String(afterOpen[..<funcClose.lowerBound])
+                } else {
+                    body = String(afterOpen)
+                }
 
-        if let firstMatch = funcMatches.first, firstMatch.numberOfRanges > 2 {
-            let name = nsInner.substring(with: firstMatch.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
-            let body = nsInner.substring(with: firstMatch.range(at: 2))
+                // Arguments are assembled by hand so the parameter order the model produced is
+                // preserved: the chat template re-renders history from this JSON, and a reordered
+                // call would no longer match what the model actually generated.
+                var members: [String] = []
+                for (pName, rawVal) in Self.extractXMLParameters(in: body) {
+                    var pVal = rawVal
+                    if pVal.hasPrefix("\n") { pVal.removeFirst() }
+                    if pVal.hasSuffix("\n") { pVal.removeLast() }
+                    members.append("\(jsonLiteral(pName)):\(jsonValue(pVal, type: schemas.type(function: name, parameter: pName)))")
+                }
 
-            // Match parameters: <parameter=([^>\n]+)>([\s\S]*?)(?:</parameter>|(?=<parameter=)|$)
-            let paramRegex = try? NSRegularExpression(pattern: "<parameter=([^>\\n]+)>([\\s\\S]*?)(?:</parameter>|(?=<parameter=)|$)", options: [])
-            let nsBody = body as NSString
-            let paramMatches = paramRegex?.matches(in: body, options: [], range: NSRange(location: 0, length: nsBody.length)) ?? []
-
-            // Arguments are assembled by hand so the parameter order the model produced is
-            // preserved: the chat template re-renders history from this JSON, and a reordered
-            // call would no longer match what the model actually generated.
-            var members: [String] = []
-            for pMatch in paramMatches {
-                guard pMatch.numberOfRanges > 2 else { continue }
-                let pName = nsBody.substring(with: pMatch.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
-                var pVal = nsBody.substring(with: pMatch.range(at: 2))
-
-                // Strip single leading/trailing newlines added by XML formatting
-                if pVal.hasPrefix("\n") { pVal.removeFirst() }
-                if pVal.hasSuffix("\n") { pVal.removeLast() }
-
-                members.append("\(jsonLiteral(pName)):\(jsonValue(pVal, type: schemas.type(function: name, parameter: pName)))")
+                return ToolCall(
+                    id: generateCallId(),
+                    type: "function",
+                    function: ToolCallFunction(name: name, arguments: "{" + members.joined(separator: ",") + "}")
+                )
             }
-
-            return ToolCall(
-                id: generateCallId(),
-                type: "function",
-                function: ToolCallFunction(name: name, arguments: "{" + members.joined(separator: ",") + "}")
-            )
         }
 
         // Format C: <tool_call>{function-name}<arg_key>{k}</arg_key><arg_value>{v}</arg_value>...</tool_call>
@@ -296,17 +293,9 @@ public enum QWToolCallParser {
             let name = String(inner[..<firstArgRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { return nil }
             let body = String(inner[firstArgRange.lowerBound...])
-            let argRegex = try? NSRegularExpression(
-                pattern: "<arg_key>([\\s\\S]*?)</arg_key>\\s*<arg_value>([\\s\\S]*?)(?:</arg_value>|(?=<arg_key>)|$)",
-                options: []
-            )
-            let nsBody = body as NSString
-            let argMatches = argRegex?.matches(in: body, options: [], range: NSRange(location: 0, length: nsBody.length)) ?? []
             var members: [String] = []
-            for aMatch in argMatches {
-                guard aMatch.numberOfRanges > 2 else { continue }
-                let pName = nsBody.substring(with: aMatch.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
-                var pVal = nsBody.substring(with: aMatch.range(at: 2))
+            for (pName, rawVal) in Self.extractGLMArgPairs(in: body) {
+                var pVal = rawVal
                 if pVal.hasPrefix("\n") { pVal.removeFirst() }
                 if pVal.hasSuffix("\n") { pVal.removeLast() }
                 members.append("\(jsonLiteral(pName)):\(jsonValue(pVal, type: schemas.type(function: name, parameter: pName)))")
@@ -328,6 +317,81 @@ public enum QWToolCallParser {
             )
         }
 
+        return nil
+    }
+
+    private static func extractXMLParameters(in body: String) -> [(String, String)] {
+        var out: [(String, String)] = []
+        var cursor = body.startIndex
+        while let open = body[cursor...].range(of: "<parameter="),
+              let gt = body[open.upperBound...].firstIndex(of: ">") {
+            let rawName = String(body[open.upperBound..<gt])
+            if rawName.contains("\n") {
+                cursor = body.index(after: open.lowerBound)
+                continue
+            }
+            let pName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let valStart = body.index(after: gt)
+            if let (valEnd, nextCursor) = findBoundaryCloseTag(
+                in: body, from: valStart, closeTag: "</parameter>", nextOpenTag: "<parameter="
+            ) {
+                out.append((pName, String(body[valStart..<valEnd])))
+                cursor = nextCursor
+            } else {
+                out.append((pName, String(body[valStart...])))
+                break
+            }
+        }
+        return out
+    }
+
+    private static func extractGLMArgPairs(in body: String) -> [(String, String)] {
+        var out: [(String, String)] = []
+        var cursor = body.startIndex
+        while let kOpen = body[cursor...].range(of: "<arg_key>"),
+              let kClose = body[kOpen.upperBound...].range(of: "</arg_key>"),
+              let vOpen = body[kClose.upperBound...].range(of: "<arg_value>") {
+            let between = body[kClose.upperBound..<vOpen.lowerBound]
+            guard between.allSatisfy(\.isWhitespace) else {
+                cursor = kClose.upperBound
+                continue
+            }
+            let pName = String(body[kOpen.upperBound..<kClose.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let valStart = vOpen.upperBound
+            if let (valEnd, nextCursor) = findBoundaryCloseTag(
+                in: body, from: valStart, closeTag: "</arg_value>", nextOpenTag: "<arg_key>"
+            ) {
+                out.append((pName, String(body[valStart..<valEnd])))
+                cursor = nextCursor
+            } else {
+                out.append((pName, String(body[valStart...])))
+                break
+            }
+        }
+        return out
+    }
+
+    private static func findBoundaryCloseTag(
+        in body: String,
+        from valStart: String.Index,
+        closeTag: String,
+        nextOpenTag: String
+    ) -> (valEnd: String.Index, nextCursor: String.Index)? {
+        var search = valStart
+        var fallbackNextOpen: String.Index? = nil
+        while let close = body[search...].range(of: closeTag) {
+            let after = body[close.upperBound...].drop(while: { $0.isWhitespace })
+            if after.isEmpty || after.hasPrefix(nextOpenTag) {
+                return (close.lowerBound, close.upperBound)
+            }
+            search = close.upperBound
+        }
+        if fallbackNextOpen == nil, let nextOpen = body[valStart...].range(of: nextOpenTag) {
+            fallbackNextOpen = nextOpen.lowerBound
+        }
+        if let end = fallbackNextOpen {
+            return (end, end)
+        }
         return nil
     }
 
@@ -357,7 +421,7 @@ public enum QWToolCallParser {
                 ? String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
                 : trimmed
             if let iv = Int64(unquoted) { return String(iv) }
-            if let dv = Double(unquoted), dv.isFinite, dv == Double(Int64(dv)) { return String(Int64(dv)) }
+            if let dv = Double(unquoted), dv.isFinite, let iv = Int64(exactly: dv) { return String(iv) }
             return jsonLiteral(raw)
         case .number:
             let unquoted = (trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"") && trimmed.count >= 2)
@@ -422,7 +486,7 @@ public enum QWToolCallParser {
                         else if low == "false" || low == "0" { out[k] = false }
                     case .integer:
                         if let iv = Int64(trimmed) { out[k] = iv }
-                        else if let dv = Double(trimmed), dv.isFinite, dv == Double(Int64(dv)) { out[k] = Int64(dv) }
+                        else if let dv = Double(trimmed), dv.isFinite, let iv = Int64(exactly: dv) { out[k] = iv }
                     case .number:
                         if let iv = Int64(trimmed) { out[k] = iv }
                         else if let dv = Double(trimmed), dv.isFinite { out[k] = dv }
@@ -477,8 +541,8 @@ public final class QWChatStreamParser: @unchecked Sendable {
 
     private enum Mode { case reasoning, content, toolCall }
 
-    private static let thinkOpen = "<think>"
-    private static let thinkClose = "</think>"
+    private static let thinkOpenTags = ["<think>", "<ernie:think>"]
+    private static let thinkCloseTags = ["</think>", "</ernie:think>"]
     private static let toolOpen = "<tool_call>"
 
     private var mode: Mode
@@ -540,34 +604,61 @@ public final class QWChatStreamParser: @unchecked Sendable {
         }
     }
 
+    private static func earliestTagRange(in text: String, tags: [String]) -> Range<String.Index>? {
+        var earliest: Range<String.Index>? = nil
+        for tag in tags {
+            if let r = text.range(of: tag), earliest.map({ r.lowerBound < $0.lowerBound }) ?? true {
+                earliest = r
+            }
+        }
+        return earliest
+    }
+
     private func drain(final: Bool) -> [Delta] {
         var out: [Delta] = []
         while true {
             switch mode {
             case .toolCall:
-                toolText += buffer
-                buffer = ""
+                if buffer.hasPrefix(Self.toolOpen) {
+                    let afterOpen = buffer.dropFirst(Self.toolOpen.count)
+                    if let close = QWToolCallParser.matchingToolCallClose(in: afterOpen) {
+                        let inner = afterOpen[..<close.lowerBound]
+                        let isClosed = QWToolCallParser.isBalancedToolPayload(inner)
+                            || (!QWToolCallParser.hasUnclosedLiteralContainer(inner)
+                                && (final || !afterOpen[close.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                        if isClosed {
+                            toolText += String(buffer[..<close.upperBound])
+                            buffer = String(afterOpen[close.upperBound...])
+                            mode = .content
+                            leadingPending = false
+                            continue
+                        }
+                    }
+                }
+                if final {
+                    toolText += buffer
+                    buffer = ""
+                }
                 return out
 
             case .reasoning:
                 if leadingPending {
-                    // Drop leading whitespace and a redundant literal opening tag.
                     buffer = String(buffer.drop(while: { $0.isWhitespace }))
-                    if buffer.hasPrefix(Self.thinkOpen) {
-                        buffer.removeFirst(Self.thinkOpen.count)
+                    if let openTag = Self.thinkOpenTags.first(where: { buffer.hasPrefix($0) }) {
+                        buffer.removeFirst(openTag.count)
                         continue
                     }
                     if buffer.isEmpty { return out }
-                    if !final && Self.thinkOpen.hasPrefix(buffer) { return out }
+                    if !final && Self.thinkOpenTags.contains(where: { $0.hasPrefix(buffer) }) { return out }
                     leadingPending = false
                 }
-                let close = buffer.range(of: Self.thinkClose)
+                let close = Self.earliestTagRange(in: buffer, tags: Self.thinkCloseTags)
                 let tool = allowToolCalls ? buffer.range(of: Self.toolOpen) : nil
                 if let close, tool.map({ close.lowerBound < $0.lowerBound }) ?? true {
                     emit(buffer[..<close.lowerBound], as: .reasoning, into: &out)
                     buffer = String(buffer[close.upperBound...])
                     mode = .content
-                    leadingPending = true
+                    leadingPending = false
                     continue
                 }
                 if let tool {
@@ -576,7 +667,7 @@ public final class QWChatStreamParser: @unchecked Sendable {
                     mode = .toolCall
                     continue
                 }
-                let activeTags = allowToolCalls ? [Self.thinkClose, Self.toolOpen] : [Self.thinkClose]
+                let activeTags = allowToolCalls ? (Self.thinkCloseTags + [Self.toolOpen]) : Self.thinkCloseTags
                 let hold = final ? 0 : Self.heldSuffix(buffer, tags: activeTags)
                 let cut = buffer.index(buffer.endIndex, offsetBy: -hold)
                 emit(buffer[..<cut], as: .reasoning, into: &out)
@@ -585,18 +676,27 @@ public final class QWChatStreamParser: @unchecked Sendable {
 
             case .content:
                 if leadingPending {
-                    buffer = String(buffer.drop(while: { $0.isWhitespace }))
-                    if buffer.isEmpty { return out }
                     if allowReasoningTags && !contentEmitted {
-                        if buffer.hasPrefix(Self.thinkOpen) {
-                            buffer.removeFirst(Self.thinkOpen.count)
-                            mode = .reasoning
-                            leadingPending = true
-                            continue
+                        if let nonWS = buffer.firstIndex(where: { !$0.isWhitespace }) {
+                            let afterWS = buffer[nonWS...]
+                            if let openTag = Self.thinkOpenTags.first(where: { afterWS.hasPrefix($0) }) {
+                                buffer = String(afterWS.dropFirst(openTag.count))
+                                mode = .reasoning
+                                leadingPending = true
+                                continue
+                            }
+                            if !final && Self.thinkOpenTags.contains(where: { $0.hasPrefix(afterWS) }) {
+                                return out
+                            }
+                            leadingPending = false
+                        } else if !final && buffer.count < 16 {
+                            return out
+                        } else {
+                            leadingPending = false
                         }
-                        if !final && Self.thinkOpen.hasPrefix(buffer) { return out }
+                    } else {
+                        leadingPending = false
                     }
-                    leadingPending = false
                 }
                 if allowToolCalls, let tool = buffer.range(of: Self.toolOpen) {
                     emit(buffer[..<tool.lowerBound], as: .content, into: &out)

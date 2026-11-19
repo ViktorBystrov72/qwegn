@@ -65,7 +65,9 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
     public let qIdxScratch: QWTensorValue?
     public let blockListScratch: QWTensorValue?
     public let blockCountScratch: QWTensorValue?
-    internal let coarseScratch: QWCoarsePoolIndex.Scratch?
+    internal let coarsePipeline: QWCoarseSelectionPipeline?
+    private var emptyClusteredMacros: [Int]
+    internal var coarseScratch: QWCoarsePoolIndex.Scratch? { coarsePipeline?.scratch }
 
     internal let hal: QWHal
     internal let psoInPrep: any MTLComputePipelineState
@@ -78,25 +80,36 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
     internal let psoAttnCombine: any MTLComputePipelineState
     internal let psoVhaInvRope: any MTLComputePipelineState
     internal let psoGroupedWoAGemv: any MTLComputePipelineState
+    internal let psoGroupedWoAGemvSub2: any MTLComputePipelineState
     internal let psoGroupedWoAGemvMR: any MTLComputePipelineState
+    internal let psoGroupedWoAGemvMRSub2: any MTLComputePipelineState
     internal let psoGroupedWoAMMA: any MTLComputePipelineState
+    internal let psoGroupedWoAMMASub2: any MTLComputePipelineState
     internal let psoGroupedWoANAX: (any MTLComputePipelineState)?
-    internal let coarsePipelines: QWCoarsePoolIndex.Pipelines?
-    internal let psoEmeansLsa: (
-        scoreCoarse: any MTLComputePipelineState,
-        scoreCands: any MTLComputePipelineState,
-        flatFallback: any MTLComputePipelineState
-    )?
-    internal var clusteredMacros: [Int]
+    internal let psoGroupedWoANAXSub2: (any MTLComputePipelineState)?
+    internal var coarsePipelines: QWCoarsePoolIndex.Pipelines? { coarsePipeline?.pipelines }
+    internal var psoEmeansLsa: QWCoarseSelectionPipeline.EmeansPSOTuple? { coarsePipeline?.emeansTuple }
+    internal var clusteredMacros: [Int] {
+        get { coarsePipeline?.watermarks ?? emptyClusteredMacros }
+        set {
+            if let coarsePipeline { coarsePipeline.watermarks = newValue }
+            else { emptyClusteredMacros = newValue }
+        }
+    }
 
     public func resetCoarseWatermarks() {
-        for i in clusteredMacros.indices { clusteredMacros[i] = 0 }
+        coarsePipeline?.resetWatermarks()
+        for i in emptyClusteredMacros.indices { emptyClusteredMacros[i] = 0 }
     }
 
     public func truncatePosition(_ validPosition: Int) {
+        if let coarsePipeline {
+            coarsePipeline.truncatePosition(validPosition, poolShift: poolShift)
+            return
+        }
         let maxMacro = max(0, validPosition) / QWCoarsePoolIndex.macroChunkTokens(poolShift: poolShift)
-        for i in clusteredMacros.indices where clusteredMacros[i] > maxMacro {
-            clusteredMacros[i] = maxMacro
+        for i in emptyClusteredMacros.indices where emptyClusteredMacros[i] > maxMacro {
+            emptyClusteredMacros[i] = maxMacro
         }
     }
 
@@ -267,32 +280,29 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
         self.psoAttnCombine = try hal.pipeline("qwg_hca_attn_combine")
         self.psoVhaInvRope = try hal.pipeline("qwg_hca_vha_invrope")
         self.psoGroupedWoAGemv = try hal.pipeline("qwg_hca_grouped_wo_a_gemv")
+        self.psoGroupedWoAGemvSub2 = try hal.pipeline("qwg_hca_grouped_wo_a_gemv_sub2")
         self.psoGroupedWoAGemvMR = try hal.pipeline("qwg_hca_grouped_wo_a_gemv_mr")
+        self.psoGroupedWoAGemvMRSub2 = try hal.pipeline("qwg_hca_grouped_wo_a_gemv_mr_sub2")
         self.psoGroupedWoAMMA = try hal.pipeline("qwg_hca_grouped_wo_a_mma")
+        self.psoGroupedWoAMMASub2 = try hal.pipeline("qwg_hca_grouped_wo_a_mma_sub2")
         self.psoGroupedWoANAX = hal.caps.isMetal4TensorCapable
             ? try hal.pipeline("qwg_hca_grouped_wo_a_nax") : nil
+        self.psoGroupedWoANAXSub2 = hal.caps.isMetal4TensorCapable
+            ? try hal.pipeline("qwg_hca_grouped_wo_a_nax_sub2") : nil
 
         let needLsa = (lsaConfig.mode != .off)
             && (self.compressRatio.nonzeroBitCount == 1)
             && (self.maxCompBlocks > self.compBudget)
         self.lsaAllocated = needLsa
-        if needLsa {
-            self.coarsePipelines = try QWCoarsePoolIndex.Pipelines(hal: hal)
-            self.psoEmeansLsa = (
-                try hal.pipeline("qwg_emeans_lsa_score_coarse"),
-                try hal.pipeline("qwg_emeans_lsa_score_cands"),
-                try hal.pipeline("qwg_emeans_lsa_flat_fallback")
-            )
-        } else {
-            self.coarsePipelines = nil
-            self.psoEmeansLsa = nil
-        }
+        let loadedCoarse = needLsa
+            ? try QWCoarseSelectionPipeline.LoadedPipelines.load(hal: hal, variant: .lsa)
+            : nil
         if let rawEnv = ProcessInfo.processInfo.environment["QW_HCA_EMEANS"]?.lowercased() {
             self.emeansCoarseEnabled = needLsa && rawEnv != "0" && rawEnv != "false" && rawEnv != "off"
         } else {
             self.emeansCoarseEnabled = needLsa
         }
-        self.clusteredMacros = Array(repeating: 0, count: numHcaLayers)
+        self.emptyClusteredMacros = Array(repeating: 0, count: numHcaLayers)
 
         var cursor = 0
         func align256(_ x: Int) -> Int { (x + 255) & ~255 }
@@ -305,7 +315,6 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
         let maxMacros = needLsa
             ? QWCoarsePoolIndex.maxMacros(forMaxContext: self.maxContext, poolShift: self.poolShift)
             : 0
-        let csrSizes = QWCoarsePoolIndex.csrBytesPerMacro(indexDim: self.indexDim)
         let paddedCompBlocks = (self.maxCompBlocks + 7) & ~7
 
         struct LayerOffs {
@@ -314,9 +323,7 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
             let scPend: Int
             let comp: Int
             let pooled: Int
-            let cCent: Int
-            let cMem: Int
-            let cSpan: Int
+            let csr: QWCoarseSelectionPipeline.CSROffsets
         }
         var layerOffs: [LayerOffs] = []
         layerOffs.reserveCapacity(numHcaLayers)
@@ -326,12 +333,11 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
             let scPendOff = reserve(self.ringCap * self.headDim * 4)
             let compOff = reserve(paddedCompBlocks * self.headDim * 2)
             let pOff = needLsa ? reserve(paddedCompBlocks * self.indexDim * 2) : 0
-            let cCent = needLsa ? reserve(maxMacros * csrSizes.centroids) : 0
-            let cMem = needLsa ? reserve(maxMacros * csrSizes.members) : 0
-            let cSpan = needLsa ? reserve(maxMacros * csrSizes.spans) : 0
+            let csr = QWCoarseSelectionPipeline.CSROffsets.reserve(
+                enabled: needLsa, maxMacros: maxMacros, indexDim: self.indexDim, reserve: reserve)
             layerOffs.append(LayerOffs(
                 swa: swaOff, kvPend: kvPendOff, scPend: scPendOff, comp: compOff,
-                pooled: pOff, cCent: cCent, cMem: cMem, cSpan: cSpan
+                pooled: pOff, csr: csr
             ))
         }
 
@@ -354,13 +360,9 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
         let listOff = needLsa ? reserve(maxT * self.listStride * 4) : 0
         let countOff = needLsa ? reserve(maxT * 4) : 0
         let maxClusters = maxMacros * QWCoarsePoolIndex.clustersPerMacro
-        let cScSizes = QWCoarsePoolIndex.scratchByteSizes(
-            maxBatchRows: self.selectBatchRows, maxClusters: maxClusters, candCap: Self.emeansCandCap)
-        let cScoreOff = needLsa ? reserve(cScSizes.cScore) : 0
-        let cHistOff = needLsa ? reserve(cScSizes.uHist) : 0
-        let cStateOff = needLsa ? reserve(cScSizes.candState) : 0
-        let cPoolsOff = needLsa ? reserve(cScSizes.candPools) : 0
-        let cUOff = needLsa ? reserve(cScSizes.candU) : 0
+        let coarseScratchOffs = QWCoarseSelectionPipeline.ScratchOffsets.reserve(
+            enabled: needLsa, maxBatchRows: self.selectBatchRows,
+            maxClusters: maxClusters, candCap: Self.emeansCandCap, reserve: reserve)
 
         let totalBytes = max(4096, cursor)
         guard let buf = hal.device.makeBuffer(length: totalBytes, options: .storageModeShared) else {
@@ -386,12 +388,9 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
         builtLayers.reserveCapacity(numHcaLayers)
         for i in 0..<numHcaLayers {
             let o = layerOffs[i]
-            let csr: QWCoarsePoolIndex.LayerCSR? = needLsa ? QWCoarsePoolIndex.LayerCSR(
-                centroids: QWTensorValue(region: reg, offset: o.cCent, shape: QWTensorShape([maxClusters, self.indexDim], .f16)),
-                memberPools: QWTensorValue(region: reg, offset: o.cMem, shape: QWTensorShape([maxMacros * 512], .i32)),
-                clusterSpans: QWTensorValue(region: reg, offset: o.cSpan, shape: QWTensorShape([maxClusters], .i32)),
-                maxMacros: maxMacros
-            ) : nil
+            let csr: QWCoarsePoolIndex.LayerCSR? = needLsa
+                ? o.csr.makeLayerCSR(region: reg, maxMacros: maxMacros, indexDim: self.indexDim)
+                : nil
             let pKeys: QWTensorValue? = needLsa
                 ? QWTensorValue(region: reg, offset: o.pooled, shape: QWTensorShape([paddedCompBlocks, self.indexDim], .f16))
                 : nil
@@ -418,25 +417,20 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
         self.partOScratch = QWTensorValue(region: reg, offset: partOOff, shape: QWTensorShape([max(1, splitRows), self.headDim], .f16))
         self.partMLScratch = QWTensorValue(region: reg, offset: partMLOff, shape: QWTensorShape([max(1, splitRows), 2], .f32))
 
-        if needLsa {
+        if let loadedCoarse, needLsa {
             self.qIdxScratch = QWTensorValue(region: reg, offset: qIdxOff, shape: QWTensorShape([maxT, self.indexDim], .f16))
             self.blockListScratch = QWTensorValue(region: reg, offset: listOff, shape: QWTensorShape([maxT, self.listStride], .i32))
             self.blockCountScratch = QWTensorValue(region: reg, offset: countOff, shape: QWTensorShape([maxT], .i32))
-            self.coarseScratch = QWCoarsePoolIndex.Scratch(
-                cScore: QWTensorValue(region: reg, offset: cScoreOff, shape: QWTensorShape([self.selectBatchRows, maxClusters], .i32)),
-                uHist: QWTensorValue(region: reg, offset: cHistOff, shape: QWTensorShape([self.selectBatchRows, 512], .i32)),
-                candState: QWTensorValue(region: reg, offset: cStateOff, shape: QWTensorShape([self.selectBatchRows * 2], .i32)),
-                candPools: QWTensorValue(region: reg, offset: cPoolsOff, shape: QWTensorShape([self.selectBatchRows, Self.emeansCandCap], .i32)),
-                candU: QWTensorValue(region: reg, offset: cUOff, shape: QWTensorShape([self.selectBatchRows, Self.emeansCandCap], .i32)),
-                maxBatchRows: self.selectBatchRows,
-                clusterStride: maxClusters,
-                candCap: Self.emeansCandCap
-            )
+            let cScratch = coarseScratchOffs.makeScratch(
+                region: reg, maxBatchRows: self.selectBatchRows,
+                maxClusters: maxClusters, candCap: Self.emeansCandCap)
+            self.coarsePipeline = QWCoarseSelectionPipeline(
+                variant: .lsa, loaded: loadedCoarse, scratch: cScratch, layerCount: numHcaLayers)
         } else {
             self.qIdxScratch = nil
             self.blockListScratch = nil
             self.blockCountScratch = nil
-            self.coarseScratch = nil
+            self.coarsePipeline = nil
         }
     }
 

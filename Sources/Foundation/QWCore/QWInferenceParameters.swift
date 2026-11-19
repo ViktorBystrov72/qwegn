@@ -59,8 +59,8 @@ public struct QWSamplingParameters: Codable, Sendable, Equatable {
     ) -> QWSamplingParameters {
         let resolvedTemp = temperature ?? self.temperature
         let resolvedTopP = topP ?? self.topP
-        // A near-zero top_p nucleus (<= 1e-5) or temperature <= 0 collapses sampling to deterministic greedy argmax.
-        let topPForcesGreedy = topP != nil && resolvedTopP <= 1e-5
+        // A tiny positive top_p nucleus (0 < top_p <= 1e-5) or temperature <= 0 collapses to greedy; top_p == 0 remains invalid.
+        let topPForcesGreedy = topP != nil && resolvedTopP > 0.0 && resolvedTopP <= 1e-5
         let resolvedTopK = topPForcesGreedy ? 1 : (topK ?? self.topK)
         let isRequestOverrideGreedy = (temperature != nil && resolvedTemp <= 0.0)
             || (topK != nil && resolvedTopK == 1)

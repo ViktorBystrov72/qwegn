@@ -1,4 +1,5 @@
 import XCTest
+import QWRope
 @testable import QWFlashNext
 import QWCore
 
@@ -13,7 +14,7 @@ final class FNSelectionTieTests: XCTestCase {
             qNorm: [Float](repeating: 0, count: headDim), kNorm: [Float](repeating: 0, count: headDim))
         let tokens = 20
         let x = (0..<(tokens * hidden)).map { Float(($0 * 37) % 11) - 5 }
-        let rope = FNRope(rotaryDim: 4, theta: 1e7)
+        let rope = QWRopeCPU(rotaryDim: 4, theta: 1e7)
         let sel = indexer.select(x, rows: tokens, hidden: hidden, rope: rope)
         // Query 19: complete blocks 0...4 (tokens 0-19), tail empty. Equal scores -> blocks 4 and 3 (tokens 12-19).
         let row = (0..<tokens).filter { sel[19][$0] }

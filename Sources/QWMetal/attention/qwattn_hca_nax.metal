@@ -224,7 +224,7 @@ METAL_FUNC void qw_hca_attn_nax_run(
         const size_t rowIdx = (nSplit > 1u) ? (((size_t)t * nSplit + z) * p.qHeads + h)
                                             : ((size_t)t * p.qHeads + h);
         if (nSplit > 1u && sg_d == 0u && sn == 0) {
-            partML[rowIdx] = float2((l > 0.0f) ? (mrow[i] * 0.6931471805599453f) : -INFINITY, l);
+            partML[rowIdx] = float2((l > 0.0f) ? (mrow[i] * 0.6931471805599453f) : -1e30f, l);
         }
         device half* dst = outBuf + rowIdx * HCA_NAX_DIM + dimCol;
         STEEL_PRAGMA_UNROLL

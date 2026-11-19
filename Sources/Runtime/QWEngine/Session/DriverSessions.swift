@@ -99,6 +99,8 @@ extension QWEngineDriver {
                     s.roundRecord.outputCount = s.generated
                     s.trunkHiddenValid = s.trunkHidden != nil && s.position > 0
                 }
+            } else {
+                s.dflashCacheOffset = 0
             }
             return s
         } catch {
@@ -121,8 +123,15 @@ extension QWEngineDriver {
         session.sessionFinished = true
         session.mlaIndexerStash = nil
         session.mlaLiveStash = nil
-        session.lastCommitCB?.waitUntilCompleted()
-        session.lastCommitCB = nil
+        if let cb = session.lastCommitCB {
+            cb.waitUntilCompleted()
+            session.lastCommitCB = nil
+            _ = syncCommitFailure(for: session, cb: cb)
+        }
+        if hcaOperator?.stateOwner === session { hcaOperator?.stateOwner = nil }
+        if mlaOperator?.stateOwner === session { mlaOperator?.stateOwner = nil }
+        if lsaOperator?.stateOwner === session { lsaOperator?.stateOwner = nil }
+        if mbsaOperator?.stateOwner === session { mbsaOperator?.stateOwner = nil }
         session.stochastic?.stream.cancelActiveRound()
         if let owner = session.stochastic { session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed }
         if verifiedSession === session {
@@ -154,8 +163,12 @@ extension QWEngineDriver {
         flight.lock()
         defer { flight.unlock() }
         try requestGate.validate()
-        session.lastCommitCB?.waitUntilCompleted()
+        let cb = session.lastCommitCB
+        cb?.waitUntilCompleted()
         session.lastCommitCB = nil
+        guard !syncCommitFailure(for: session, cb: cb) else {
+            throw QWEngineDriverError.state("commit GPU failure before snapshotSession")
+        }
         return try QWEngineSessionState.snapshot(
             session, cache: kvCache, mtpCache: mtpCache,
             sparseStateData: captureMLAIndexerState(session))
@@ -167,8 +180,11 @@ extension QWEngineDriver {
         defer { flight.unlock() }
 
         try requestGate.validate()
-        session.lastCommitCB?.waitUntilCompleted()
-        session.lastCommitCB = nil
+        if let cb = session.lastCommitCB {
+            cb.waitUntilCompleted()
+            session.lastCommitCB = nil
+            _ = syncCommitFailure(for: session, cb: cb)
+        }
         try claimMLAIndexerState(session)
         try QWEngineSessionState.restore(session, to: snapshot, cache: kvCache,
                                         mtpCache: mtpCache, attnLayers: attnLayers)
@@ -188,8 +204,12 @@ extension QWEngineDriver {
         defer { flight.unlock() }
         try requestGate.validate()
         guard verifiedSession == nil else { throw QWEngineDriverError.busy }
-        session.lastCommitCB?.waitUntilCompleted()
+        let cb = session.lastCommitCB
+        cb?.waitUntilCompleted()
         session.lastCommitCB = nil
+        guard !syncCommitFailure(for: session, cb: cb) else {
+            throw QWEngineDriverError.state("commit GPU failure before capturePrivatePrefix")
+        }
         return try QWEngineSessionState.capturePrivatePrefix(session, cache: kvCache,
                                                             mtpCache: mtpCache, maxBytes: maxBytes,
                                                             mlaIndexerData: captureMLAIndexerState(session))
@@ -201,8 +221,12 @@ extension QWEngineDriver {
         defer { flight.unlock() }
         try requestGate.validate(permit)
         guard verifiedSession == nil else { throw QWEngineDriverError.busy }
-        session.lastCommitCB?.waitUntilCompleted()
+        let cb = session.lastCommitCB
+        cb?.waitUntilCompleted()
         session.lastCommitCB = nil
+        guard !syncCommitFailure(for: session, cb: cb) else {
+            throw QWEngineDriverError.state("commit GPU failure before captureSharedPrefix")
+        }
         return try QWEngineSessionState.captureSharedPrefix(session, cache: kvCache,
                                                            mtpCache: mtpCache, maxBytes: maxBytes,
                                                            mlaIndexerData: captureMLAIndexerState(session))
@@ -375,8 +399,14 @@ extension QWEngineDriver {
             guard needsClaim else { return }
             if let prev = (hca.stateOwner ?? mlaOperator?.stateOwner ?? lsaOperator?.stateOwner) as? QWEngineSession,
                !prev.sessionFinished, prev.position > 0 {
-                prev.lastCommitCB?.waitUntilCompleted()
-                prev.mlaIndexerStash = (captureLiveCompositeState(position: prev.position), prev.position)
+                let prevCB = prev.lastCommitCB
+                prevCB?.waitUntilCompleted()
+                prev.lastCommitCB = nil
+                if !syncCommitFailure(for: prev, cb: prevCB) {
+                    prev.mlaIndexerStash = (captureLiveCompositeState(position: prev.position), prev.position)
+                } else {
+                    prev.mlaIndexerStash = nil
+                }
             }
             hca.stateOwner = session
             mlaOperator?.stateOwner = session
@@ -408,12 +438,18 @@ extension QWEngineDriver {
             let mtpLayer = (mtpDraftEncoder != nil || echoDrafter != nil) && attnLayers.count < mla.layers.count
                 ? attnLayers.count : nil
             if let prev = mla.stateOwner as? QWEngineSession, !prev.sessionFinished, prev.position > 0 {
-                prev.lastCommitCB?.waitUntilCompleted()
-                let mtpPos = prev.roundRecord.mtpPhysicalRows
-                prev.mlaLiveStash = (
-                    mla.captureLiveSessionStash(trunkPosition: prev.position, mtpLayerIndex: mtpLayer, mtpPosition: mtpPos),
-                    prev.position, mtpPos
-                )
+                let prevCB = prev.lastCommitCB
+                prevCB?.waitUntilCompleted()
+                prev.lastCommitCB = nil
+                if !syncCommitFailure(for: prev, cb: prevCB) {
+                    let mtpPos = prev.roundRecord.mtpPhysicalRows
+                    prev.mlaLiveStash = (
+                        mla.captureLiveSessionStash(trunkPosition: prev.position, mtpLayerIndex: mtpLayer, mtpPosition: mtpPos),
+                        prev.position, mtpPos
+                    )
+                } else {
+                    prev.mlaLiveStash = nil
+                }
             }
             mla.stateOwner = session
             defer {
@@ -440,8 +476,14 @@ extension QWEngineDriver {
             guard lsa.stateOwner !== session else { return }
             if let prev = lsa.stateOwner as? QWEngineSession,
                !prev.sessionFinished, !prev.batchedDecodeTouched, prev.position > 0 {
-                prev.lastCommitCB?.waitUntilCompleted()
-                prev.mlaIndexerStash = (lsa.captureIndexerState(position: prev.position), prev.position)
+                let prevCB = prev.lastCommitCB
+                prevCB?.waitUntilCompleted()
+                prev.lastCommitCB = nil
+                if !syncCommitFailure(for: prev, cb: prevCB) {
+                    prev.mlaIndexerStash = (lsa.captureIndexerState(position: prev.position), prev.position)
+                } else {
+                    prev.mlaIndexerStash = nil
+                }
             }
             lsa.stateOwner = session
             defer { session.mlaIndexerStash = nil }
@@ -458,8 +500,14 @@ extension QWEngineDriver {
         } else if let mbsa = mbsaOperator {
             guard mbsa.stateOwner !== session else { return }
             if let prev = mbsa.stateOwner as? QWEngineSession, !prev.sessionFinished, prev.position > 0 {
-                prev.lastCommitCB?.waitUntilCompleted()
-                prev.mlaIndexerStash = (mbsa.captureIndexerState(position: prev.position), prev.position)
+                let prevCB = prev.lastCommitCB
+                prevCB?.waitUntilCompleted()
+                prev.lastCommitCB = nil
+                if !syncCommitFailure(for: prev, cb: prevCB) {
+                    prev.mlaIndexerStash = (mbsa.captureIndexerState(position: prev.position), prev.position)
+                } else {
+                    prev.mlaIndexerStash = nil
+                }
             }
             mbsa.stateOwner = session
             defer { session.mlaIndexerStash = nil }

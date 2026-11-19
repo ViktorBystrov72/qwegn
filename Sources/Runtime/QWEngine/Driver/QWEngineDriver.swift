@@ -8,6 +8,8 @@
 import Foundation
 import Darwin
 import Metal
+import os
+import Synchronization
 import QWCore
 import QWHAL
 import QWAlloc
@@ -90,8 +92,8 @@ public final class QWEngineDriver: @unchecked Sendable {
         set { prefillModeLock.withLock { storedPrefillMode = newValue } }
     }
     public var gdnSolveBackend: QWGDNPrefill.SolveBackend {
-        get { gdnPrefill.solveBackend }
-        set { gdnPrefill.solveBackend = newValue }
+        get { prefillModeLock.withLock { gdnPrefill.solveBackend } }
+        set { prefillModeLock.withLock { gdnPrefill.solveBackend = newValue } }
     }
 
     // Weight views are module-internal: an internal property may not expose a private type.
@@ -137,13 +139,29 @@ public final class QWEngineDriver: @unchecked Sendable {
     let mtpVerifyHeadQ4: Bool
     let mtpStageProfiling: Bool
     let mtpVerificationProfiling: Bool
-    var verificationGpuMsByStage: [String: Double]?
+    let admission = QWSessionAdmissionManager()
+    let commandFrame = QWCommandFrame()
+    let speculativeCoordinator = QWSpeculativeSessionCoordinator()
+
+    var verificationGpuMsByStage: [String: Double]? {
+        get { speculativeCoordinator.verificationGpuMsByStage }
+        set { speculativeCoordinator.verificationGpuMsByStage = newValue }
+    }
     let mtpBatchedMLP: QWMTPBatchedMLP?
     let mtpBatchedTrunk: QWMTPBatchedTrunk?
     let mtpSharedAttentionPartials: QWMRegion?
-    var pendingMTPProfile: (draft: QWMTPStageTiming, verification: QWMTPStageTiming)?
-    var pendingMTPAdaptiveEntropy: [Double]?
-    var lastMTPRoundProfile: QWMTPRoundProfile?
+    var pendingMTPProfile: (draft: QWMTPStageTiming, verification: QWMTPStageTiming)? {
+        get { speculativeCoordinator.pendingMTPProfile }
+        set { speculativeCoordinator.pendingMTPProfile = newValue }
+    }
+    var pendingMTPAdaptiveEntropy: [Double]? {
+        get { speculativeCoordinator.pendingMTPAdaptiveEntropy }
+        set { speculativeCoordinator.pendingMTPAdaptiveEntropy = newValue }
+    }
+    var lastMTPRoundProfile: QWMTPRoundProfile? {
+        get { speculativeCoordinator.lastMTPRoundProfile }
+        set { speculativeCoordinator.lastMTPRoundProfile = newValue }
+    }
     let embedStaging: any MTLBuffer              // one [H] f16 host-shared row buffer (init-time)
     let headStorage: QWHeadStorage
     let finalNorm: QWTensorValue
@@ -152,9 +170,14 @@ public final class QWEngineDriver: @unchecked Sendable {
     /// the weight arena never carries it.
     let mtpDraftHead: QWMTPTDraftHead?
 
-    public internal(set) var mtpDraftProposals: Int = 0
-    public internal(set) var mtpDraftAccepted: Int = 0
-
+    public internal(set) var mtpDraftProposals: Int {
+        get { speculativeCoordinator.mtpDraftProposals }
+        set { speculativeCoordinator.mtpDraftProposals = newValue }
+    }
+    public internal(set) var mtpDraftAccepted: Int {
+        get { speculativeCoordinator.mtpDraftAccepted }
+        set { speculativeCoordinator.mtpDraftAccepted = newValue }
+    }
 
     /// Dedicated MTP draft scratch buffers (Phase 4, section 5A.6).
     typealias MTPScratch = QWMTPDraftScratch
@@ -162,21 +185,45 @@ public final class QWEngineDriver: @unchecked Sendable {
     let mtpDraftEncoder: QWMTPDraftEncoder?
     let echoDrafter: QWEchoDraftEncoder?
     let dflashDrafter: QWDFlashDrafter?
-    var lastRoundUsedPLD: Bool = false
-    var lastDraftedPairs: Int = 0
+    var lastRoundUsedPLD: Bool {
+        get { speculativeCoordinator.lastRoundUsedPLD }
+        set { speculativeCoordinator.lastRoundUsedPLD = newValue }
+    }
+    var lastDraftedPairs: Int {
+        get { speculativeCoordinator.lastDraftedPairs }
+        set { speculativeCoordinator.lastDraftedPairs = newValue }
+    }
     public var dflashDraftPackPath: String? { dflashDrafter?.packPath }
     public var dflashSelectorTopK: Int? { dflashDrafter?.config.selectorTopK }
     let gdnReplayCheckpoint: QWGDNReplayCheckpoint?
     let mtpPromptEmbeddings: QWTensorValue?
     let verifyWindow: QWVerifyWindow?
-    var verifiedSession: QWEngineSession?
-    var verifiedInputs: [Int] = []
-    var preparedGreedyLease: QWGreedyRoundLease?
-    var preparedStochasticWitness: QWStochasticRoundWitness?
-    let requestGate = QWGenerationRequestGate()
+    var verifiedSession: QWEngineSession? {
+        get { speculativeCoordinator.verifiedSession }
+        set { speculativeCoordinator.verifiedSession = newValue }
+    }
+    var verifiedInputs: [Int] {
+        get { speculativeCoordinator.verifiedInputs }
+        set { speculativeCoordinator.verifiedInputs = newValue }
+    }
+    var preparedGreedyLease: QWGreedyRoundLease? {
+        get { speculativeCoordinator.preparedGreedyLease }
+        set { speculativeCoordinator.preparedGreedyLease = newValue }
+    }
+    var preparedStochasticWitness: QWStochasticRoundWitness? {
+        get { speculativeCoordinator.preparedStochasticWitness }
+        set { speculativeCoordinator.preparedStochasticWitness = newValue }
+    }
+    var requestGate: QWGenerationRequestGate { admission.requestGate }
     var prefixStore: QWEnginePrefixStore<QWEngineCachedPrefix>?
     var cacheDiskManager: QWCacheDiskManager?
-    public internal(set) var lastPrefixCacheStats: QWPrefixCacheStats?
+    let coldWriteController = QWAsyncColdWriteController()
+    private let statsLock = NSLock()
+    private var _lastPrefixCacheStats: QWPrefixCacheStats?
+    public internal(set) var lastPrefixCacheStats: QWPrefixCacheStats? {
+        get { statsLock.withLock { _lastPrefixCacheStats } }
+        set { statsLock.withLock { _lastPrefixCacheStats = newValue } }
+    }
     let mtpCache: QWKVCache?
     public let mtpDrafts: Int
     /// Performance and memory tunables, environment overrides applied.
@@ -221,23 +268,39 @@ public final class QWEngineDriver: @unchecked Sendable {
     let pscBuffer: any MTLBuffer
     let pscByteOffset: Int
     let pscByteLength: Int
-    let flight = NSLock()          // single-flight admission
-    var activeCB: (any MTLCommandBuffer)?
-    var activeEnc: (any MTLComputeCommandEncoder)?
-    var pendingColdUnloads: [(streamer: ColdExpertStreamer, stagedCount: Int)] = []
-    /// Every command buffer a decode step splits into (cold staging ends and
-    /// reopens the CB per MoE layer). Non-nil only inside `forwardStep`, so the
-    /// step's GPU time covers all of them, not just the last.
-    var stepCBs: [any MTLCommandBuffer]?
-    var decodeTel = QWDecodeTelemetry()
-    var coldEvents: ColdEventPipeline?
+    var flight: NSLock { admission.flight }
+    var generateLock: NSRecursiveLock { admission.generateLock }
+    var activeCB: (any MTLCommandBuffer)? {
+        get { commandFrame.activeCB }
+        set { commandFrame.activeCB = newValue }
+    }
+    var activeEnc: (any MTLComputeCommandEncoder)? {
+        get { commandFrame.activeEnc }
+        set { commandFrame.activeEnc = newValue }
+    }
+    var pendingColdUnloads: [(streamer: ColdExpertStreamer, stagedCount: Int)] {
+        get { commandFrame.pendingColdUnloads }
+        set { commandFrame.pendingColdUnloads = newValue }
+    }
+    var stepCBs: [any MTLCommandBuffer]? {
+        get { commandFrame.stepCBs }
+        set { commandFrame.stepCBs = newValue }
+    }
+    var decodeTel: QWDecodeTelemetry {
+        get { commandFrame.decodeTel }
+        set { commandFrame.decodeTel = newValue }
+    }
+    var coldEvents: ColdEventPipeline? {
+        get { commandFrame.coldEvents }
+        set { commandFrame.coldEvents = newValue }
+    }
     var spanMapIds: (any MTLBuffer)?  // qwg_moe_span_ids output of the current prefill span (host-read)
 
-    // Pre-carved GDN session slots (two: the engine holds at most two live
-    // sequences — one computing, one being admitted; more would share the
-    // step scratch anyway under the single-flight law). Each slot carries
-    let slotLock = NSLock()
-    var freeSlots: [GdnSlot] = []
+    var slotLock: NSLock { admission.slotLock }
+    var freeSlots: [GdnSlot] {
+        get { admission.freeSlots }
+        set { admission.freeSlots = newValue }
+    }
 
     public init(packPath: String, maxTokens: Int = 4096, ropeRows: Int = 8192,
                 kvMode: QWKVMode = .f16,
@@ -426,7 +489,7 @@ public final class QWEngineDriver: @unchecked Sendable {
         self.attnDecode = aDec
         self.gdnConv = try QWGDNConv(hal: prelimHal, geometry: geometry)
         self.gdnDecode = try QWGDNDecode(hal: prelimHal)
-        let needsMTPCache = (startup.mtpWeightDrafts > 0 || cfg.mtpBackend == .dflash2) && startup.mtpDrafts > 0
+        let needsMTPCache = startup.mtpWeightDrafts > 0 && startup.mtpDrafts > 0
         let caches = try Self.makeKVCaches(
             hal: prelimHal, arena: budget.arena, attnLayers: attnL, kvMode: kvMode,
             geometry: geometry, mtpDrafts: needsMTPCache ? startup.mtpDrafts : 0,
@@ -448,7 +511,7 @@ public final class QWEngineDriver: @unchecked Sendable {
                                   drafts: startup.mtpDrafts, selectorTopK: cfg.dflashSelectorTopK,
                                   sessionSlotCount: Self.gdnSlotCount()) : nil
         self.dflashDrafter = dflash
-        self.freeSlots = try Self.buildGDNSlots(
+        admission.freeSlots = try Self.buildGDNSlots(
             gsub: gsub, geometry: geometry, gdnLayerCount: gdnL.count,
             mtpDrafts: startup.mtpDrafts, dflashDrafter: dflash)
 
@@ -484,8 +547,22 @@ public final class QWEngineDriver: @unchecked Sendable {
         self.mtpSharedAttentionPartials = mtpRes.mtpSharedAttentionPartials
         self.mtpScratch = mtpRes.mtpScratch; self.mtpPromptEmbeddings = mtpRes.mtpPromptEmbeddings
         self.mtpDraftEncoder = mtpRes.mtpDraftEncoder; self.echoDrafter = mtpRes.echoDrafter
+        self.mtpDraftEncoder?.driver = self
 
         asub.markSteadyState(); gsub.markSteadyState()
+        let hasDynamicMoECache = decoder.layers.contains { $0.moe?.coldStreamer?.isDynamic == true }
+        if tuning.expertCache {
+            for lw in decoder.layers { _ = lw.moe?.coldStreamer?.attachGPUSlotMap(device: prelimHal.device) }
+            if hasDynamicMoECache, spanMapIds == nil {
+                spanMapIds = prelimHal.device.makeBuffer(
+                    length: max(4 * chunkRows * geometry.expertsPerTok, 4096),
+                    options: .storageModeShared)
+            }
+        }
+        if tuning.coldEvents, !Self.decodeProfileEnabled, !QWMoEChain.coldTimingProxy,
+           hasDynamicMoECache, coldEvents == nil {
+            coldEvents = ColdEventPipeline(device: prelimHal.device)
+        }
         prelimHal.adoptPendingResidency()
         prelimHal.makeResident(allResidentBuffers())
         try Self.prewarmPipelines(hal: prelimHal, doors: prewarmDoors)
@@ -504,21 +581,65 @@ public final class QWEngineDriver: @unchecked Sendable {
         }
     }
 
-    public var onCacheEvent: (@Sendable (QWPrefixCacheEvent) -> Void)?
+    private var _onCacheEvent: (@Sendable (QWPrefixCacheEvent) -> Void)?
+    public var onCacheEvent: (@Sendable (QWPrefixCacheEvent) -> Void)? {
+        get { statsLock.withLock { _onCacheEvent } }
+        set { statsLock.withLock { _onCacheEvent = newValue } }
+    }
     var activePrefillProgress: (@Sendable (Int, Int) -> Void)?
     var activePrefillTotalTokens: Int?
     var activePrefillBasePosition: Int = 0
-    public internal(set) var lastExperimentalGeneration: QWExperimentalGenerationStats?
-    public internal(set) var lastGeneration: QWGenerationStats?
-    public internal(set) var lastRequestedBackend: String?
-    public internal(set) var lastPromptTokens: Int = 0
-    public internal(set) var lastStopToken: Int?
+    private var _lastExperimentalGeneration: QWExperimentalGenerationStats?
+    private var _lastGeneration: QWGenerationStats?
+    private var _lastRequestedBackend: String?
+    private var _lastPromptTokens: Int = 0
+    private var _lastStopToken: Int?
+    public internal(set) var lastExperimentalGeneration: QWExperimentalGenerationStats? {
+        get { statsLock.withLock { _lastExperimentalGeneration } }
+        set { statsLock.withLock { _lastExperimentalGeneration = newValue } }
+    }
+    public internal(set) var lastGeneration: QWGenerationStats? {
+        get { statsLock.withLock { _lastGeneration } }
+        set { statsLock.withLock { _lastGeneration = newValue } }
+    }
+    public internal(set) var lastRequestedBackend: String? {
+        get { statsLock.withLock { _lastRequestedBackend } }
+        set { statsLock.withLock { _lastRequestedBackend = newValue } }
+    }
+    public internal(set) var lastPromptTokens: Int {
+        get { statsLock.withLock { _lastPromptTokens } }
+        set { statsLock.withLock { _lastPromptTokens = newValue } }
+    }
+    public internal(set) var lastStopToken: Int? {
+        get { statsLock.withLock { _lastStopToken } }
+        set { statsLock.withLock { _lastStopToken = newValue } }
+    }
     public let cpuEncodeLedger = QWEncodeLedger()
     public let prefillTimingLedger = QWPrefillTimingLedger()
-    public internal(set) var commandBufferErrors: Int = 0
+    public internal(set) var commandBufferErrors: Int {
+        get { admission.commandBufferErrors }
+        set { admission.commandBufferErrors = newValue }
+    }
     public let decodeGpuLedger = QWDecodeGPULedger()
 
+    func recordCommandBufferError(for cb: (any MTLCommandBuffer)?) {
+        admission.recordCommandBufferError(for: cb)
+    }
+
+    func recordAsyncCommandBufferFailure(_ cb: any MTLCommandBuffer, session: QWEngineSession?) {
+        admission.recordAsyncCommandBufferFailure(cb, session: session)
+    }
+
+    func syncCommitFailure(for session: QWEngineSession, cb: (any MTLCommandBuffer)? = nil) -> Bool {
+        admission.syncCommitFailure(for: session, cb: cb)
+    }
+
+    func addMTPStats(proposals: Int = 0, accepted: Int = 0) {
+        speculativeCoordinator.addMTPStats(proposals: proposals, accepted: accepted)
+    }
+
     deinit {
+        coldWriteController.closeAndDrain()
         if cacheDiskManager?.config.wipeOnStart == true {
             cacheDiskManager?.purgeAll()
         }

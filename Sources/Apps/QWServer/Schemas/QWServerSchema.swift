@@ -2,243 +2,6 @@ import Foundation
 import QWCore
 import QWToken
 
-public struct ChatMessageContent: Codable, Sendable {
-    public enum Part: Codable, Sendable {
-        case text(String)
-        case imageUrl(String)
-
-        enum CodingKeys: String, CodingKey {
-            case type
-            case text
-            case imageUrl = "image_url"
-        }
-
-        enum ImageUrlKeys: String, CodingKey {
-            case url
-        }
-
-        public init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            let type = try container.decode(String.self, forKey: .type)
-            if type == "text" {
-                let text = try container.decode(String.self, forKey: .text)
-                self = .text(text)
-            } else if type == "image_url" {
-                let imgContainer = try container.nestedContainer(keyedBy: ImageUrlKeys.self, forKey: .imageUrl)
-                let url = try imgContainer.decode(String.self, forKey: .url)
-                self = .imageUrl(url)
-            } else {
-                self = .text("")
-            }
-        }
-
-        public func encode(to encoder: Encoder) throws {
-            var container = encoder.container(keyedBy: CodingKeys.self)
-            switch self {
-            case .text(let t):
-                try container.encode("text", forKey: .type)
-                try container.encode(t, forKey: .text)
-            case .imageUrl(let u):
-                try container.encode("image_url", forKey: .type)
-                var imgContainer = container.nestedContainer(keyedBy: ImageUrlKeys.self, forKey: .imageUrl)
-                try imgContainer.encode(u, forKey: .url)
-            }
-        }
-    }
-
-    public let rawText: String?
-    public let parts: [Part]?
-
-    public init(string: String) {
-        self.rawText = string
-        self.parts = nil
-    }
-
-    public init(parts: [Part]) {
-        self.rawText = nil
-        self.parts = parts
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if let str = try? container.decode(String.self) {
-            self.rawText = str
-            self.parts = nil
-        } else if let p = try? container.decode([Part].self) {
-            self.rawText = nil
-            self.parts = p
-        } else {
-            self.rawText = ""
-            self.parts = nil
-        }
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
-        if let rawText {
-            try container.encode(rawText)
-        } else if let parts {
-            try container.encode(parts)
-        } else {
-            try container.encode("")
-        }
-    }
-
-    public var textValue: String {
-        if let rawText { return rawText }
-        if let parts {
-            var res = ""
-            for p in parts {
-                if case .text(let t) = p {
-                    if !res.isEmpty { res += "\n" }
-                    res += t
-                }
-            }
-            return res
-        }
-        return ""
-    }
-
-    /// Content string formatted for chat-template rendering, inserting `<|vision_start|><|image_pad|><|vision_end|>`
-    /// for each `image_url` part when the text does not already include explicit `<|image_pad|>` markers.
-    public var templateTextValue: String {
-        if let rawText { return rawText }
-        guard let parts else { return "" }
-        let plainText = textValue
-        if plainText.contains("<|image_pad|>") { return plainText }
-        var res = ""
-        for p in parts {
-            switch p {
-            case .text(let t):
-                if !res.isEmpty && !res.hasSuffix(">") { res += "\n" }
-                res += t
-            case .imageUrl:
-                res += "<|vision_start|><|image_pad|><|vision_end|>"
-            }
-        }
-        return res
-    }
-
-    public var imageUrls: [String] {
-        guard let parts else { return [] }
-        var urls: [String] = []
-        for p in parts {
-            if case .imageUrl(let u) = p {
-                urls.append(u)
-            }
-        }
-        return urls
-    }
-}
-
-public struct ChatMessage: Codable, Sendable {
-    public let role: String
-    public let content: ChatMessageContent?
-    public let toolCalls: [ToolCall]?
-    public let toolCallId: String?
-    public let name: String?
-    public let reasoningContent: String?
-
-    enum CodingKeys: String, CodingKey {
-        case role
-        case content
-        case toolCalls = "tool_calls"
-        case toolCallId = "tool_call_id"
-        case name
-        case reasoningContent = "reasoning_content"
-    }
-
-    public init(
-        role: String,
-        content: ChatMessageContent? = nil,
-        toolCalls: [ToolCall]? = nil,
-        toolCallId: String? = nil,
-        name: String? = nil,
-        reasoningContent: String? = nil
-    ) {
-        self.role = role
-        self.content = content
-        self.toolCalls = toolCalls
-        self.toolCallId = toolCallId
-        self.name = name
-        self.reasoningContent = reasoningContent
-    }
-
-    public init(role: String, text: String) {
-        self.role = role
-        self.content = ChatMessageContent(string: text)
-        self.toolCalls = nil
-        self.toolCallId = nil
-        self.name = nil
-        self.reasoningContent = nil
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.role = try container.decode(String.self, forKey: .role)
-        self.content = try container.decodeIfPresent(ChatMessageContent.self, forKey: .content)
-        self.toolCalls = try container.decodeIfPresent([ToolCall].self, forKey: .toolCalls)
-        self.toolCallId = try container.decodeIfPresent(String.self, forKey: .toolCallId)
-        self.name = try container.decodeIfPresent(String.self, forKey: .name)
-        self.reasoningContent = try container.decodeIfPresent(String.self, forKey: .reasoningContent)
-    }
-
-    public func extractTextContent() -> String {
-        content?.textValue ?? ""
-    }
-}
-
-public struct ChatLogprobTokenEntry: Codable, Sendable {
-    public struct TopLogprob: Codable, Sendable {
-        public let token: String
-        public let logprob: Float
-        public let bytes: [Int]?
-
-        public init(token: String, logprob: Float, bytes: [Int]? = nil) {
-            self.token = token
-            self.logprob = logprob
-            self.bytes = bytes
-        }
-    }
-
-    public let token: String
-    public let logprob: Float
-    public let bytes: [Int]?
-    public let topLogprobs: [TopLogprob]
-
-    enum CodingKeys: String, CodingKey {
-        case token
-        case logprob
-        case bytes
-        case topLogprobs = "top_logprobs"
-    }
-
-    public init(token: String, logprob: Float, bytes: [Int]? = nil, topLogprobs: [TopLogprob] = []) {
-        self.token = token
-        self.logprob = logprob
-        self.bytes = bytes
-        self.topLogprobs = topLogprobs
-    }
-}
-
-public struct ChoiceLogprobs: Codable, Sendable {
-    public let content: [ChatLogprobTokenEntry]
-
-    public init(content: [ChatLogprobTokenEntry]) {
-        self.content = content
-    }
-}
-
-public struct QWMetadataValidationError: Error, CustomStringConvertible, Sendable {
-    public let message: String
-
-    public init(_ message: String) {
-        self.message = message
-    }
-
-    public var description: String { message }
-}
-
 public struct ChatCompletionRequest: Codable, Sendable {
     public struct ChatTemplateKwargs: Codable, Sendable {
         public let enableThinking: Bool?
@@ -248,11 +11,21 @@ public struct ChatCompletionRequest: Codable, Sendable {
             case enableThinking = "enable_thinking"
             case reasoningEffort = "reasoning_effort"
         }
+
+        public init(enableThinking: Bool? = nil, reasoningEffort: String? = nil) {
+            self.enableThinking = enableThinking
+            self.reasoningEffort = reasoningEffort
+        }
     }
 
     public struct ReasoningConfig: Codable, Sendable {
         public let enabled: Bool?
         public let effort: String?
+
+        public init(enabled: Bool? = nil, effort: String? = nil) {
+            self.enabled = enabled
+            self.effort = effort
+        }
     }
 
     public let model: String?
@@ -292,40 +65,102 @@ public struct ChatCompletionRequest: Codable, Sendable {
     public var httpHeaders: [String: String]? = nil
 
     enum CodingKeys: String, CodingKey {
-        case model
-        case messages
-        case tools
+        case model, messages, tools, logprobs, n, stream, temperature, seed, stop, reasoning, metadata, user, store
         case toolChoice = "tool_choice"
         case parallelToolCalls = "parallel_tool_calls"
         case responseFormat = "response_format"
-        case logprobs
         case topLogprobs = "top_logprobs"
-        case n
         case continueFinalMessage = "continue_final_message"
         case addGenerationPrompt = "add_generation_prompt"
-        case stream
         case maxTokens = "max_tokens"
         case maxCompletionTokens = "max_completion_tokens"
         case minTokens = "min_tokens"
         case ignoreEos = "ignore_eos"
-        case temperature
         case topP = "top_p"
         case topK = "top_k"
         case repetitionPenalty = "repetition_penalty"
-        case seed
-        case stop
         case enableThinking = "enable_thinking"
         case reasoningEffort = "reasoning_effort"
-        case reasoning
         case reasoningBudget = "reasoning_budget"
         case chatTemplateKwargs = "chat_template_kwargs"
-        case metadata
-        case user
         case sessionId = "session_id"
         case promptCacheKey = "prompt_cache_key"
         case cacheSalt = "cache_salt"
         case cachePrompt = "cache_prompt"
-        case store
+    }
+
+    public init(
+        model: String? = nil,
+        messages: [ChatMessage],
+        tools: [QWJson]? = nil,
+        toolChoice: QWJson? = nil,
+        parallelToolCalls: Bool? = nil,
+        responseFormat: QWJson? = nil,
+        logprobs: Bool? = nil,
+        topLogprobs: Int? = nil,
+        n: Int? = nil,
+        continueFinalMessage: Bool? = nil,
+        addGenerationPrompt: Bool? = nil,
+        stream: Bool? = nil,
+        maxTokens: Int? = nil,
+        maxCompletionTokens: Int? = nil,
+        minTokens: Int? = nil,
+        ignoreEos: Bool? = nil,
+        temperature: Double? = nil,
+        topP: Double? = nil,
+        topK: Int? = nil,
+        repetitionPenalty: Double? = nil,
+        seed: Int? = nil,
+        stop: [String]? = nil,
+        enableThinking: Bool? = nil,
+        reasoningEffort: String? = nil,
+        reasoning: ReasoningConfig? = nil,
+        reasoningBudget: Int? = nil,
+        chatTemplateKwargs: ChatTemplateKwargs? = nil,
+        metadata: [String: String]? = nil,
+        user: String? = nil,
+        sessionId: String? = nil,
+        promptCacheKey: String? = nil,
+        cacheSalt: String? = nil,
+        cachePrompt: Bool? = nil,
+        store: Bool? = nil,
+        httpHeaders: [String: String]? = nil
+    ) {
+        self.model = model
+        self.messages = messages
+        self.tools = tools
+        self.toolChoice = toolChoice
+        self.parallelToolCalls = parallelToolCalls
+        self.responseFormat = responseFormat
+        self.logprobs = logprobs
+        self.topLogprobs = topLogprobs
+        self.n = n
+        self.continueFinalMessage = continueFinalMessage
+        self.addGenerationPrompt = addGenerationPrompt
+        self.stream = stream
+        self.maxTokens = maxTokens
+        self.maxCompletionTokens = maxCompletionTokens
+        self.minTokens = minTokens
+        self.ignoreEos = ignoreEos
+        self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.repetitionPenalty = repetitionPenalty
+        self.seed = seed
+        self.stop = stop
+        self.enableThinking = enableThinking
+        self.reasoningEffort = reasoningEffort
+        self.reasoning = reasoning
+        self.reasoningBudget = reasoningBudget
+        self.chatTemplateKwargs = chatTemplateKwargs
+        self.metadata = metadata
+        self.user = user
+        self.sessionId = sessionId
+        self.promptCacheKey = promptCacheKey
+        self.cacheSalt = cacheSalt
+        self.cachePrompt = cachePrompt
+        self.store = store
+        self.httpHeaders = httpHeaders
     }
 
     public init(from decoder: Decoder) throws {
@@ -362,55 +197,8 @@ public struct ChatCompletionRequest: Codable, Sendable {
         self.cacheSalt = try container.decodeIfPresent(String.self, forKey: .cacheSalt)
         self.cachePrompt = try container.decodeIfPresent(Bool.self, forKey: .cachePrompt)
         self.store = try container.decodeIfPresent(Bool.self, forKey: .store)
-
-        if container.contains(.metadata), (try? container.decodeNil(forKey: .metadata)) != true {
-            let rawMeta = try container.decode(QWJson.self, forKey: .metadata)
-            guard case .object(let pairs) = rawMeta else {
-                throw DecodingError.typeMismatch(
-                    [String: String].self,
-                    DecodingError.Context(
-                        codingPath: container.codingPath + [CodingKeys.metadata],
-                        debugDescription: "metadata must be a JSON object"
-                    )
-                )
-            }
-            var coerced: [String: String] = [:]
-            for (k, v) in pairs {
-                switch v {
-                case .string(let s):
-                    coerced[k] = s
-                case .bool(let b):
-                    coerced[k] = b ? "true" : "false"
-                case .int(let i):
-                    coerced[k] = String(i)
-                case .double(let d):
-                    if d.isFinite && d >= Double(Int64.min) && d < Double(Int64.max) && d.truncatingRemainder(dividingBy: 1) == 0 {
-                        coerced[k] = String(Int64(d))
-                    } else {
-                        coerced[k] = String(d)
-                    }
-                case .null, .undefined:
-                    break
-                case .array, .object:
-                    throw DecodingError.typeMismatch(
-                        String.self,
-                        DecodingError.Context(
-                            codingPath: container.codingPath + [CodingKeys.metadata],
-                            debugDescription: "metadata['\(k)'] must be a scalar string, number, or boolean"
-                        )
-                    )
-                }
-            }
-            self.metadata = coerced
-        } else {
-            self.metadata = nil
-        }
-
-        if let singleStop = try? container.decode(String.self, forKey: .stop) {
-            self.stop = [singleStop]
-        } else {
-            self.stop = try container.decodeIfPresent([String].self, forKey: .stop)
-        }
+        self.metadata = try QWSchemaMetadataCoercion.decodeOptionalMetadata(from: container, forKey: .metadata)
+        self.stop = try QWSchemaMetadataCoercion.decodeOptionalStop(from: container, forKey: .stop)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -559,30 +347,11 @@ public struct ChatCompletionRequest: Codable, Sendable {
     }
 
     public static func normalizeReasoningEffort(_ raw: String?, fallback: String = "xhigh") -> String {
-        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              !trimmed.isEmpty else {
-            if fallback.lowercased() == raw?.lowercased() {
-                return "xhigh"
-            }
-            return normalizeReasoningEffort(fallback, fallback: "xhigh")
-        }
-        switch trimmed {
-        case "xhigh", "high", "max", "maximum", "deep":
-            return "xhigh"
-        case "medium", "mid", "med", "normal", "auto", "default":
-            return "medium"
-        case "low", "min", "minimal", "light", "fast", "quick", "none", "off", "false", "disabled", "disable":
-            return "low"
-        default:
-            if fallback.lowercased() == trimmed {
-                return "xhigh"
-            }
-            return normalizeReasoningEffort(fallback, fallback: "xhigh")
-        }
+        QWChatPolicyResolver.normalizeReasoningEffort(raw, fallback: fallback)
     }
 
     public func effectiveReasoningEffort(defaultValue: String) -> String {
-        Self.normalizeReasoningEffort(rawReasoningEffort, fallback: defaultValue)
+        QWChatPolicyResolver.normalizeReasoningEffort(rawReasoningEffort, fallback: defaultValue)
     }
 
     public var hasExplicitThinkingSetting: Bool {
@@ -592,45 +361,21 @@ public struct ChatCompletionRequest: Codable, Sendable {
     }
 
     public func effectiveEnableThinking(defaultValue: Bool) -> Bool {
-        if isAssistantPrefill { return false }
-        if let fmtType = responseFormatType, (fmtType == "json_object" || fmtType == "json_schema") {
-            return enableThinking ?? chatTemplateKwargs?.enableThinking ?? reasoning?.enabled ?? false
-        }
-        if let explicit = enableThinking ?? chatTemplateKwargs?.enableThinking ?? reasoning?.enabled {
-            return explicit
-        }
-        if let effort = rawReasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !effort.isEmpty {
-            return !(effort == "none" || effort == "off" || effort == "false" || effort == "disabled" || effort == "disable")
-        }
-        if let budget = reasoningBudget { return budget > 0 }
-        return defaultValue
+        QWChatPolicyResolver.effectiveEnableThinking(for: self, defaultValue: defaultValue)
     }
 
-    private static let effortThinkingCaps: [String: Int] = [
-        "low": 256, "min": 256, "minimal": 256, "light": 256, "fast": 256, "quick": 256,
-        "medium": 1024, "mid": 1024, "med": 1024, "normal": 1024, "auto": 1024, "default": 1024,
-        "high": 4096, "xhigh": 8192, "max": 8192, "maximum": 8192, "deep": 8192,
-    ]
     public func resolvedThinkingPolicy(
         defaultEnableThinking: Bool, defaultMaxTokens: Int,
         modelMaxLength: Int? = nil, overrideMaxNewTokens: Int? = nil
     ) -> (shouldThink: Bool, thinkingBudget: Int?) {
-        guard effectiveEnableThinking(defaultValue: defaultEnableThinking) else { return (false, nil) }
-        let isJsonFormat = responseFormatType == "json_object" || responseFormatType == "json_schema"
-        let maxNew = max(0, overrideMaxNewTokens ?? maxTokens ?? maxCompletionTokens ?? modelMaxLength ?? defaultMaxTokens)
-        let reserved = maxNew <= 32 ? nil : max(16, maxNew - min(256, max(16, maxNew / 4)))
-        if reasoningBudget == nil,
-           let raw = rawReasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-           let cap = Self.effortThinkingCaps[raw] {
-            return (true, reserved.map { min(cap, $0) } ?? max(1, min(cap, maxNew / 2)))
-        }
-        if reasoningBudget == nil {
-            if !hasExplicitThinkingSetting || isJsonFormat {
-                return reserved.map { (true, $0) } ?? (isJsonFormat ? (true, max(1, maxNew / 2)) : (false, nil))
-            }
-            return (true, reserved)
-        }
-        return (true, reasoningBudget.map { max(0, $0) })
+        let p = QWChatPolicyResolver.resolveThinkingPolicy(
+            for: self,
+            defaultEnableThinking: defaultEnableThinking,
+            defaultMaxTokens: defaultMaxTokens,
+            modelMaxLength: modelMaxLength,
+            overrideMaxNewTokens: overrideMaxNewTokens
+        )
+        return (p.shouldThink, p.thinkingBudget)
     }
 
     /// True when the final message in `messages` is an assistant text message to be continued in-place.
@@ -702,16 +447,11 @@ public struct ChatCompletionRequest: Codable, Sendable {
             let lowered = msg.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let canonicalRole: String
             switch lowered {
-            case "system", "developer":
-                canonicalRole = "system"
-            case "user":
-                canonicalRole = "user"
-            case "assistant", "model":
-                canonicalRole = "assistant"
-            case "tool", "function":
-                canonicalRole = "tool"
-            default:
-                canonicalRole = "user"
+            case "system", "developer": canonicalRole = "system"
+            case "user": canonicalRole = "user"
+            case "assistant", "model": canonicalRole = "assistant"
+            case "tool", "function": canonicalRole = "tool"
+            default: canonicalRole = "user"
             }
             normalizedMessages.append((canonicalRole, msg))
         }
@@ -739,9 +479,7 @@ public struct ChatCompletionRequest: Codable, Sendable {
         for idx in firstNonSystemIndex..<normalizedMessages.count {
             let (rawRole, msg) = normalizedMessages[idx]
             let roleStr = (rawRole == "system") ? "user" : rawRole
-            var pairs: [(String, QWJson)] = [
-                ("role", .string(roleStr))
-            ]
+            var pairs: [(String, QWJson)] = [("role", .string(roleStr))]
             if let text = msg.content?.templateTextValue {
                 pairs.append(("content", .string(text)))
             } else {
@@ -759,17 +497,15 @@ public struct ChatCompletionRequest: Codable, Sendable {
                     } else {
                         parsedArgs = .string(call.function.arguments)
                     }
-
                     let funcObj: QWJson = .object([
                         ("name", .string(call.function.name)),
                         ("arguments", parsedArgs)
                     ])
-                    let callObj: QWJson = .object([
+                    callArray.append(.object([
                         ("id", .string(call.id)),
                         ("type", .string(call.type)),
                         ("function", funcObj)
-                    ])
-                    callArray.append(callObj)
+                    ]))
                 }
                 pairs.append(("tool_calls", .array(callArray)))
             }
@@ -795,4 +531,3 @@ public struct ChatCompletionRequest: Codable, Sendable {
         return list
     }
 }
-

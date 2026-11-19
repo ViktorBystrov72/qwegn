@@ -361,6 +361,10 @@ public final class QWHal: @unchecked Sendable {
 
 /// Diagnostic (QW_PREFILL_TIMER=1 prints it): total time spent creating compute pipelines (cold start).
 public enum QWHalPSOStats {
-    nonisolated(unsafe) public static var seconds: Double = 0
-    static func add(_ s: Double) { seconds += s }
+    private static let state = OSAllocatedUnfairLock<Double>(initialState: 0)
+    public static var seconds: Double {
+        get { state.withLock { $0 } }
+        set { state.withLock { $0 = newValue } }
+    }
+    static func add(_ s: Double) { state.withLock { $0 += s } }
 }

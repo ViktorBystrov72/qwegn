@@ -42,9 +42,10 @@ static inline void lsa_load_window_kv8(
             km = fmax(km, simd_shuffle_xor(km, sh));
             vm = fmax(vm, simd_shuffle_xor(vm, sh));
         }
-        const float ks = float(half(fmax(km / 127.0f, 1e-8f)));
-        const float vs = float(half(fmax(vm / 127.0f, 1e-8f)));
-        const float kinv = 1.0f / ks, vinv = 1.0f / vs;
+        const float ks = float(half(fmax(km / 127.0f, 6.103515625e-5f)));
+        const float vs = float(half(fmax(vm / 127.0f, 6.103515625e-5f)));
+        const float kinv = (ks > 0.0f) ? (1.0f / ks) : 0.0f;
+        const float vinv = (vs > 0.0f) ? (1.0f / vs) : 0.0f;
         if (liveCol) {
             for (uint i = 0u; i < 8u; i++) {
                 kk[i] = half(clamp(round(float(kRaw[i]) * kinv), -127.0f, 127.0f) * ks);
@@ -70,8 +71,8 @@ static inline void lsa_load_window_kv8(
             vmn = fmin(vmn, simd_shuffle_xor(vmn, sh)); vmx = fmax(vmx, simd_shuffle_xor(vmx, sh));
         }
         if (liveCol) {
-            const float ksc = float(half(fmax((kmx - kmn) / 15.0f, 1e-8f))), km0 = float(half(kmn)), kinv = 1.0f / ksc;
-            const float vsc = float(half(fmax((vmx - vmn) / 15.0f, 1e-8f))), vm0 = float(half(vmn)), vinv = 1.0f / vsc;
+            const float ksc = float(half(fmax((kmx - kmn) / 15.0f, 6.103515625e-5f))), km0 = float(half(kmn)), kinv = (ksc > 0.0f) ? (1.0f / ksc) : 0.0f;
+            const float vsc = float(half(fmax((vmx - vmn) / 15.0f, 6.103515625e-5f))), vm0 = float(half(vmn)), vinv = (vsc > 0.0f) ? (1.0f / vsc) : 0.0f;
             for (uint i = 0u; i < 8u; i++) {
                 const uint kq = (uint)clamp(round((float(kRaw[i]) - km0) * kinv), 0.0f, 15.0f);
                 const uint vq = (uint)clamp(round((float(vRaw[i]) - vm0) * vinv), 0.0f, 15.0f);
@@ -257,7 +258,7 @@ static inline void lsa_decode_sparse_core(
                 QW_KV_LOAD8(kk, kpool, ktab[r >> 8u], r & 255u, kvh, d0, MODE)
                 QW_KV_LOAD8(vv, vpool, vtab[r >> 8u], r & 255u, kvh, d0, MODE)
             }
-        } else if (live && r == C) {
+        } else if (r == C) {
             continue;
         } else {
             for (uint i = 0u; i < 8u; i++) { kk[i] = half(0.0h); vv[i] = half(0.0h); }

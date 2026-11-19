@@ -94,34 +94,24 @@ extension FNGPUEngine {
             }
         }
         if let warm = prefixCacheWarmStore {
-            // A longer prompt may extend a prefix the RAM holds.
-            var bestWarmMatch: (name: String, tokens: Int, hasMTP: Bool, isUnsaltedSharedBase: Bool)?
+            var bestWarmHit: (hit: QWTwoTierPrefixCache.WarmLookupHit<Data>, hasMTP: Bool)?
             for hasMTP in candidateMTPFlags {
-                if let match = warm.longestMatch(history: history, kvMode: kvMode,
-                                                 hasMTP: hasMTP, dflashMarker: dflashPrefixMarker) {
-                    if bestWarmMatch == nil || match.tokens > bestWarmMatch!.tokens {
-                        bestWarmMatch = (match.name, match.tokens, hasMTP, false)
+                if let match = warm.lookupWarmHit(exactName: "", history: history, rawHistory: rawHist,
+                                                  kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashPrefixMarker,
+                                                  allowExact: false),
+                   match.matchedTokens < history.count {
+                    if bestWarmHit == nil || match.matchedTokens > bestWarmHit!.hit.matchedTokens {
+                        bestWarmHit = (match, hasMTP)
                     }
                 }
             }
-            if bestWarmMatch == nil, rawHist.first != history.first, warm.hasSharedBase {
-                for hasMTP in candidateMTPFlags {
-                    if let shared = warm.longestSharedBaseMatch(history: rawHist, kvMode: kvMode,
-                                                                 hasMTP: hasMTP, dflashMarker: dflashPrefixMarker) {
-                        if bestWarmMatch == nil || shared.tokens > bestWarmMatch!.tokens {
-                            bestWarmMatch = (shared.name, shared.tokens, hasMTP, true)
-                        }
-                    }
-                }
-            }
-            if let match = bestWarmMatch,
-               let blob = warm.blob(name: match.name) {
-                let expectedToks = match.isUnsaltedSharedBase
-                    ? rawHist.prefix(match.tokens)
-                    : history.prefix(match.tokens)
-                if let restored = try? restorePrefix(data: blob, expectedTokens: expectedToks,
-                                                     hasMTP: match.hasMTP, isExact: false,
-                                                     nextTokenAfterPrefix: Int32(rawHist[match.tokens]),
+            if let best = bestWarmHit {
+                let expectedToks = best.hit.isUnsaltedSharedBase
+                    ? rawHist.prefix(best.hit.matchedTokens)
+                    : history.prefix(best.hit.matchedTokens)
+                if let restored = try? restorePrefix(data: best.hit.value, expectedTokens: expectedToks,
+                                                     hasMTP: best.hasMTP, isExact: false,
+                                                     nextTokenAfterPrefix: Int32(rawHist[best.hit.matchedTokens]),
                                                      gpuSec: &gpuSec) {
                     var warmHit = restored
                     warmHit.tier = .warmRAM
@@ -210,11 +200,10 @@ extension FNGPUEngine {
                 warm.makeRoom(for: data.count, activeSlot: nil)
                 warm.store(name: url.lastPathComponent, blob: data, slot: nil, rootHash: nil, history: tokArray, isSharedBase: true)
             } else {
-                let rHash = FNPrefixWarmStore.rootHash(history: tokArray, kvMode: kvMode,
-                                                       hasMTP: hasMTP, dflashMarker: dflashPrefixMarker)
-                let slot = warm.resolveSlot(rootHash: rHash, history: tokArray, kvMode: kvMode,
-                                            hasMTP: hasMTP, dflashMarker: dflashPrefixMarker)
-                warm.store(name: url.lastPathComponent, blob: data, slot: slot, rootHash: rHash, history: tokArray, isSharedBase: false)
+                _ = warm.storeWithSlotPinning(
+                    name: url.lastPathComponent, blob: data, history: tokArray,
+                    kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashPrefixMarker, isSharedBase: false
+                )
             }
         }
         return restored
@@ -300,6 +289,7 @@ extension FNGPUEngine {
                                                                 hasMTP: hasMTP || wantDFlash)
             if isCompactInPlace && !inPlaceKV { return nil }
             wipeSessionTail(from: N)
+            highWaterPos = max(highWaterPos, N)
 
             // Per-layer recurrent, PLE, and attention KV state
             var layerOffsets = [Int](repeating: 0, count: layerRecords.count)
@@ -364,15 +354,19 @@ extension FNGPUEngine {
 
             if !inPlaceKV, N >= 512, layerRecords.contains(where: { $0.attnState?.lsaClusters != nil }),
                let (cb, enc) = arena.hal.begin() {
+                var encEnded = false
+                defer { if !encEnded { enc.endEncoding() } }
                 for rec in layerRecords {
                     if let a = rec.attnState, let clusters = a.lsaClusters {
-                        _ = try? QWGemm.encodeFnLSAClusterRange(
+                        try QWGemm.encodeFnLSAClusterRange(
                             enc, hal: arena.hal, pooled: a.pooled, clusters: clusters,
                             pos0: 0, count: N, indexDim: 128)
                     }
                 }
+                encEnded = true
                 arena.hal.end(cb, enc)
                 cb.waitUntilCompleted()
+                if let err = cb.error { throw err }
             }
 
             if hasMTP, let mtp = self.mtp {

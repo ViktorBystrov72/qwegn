@@ -146,9 +146,9 @@ extension QWDFlashDrafter {
                         weight: QWWeightView,
                         input: QWTensorValue,
                         output: QWTensorValue,
-                        rows: Int) {
+                        rows: Int) throws {
         if !Self.usesQ4GMKernel(weight) {
-            encodeAQMatmul(enc, weight: weight, input: input, output: output, rows: rows)
+            try encodeAQMatmul(enc, weight: weight, input: input, output: output, rows: rows)
             return
         }
         let n = weight.n, k = weight.k
@@ -182,12 +182,12 @@ extension QWDFlashDrafter {
                                      threadsPerThreadgroup: MTLSize(width: tptg, height: 1, depth: 1))
         } else if !useNaxSmall && (9...16).contains(rows) {
             let c0 = rows / 2, c1 = rows - c0
-            encodeQ4Matmul(enc, weight: weight, input: input.slice(byteOffset: 0, count: c0 * k),
-                           output: output.slice(byteOffset: 0, count: c0 * n), rows: c0)
-            encodeQ4Matmul(enc, weight: weight, input: input.slice(byteOffset: c0 * k * 2, count: c1 * k),
-                           output: output.slice(byteOffset: c0 * n * 2, count: c1 * n), rows: c1)
+            try encodeQ4Matmul(enc, weight: weight, input: input.slice(byteOffset: 0, count: c0 * k),
+                               output: output.slice(byteOffset: 0, count: c0 * n), rows: c0)
+            try encodeQ4Matmul(enc, weight: weight, input: input.slice(byteOffset: c0 * k * 2, count: c1 * k),
+                               output: output.slice(byteOffset: c0 * n * 2, count: c1 * n), rows: c1)
         } else if !weight.isIncumbentContainer {
-            encodeAQMatmul(enc, weight: weight, input: input, output: output, rows: rows)
+            try encodeAQMatmul(enc, weight: weight, input: input, output: output, rows: rows)
         } else {
             encodeSmallTileNAX(enc, pso: psoGemmBatched, weight: weight, input: input, output: output, rows: rows)
         }
@@ -256,18 +256,18 @@ extension QWDFlashDrafter {
             throw QWDFlashError.state("QWDFlashDrafter: failed to create context encoder")
         }
         defer { enc.endEncoding() }
-        encodeContextUpdate(enc, slot: slot, startPosition: startPosition, totalCount: totalCount)
+        try encodeContextUpdate(enc, slot: slot, startPosition: startPosition, totalCount: totalCount)
     }
 
     public func encodeContextUpdate(_ enc: any MTLComputeCommandEncoder,
                                     slot: QWDFlashSessionSlot,
                                     startPosition: Int,
-                                    totalCount: Int) {
+                                    totalCount: Int) throws {
         let captureRows = min(totalCount, config.maxCacheSize)
         guard captureRows > 0 else { return }
         let posOffset = startPosition + (totalCount - captureRows)
 
-        encodeQ4Matmul(enc, weight: fc, input: targetHidden, output: hCtx, rows: captureRows)
+        try encodeQ4Matmul(enc, weight: fc, input: targetHidden, output: hCtx, rows: captureRows)
         enc.memoryBarrier(scope: .buffers)
         encodeRMSNorm(enc, x: hCtx, gamma: hiddenNorm, y: hCtx, yRot: hCtx, rows: captureRows, mode: 1)
         enc.memoryBarrier(scope: .buffers)
@@ -276,7 +276,7 @@ extension QWDFlashDrafter {
         var maxCacheU = UInt32(config.maxCacheSize), kvHeadsU = UInt32(config.numKeyValueHeads)
         for l in 0..<config.numLayers {
             let lw = layers[l]
-            encodeQ4Matmul(enc, weight: lw.kvProj, input: hCtx, output: kvCtx, rows: captureRows)
+            try encodeQ4Matmul(enc, weight: lw.kvProj, input: hCtx, output: kvCtx, rows: captureRows)
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(psoRopeKVCtx)
             kvCtx.bind(enc, index: 0)
@@ -365,9 +365,15 @@ extension QWDFlashDrafter {
         guard let (cb, enc) = hal.begin(.serial) else {
             throw QWDFlashError.state("QWDFlashDrafter: command buffer creation failed")
         }
+        var encoderEnded = false
+        defer {
+            if !encoderEnded {
+                enc.endEncoding()
+            }
+        }
 
         if let pre = preContextUpdate, min(pre.totalCount, config.maxCacheSize) > 0 {
-            encodeContextUpdate(enc, slot: pre.slot, startPosition: pre.startPosition, totalCount: pre.totalCount)
+            try encodeContextUpdate(enc, slot: pre.slot, startPosition: pre.startPosition, totalCount: pre.totalCount)
             enc.memoryBarrier(scope: .buffers)
         }
         if let encodeAnchorMaskEmbed {
@@ -392,7 +398,7 @@ extension QWDFlashDrafter {
                 encodeF16GemvBatched(enc, w: acProj, x: propNorm, y: pDyn, n: convProjDim, k: H, m: M)
                 encodeConvApply(enc, x: propNorm, dyn: pDyn, baseKernel: acBase, outOrResidual: propRot, rows: M, mode: 0)
             }
-            encodeQ4Matmul(enc, weight: lw.qkvProj, input: propRot, output: qkvProp, rows: M)
+            try encodeQ4Matmul(enc, weight: lw.qkvProj, input: propRot, output: qkvProp, rows: M)
 
             enc.setComputePipelineState(psoRopeQKProp)
             qkvProp.bind(enc, index: 0)
@@ -423,19 +429,19 @@ extension QWDFlashDrafter {
                                      threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
             if config.isDSpine {
-                encodeQ4Matmul(enc, weight: lw.oProj, input: attnOut, output: propDown, rows: M)
+                try encodeQ4Matmul(enc, weight: lw.oProj, input: attnOut, output: propDown, rows: M)
                 encodeRMSNorm(enc, x: propX, gamma: lw.ln2, y: propDown, yRot: propRot, rows: M, mode: 3)
             } else if let acBase = lw.attnConvBase, let mcProj = lw.mlpConvProj,
                       let mcBase = lw.mlpConvBase, let pDyn = propDyn {
-                encodeQ4Matmul(enc, weight: lw.oProj, input: attnOut, output: propNorm, rows: M)
+                try encodeQ4Matmul(enc, weight: lw.oProj, input: attnOut, output: propNorm, rows: M)
                 encodeConvApply(enc, x: propNorm, dyn: pDyn, baseKernel: acBase, outOrResidual: propX, rows: M, mode: 1)
                 encodeRMSNorm(enc, x: propX, gamma: lw.ln2, y: propNorm, yRot: propNorm, rows: M, mode: 0)
                 encodeF16GemvBatched(enc, w: mcProj, x: propNorm, y: pDyn, n: convProjDim, k: H, m: M)
                 encodeConvApply(enc, x: propNorm, dyn: pDyn, baseKernel: mcBase, outOrResidual: propRot, rows: M, mode: 0)
             }
 
-            encodeGateUpMatmul(enc, weight: lw.gateUpProj, input: propRot, output: mlpInter, rows: M)
-            encodeQ4Matmul(enc, weight: lw.downProj, input: mlpInter, output: propDown, rows: M)
+            try encodeGateUpMatmul(enc, weight: lw.gateUpProj, input: propRot, output: mlpInter, rows: M)
+            try encodeQ4Matmul(enc, weight: lw.downProj, input: mlpInter, output: propDown, rows: M)
             if let bw = dspineBridge, let bs = dspineScratch {
                 encodeDSpineBridgeLayer(enc, layer: l, anchorToken: safeAnchor, rows: M, bw: bw, bs: bs)
             } else if let mcBase = lw.mlpConvBase, let pDyn = propDyn {
@@ -510,6 +516,7 @@ extension QWDFlashDrafter {
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
 
+        encoderEnded = true
         hal.end(cb, enc)
         cb.waitUntilCompleted()
         guard cb.status == .completed, cb.error == nil else {

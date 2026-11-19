@@ -8,6 +8,7 @@ import QWAlloc
 import QWGEMM
 import QWGDN
 import QWLoad
+import QWRope
 
 // FlashNext GPU layer weights: every tensor a decoder layer needs on the device, uploaded once from the HQ4 pack (stacked
 // banks as HQ4 slabs; small projections as f32; the depthwise conv as f16). The CPU layer objects provide the small arrays.
@@ -45,7 +46,7 @@ public struct FNGPUAttnMixer: Sendable {
     public let qNorm: QWTensorValue, kNorm: QWTensorValue, iqNorm: QWTensorValue, ikNorm: QWTensorValue
     public let heads: Int, kvHeads: Int, headDim: Int, indexHeads: Int, indexKVHeads: Int, indexHeadDim: Int
     public let rotaryDim: Int, compress: Int, blockTopK: Int, bankRows: Int
-    public let rope: FNRope
+    public let rope: QWRopeCPU
     public var iqOff: Int { heads * 2 * headDim + 2 * kvHeads * headDim }
     public var ikOff: Int { iqOff + indexHeads * indexHeadDim }
 }
@@ -232,7 +233,7 @@ public enum FNGPULoader {
     }
 
     static func bf16FromF32(_ arena: QWArena, _ a: [Float]) throws -> QWTensorValue {
-        let t = try arena.weightsRegion().allocate(QWTensorShape([a.count], .f16))
+        let t = try arena.weightsRegion().allocate(QWTensorShape([a.count], .bf16))
         arena.write(t, from: a.map(QWBF16.fromFloatRNE)); return t
     }
 
@@ -318,7 +319,7 @@ public enum FNGPULoader {
             let oView = try hq4Bank(arena, loader, ap + "o_proj.weight", n: d.hidden, k: d.qHeads * d.headDim, staging: staging)
             let ixHeads = d.indexerHeads!, ixKVHeads = d.indexerKvHeads!, ixHeadDim = d.indexerHeadDim!
             let ixCompress = d.indexerCompressRatio!, ixBudget = d.indexerBudget!
-            let rope = FNRope(rotaryDim: d.rotaryDims, theta: d.ropeTheta, yarnFactor: yarnFactor, originalMaxPosition: d.maxPositionEmbeddings)
+            let rope = QWRopeCPU(rotaryDim: d.rotaryDims, theta: d.ropeTheta, yarnFactor: yarnFactor, originalMaxPosition: d.maxPositionEmbeddings)
             mixer = .attention(FNGPUAttnMixer(
                 bank: bankView, oProj: oView,
                 qNorm: try f32(arena, try loader.tensor(ap + "q_norm.weight")),

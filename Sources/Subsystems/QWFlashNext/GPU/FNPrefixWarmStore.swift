@@ -49,7 +49,7 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
     public var hasSharedBase: Bool { core.hasSharedBase }
 
     public func canHold(bytes: Int) -> Bool {
-        core.isEnabled && (core.sharedBaseBytes + bytes <= core.byteLimit)
+        core.canHoldIncludingShared(bytes: bytes)
     }
 
     public func isSharedBaseEntry(_ name: String) -> Bool {
@@ -121,6 +121,36 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
         )
     }
 
+    public func storeWithSlotPinning(
+        name: String,
+        blob: Data,
+        history: [Int64],
+        kvMode: FNKVStorageMode,
+        hasMTP: Bool,
+        dflashMarker: String? = nil,
+        isSharedBase: Bool = false
+    ) -> Bool {
+        guard core.isEnabled, blob.count <= core.byteLimit else { return false }
+        let rHash = Self.rootHash(history: history, kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker)
+        let tokCount = Self.tokenCount(in: name) ?? history.count
+        return QWTwoTierPrefixCache.storeWithSlotPinning(
+            in: core,
+            key: name,
+            value: blob,
+            charge: blob.count,
+            tokenCount: tokCount,
+            allowsSuffix: true,
+            rootHash: rHash,
+            history: history,
+            isSharedBase: isSharedBase
+        ) { candName, candCount in
+            Self.matchesEntry(
+                name: candName, count: candCount, history: history,
+                kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker
+            )
+        }
+    }
+
     public func blob(name: String) -> Data? {
         core.value(for: name, touchOnHit: true)?.value
     }
@@ -134,47 +164,91 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
         let queryRootHash: UInt64? = history.count >= Self.rootPrefixTokenCount
             ? Self.rootHash(history: history, kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker)
             : nil
-        var candidates: [(name: String, tokens: Int)] = []
-        candidates.reserveCapacity(core.order.count)
-        for name in core.order {
-            guard let count = Self.tokenCount(in: name), count > 0, count < history.count else { continue }
-            if count >= Self.rootPrefixTokenCount,
-               let qHash = queryRootHash,
-               let eHash = core.entries[name]?.rootHash,
-               qHash != eHash {
-                continue
+        var matchedName: String?
+        let hit = QWTwoTierPrefixCache.lookupWarmPrefix(
+            in: core,
+            exactKey: "",
+            saltedBaseKey: nil,
+            tokenCount: history.count,
+            queryRootHash: queryRootHash,
+            allowExact: false,
+            allowPrefix: true,
+            sharedBaseOnly: false,
+            touchOnHit: false,
+            isCandidate: { _, _, _ in true },
+            matchesPrefix: { name, count, _ in
+                let ok = Self.matchesEntry(
+                    name: name, count: count, history: history,
+                    kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker
+                )
+                if ok { matchedName = name }
+                return ok
             }
-            candidates.append((name, count))
-        }
-        candidates.sort { $0.tokens > $1.tokens }
-        for cand in candidates {
-            if Self.matchesEntry(name: cand.name, count: cand.tokens, history: history,
-                                 kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker) {
-                core.touchSlot(for: cand.name)
-                return cand
-            }
-        }
-        return nil
+        )
+        guard let hit, let name = matchedName else { return nil }
+        core.touchSlot(for: name)
+        return (name, hit.matchedTokens)
     }
 
     public func longestSharedBaseMatch(history: [Int64], kvMode: FNKVStorageMode,
                                        hasMTP: Bool, dflashMarker: String? = nil) -> (name: String, tokens: Int)? {
-        guard core.hasSharedBase else { return nil }
-        var candidates: [(name: String, tokens: Int)] = []
-        for name in core.sharedBaseKeys {
-            guard core.entries[name] != nil,
-                  let count = Self.tokenCount(in: name),
-                  count > 0, count < history.count else { continue }
-            candidates.append((name, count))
-        }
-        candidates.sort { $0.tokens > $1.tokens }
-        for cand in candidates {
-            if Self.matchesEntry(name: cand.name, count: cand.tokens, history: history,
-                                 kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker) {
-                return cand
+        var matchedName: String?
+        let hit = QWTwoTierPrefixCache.lookupWarmPrefix(
+            in: core,
+            exactKey: "",
+            saltedBaseKey: nil,
+            tokenCount: history.count,
+            queryRootHash: nil,
+            allowExact: false,
+            allowPrefix: true,
+            sharedBaseOnly: true,
+            touchOnHit: false,
+            isCandidate: { _, _, _ in true },
+            matchesPrefix: { name, count, _ in
+                let ok = Self.matchesEntry(
+                    name: name, count: count, history: history,
+                    kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker
+                )
+                if ok { matchedName = name }
+                return ok
             }
-        }
-        return nil
+        )
+        guard let hit, let name = matchedName else { return nil }
+        return (name, hit.matchedTokens)
+    }
+
+    public func lookupWarmHit(
+        exactName: String,
+        history: [Int64],
+        rawHistory: [Int64],
+        kvMode: FNKVStorageMode,
+        hasMTP: Bool,
+        dflashMarker: String? = nil,
+        allowExact: Bool
+    ) -> QWTwoTierPrefixCache.WarmLookupHit<Data>? {
+        let queryRootHash: UInt64? = history.count >= Self.rootPrefixTokenCount
+            ? Self.rootHash(history: history, kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker)
+            : nil
+        let isSalted = rawHistory.first != history.first
+        return QWTwoTierPrefixCache.lookupWarmPrefix(
+            in: core,
+            exactKey: exactName,
+            saltedBaseKey: isSalted ? exactName : nil,
+            tokenCount: history.count,
+            queryRootHash: queryRootHash,
+            allowExact: allowExact,
+            allowPrefix: true,
+            sharedBaseOnly: false,
+            touchOnHit: true,
+            isCandidate: { _, _, _ in true },
+            matchesPrefix: { name, count, sharedFallback in
+                let toks = sharedFallback ? rawHistory : history
+                return Self.matchesEntry(
+                    name: name, count: count, history: toks,
+                    kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker
+                )
+            }
+        )
     }
 
     static func tokenCount(in name: String) -> Int? {

@@ -7,6 +7,7 @@
 // are in specs/04-qwquant.md.
 
 #include <metal_stdlib>
+#include "include/qw_fastmath_safe.metalh"
 #include "quant/qw_quant_decls.metalh"
 using namespace metal;
 
@@ -64,7 +65,7 @@ METAL_FUNC float qwg_read_f16_or_bf16(device const ushort* p, uint dtype, uint i
 /// rounds to the nearest 2^-24 subnormal step (~3e-8) while remaining finite.
 METAL_FUNC bool qwg_f16_header_holds(float raw, half stored) {
     if (float(stored) == raw) return true;
-    return isfinite(raw) && isfinite(float(stored)) && fabs(raw) < 6.103515625e-5f;
+    return qw_is_finite_bits(raw) && qw_is_finite_bits(float(stored)) && fabs(raw) < 6.103515625e-5f;
 }
 
 /// Repack an MLX affine checkpoint into our one plane, at the same byte

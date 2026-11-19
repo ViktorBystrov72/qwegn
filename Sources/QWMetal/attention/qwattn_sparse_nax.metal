@@ -4,6 +4,9 @@
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#if !defined(__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__) || __ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ < 260200
+#error "NAX cooperative_tensor kernels require -mmacosx-version-min=26.2 or newer (Apple MPP operand_index ABI)."
+#endif
 #include "include/qw_weight_basis.metalh"
 using namespace metal;
 
@@ -279,11 +282,11 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
             for (short f = 0; f < 2; ++f) {
                 #pragma unroll
                 for (short j = 0; j < 4; ++j) {
-                    s[f][j] = (j < nvis[f]) ? (s[f][j] * scale2) : -INFINITY;
+                    s[f][j] = (j < nvis[f]) ? (s[f][j] * scale2) : -1e30f;
                 }
             }
 
-            float m = -INFINITY;
+            float m = -1e30f;
             #pragma unroll
             for (short f = 0; f < 2; ++f) {
                 m = max(m, max(max(s[f][0], s[f][1]), max(s[f][2], s[f][3])));
@@ -349,15 +352,15 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
                 #pragma unroll
                 for (short j = 0; j < 4; ++j) {
                     const bool ok = j < nvis[f];
-                    s[f][j]     = ok ? (s[f][j] * scale2) : -INFINITY;
-                    s[f][4 + j] = ok ? (s[f][4 + j] * scale2) : -INFINITY;
+                    s[f][j]     = ok ? (s[f][j] * scale2) : -1e30f;
+                    s[f][4 + j] = ok ? (s[f][4 + j] * scale2) : -1e30f;
                 }
             }
 
             float factor[2];
             #pragma unroll
             for (short i = 0; i < 2; ++i) {
-                float m = -INFINITY;
+                float m = -1e30f;
                 #pragma unroll
                 for (short f = 0; f < 2; ++f) {
                     m = max(m, max(max(s[f][4 * i], s[f][4 * i + 1]), max(s[f][4 * i + 2], s[f][4 * i + 3])));

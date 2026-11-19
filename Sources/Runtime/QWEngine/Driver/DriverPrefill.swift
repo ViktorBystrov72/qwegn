@@ -75,19 +75,21 @@ extension QWEngineDriver {
         // Its per-token loops place barriers only at REGION seams, not at
         // every per-token producer→consumer edge — the serial encoder's
         let encodeStart = prefillTimingLedger.isEnabled ? Date() : nil
-        guard let firstPair = hal.begin() else { throw QWEngineDriverError.state("cmdbuffer") }
-        var cb: any MTLCommandBuffer = firstPair.0
-        var enc: any MTLComputeCommandEncoder = firstPair.1
-        activeCB = cb
-        activeEnc = enc
-        stepCBs = []
+        var (cb, enc) = try commandFrame.begin(hal: hal)
         beginPrefillProfileChunk()
-        defer {
-            activeCB = nil
-            activeEnc = nil
-            stepCBs = nil
-        }
+        var allCBsDrained = false
         var committedCbs: [any MTLCommandBuffer] = []
+        defer {
+            if allCBsDrained {
+                commandFrame.closeActiveEncoder()
+                commandFrame.clearActiveBindings()
+            } else {
+                commandFrame.abortIncomplete(
+                    admission: admission, session: nil,
+                    fallbackCBs: committedCbs,
+                    clearPrefillProfiler: Self.prefillProfileEnabled)
+            }
+        }
 
         if ProcessInfo.processInfo.environment["QW_DEBUG_LAYERS"] == "1" {
             fputs("GPU prefill tokens[\(start)..<\(start+T)]: \(Array(tokens[start..<(start+T)]))\n", stderr)
@@ -112,18 +114,9 @@ extension QWEngineDriver {
                 || (pos >= 131_072 && v > 16 && v % 8 == 0)
                 || (longWideChunk && v > 0 && v % 4 == 0)) && T >= 16
             if shouldSlice {
-                hal.end(cb, enc)
-                if !pendingColdUnloads.isEmpty {
-                    cb.waitUntilCompleted()
-                    flushPendingColdUnloads()
-                }
-                committedCbs.append(cb)
-                stepCBs?.append(cb)
-                guard let nextPair = hal.begin() else { throw QWEngineDriverError.state("cmdbuffer slice") }
-                cb = nextPair.0
-                enc = nextPair.1
-                activeCB = cb
-                activeEnc = enc
+                let nextPair = try commandFrame.slicePrefillCB(hal: hal, committedCbs: &committedCbs)
+                cb = nextPair.cb
+                enc = nextPair.enc
             }
             // The layer's kind was resolved when the plan was read: the loop
             // looks the kernel up instead of switching on the kind.
@@ -145,8 +138,10 @@ extension QWEngineDriver {
             // left the count honest.
         }
 
-        if let mtpPromptEmbeddings {
+        if mtpPromptEmbeddings != nil || dflashDrafter != nil {
             if T >= 1024 {
+                activeEnc = nil
+                activeCB = nil
                 hal.end(cb, enc)
                 committedCbs.append(cb)
                 stepCBs?.append(cb)
@@ -154,20 +149,24 @@ extension QWEngineDriver {
                     throw QWEngineDriverError.state("MTP seed cmdbuffer slice")
                 }
                 cb = seedCB
-                activeCB = cb
-                activeEnc = nil
             } else {
+                activeEnc = nil
+                activeCB = nil
                 enc.endEncoding()
             }
             let seedHidden = echoDrafter != nil
                 ? prefixRows(psc.mhcStream!, rows: T, cols: (geometry.mhcConfig?.streams ?? 4) * H, dt: .f32)
                 : prefixRows(psc.ln1, rows: T, cols: H, dt: .f16)
+            let seedEmbeddings = mtpPromptEmbeddings.map { prefixRows($0, rows: T, cols: H, dt: .f16) }
+                ?? prefixRows(psc.x, rows: T, cols: H, dt: .f16)
             try encodeMTPSeeding(cb, session: session,
-                                 embeddings: prefixRows(mtpPromptEmbeddings, rows: T, cols: H, dt: .f16),
+                                 embeddings: seedEmbeddings,
                                  hidden: seedHidden,
                                  count: T, cacheRows: mtpRows)
             cb.commit()
         } else {
+            activeEnc = nil
+            activeCB = nil
             hal.end(cb, enc)
         }
         committedCbs.append(cb)
@@ -177,7 +176,9 @@ extension QWEngineDriver {
         for sliceCb in allCbs {
             sliceCb.waitUntilCompleted()
         }
-        flushPendingColdUnloads()
+        let coldFailure = commandFrame.drainColdEvents(waitUntilIdle: true)
+        commandFrame.flushPendingColdUnloads()
+        allCBsDrained = true
         endPrefillProfileChunk(tokens: T)
         if let encodeMicros {
             let gpuMicros = Self.gpuBusyMicros(allCbs)
@@ -185,20 +186,22 @@ extension QWEngineDriver {
                 encodeMicros: encodeMicros,
                 gpuMicros: gpuMicros > 0 ? gpuMicros : nil)
         }
-        for sliceCb in allCbs where sliceCb.error != nil {
+        let hasSpecState = mtpCache != nil || verifyWindow != nil
+        for sliceCb in allCbs where sliceCb.status != .completed || sliceCb.error != nil {
             commandBufferErrors += 1   // M1 triad (prefill path)
         }
-        // H3 FIX (prefill): same law as decodeStep — a failed chunk cb
-        // would return a stale token and leave position/state half-true.
-        let hasSpecState = mtpCache != nil || verifyWindow != nil
+        if let coldFailure {
+            if hasSpecState { session.stateFailed = true }
+            throw QWEngineDriverError.state("cold event staging: \(coldFailure)")
+        }
         for sliceCb in allCbs {
-            if hasSpecState, sliceCb.status != .completed {
-                session.stateFailed = true
-                throw QWEngineDriverError.state("MTP prefill GPU completion failed: \(String(describing: sliceCb.error))")
-            }
             if let e = sliceCb.error {
                 if hasSpecState { session.stateFailed = true }
                 throw QWEngineDriverError.state("prefill cb: \(e.localizedDescription)")
+            }
+            if sliceCb.status != .completed {
+                if hasSpecState { session.stateFailed = true }
+                throw QWEngineDriverError.state("prefill cb completion failed (status=\(sliceCb.status.rawValue))")
             }
         }
         if runsHead {

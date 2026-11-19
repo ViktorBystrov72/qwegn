@@ -53,29 +53,38 @@ public enum QWNorm {
         guard variant != .headNorm else {
             throw QWNormError.variantNotHere("head-norm")
         }
+        guard x.shape.dtype == .f16, gamma.shape.dtype == .f16, out.shape.dtype == .f16 else {
+            throw QWNormError.badShape("x, gamma, and out must be f16")
+        }
         let hidden = geometry.hidden
         let elems = x.shape.dims.reduce(1, *)
-        guard elems % hidden == 0 else {
+        guard elems > 0, elems % hidden == 0 else {
             throw QWNormError.badShape("rows·hidden mismatch: \(x.shape.dims) % \(hidden)")
         }
         let rows = elems / hidden
+        guard rows > 0 else {
+            throw QWNormError.badShape("rows must be positive")
+        }
+        guard out.shape.elementCount == elems else {
+            throw QWNormError.badShape("out must match x element count (\(elems))")
+        }
         guard gamma.shape.dims.reduce(1, *) == hidden else {
             throw QWNormError.badShape("gamma must be [\(hidden)]")
         }
         switch variant {
         case .rmsnormResidual:
-            guard let r = residual, r.shape.dims.reduce(1, *) == elems else {
-                throw QWNormError.badShape("residual required, same shape as x")
+            guard let r = residual, r.shape.dtype == .f16, r.shape.dims.reduce(1, *) == elems else {
+                throw QWNormError.badShape("residual required, same f16 shape as x")
             }
         case .rmsnormPrologueScale:
-            guard let s = rowScalesOut, s.shape.dims == [rows] else {
+            guard let s = rowScalesOut, s.shape.dtype == .f32, s.shape.dims == [rows] else {
                 throw QWNormError.badShape("rowScalesOut must be [\(rows)] f32")
             }
         case .rmsnormResidualPrologueScale:
-            guard let r = residual, r.shape.dims.reduce(1, *) == elems else {
-                throw QWNormError.badShape("residual required, same shape as x")
+            guard let r = residual, r.shape.dtype == .f16, r.shape.dims.reduce(1, *) == elems else {
+                throw QWNormError.badShape("residual required, same f16 shape as x")
             }
-            guard let s = rowScalesOut, s.shape.dims == [rows] else {
+            guard let s = rowScalesOut, s.shape.dtype == .f32, s.shape.dims == [rows] else {
                 throw QWNormError.badShape("rowScalesOut must be [\(rows)] f32")
             }
         default: break

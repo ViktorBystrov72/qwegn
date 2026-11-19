@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import QWRope
 @testable import QWFlashNext
 
 // Goldens for full attention + QSA indexer (HF qwen4_exp, eager path, float causal mask).
@@ -20,7 +21,7 @@ final class FNAttentionGoldenTests: XCTestCase {
             qProj: t("q_proj.weight"), kProj: t("k_proj.weight"), vProj: t("v_proj.weight"),
             oProj: t("o_proj.weight"), qNorm: t("q_norm.weight"), kNorm: t("k_norm.weight"),
             indexer: indexer,
-            rope: FNRope(rotaryDim: g["rotary_dim"] as! Int, theta: g["rope_theta"] as! Double))
+            rope: QWRopeCPU(rotaryDim: g["rotary_dim"] as! Int, theta: g["rope_theta"] as! Double))
         return (block, g)
     }
 
@@ -58,8 +59,8 @@ final class FNAttentionGoldenTests: XCTestCase {
     }
 
     func testRopeYaRN1MScaling() {
-        let defaultRope = FNRope(rotaryDim: 64, theta: 10_000_000.0)
-        let yarnRope = FNRope(rotaryDim: 64, theta: 10_000_000.0,
+        let defaultRope = QWRopeCPU(rotaryDim: 64, theta: 10_000_000.0)
+        let yarnRope = QWRopeCPU(rotaryDim: 64, theta: 10_000_000.0,
                               yarnFactor: 4.0, originalMaxPosition: 262_144)
         XCTAssertEqual(defaultRope.attentionScaling, 1.0, accuracy: 1e-6)
         let expectedScale = Float(0.1 * Foundation.log(4.0) + 1.0)

@@ -233,15 +233,22 @@ public enum FNGPULayerPasses {
             let p0 = g.convParity & QWFourSlotRollbackRing.ringMask
             g.convParity = (p0 + T) & QWFourSlotRollbackRing.ringMask
             let interleaved = g.qkvZ != nil
+            let baInterleaved = interleaved || useFusedBA
+            let xIn = interleaved ? s.qkvZ32 : s.qkv32
             let xStride = interleaved ? (CONV + VALUE) : CONV
-            let baStride = interleaved ? 2 * VH : VH
-            let aOff = (interleaved ? VH : s.maxT * VH) * 4
-            let zOff = (interleaved ? CONV : s.maxT * CONV) * 4
-            try QWGDNF32.encodeConvPrepF32(enc, hal: hal, x: s.qkvZ32, w: g.conv,
+            let zStride = interleaved ? (CONV + VALUE) : VALUE
+            let baStride = baInterleaved ? 2 * VH : VH
+            let bIn = baInterleaved ? s.gdnBA : s.gdnB
+            let aIn = baInterleaved
+                ? view(s.gdnBA, byteOffset: VH * 4, count: T * baStride - VH, dtype: .f32)
+                : s.gdnA
+            let zIn = interleaved
+                ? view(s.qkvZ32, byteOffset: CONV * 4, count: T * (CONV + VALUE) - CONV, dtype: .f32)
+                : s.z32
+            try QWGDNF32.encodeConvPrepF32(enc, hal: hal, x: xIn, w: g.conv,
                                            stIn: g.convState[p0],
                                            stOut: g.convState[(p0 + 1) & QWFourSlotRollbackRing.ringMask],
-                                           b: s.gdnBA,
-                                           a: view(s.gdnBA, byteOffset: aOff, count: T * baStride - (aOff / 4), dtype: .f32),
+                                           b: bIn, a: aIn,
                                            aLog: g.aLog, dtBias: g.dtBias,
                                            y: s.yDense32, glog: s.glog, beta: s.beta,
                                            rows: T, xStride: xStride, baStride: baStride,
@@ -250,17 +257,13 @@ public enum FNGPULayerPasses {
             if T == 1 {
                 let stIn = g.states[g.stateParity & QWFourSlotRollbackRing.ringMask]
                 try QWGDNF32.encodeRecurrentRowsF32(enc, hal: hal, y: s.yDense32, betas: s.beta, glog: s.glog,
-                                                    state: stIn,
-                                                    z: view(s.qkvZ32, byteOffset: zOff, count: VALUE, dtype: .f32),
-                                                    zStride: interleaved ? CONV + VALUE : VALUE,
+                                                    state: stIn, z: zIn, zStride: zStride,
                                                     normWeight: g.normWeight, out: s.outNorm32, rows: 1)
             } else {
                 let sp0 = g.stateParity & QWFourSlotRollbackRing.ringMask
                 g.stateParity = (sp0 + T) & QWFourSlotRollbackRing.ringMask
                 try QWGDNF32.encodeRecurrentRowsF32(enc, hal: hal, y: s.yDense32, betas: s.beta, glog: s.glog,
-                                                    state: g.states[sp0],
-                                                    z: view(s.qkvZ32, byteOffset: zOff, count: VALUE, dtype: .f32),
-                                                    zStride: interleaved ? CONV + VALUE : VALUE,
+                                                    state: g.states[sp0], z: zIn, zStride: zStride,
                                                     normWeight: g.normWeight, out: s.outNorm32, rows: T,
                                                     ringBase: g.states[0], ringParity: sp0)
             }

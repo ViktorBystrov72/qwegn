@@ -98,7 +98,10 @@ extension QWMoEOperator {
         let fc1Precast16 = canUseFc1NaxPrecast ? xe16ForNax : nil
         let shPrecast16 = (T >= minNax && hasNaxHScratch && H % 64 == 0 && (2 * ISh) % 64 == 0 && H <= s.maxTileWidth)
             ? xe16ForNax : nil
-        let shAct16 = (T >= minNax && ISh > 0 && ISh % 64 == 0 && (s.naxX16?.shape.elementCount ?? 0) >= T * (H + ISh))
+        let canNaxShDown = allowDenseNax && canUseNaxDenseProj(
+            hal: hal, weight: w.sharedDown, rows: T, maxTileWidth: s.maxTileWidth, minNaxRows: minNax
+        )
+        let shAct16 = (ISh > 0 && canNaxShDown && (s.naxX16?.shape.elementCount ?? 0) >= T * (H + ISh))
             ? s.naxX16!.slice(byteOffset: T * H * 2, count: T * ISh, dtype: .f16)
             : nil
 
@@ -131,16 +134,18 @@ extension QWMoEOperator {
             if let shGU = w.sharedGateUp, let shDown = w.sharedDown,
                let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
                 try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shGU, x: xRot, y: guSh,
-                                              naxX16: naxScratch0, naxY16: naxY, maxTileWidth: max(H, s.maxTileWidth),
+                                              naxX16: naxScratch0, naxY16: naxY, maxTileWidth: s.maxTileWidth,
                                               rows: T, x16Precast: shPrecast16, minNaxRows: minNax)
                 barrier()
                 try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
                                             intermediate: ISh, act16: shAct16)
                 barrier()
+                let canUseScratch0ForDown = naxScratch0.shape.elementCount >= T * ISh && naxY.shape.elementCount >= T * ISh
                 let shScratch = shAct16 ?? naxScratch0
+                let shDownMaxTile = (shAct16 != nil || canUseScratch0ForDown) ? s.maxTileWidth : 0
                 try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shDown, x: actSh, y: s.shared,
                                               naxX16: shScratch, naxY16: naxY,
-                                              maxTileWidth: max(max(H, ISh), s.maxTileWidth),
+                                              maxTileWidth: shDownMaxTile,
                                               rows: T, x16Precast: shAct16, minNaxRows: minNax)
             }
             barrier()
@@ -208,7 +213,7 @@ extension QWMoEOperator {
         let naxScratchH = hasNaxHScratch ? s.naxX16!.slice(byteOffset: 0, count: T * H, dtype: .f16) : nil
         try encodeDenseFallback(weight: latent.fc1, x: xRot, y: ls.bufA32, rows: T,
                                 naxScratch: naxScratchH, precast16: fc1Precast16)
-        let fuseSh = T <= 8 && ISh > 0 && ISh <= 4096 && w.sharedGateUp != nil && s.guSh32 != nil && s.actSh32 != nil
+        let fuseSh = T <= 8 && ISh > 0 && ISh <= 4096 && (ISh % 8 == 0) && w.sharedGateUp != nil && s.guSh32 != nil && s.actSh32 != nil
         if let shGU = w.sharedGateUp, let guSh = s.guSh32, ISh > 0 {
             try encodeDenseFallback(weight: shGU, x: xRot, y: guSh, rows: T,
                                     naxScratch: naxScratchH, precast16: shPrecast16)
@@ -236,8 +241,11 @@ extension QWMoEOperator {
                                             intermediate: ISh, act16: shAct16)
                 barrier()
             }
+            let canAliasShDown0 = (s.naxX16?.shape.elementCount ?? 0) >= T * ISh
+                && (s.naxY16?.shape.elementCount ?? s.naxX16?.shape.elementCount ?? 0) >= T * ISh
+                && canUseNaxDenseProj(hal: hal, weight: shDown, rows: T, maxTileWidth: s.maxTileWidth, minNaxRows: minNax)
             let shDownScratch = shAct16
-                ?? ((s.naxX16?.shape.elementCount ?? 0) >= T * ISh ? s.naxX16!.slice(byteOffset: 0, count: T * ISh, dtype: .f16) : nil)
+                ?? (canAliasShDown0 ? s.naxX16!.slice(byteOffset: 0, count: T * ISh, dtype: .f16) : nil)
             try encodeDenseFallback(weight: shDown, x: actSh, y: s.shared, rows: T,
                                     naxScratch: shDownScratch, precast16: shAct16)
         }

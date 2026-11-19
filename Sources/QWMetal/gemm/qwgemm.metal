@@ -328,8 +328,10 @@ kernel void qwg_gemv_q4g_silu_pair_dx_h16(device const Block_HQ4_G32* blocks [[b
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgi == 0u && rBase + lane < I) {
-            h16[rBase + lane] = simd_fwht32(tgAct[lane], lane);
+        if (sgi == 0u) {
+            const half act = (rBase + lane < I) ? tgAct[lane] : half(0.0h);
+            const half rot = simd_fwht32(act, lane);
+            if (rBase + lane < I) h16[rBase + lane] = rot;
         }
         return;
     }
@@ -425,7 +427,8 @@ static inline void qwg_gdn_inproj_store_row(uint row, float vx, device half* y16
         y16[row] = half(vx);
     } else if (row < bRow0) {
         const uint h = row - aRow0;
-        const float sp = log(1.0f + exp(vx + dtBias[h]));
+        const float spIn = vx + dtBias[h];
+        const float sp = (spIn > 20.0f) ? spIn : log(1.0f + exp(spIn));
         glog[h] = -exp(aLog[h]) * sp;
         if (y32) y32[row] = vx;
         y16[row] = half(vx);

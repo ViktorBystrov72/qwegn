@@ -191,7 +191,7 @@ kernel void qwg_hca_compress_blocks(
     float sq = 0.0f;
 
     for (uint d = tid; d < p.headDim; d += 256u) {
-        float mx = -INFINITY;
+        float mx = -1e30f;
         for (uint r = 0u; r < p.compressRatio; ++r) {
             const uint slot = (basePos + r) & p.ringMask;
             mx = max(mx, compScorePend[(size_t)slot * p.headDim + d]);
@@ -410,10 +410,10 @@ kernel void qwg_hca_attn_mma(
     if (tid < HCA_HG) {
         if (nSplit == 1u && p.hasSink != 0u) {
             const float sk = attnSink[h0 + tid];
-            mH[tid] = (sk > -1e29f) ? sk : -INFINITY;
+            mH[tid] = (sk > -1e29f) ? sk : -1e30f;
             lH[tid] = (sk > -1e29f) ? 1.0f : 0.0f;
         } else {
-            mH[tid] = -INFINITY;
+            mH[tid] = -1e30f;
             lH[tid] = 0.0f;
         }
     }
@@ -463,7 +463,7 @@ kernel void qwg_hca_attn_mma(
             #pragma unroll
             for (uint i = 0u; i < 2u; ++i) {
                 const uint col = sTb * 8u + cl + i;
-                sbuf[hr * HCA_TK + col] = (s0 + col < sEnd) ? e[i] * scale : -INFINITY;
+                sbuf[hr * HCA_TK + col] = (s0 + col < sEnd) ? e[i] * scale : -1e30f;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -478,15 +478,15 @@ kernel void qwg_hca_attn_mma(
             mx = max(mx, simd_shuffle_xor(mx, 4u));
             const float mOld = mH[hr];
             const float mNew = max(mOld, mx);
-            const float pa = (mNew == -INFINITY) ? 0.0f : exp(a - mNew);
-            const float pb = (mNew == -INFINITY) ? 0.0f : exp(b - mNew);
+            const float pa = (mNew <= -1e29f) ? 0.0f : exp(a - mNew);
+            const float pb = (mNew <= -1e29f) ? 0.0f : exp(b - mNew);
             pbuf[hr * HCA_TK + c0] = half(pa);
             pbuf[hr * HCA_TK + c0 + 1u] = half(pb);
             float sm = pa + pb;
             sm += simd_shuffle_xor(sm, 1u);
             sm += simd_shuffle_xor(sm, 2u);
             sm += simd_shuffle_xor(sm, 4u);
-            const float corr = (mOld == -INFINITY) ? 0.0f : exp(mOld - mNew);
+            const float corr = (mOld <= -1e29f) ? 0.0f : exp(mOld - mNew);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             if ((tid & 7u) == 0u) {
                 corrH[hr] = corr;
@@ -561,7 +561,7 @@ kernel void qwg_hca_attn_combine(
     const uint h = tg - t * p.qHeads;
     if (t >= p.T) return;
     const size_t base = (size_t)t * nSplit * p.qHeads + h;
-    float sink = -INFINITY;
+    float sink = -1e30f;
     bool validSink = false;
     if (p.hasSink != 0u) {
         const float sk = attnSink[h];

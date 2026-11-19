@@ -7,11 +7,12 @@
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include "qw_dequant.metalh"
+#include "qw_fastmath_safe.metalh"
 using namespace metal;
 
 /// IEEE-754 round-to-nearest-even `float` -> `bfloat` matching `QWFlashNextOps.bf16`.
 METAL_FUNC bfloat qw_bf16(float v) {
-    if (isnan(v) || isinf(v)) return bfloat(v);
+    if (!qw_is_finite_bits(v)) return bfloat(v);
     uint u = as_type<uint>(v);
     u = u + 0x7FFFu + ((u >> 16) & 1u);
     return bfloat(as_type<float>(u & 0xFFFF0000u));

@@ -4,7 +4,7 @@
 using namespace metal;
 
 static inline uint lsa_float_to_sortable_u32(float x) {
-    if (isnan(x)) return 0u;
+    if ((as_type<uint>(x) & 0x7FFFFFFFu) > 0x7F800000u) return 0u;
     const uint bits = as_type<uint>(x);
     return (bits & 0x80000000u) ? (~bits) : (bits ^ 0x80000000u);
 }

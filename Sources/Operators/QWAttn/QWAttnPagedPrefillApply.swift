@@ -88,6 +88,9 @@ public final class QWAttnPagedPrefill: Sendable {
 
         let numTiles = (T + 31) / 32
         let gqaRatio = max(1, geometry.qHeads / max(1, geometry.kvHeads))
+        guard gqaRatio <= 16 else {
+            throw QWAttnPagedPrefillError.badShape("gqaRatio \(gqaRatio) exceeds 16")
+        }
         let totalThreadgroups = numTiles * geometry.kvHeads
         enc.dispatchThreadgroups(MTLSize(width: totalThreadgroups, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 64 * gqaRatio, height: 1, depth: 1))
@@ -146,6 +149,9 @@ public final class QWAttnPagedPrefill: Sendable {
 
         let numTiles = (T + 31) / 32
         let gqaRatio = max(1, geometry.qHeads / max(1, geometry.kvHeads))
+        guard gqaRatio <= 16 else {
+            throw QWAttnPagedPrefillError.badShape("gqaRatio \(gqaRatio) exceeds 16")
+        }
         let totalThreadgroups = numTiles * geometry.kvHeads
         enc.dispatchThreadgroups(MTLSize(width: totalThreadgroups, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 64 * gqaRatio, height: 1, depth: 1))

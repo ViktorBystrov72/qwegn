@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2">
   <img src="https://img.shields.io/badge/platform-macOS%2026%20(Apple%20Silicon)-lightgrey.svg" alt="macOS 26, Apple Silicon">
   <a href="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml"><img src="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.27.3-green.svg" alt="Release v0.27.3"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.27.4-green.svg" alt="Release v0.27.4"></a>
 </p>
 
 **Qwegn** (`qwg`) is a from-scratch LLM/VLM inference engine for Apple Silicon,
@@ -18,8 +18,8 @@ Custom cooperative-tensor kernels, direct Metal command encoding, and zero heap
 or Metal-buffer allocations in steady-state decode, from dense 9B models up to a
 321B MoE running 100% UMA-resident (`100.6 GiB` SHVQ) or NVMe-streamed on a 128 GB Mac.
 
-Requires macOS 26+ on Apple Silicon (M-series; M5 recommended for NAX cooperative
-tensors), Xcode 26+ and Python 3.13 for the build. One-line dev loop: `make init && make ci`.
+Requires macOS 26.2+ on Apple Silicon (M-series; M5 recommended for NAX cooperative
+tensors), Xcode 26.2+ and Python 3.13 for the build. One-line dev loop: `make init && make ci`.
 
 <p align="center">
   <img src="assets/qwegn_menubar.png" alt="Qwegn.app menu bar control panel — live decode and prefill rates from the engine" width="380">

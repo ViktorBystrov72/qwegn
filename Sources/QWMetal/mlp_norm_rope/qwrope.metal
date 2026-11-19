@@ -49,9 +49,11 @@ kernel void qwg_rope_norm_qk(device const uint4* qIn      [[buffer(0)]],
     if (flags.y) {                                 // staged head-norm (f16 store)
         H8 n16;
         for (int i = 0; i < 8; i++) n16.v[i] = half(xn[i]);
-        const size_t nBase = isQ ? (size_t)s * 768
-                                 : (size_t)flags.z + (size_t)s * 128;
-        normOut[nBase + (size_t)row * 32 + ti] = *(thread uint4*)&n16;
+        const size_t qRowU4 = (size_t)QW_QPROJ_OUT / 8u;
+        const size_t kRowU4 = (size_t)QW_KV_HEADS * flags.x;
+        const size_t nBase = isQ ? ((size_t)s * qRowU4 + (size_t)head * flags.x)
+                                 : ((size_t)flags.z + (size_t)s * kRowU4 + (size_t)row * flags.x);
+        normOut[nBase + ti] = *(thread uint4*)&n16;
     }
 
     // Gate halves of each interleaved [Q‖gate] slot are NEVER touched by
@@ -124,10 +126,10 @@ kernel void qwg_extract_rope_norm_qk(device const uint4* attnY    [[buffer(0)]],
     float4 hi = float4(xn[4], xn[5], xn[6], xn[7]);
     float4 plo = simd_shuffle_xor(lo, 4), phi = simd_shuffle_xor(hi, 4);
 
-    if (isQ) {
+    if (isQ && QW_HAS_Q_GATE) {
         // Pass through gate half (32 uint4s after Q)
         dst[32 + ti] = src[32 + ti];
-    } else {
+    } else if (!isQ) {
         // The 4 K threadgroups also copy V to vOut (128 uint4s per token)
         vOut[(size_t)s * QW_KV_HEADS * QW_HEAD_DIM / 8u + head * 32u + ti] =
             attnY[inRow + (size_t)(QW_QPROJ_OUT + QW_KV_HEADS * QW_HEAD_DIM) / 8u + head * 32u + ti];

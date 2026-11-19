@@ -13,6 +13,38 @@ using namespace metal;
 #include "include/qw_kv_paged.metalh"
 #include "include/qw_attn_decode.metalh"
 
+template <uint MODE>
+static inline void qwb_load_new_kv8(const device half* knew, const device half* vnew,
+                                    uint relRow, uint kvh, uint d0,
+                                    thread half (&kk)[8], thread half (&vv)[8]) {
+    device const half* kb = knew + (uint64_t)relRow * (QW_KV_HEADS * QW_HEAD_DIM) + kvh * QW_HEAD_DIM + d0;
+    device const half* vb = vnew + (uint64_t)relRow * (QW_KV_HEADS * QW_HEAD_DIM) + kvh * QW_HEAD_DIM + d0;
+    if ((MODE == 0u)) {
+        for (uint i = 0; i < 8u; i++) { kk[i] = kb[i]; vv[i] = vb[i]; }
+    } else if ((MODE == 1u)) {
+        float km = 0.0f, vm = 0.0f;
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) {
+            km = fmax(km, fabs(float(kb[i])));
+            vm = fmax(vm, fabs(float(vb[i])));
+        }
+        km = simd_max(km); vm = simd_max(vm);
+        const float ks = float(half(fmax(km / 127.0f, 6.103515625e-5f)));
+        const float vs = float(half(fmax(vm / 127.0f, 6.103515625e-5f)));
+        const float kinv = (ks > 0.0f) ? (1.0f / ks) : 0.0f;
+        const float vinv = (vs > 0.0f) ? (1.0f / vs) : 0.0f;
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) {
+            kk[i] = half(clamp(round(float(kb[i]) * kinv), -127.0f, 127.0f) * ks);
+            vv[i] = half(clamp(round(float(vb[i]) * vinv), -127.0f, 127.0f) * vs);
+        }
+    } else {
+        uint knib[8], vnib[8]; float ksc, kmn, vsc, vmn;
+        qwg_q4_quant8(kb, &kk[0], knib, &ksc, &kmn);
+        qwg_q4_quant8(vb, &vv[0], vnib, &vsc, &vmn);
+    }
+}
+
 // EXP-9 sub-item 3 (OPT-IN, NOT the shipping default) — batched
 // prefix-aware decode attention for pos>0 continuations. "Local
 // MLX-derived" scope note (binding): this mechanism is NOT imported from
@@ -72,23 +104,29 @@ static inline void qwg_decode_batched_body(const device half* qgate [[buffer(0)]
         for (uint _i = 0; _i < 8u; _i++) _pd += q8[_i] * float(kk[_i]);  \
         qwg_dec_logit(_pd); })
 
+    const uint cPoolEnd = min(cEnd, cBase);
     uint r = k0;
     for (; r + QW_ST <= cEnd; r += QW_ST) {
         #pragma unroll
         for (uint s = 0; s < 2u; ++s) {
             const uint e = s * (192u * 8u) + tid * 8u;
             const uint row = r + (e >> 8);
-            const uint pk = (uint)ktab[row >> 8], pv = (uint)vtab[row >> 8];
-            const uint off = (row & 255u) * QW_ROW + kvh * QW_HEAD_DIM + (e & 255u);
-            device const half* sk = kpool + (uint64_t)pk * QW_PGEL + off;
-            device const half* sv = vpool + (uint64_t)pv * QW_PGEL + off;
+            const uint seg = e & 255u;
             threadgroup half* dk = &stageK[e]; threadgroup half* dv = &stageV[e];
             half ka[8], va[8];
-            if ((MODE == 0u)) {
-                for (uint i = 0; i < 8u; i++) { ka[i] = sk[i]; va[i] = sv[i]; }
+            if (row < cBase) {
+                const uint pk = (uint)ktab[row >> 8], pv = (uint)vtab[row >> 8];
+                const uint off = (row & 255u) * QW_ROW + kvh * QW_HEAD_DIM + seg;
+                device const half* sk = kpool + (uint64_t)pk * QW_PGEL + off;
+                device const half* sv = vpool + (uint64_t)pv * QW_PGEL + off;
+                if ((MODE == 0u)) {
+                    for (uint i = 0; i < 8u; i++) { ka[i] = sk[i]; va[i] = sv[i]; }
+                } else {
+                    QW_KV_LOAD8(ka, kpool, pk, row & 255u, kvh, seg, MODE)
+                    QW_KV_LOAD8(va, vpool, pv, row & 255u, kvh, seg, MODE)
+                }
             } else {
-                QW_KV_LOAD8(ka, kpool, pk, row & 255u, kvh, (e & 255u), MODE)
-                QW_KV_LOAD8(va, vpool, pv, row & 255u, kvh, (e & 255u), MODE)
+                qwb_load_new_kv8<MODE>(knew, vnew, row - cBase, kvh, seg, ka, va);
             }
             for (uint i = 0; i < 8u; i++) { dk[i] = ka[i]; dv[i] = va[i]; }
         }
@@ -125,7 +163,7 @@ static inline void qwg_decode_batched_body(const device half* qgate [[buffer(0)]
         m = Mb;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (; r + 4u <= cEnd; r += 4u) {
+    for (; r + 4u <= cPoolEnd; r += 4u) {
         device const half* k0p = kpool + (uint64_t)ktab[(r + 0u) >> 8] * QW_PGEL + (uint64_t)((r + 0u) & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
         device const half* k1p = kpool + (uint64_t)ktab[(r + 1u) >> 8] * QW_PGEL + (uint64_t)((r + 1u) & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
         device const half* k2p = kpool + (uint64_t)ktab[(r + 2u) >> 8] * QW_PGEL + (uint64_t)((r + 2u) & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
@@ -152,44 +190,24 @@ static inline void qwg_decode_batched_body(const device half* qgate [[buffer(0)]
         QWB_MERGE(sA, vA)  QWB_MERGE(sB, vB)  QWB_MERGE(sC, vCc)  QWB_MERGE(sD, vD)
     }
     for (; r < cEnd; r++) {
-        device const half* kb = kpool + (uint64_t)ktab[r >> 8] * QW_PGEL + (uint64_t)(r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
-        device const half* vb = vpool + (uint64_t)vtab[r >> 8] * QW_PGEL + (uint64_t)(r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
         half kk[8], vv[8];
-        if ((MODE == 0u)) {
-            for (uint i = 0; i < 8u; i++) { kk[i] = kb[i]; vv[i] = vb[i]; }
+        if (r < cBase) {
+            device const half* kb = kpool + (uint64_t)ktab[r >> 8] * QW_PGEL + (uint64_t)(r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
+            device const half* vb = vpool + (uint64_t)vtab[r >> 8] * QW_PGEL + (uint64_t)(r & 255u) * QW_ROW + kvh * QW_HEAD_DIM + d0;
+            if ((MODE == 0u)) {
+                for (uint i = 0; i < 8u; i++) { kk[i] = kb[i]; vv[i] = vb[i]; }
+            } else {
+                QW_KV_LOAD8(kk, kpool, ktab[r >> 8], r & 255u, kvh, d0, MODE);
+                QW_KV_LOAD8(vv, vpool, vtab[r >> 8], r & 255u, kvh, d0, MODE);
+            }
         } else {
-            QW_KV_LOAD8(kk, kpool, ktab[r >> 8], r & 255u, kvh, d0, MODE);
-            QW_KV_LOAD8(vv, vpool, vtab[r >> 8], r & 255u, kvh, d0, MODE);
+            qwb_load_new_kv8<MODE>(knew, vnew, r - cBase, kvh, d0, kk, vv);
         }
         QWB_MERGE(QWB_DOT(kk), vv)
     }
     if (C >= k0 && C < k1) {
-        device const half* kb = knewQ + kvh * QW_HEAD_DIM + d0;
-        device const half* vb = vnewQ + kvh * QW_HEAD_DIM + d0;
         half kk[8], vv[8];
-        if ((MODE == 0u)) {
-            for (uint i = 0; i < 8u; i++) { kk[i] = kb[i]; vv[i] = vb[i]; }
-        } else if ((MODE == 1u)) {
-            // In-register quantise of the new row (same maths as the f16 twin
-            // in qwg_attn_decode and the batched epilogue's store_seg).
-            float km = 0.0f, vm = 0.0f;
-            #pragma unroll
-            for (uint i = 0; i < 8u; i++) { km = fmax(km, fabs(float(kb[i])));
-                                           vm = fmax(vm, fabs(float(vb[i]))); }
-            km = simd_max(km); vm = simd_max(vm);
-            const float ks = float(half(fmax(km / 127.0f, 1e-8f)));
-            const float vs = float(half(fmax(vm / 127.0f, 1e-8f)));
-            const float kinv = 1.0f / ks, vinv = 1.0f / vs;
-            #pragma unroll
-            for (uint i = 0; i < 8u; i++) {
-                kk[i] = half(clamp(round(float(kb[i]) * kinv), -127.0f, 127.0f) * ks);
-                vv[i] = half(clamp(round(float(vb[i]) * vinv), -127.0f, 127.0f) * vs);
-            }
-        } else {
-            uint knib[8], vnib[8]; float ksc, kmn, vsc, vmn;
-            qwg_q4_quant8(kb, &kk[0], knib, &ksc, &kmn);
-            qwg_q4_quant8(vb, &vv[0], vnib, &vsc, &vmn);
-        }
+        qwb_load_new_kv8<MODE>(knew, vnew, qi, kvh, d0, kk, vv);
         QWB_MERGE(QWB_DOT(kk), vv)
     }
 

@@ -150,6 +150,7 @@ extension QWHCAAttnOperator {
         } else {
             return
         }
+        let isSub2SHVQ = baseInc == 2 && (bits == 1 || bits == 15)
         let woP = GroupedWoAParams(
             T: UInt32(rows),
             oGroups: UInt32(oGroups),
@@ -161,7 +162,8 @@ extension QWHCAAttnOperator {
             group: group,
             isIncumbent: baseInc | (skipExitRotation ? 0x10000 : 0)
         )
-        let useNax0 = rows >= 16 && psoGroupedWoANAX != nil && (oLoraRank % 64 == 0) && (groupIn % 32 == 0)
+        let naxPSO = isSub2SHVQ ? psoGroupedWoANAXSub2 : psoGroupedWoANAX
+        let useNax0 = rows >= 16 && naxPSO != nil && (oLoraRank % 64 == 0) && (groupIn % 32 == 0)
         let useMma0 = !useNax0 && rows >= 16 && (oLoraRank % 128 == 0) && (groupIn % 32 == 0)
         let slcBytes = max(1, (qHeads * headDim + oGroups * oLoraRank) * 2)
         let slcRows = max(64, ((24 << 20) / slcBytes) & ~63)
@@ -171,20 +173,20 @@ extension QWHCAAttnOperator {
         var activeMode = -1
         while rowStart < rows {
             let chunk = min(chunkRows, rows - rowStart)
-            let useNAX = chunk >= 16 && psoGroupedWoANAX != nil && (oLoraRank % 64 == 0) && (groupIn % 32 == 0)
+            let useNAX = chunk >= 16 && naxPSO != nil && (oLoraRank % 64 == 0) && (groupIn % 32 == 0)
             let useMMA = !useNAX && chunk >= 16 && (oLoraRank % 128 == 0) && (groupIn % 32 == 0)
             let useMR = !useNAX && !useMMA && chunk > 1 && chunk <= 8 && (oLoraRank % 32 == 0) && (groupIn % 32 == 0)
             let mode = useNAX ? 0 : (useMMA ? 1 : (useMR ? 2 : 3))
             if mode != activeMode {
                 activeMode = mode
-                if let naxPSO = psoGroupedWoANAX, useNAX {
+                if let naxPSO, useNAX {
                     enc.setComputePipelineState(naxPSO)
                 } else if useMMA {
-                    enc.setComputePipelineState(psoGroupedWoAMMA)
+                    enc.setComputePipelineState(isSub2SHVQ ? psoGroupedWoAMMASub2 : psoGroupedWoAMMA)
                 } else if useMR {
-                    enc.setComputePipelineState(psoGroupedWoAGemvMR)
+                    enc.setComputePipelineState(isSub2SHVQ ? psoGroupedWoAGemvMRSub2 : psoGroupedWoAGemvMR)
                 } else {
-                    enc.setComputePipelineState(psoGroupedWoAGemv)
+                    enc.setComputePipelineState(isSub2SHVQ ? psoGroupedWoAGemvSub2 : psoGroupedWoAGemv)
                 }
             }
             let zVhaSub = rowStart == 0 && chunk == rows ? zVhaScratch

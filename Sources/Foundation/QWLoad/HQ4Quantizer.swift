@@ -46,9 +46,13 @@ public enum QWHQ4Quantizer {
         into dst: UnsafeMutablePointer<UInt16>,
         parallel: Bool = true
     ) throws {
+        guard cols > 0, rowOffset >= 0, rowCount >= 0 else {
+            throw QuantizeError.invalidLayout(name: name, reason: "invalid slice rowOffset=\(rowOffset) rowCount=\(rowCount) cols=\(cols)")
+        }
         guard st.tensor(name) != nil else {
             throw QuantizeError.missingTensor(name: name, reason: "missing in safetensors")
         }
+        if rowCount == 0 { return }
         let r = try st.reader(of: name)
         let info = r.tensorInfo
 
@@ -69,24 +73,43 @@ public enum QWHQ4Quantizer {
             guard (sInfo.dtype == .bf16 || sInfo.dtype == .f16), bInfo.dtype == sInfo.dtype else {
                 throw QuantizeError.invalidLayout(name: scalesName, reason: "unsupported MLX scale/bias dtype")
             }
-            guard let wCols = info.shape.last, let gCols = sInfo.shape.last, gCols > 0, cols % gCols == 0 else {
+            guard info.shape.count >= 2,
+                  let wCols = info.shape.last,
+                  let gCols = sInfo.shape.last,
+                  let wElems = info.elementCount,
+                  let sElems = sInfo.elementCount,
+                  let bElems = bInfo.elementCount,
+                  wCols > 0, gCols > 0, cols % gCols == 0,
+                  sInfo.shape == bInfo.shape, sElems == bElems else {
                 throw QuantizeError.invalidLayout(name: name, reason: "invalid MLX group layout")
             }
-            let bits = (wCols * 32) == cols * 4 ? 4 : (wCols * 32) / cols
+            let totalRows = info.shape.dropLast().reduce(1, *)
+            let (endRow, ovEndRow) = rowOffset.addingReportingOverflow(rowCount)
+            guard !ovEndRow, endRow <= totalRows,
+                  wElems >= endRow * wCols, sElems >= endRow * gCols else {
+                throw QuantizeError.invalidLayout(name: name, reason: "row range [\(rowOffset), \(rowOffset)+\(rowCount)) out of bounds")
+            }
+            let (wBits, ovBits) = wCols.multipliedReportingOverflow(by: 32)
+            guard !ovBits, wBits % cols == 0 else {
+                throw QuantizeError.invalidLayout(name: name, reason: "packed cols \(wCols) incompatible with cols \(cols)")
+            }
+            let bits = wBits / cols
             guard QWBF16.isSupportedMLXAffineBits(bits) else {
                 throw QuantizeError.invalidLayout(name: name, reason: "unsupported MLX affine bit-width \(bits)")
             }
             let groupSize = cols / gCols
             let isF16 = (sInfo.dtype == .f16)
-            r.withBytes { wRaw in
-                sReader.withBytes { sRaw in
-                    bReader.withBytes { bRaw in
-                        let wWords = wRaw.bindMemory(to: UInt32.self)
-                        let sU16 = sRaw.bindMemory(to: UInt16.self)
-                        let bU16 = bRaw.bindMemory(to: UInt16.self)
-                        nonisolated(unsafe) let wPtr = wWords.baseAddress!
-                        nonisolated(unsafe) let sPtr = sU16.baseAddress!
-                        nonisolated(unsafe) let bPtr = bU16.baseAddress!
+            try r.withBytes { wRaw in
+                try sReader.withBytes { sRaw in
+                    try bReader.withBytes { bRaw in
+                        guard let wBase = wRaw.baseAddress, wRaw.count >= endRow * wCols * 4,
+                              let sBase = sRaw.baseAddress, sRaw.count >= endRow * gCols * 2,
+                              let bBase = bRaw.baseAddress, bRaw.count >= endRow * gCols * 2 else {
+                            throw QuantizeError.invalidLayout(name: name, reason: "truncated MLX affine tensor")
+                        }
+                        nonisolated(unsafe) let wPtr = wBase
+                        nonisolated(unsafe) let sPtr = sBase
+                        nonisolated(unsafe) let bPtr = bBase
                         nonisolated(unsafe) let dPtr = dst
                         let workers = (parallel && rowCount >= 64) ? min(16, rowCount) : 1
                         let perWorker = (rowCount + workers - 1) / workers
@@ -96,12 +119,12 @@ public enum QWHQ4Quantizer {
                             guard startR < endR else { return }
                             for rIdx in startR..<endR {
                                 let srcRow = rowOffset + rIdx
-                                let rowWords = wPtr.advanced(by: srcRow * wCols)
+                                let rowRaw = wPtr.advanced(by: srcRow * wCols * 4)
                                 let sbRowBase = srcRow * gCols
                                 let dstRowBase = rIdx * cols
                                 for g in 0..<gCols {
-                                    let sBits = UInt16(littleEndian: sPtr[sbRowBase + g])
-                                    let bBits = UInt16(littleEndian: bPtr[sbRowBase + g])
+                                    let sBits = UInt16(littleEndian: sPtr.loadUnaligned(fromByteOffset: (sbRowBase + g) * 2, as: UInt16.self))
+                                    let bBits = UInt16(littleEndian: bPtr.loadUnaligned(fromByteOffset: (sbRowBase + g) * 2, as: UInt16.self))
                                     let scale = isF16
                                         ? Float(Float16(bitPattern: sBits))
                                         : Float(bitPattern: UInt32(sBits) << 16)
@@ -117,7 +140,7 @@ public enum QWHQ4Quantizer {
                                             let scaleVec = SIMD8<Float>(repeating: scale)
                                             let biasVec = SIMD8<Float>(repeating: bias)
                                             for wIdx in 0..<wordsInGroup {
-                                                let word = UInt32(littleEndian: rowWords[wordBase + wIdx])
+                                                let word = UInt32(littleEndian: rowRaw.loadUnaligned(fromByteOffset: (wordBase + wIdx) * 4, as: UInt32.self))
                                                 let baseOut = dstGroupBase + wIdx * 8
                                                 let qVec = SIMD8<Float>(
                                                     Float(word & 0xF),
@@ -138,7 +161,7 @@ public enum QWHQ4Quantizer {
                                             }
                                         } else {
                                             for wIdx in 0..<wordsInGroup {
-                                                var word = UInt32(littleEndian: rowWords[wordBase + wIdx])
+                                                var word = UInt32(littleEndian: rowRaw.loadUnaligned(fromByteOffset: (wordBase + wIdx) * 4, as: UInt32.self))
                                                 let baseOut = dstGroupBase + wIdx * 8
                                                 for nib in 0..<8 {
                                                     let q = Float(word & 0xF)
@@ -153,8 +176,8 @@ public enum QWHQ4Quantizer {
                                         let scaleVec = SIMD8<Float>(repeating: scale)
                                         let biasVec = SIMD8<Float>(repeating: bias)
                                         for pIdx in 0..<pairsInGroup {
-                                            let w0 = UInt32(littleEndian: rowWords[wordBase + pIdx * 2])
-                                            let w1 = UInt32(littleEndian: rowWords[wordBase + pIdx * 2 + 1])
+                                            let w0 = UInt32(littleEndian: rowRaw.loadUnaligned(fromByteOffset: (wordBase + pIdx * 2) * 4, as: UInt32.self))
+                                            let w1 = UInt32(littleEndian: rowRaw.loadUnaligned(fromByteOffset: (wordBase + pIdx * 2 + 1) * 4, as: UInt32.self))
                                             let baseOut = dstGroupBase + pIdx * 8
                                             let qVec = SIMD8<Float>(
                                                 Float(w0 & 0xFF),
@@ -177,7 +200,7 @@ public enum QWHQ4Quantizer {
                                         let wordBase = (g * groupSize) / 4
                                         let wordsInGroup = groupSize / 4
                                         for wIdx in 0..<wordsInGroup {
-                                            var word = UInt32(littleEndian: rowWords[wordBase + wIdx])
+                                            var word = UInt32(littleEndian: rowRaw.loadUnaligned(fromByteOffset: (wordBase + wIdx) * 4, as: UInt32.self))
                                             let baseOut = dstGroupBase + wIdx * 4
                                             for byteIdx in 0..<4 {
                                                 let q = Float(word & 0xFF)
@@ -188,7 +211,7 @@ public enum QWHQ4Quantizer {
                                     } else {
                                         for j in 0..<groupSize {
                                             let col = g * groupSize + j
-                                            let q = QWBF16.unpackMLXAffineQ(rowWords: rowWords, col: col, bits: bits)
+                                            let q = QWBF16.unpackMLXAffineQ(rowRaw: rowRaw, col: col, bits: bits)
                                             dPtr[dstGroupBase + j] = QWBF16.fromFloatRNE(q * scale + bias)
                                         }
                                     }
@@ -201,28 +224,43 @@ public enum QWHQ4Quantizer {
             return
         }
 
-        let elemStart = rowOffset * cols
-        let elemCount = rowCount * cols
-        if let totalElems = info.elementCount, elemStart + elemCount > totalElems {
+        let (elemStart, ovStart) = rowOffset.multipliedReportingOverflow(by: cols)
+        let (elemCount, ovCount) = rowCount.multipliedReportingOverflow(by: cols)
+        let (elemEnd, ovEnd) = elemStart.addingReportingOverflow(elemCount)
+        guard !ovStart, !ovCount, !ovEnd else {
+            throw QuantizeError.invalidLayout(name: name, reason: "row/col product overflow")
+        }
+        if let totalElems = info.elementCount, elemEnd > totalElems {
             throw QuantizeError.invalidLayout(
                 name: name,
                 reason: "shape \(info.shape) smaller than requested rows \(rowOffset + rowCount) × \(cols)"
             )
         }
         try r.withBytes { raw in
+            guard let base = raw.baseAddress else {
+                throw QuantizeError.invalidLayout(name: name, reason: "empty safetensors buffer")
+            }
             switch info.dtype {
             case .bf16:
-                memcpy(dst, raw.baseAddress!.advanced(by: elemStart * 2), elemCount * 2)
+                guard raw.count >= elemEnd * 2 else {
+                    throw QuantizeError.invalidLayout(name: name, reason: "truncated bf16 tensor")
+                }
+                memcpy(dst, base.advanced(by: elemStart * 2), elemCount * 2)
             case .f16:
-                let src = raw.bindMemory(to: UInt16.self)
+                guard raw.count >= elemEnd * 2 else {
+                    throw QuantizeError.invalidLayout(name: name, reason: "truncated f16 tensor")
+                }
                 for i in 0..<elemCount {
-                    let f = Float(Float16(bitPattern: UInt16(littleEndian: src[elemStart + i])))
+                    let bits = UInt16(littleEndian: base.loadUnaligned(fromByteOffset: (elemStart + i) * 2, as: UInt16.self))
+                    let f = Float(Float16(bitPattern: bits))
                     dst[i] = QWBF16.fromFloatRNE(f)
                 }
             case .f32:
-                let src = raw.bindMemory(to: UInt32.self)
+                guard raw.count >= elemEnd * 4 else {
+                    throw QuantizeError.invalidLayout(name: name, reason: "truncated f32 tensor")
+                }
                 for i in 0..<elemCount {
-                    let bits = UInt32(littleEndian: src[elemStart + i])
+                    let bits = UInt32(littleEndian: base.loadUnaligned(fromByteOffset: (elemStart + i) * 4, as: UInt32.self))
                     dst[i] = QWBF16.fromFloatRNE(Float(bitPattern: bits))
                 }
             default:
@@ -243,11 +281,14 @@ public enum QWHQ4Quantizer {
         dstByteOffset: Int,
         name: String
     ) throws {
+        guard chunkRows > 0, k > 0, k % 32 == 0, dstByteOffset >= 0,
+              var nU = UInt32(exactly: chunkRows),
+              var kU = UInt32(exactly: k) else {
+            throw QuantizeError.invalidLayout(name: name, reason: "invalid quant dispatch dimensions chunkRows=\(chunkRows) k=\(k)")
+        }
         guard let (cb, enc) = hal.begin(.serial) else {
             throw QuantizeError.deviceFailure(name: name, reason: "cmdbuffer unavailable")
         }
-        var nU = UInt32(chunkRows)
-        var kU = UInt32(k)
         enc.setComputePipelineState(pso)
         enc.setBuffer(stageBuf, offset: 0, index: 0)
         enc.setBuffer(dstBuffer, offset: dstByteOffset, index: 1)
@@ -280,6 +321,10 @@ public enum QWHQ4Quantizer {
         staging: (any MTLBuffer)? = nil,
         quantPSO: (any MTLComputePipelineState)? = nil
     ) throws {
+        guard k > 0, k % 32 == 0, rowCount >= 0, srcRowOffset >= 0, dstByteOffset >= 0 else {
+            throw QuantizeError.invalidLayout(name: name, reason: "invalid quantizeSafeTensorsInto dimensions")
+        }
+        if rowCount == 0 { return }
         let pso = try quantPSO ?? hal.pipeline("qwg_quantize_bf16_to_hq4_g32_m5")
         let stageBytes = 128 * 1024 * 1024
         guard let stageBuf = staging ?? hal.device.makeBuffer(length: stageBytes, options: .storageModeShared) else {
@@ -334,6 +379,10 @@ public enum QWHQ4Quantizer {
         staging: (any MTLBuffer)? = nil,
         quantPSO: (any MTLComputePipelineState)? = nil
     ) throws {
+        guard experts >= 0, inter > 0, hidden > 0, hidden % 32 == 0, dstByteOffset >= 0 else {
+            throw QuantizeError.invalidLayout(name: gateName, reason: "invalid switch gate/up dimensions")
+        }
+        if experts == 0 { return }
         guard st.tensor(gateName) != nil, st.tensor(upName) != nil else {
             throw QuantizeError.missingTensor(name: gateName, reason: "missing switch_mlp gate/up in safetensors")
         }
@@ -385,9 +434,9 @@ public enum QWHQ4Quantizer {
                             )
                         }
                     } catch {
-                        errLock.lock()
-                        if capturedError == nil { capturedError = error }
-                        errLock.unlock()
+                        errLock.withLock {
+                            if capturedError == nil { capturedError = error }
+                        }
                     }
                 }
                 if let err = capturedError { throw err }

@@ -107,6 +107,7 @@ kernel void qwg_mla_dsa_latent_prep(
 ) {
     if (t >= p.T) return;
     threadgroup float sgScratch[8];
+    threadgroup float sgMinScratch[8];
     threadgroup half shX[512];
 
     const uint pos = p.pos0 + t;
@@ -179,38 +180,39 @@ kernel void qwg_mla_dsa_latent_prep(
             if (sg == 0u) {
                 float mVal = (lane < 8u) ? sgScratch[lane] : 0.0f;
                 mVal = simd_max(mVal);
-                if (lane == 0u) sgScratch[0] = float(half(max(mVal / 127.0f, 1e-8f)));
+                if (lane == 0u) sgScratch[0] = float(half(max(mVal / 127.0f, 6.103515625e-5f)));
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const half scH = half(sgScratch[0]);
-            const float invSc = 1.0f / float(scH);
+            const float invSc = (float(scH) > 0.0f) ? (1.0f / float(scH)) : 0.0f;
             const size_t dataBytes = 256ul * halfRank;
             const size_t pageBytes = dataBytes + 512ul;
             device uchar* pageBase = poolBytes + (size_t)pageID * pageBytes;
-            ((device char*)(pageBase + (size_t)pageOff * halfRank))[col] = char(clamp(rint(v * invSc), -127.0f, 127.0f));
+            ((device char*)(pageBase + (size_t)pageOff * halfRank))[col] = char(clamp(round(v * invSc), -127.0f, 127.0f));
             if (col == 0u) *((device half*)(pageBase + dataBytes + (size_t)pageOff * 2ul)) = scH;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         } else {
             const uint grp = sg >> 2u;
             float minV = simd_min(v), maxV = simd_max(v);
-            if (lane == 0u) { shX[sg] = half(minV); sgScratch[sg] = maxV; }
+            if (lane == 0u) { sgMinScratch[sg] = minV; sgScratch[sg] = maxV; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sg < 2u && lane < 4u) {
                 const uint sgIdx = sg * 4u + lane;
-                float gMin = float(shX[sgIdx]), gMax = sgScratch[sgIdx];
+                float gMin = sgMinScratch[sgIdx], gMax = sgScratch[sgIdx];
                 for (uint off = 2u; off >= 1u; off >>= 1u) {
                     gMin = min(gMin, simd_shuffle_xor(gMin, ushort(off)));
                     gMax = max(gMax, simd_shuffle_xor(gMax, ushort(off)));
                 }
                 if (lane == 0u) {
-                    sgScratch[sg * 2u + 0u] = float(half(max((gMax - gMin) / 15.0f, 1e-8f)));
+                    sgScratch[sg * 2u + 0u] = float(half(max((gMax - gMin) / 15.0f, 6.103515625e-5f)));
                     sgScratch[sg * 2u + 1u] = float(half(gMin));
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const half scH = half(sgScratch[grp * 2u + 0u]);
             const half mnH = half(sgScratch[grp * 2u + 1u]);
-            shX[col] = half(uint(clamp(rint((v - float(mnH)) / float(scH)), 0.0f, 15.0f)));
+            const float invSc4 = (float(scH) > 0.0f) ? (1.0f / float(scH)) : 0.0f;
+            shX[col] = half(uint(clamp(round((v - float(mnH)) * invSc4), 0.0f, 15.0f)));
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const uint groupsPerHalf = max(1u, halfRank >> 7u);
@@ -411,16 +413,16 @@ kernel void qwg_mla_dsa_sparse_attn(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float localMax = -INFINITY;
+    float localMax = -1e30f;
     for (uint s = d; s < slots; s += 256u) localMax = max(localMax, score[s]);
     localMax = simd_max(localMax);
     if (lane == 0u) sgScratch[sg] = localMax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0u) {
-        float vMax = (lane < 8u) ? sgScratch[lane] : -INFINITY;
+        float vMax = (lane < 8u) ? sgScratch[lane] : -1e30f;
         vMax = simd_max(vMax);
         if (lane == 0u) {
-            const float sk = (p.hasSink != 0u) ? attnSink[h] : -INFINITY;
+            const float sk = (p.hasSink != 0u) ? attnSink[h] : -1e30f;
             sgScratch[0] = (sk > -1e29f) ? max(vMax, sk) : vMax;
         }
     }
@@ -441,7 +443,7 @@ kernel void qwg_mla_dsa_sparse_attn(
         float vSum = (lane < 8u) ? sgScratch[lane] : 0.0f;
         vSum = simd_sum(vSum);
         if (lane == 0u) {
-            const float sk = (p.hasSink != 0u) ? attnSink[h] : -INFINITY;
+            const float sk = (p.hasSink != 0u) ? attnSink[h] : -1e30f;
             if (sk > -1e29f) vSum += exp(sk - m);
             sgScratch[0] = (vSum > 0.0f) ? (1.0f / vSum) : 0.0f;
         }

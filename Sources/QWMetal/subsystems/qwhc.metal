@@ -149,6 +149,7 @@ kernel void qwg_hc_up_mix_h32_q4g_f32(device const Block_HQ4_G32* upBlocks [[buf
     threadgroup float sMix[32];
     const uint b = tg.x;
     const uint realHC = hc & 0xFFu;
+    if (R > 512u || (R & 31u) != 0u || realHC == 0u) return;
     const uint nBlocks = R >> 5u;
     const uint halfId = lane >> 4u;
     const uint g = lane & 15u;
@@ -375,17 +376,21 @@ static inline void qwg_hc_inject_norm_core(device const float* base,
         float total = 0.0f;
         for (uint i = 0u; i < 8u; i++) total += partial[i];
         const float inv = 1.0f / sqrt(total / float(hidden) + eps);
-        if (WITH_ROT32 && rinvOnly && tid == 0u) xn[t * groups + g] = inv;
+        if (WITH_ROT32 && rinvOnly && tid == 0u) xn[(size_t)t * groups + g] = inv;
         #pragma unroll
         for (uint i = 0u; i < 16u; i++) {
-            const uint k = tid + i * 256u;
-            if (k >= hidden) break;
-            float v = regV[i] * inv * (1.0f + w[g * hidden + k]);
-            if (!rinvOnly) xn[off + k] = v;
+            const uint b0 = i * 256u;
+            if (b0 >= hidden) break;
+            const uint k = b0 + tid;
+            const bool inBounds = (k < hidden);
+            float v = inBounds ? (regV[i] * inv * (1.0f + w[(size_t)g * hidden + k])) : 0.0f;
+            if (inBounds && !rinvOnly) xn[off + k] = v;
             if (WITH_ROT32) {
                 v = qwg_fwht32_lane_f32(v, lane);
-                if ((hasRot16 & 1u) != 0u) rot16[off + k] = half(v);
-                else rot[off + k] = v;
+                if (inBounds) {
+                    if ((hasRot16 & 1u) != 0u) rot16[off + k] = half(v);
+                    else rot[off + k] = v;
+                }
             }
         }
         return;
@@ -402,14 +407,19 @@ static inline void qwg_hc_inject_norm_core(device const float* base,
     float total = 0.0f;
     for (uint i = 0u; i < 8u; i++) total += partial[i];
     const float inv = 1.0f / sqrt(total / float(hidden) + eps);
-    if (WITH_ROT32 && rinvOnly && tid == 0u) xn[t * groups + g] = inv;
-    for (uint k = tid; k < hidden; k += 256u) {
-        float v = xOut[off + k] * inv * (1.0f + w[g * hidden + k]);
-        if (!rinvOnly) xn[off + k] = v;
+    if (WITH_ROT32 && rinvOnly && tid == 0u) xn[(size_t)t * groups + g] = inv;
+    const uint lim = (hidden + 255u) & ~255u;
+    for (uint b0 = 0u; b0 < lim; b0 += 256u) {
+        const uint k = b0 + tid;
+        const bool inBounds = (k < hidden);
+        float v = inBounds ? (xOut[off + k] * inv * (1.0f + w[(size_t)g * hidden + k])) : 0.0f;
+        if (inBounds && !rinvOnly) xn[off + k] = v;
         if (WITH_ROT32) {
             v = qwg_fwht32_lane_f32(v, lane);
-            if ((hasRot16 & 1u) != 0u) rot16[off + k] = half(v);
-            else rot[off + k] = v;
+            if (inBounds) {
+                if ((hasRot16 & 1u) != 0u) rot16[off + k] = half(v);
+                else rot[off + k] = v;
+            }
         }
     }
 }
@@ -473,7 +483,8 @@ kernel void qwg_hc_inject_norm_h32_sel(device const float* base        [[buffer(
         }
     }
     const uint groups = width / hidden;
-    qwg_hc_inject_norm_core<true>(base + srcRow * width, src + srcRow * hidden, inj + srcRow * groups,
+    qwg_hc_inject_norm_core<true>(base + (size_t)srcRow * width, src + (size_t)srcRow * hidden,
+                                  inj + (size_t)srcRow * groups,
                                   xOut, w, xn, rot, hidden, eps, width, tg, tid, partial, nullptr, 0u);
 }
 
@@ -489,15 +500,21 @@ kernel void qwg_hc_low_epilogue_f32(device float*       yLow     [[buffer(0)]],
                                     uint  lane [[thread_index_in_simdgroup]]) {
     const uint t = tg.y * 8u + sg;
     const uint col = tg.x * 32u + lane;
-    if (t >= T || col >= R) return;
+    if (t >= T) return;
+    const bool inBounds = (col < R);
     const size_t idx = (size_t)t * R + col;
-    const float z = yLow[idx] / scale;
-    float v = z / (1.0f + exp(-z));
+    float v = 0.0f;
+    if (inBounds) {
+        const float z = yLow[idx] / scale;
+        v = z / (1.0f + exp(-z));
+    }
     v = qwg_fwht32_lane_f32(v, lane);
-    if (hasOut16 != 0u) {
-        out16[idx] = half(v);
-    } else {
-        yLow[idx] = v;
+    if (inBounds) {
+        if (hasOut16 != 0u) {
+            out16[idx] = half(v);
+        } else {
+            yLow[idx] = v;
+        }
     }
 }
 
@@ -521,7 +538,7 @@ kernel void qwg_hc_down_inject_f32(device const Block_HQ4_G32* downBlocks [[buff
     threadgroup float4 part4[4];
     if (tg < nDownTG) {
         const uint row0 = tg * 4u;
-        const float4 acc = qwg_gemv_hq4_rows4_part_f32(downBlocks, xRot + rw * K, row0, NDown, K, sg * 32u + lane, 128u);
+        const float4 acc = qwg_gemv_hq4_rows4_part_f32(downBlocks, xRot + (size_t)rw * K, row0, NDown, K, sg * 32u + lane, 128u);
         qwg_hc_down_rows4_store(acc, yLow, NDown, rw, row0, scale, sg, lane, part4);
         return;
     }

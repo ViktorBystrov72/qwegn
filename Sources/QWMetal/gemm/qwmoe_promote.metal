@@ -40,8 +40,11 @@ kernel void qwg_moe_resident_ids(
         constant uint& experts [[buffer(4)]],
         uint tid [[thread_position_in_grid]]) {
     if (tid >= count) return;
-    const int e = ids[tid];
-    out[tid] = (e >= 0 && uint(e) < experts) ? slotMap[e] : -1;
+    const int raw = ids[tid];
+    if (raw < 0) { out[tid] = -1; return; }
+    const uint e = uint(raw) & 0xFFFFu;
+    const int s = (e < experts) ? slotMap[e] : -1;
+    out[tid] = (s >= 0) ? int((uint(raw) & 0xFFFF0000u) | uint(s)) : -1;
 }
 
 // Span router ids → bank rows for dynamic residency: resident → its slot, each distinct miss → residentE + its
@@ -61,8 +64,11 @@ kernel void qwg_moe_span_ids(
     for (uint e = tid; e < experts; e += tgSize) atomic_store_explicit(&miss[e], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < count; i += tgSize) {
-        const int e = ids[i];
-        if (e >= 0 && uint(e) < experts && slotMap[e] < 0) atomic_store_explicit(&miss[e], 1u, memory_order_relaxed);
+        const int raw = ids[i];
+        if (raw >= 0) {
+            const uint e = uint(raw) & 0xFFFFu;
+            if (e < experts && slotMap[e] < 0) atomic_store_explicit(&miss[e], 1u, memory_order_relaxed);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < 32u) {
@@ -79,11 +85,14 @@ kernel void qwg_moe_span_ids(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < count; i += tgSize) {
-        const int e = ids[i];
+        const int raw = ids[i];
         int o = -1;
-        if (e >= 0 && uint(e) < experts) {
-            const int s = slotMap[e];
-            o = s >= 0 ? s : int(residentE + rank[e]);
+        if (raw >= 0) {
+            const uint e = uint(raw) & 0xFFFFu;
+            if (e < experts) {
+                const int s = slotMap[e];
+                o = s >= 0 ? s : int(residentE + rank[e]);
+            }
         }
         out[i] = o;
     }

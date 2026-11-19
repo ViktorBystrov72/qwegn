@@ -181,95 +181,123 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
     public static var defaultMaxSlots: Int { 8 }
     public static var defaultRootPrefixTokenCount: Int { 128 }
 
-    public private(set) var maxSlots: Int
-    public private(set) var byteLimit: Int
-    public private(set) var entryLimit: Int
+    private let lock = NSRecursiveLock()
+    private var _maxSlots: Int
+    private var _byteLimit: Int
+    private var _entryLimit: Int
     public let rootPrefixTokenCount: Int
 
-    public private(set) var entries: [Key: StoredEntry] = [:]
-    public private(set) var order: [Key] = []
-    public private(set) var chargedBytes: Int = 0
-    public private(set) var evictions: Int = 0
+    private var _entries: [Key: StoredEntry] = [:]
+    private var _order: [Key] = []
+    private var _chargedBytes: Int = 0
+    private var _evictions: Int = 0
 
-    public private(set) var keySlot: [Key: Int] = [:]
-    public private(set) var slotLastKey: [Int: Key] = [:]
-    public private(set) var slotBaseKey: [Int: Key] = [:]
-    public private(set) var slotLastTokens: [Int: [Int64]] = [:]
-    public private(set) var slotRootHash: [Int: UInt64] = [:]
-    public private(set) var slotLastTouch: [Int: UInt64] = [:]
-    public private(set) var sharedBaseKeys: Set<Key> = []
+    private var _keySlot: [Key: Int] = [:]
+    private var _slotLastKey: [Int: Key] = [:]
+    private var _slotBaseKey: [Int: Key] = [:]
+    private var _slotLastTokens: [Int: [Int64]] = [:]
+    private var _slotRootHash: [Int: UInt64] = [:]
+    private var _slotLastTouch: [Int: UInt64] = [:]
+    private var _sharedBaseKeys: Set<Key> = []
     private var touchCounter: UInt64 = 0
+    private var _onEvict: ((Key, StoredEntry) -> Void)?
 
-    public var onEvict: ((Key, StoredEntry) -> Void)?
+    public var maxSlots: Int { lock.withLock { _maxSlots } }
+    public var byteLimit: Int { lock.withLock { _byteLimit } }
+    public var entryLimit: Int { lock.withLock { _entryLimit } }
+    public var entries: [Key: StoredEntry] { lock.withLock { _entries } }
+    public var order: [Key] { lock.withLock { _order } }
+    public var chargedBytes: Int { lock.withLock { _chargedBytes } }
+    public var evictions: Int { lock.withLock { _evictions } }
+    public var keySlot: [Key: Int] { lock.withLock { _keySlot } }
+    public var slotLastKey: [Int: Key] { lock.withLock { _slotLastKey } }
+    public var slotBaseKey: [Int: Key] { lock.withLock { _slotBaseKey } }
+    public var slotLastTokens: [Int: [Int64]] { lock.withLock { _slotLastTokens } }
+    public var slotRootHash: [Int: UInt64] { lock.withLock { _slotRootHash } }
+    public var slotLastTouch: [Int: UInt64] { lock.withLock { _slotLastTouch } }
+    public var sharedBaseKeys: Set<Key> { lock.withLock { _sharedBaseKeys } }
+    public var onEvict: ((Key, StoredEntry) -> Void)? {
+        get { lock.withLock { _onEvict } }
+        set { lock.withLock { _onEvict = newValue } }
+    }
 
     public init(byteLimit: Int, entryLimit: Int = Int.max,
                 maxSlots: Int = 8, rootPrefixTokenCount: Int = 128) {
-        self.byteLimit = max(0, byteLimit)
-        self.entryLimit = max(1, entryLimit)
-        self.maxSlots = max(1, min(16, maxSlots))
+        self._byteLimit = max(0, byteLimit)
+        self._entryLimit = max(1, entryLimit)
+        self._maxSlots = max(1, min(16, maxSlots))
         self.rootPrefixTokenCount = max(1, rootPrefixTokenCount)
     }
 
     public func setMaxSlots(_ count: Int) {
-        self.maxSlots = max(1, min(16, count))
+        lock.withLock { _maxSlots = max(1, min(16, count)) }
     }
 
     public func ensureByteLimit(atLeast minimumBytes: Int) {
-        if minimumBytes > byteLimit {
-            byteLimit = minimumBytes
+        lock.withLock {
+            if minimumBytes > _byteLimit { _byteLimit = minimumBytes }
         }
     }
 
     public func removeSharedBaseEntries() {
-        for key in Array(sharedBaseKeys) {
-            forget(key)
+        lock.withLock {
+            for key in Array(_sharedBaseKeys) { forgetLocked(key) }
         }
     }
 
-    public var isEnabled: Bool { byteLimit > 0 }
-    public var count: Int { entries.count }
-    public var state: (entries: Int, bytes: Int) { (entries.count, chargedBytes) }
+    public var isEnabled: Bool { lock.withLock { _byteLimit > 0 } }
+    public var count: Int { lock.withLock { _entries.count } }
+    public var state: (entries: Int, bytes: Int) { lock.withLock { (_entries.count, _chargedBytes) } }
 
-    public func canHold(bytes: Int) -> Bool { isEnabled && bytes <= byteLimit }
-    public func contains(_ key: Key) -> Bool { entries[key] != nil }
+    public func canHold(bytes: Int) -> Bool { lock.withLock { _byteLimit > 0 && bytes <= _byteLimit } }
+    public func canHoldIncludingShared(bytes: Int) -> Bool {
+        lock.withLock {
+            let shared = _sharedBaseKeys.reduce(0) { $0 + (_entries[$1]?.charge ?? 0) }
+            return _byteLimit > 0 && (shared + bytes <= _byteLimit)
+        }
+    }
+    public func contains(_ key: Key) -> Bool { lock.withLock { _entries[key] != nil } }
+
+    public func snapshotOrderedEntries() -> (order: [Key], entries: [Key: StoredEntry], sharedBaseKeys: Set<Key>) {
+        lock.withLock { (_order, _entries, _sharedBaseKeys) }
+    }
 
     public func isProtectedLastKey(_ key: Key, excludingSlot: Int? = nil) -> Bool {
-        for (slot, lastKey) in slotLastKey where slot != excludingSlot {
-            if lastKey == key && entries[lastKey] != nil {
-                return true
-            }
+        lock.withLock { isProtectedLastKeyLocked(key, excludingSlot: excludingSlot) }
+    }
+
+    private func isProtectedLastKeyLocked(_ key: Key, excludingSlot: Int? = nil) -> Bool {
+        for (slot, lastKey) in _slotLastKey where slot != excludingSlot {
+            if lastKey == key && _entries[lastKey] != nil { return true }
         }
         return false
     }
 
-    public func isSharedBaseKey(_ key: Key) -> Bool {
-        sharedBaseKeys.contains(key) && entries[key] != nil
-    }
+    public func isSharedBaseKey(_ key: Key) -> Bool { lock.withLock { isSharedBaseKeyLocked(key) } }
+    private func isSharedBaseKeyLocked(_ key: Key) -> Bool { _sharedBaseKeys.contains(key) && _entries[key] != nil }
 
-    public var hasSharedBase: Bool {
-        sharedBaseKeys.contains { entries[$0] != nil }
-    }
+    public var hasSharedBase: Bool { lock.withLock { _sharedBaseKeys.contains { _entries[$0] != nil } } }
 
     public var sharedBaseBytes: Int {
-        sharedBaseKeys.reduce(0) { $0 + (entries[$1]?.charge ?? 0) }
+        lock.withLock { _sharedBaseKeys.reduce(0) { $0 + (_entries[$1]?.charge ?? 0) } }
     }
 
     /// Returns the longest common prefix length (`>= rootPrefixTokenCount` and `< history.count`)
     /// between `history` and any active slot's `slotLastTokens` when `history` branches off from that slot.
     public func sharedBranchPrefixLength(for history: [Int64]) -> Int? {
-        guard isEnabled, history.count > rootPrefixTokenCount else { return nil }
-        var best = 0
-        for (_, lastToks) in slotLastTokens {
-            let limit = min(history.count, lastToks.count)
-            var common = 0
-            while common < limit && history[common] == lastToks[common] {
-                common += 1
+        lock.withLock {
+            guard _byteLimit > 0, history.count > rootPrefixTokenCount else { return nil }
+            var best = 0
+            for (_, lastToks) in _slotLastTokens {
+                let limit = min(history.count, lastToks.count)
+                var common = 0
+                while common < limit && history[common] == lastToks[common] { common += 1 }
+                if common >= rootPrefixTokenCount && common < history.count && common < lastToks.count {
+                    best = max(best, common)
+                }
             }
-            if common >= rootPrefixTokenCount && common < history.count && common < lastToks.count {
-                best = max(best, common)
-            }
+            return best >= rootPrefixTokenCount ? best : nil
         }
-        return best >= rootPrefixTokenCount ? best : nil
     }
 
     /// Resolves the request slot (`0..<maxSlots`) for an incoming prompt history.
@@ -278,53 +306,51 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
         history: [Int64],
         isContinuationOf: (Key, Int) -> Bool
     ) -> Int {
-        var activeContinuations: [(slot: Int, key: Key, count: Int)] = []
-        for s in 0..<maxSlots {
-            if let last = slotLastKey[s], let entry = entries[last],
-               entry.tokenCount > 0, entry.tokenCount <= history.count {
-                activeContinuations.append((s, last, entry.tokenCount))
+        lock.withLock {
+            var activeContinuations: [(slot: Int, key: Key, count: Int)] = []
+            for s in 0..<_maxSlots {
+                if let last = _slotLastKey[s], let entry = _entries[last],
+                   entry.tokenCount > 0, entry.tokenCount <= history.count {
+                    activeContinuations.append((s, last, entry.tokenCount))
+                }
+                if let base = _slotBaseKey[s], base != _slotLastKey[s], let entry = _entries[base],
+                   entry.tokenCount > 0, entry.tokenCount <= history.count {
+                    activeContinuations.append((s, base, entry.tokenCount))
+                }
             }
-            if let base = slotBaseKey[s], base != slotLastKey[s], let entry = entries[base],
-               entry.tokenCount > 0, entry.tokenCount <= history.count {
-                activeContinuations.append((s, base, entry.tokenCount))
+            activeContinuations.sort { $0.count > $1.count }
+            for cand in activeContinuations where isContinuationOf(cand.key, cand.count) { return cand.slot }
+
+            if history.count >= rootPrefixTokenCount {
+                let rollbackSlots = (0..<_maxSlots).filter { s in
+                    guard let last = _slotLastKey[s], _entries[last] != nil,
+                          let lastToks = _slotLastTokens[s],
+                          history.count < lastToks.count,
+                          lastToks.starts(with: history) else { return false }
+                    return true
+                }
+                if rollbackSlots.count == 1 { return rollbackSlots[0] }
             }
-        }
-        activeContinuations.sort { $0.count > $1.count }
-        for cand in activeContinuations where isContinuationOf(cand.key, cand.count) {
-            return cand.slot
-        }
 
-        if history.count >= rootPrefixTokenCount {
-            let rollbackSlots = (0..<maxSlots).filter { s in
-                guard let last = slotLastKey[s], entries[last] != nil,
-                      let lastToks = slotLastTokens[s],
-                      history.count < lastToks.count,
-                      lastToks.starts(with: history) else { return false }
-                return true
+            for s in 0..<_maxSlots {
+                if let last = _slotLastKey[s], _entries[last] != nil { continue }
+                return s
             }
-            if rollbackSlots.count == 1 {
-                return rollbackSlots[0]
+
+            let sameRootSlots = (0..<_maxSlots).filter { _slotRootHash[$0] == rootHash }
+            if let victim = sameRootSlots.min(by: { (_slotLastTouch[$0] ?? 0) < (_slotLastTouch[$1] ?? 0) }) {
+                return victim
             }
-        }
 
-        for s in 0..<maxSlots {
-            if let last = slotLastKey[s], entries[last] != nil { continue }
-            return s
+            let shortSlots = (0..<_maxSlots).filter { s in
+                guard let last = _slotLastKey[s], let entry = _entries[last] else { return true }
+                return entry.tokenCount < 1024
+            }
+            if let victim = shortSlots.min(by: { (_slotLastTouch[$0] ?? 0) < (_slotLastTouch[$1] ?? 0) }) {
+                return victim
+            }
+            return (0..<_maxSlots).min(by: { (_slotLastTouch[$0] ?? 0) < (_slotLastTouch[$1] ?? 0) }) ?? 0
         }
-
-        let sameRootSlots = (0..<maxSlots).filter { slotRootHash[$0] == rootHash }
-        if let victim = sameRootSlots.min(by: { (slotLastTouch[$0] ?? 0) < (slotLastTouch[$1] ?? 0) }) {
-            return victim
-        }
-
-        let shortSlots = (0..<maxSlots).filter { s in
-            guard let last = slotLastKey[s], let entry = entries[last] else { return true }
-            return entry.tokenCount < 1024
-        }
-        if let victim = shortSlots.min(by: { (slotLastTouch[$0] ?? 0) < (slotLastTouch[$1] ?? 0) }) {
-            return victim
-        }
-        return (0..<maxSlots).min(by: { (slotLastTouch[$0] ?? 0) < (slotLastTouch[$1] ?? 0) }) ?? 0
     }
 
     /// Pre-evicts superseded entries of `slot` while retaining the slot's longest valid prefix checkpoint when room allows.
@@ -334,77 +360,86 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
         incomingBytes: Int,
         isPrefixEntry: (Key, Int) -> Bool
     ) {
-        guard isEnabled else { return }
-        let clampedSlot = max(0, min(maxSlots - 1, slot))
-        slotLastTokens[clampedSlot] = history
-        var keepBaseKey: Key? = nil
-        var keepBaseTokens = 0
-        if let baseKey = slotBaseKey[clampedSlot],
-           let baseEntry = entries[baseKey],
-           baseEntry.tokenCount > 0, baseEntry.tokenCount < history.count,
-           isPrefixEntry(baseKey, baseEntry.tokenCount) {
-            keepBaseKey = baseKey
-            keepBaseTokens = baseEntry.tokenCount
-        }
-        for key in order where keySlot[key] == clampedSlot && !isSharedBaseKey(key) {
-            guard let entry = entries[key],
-                  entry.tokenCount > keepBaseTokens,
-                  entry.tokenCount < history.count,
-                  isPrefixEntry(key, entry.tokenCount) else { continue }
-            keepBaseKey = key
-            keepBaseTokens = entry.tokenCount
-        }
-        if let keepBaseKey {
-            slotBaseKey[clampedSlot] = keepBaseKey
-        }
-
-        for key in Array(order) {
-            if key == keepBaseKey || isSharedBaseKey(key) { continue }
-            if keySlot[key] == clampedSlot {
-                forget(key)
-                continue
+        let pending = lock.withLock { () -> ([(Key, StoredEntry)], ((Key, StoredEntry) -> Void)?) in
+            guard _byteLimit > 0 else { return ([], nil) }
+            let clampedSlot = max(0, min(_maxSlots - 1, slot))
+            _slotLastTokens[clampedSlot] = history
+            var keepBaseKey: Key? = nil
+            var keepBaseTokens = 0
+            if let baseKey = _slotBaseKey[clampedSlot],
+               let baseEntry = _entries[baseKey],
+               baseEntry.tokenCount > 0, baseEntry.tokenCount < history.count,
+               isPrefixEntry(baseKey, baseEntry.tokenCount) {
+                keepBaseKey = baseKey
+                keepBaseTokens = baseEntry.tokenCount
             }
-            guard !isProtectedLastKey(key, excludingSlot: clampedSlot),
-                  keySlot[key] == nil,
-                  let entry = entries[key],
-                  entry.tokenCount > 0, entry.tokenCount < history.count,
-                  isPrefixEntry(key, entry.tokenCount) else { continue }
-            forget(key)
-        }
+            for key in _order where _keySlot[key] == clampedSlot && !isSharedBaseKeyLocked(key) {
+                guard let entry = _entries[key],
+                      entry.tokenCount > keepBaseTokens,
+                      entry.tokenCount < history.count,
+                      isPrefixEntry(key, entry.tokenCount) else { continue }
+                keepBaseKey = key
+                keepBaseTokens = entry.tokenCount
+            }
+            if let keepBaseKey { _slotBaseKey[clampedSlot] = keepBaseKey }
 
-        if let baseKey = keepBaseKey, !isSharedBaseKey(baseKey), chargedBytes + incomingBytes > byteLimit {
-            forget(baseKey)
+            for key in Array(_order) {
+                if key == keepBaseKey || isSharedBaseKeyLocked(key) { continue }
+                if _keySlot[key] == clampedSlot { forgetLocked(key); continue }
+                guard !isProtectedLastKeyLocked(key, excludingSlot: clampedSlot),
+                      _keySlot[key] == nil,
+                      let entry = _entries[key],
+                      entry.tokenCount > 0, entry.tokenCount < history.count,
+                      isPrefixEntry(key, entry.tokenCount) else { continue }
+                forgetLocked(key)
+            }
+
+            if let baseKey = keepBaseKey, !isSharedBaseKeyLocked(baseKey), _chargedBytes + incomingBytes > _byteLimit {
+                forgetLocked(baseKey)
+            }
+            return (makeRoomLocked(for: incomingBytes, activeSlot: clampedSlot), _onEvict)
         }
-        makeRoom(for: incomingBytes, activeSlot: clampedSlot)
+        notifyEvictions(pending.0, callback: pending.1)
     }
 
     /// Two-pass eviction: first evicts non-protected non-shared entries, then short (<1024) or unprotected non-shared entries.
     /// Pinned shared-base entries (`isSharedBaseKey`) are never evicted by normal slot insertions.
     public func makeRoom(for incomingBytes: Int, activeSlot: Int? = nil) {
-        guard isEnabled, incomingBytes <= byteLimit else { return }
-        while entries.count >= entryLimit || chargedBytes + incomingBytes > byteLimit {
-            guard let victim = order.first(where: {
-                !isProtectedLastKey($0, excludingSlot: activeSlot) && !isSharedBaseKey($0)
-            }) else {
-                break
-            }
-            evictKey(victim)
+        let pending = lock.withLock {
+            (makeRoomLocked(for: incomingBytes, activeSlot: activeSlot), _onEvict)
         }
-        while entries.count >= entryLimit || chargedBytes + incomingBytes > byteLimit {
-            let shortVictim = order.first { key in
-                !isSharedBaseKey(key) && (keySlot[key] != activeSlot && (entries[key]?.tokenCount ?? 0) < 1024)
-            }
-            guard let victim = shortVictim ?? order.first(where: { !isSharedBaseKey($0) }) else { break }
-            evictKey(victim)
+        notifyEvictions(pending.0, callback: pending.1)
+    }
+
+    private func makeRoomLocked(for incomingBytes: Int, activeSlot: Int?) -> [(Key, StoredEntry)] {
+        guard _byteLimit > 0, incomingBytes <= _byteLimit else { return [] }
+        var evicted: [(Key, StoredEntry)] = []
+        while _entries.count >= _entryLimit || _chargedBytes + incomingBytes > _byteLimit {
+            guard let victim = _order.first(where: {
+                !isProtectedLastKeyLocked($0, excludingSlot: activeSlot) && !isSharedBaseKeyLocked($0)
+            }) else { break }
+            if let item = evictKeyLocked(victim) { evicted.append(item) }
         }
+        while _entries.count >= _entryLimit || _chargedBytes + incomingBytes > _byteLimit {
+            let shortVictim = _order.first { key in
+                !isSharedBaseKeyLocked(key) && (_keySlot[key] != activeSlot && (_entries[key]?.tokenCount ?? 0) < 1024)
+            }
+            guard let victim = shortVictim ?? _order.first(where: { !isSharedBaseKeyLocked($0) }) else { break }
+            if let item = evictKeyLocked(victim) { evicted.append(item) }
+        }
+        return evicted
     }
 
     @discardableResult
     public func evictOldest(excludingSlot: Int? = nil) -> Bool {
-        guard let victim = order.first(where: {
-            !isProtectedLastKey($0, excludingSlot: excludingSlot) && !isSharedBaseKey($0)
-        }) ?? order.first(where: { !isSharedBaseKey($0) }) else { return false }
-        evictKey(victim)
+        let pending = lock.withLock { () -> ((Key, StoredEntry)?, ((Key, StoredEntry) -> Void)?) in
+            guard let victim = _order.first(where: {
+                !isProtectedLastKeyLocked($0, excludingSlot: excludingSlot) && !isSharedBaseKeyLocked($0)
+            }) ?? _order.first(where: { !isSharedBaseKeyLocked($0) }) else { return (nil, nil) }
+            return (evictKeyLocked(victim), _onEvict)
+        }
+        guard let item = pending.0 else { return false }
+        pending.1?(item.0, item.1)
         return true
     }
 
@@ -420,87 +455,100 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
         history: [Int64]? = nil,
         isSharedBase: Bool = false
     ) -> Bool {
-        guard isEnabled, charge <= byteLimit else { return false }
-        forget(key)
-        makeRoom(for: charge, activeSlot: slot)
-        guard entries.count < entryLimit, chargedBytes + charge <= byteLimit else { return false }
-        entries[key] = StoredEntry(value: value, charge: charge, tokenCount: tokenCount, allowsSuffix: allowsSuffix, rootHash: rootHash)
-        order.append(key)
-        chargedBytes += charge
-        if isSharedBase {
-            sharedBaseKeys.insert(key)
-            return true
-        }
-        if let slot {
-            let clampedSlot = max(0, min(maxSlots - 1, slot))
-            keySlot[key] = clampedSlot
-            slotLastKey[clampedSlot] = key
-            if let history {
-                slotLastTokens[clampedSlot] = history
+        let (stored, evicted, cb) = lock.withLock { () -> (Bool, [(Key, StoredEntry)], ((Key, StoredEntry) -> Void)?) in
+            guard _byteLimit > 0, charge <= _byteLimit else { return (false, [], nil) }
+            forgetLocked(key)
+            let evicted = makeRoomLocked(for: charge, activeSlot: slot)
+            guard _entries.count < _entryLimit, _chargedBytes + charge <= _byteLimit else {
+                return (false, evicted, _onEvict)
             }
-            if let base = slotBaseKey[clampedSlot], let baseEntry = entries[base] {
-                if tokenCount < baseEntry.tokenCount {
-                    slotBaseKey[clampedSlot] = key
+            _entries[key] = StoredEntry(value: value, charge: charge, tokenCount: tokenCount, allowsSuffix: allowsSuffix, rootHash: rootHash)
+            _order.append(key)
+            _chargedBytes += charge
+            if isSharedBase {
+                _sharedBaseKeys.insert(key)
+                return (true, evicted, _onEvict)
+            }
+            if let slot {
+                let clampedSlot = max(0, min(_maxSlots - 1, slot))
+                _keySlot[key] = clampedSlot
+                _slotLastKey[clampedSlot] = key
+                if let history { _slotLastTokens[clampedSlot] = history }
+                if let base = _slotBaseKey[clampedSlot], let baseEntry = _entries[base] {
+                    if tokenCount < baseEntry.tokenCount { _slotBaseKey[clampedSlot] = key }
+                } else {
+                    _slotBaseKey[clampedSlot] = key
                 }
-            } else {
-                slotBaseKey[clampedSlot] = key
+                if let rootHash { _slotRootHash[clampedSlot] = rootHash }
+                touchCounter &+= 1
+                _slotLastTouch[clampedSlot] = touchCounter
             }
-            if let rootHash {
-                slotRootHash[clampedSlot] = rootHash
-            }
-            touchCounter &+= 1
-            slotLastTouch[clampedSlot] = touchCounter
+            return (true, evicted, _onEvict)
         }
-        return true
+        notifyEvictions(evicted, callback: cb)
+        return stored
     }
 
     public func value(for key: Key, touchOnHit: Bool = true) -> StoredEntry? {
-        guard let entry = entries[key] else { return nil }
-        if touchOnHit {
-            touch(key)
+        lock.withLock {
+            guard let entry = _entries[key] else { return nil }
+            if touchOnHit { touchLocked(key) }
+            return entry
         }
-        return entry
     }
 
     public func touch(_ key: Key) {
-        guard entries[key] != nil else { return }
-        order.removeAll { $0 == key }
-        order.append(key)
-        if let s = keySlot[key] {
+        lock.withLock { touchLocked(key) }
+    }
+
+    private func touchLocked(_ key: Key) {
+        guard _entries[key] != nil else { return }
+        _order.removeAll { $0 == key }
+        _order.append(key)
+        if let s = _keySlot[key] {
             touchCounter &+= 1
-            slotLastTouch[s] = touchCounter
+            _slotLastTouch[s] = touchCounter
         }
     }
 
     public func touchSlot(for key: Key) {
-        if let s = keySlot[key] {
-            touchCounter &+= 1
-            slotLastTouch[s] = touchCounter
+        lock.withLock {
+            if let s = _keySlot[key] {
+                touchCounter &+= 1
+                _slotLastTouch[s] = touchCounter
+            }
         }
     }
 
     public func forget(_ key: Key) {
-        if let entry = entries.removeValue(forKey: key) {
-            chargedBytes -= entry.charge
-        }
-        order.removeAll { $0 == key }
-        sharedBaseKeys.remove(key)
-        if let s = keySlot.removeValue(forKey: key) {
-            if slotLastKey[s] == key { slotLastKey.removeValue(forKey: s) }
-            if slotBaseKey[s] == key { slotBaseKey.removeValue(forKey: s) }
+        lock.withLock { forgetLocked(key) }
+    }
+
+    private func forgetLocked(_ key: Key) {
+        if let entry = _entries.removeValue(forKey: key) { _chargedBytes -= entry.charge }
+        _order.removeAll { $0 == key }
+        _sharedBaseKeys.remove(key)
+        if let s = _keySlot.removeValue(forKey: key) {
+            if _slotLastKey[s] == key { _slotLastKey.removeValue(forKey: s) }
+            if _slotBaseKey[s] == key { _slotBaseKey.removeValue(forKey: s) }
         }
     }
 
-    private func evictKey(_ key: Key) {
-        guard let entry = entries[key] else { return }
-        let slot = keySlot[key]
-        forget(key)
-        if let slot, slotLastKey[slot] == nil, slotBaseKey[slot] == nil, !keySlot.values.contains(slot) {
-            slotLastTokens.removeValue(forKey: slot)
-            slotRootHash.removeValue(forKey: slot)
-            slotLastTouch.removeValue(forKey: slot)
+    private func evictKeyLocked(_ key: Key) -> (Key, StoredEntry)? {
+        guard let entry = _entries[key] else { return nil }
+        let slot = _keySlot[key]
+        forgetLocked(key)
+        if let slot, _slotLastKey[slot] == nil, _slotBaseKey[slot] == nil, !_keySlot.values.contains(slot) {
+            _slotLastTokens.removeValue(forKey: slot)
+            _slotRootHash.removeValue(forKey: slot)
+            _slotLastTouch.removeValue(forKey: slot)
         }
-        evictions += 1
-        onEvict?(key, entry)
+        _evictions += 1
+        return (key, entry)
+    }
+
+    private func notifyEvictions(_ evicted: [(Key, StoredEntry)], callback: ((Key, StoredEntry) -> Void)?) {
+        guard let callback, !evicted.isEmpty else { return }
+        for (key, entry) in evicted { callback(key, entry) }
     }
 }

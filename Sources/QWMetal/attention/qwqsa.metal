@@ -118,7 +118,7 @@ kernel void qwg_qsa_scores(device const float* idxQ        [[buffer(0)]],
         }
         score += max(dot, 0.0f);
     }
-    scores[t * scoreStride + b] = as_type<uint>((score / sqrt(float(DI))) + 0.0f);
+    scores[(size_t)t * scoreStride + b] = as_type<uint>((score / sqrt(float(DI))) + 0.0f);
 }
 
 // Stage 1B — qwg_qsa_scores_tiled: 2D grid (blockChunks, ceil(T / 8)).
@@ -144,11 +144,11 @@ kernel void qwg_qsa_scores_tiled(device const float* idxQ        [[buffer(0)]],
     if ((s << 8u) >= maxN) return;
     const uint numRows = maxT - tBase;
     for (uint i = tid; i < numRows * NI * DI; i += 256u) {
-        qs[i] = idxQ[tBase * NI * DI + i];
+        qs[i] = idxQ[(size_t)tBase * NI * DI + i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (b >= maxN) return;
-    device const half4* pb = (device const half4*)(pooled + b * DI);
+    device const half4* pb = (device const half4*)(pooled + (size_t)b * DI);
     half4 pv[DI / 4u];
     #pragma unroll
     for (uint d4 = 0u; d4 < DI / 4u; d4++) {
@@ -174,7 +174,7 @@ kernel void qwg_qsa_scores_tiled(device const float* idxQ        [[buffer(0)]],
             }
             score += max(dot, 0.0f);
         }
-        scores[t * scoreStride + b] = as_type<uint>((score * invSqrtD) + 0.0f);
+        scores[(size_t)t * scoreStride + b] = as_type<uint>((score * invSqrtD) + 0.0f);
     }
 }
 
@@ -242,13 +242,13 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
     const uint n = (t + pos0 + 1u) / 4u;
     const uint kEff = min(topK, n);
     if (n <= topK) {
-        for (uint b = tid; b < n; b += 256u) list[t * topK + b] = int(b);
+        for (uint b = tid; b < n; b += 256u) list[(size_t)t * topK + b] = int(b);
         return;
     }
     const uint sg = tid >> 5u, lane = tid & 31u;
     const uint numChunks = (n + 255u) >> 8u;
     const bool trackChunkMax = (numChunks > 16u);
-    device const uint* rowScores = scores + t * scoreStride;
+    device const uint* rowScores = scores + (size_t)t * scoreStride;
     if (trackChunkMax) {
         for (uint i = tid; i < 516u; i += 256u) chunkMax[i] = 0u;
     }

@@ -23,6 +23,14 @@ public enum QWAllocError: Error, CustomStringConvertible {
 @inline(__always)
 public func qwAlignUp(_ n: Int, _ a: Int = 256) -> Int { (n + a - 1) & ~(a - 1) }
 
+@inline(__always)
+private func qwCheckedAlignUp(_ n: Int, _ a: Int = 256) -> Int? {
+    guard n >= 0, a > 0, (a & (a - 1)) == 0 else { return nil }
+    let (sum, ov) = n.addingReportingOverflow(a - 1)
+    guard !ov else { return nil }
+    return sum & ~(a - 1)
+}
+
 /// A region of the arena: one MTLBuffer + byte extent. The DRY currency of
 /// every launcher: (buffer, offset) pairs, never per-tensor buffers.
 public struct QWMRegion: @unchecked Sendable {
@@ -64,15 +72,19 @@ extension MTLComputeCommandEncoder {
     public func setPod<T>(_ value: T, index: Int) {
         var copy = value
         withUnsafeBytes(of: &copy) { (raw: UnsafeRawBufferPointer) in
-            setBytes(raw.baseAddress!, length: raw.count, index: index)
+            guard let base = raw.baseAddress, raw.count > 0 else { return }
+            setBytes(base, length: raw.count, index: index)
         }
     }
 
     /// Binds one or more `UInt32` values into consecutive buffer indices starting at `startIndex`.
     @inline(__always)
     public func setUInt32s(_ values: Int..., startIndex: Int) {
+        precondition(startIndex >= 0, "setUInt32s startIndex must be non-negative")
         for (offset, v) in values.enumerated() {
-            var u = UInt32(v)
+            guard var u = UInt32(exactly: v) else {
+                preconditionFailure("setUInt32s value \(v) out of UInt32 range")
+            }
             setBytes(&u, length: 4, index: startIndex + offset)
         }
     }
@@ -90,10 +102,50 @@ extension MTLComputeCommandEncoder {
 public struct QWTensorShape: Sendable, Hashable {
     public let dims: [Int]
     public let dtype: QWDType
-    public var elementCount: Int { dims.reduce(1, *) }
-    public var totalBytes: Int { Int((Double(elementCount) * dtype.bytesPerParam).rounded()) }
+    public var checkedElementCount: Int? {
+        var acc = 1
+        for d in dims {
+            guard d >= 0 else { return nil }
+            let (m, ov) = acc.multipliedReportingOverflow(by: d)
+            if ov { return nil }
+            acc = m
+        }
+        return acc
+    }
+    public var checkedTotalBytes: Int? {
+        guard let elems = checkedElementCount else { return nil }
+        switch dtype {
+        case .bf16, .f16:
+            let (b, ov) = elems.multipliedReportingOverflow(by: 2)
+            return ov ? nil : b
+        case .f32, .i32:
+            let (b, ov) = elems.multipliedReportingOverflow(by: 4)
+            return ov ? nil : b
+        case .q8_0, .hq8_g32:
+            let groups = elems / 32, rem = elems % 32
+            let (gBytes, ov1) = groups.multipliedReportingOverflow(by: 34)
+            guard !ov1 else { return nil }
+            let (b, ov2) = gBytes.addingReportingOverflow((rem * 34 + 16) / 32)
+            return ov2 ? nil : b
+        case .q4g:
+            let groups = elems / 32, rem = elems % 32
+            let (gBytes, ov1) = groups.multipliedReportingOverflow(by: 20)
+            guard !ov1 else { return nil }
+            let (b, ov2) = gBytes.addingReportingOverflow((rem * 20 + 16) / 32)
+            return ov2 ? nil : b
+        }
+    }
+    public var elementCount: Int {
+        guard let n = checkedElementCount else { preconditionFailure("QWTensorShape elementCount overflow") }
+        return n
+    }
+    public var totalBytes: Int {
+        guard let b = checkedTotalBytes else { preconditionFailure("QWTensorShape totalBytes overflow") }
+        return b
+    }
     public init(_ dims: [Int], _ dtype: QWDType) {
         precondition((1...4).contains(dims.count), "rank 1…4")
+        precondition(dims.allSatisfy { $0 >= 0 }, "QWTensorShape dims must be non-negative")
         self.dims = dims; self.dtype = dtype
     }
 }
@@ -107,14 +159,17 @@ public final class QWSubAllocator: @unchecked Sendable {
     private var cursor: Int = 0
     private let lock = NSLock()
     /// Counters the CI gate watches: allocs after `markSteadyState()`.
-    public private(set) var steadyStateAllocs: Int = 0
+    private var _steadyStateAllocs: Int = 0
+    public var steadyStateAllocs: Int { lock.withLock { _steadyStateAllocs } }
     private var steady = false
     /// High-water bookkeeping for the memory-pressure contract.
-    public private(set) var usedBytes: Int = 0
+    private var _usedBytes: Int = 0
+    public var usedBytes: Int { lock.withLock { _usedBytes } }
     public let totalCapacityBytes: Int
-    public var freeBytes: Int { max(0, totalCapacityBytes - usedBytes) }
+    public var freeBytes: Int { lock.withLock { max(0, totalCapacityBytes - _usedBytes) } }
 
     public init(region: QWMRegion) {
+        precondition(region.length >= 0, "QWSubAllocator region length must be non-negative")
         self.region = region
         self.regions = [region]
         self.totalCapacityBytes = region.length
@@ -122,60 +177,72 @@ public final class QWSubAllocator: @unchecked Sendable {
 
     public init(regions: [QWMRegion]) {
         precondition(!regions.isEmpty, "QWSubAllocator requires at least one region")
+        var total = 0
+        for r in regions {
+            precondition(r.length >= 0, "QWSubAllocator region length must be non-negative")
+            let (sum, ov) = total.addingReportingOverflow(r.length)
+            precondition(!ov, "QWSubAllocator totalCapacityBytes overflow")
+            total = sum
+        }
         self.region = regions[0]
         self.regions = regions
-        self.totalCapacityBytes = regions.reduce(0) { $0 + $1.length }
+        self.totalCapacityBytes = total
     }
 
-    /// Carve `bytes` (auto-aligned to 256) from the current slab. Returns byte offset in `region`.
+    private func allocateLocked(bytes: Int) throws -> (region: QWMRegion, offset: Int) {
+        if steady { _steadyStateAllocs += 1 }   // gate fails this if != 0
+        guard bytes >= 0 else {
+            throw QWAllocError.misalignment(bytes: bytes)
+        }
+        let freeInCurrent = slabIndex < regions.count ? max(0, regions[slabIndex].length - cursor) : 0
+        guard let n = qwCheckedAlignUp(bytes, 256) else {
+            throw QWAllocError.outOfSpace(region: "sub", asked: bytes, free: freeInCurrent)
+        }
+        var candSlab = slabIndex
+        var candCursor = cursor
+        while candSlab < regions.count {
+            let (end, ov) = candCursor.addingReportingOverflow(n)
+            if !ov, end <= regions[candSlab].length {
+                let reg = regions[candSlab]
+                let off = candCursor
+                slabIndex = candSlab
+                cursor = end
+                let (newUsed, usedOv) = _usedBytes.addingReportingOverflow(n)
+                _usedBytes = usedOv ? totalCapacityBytes : newUsed
+                return (reg, off)
+            }
+            candSlab += 1
+            candCursor = 0
+        }
+        throw QWAllocError.outOfSpace(region: "sub", asked: n, free: freeInCurrent)
+    }
+
+    /// Carve `bytes` (auto-aligned to 256) across slabs. Returns byte offset in the selected slab.
     @discardableResult
     public func allocate(bytes: Int) throws -> Int {
-        lock.lock(); defer { lock.unlock() }
-        if steady { steadyStateAllocs += 1 }   // gate fails this if != 0
-        let n = qwAlignUp(bytes)
-        guard cursor + n <= region.length else {
-            throw QWAllocError.outOfSpace(region: "sub", asked: n,
-                                          free: region.length - cursor)
-        }
-        let off = cursor
-        cursor += n
-        usedBytes += n
+        let (_, off) = try lock.withLock { try allocateLocked(bytes: bytes) }
         return off
     }
 
     /// View of a carved tensor at the current cursor (advances to next slab if multi-slab and needed).
     public func allocate(_ shape: QWTensorShape) throws -> QWTensorValue {
-        if regions.count == 1 {
-            let off = try allocate(bytes: shape.totalBytes)
-            return QWTensorValue(region: region, offset: off, shape: shape)
+        guard let bytes = shape.checkedTotalBytes else {
+            throw QWAllocError.outOfSpace(region: "sub", asked: Int.max, free: freeBytes)
         }
-        lock.lock(); defer { lock.unlock() }
-        if steady { steadyStateAllocs += 1 }
-        let n = qwAlignUp(shape.totalBytes)
-        while slabIndex < regions.count && cursor + n > regions[slabIndex].length {
-            slabIndex += 1
-            cursor = 0
-        }
-        guard slabIndex < regions.count else {
-            let freeInCurrent = slabIndex < regions.count ? (regions[slabIndex].length - cursor) : 0
-            throw QWAllocError.outOfSpace(region: "sub", asked: n, free: freeInCurrent)
-        }
-        let reg = regions[slabIndex]
-        let off = cursor
-        cursor += n
-        usedBytes += n
+        let (reg, off) = try lock.withLock { try allocateLocked(bytes: bytes) }
         return QWTensorValue(region: reg, offset: off, shape: shape)
     }
 
-    public func markSteadyState() { lock.lock(); steady = true; lock.unlock() }
+    public func markSteadyState() { lock.withLock { steady = true } }
 
     /// C31: return the cursor to the region base. Only legal when no slice
     /// carved from this region is still live (single owner per session batch).
     public func reset() {
-        lock.lock(); defer { lock.unlock() }
-        slabIndex = 0
-        cursor = 0
-        usedBytes = 0
+        lock.withLock {
+            slabIndex = 0
+            cursor = 0
+            _usedBytes = 0
+        }
     }
 }
 
@@ -190,14 +257,21 @@ public final class QWRingAllocator: @unchecked Sendable {
     private var steady = false
 
     init(region: QWMRegion, slabBytes: Int, depth: Int) {
+        precondition(slabBytes > 0 && depth > 0, "QWRingAllocator requires slabBytes > 0 and depth > 0")
+        guard let aligned = qwCheckedAlignUp(slabBytes, 256) else {
+            preconditionFailure("QWRingAllocator slabBytes overflow")
+        }
+        let (total, ov) = aligned.multipliedReportingOverflow(by: depth)
+        precondition(!ov && total <= region.length, "QWRingAllocator exceeds region length")
         self.region = region
-        self.slabBytes = qwAlignUp(slabBytes)
+        self.slabBytes = aligned
         self.depth = depth
     }
 
     /// Next slab view (wraps; reuses oldest — caller guarantees no hazard
     /// beyond `depth` in-flight steps; the engine's encode loop is serial).
     public func acquire(_ shape: QWTensorShape) -> QWTensorValue {
+        precondition(shape.totalBytes <= slabBytes, "QWRingAllocator acquire \(shape.totalBytes) > slabBytes \(slabBytes)")
         if steady { steadyStateAcquires += 1 }   // ring acquire is NOT an alloc;
         // counter here just proves the ring shape fits the steady loop size.
         let off = next * slabBytes
@@ -213,17 +287,38 @@ public final class QWPageArena: @unchecked Sendable {
     public let region: QWMRegion
     public let pageSize: Int
     public let pageCount: Int
+    private let lock = NSLock()
     private var freeStack: [Int]
+    private var isFree: [Bool]
 
     public init(region: QWMRegion, pageSize: Int, pageCount: Int) {
+        precondition(pageSize > 0 && pageCount >= 0, "QWPageArena requires pageSize > 0 and pageCount >= 0")
+        guard let aligned = qwCheckedAlignUp(pageSize, 128) else {
+            preconditionFailure("QWPageArena pageSize overflow")
+        }
+        let (total, ov) = aligned.multipliedReportingOverflow(by: pageCount)
+        precondition(!ov && total <= region.length, "QWPageArena exceeds region length")
         self.region = region
-        self.pageSize = qwAlignUp(pageSize, 128)
+        self.pageSize = aligned
         self.pageCount = pageCount
         self.freeStack = (0..<pageCount).reversed()
+        self.isFree = [Bool](repeating: true, count: pageCount)
     }
-    public func allocPage() -> Int? { freeStack.popLast().map { $0 } }
-    public func freePage(_ i: Int) { freeStack.append(i) }
-    public var freePages: Int { freeStack.count }
+    public func allocPage() -> Int? {
+        lock.withLock {
+            guard let id = freeStack.popLast() else { return nil }
+            isFree[id] = false
+            return id
+        }
+    }
+    public func freePage(_ i: Int) {
+        lock.withLock {
+            guard i >= 0, i < pageCount, !isFree[i] else { return }
+            isFree[i] = true
+            freeStack.append(i)
+        }
+    }
+    public var freePages: Int { lock.withLock { freeStack.count } }
 }
 
 /// The arena. One per process: one giant shared buffer (or per-region shared
@@ -246,23 +341,38 @@ public final class QWArena: @unchecked Sendable {
     public let kvAuxSub: QWSubAllocator?
     public let gdnSub: QWSubAllocator
 
+    static func weightSlabCap(maxBufferLength maxBuf: Int) -> Int {
+        let alignedMax = max(256, (maxBuf / 256) * 256)
+        return alignedMax > (2048 << 20)
+            ? max(256, ((alignedMax - (1536 << 20)) / 256) * 256)
+            : alignedMax
+    }
+
     /// Sizes decided once at launch by the caller's allocation plan.
     /// All region capacities and bases are rounded to 256 B.
     public init(hal: QWHal, weights: Int, activations: Int, kv: Int, gdnStates: Int, keepAlive: Bool = true) throws {
-        let w = qwAlignUp(weights), a = qwAlignUp(activations)
-        let k = qwAlignUp(kv), g = qwAlignUp(gdnStates)
-        let total = w + a + k + g
+        guard let w = qwCheckedAlignUp(weights, 256),
+              let a = qwCheckedAlignUp(activations, 256),
+              let k = qwCheckedAlignUp(kv, 256),
+              let g = qwCheckedAlignUp(gdnStates, 256) else {
+            throw QWAllocError.misalignment(bytes: min(weights, min(activations, min(kv, gdnStates))))
+        }
+        let (wa, ov0) = w.addingReportingOverflow(a)
+        let (wak, ov1) = wa.addingReportingOverflow(k)
+        let (total, ov2) = wak.addingReportingOverflow(g)
         let limit = hal.caps.maxWorkingSetBytes
-        guard total <= limit else { throw QWAllocError.arenaTooLarge(asked: total, limit: limit) }
+        guard !ov0, !ov1, !ov2, total <= limit else {
+            throw QWAllocError.arenaTooLarge(asked: (ov0 || ov1 || ov2) ? Int.max : total, limit: limit)
+        }
         let maxBuf = max(256, (Int(hal.device.maxBufferLength) / 256) * 256)
         self.hal = hal
         self.totalBytes = total
         self.regionSizes = (w, a, k, g)
-        self.committedBytes = total
         if total <= maxBuf {
             guard let buf = hal.device.makeBuffer(length: max(256, total), options: .storageModeShared) else {
                 throw QWAllocError.outOfSpace(region: "arena", asked: total, free: 0)
             }
+            self.committedBytes = total
             self.bigBuffer = buf
             self.allBuffers = [buf]
             self.weightsSub = QWSubAllocator(region: QWMRegion(buffer: buf, base: 0, length: w))
@@ -283,16 +393,19 @@ public final class QWArena: @unchecked Sendable {
             }
             var bufs: [any MTLBuffer] = []
             var wRegions: [QWMRegion] = []
+            var slackBytes = 0
             if w <= maxBuf {
                 let wBuf = try allocBuf(w, "weights")
                 bufs.append(wBuf)
                 wRegions.append(QWMRegion(buffer: wBuf, base: 0, length: w))
             } else {
-                // Split weights across maxBuf-bounded slabs with 1.5 GiB boundary slack
+                // Split weights across maxBuf-bounded slabs with up to 1.5 GiB boundary slack
                 // so no single contiguous tensor allocation fails at a slab seam.
-                let slabCap = max(256, ((maxBuf - (1536 << 20)) / 256) * 256)
-                let boundarySlack = min(1536 << 20, max(0, limit - total))
-                var remainingW = w + boundarySlack
+                let slabCap = Self.weightSlabCap(maxBufferLength: maxBuf)
+                slackBytes = (min(1536 << 20, max(0, limit - total)) / 256) * 256
+                let (wWithSlack, ovSlack) = w.addingReportingOverflow(slackBytes)
+                if ovSlack { slackBytes = 0 }
+                var remainingW = ovSlack ? w : wWithSlack
                 var slabIdx = 0
                 while remainingW > 0 {
                     let chunk = min(slabCap, remainingW)
@@ -303,6 +416,7 @@ public final class QWArena: @unchecked Sendable {
                     slabIdx += 1
                 }
             }
+            self.committedBytes = total + slackBytes
             let aBuf = try allocBuf(a, "activations")
             let gBuf = try allocBuf(g, "gdn")
             bufs.append(contentsOf: [aBuf, gBuf])
@@ -372,16 +486,22 @@ public final class QWArena: @unchecked Sendable {
     public func gdnRegion() -> QWSubAllocator { gdnSub }
 
     public func ring(slabBytes: Int, depth: Int) throws -> QWRingAllocator {
-        let need = qwAlignUp(slabBytes) * depth
-        guard need <= regionSizes.act else {
-            throw QWAllocError.outOfSpace(region: "ring", asked: need, free: regionSizes.act)
+        guard slabBytes > 0, depth > 0, let aligned = qwCheckedAlignUp(slabBytes, 256) else {
+            throw QWAllocError.misalignment(bytes: slabBytes)
+        }
+        let (need, ov) = aligned.multipliedReportingOverflow(by: depth)
+        guard !ov, need <= activationsSub.region.length else {
+            throw QWAllocError.outOfSpace(region: "ring", asked: ov ? Int.max : need, free: activationsSub.region.length)
         }
         return QWRingAllocator(region: activationsSub.region, slabBytes: slabBytes, depth: depth)
     }
     public func pages(pageSize: Int, count: Int) throws -> QWPageArena {
-        let need = qwAlignUp(pageSize, 128) * count
-        guard need <= regionSizes.kv else {
-            throw QWAllocError.outOfSpace(region: "pages", asked: need, free: regionSizes.kv)
+        guard pageSize > 0, count >= 0, let aligned = qwCheckedAlignUp(pageSize, 128) else {
+            throw QWAllocError.misalignment(bytes: pageSize)
+        }
+        let (need, ov) = aligned.multipliedReportingOverflow(by: count)
+        guard !ov, need <= kvSub.region.length else {
+            throw QWAllocError.outOfSpace(region: "pages", asked: ov ? Int.max : need, free: kvSub.region.length)
         }
         return QWPageArena(region: kvSub.region, pageSize: pageSize, pageCount: count)
     }
@@ -399,25 +519,47 @@ public final class QWArena: @unchecked Sendable {
 
     /// Copy fixture/load bytes into an allocated arena tensor.
     public func copyIn(_ t: QWTensorValue, from d: Data) {
-        precondition(d.count <= t.bytes, "copyIn \(d.count) > tensor \(t.bytes)")
-        memcpy(cpuPointer(of: t), (d as NSData).bytes, d.count)
+        let (regEnd, ovReg) = t.offset.addingReportingOverflow(d.count)
+        precondition(t.offset >= 0 && d.count <= t.bytes && !ovReg && regEnd <= t.region.length,
+                     "copyIn \(d.count) > tensor \(t.bytes)")
+        guard !d.isEmpty else { return }
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            memcpy(cpuPointer(of: t), base, raw.count)
+        }
     }
 
     /// Zero-allocation copy from a contiguous array into an allocated arena tensor.
     @inline(__always)
     public func write<Element>(_ t: QWTensorValue, from array: [Element]) {
-        let byteCount = array.count * MemoryLayout<Element>.stride
-        precondition(byteCount <= t.bytes, "write \(byteCount) > tensor \(t.bytes)")
+        let (byteCount, ov) = array.count.multipliedReportingOverflow(by: MemoryLayout<Element>.stride)
+        precondition(!ov, "write byteCount overflow")
+        let (regEnd, ovReg) = t.offset.addingReportingOverflow(byteCount)
+        precondition(t.offset >= 0 && byteCount <= t.bytes && !ovReg && regEnd <= t.region.length,
+                     "write \(byteCount) > tensor \(t.bytes)")
         guard byteCount > 0 else { return }
-        _ = array.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            memcpy(cpuPointer(of: t), raw.baseAddress!, byteCount)
+        array.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            memcpy(cpuPointer(of: t), base, byteCount)
         }
     }
 
     /// Read `count` elements of `Element` from a shared-storage arena tensor.
     @inline(__always)
     public func read<Element>(_ t: QWTensorValue, as type: Element.Type = Element.self, count: Int) -> [Element] {
-        let ptr = cpuPointer(of: t).bindMemory(to: Element.self, capacity: count)
-        return Array(UnsafeBufferPointer(start: ptr, count: count))
+        precondition(count >= 0, "read count must be non-negative")
+        guard count > 0 else { return [] }
+        let (byteCount, ov) = count.multipliedReportingOverflow(by: MemoryLayout<Element>.stride)
+        precondition(!ov, "read byteCount overflow")
+        let (regEnd, ovReg) = t.offset.addingReportingOverflow(byteCount)
+        precondition(t.offset >= 0 && byteCount <= t.bytes && !ovReg && regEnd <= t.region.length,
+                     "read \(byteCount) > tensor \(t.bytes)")
+        let base = UnsafeRawPointer(cpuPointer(of: t))
+        return [Element](unsafeUninitializedCapacity: count) { dst, initialized in
+            for i in 0..<count {
+                dst[i] = base.loadUnaligned(fromByteOffset: i * MemoryLayout<Element>.stride, as: Element.self)
+            }
+            initialized = count
+        }
     }
 }

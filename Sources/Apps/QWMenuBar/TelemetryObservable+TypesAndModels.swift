@@ -47,6 +47,7 @@ public enum MenuBarStatusState: Equatable, Sendable {
 
 extension TelemetryObservable {
     public func stopEngineAsync() async {
+        startTask?.cancel()
         isDaemonTransitioning = true
         defer { isDaemonTransitioning = false }
         engineState = .stopping
@@ -59,7 +60,9 @@ extension TelemetryObservable {
         }
         let pidPath = QWPaths.pidFilePath
         var candidatePids: [Int32] = []
-        if let pidVal = engineInfo?.pid, pidVal > 0 { candidatePids.append(Int32(pidVal)) }
+        if let pidVal = engineInfo?.pid, let p32 = Int32(exactly: pidVal), p32 > 0 { candidatePids.append(p32) }
+        if let lastPid = lastKnownServerPid, lastPid > 0 { candidatePids.append(lastPid) }
+        if let lockPid = QWEngineInstanceLock.runningEnginePID(), lockPid > 0 { candidatePids.append(lockPid) }
         if let fileData = try? String(contentsOfFile: pidPath, encoding: .utf8),
            let filePid = Int32(fileData.trimmingCharacters(in: .whitespacesAndNewlines)), filePid > 0 {
             candidatePids.append(filePid)
@@ -84,8 +87,11 @@ extension TelemetryObservable {
             QWServerLogger.shared.log(.warn, "Process \(pid) did not exit cleanly; sending SIGKILL…")
             kill(pid, SIGKILL)
         }
-        if let proc = serverProcess, proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+        if let proc = serverProcess, proc.isRunning, Self.isVerifiedQWGProcess(pid: proc.processIdentifier) {
+            kill(proc.processIdentifier, SIGKILL)
+        }
         serverProcess = nil
+        lastKnownServerPid = nil
         try? FileManager.default.removeItem(atPath: pidPath)
         self.serverAppliedSettings = nil
         self.parentPidWatchdogArmed = false
@@ -97,9 +103,10 @@ extension TelemetryObservable {
     }
 
     static func isVerifiedQWGProcess(pid: pid_t) -> Bool {
+        guard pid > 0 else { return false }
         var buffer = [UInt8](repeating: 0, count: 4096)
         let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
-        guard length > 0 else { return false }
+        guard length > 0, Int(length) <= buffer.count else { return false }
         let path = String(decoding: buffer.prefix(Int(length)), as: UTF8.self)
         return URL(fileURLWithPath: path).lastPathComponent == "qwg"
     }
@@ -127,21 +134,19 @@ extension TelemetryObservable {
         refreshDiscoveredModels()
 
         guard isConnected,
-              let url = URL(string: "http://\(settings.host):\(settings.port)/v1/models/load") else {
+              var req = authorizedRequest(path: "/v1/models/load", method: "POST", timeoutInterval: 120.0) else {
             return
         }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
             "model": model.packPath.isEmpty ? model.name : model.packPath
         ])
-        req.timeoutInterval = 120.0
+        let request = req
         isModelTransitioning = true
         Task {
             defer { self.isModelTransitioning = false }
             do {
-                let (data, res) = try await URLSession.shared.data(for: req)
+                let (data, res) = try await URLSession.shared.data(for: request)
                 guard let http = res as? HTTPURLResponse, http.statusCode == 200 else {
                     let code = (res as? HTTPURLResponse)?.statusCode ?? 0
                     self.fail("Switch model failed (HTTP \(code)): \(Self.responseDetail(data))")
@@ -180,13 +185,10 @@ extension TelemetryObservable {
     }
 
     func pushLiveSettingsThrowing() async throws {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/v1/settings") else { return }
+        guard var req = authorizedRequest(path: "/v1/settings", method: "POST", timeoutInterval: 30.0) else { return }
         let body = try JSONEncoder().encode(self.settings)
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
-        req.timeoutInterval = 30.0
         let (data, res) = try await URLSession.shared.data(for: req)
         guard let http = res as? HTTPURLResponse, http.statusCode == 200 else {
             let code = (res as? HTTPURLResponse)?.statusCode ?? 0

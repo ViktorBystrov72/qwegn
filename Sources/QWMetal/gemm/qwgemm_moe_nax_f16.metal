@@ -110,10 +110,12 @@ kernel void qwg_moe_down_reduce_combine_f32(device const float* dnAcc [[buffer(0
                         if (rawS < 0) continue;
                         if (numGroups > 0u && ((uint(rawS) >> 16u) & 0x7Fu) != targetGroup) continue;
                     }
-                    const int p = identityPerm ? int(basePair + k) : invPerm[basePair + k];
-                    const float dv = dnIsF16 ? float(dnAcc16[size_t(p) * N + h + i]) : dnAcc[size_t(p) * N + h + i];
                     const float wk = w[basePair + k];
-                    if (wk != 0.0f) acc += wk * dv;
+                    if (wk == 0.0f) continue;
+                    const int p = identityPerm ? int(basePair + k) : invPerm[basePair + k];
+                    if (p < 0) continue;
+                    const float dv = dnIsF16 ? float(dnAcc16[size_t(p) * N + h + i]) : dnAcc[size_t(p) * N + h + i];
+                    acc += wk * dv;
                 }
             }
             const float y = skipShared ? acc : (acc + g * shared[idx]);

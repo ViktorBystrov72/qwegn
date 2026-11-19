@@ -226,3 +226,46 @@ public struct ChatCompletionChunk: Codable, Sendable {
         self.usage = usage
     }
 }
+
+public struct ChatCompletionExecutionResult: Sendable {
+    public let content: String
+    public let promptTokens: Int
+    public let completionTokens: Int
+    public let reasoningTokens: Int?
+    public let cachedTokens: Int
+    public let cacheActive: Bool
+    public let truncated: Bool
+    public let startsInThinking: Bool
+    public let matchedStopSequence: String?
+    public let logprobs: [ChatLogprobTokenEntry]?
+    public let prefillSec: Double?
+    public let decodeSec: Double?
+
+    public init(
+        content: String,
+        promptTokens: Int,
+        completionTokens: Int,
+        reasoningTokens: Int?,
+        cachedTokens: Int,
+        cacheActive: Bool = false,
+        truncated: Bool,
+        startsInThinking: Bool,
+        matchedStopSequence: String?,
+        logprobs: [ChatLogprobTokenEntry]?,
+        prefillSec: Double?,
+        decodeSec: Double?
+    ) {
+        self.content = content
+        self.promptTokens = promptTokens
+        self.completionTokens = completionTokens
+        self.reasoningTokens = reasoningTokens
+        self.cachedTokens = cachedTokens
+        self.cacheActive = cacheActive
+        self.truncated = truncated
+        self.startsInThinking = startsInThinking
+        self.matchedStopSequence = matchedStopSequence
+        self.logprobs = logprobs
+        self.prefillSec = prefillSec
+        self.decodeSec = decodeSec
+    }
+}

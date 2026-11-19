@@ -51,7 +51,8 @@ struct QWEnginePrefixState: Sendable {
     }
 
     var memoryBytes: Int {
-        recData.count + ringData.count + (trunkHiddenData?.count ?? 0) + (mlaIndexerData?.count ?? 0)
+        recData.count + ringData.count + (trunkHiddenData?.count ?? 0) + (mlaIndexerData?.count ?? 0) +
+            (dflashKData?.count ?? 0) + (dflashVData?.count ?? 0)
     }
 
     func validateDestination(_ session: QWEngineSession, requiresRoundMetadata: Bool) throws {
@@ -77,36 +78,62 @@ struct QWEnginePrefixState: Sendable {
 
     /// All geometry and cache operations must succeed before publication.
     func publish(into session: QWEngineSession, stochastic owner: QWStochasticSession? = nil) {
-        recData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            session.recSlab.region.pointer.advanced(by: session.recSlab.offset)
-                .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+        if !recData.isEmpty {
+            recData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                if let base = raw.baseAddress {
+                    session.recSlab.region.pointer.advanced(by: session.recSlab.offset)
+                        .copyMemory(from: base, byteCount: raw.count)
+                }
+            }
         }
-        ringData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            session.ringSlab.region.pointer.advanced(by: session.ringSlab.offset)
-                .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+        if !ringData.isEmpty {
+            ringData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                if let base = raw.baseAddress {
+                    session.ringSlab.region.pointer.advanced(by: session.ringSlab.offset)
+                        .copyMemory(from: base, byteCount: raw.count)
+                }
+            }
         }
-        if let hidden = session.trunkHidden, let data = trunkHiddenData {
+        if let hidden = session.trunkHidden, let data = trunkHiddenData, !data.isEmpty {
             data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                hidden.region.pointer.advanced(by: hidden.offset)
-                    .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+                if let base = raw.baseAddress {
+                    hidden.region.pointer.advanced(by: hidden.offset)
+                        .copyMemory(from: base, byteCount: raw.count)
+                }
             }
         }
-        if let dSlot = session.dflashSlot, let kData = dflashKData, let vData = dflashVData,
-           kData.count == dSlot.kSlab.bytes, vData.count == dSlot.vSlab.bytes {
-            kData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset)
-                    .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
-            }
-            vData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset)
-                    .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+        var restoredDFlashOffset = 0
+        if let dSlot = session.dflashSlot {
+            if let kData = dflashKData, let vData = dflashVData,
+               kData.count == dSlot.kSlab.bytes, vData.count == dSlot.vSlab.bytes,
+               dflashCacheOffset > 0 {
+                if !kData.isEmpty {
+                    kData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                        if let base = raw.baseAddress {
+                            dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset)
+                                .copyMemory(from: base, byteCount: raw.count)
+                        }
+                    }
+                }
+                if !vData.isEmpty {
+                    vData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                        if let base = raw.baseAddress {
+                            dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset)
+                                .copyMemory(from: base, byteCount: raw.count)
+                        }
+                    }
+                }
+                restoredDFlashOffset = dflashCacheOffset
+            } else {
+                memset(dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset), 0, dSlot.kSlab.bytes)
+                memset(dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset), 0, dSlot.vSlab.bytes)
             }
         }
         session.position = position
         session.generated = generated
         session.roundRecord = roundRecord
         session.trunkHiddenValid = trunkHiddenValid
-        session.dflashCacheOffset = dflashCacheOffset > 0 ? dflashCacheOffset : position
+        session.dflashCacheOffset = restoredDFlashOffset
         session.stochastic = owner
     }
 }
@@ -128,7 +155,7 @@ extension QWEngineSessionState {
                                     mlaIndexerData: Data? = nil) throws -> QWEngineSharedPrefix {
         try validate(session, cache: cache, mtpCache: mtpCache)
         let stateBytes = session.recSlab.bytes + session.ringSlab.bytes + (session.trunkHidden?.bytes ?? 0) +
-            (mlaIndexerData?.count ?? 0)
+            (mlaIndexerData?.count ?? 0) + (session.dflashSlot.map { $0.kSlab.bytes + $0.vSlab.bytes } ?? 0)
         guard maxBytes >= stateBytes, session.position == cache.written(session.kv),
               mtpCache == nil || (session.roundRecord.consumedCount == session.position &&
                   session.roundRecord.absolutePosition == session.position &&

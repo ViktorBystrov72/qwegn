@@ -265,6 +265,7 @@ final class QWChatMetadataTests: XCTestCase {
                 QWEngineLifecycleActor.LoadedState(modelBackend: backend, tokenizer: tok, chatTemplate: tpl)
             }
         )
+        actor.configureAllowedWorkspaceRoots([tempRoot.path])
 
         let req1Id = "meta-req-1-\(UUID().uuidString.prefix(8))"
         let req1JSON = """
@@ -334,13 +335,13 @@ final class QWChatMetadataTests: XCTestCase {
         let wireA = "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi A<|im_end|>\n<|im_start|>assistant\n"
         let wireB = "<|im_start|>system\nYou are strict.<|im_end|>\n<|im_start|>user\nHi B<|im_end|>\n<|im_start|>assistant\n"
 
-        let firstA = try await actor.encodeWireIncrementallyWithSystemPrefix(
+        let firstA = try actor.encodeWireIncrementallyWithSystemPrefix(
             wire: wireA, tokenizer: tok, packPath: "/dummy/model.qwp", cachePrompt: true, cacheSalt: "tenant-a"
         )
-        let secondA = try await actor.encodeWireIncrementallyWithSystemPrefix(
+        let secondA = try actor.encodeWireIncrementallyWithSystemPrefix(
             wire: wireA + " follow-up", tokenizer: tok, packPath: "/dummy/model.qwp", cachePrompt: true, cacheSalt: "tenant-a"
         )
-        let firstB = try await actor.encodeWireIncrementallyWithSystemPrefix(
+        let firstB = try actor.encodeWireIncrementallyWithSystemPrefix(
             wire: wireB, tokenizer: tok, packPath: "/dummy/model.qwp", cachePrompt: true, cacheSalt: "tenant-b"
         )
         XCTAssertNotNil(firstA.systemPrefixTokenCount)
@@ -349,7 +350,7 @@ final class QWChatMetadataTests: XCTestCase {
         XCTAssertNotNil(firstB.systemPrefixTokenCount)
         XCTAssertNotEqual(firstA.tokens, firstB.tokens)
 
-        let bypassResult = try await actor.encodeWireIncrementallyWithSystemPrefix(
+        let bypassResult = try actor.encodeWireIncrementallyWithSystemPrefix(
             wire: wireA + " stateless", tokenizer: tok, packPath: "/dummy/model.qwp", cachePrompt: false, cacheSalt: "tenant-c"
         )
         XCTAssertNil(bypassResult.systemPrefixTokenCount)

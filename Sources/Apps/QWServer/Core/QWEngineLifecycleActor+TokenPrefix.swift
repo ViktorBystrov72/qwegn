@@ -25,19 +25,114 @@ extension QWEngineLifecycleActor {
     }
 
     nonisolated static func heldStopSuffixUTF8(_ text: String, stops: [String]) -> Int {
-        var best = 0
-        for s in stops {
-            let maxChars = min(s.count - 1, text.count)
-            guard maxChars > 0 else { continue }
-            for len in stride(from: maxChars, through: 1, by: -1) {
-                let prefix = String(s.prefix(len))
-                if text.hasSuffix(prefix) {
-                    best = max(best, prefix.utf8.count)
-                    break
+        IncrementalStopScanner(stops: stops).heldSuffixUTF8Count(in: Array(text.utf8))
+    }
+
+    struct IncrementalStopScanner: @unchecked Sendable {
+        struct Entry {
+            let stop: String
+            let bytes: [UInt8]
+            let properPrefixes: [[UInt8]]
+        }
+        let entries: [Entry]
+        let isEmpty: Bool
+
+        init(stops: [String]) {
+            var built: [Entry] = []
+            for stop in stops where !stop.isEmpty {
+                var prefixes: [[UInt8]] = []
+                var idx = stop.endIndex
+                while idx > stop.startIndex {
+                    idx = stop.index(before: idx)
+                    if idx > stop.startIndex {
+                        prefixes.append(Array(stop[..<idx].utf8))
+                    }
+                }
+                built.append(Entry(stop: stop, bytes: Array(stop.utf8), properPrefixes: prefixes))
+            }
+            self.entries = built
+            self.isEmpty = built.isEmpty
+        }
+
+        func firstMatch(in utf8: [UInt8], previousCount: Int) -> (byteOffset: Int, stop: String)? {
+            var earliest: (byteOffset: Int, stop: String)? = nil
+            for entry in entries {
+                let m = entry.bytes.count
+                guard m > 0, utf8.count >= m else { continue }
+                let scanStart = max(0, previousCount - (m - 1))
+                let scanEnd = utf8.count - m
+                guard scanStart <= scanEnd else { continue }
+                let firstByte = entry.bytes[0]
+                for i in scanStart...scanEnd where utf8[i] == firstByte {
+                    if let current = earliest, i >= current.byteOffset { break }
+                    var matched = true
+                    for j in 1..<m where utf8[i + j] != entry.bytes[j] {
+                        matched = false
+                        break
+                    }
+                    if matched {
+                        earliest = (i, entry.stop)
+                        break
+                    }
                 }
             }
+            return earliest
         }
-        return best
+
+        func heldSuffixUTF8Count(in utf8: [UInt8]) -> Int {
+            var best = 0
+            for entry in entries {
+                for prefix in entry.properPrefixes {
+                    let len = prefix.count
+                    guard len > best, utf8.count >= len else { continue }
+                    if utf8[(utf8.count - len)..<utf8.count].elementsEqual(prefix) {
+                        best = len
+                        break
+                    }
+                }
+            }
+            return best
+        }
+    }
+
+    struct IncrementalJSONObjectTracker: Sendable {
+        private var started = false
+        private var depth = 0
+        private var inString = false
+        private var escaped = false
+        private var scannedCount = 0
+        private(set) var completedByteOffset: Int? = nil
+
+        mutating func advance(utf8: [UInt8]) {
+            guard completedByteOffset == nil, scannedCount < utf8.count else { return }
+            for idx in scannedCount..<utf8.count {
+                let b = utf8[idx]
+                if inString {
+                    if escaped {
+                        escaped = false
+                    } else if b == 0x5C {
+                        escaped = true
+                    } else if b == 0x22 {
+                        inString = false
+                    }
+                    continue
+                }
+                if b == 0x22 {
+                    inString = true
+                } else if b == 0x7B {
+                    depth += 1
+                    started = true
+                } else if b == 0x7D {
+                    depth -= 1
+                    if started && depth == 0 {
+                        scannedCount = idx + 1
+                        completedByteOffset = idx + 1
+                        return
+                    }
+                }
+            }
+            scannedCount = utf8.count
+        }
     }
 
     nonisolated static func firstCompleteJsonObjectEnd(in text: String) -> String.Index? {
@@ -72,9 +167,9 @@ extension QWEngineLifecycleActor {
         return nil
     }
 
-    /// Incrementally encodes a rendered chat wire string by caching tokenized prefixes up to
-    /// `<|im_start|>` turn boundaries across concurrent sessions, isolated by `cacheSalt`.
-    func encodeWireIncrementallyWithSystemPrefix(
+    /// Incrementally encodes a rendered chat wire string on caller executor using a lock-protected
+    /// token prefix cache up to `<|im_start|>` turn boundaries across concurrent sessions.
+    nonisolated func encodeWireIncrementallyWithSystemPrefix(
         wire: String,
         tokenizer tok: QWTokenizer,
         packPath: String,
@@ -97,16 +192,7 @@ extension QWEngineLifecycleActor {
               lastRange.lowerBound > wire.startIndex else {
             return (try tok.encode(wire), nil)
         }
-        let maxEntries = max(12, config.maxConcurrentSessions * 2 + 4)
-        func storePrefixEntry(_ entry: CachedTokenPrefixEntry) {
-            cachedTokenPrefixes.removeAll {
-                $0.packPath == entry.packPath && $0.cacheSalt == entry.cacheSalt && $0.prefixWire == entry.prefixWire
-            }
-            cachedTokenPrefixes.append(entry)
-            if cachedTokenPrefixes.count > maxEntries {
-                cachedTokenPrefixes.removeFirst(cachedTokenPrefixes.count - maxEntries)
-            }
-        }
+        let maxEntries = max(12, getConfig().maxConcurrentSessions * 2 + 4)
 
         var systemWire: String? = nil
         if wire.hasPrefix("\(marker)system") || wire.hasPrefix("\(marker)developer") {
@@ -122,26 +208,12 @@ extension QWEngineLifecycleActor {
         let newUTF8Count = newPrefixWire.utf8.count
         let markerUTF8 = Array(marker.utf8)
 
-        var bestIdx: Int? = nil
-        var bestLen = 0
-        for (idx, entry) in cachedTokenPrefixes.enumerated()
-        where entry.packPath == packPath && entry.cacheSalt == saltKey && !entry.prefixWire.isEmpty {
-            let count = entry.prefixWire.utf8.count
-            guard count > bestLen, count <= newUTF8Count,
-                  newPrefixWire.utf8.starts(with: entry.prefixWire.utf8) else { continue }
-            if count == newUTF8Count {
-                bestIdx = idx; bestLen = count
-            } else {
-                let deltaStart = newPrefixWire.utf8.index(newPrefixWire.utf8.startIndex, offsetBy: count)
-                if newPrefixWire.utf8[deltaStart...].starts(with: markerUTF8) {
-                    bestIdx = idx; bestLen = count
-                }
-            }
-        }
-
-        if let idx = bestIdx {
-            let matched = cachedTokenPrefixes.remove(at: idx)
-            cachedTokenPrefixes.append(matched)
+        if let matched = tokenPrefixCache.lookupBestPrefix(
+            newPrefixWire: newPrefixWire,
+            packPath: packPath,
+            saltKey: saltKey,
+            markerUTF8: markerUTF8
+        ) {
             let deltaStart = newPrefixWire.utf8.index(newPrefixWire.utf8.startIndex, offsetBy: matched.prefixWire.utf8.count)
             let deltaWire = String(newPrefixWire[deltaStart...])
             if deltaWire.isEmpty {
@@ -152,9 +224,13 @@ extension QWEngineLifecycleActor {
                 let updatedPrefixTokens = matched.prefixTokens + deltaTokens
                 let sysCount = matched.systemTokenCount
                     ?? (systemWire != nil && matched.prefixWire == systemWire ? matched.prefixTokens.count : nil)
-                storePrefixEntry(CachedTokenPrefixEntry(
-                    packPath: packPath, cacheSalt: saltKey, prefixWire: newPrefixWire,
-                    prefixTokens: updatedPrefixTokens, systemTokenCount: sysCount))
+                tokenPrefixCache.store(
+                    CachedTokenPrefixEntry(
+                        packPath: packPath, cacheSalt: saltKey, prefixWire: newPrefixWire,
+                        prefixTokens: updatedPrefixTokens, systemTokenCount: sysCount
+                    ),
+                    maxEntries: maxEntries
+                )
                 let tailTokens = try tok.encode(tailWire)
                 return (updatedPrefixTokens + tailTokens, sysCount)
             }
@@ -165,9 +241,13 @@ extension QWEngineLifecycleActor {
         if let sysW = systemWire, sysW.utf8.count < newUTF8Count, newPrefixWire.utf8.starts(with: sysW.utf8) {
             let sysTokens = try tok.encode(sysW)
             resolvedSystemTokenCount = sysTokens.count
-            storePrefixEntry(CachedTokenPrefixEntry(
-                packPath: packPath, cacheSalt: saltKey, prefixWire: sysW, prefixTokens: sysTokens,
-                systemTokenCount: sysTokens.count))
+            tokenPrefixCache.store(
+                CachedTokenPrefixEntry(
+                    packPath: packPath, cacheSalt: saltKey, prefixWire: sysW, prefixTokens: sysTokens,
+                    systemTokenCount: sysTokens.count
+                ),
+                maxEntries: maxEntries
+            )
             let remStart = newPrefixWire.utf8.index(newPrefixWire.utf8.startIndex, offsetBy: sysW.utf8.count)
             let remTokens = try tok.encode(String(newPrefixWire[remStart...]))
             prefixTokens = sysTokens + remTokens
@@ -177,9 +257,13 @@ extension QWEngineLifecycleActor {
                 resolvedSystemTokenCount = prefixTokens.count
             }
         }
-        storePrefixEntry(CachedTokenPrefixEntry(
-            packPath: packPath, cacheSalt: saltKey, prefixWire: newPrefixWire,
-            prefixTokens: prefixTokens, systemTokenCount: resolvedSystemTokenCount))
+        tokenPrefixCache.store(
+            CachedTokenPrefixEntry(
+                packPath: packPath, cacheSalt: saltKey, prefixWire: newPrefixWire,
+                prefixTokens: prefixTokens, systemTokenCount: resolvedSystemTokenCount
+            ),
+            maxEntries: maxEntries
+        )
         let tailTokens = try tok.encode(tailWire)
         return (prefixTokens + tailTokens, resolvedSystemTokenCount)
     }
@@ -187,8 +271,7 @@ extension QWEngineLifecycleActor {
     nonisolated public func validateRequestCapabilities(_ request: ChatCompletionRequest) throws {
         guard !request.extractImageUrls().isEmpty else { return }
         let cfg = statusBox.getConfig()
-        let eager = cfg.loadVision || ProcessInfo.processInfo.environment["QW_VISION_EAGER"] == "1"
-        guard eager else {
+        guard cfg.loadVision else {
             throw QWMultimodalError.badArgument(
                 "Vision tower is disabled (--no-load-vision). Enable --load-vision to process image inputs."
             )

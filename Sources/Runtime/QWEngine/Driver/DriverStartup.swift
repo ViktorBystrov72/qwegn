@@ -50,7 +50,14 @@ extension QWEngineDriver {
         guard FileManager.default.fileExists(atPath: packPath) else {
             throw QWEngineDriverError.packMissing(packPath)
         }
-        let maxDrafts = mtpBackend == .dflash2 ? 15 : 7
+        // L1: resolve the backend and draft budget BEFORE any pack read, HAL, or arena work.
+        let mtpBackendResolved: QWMTPBackend
+        do {
+            mtpBackendResolved = try QWMTPBackend.resolveSelection(mtpBackend, drafts: mtpDrafts)
+        } catch QWEngineError.badMTPDrafts(let d) {
+            throw QWEngineDriverError.badMTPDrafts(d)
+        }
+        let maxDrafts = mtpBackendResolved == .dflash2 ? 15 : 7
         guard mtpDrafts >= 0 && mtpDrafts <= maxDrafts else {
             throw QWEngineDriverError.badMTPDrafts(mtpDrafts)
         }
@@ -90,9 +97,6 @@ extension QWEngineDriver {
         // Validate KV mode before any arena work (f16, q8, and q4 are all
         // shipped and parity-gated across prefill, decode, and MTP verify).
         try Self.validateKVMode(mode: kvMode)
-        // L1: resolve the backend BEFORE any pack read, HAL, or arena work.
-        // Invalid selections fail here, before mutation (plan §2.1).
-        let mtpBackendResolved = try QWMTPBackend.resolveSelection(mtpBackend, drafts: mtpDrafts)
         let headIsQ4g = isSafetensors
             ? true
             : ((try? QWQuant.Pack(url: URL(fileURLWithPath: packPath))

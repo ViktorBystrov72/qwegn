@@ -114,7 +114,8 @@ static inline void qwm_gdn_store_row(uint row, uint N, float value, uint m,
     const uint ctrlStride = 2u * QW_GDN_V_HEADS;
     if (row >= aRow0 && row < bRow0) {
         uint h = row - aRow0;
-        float sp = log(1.0f + exp(value + bias[h]));
+        float spIn = value + bias[h];
+        float sp = (spIn > 20.0f) ? spIn : log(1.0f + exp(spIn));
         controls[m * ctrlStride + QW_GDN_V_HEADS + h] = -exp(aLog[h]) * sp;
     } else if (row >= bRow0 && row < bRowEnd) {
         controls[m * ctrlStride + row - bRow0] = 1.0f / (1.0f + exp(-value));

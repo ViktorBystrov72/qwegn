@@ -1,0 +1,81 @@
+// qw_quant_traits_shvq.metalh — QuantTraits specialization for SHVQ<BITS, GROUP>.
+// Kept isolated from qw_quant_traits.metalh to honor Law 27 constant-LUT per-PSO budgets.
+#pragma once
+#include "qw_dequant_shvq.metalh"
+#include "qw_quant_traits.metalh"
+
+/// QuantTraits for SHVQ<BITS, GROUP> codebook blocks using threadgroup-staged LUTs.
+template <int BITS, int GROUP>
+struct QWQuantSHVQ {
+    using WeightPtr = device const char*;
+    using TgLut = ShvqTgLut<BITS>;
+    using ActSlice = QWActSlice32F32;
+
+    METAL_FUNC static constexpr bool has_tg_lut() { return BITS <= 3; }
+    METAL_FUNC static constexpr uint group_bytes() { return qwg_shvq_group_bytes(BITS, GROUP); }
+    METAL_FUNC static constexpr uint slices_per_group() { return uint(GROUP) >> 5u; }
+    METAL_FUNC static constexpr uint slice_payload_bytes() { return qwg_shvq_slice_bytes(BITS); }
+
+    METAL_FUNC static size_t row_stride(uint K) {
+        return size_t(K / uint(GROUP)) * size_t(group_bytes());
+    }
+
+    METAL_FUNC static WeightPtr row_ptr(WeightPtr base, size_t row, size_t rowStride) {
+        return base + row * rowStride;
+    }
+
+    METAL_FUNC static WeightPtr group_ptr(WeightPtr rowBase, uint sliceIdx) {
+        return rowBase + size_t(sliceIdx / slices_per_group()) * size_t(group_bytes());
+    }
+
+    METAL_FUNC static uint byte_in_group(uint sliceIdx) {
+        return (sliceIdx & (slices_per_group() - 1u)) * slice_payload_bytes();
+    }
+
+    METAL_FUNC static void load_act_f32(device const float* xg, thread ActSlice& a) {
+        qwg_shvq_load_float32(xg, a.lo, a.hi);
+        a.sumX = 0.0f;
+    }
+
+    METAL_FUNC static float slice_dot(WeightPtr gp, uint byteInGroup, thread const ActSlice& a,
+                                      threadgroup const TgLut& tgLut) {
+        return qwg_shvq_slice_dot_tg<BITS>(gp, byteInGroup, a.lo, a.hi, tgLut);
+    }
+
+    METAL_FUNC static float2 slice_dot2(WeightPtr gp, uint byteInGroup, thread const ActSlice& a0,
+                                        thread const ActSlice& a1, threadgroup const TgLut& tgLut) {
+        return qwg_shvq_slice_dot2_tg<BITS>(gp, byteInGroup, a0.lo, a0.hi, a1.lo, a1.hi, tgLut);
+    }
+
+    METAL_FUNC static void unpack_lane4_f32(WeightPtr wrow, uint g, uint dl,
+                                            thread float2& w01, thread float2& w23) {
+        qwg_unpack_shvq_lane4_f32<BITS, GROUP>(wrow, g, dl, w01, w23);
+    }
+
+    template <uint LS = 32u>
+    METAL_FUNC static float4 rows4_f32(WeightPtr w, device const float* x,
+                                       uint row0, uint N, uint K, uint lane,
+                                       threadgroup const TgLut& tgLut) {
+        return qwg_gemv_shvq_rows4_f32<BITS, GROUP, LS>(w, x, row0, N, K, lane, tgLut);
+    }
+
+    template <uint LS = 32u>
+    METAL_FUNC static void rows4_m2_f32(WeightPtr w, device const float* x0, device const float* x1,
+                                        uint row0, uint N, uint K, uint lane,
+                                        thread float4& acc0, thread float4& acc1,
+                                        threadgroup const TgLut& tgLut) {
+        qwg_gemv_shvq_rows4_m2_f32<BITS, GROUP, LS>(w, x0, x1, row0, N, K, lane, acc0, acc1, tgLut);
+    }
+
+    template <uint LS = 32u>
+    METAL_FUNC static void rows4_m4_f32(WeightPtr w, device const float* x, uint M,
+                                        uint row0, uint N, uint K, uint lane,
+                                        thread float4 (&acc)[4], threadgroup const TgLut& tgLut) {
+        qwg_gemv_shvq_rows4_m4_f32<BITS, GROUP, LS>(w, x, M, row0, N, K, lane, acc, tgLut);
+    }
+
+    METAL_FUNC static float row_f32(WeightPtr w, device const float* x, size_t row, uint K,
+                                    uint lane, threadgroup const TgLut& tgLut) {
+        return qwg_gemv_shvq_row_f32_tg<BITS, GROUP>(w, x, row, K, lane, tgLut);
+    }
+};

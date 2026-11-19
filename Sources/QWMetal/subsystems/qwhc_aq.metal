@@ -22,7 +22,9 @@ static inline void qwg_hc_up_mix_h32_aq_f32_body(device const char*  upBytes,
                                                  uint                lane,
                                                  threadgroup float*  sRot,
                                                  threadgroup float*  sMix) {
-    const uint b = tg.x, realHC = hc & 0xFFu, nBlocks = R >> 5u;
+    const uint b = tg.x, realHC = hc & 0xFFu;
+    if (R > 512u || (R & 31u) != 0u || realHC == 0u) return;
+    const uint nBlocks = R >> 5u;
     const uint halfId = lane >> 4u, s = lane & 15u, h0 = b * 32u + sg * 4u;
     constexpr uint groupBytes = 4u + ((GROUP * BITS) >> 3), slicesPerGroup = GROUP >> 5, slicePayloadBytes = 4u * BITS;
     const uint rowBytes = (R / GROUP) * groupBytes;
@@ -95,7 +97,7 @@ static inline void qwg_hc_down_inject_aq_f32_body(device const char*   downBytes
     const uint tg = tgp.x, rw = tgp.y, realCH = CH & 0xFFu, nDownTG = (NDown + 3u) >> 2u;
     if (tg < nDownTG) {
         const uint row0 = tg * 4u;
-        const float4 acc = qwg_gemv_aq_rows4_part_f32<BITS, GROUP>(downBytes, xRot + rw * K, row0, NDown, K,
+        const float4 acc = qwg_gemv_aq_rows4_part_f32<BITS, GROUP>(downBytes, xRot + (size_t)rw * K, row0, NDown, K,
                                                                    sg * 32u + lane, 128u);
         qwg_hc_down_rows4_store(acc, yLow, NDown, rw, row0, scale, sg, lane, part4);
         return;
@@ -157,7 +159,8 @@ static inline void qwg_hc_norm_down_inject_aq_f32_body(device const char*   down
     const uint tg = tgp.x, rw = tgp.y, realCH = CH & 0xFFu, nDownTG = (NDown + 3u) >> 2u;
     const uint nTG = nDownTG + realCH;
     const uint tid = sg * 32u + lane;
-    const uint groups = K / hidden;
+    const uint groups = (hidden > 0u && (K % hidden) == 0u) ? (K / hidden) : 0u;
+    if (groups == 0u || groups > 4u) return;
     const bool injecting = hasInject != 0u;
     device const float* xr = x + (size_t)rw * K;
     device const float* sr = src + (size_t)rw * hidden;
@@ -259,7 +262,7 @@ static inline void qwg_hc_norm_down_inject_aq_f32_body(device const char*   down
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         const float y = (partial[0] + partial[1]) + (partial[2] + partial[3]);
-        yInj[rw * realCH + n] = 2.0f / (1.0f + exp(-(y / scale)));
+        yInj[(size_t)rw * realCH + n] = 2.0f / (1.0f + exp(-(y / scale)));
     }
 }
 

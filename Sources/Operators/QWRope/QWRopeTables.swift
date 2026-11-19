@@ -88,17 +88,21 @@ public final class QWRopeTables: @unchecked Sendable {
     /// HF _compute_yarn_parameters — verbatim order of operations. Ramp
     /// bounds in Double (Python floats); ramp/pairs in Float (f32 tensors).
     static func invFreqYarn(_ y: QWYaRNConfig, geometry: QWModelGeometry) -> (invf: [Float], scaling: Float) {
-        let dimI = geometry.rotaryDims, dim = Float(dimI)
-        let base: Float = Float(geometry.ropeTheta)
+        invFreqYarn(rotaryDims: geometry.rotaryDims, ropeTheta: geometry.ropeTheta, yarn: y)
+    }
+
+    static func invFreqYarn(rotaryDims dimI: Int, ropeTheta baseD: Double,
+                            yarn y: QWYaRNConfig) -> (invf: [Float], scaling: Float) {
+        let dim = Float(dimI)
+        let base = Float(baseD)
         let factor = y.factor
         let pairs = dimI / 2
         let posFreqs = (0..<pairs).map { pow(base, Float($0) * 2.0 / dim) }
         let invEx = posFreqs.map { 1.0 / $0 }
         let invIn = posFreqs.map { 1.0 / (factor * $0) }
         func fcd(_ nr: Double) -> Double {   // find_correction_dim (python float)
-            let baseD = geometry.ropeTheta
-            return (Double(dimI) * Foundation.log(Double(y.originalMaxPosition) / (nr * 2.0 * Double.pi)))
-                 / (2.0 * Foundation.log(baseD))
+            (Double(dimI) * Foundation.log(Double(y.originalMaxPosition) / (nr * 2.0 * Double.pi)))
+                / (2.0 * Foundation.log(baseD))
         }
         var lo = fcd(Double(y.betaFast)), hi = fcd(Double(y.betaSlow))
         if y.truncate { lo = Foundation.floor(lo); hi = Foundation.ceil(hi) }

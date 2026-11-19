@@ -5,6 +5,7 @@
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include "include/qw_dequant.metalh"
+#include "include/qw_fastmath_safe.metalh"
 using namespace metal;
 
 struct DFlashH8 { half v[8]; } __attribute__((__packed__, __aligned__(16)));
@@ -158,17 +159,18 @@ kernel void qwg_dflash_f16_gemv_batched(
     if (row >= N) return;
     const uint chunks = K >> 3u;
     device const uint4* wr = W + (size_t)row * chunks;
+    const uint safeM = min(M, 16u);
     float acc[16] = {0.0f};
     for (uint c = lane; c < chunks; c += 32u) {
         DFlashH8 wv = asDFlashH8(wr[c]);
-        for (uint m = 0; m < M; ++m) {
+        for (uint m = 0; m < safeM; ++m) {
             DFlashH8 xv = asDFlashH8(x[(size_t)m * chunks + c]);
             float s = 0.0f;
             for (int i = 0; i < 8; ++i) s += float(wv.v[i]) * float(xv.v[i]);
             acc[m] += s;
         }
     }
-    for (uint m = 0; m < M; ++m) {
+    for (uint m = 0; m < safeM; ++m) {
         float val = simd_sum(acc[m]);
         if (lane == 0u) y[(size_t)m * N + row] = val;
     }
@@ -185,10 +187,11 @@ kernel void qwg_dflash_conv_apply(
         constant uint& convGroups      [[buffer(6)]],
         uint tg [[threadgroup_position_in_grid]],
         uint ti [[thread_index_in_threadgroup]]) {
+    if (convGroups == 0u) return;
     const uint t = tg;
     const uint hiddenF4 = hiddenU4 << 1u;
     const uint dynStride = convGroups * 4u;
-    const uint uPerGroup = max(1u, hiddenU4 / convGroups);
+    const uint uPerGroup = max(1u, (hiddenU4 + convGroups - 1u) / convGroups);
     device const uint4* xCur = x + (size_t)t * hiddenU4;
     device const uint4* xPrev = (t > 0u) ? (x + (size_t)(t - 1u) * hiddenU4) : xCur;
     device const uint4* bTap0 = baseKernel + (size_t)(mode * 2u + 0u) * hiddenU4;
@@ -197,7 +200,7 @@ kernel void qwg_dflash_conv_apply(
     device const float* dTap1 = dTap0 + convGroups;
 
     for (uint u = ti; u < hiddenU4; u += 32u) {
-        const uint g = u / uPerGroup;
+        const uint g = min(u / uPerGroup, convGroups - 1u);
         const float dw0 = dTap0[g];
         const float dw1 = dTap1[g];
         DFlashH8 xc = asDFlashH8(xCur[u]);
@@ -354,7 +357,8 @@ kernel void qwg_dflash_attn(
     const float q2 = float(qv[lane + 64u]) * scale;
     const float q3 = float(qv[lane + 96u]) * scale;
 
-    float maxLogit = -INFINITY;
+    float maxLogit = -3.4e38f;
+    bool hasLogit = false;
     float lsum = 0.0f;
     float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
 
@@ -367,8 +371,8 @@ kernel void qwg_dflash_attn(
         float dot = q0 * float(kv[lane]) + q1 * float(kv[lane + 32u])
                   + q2 * float(kv[lane + 64u]) + q3 * float(kv[lane + 96u]);
         float s = simd_sum(dot);
-        float newMax = max(maxLogit, s);
-        float corr = (maxLogit == -INFINITY) ? 0.0f : exp(maxLogit - newMax);
+        float newMax = hasLogit ? max(maxLogit, s) : s;
+        float corr = hasLogit ? exp(maxLogit - newMax) : 0.0f;
         float p = exp(s - newMax);
         lsum = lsum * corr + p;
         o0 = o0 * corr + p * float(vv[lane]);
@@ -376,6 +380,7 @@ kernel void qwg_dflash_attn(
         o2 = o2 * corr + p * float(vv[lane + 64u]);
         o3 = o3 * corr + p * float(vv[lane + 96u]);
         maxLogit = newMax;
+        hasLogit = true;
     }
 
     const uint pLimit = (isCausal != 0u) ? (m + 1u) : M;
@@ -385,8 +390,8 @@ kernel void qwg_dflash_attn(
         float dot = q0 * float(kv[lane]) + q1 * float(kv[lane + 32u])
                   + q2 * float(kv[lane + 64u]) + q3 * float(kv[lane + 96u]);
         float s = simd_sum(dot);
-        float newMax = max(maxLogit, s);
-        float corr = (maxLogit == -INFINITY) ? 0.0f : exp(maxLogit - newMax);
+        float newMax = hasLogit ? max(maxLogit, s) : s;
+        float corr = hasLogit ? exp(maxLogit - newMax) : 0.0f;
         float p = exp(s - newMax);
         lsum = lsum * corr + p;
         o0 = o0 * corr + p * float(vv[lane]);
@@ -394,6 +399,7 @@ kernel void qwg_dflash_attn(
         o2 = o2 * corr + p * float(vv[lane + 64u]);
         o3 = o3 * corr + p * float(vv[lane + 96u]);
         maxLogit = newMax;
+        hasLogit = true;
     }
 
     const float invL = (lsum > 0.0f) ? (1.0f / lsum) : 0.0f;
@@ -424,7 +430,7 @@ static inline void dflash_tg_argmax(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_id == 0u) {
-        float v = (lane < 8u) ? sVal[lane] : -INFINITY;
+        float v = (lane < 8u) ? sVal[lane] : -3.4e38f;
         int id = (lane < 8u) ? sId[lane] : 0x7fffffff;
         for (ushort offset = 4; offset > 0; offset >>= 1) {
             float ov = simd_shuffle_down(v, offset);
@@ -445,7 +451,7 @@ static inline void dflash_tg_argmax(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// Top-16 Stage 1 over arbitrary vocab <= 393216 logits per draft row.
+// Top-16 Stage 1 over vocab logits per draft row (fast register path <= 393216, general loop above).
 // Grid = (256, D, 1), threadsPerThreadgroup = (256, 1, 1).
 kernel void qwg_dflash_top16_stage1(
         device const float* logits   [[buffer(0)]],
@@ -458,52 +464,90 @@ kernel void qwg_dflash_top16_stage1(
     const uint chunk = tg.x;
     const uint row = tg.y;
     const uint safeTopK = min(topK, 16u);
+    const uint outBase = (row * 256u + chunk) * 16u;
+    if (vocab == 0u) {
+        if (ti < safeTopK) {
+            partialVals[outBase + ti] = -3.4e38f;
+            partialIds[outBase + ti] = 0x7fffffff;
+        }
+        return;
+    }
     const uint chunkStride = (vocab + 255u) >> 8u;
     const uint base = chunk * chunkStride;
+    const uint chunkEnd = min(vocab, base + chunkStride);
     device const float* rowLogits = logits + (size_t)row * vocab;
-
-    float regVal[6];
-    int regId[6];
-    #pragma unroll
-    for (uint i = 0; i < 6u; ++i) {
-        uint idx = base + i * 256u + ti;
-        if (idx < min(vocab, base + chunkStride)) {
-            float v = rowLogits[idx];
-            regVal[i] = isfinite(v) ? max(v, -1e30f) : -1e30f;
-            regId[i] = int(idx);
-        } else {
-            regVal[i] = -INFINITY;
-            regId[i] = 0x7fffffff;
-        }
-    }
 
     threadgroup float sVal[8];
     threadgroup int sId[8];
-    const uint outBase = (row * 256u + chunk) * 16u;
 
-    for (uint k = 0; k < safeTopK; ++k) {
-        float bestLocalVal = -INFINITY;
-        int bestLocalId = 0x7fffffff;
+    if (chunkStride <= 1536u) {
+        float regVal[6];
+        int regId[6];
         #pragma unroll
         for (uint i = 0; i < 6u; ++i) {
-            if (regVal[i] > bestLocalVal || (regVal[i] == bestLocalVal && regId[i] < bestLocalId)) {
-                bestLocalVal = regVal[i];
-                bestLocalId = regId[i];
+            uint idx = base + i * 256u + ti;
+            if (idx < chunkEnd) {
+                float v = rowLogits[idx];
+                regVal[i] = qw_is_finite_bits(v) ? max(v, -1e30f) : -1e30f;
+                regId[i] = int(idx);
+            } else {
+                regVal[i] = -3.4e38f;
+                regId[i] = 0x7fffffff;
+            }
+        }
+
+        for (uint k = 0; k < safeTopK; ++k) {
+            float bestLocalVal = -3.4e38f;
+            int bestLocalId = 0x7fffffff;
+            #pragma unroll
+            for (uint i = 0; i < 6u; ++i) {
+                if (regVal[i] > bestLocalVal || (regVal[i] == bestLocalVal && regId[i] < bestLocalId)) {
+                    bestLocalVal = regVal[i];
+                    bestLocalId = regId[i];
+                }
+            }
+            float winVal;
+            int winId;
+            dflash_tg_argmax(bestLocalVal, bestLocalId, ti, sVal, sId, winVal, winId);
+            if (ti == 0u) {
+                partialVals[outBase + k] = winVal;
+                partialIds[outBase + k] = winId;
+            }
+            #pragma unroll
+            for (uint i = 0; i < 6u; ++i) {
+                if (regId[i] == winId) {
+                    regVal[i] = -3.4e38f;
+                    regId[i] = 0x7fffffff;
+                }
+            }
+        }
+        return;
+    }
+
+    int chosenIds[16];
+    for (uint k = 0; k < safeTopK; ++k) {
+        float bestLocalVal = -3.4e38f;
+        int bestLocalId = 0x7fffffff;
+        for (uint idx = base + ti; idx < chunkEnd; idx += 256u) {
+            bool already = false;
+            for (uint p = 0; p < k; ++p) {
+                if (chosenIds[p] == int(idx)) { already = true; break; }
+            }
+            if (already) continue;
+            float raw = rowLogits[idx];
+            float v = qw_is_finite_bits(raw) ? max(raw, -1e30f) : -1e30f;
+            if (v > bestLocalVal || (v == bestLocalVal && int(idx) < bestLocalId)) {
+                bestLocalVal = v;
+                bestLocalId = int(idx);
             }
         }
         float winVal;
         int winId;
         dflash_tg_argmax(bestLocalVal, bestLocalId, ti, sVal, sId, winVal, winId);
+        chosenIds[k] = winId;
         if (ti == 0u) {
             partialVals[outBase + k] = winVal;
             partialIds[outBase + k] = winId;
-        }
-        #pragma unroll
-        for (uint i = 0; i < 6u; ++i) {
-            if (regId[i] == winId) {
-                regVal[i] = -INFINITY;
-                regId[i] = 0x7fffffff;
-            }
         }
     }
 }
@@ -530,14 +574,14 @@ kernel void qwg_dflash_top16_stage2(
             float pv = partialVals[inBase + ti * 16u + i];
             int pid = partialIds[inBase + ti * 16u + i];
             if (pid >= 0 && pid < int(vocab) && pid != 0x7fffffff) {
-                regVal[i] = isfinite(pv) ? max(pv, -1e30f) : -1e30f;
+                regVal[i] = qw_is_finite_bits(pv) ? max(pv, -1e30f) : -1e30f;
                 regId[i] = pid;
             } else {
-                regVal[i] = -INFINITY;
+                regVal[i] = -3.4e38f;
                 regId[i] = 0x7fffffff;
             }
         } else {
-            regVal[i] = -INFINITY;
+            regVal[i] = -3.4e38f;
             regId[i] = 0x7fffffff;
         }
     }
@@ -547,7 +591,7 @@ kernel void qwg_dflash_top16_stage2(
     const uint outBase = row * 16u;
 
     for (uint k = 0; k < safeTopK; ++k) {
-        float bestLocalVal = -INFINITY;
+        float bestLocalVal = -3.4e38f;
         int bestLocalId = 0x7fffffff;
         for (uint i = 0; i < 16u; ++i) {
             if (regVal[i] > bestLocalVal || (regVal[i] == bestLocalVal && regId[i] < bestLocalId)) {
@@ -560,12 +604,12 @@ kernel void qwg_dflash_top16_stage2(
         dflash_tg_argmax(bestLocalVal, bestLocalId, ti, sVal, sId, winVal, winId);
         if (ti == 0u) {
             bool valid = (winId >= 0 && winId < int(vocab) && winId != 0x7fffffff);
-            unaryOut[outBase + k] = valid ? (isfinite(winVal) ? max(winVal, -1e30f) : -1e30f) : -1e30f;
+            unaryOut[outBase + k] = valid ? (qw_is_finite_bits(winVal) ? max(winVal, -1e30f) : -1e30f) : -1e30f;
             candidatesOut[outBase + k] = valid ? winId : 0;
         }
         for (uint i = 0; i < 16u; ++i) {
             if (regId[i] == winId) {
-                regVal[i] = -INFINITY;
+                regVal[i] = -3.4e38f;
                 regId[i] = 0x7fffffff;
             }
         }
@@ -602,7 +646,7 @@ kernel void qwg_dflash_selector_greedy(
     for (uint pos = 0; pos < draftCount; ++pos) {
         float hVal = hiddenProj[pos * 256u + ti];
         float pVal = dflash_bf16_to_f32(predBook[(size_t)pred * 256u + ti]) * hVal;
-        float bestScore = -INFINITY;
+        float bestScore = -3.4e38f;
         int bestToken = 0;
 
         for (uint k = 0; k < safeTopK; ++k) {
@@ -618,7 +662,7 @@ kernel void qwg_dflash_selector_greedy(
                 for (uint s = 0; s < 8u; ++s) edge += sSums[s];
                 float u = unary[pos * 16u + k];
                 float rawScore = u + edge;
-                float score = (isfinite(u) && isfinite(edge) && isfinite(rawScore)) ? max(rawScore, -1e30f) : -1e30f;
+                float score = (qw_is_finite_bits(u) && qw_is_finite_bits(edge) && qw_is_finite_bits(rawScore)) ? max(rawScore, -1e30f) : -1e30f;
                 if (score > bestScore) {
                     bestScore = score;
                     bestToken = cand;

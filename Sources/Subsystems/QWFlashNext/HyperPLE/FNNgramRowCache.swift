@@ -187,14 +187,14 @@ public final class FNNgramCachedRows: FNNgramRows, @unchecked Sendable {
         return fresh
     }
 
-    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) {
+    public func copyRow(_ id: Int, to dst: UnsafeMutablePointer<Float>) throws {
         if let hit = cache.value(for: id) {
             hit.withUnsafeBufferPointer { src in
                 dst.update(from: src.baseAddress!, count: headDim)
             }
             return
         }
-        backing.copyRow(id, to: dst)
+        try backing.copyRow(id, to: dst)
         // A cache with no budget stores nothing, so do not pay for a copy
         // that would be thrown away.
         guard cache.isEnabled else { return }

@@ -11,7 +11,12 @@ extension SettingsView {
     // MARK: - Actions
 
     func refreshDiscoveredModels() {
-        let scanned = QWServerSettings.scanModelsDirectory()
+        telemetry.refreshDiscoveredModelsAsync { scanned, drafters in
+            applyDiscoveredModels(scanned: scanned, drafters: drafters)
+        }
+    }
+
+    private func applyDiscoveredModels(scanned: [DiscoveredModel], drafters: [DiscoveredModel]) {
         discoveredModels = scanned
         // The configured pack is the model the engine runs. The name the
         // server serves it under can be an id of the user's choosing, not
@@ -33,7 +38,7 @@ extension SettingsView {
         } else {
             draftSettings.modelAlias = draftSettings.alias(for: draftSettings.modelName)
         }
-        discoveredDrafterModels = QWServerSettings.scanDrafterModelsDirectory()
+        discoveredDrafterModels = drafters
         let trimmedDraft = draftSettings.dflashDraftPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedDraft.isEmpty
             && !discoveredDrafterModels.contains(where: { $0.packPath == trimmedDraft }) {
@@ -50,13 +55,41 @@ extension SettingsView {
         }
     }
 
-    func selectDrafterPackFile() {
+    private func chooseFilePanel(
+        canChooseFiles: Bool,
+        canChooseDirectories: Bool,
+        message: String? = nil
+    ) -> URL? {
         let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
+        panel.canChooseFiles = canChooseFiles
+        panel.canChooseDirectories = canChooseDirectories
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            draftSettings.dflashDraftPackPath = url.path
+        if let message { panel.message = message }
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func resolvedSelectedModelReference() -> (packPath: String, modelName: String, alias: String) {
+        let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        return draftSettings.resolveModelReference(
+            rawPath.isEmpty ? draftSettings.modelName : rawPath,
+            discovered: discoveredModels
+        )
+    }
+
+    func selectDrafterPackFile() {
+        guard let url = chooseFilePanel(canChooseFiles: true, canChooseDirectories: true) else { return }
+        let path = url.path
+        let name = QWModelRoot.canonicalModelName(for: url)
+        Task { @MainActor in
+            let isValidDrafter = await Task.detached(priority: .userInitiated) {
+                QWModelCatalog.isDrafterPack(at: path)
+            }.value
+            guard isValidDrafter else {
+                validationErrorMessage = "Cannot select '\(name)': not a DFlash2 or DSpine drafter pack"
+                return
+            }
+            draftSettings.dflashDraftPackPath = path
+            telemetry.invalidateModelMetadataCache()
             refreshDiscoveredModels()
             validateModelAndDrafterOnSelection()
         }
@@ -69,21 +102,22 @@ extension SettingsView {
     }
 
     func selectModelPackFile() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            let baseName = QWModelRoot.canonicalModelName(for: url)
-            let entry = QWModelCatalog.classify(name: baseName, path: url.path)
+        guard let url = chooseFilePanel(canChooseFiles: true, canChooseDirectories: true) else { return }
+        let path = url.path
+        let baseName = QWModelRoot.canonicalModelName(for: url)
+        Task { @MainActor in
+            let entry = await Task.detached(priority: .userInitiated) {
+                QWModelCatalog.classify(name: baseName, path: path)
+            }.value
             guard entry.supported else {
                 validationErrorMessage = "Cannot select '\(baseName)': \(entry.reason ?? "not runnable")"
                 return
             }
-            draftSettings.modelPackPath = url.path
+            draftSettings.modelPackPath = path
             if !baseName.isEmpty {
                 draftSettings.modelName = baseName
             }
+            telemetry.invalidateModelMetadataCache()
             refreshDiscoveredModels()
             validateModelAndDrafterOnSelection()
         }
@@ -94,7 +128,7 @@ extension SettingsView {
            !disc.capabilities.isEmpty {
             return disc.capabilities.contains("vision")
         }
-        if let desc = try? draftSettings.validatePrimaryModel() {
+        if let desc = selectedPrimaryDescriptor {
             return desc.visDepth > 0 && desc.capabilities.contains(.vision)
         }
         return true
@@ -102,12 +136,9 @@ extension SettingsView {
 
     var selectedPrimaryDescriptor: QWModelDescriptor? {
         let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ref = draftSettings.resolveModelReference(
-            rawPath.isEmpty ? draftSettings.modelName : rawPath,
-            discovered: discoveredModels
-        )
+        let ref = resolvedSelectedModelReference()
         let candidate = ref.packPath.isEmpty ? rawPath : ref.packPath
-        return QWServerSettings.loadPrimaryDescriptor(packPath: candidate)
+        return telemetry.cachedPrimaryDescriptor(packPath: candidate)
     }
 
     var selectedModelSupportsDFlash2: Bool {
@@ -209,10 +240,12 @@ extension SettingsView {
                 drafters: discoveredDrafterModels,
                 targetModelName: draftSettings.modelName
             ) ?? draftSettings.dflashDraftPackPath
-            let inferred = QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: effPath)
-            return draftSettings.mtpBackend.lowercased() == "dspine" ? max(15, inferred.maxDrafts) : inferred.maxDrafts
+            if let cached = telemetry.cachedMaxDrafts(forDrafterPackPath: effPath) {
+                return draftSettings.mtpBackend.lowercased() == "dspine" ? max(15, cached) : cached
+            }
+            return draftSettings.mtpBackend.lowercased() == "dspine" ? 15 : 7
         }
-        if let desc = selectedPrimaryDescriptor ?? (try? draftSettings.validatePrimaryModel()),
+        if let desc = selectedPrimaryDescriptor,
            desc.maxSpeculativeDrafts > 0 {
             return desc.maxSpeculativeDrafts
         }
@@ -222,37 +255,28 @@ extension SettingsView {
         return 7
     }
 
-    var selectedModelHasLSASidecar: Bool {
-        let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ref = draftSettings.resolveModelReference(rawPath.isEmpty ? draftSettings.modelName : rawPath, discovered: discoveredModels)
+    private func resolvedLSASidecarPaths() -> (packPath: String, explicitPath: String) {
+        let ref = resolvedSelectedModelReference()
         let explicit = draftSettings.lsaSidecarPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        return QWLSAConfig.resolveSidecarURL(packPath: ref.packPath, explicitSidecarPath: explicit.isEmpty ? nil : explicit) != nil
+        return (ref.packPath, explicit)
+    }
+
+    var selectedModelHasLSASidecar: Bool {
+        let paths = resolvedLSASidecarPaths()
+        return telemetry.cachedLSASidecarStatus(packPath: paths.packPath, explicitPath: paths.explicitPath)?.hasSidecar ?? false
     }
 
     var selectedModelLSASidecarStatusText: String {
-        let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ref = draftSettings.resolveModelReference(rawPath.isEmpty ? draftSettings.modelName : rawPath, discovered: discoveredModels)
-        let explicit = draftSettings.lsaSidecarPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = QWLSAConfig.resolveSidecarURL(packPath: ref.packPath, explicitSidecarPath: explicit.isEmpty ? nil : explicit) else {
-            return "No .qlsa sidecar detected (Auto uses in-memory Weight-SVD)"
-        }
-        if let desc = try? draftSettings.validatePrimaryModel(),
-           let info = try? QWLSASidecar.peekInfo(url: url, descriptor: desc) {
-            let matchNote = info.geometryMatches ? "verified" : "digest mismatch"
-            return "Detected \(url.lastPathComponent) [\(info.method), d=\(info.indexDim), \(matchNote)]"
-        }
-        return "Detected \(url.lastPathComponent)"
+        let paths = resolvedLSASidecarPaths()
+        return telemetry.cachedLSASidecarStatus(packPath: paths.packPath, explicitPath: paths.explicitPath)?.statusText
+            ?? "No .qlsa sidecar detected (Auto uses in-memory Weight-SVD)"
     }
 
     func selectLSASidecarFile() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            draftSettings.lsaSidecarPath = url.path
-            validateModelAndDrafterOnSelection()
-        }
+        guard let url = chooseFilePanel(canChooseFiles: true, canChooseDirectories: false) else { return }
+        draftSettings.lsaSidecarPath = url.path
+        telemetry.invalidateLSASidecarCache()
+        validateModelAndDrafterOnSelection()
     }
 
     func generateLSASidecarForSelectedModel() {
@@ -260,22 +284,11 @@ extension SettingsView {
         lsaSidecarTask?.cancel()
         validationErrorMessage = nil
 
-        let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ref = draftSettings.resolveModelReference(
-            rawPath.isEmpty ? draftSettings.modelName : rawPath,
-            discovered: discoveredModels
-        )
-        let desc: QWModelDescriptor
-        do {
-            desc = try draftSettings.validatePrimaryModel()
-        } catch {
-            validationErrorMessage = "LSA sidecar build failed: \(error)"
-            return
-        }
-
-        let packPath = ref.packPath
+        let packPath = resolvedSelectedModelReference().packPath
         let clusterBlock = draftSettings.lsaClusterBlock
         let budget = draftSettings.lsaBudget
+        let snapshot = draftSettings
+        let cachedDesc = selectedPrimaryDescriptor
         isGeneratingLSASidecar = true
 
         lsaSidecarTask = Task { @MainActor in
@@ -285,6 +298,7 @@ extension SettingsView {
             }
             do {
                 let outcome: (URL, Int) = try await Task.detached(priority: .userInitiated) {
+                    let desc = try cachedDesc ?? snapshot.validatePrimaryModel()
                     let indexDim = QWLSAConfig.defaultIndexDim
                     let tensors = try QWLSASidecar.synthesizeFromModel(
                         packPath: packPath,
@@ -317,6 +331,7 @@ extension SettingsView {
                 }.value
 
                 guard !Task.isCancelled else { return }
+                telemetry.invalidateLSASidecarCache()
                 refreshDiscoveredModels()
                 validationErrorMessage = nil
                 showTimedConfirmation("Built \(outcome.0.lastPathComponent) (\(outcome.1) layers)")
@@ -335,19 +350,15 @@ extension SettingsView {
     }
 
     func resetToTopPerformanceDefaults() {
-        let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ref = draftSettings.resolveModelReference(rawPath.isEmpty ? draftSettings.modelName : rawPath)
-        draftSettings.applyModelConfigDefaults(packPath: ref.packPath)
+        draftSettings.applyModelConfigDefaults(packPath: resolvedSelectedModelReference().packPath)
         pendingProfileReset = true
         validationErrorMessage = nil
         showTimedConfirmation("Staged model & engine defaults — click Save to apply")
     }
 
     func resetSpeculativeDefaults() {
-        let rawPath = draftSettings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ref = draftSettings.resolveModelReference(rawPath.isEmpty ? draftSettings.modelName : rawPath)
         var baseline = draftSettings
-        baseline.applyModelConfigDefaults(packPath: ref.packPath)
+        baseline.applyModelConfigDefaults(packPath: resolvedSelectedModelReference().packPath)
         draftSettings.speculativeDecodingEnabled = baseline.speculativeDecodingEnabled
         draftSettings.mtpBackend = baseline.mtpBackend
         draftSettings.mtpDrafts = baseline.mtpDrafts
@@ -374,8 +385,37 @@ extension SettingsView {
     }
 
     func validateModelAndDrafterOnSelection() {
+        let snapshot = draftSettings
+        let models = discoveredModels
+        if let desc = selectedPrimaryDescriptor {
+            applyValidation(for: desc)
+            return
+        }
+        Task { @MainActor in
+            let result = await Task.detached(priority: .userInitiated) { () -> Result<(String, QWModelDescriptor), any Error> in
+                let rawPath = snapshot.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                let ref = snapshot.resolveModelReference(rawPath.isEmpty ? snapshot.modelName : rawPath, discovered: models)
+                let key = ref.packPath.isEmpty ? rawPath : ref.packPath
+                do {
+                    return .success((key, try snapshot.validatePrimaryModel()))
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+            guard draftSettings.modelName == snapshot.modelName,
+                  draftSettings.modelPackPath == snapshot.modelPackPath else { return }
+            switch result {
+            case .success(let (key, desc)):
+                if !key.isEmpty { telemetry.cachedPrimaryDescriptors[key] = desc }
+                applyValidation(for: desc)
+            case .failure(let error):
+                validationErrorMessage = "\(error)"
+            }
+        }
+    }
+
+    private func applyValidation(for desc: QWModelDescriptor) {
         do {
-            let desc = try draftSettings.validatePrimaryModel()
             if !(desc.visDepth > 0 && desc.capabilities.contains(.vision)) {
                 draftSettings.loadVision = false
             }
@@ -416,7 +456,7 @@ extension SettingsView {
                 targetModelName: draftSettings.modelName
             ) ?? draftSettings.dflashDraftPackPath
             let maxD = isExternalDrafterSelected
-                ? QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: effPath).maxDrafts
+                ? (telemetry.cachedMaxDrafts(forDrafterPackPath: effPath) ?? 7)
                 : max(1, desc.maxSpeculativeDrafts)
             if draftSettings.mtpDrafts > maxD {
                 draftSettings.mtpDrafts = maxD
@@ -435,13 +475,8 @@ extension SettingsView {
     }
 
     func selectCacheDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            draftSettings.cacheDir = url.path
-        }
+        guard let url = chooseFilePanel(canChooseFiles: false, canChooseDirectories: true) else { return }
+        draftSettings.cacheDir = url.path
     }
 
     var mountedMemoryPack: QWEngineInfoResponse.MountedMemoryPackInfo? {
@@ -457,28 +492,23 @@ extension SettingsView {
         if let enforced = mountedMemoryPack?.enforcedKVMode {
             effective.kvMode = enforced
         }
-        return effective.estimateContextMemory()
+        return telemetry.cachedContextEstimate(for: effective, descriptor: selectedPrimaryDescriptor)
     }
 
     func selectAndMountMemoryPackDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.message = "Select a repository or knowledge directory containing .qwg/manifest.json"
-        if panel.runModal() == .OK, let url = panel.url {
-            telemetry.mountMemoryPack(path: url.path) { result in
-                switch result {
-                case .success(let info):
-                    draftSettings.kvMode = info.enforcedKVMode
-                    validationErrorMessage = nil
-                    saveConfirmationMessage = "Mounted '\(info.packName)' (KV \(info.enforcedKVMode.uppercased()) locked)"
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                        saveConfirmationMessage = nil
-                    }
-                case .failure(let error):
-                    validationErrorMessage = "Memory pack mount failed: \(error.localizedDescription)"
-                }
+        guard let url = chooseFilePanel(
+            canChooseFiles: false,
+            canChooseDirectories: true,
+            message: "Select a repository or knowledge directory containing .qwg/manifest.json"
+        ) else { return }
+        telemetry.mountMemoryPack(path: url.path) { result in
+            switch result {
+            case .success(let info):
+                draftSettings.kvMode = info.enforcedKVMode
+                validationErrorMessage = nil
+                showTimedConfirmation("Mounted '\(info.packName)' (KV \(info.enforcedKVMode.uppercased()) locked)")
+            case .failure(let error):
+                validationErrorMessage = "Memory pack mount failed: \(error.localizedDescription)"
             }
         }
     }
@@ -486,10 +516,7 @@ extension SettingsView {
     func unmountActiveMemoryPack() {
         telemetry.unmountMemoryPack {
             validationErrorMessage = nil
-            saveConfirmationMessage = "Unmounted memory pack (KV Cache Mode unlocked)"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                saveConfirmationMessage = nil
-            }
+            showTimedConfirmation("Unmounted memory pack (KV Cache Mode unlocked)")
         }
     }
 
@@ -549,7 +576,9 @@ extension SettingsView {
         defer { isSaving = false }
         do {
             var toSave = draftSettings
-            let scanned = QWServerSettings.scanModelsDirectory()
+            let scanned = await Task.detached(priority: .userInitiated) {
+                QWServerSettings.scanModelsDirectory()
+            }.value
             _ = toSave.pruneRemovedModels(discovered: scanned)
             try toSave.validateBeforeLaunch()
             updateRunAtStartup(toSave.runAtStartup)

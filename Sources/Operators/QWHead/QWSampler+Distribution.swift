@@ -45,9 +45,17 @@ extension QWSampler {
     /// lowest id. A repetition penalty shifts the row first.
     public static func greedyToken(logits: [Float], repetitionHistory: [Int] = [],
                                    repetitionPenalty: Float = 1.0) throws -> Int {
+        guard !logits.isEmpty else {
+            throw QWSamplerError.invalid("empty logit row")
+        }
         let row = repetitionPenalty == 1 ? logits
             : try adjustedLogits(logits, repetitionHistory: repetitionHistory,
                                  repetitionPenalty: repetitionPenalty)
+        if repetitionPenalty == 1 {
+            guard row.withUnsafeBufferPointer({ Self.allFiniteSIMD($0) }) else {
+                throw QWSamplerError.invalid("logit row contains a non-finite value")
+            }
+        }
         var best = 0
         for index in 1..<row.count where row[index] > row[best] { best = index }
         return best
@@ -298,12 +306,16 @@ extension QWSampler {
         }
         heapScratch.removeAll(keepingCapacity: true)
         heapScratch.reserveCapacity(k)
+        @inline(__always) func heapLess(_ a: Int, _ b: Int) -> Bool {
+            let la = logits[a], lb = logits[b]
+            return la != lb ? la < lb : a > b
+        }
         for i in 0..<k {
             heapScratch.append(i)
             var c = heapScratch.count - 1
             while c > 0 {
                 let p = (c - 1) >> 1
-                if logits[heapScratch[c]] < logits[heapScratch[p]] {
+                if heapLess(heapScratch[c], heapScratch[p]) {
                     heapScratch.swapAt(c, p)
                     c = p
                 } else {
@@ -311,26 +323,49 @@ extension QWSampler {
                 }
             }
         }
+        var maxEvicted = -Float.infinity
         var rootVal = logits[heapScratch[0]]
-        for i in k..<n where logits[i] > rootVal {
-            heapScratch[0] = i
-            var p = 0
-            while true {
-                let l = 2 * p + 1, r = l + 1
-                var m = p
-                if l < k && logits[heapScratch[l]] < logits[heapScratch[m]] { m = l }
-                if r < k && logits[heapScratch[r]] < logits[heapScratch[m]] { m = r }
-                if m == p { break }
-                heapScratch.swapAt(p, m)
-                p = m
+        for i in k..<n {
+            let v = logits[i]
+            if v > rootVal || (v == rootVal && i < heapScratch[0]) {
+                if rootVal > maxEvicted { maxEvicted = rootVal }
+                heapScratch[0] = i
+                var p = 0
+                while true {
+                    let l = 2 * p + 1, r = l + 1
+                    var m = p
+                    if l < k && heapLess(heapScratch[l], heapScratch[m]) { m = l }
+                    if r < k && heapLess(heapScratch[r], heapScratch[m]) { m = r }
+                    if m == p { break }
+                    heapScratch.swapAt(p, m)
+                    p = m
+                }
+                rootVal = logits[heapScratch[0]]
+            } else if v > maxEvicted {
+                maxEvicted = v
             }
-            rootVal = logits[heapScratch[0]]
         }
-        let sortedTop = heapScratch.sorted { a, b in
+        let kth = logits[heapScratch[0]]
+        topKScratch.removeAll(keepingCapacity: true)
+        topKScratch.reserveCapacity(k)
+        if maxEvicted < kth {
+            topKScratch.append(contentsOf: heapScratch)
+        } else {
+            for i in 0..<n where logits[i] > kth {
+                topKScratch.append(i)
+            }
+            if topKScratch.count < k {
+                for i in 0..<n where logits[i] == kth {
+                    topKScratch.append(i)
+                    if topKScratch.count == k { break }
+                }
+            }
+        }
+        topKScratch.sort { a, b in
             let la = logits[a], lb = logits[b]
             return la != lb ? la > lb : a < b
         }
-        let candidates = sortedTop.map { idx in
+        let candidates = topKScratch.map { idx in
             QWTokenLogprob.Candidate(tokenId: idx, logprob: logits[idx] - logZ)
         }
         return QWTokenLogprob(tokenId: chosenToken, logprob: chosenLP, topCandidates: candidates)

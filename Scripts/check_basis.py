@@ -96,7 +96,7 @@ def compile_ir(tree: Path, out: Path, extra: list[str]) -> dict[str, list[str]]:
     def compile_one(idx_mtl: tuple[int, Path]) -> tuple[Path, list[tuple[str, list[str]]]]:
         idx, mtl = idx_mtl
         air = out / f"{idx:04d}_{mtl.stem}.ll"
-        cmd = [*cc, "-std=metal4.0", "-O2", *extra,
+        cmd = [*cc, "-std=metal4.0", "-mmacosx-version-min=26.2", "-O2", *extra,
                *INCLUDES, "-S", "-emit-llvm", str(mtl), "-o", str(air)]
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:

@@ -36,4 +36,37 @@ final class QWWeightStreamerTests: XCTestCase {
             XCTAssertEqual(destBytes[i], sourceData[sliceOffset + i])
         }
     }
+
+    func testWeightStreamerRejectsOverflowAndShortRead() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempFile = tempDir.appendingPathComponent("test_weights_short_\(UUID().uuidString).bin")
+        defer { try? FileManager.default.removeItem(at: tempFile) }
+
+        try Data(repeating: 0xAB, count: 4096).write(to: tempFile)
+        let streamer = try QWWeightStreamer(url: tempFile, unbuffered: false)
+        defer { streamer.dispatchIO.close() }
+
+        let dst = UnsafeMutableRawPointer.allocate(byteCount: 4096, alignment: 16)
+        defer { dst.deallocate() }
+
+        XCTAssertThrowsError(try streamer.streamTensor(offset: 1024, byteCount: Int.max, destination: dst)) { error in
+            guard case QWWeightStreamerError.invalidRange = error else {
+                return XCTFail("Expected invalidRange, got \(error)")
+            }
+            XCTAssertFalse(error.localizedDescription.isEmpty)
+        }
+
+        // Truncating the file after open must throw shortRead rather than succeeding silently.
+        let fh = try FileHandle(forWritingTo: tempFile)
+        try fh.truncate(atOffset: 512)
+        try fh.close()
+
+        XCTAssertThrowsError(try streamer.streamTensor(offset: 0, byteCount: 4096, destination: dst)) { error in
+            guard case QWDispatchIOError.shortRead(let exp, let act) = error else {
+                return XCTFail("Expected shortRead, got \(error)")
+            }
+            XCTAssertEqual(exp, 4096)
+            XCTAssertEqual(act, 512)
+        }
+    }
 }

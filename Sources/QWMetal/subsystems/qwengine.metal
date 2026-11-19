@@ -12,5 +12,5 @@ kernel void qwg_bf16_to_f16(device const ushort* src [[buffer(0)]],
                             uint ti                    [[thread_index_in_threadgroup]]) {
     const uint i = tg.x * 256u + ti;
     if (i >= n) return;
-    dst[i] = half(as_type<float>(uint(src[start + i]) << 16));
+    dst[i] = half(as_type<float>(uint(src[(size_t)start + i]) << 16));
 }

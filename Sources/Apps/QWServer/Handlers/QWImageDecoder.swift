@@ -58,8 +58,21 @@ public enum QWImageDecoder {
         return try decode(data: data, policy: policy)
     }
 
-    private static func resolveSourceData(urlOrDataUri: String, policy: QWImageDecodePolicy) throws -> Data {
+    private enum ClassifiedImageSource: Sendable {
+        case dataURI(String)
+        case remoteURL(URL)
+        case localFilePath(String)
+        case rawBase64(String)
+    }
+
+    private static func validateSourcePolicy(
+        urlOrDataUri: String,
+        policy: QWImageDecodePolicy
+    ) throws -> ClassifiedImageSource {
         let trimmed = urlOrDataUri.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw QWImageDecoderError.disallowedImageSource("Empty image source")
+        }
         let lower = trimmed.lowercased()
 
         if lower.hasPrefix("data:") {
@@ -73,17 +86,7 @@ public enum QWImageDecoder {
             guard header.hasPrefix("data:image/"), header.contains(";base64") else {
                 throw QWImageDecoderError.disallowedImageSource("Only base64 data:image/* URIs are allowed")
             }
-            let base64Part = String(trimmed[trimmed.index(after: commaIdx)...])
-            guard base64Part.utf8.count <= (policy.maxSourceBytes / 3 + 2) * 4 else {
-                throw QWImageDecoderError.imageTooLarge("Base64 payload exceeds \(policy.maxSourceBytes) bytes")
-            }
-            guard let decoded = Data(base64Encoded: base64Part, options: .ignoreUnknownCharacters) else {
-                throw QWImageDecoderError.base64DecodeFailed
-            }
-            guard decoded.count <= policy.maxSourceBytes else {
-                throw QWImageDecoderError.imageTooLarge("Decoded image exceeds \(policy.maxSourceBytes) bytes")
-            }
-            return decoded
+            return .dataURI(trimmed)
         }
 
         if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
@@ -93,34 +96,112 @@ public enum QWImageDecoder {
             guard let url = URL(string: trimmed) else {
                 throw QWImageDecoderError.invalidDataUrl(trimmed)
             }
-            return try QWImageDecodePolicy.fetchBoundedRemoteData(url: url, maxBytes: policy.maxSourceBytes)
+            return .remoteURL(url)
         }
 
-        if lower.hasPrefix("file://") || trimmed.hasPrefix("/") || trimmed.hasPrefix("~") || trimmed.hasPrefix("./") || trimmed.hasPrefix("../") {
+        if lower.hasPrefix("file://") || trimmed.hasPrefix("/") || trimmed.hasPrefix("~")
+            || trimmed.hasPrefix("./") || trimmed.hasPrefix("../") {
             guard policy.allowLocalImagePaths else {
                 throw QWImageDecoderError.disallowedImageSource("Local filesystem image paths are disabled by policy")
             }
             let path = lower.hasPrefix("file://")
                 ? (URL(string: trimmed)?.path ?? "")
                 : trimmed.expandingTildePath
-            return try readBoundedLocalFile(atPath: path, displayPath: trimmed, maxBytes: policy.maxSourceBytes)
+            return .localFilePath(path)
+        }
+
+        if lower.contains("://") {
+            throw QWImageDecoderError.disallowedImageSource("Rejected image URL '\(trimmed.prefix(48))'")
         }
 
         if policy.allowLocalImagePaths, FileManager.default.fileExists(atPath: trimmed.expandingTildePath) {
-            return try readBoundedLocalFile(atPath: trimmed.expandingTildePath, displayPath: trimmed, maxBytes: policy.maxSourceBytes)
+            return .localFilePath(trimmed.expandingTildePath)
         }
 
-        if policy.allowDataURLs,
-           trimmed.utf8.count <= (policy.maxSourceBytes / 3 + 2) * 4,
-           let decoded = Data(base64Encoded: trimmed, options: .ignoreUnknownCharacters),
-           !decoded.isEmpty {
-            guard decoded.count <= policy.maxSourceBytes else {
-                throw QWImageDecoderError.imageTooLarge("Decoded image exceeds \(policy.maxSourceBytes) bytes")
-            }
-            return decoded
+        if policy.allowDataURLs {
+            return .rawBase64(trimmed)
         }
 
         throw QWImageDecoderError.disallowedImageSource("Rejected image URL '\(trimmed.prefix(48))'")
+    }
+
+    private static func resolveSourceData(urlOrDataUri: String, policy: QWImageDecodePolicy) throws -> Data {
+        let classified = try validateSourcePolicy(urlOrDataUri: urlOrDataUri, policy: policy)
+        switch classified {
+        case .dataURI(let trimmed):
+            return try decodeBase64DataURI(trimmed, maxBytes: policy.maxSourceBytes)
+        case .remoteURL(let url):
+            return try QWImageDecodePolicy.fetchBoundedRemoteData(url: url, maxBytes: policy.maxSourceBytes)
+        case .localFilePath(let path):
+            let displayPath = urlOrDataUri.trimmingCharacters(in: .whitespacesAndNewlines)
+            return try readBoundedLocalFile(atPath: path, displayPath: displayPath, maxBytes: policy.maxSourceBytes)
+        case .rawBase64(let trimmed):
+            return try decodeRawBase64(trimmed, maxBytes: policy.maxSourceBytes)
+        }
+    }
+
+    private static func resolveSourceDataAsync(urlOrDataUri: String, policy: QWImageDecodePolicy) async throws -> Data {
+        let classified = try validateSourcePolicy(urlOrDataUri: urlOrDataUri, policy: policy)
+        switch classified {
+        case .remoteURL(let url):
+            return try await QWImageDecodePolicy.fetchBoundedRemoteDataAsync(url: url, maxBytes: policy.maxSourceBytes)
+        case .dataURI(let trimmed):
+            return try await runOffCooperativePool {
+                try decodeBase64DataURI(trimmed, maxBytes: policy.maxSourceBytes)
+            }
+        case .localFilePath(let path):
+            let displayPath = urlOrDataUri.trimmingCharacters(in: .whitespacesAndNewlines)
+            return try await runOffCooperativePool {
+                try readBoundedLocalFile(atPath: path, displayPath: displayPath, maxBytes: policy.maxSourceBytes)
+            }
+        case .rawBase64(let trimmed):
+            return try await runOffCooperativePool {
+                try decodeRawBase64(trimmed, maxBytes: policy.maxSourceBytes)
+            }
+        }
+    }
+
+    private static func decodeBase64DataURI(_ trimmed: String, maxBytes: Int) throws -> Data {
+        guard let commaIdx = trimmed.firstIndex(of: ",") else {
+            throw QWImageDecoderError.invalidDataUrl(trimmed)
+        }
+        let base64Part = String(trimmed[trimmed.index(after: commaIdx)...])
+        guard base64Part.utf8.count <= (maxBytes / 3 + 2) * 4 else {
+            throw QWImageDecoderError.imageTooLarge("Base64 payload exceeds \(maxBytes) bytes")
+        }
+        guard let decoded = Data(base64Encoded: base64Part, options: .ignoreUnknownCharacters) else {
+            throw QWImageDecoderError.base64DecodeFailed
+        }
+        guard decoded.count <= maxBytes else {
+            throw QWImageDecoderError.imageTooLarge("Decoded image exceeds \(maxBytes) bytes")
+        }
+        return decoded
+    }
+
+    private static func decodeRawBase64(_ trimmed: String, maxBytes: Int) throws -> Data {
+        guard trimmed.utf8.count <= (maxBytes / 3 + 2) * 4,
+              let decoded = Data(base64Encoded: trimmed, options: .ignoreUnknownCharacters),
+              !decoded.isEmpty else {
+            throw QWImageDecoderError.disallowedImageSource("Rejected image URL '\(trimmed.prefix(48))'")
+        }
+        guard decoded.count <= maxBytes else {
+            throw QWImageDecoderError.imageTooLarge("Decoded image exceeds \(maxBytes) bytes")
+        }
+        return decoded
+    }
+
+    private static func runOffCooperativePool<T: Sendable>(
+        _ work: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    continuation.resume(returning: try work())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 
     private static func readBoundedLocalFile(atPath path: String, displayPath: String, maxBytes: Int) throws -> Data {
@@ -156,12 +237,36 @@ public enum QWImageDecoder {
         spec: QWMMSpec = .qwen3VLReference
     ) throws -> (image: DecodedImage, grid: QWVisionGrid) {
         let data = try resolveSourceData(urlOrDataUri: urlOrDataUri, policy: policy)
-        let (source, rawWidth, rawHeight) = try inspectSource(data: data, policy: policy)
-        let resized = try QWMMConfig.smartResize(height: rawHeight, width: rawWidth, maxPixels: maxPixels, spec: spec)
+        return try decodeSmartResizedData(data, maxPixels: maxPixels, policy: policy, spec: spec)
+    }
+
+    private static func decodeSmartResizedAsync(
+        urlOrDataUri: String,
+        maxPixels: Int = QWImageDecoder.liveMaxPixels,
+        policy: QWImageDecodePolicy = .serverDefault,
+        spec: QWMMSpec = .qwen3VLReference
+    ) async throws -> (image: DecodedImage, grid: QWVisionGrid) {
+        let data = try await resolveSourceDataAsync(urlOrDataUri: urlOrDataUri, policy: policy)
+        return try await runOffCooperativePool {
+            try decodeSmartResizedData(data, maxPixels: maxPixels, policy: policy, spec: spec)
+        }
+    }
+
+    private static func decodeSmartResizedData(
+        _ data: Data,
+        maxPixels: Int,
+        policy: QWImageDecodePolicy,
+        spec: QWMMSpec
+    ) throws -> (image: DecodedImage, grid: QWVisionGrid) {
+        let (source, orientedWidth, orientedHeight, orientation) = try inspectSource(data: data, policy: policy)
+        let resized = try QWMMConfig.smartResize(
+            height: orientedHeight, width: orientedWidth, maxPixels: maxPixels, spec: spec
+        )
         let grid = try QWVisionGrid(t: 1, h: resized.h / spec.patch, w: resized.w / spec.patch, spec: spec)
 
         let cgImage: CGImage
-        if resized.w < rawWidth || resized.h < rawHeight {
+        let renderOrientation: UInt32
+        if resized.w < orientedWidth || resized.h < orientedHeight {
             let thumbOpts: [CFString: Any] = [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
@@ -172,13 +277,17 @@ public enum QWImageDecoder {
                 throw QWImageDecoderError.imageDecodeFailed("CGImageSourceCreateThumbnailAtIndex failed")
             }
             cgImage = thumb
+            renderOrientation = 1
         } else {
             guard let full = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                 throw QWImageDecoderError.imageDecodeFailed("CGImageSourceCreateImageAtIndex failed")
             }
             cgImage = full
+            renderOrientation = orientation
         }
-        let decoded = try renderRGB(cgImage: cgImage, targetWidth: resized.w, targetHeight: resized.h)
+        let decoded = try renderRGB(
+            cgImage: cgImage, targetWidth: resized.w, targetHeight: resized.h, orientation: renderOrientation
+        )
         return (decoded, grid)
     }
 
@@ -189,6 +298,9 @@ public enum QWImageDecoder {
         let patch: Int
         let merge: Int
         let posSide: Int
+        let allowDataURLs: Bool
+        let allowLocalImagePaths: Bool
+        let allowRemoteImageURLs: Bool
     }
 
     final class EncodedImageLRUCache: @unchecked Sendable {
@@ -198,34 +310,34 @@ public enum QWImageDecoder {
         private var entries: [EncodedCacheKey: (grid: QWVisionGrid, features: [Float])] = [:]
 
         func get(_ key: EncodedCacheKey) -> (grid: QWVisionGrid, features: [Float])? {
-            lock.lock()
-            defer { lock.unlock() }
-            guard let val = entries[key] else { return nil }
-            if let idx = order.firstIndex(of: key) {
-                order.remove(at: idx)
-                order.append(key)
+            lock.withLock {
+                guard let val = entries[key] else { return nil }
+                if let idx = order.firstIndex(of: key) {
+                    order.remove(at: idx)
+                    order.append(key)
+                }
+                return val
             }
-            return val
         }
 
         func put(_ key: EncodedCacheKey, value: (grid: QWVisionGrid, features: [Float])) {
-            lock.lock()
-            defer { lock.unlock() }
-            if entries[key] != nil, let idx = order.firstIndex(of: key) {
-                order.remove(at: idx)
-            } else if order.count >= maxEntries, let oldest = order.first {
-                order.removeFirst()
-                entries.removeValue(forKey: oldest)
+            lock.withLock {
+                if entries[key] != nil, let idx = order.firstIndex(of: key) {
+                    order.remove(at: idx)
+                } else if order.count >= maxEntries, let oldest = order.first {
+                    order.removeFirst()
+                    entries.removeValue(forKey: oldest)
+                }
+                order.append(key)
+                entries[key] = value
             }
-            order.append(key)
-            entries[key] = value
         }
 
         func clear() {
-            lock.lock()
-            defer { lock.unlock() }
-            order.removeAll()
-            entries.removeAll()
+            lock.withLock {
+                order.removeAll()
+                entries.removeAll()
+            }
         }
     }
 
@@ -235,14 +347,20 @@ public enum QWImageDecoder {
         urlOrDataUri: String,
         hiddenDim: Int,
         maxPixels: Int,
-        spec: QWMMSpec
+        spec: QWMMSpec,
+        policy: QWImageDecodePolicy
     ) -> EncodedCacheKey {
         let trimmed = urlOrDataUri.trimmingCharacters(in: .whitespacesAndNewlines)
         var hasher = SHA256()
         hasher.update(data: Data(trimmed.utf8))
-        if (trimmed.starts(with: "/") || trimmed.starts(with: "~")) && trimmed.count < 1024 {
-            let path = trimmed.expandingTildePath
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: path) {
+        let lower = trimmed.lowercased()
+        let isLocalPathCandidate = lower.hasPrefix("file://") || trimmed.starts(with: "/")
+            || trimmed.starts(with: "~") || trimmed.starts(with: "./") || trimmed.starts(with: "../")
+        if policy.allowLocalImagePaths && isLocalPathCandidate && trimmed.count < 1024 {
+            let path = lower.hasPrefix("file://")
+                ? (URL(string: trimmed)?.path ?? "")
+                : trimmed.expandingTildePath
+            if !path.isEmpty, let attrs = try? FileManager.default.attributesOfItem(atPath: path) {
                 if let size = attrs[.size] as? NSNumber {
                     hasher.update(data: Data("s:\(size.uint64Value)".utf8))
                 }
@@ -258,24 +376,29 @@ public enum QWImageDecoder {
             maxPixels: maxPixels,
             patch: spec.patch,
             merge: spec.merge,
-            posSide: spec.posSide
+            posSide: spec.posSide,
+            allowDataURLs: policy.allowDataURLs,
+            allowLocalImagePaths: policy.allowLocalImagePaths,
+            allowRemoteImageURLs: policy.allowRemoteImageURLs
         )
     }
 
     fileprivate static func cachedEncodedImage(
         urlOrDataUri: String, hiddenDim: Int, maxPixels: Int = QWImageDecoder.liveMaxPixels,
-        spec: QWMMSpec = .qwen3VLReference
+        spec: QWMMSpec = .qwen3VLReference, policy: QWImageDecodePolicy = .serverDefault
     ) -> (grid: QWVisionGrid, features: [Float])? {
-        encodedCache.get(cacheKey(urlOrDataUri: urlOrDataUri, hiddenDim: hiddenDim, maxPixels: maxPixels, spec: spec))
+        encodedCache.get(cacheKey(
+            urlOrDataUri: urlOrDataUri, hiddenDim: hiddenDim, maxPixels: maxPixels, spec: spec, policy: policy
+        ))
     }
 
     fileprivate static func storeEncodedImage(
         urlOrDataUri: String, hiddenDim: Int, maxPixels: Int = QWImageDecoder.liveMaxPixels,
-        spec: QWMMSpec = .qwen3VLReference,
+        spec: QWMMSpec = .qwen3VLReference, policy: QWImageDecodePolicy = .serverDefault,
         grid: QWVisionGrid, features: [Float]
     ) {
         encodedCache.put(
-            cacheKey(urlOrDataUri: urlOrDataUri, hiddenDim: hiddenDim, maxPixels: maxPixels, spec: spec),
+            cacheKey(urlOrDataUri: urlOrDataUri, hiddenDim: hiddenDim, maxPixels: maxPixels, spec: spec, policy: policy),
             value: (grid: grid, features: features)
         )
     }
@@ -293,12 +416,22 @@ public enum QWImageDecoder {
         if imageUrls.isEmpty {
             if let visionBackend, visionBackend.isLoaded {
                 try visionBackend.prepareForPrompt(hasImages: false)
-                return (promptTokens, [], false, true)
+                return (promptTokens, [], false, !visionBackend.isLoaded)
             }
             return (promptTokens, [], false, false)
         }
+        guard imageUrls.count <= QWImageDecodePolicy.defaultMaxImagesPerTurn else {
+            throw QWMultimodalError.badArgument(
+                "Too many images in turn (\(imageUrls.count)); maximum is \(QWImageDecodePolicy.defaultMaxImagesPerTurn)"
+            )
+        }
         guard let visionBackend else {
             throw QWMultimodalError.badArgument("Model pack does not have an active vision tower")
+        }
+        guard visionBackend.isVisionEnabled else {
+            throw QWMultimodalError.badArgument(
+                "Vision tower is disabled (--no-load-vision). Enable --load-vision to process image inputs."
+            )
         }
         let maxPixels = liveMaxPixels
         let spec = QWMMSpec(visionConfig: visionBackend.visionConfig, maxPixels: maxPixels)
@@ -307,19 +440,20 @@ public enum QWImageDecoder {
         var images: [(grid: QWVisionGrid, features: [Float])] = []
         let clock = ContinuousClock()
         for (idx, urlStr) in imageUrls.enumerated() {
-            if let cached = cachedEncodedImage(
-                urlOrDataUri: urlStr, hiddenDim: hiddenDim, maxPixels: maxPixels, spec: spec
-            ) {
-                onImageEncoded?(idx + 1, imageUrls.count, cached.grid.h, cached.grid.w, 0.0)
-                images.append(cached)
-                continue
-            }
             do {
+                _ = try validateSourcePolicy(urlOrDataUri: urlStr, policy: policy)
+                if let cached = cachedEncodedImage(
+                    urlOrDataUri: urlStr, hiddenDim: hiddenDim, maxPixels: maxPixels, spec: spec, policy: policy
+                ) {
+                    onImageEncoded?(idx + 1, imageUrls.count, cached.grid.h, cached.grid.w, 0.0)
+                    images.append(cached)
+                    continue
+                }
                 if !visionBackend.isLoaded {
                     try visionBackend.prepareForPrompt(hasImages: true)
                     loadedNow = !wasLoaded && visionBackend.isLoaded
                 }
-                let (decoded, grid) = try decodeSmartResized(
+                let (decoded, grid) = try await decodeSmartResizedAsync(
                     urlOrDataUri: urlStr, maxPixels: maxPixels, policy: policy, spec: spec
                 )
                 let t0 = clock.now
@@ -330,7 +464,7 @@ public enum QWImageDecoder {
                 let d = t0.duration(to: clock.now)
                 let ms = Double(d.components.attoseconds) / 1e15 + Double(d.components.seconds) * 1e3
                 storeEncodedImage(urlOrDataUri: urlStr, hiddenDim: hiddenDim, maxPixels: maxPixels,
-                                  spec: spec, grid: grid, features: visualTokens)
+                                  spec: spec, policy: policy, grid: grid, features: visualTokens)
                 onImageEncoded?(idx + 1, imageUrls.count, grid.h, grid.w, ms)
                 images.append((grid: grid, features: visualTokens))
             } catch let mmError as QWMultimodalError {
@@ -363,49 +497,65 @@ public enum QWImageDecoder {
 
     /// Decodes raw image data (JPEG, PNG, WebP, TIFF) via ImageIO into RGB8 bytes.
     public static func decode(data: Data, policy: QWImageDecodePolicy = .serverDefault) throws -> DecodedImage {
-        let (source, _, _) = try inspectSource(data: data, policy: policy)
+        let (source, orientedW, orientedH, orientation) = try inspectSource(data: data, policy: policy)
         guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw QWImageDecoderError.imageDecodeFailed("CGImageSourceCreateImageAtIndex failed")
         }
-        return try renderRGB(cgImage: cgImage, targetWidth: cgImage.width, targetHeight: cgImage.height)
+        return try renderRGB(
+            cgImage: cgImage, targetWidth: orientedW, targetHeight: orientedH, orientation: orientation
+        )
     }
 
-    private static func inspectSource(data: Data, policy: QWImageDecodePolicy) throws -> (CGImageSource, Int, Int) {
+    private static func inspectSource(
+        data: Data,
+        policy: QWImageDecodePolicy
+    ) throws -> (source: CGImageSource, width: Int, height: Int, orientation: UInt32) {
         guard data.count <= policy.maxSourceBytes else {
             throw QWImageDecoderError.imageTooLarge("Image buffer exceeds \(policy.maxSourceBytes) bytes")
         }
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
             throw QWImageDecoderError.imageDecodeFailed("CGImageSource creation failed")
         }
-        if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-           let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
-           let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue {
-            guard w > 0, h > 0 else {
-                throw QWImageDecoderError.emptyImage
-            }
-            guard w <= policy.maxPixelDimension && h <= policy.maxPixelDimension else {
-                throw QWImageDecoderError.imageTooLarge("Image dimensions \(w)x\(h) exceed max \(policy.maxPixelDimension)")
-            }
-            return (source, w, h)
+        guard let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue else {
+            throw QWImageDecoderError.imageDecodeFailed("Missing pixel dimensions in image header")
         }
-        guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-            throw QWImageDecoderError.imageDecodeFailed("CGImageSourceCreateImageAtIndex failed")
+        guard w > 0, h > 0 else {
+            throw QWImageDecoderError.emptyImage
         }
-        let w = cgImage.width
-        let h = cgImage.height
-        guard w > 0, h > 0 else { throw QWImageDecoderError.emptyImage }
-        guard w <= policy.maxPixelDimension && h <= policy.maxPixelDimension else {
-            throw QWImageDecoderError.imageTooLarge("Image dimensions \(w)x\(h) exceed max \(policy.maxPixelDimension)")
+        let rawOrientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.uint32Value ?? 1
+        let orientation: UInt32 = (1...8).contains(rawOrientation) ? rawOrientation : 1
+        let swapsAxes = (5...8).contains(orientation)
+        let orientedW = swapsAxes ? h : w
+        let orientedH = swapsAxes ? w : h
+        guard orientedW <= policy.maxPixelDimension && orientedH <= policy.maxPixelDimension else {
+            throw QWImageDecoderError.imageTooLarge(
+                "Image dimensions \(orientedW)x\(orientedH) exceed max \(policy.maxPixelDimension)"
+            )
         }
-        return (source, w, h)
+        let (area, overflow) = Int64(orientedW).multipliedReportingOverflow(by: Int64(orientedH))
+        let maxArea = min(Int64(policy.maxPixelArea), Int64(QWImageDecodePolicy.defaultMaxPixelArea))
+        guard !overflow, area <= maxArea else {
+            throw QWImageDecoderError.imageTooLarge("Image pixel area \(orientedW)x\(orientedH) exceeds max \(maxArea)")
+        }
+        return (source, orientedW, orientedH, orientation)
     }
 
-    private static func renderRGB(cgImage: CGImage, targetWidth: Int, targetHeight: Int) throws -> DecodedImage {
+    private static func renderRGB(
+        cgImage: CGImage,
+        targetWidth: Int,
+        targetHeight: Int,
+        orientation: UInt32 = 1
+    ) throws -> DecodedImage {
         guard targetWidth > 0, targetHeight > 0 else {
             throw QWImageDecoderError.emptyImage
         }
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        var rgba = [UInt8](repeating: 0, count: targetWidth * targetHeight * 4)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw QWImageDecoderError.imageDecodeFailed("Failed to create sRGB colorspace")
+        }
+        var rgba = [UInt8](repeating: 255, count: targetWidth * targetHeight * 4)
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
         let drew = rgba.withUnsafeMutableBytes { (ptr: UnsafeMutableRawBufferPointer) -> Bool in
             guard let context = CGContext(
                 data: ptr.baseAddress,
@@ -414,12 +564,31 @@ public enum QWImageDecoder {
                 bitsPerComponent: 8,
                 bytesPerRow: targetWidth * 4,
                 space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                bitmapInfo: bitmapInfo
             ) else {
                 return false
             }
+            context.setFillColor(CGColor(srgbRed: 1.0, green: 1.0, blue: 1.0, alpha: 1.0))
+            context.fill(CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+            let swapsAxes = (5...8).contains(orientation)
+            let drawW = swapsAxes ? targetHeight : targetWidth
+            let drawH = swapsAxes ? targetWidth : targetHeight
+            let w = CGFloat(targetWidth)
+            let h = CGFloat(targetHeight)
+            let transform: CGAffineTransform
+            switch orientation {
+            case 2: transform = CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w, ty: 0)
+            case 3: transform = CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: w, ty: h)
+            case 4: transform = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: h)
+            case 5: transform = CGAffineTransform(a: 0, b: -1, c: -1, d: 0, tx: w, ty: h)
+            case 6: transform = CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: h)
+            case 7: transform = CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0)
+            case 8: transform = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: w, ty: 0)
+            default: transform = .identity
+            }
+            context.concatenate(transform)
             context.interpolationQuality = .high
-            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: drawW, height: drawH))
             return true
         }
         guard drew else {
@@ -461,12 +630,17 @@ public final class QWCLIVisionController: @unchecked Sendable {
             try backend.prepareForPrompt(hasImages: false)
             return (promptTokens, [])
         }
+        guard backend.isVisionEnabled else {
+            throw QWMultimodalError.badArgument(
+                "Vision tower is disabled (--no-load-vision). Enable --load-vision to process image inputs."
+            )
+        }
         let maxPixels = QWImageDecoder.liveMaxPixels
         let spec = QWMMSpec(visionConfig: backend.visionConfig, maxPixels: maxPixels)
         var images: [(grid: QWVisionGrid, features: [Float])] = []
         for path in imagePaths {
             if let cached = QWImageDecoder.cachedEncodedImage(
-                urlOrDataUri: path, hiddenDim: hiddenDim, maxPixels: maxPixels, spec: spec
+                urlOrDataUri: path, hiddenDim: hiddenDim, maxPixels: maxPixels, spec: spec, policy: .cliLocal
             ) {
                 images.append(cached)
                 continue
@@ -485,7 +659,7 @@ public final class QWCLIVisionController: @unchecked Sendable {
             )
             QWImageDecoder.storeEncodedImage(
                 urlOrDataUri: path, hiddenDim: hiddenDim, maxPixels: maxPixels,
-                spec: spec, grid: grid, features: visualTokens
+                spec: spec, policy: .cliLocal, grid: grid, features: visualTokens
             )
             images.append((grid: grid, features: visualTokens))
         }

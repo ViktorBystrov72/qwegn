@@ -254,14 +254,14 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         try driver.encodeRMSNormFast(enc, x: embeddings, gamma: weights.eNorm, out: eNormSlice, rows: rows)
         enc.memoryBarrier(scope: .buffers)
 
-        driver.gemmBatchedH16(enc, m: streamRows, n: h, k: h,
-                              x: hNormSlice, wQ4: weights.hProj, y16: hOutSlice)
+        try driver.gemmBatchedH16(enc, m: streamRows, n: h, k: h,
+                                  x: hNormSlice, wQ4: weights.hProj, y16: hOutSlice)
         if rows == 1 {
             try driver.gemvH16T4(enc, n: h, k: h, x: eNormSlice, gs: driver.sc.gs,
                                  wQ4: weights.eProj, y16: eOutSlice)
         } else {
-            driver.gemmBatchedH16(enc, m: rows, n: h, k: h,
-                                  x: eNormSlice, wQ4: weights.eProj, y16: eOutSlice)
+            try driver.gemmBatchedH16(enc, m: rows, n: h, k: h,
+                                      x: eNormSlice, wQ4: weights.eProj, y16: eOutSlice)
         }
         enc.memoryBarrier(scope: .buffers)
 
@@ -287,9 +287,9 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                 try driver.gemvH16T4(enc, n: attn.qkvProj.n, k: h, x: ln1Slice, gs: driver.sc.gs,
                                      wQ4: attn.qkvProj, y16: latent1)
             } else {
-                driver.gemmBatchedH16(enc, m: rows, n: attn.qkvProj.n, k: h,
-                                      x: ln1Slice, wQ4: attn.qkvProj, y16: mla.mlaLatentScratch,
-                                      yStride: mla.latentStride)
+                try driver.gemmBatchedH16(enc, m: rows, n: attn.qkvProj.n, k: h,
+                                          x: ln1Slice, wQ4: attn.qkvProj, y16: mla.mlaLatentScratch,
+                                          yStride: mla.latentStride)
             }
             enc.memoryBarrier(scope: .buffers)
             mla.encodeLatentPrepAndPool(enc, ln1: ln1Slice, mlaW: mlaW,
@@ -308,8 +308,8 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                 try driver.gemvH16T4(enc, n: geometry.attnTotalN, k: h,
                                      x: ln1Slice, gs: driver.sc.gs, wQ4: attn.qkvProj, y16: qkvSlice)
             } else {
-                driver.gemmBatchedH16(enc, m: rows, n: geometry.attnTotalN, k: h,
-                                      x: ln1Slice, wQ4: attn.qkvProj, y16: qkvSlice)
+                try driver.gemmBatchedH16(enc, m: rows, n: geometry.attnTotalN, k: h,
+                                          x: ln1Slice, wQ4: attn.qkvProj, y16: qkvSlice)
             }
             enc.memoryBarrier(scope: .buffers)
             try driver.ropeApply.encodeExtractQK(
@@ -402,12 +402,18 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         enc.memoryBarrier(scope: .buffers)
 
         if let moeW = layer.moe, let moeSc = self.moe {
+            let prevEncID = ObjectIdentifier(enc)
             try QWMoEChain.encode(enc: &enc, hal: driver.hal, moe: moeW, s: moeSc,
                                   x16: ln2, dn32: dn32, dn16: dn16,
-                                  rows: 1, geometry: geometry, driver: driver, skipOut32: true)
+                                  rows: 1, geometry: geometry, driver: driver,
+                                  cb: driver.activeCB, skipOut32: true)
+            if ObjectIdentifier(enc) != prevEncID {
+                driver.hal.touchKeepAlive(enc)
+                enc.useResource(region.buffer, usage: [.read, .write])
+            }
         } else {
-            driver.mlpSiluPairH16(enc, x: ln2, gs: driver.sc.gs, wQ4: layer.gu.view,
-                                  h16: mlpInter, fuseFwht32: true)
+            try driver.mlpSiluPairH16(enc, x: ln2, gs: driver.sc.gs, wQ4: layer.gu.view,
+                                      h16: mlpInter, fuseFwht32: true)
             enc.memoryBarrier(scope: .buffers)
             try driver.gemvH16T4(enc, n: h, k: layer.down.k, x: mlpInter, gs: driver.sc.gsI,
                                  wQ4: layer.down, y16: dn16)
@@ -501,7 +507,6 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         driver.stepCBs = []
         driver.activeCB = cb
         driver.activeEnc = enc
-        var open = true
         defer {
             driver.stepCBs = nil
             driver.activeEnc = nil
@@ -522,22 +527,96 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
                     bindEchoResources(enc)
                     boundEncID = ObjectIdentifier(enc)
                 }
-                let saved = QWTensorValue(region: QWMRegion(buffer: table.tokens, base: 0, length: 256),
+                let saved = QWTensorValue(region: QWMRegion(buffer: table.tokens, base: 0, length: table.tokens.length),
                                           offset: (journalTokenOffset + step) * 4, shape: QWTensorShape([1], .i32))
                 enc.memoryBarrier(scope: .buffers)
                 try QWVerifyWindow.encodeCopy(enc, hal: driver.hal, source: greedySelector.token, destination: saved)
                 if !isLast { enc.memoryBarrier(scope: .buffers) }
             }
-            if let active = driver.activeEnc { enc = active }
+            let finalEnc = driver.activeEnc ?? enc
             let finalCB = driver.activeCB ?? cb
             let extraCBs = driver.stepCBs ?? []
-            enc.endEncoding()
-            open = false
+            driver.activeEnc = nil
+            driver.activeCB = nil
+            finalEnc.endEncoding()
             finalCB.commit()
             return extraCBs + [finalCB]
         } catch {
-            if open { enc.endEncoding() }
+            if let openEnc = driver.activeEnc {
+                driver.activeEnc = nil
+                openEnc.endEncoding()
+            }
+            for pendingCb in (driver.stepCBs ?? []) {
+                pendingCb.waitUntilCompleted()
+                if pendingCb.status != .completed || pendingCb.error != nil {
+                    driver.commandBufferErrors += 1
+                }
+            }
+            if let pipe = driver.coldEvents {
+                pipe.waitUntilIdle()
+                let r = pipe.takeStepResult()
+                pipe.tuneBridge()
+                driver.decodeTel.coldWaitUs += r.waitUs
+                driver.decodeTel.coldIOUs += r.ioUs
+                driver.decodeTel.coldStaged += r.staged
+            }
+            driver.flushPendingColdUnloads()
             throw error
+        }
+    }
+
+    private static func waitAndDrainCBs(
+        _ cbs: [any MTLCommandBuffer],
+        driver: QWEngineDriver,
+        completed: ((any MTLCommandBuffer) throws -> Void)? = nil
+    ) throws {
+        var allDrained = false
+        defer {
+            if !allDrained {
+                for sub in cbs {
+                    sub.waitUntilCompleted()
+                    if sub.status != .completed || sub.error != nil {
+                        driver.commandBufferErrors += 1
+                    }
+                }
+                if let pipe = driver.coldEvents {
+                    pipe.waitUntilIdle()
+                    let r = pipe.takeStepResult()
+                    pipe.tuneBridge()
+                    driver.decodeTel.coldWaitUs += r.waitUs
+                    driver.decodeTel.coldIOUs += r.ioUs
+                    driver.decodeTel.coldStaged += r.staged
+                }
+                driver.flushPendingColdUnloads()
+            }
+        }
+        for sub in cbs { sub.waitUntilCompleted() }
+        var coldFailure: (any Error)?
+        if let pipe = driver.coldEvents {
+            pipe.waitUntilIdle()
+            let r = pipe.takeStepResult()
+            pipe.tuneBridge()
+            driver.decodeTel.coldWaitUs += r.waitUs
+            driver.decodeTel.coldIOUs += r.ioUs
+            driver.decodeTel.coldStaged += r.staged
+            coldFailure = r.failure
+        }
+        driver.flushPendingColdUnloads()
+        allDrained = true
+        for sub in cbs where sub.status != .completed || sub.error != nil {
+            driver.commandBufferErrors += 1
+        }
+        if let coldFailure {
+            throw QWEngineDriverError.state("ECHO cold event staging: \(coldFailure)")
+        }
+        for sub in cbs {
+            if let err = sub.error {
+                throw QWEngineDriverError.state("ECHO draft GPU failure: \(err.localizedDescription)")
+            }
+            if sub.status != .completed {
+                throw QWEngineDriverError.state("ECHO draft GPU completion failed (status=\(sub.status.rawValue))")
+            }
+            try completed?(sub)
         }
     }
 
@@ -554,15 +633,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             driver: driver, table: table, initialStream: initialStream, kv: kv,
             pendingToken: pendingToken, cacheRows: cacheRows, drafts: drafts,
             writeLogitsOnFinalDraft: writeLogitsOnFinalDraft)
-        for sub in cbs {
-            sub.waitUntilCompleted()
-            if sub === cbs.last { driver.flushPendingColdUnloads() }
-            guard sub.status == .completed else {
-                driver.commandBufferErrors += 1
-                throw QWEngineDriverError.state("ECHO draft GPU failure: \(String(describing: sub.error))")
-            }
-            try completed?(sub)
-        }
+        try Self.waitAndDrainCBs(cbs, driver: driver, completed: completed)
         let ids = table.tokens.contents().assumingMemoryBound(to: Int32.self)
         var proposed: [Int] = []
         proposed.reserveCapacity(drafts)
@@ -615,32 +686,54 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             }
             driver.hal.touchKeepAlive(enc)
             enc.useResource(region.buffer, usage: [.read, .write])
+            driver.stepCBs = []
             driver.activeCB = cb
             driver.activeEnc = enc
-            var open = true
+            var stepDrained = false
+            defer {
+                if let openEnc = driver.activeEnc {
+                    driver.activeEnc = nil
+                    openEnc.endEncoding()
+                }
+                if !stepDrained {
+                    for pendingCb in (driver.stepCBs ?? []) {
+                        pendingCb.waitUntilCompleted()
+                        if pendingCb.status != .completed || pendingCb.error != nil {
+                            driver.commandBufferErrors += 1
+                        }
+                    }
+                    if let pipe = driver.coldEvents {
+                        pipe.waitUntilIdle()
+                        let r = pipe.takeStepResult()
+                        pipe.tuneBridge()
+                        driver.decodeTel.coldWaitUs += r.waitUs
+                        driver.decodeTel.coldIOUs += r.ioUs
+                        driver.decodeTel.coldStaged += r.staged
+                    }
+                    driver.flushPendingColdUnloads()
+                }
+                driver.stepCBs = nil
+                driver.activeEnc = nil
+                driver.activeCB = nil
+            }
+            let stepCbs: [any MTLCommandBuffer]
             do {
                 try encodeStep(&enc, driver: driver, prevStream: inStream, embedding: embSlice,
                                kv: kv, cacheRows: cacheRows + step, outStream: outStream,
                                writeLogits: needLogits, selectGreedy: sampledToken == nil)
-                if let active = driver.activeEnc { enc = active }
+                let finalEnc = driver.activeEnc ?? enc
                 let finalCB = driver.activeCB ?? cb
-                enc.endEncoding()
-                open = false
+                let extraCBs = driver.stepCBs ?? []
                 driver.activeEnc = nil
                 driver.activeCB = nil
+                finalEnc.endEncoding()
                 finalCB.commit()
-                finalCB.waitUntilCompleted()
-                guard finalCB.status == .completed else {
-                    driver.commandBufferErrors += 1
-                    throw QWEngineDriverError.state("ECHO draft GPU failure: \(String(describing: finalCB.error))")
-                }
-                try completed?(finalCB)
+                stepCbs = extraCBs + [finalCB]
             } catch {
-                if open { enc.endEncoding() }
-                driver.activeEnc = nil
-                driver.activeCB = nil
                 throw error
             }
+            stepDrained = true
+            try Self.waitAndDrainCBs(stepCbs, driver: driver, completed: completed)
 
             let chosen: Int
             if let sampledToken {

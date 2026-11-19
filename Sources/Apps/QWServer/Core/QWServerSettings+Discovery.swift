@@ -82,15 +82,41 @@ extension QWServerSettings {
         return changed
     }
 
+    /// Returns true when `raw` uses path syntax (`/`, `~`, `.`, `..`, `\`, NUL) rather than a registered model name or alias.
+    public static func isArbitraryFilesystemModelPath(_ raw: String) -> Bool {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~") || trimmed.hasPrefix("./")
+            || trimmed.hasPrefix("../") || trimmed == "." || trimmed == ".."
+            || trimmed.contains("\\") || trimmed.contains("\0") {
+            return true
+        }
+        let parts = trimmed.split(separator: "/", omittingEmptySubsequences: false)
+        return parts.contains { $0.isEmpty || $0 == "." || $0 == ".." }
+    }
+
     /// Resolves a model reference (CLI `--model` argument, model name in `~/.qwg/models`, alias, or pack path)
     /// to `(packPath, modelName, alias)`.
     public func resolveModelReference(
         _ ref: String,
-        discovered: [DiscoveredModel] = Self.scanModelsDirectory()
+        discovered: [DiscoveredModel] = Self.scanModelsDirectory(),
+        allowArbitraryFilesystemPaths: Bool = true,
+        registeredModelsRoot: URL = QWPaths.modelsDirectoryURL
     ) -> (packPath: String, modelName: String, alias: String) {
         let trimmed = ref.trimmingCharacters(in: .whitespacesAndNewlines)
         let activeAlias = alias(for: modelName)
         guard !trimmed.isEmpty else { return (modelPackPath.expandingTildePath, modelName, activeAlias) }
+        if !allowArbitraryFilesystemPaths && Self.isArbitraryFilesystemModelPath(trimmed) {
+            return ("", "", "")
+        }
+        func isAllowedRegisteredPack(_ path: String) -> Bool {
+            guard !path.isEmpty else { return false }
+            if allowArbitraryFilesystemPaths { return true }
+            return QWHttpSecurity.canonicalDirectoryContainment(
+                URL(fileURLWithPath: path.expandingTildePath),
+                inside: registeredModelsRoot
+            )
+        }
         // 0. Prefer the active model when `ref` matches its name or alias case-insensitively.
         if !modelPackPath.isEmpty && (trimmed.caseInsensitiveCompare(modelName) == .orderedSame
             || (!activeAlias.isEmpty && trimmed.caseInsensitiveCompare(activeAlias) == .orderedSame)) {
@@ -99,11 +125,17 @@ extension QWServerSettings {
         // 1. Match by persisted alias in modelAliases
         if let (targetModel, targetAlias) = modelAliases.first(where: { $0.value == trimmed })
             ?? modelAliases.first(where: { $0.value.caseInsensitiveCompare(trimmed) == .orderedSame }) {
-            if let disc = discovered.first(where: { $0.name == targetModel }), !disc.packPath.isEmpty {
+            if let disc = discovered.first(where: { $0.name == targetModel }),
+               !disc.packPath.isEmpty,
+               isAllowedRegisteredPack(disc.packPath) {
                 return (disc.packPath, disc.name, targetAlias)
             }
-            let candidate = (QWPaths.modelsDirectoryPath as NSString).appendingPathComponent(targetModel)
-            if FileManager.default.fileExists(atPath: candidate) { return (candidate, targetModel, targetAlias) }
+            if !Self.isArbitraryFilesystemModelPath(targetModel) {
+                let candidate = (registeredModelsRoot.path as NSString).appendingPathComponent(targetModel)
+                if isAllowedRegisteredPack(candidate), FileManager.default.fileExists(atPath: candidate) {
+                    return (candidate, targetModel, targetAlias)
+                }
+            }
             if targetModel == modelName && !modelPackPath.isEmpty {
                 return (modelPackPath.expandingTildePath, modelName, targetAlias)
             }
@@ -114,7 +146,8 @@ extension QWServerSettings {
         // 2. Match by discovered model name in ~/.qwg/models
         if let disc = discovered.first(where: { $0.name == trimmed })
             ?? discovered.first(where: { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }),
-           !disc.packPath.isEmpty {
+           !disc.packPath.isEmpty,
+           isAllowedRegisteredPack(disc.packPath) {
             return (disc.packPath, disc.name, alias(for: disc.name))
         }
         // 3. Direct path or relative to ~/.qwg/models or HuggingFace / MLX cache
@@ -124,9 +157,13 @@ extension QWServerSettings {
             let name = QWModelRoot.canonicalModelName(for: resolvedURL)
             return (resolvedURL.path, name, alias(for: name))
         }
-        let inModelsDir = (QWPaths.modelsDirectoryPath as NSString).appendingPathComponent(trimmed)
-        if !trimmed.contains("/") && !trimmed.hasPrefix("~") && fm.fileExists(atPath: inModelsDir) {
+        let inModelsDir = (registeredModelsRoot.path as NSString).appendingPathComponent(trimmed)
+        if !trimmed.contains("/") && !trimmed.hasPrefix("~")
+            && isAllowedRegisteredPack(inModelsDir) && fm.fileExists(atPath: inModelsDir) {
             return resolvedTuple(inModelsDir)
+        }
+        guard allowArbitraryFilesystemPaths else {
+            return ("", "", "")
         }
         let expanded = trimmed.expandingTildePath
         if !fm.fileExists(atPath: expanded) {
@@ -160,13 +197,7 @@ extension QWServerSettings {
 
     /// Scans ~/.qwg/models and the Hugging Face hub cache for installed primary model packs.
     public static func scanModelsDirectory() -> [DiscoveredModel] {
-        let dir = QWPaths.modelsDirectoryPath
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: dir) { try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true) }
-        let local = QWModelCatalog.scan(directory: dir)
-        let hub = QWModelCatalog.scanHuggingFaceHub(directory: QWPaths.hfHubCacheDirectoryURL.path)
-        let localNames = Set(local.map(\.name))
-        return (local + hub.filter { !localNames.contains($0.name) }).map { e in
+        QWModelCatalog.scanInstalledPrimaryModels().map { e in
             var caps = Set(e.capabilities.map(\.rawValue))
             if e.supported, let family = e.family,
                QWModuleRegistry.capabilities(for: family).contains(.dflash) || family == .qwen38FlashNext {
@@ -181,15 +212,7 @@ extension QWServerSettings {
     }
 
     /// Parsed `config.json` geometry and backend metadata for an installed DFlash 2 or DSpine drafter pack.
-    public struct DrafterMetadata: Sendable, Equatable {
-        public let hiddenSize: Int
-        public let vocabSize: Int
-        public let numLayers: Int
-        public let targetLayerIds: [Int]
-        public let numTargetLayers: Int?
-        public let backend: String
-        public let maxDrafts: Int
-    }
+    public typealias DrafterMetadata = QWDrafterMetadata
 
     /// HTTP/WebUI summary of an installed DFlash 2 or DSpine drafter pack and compatible primary models.
     public struct DiscoveredDrafter: Codable, Sendable, Equatable {
@@ -204,64 +227,14 @@ extension QWServerSettings {
     public static func scanDrafterModelsDirectory(
         in directory: String = QWPaths.modelsDirectoryPath
     ) -> [DiscoveredModel] {
-        var models: [DiscoveredModel] = []
-        if let items = try? FileManager.default.contentsOfDirectory(atPath: directory) {
-            for item in items.sorted() where !item.hasPrefix(".") {
-                let itemPath = (directory as NSString).appendingPathComponent(item)
-                let url = URL(fileURLWithPath: itemPath)
-                guard QWDFlashConfig.isDrafterPack(at: url) else { continue }
-                models.append(DiscoveredModel(name: QWModelRoot.canonicalModelName(for: url), packPath: itemPath))
-            }
+        QWModelCatalog.scanDrafters(in: directory).map {
+            DiscoveredModel(name: $0.name, packPath: $0.path)
         }
-        return models
     }
 
     /// Reads drafter geometry and backend metadata from `packPath`'s `config.json`.
     public static func drafterMetadata(atPackPath packPath: String) -> DrafterMetadata? {
-        let trimmed = packPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let resolvedURL = trimmed.expandingTildePath.canonicalFileURL
-        guard QWDFlashConfig.isDrafterPack(at: resolvedURL),
-              let cfgURL = QWModelRoot(url: resolvedURL).configURL,
-              let data = try? Data(contentsOf: cfgURL),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        let tc = (root["text_config"] as? [String: Any]) ?? root
-        let dflash = (root["dflash_config"] as? [String: Any])
-            ?? (tc["dflash_config"] as? [String: Any])
-            ?? [:]
-        guard let hiddenSize = tc["hidden_size"] as? Int, hiddenSize > 0,
-              let vocabSize = tc["vocab_size"] as? Int, vocabSize > 0,
-              let numLayers = tc["num_hidden_layers"] as? Int, numLayers > 0 else {
-            return nil
-        }
-        let targetLayerIds = (dflash["target_layer_ids"] as? [Int])
-            ?? (tc["target_layer_ids"] as? [Int])
-            ?? (root["target_layer_ids"] as? [Int])
-            ?? []
-        let numTargetLayers = (tc["num_target_layers"] as? Int)
-            ?? (dflash["num_target_layers"] as? Int)
-            ?? (root["num_target_layers"] as? Int)
-        let bridgeObj = dflash["selected_prefix_code_bridge"]
-            ?? tc["selected_prefix_code_bridge"]
-            ?? root["selected_prefix_code_bridge"]
-        let modelTypeLower = ((tc["model_type"] as? String) ?? (root["model_type"] as? String) ?? "").lowercased()
-        let isDSpine = (bridgeObj != nil && !(bridgeObj is NSNull) && (bridgeObj as? Bool) != false)
-            || modelTypeLower.contains("dspine")
-        let blockSize = (dflash["block_size"] as? Int)
-            ?? (tc["block_size"] as? Int)
-            ?? (root["block_size"] as? Int)
-            ?? (isDSpine ? 16 : 8)
-        return DrafterMetadata(
-            hiddenSize: hiddenSize,
-            vocabSize: vocabSize,
-            numLayers: numLayers,
-            targetLayerIds: targetLayerIds,
-            numTargetLayers: numTargetLayers,
-            backend: isDSpine ? "dspine" : "dflash2",
-            maxDrafts: max(7, min(15, blockSize - 1))
-        )
+        QWModelCatalog.drafterMetadata(at: packPath)
     }
 
     /// Infers `"dspine"` vs `"dflash2"` and maximum draft count (`blockSize - 1`) from the drafter pack's `config.json`.
@@ -285,14 +258,7 @@ extension QWServerSettings {
 
     /// Decodes a primary model's `QWModelDescriptor` from its `config.json` without reading tokenizer assets.
     public static func loadPrimaryDescriptor(packPath: String) -> QWModelDescriptor? {
-        let trimmed = packPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let root = QWModelRoot(url: URL(fileURLWithPath: trimmed.expandingTildePath))
-        guard let cfgURL = root.configURL,
-              let data = try? Data(contentsOf: cfgURL) else {
-            return nil
-        }
-        return try? QWModelDescriptor.decode(configJSON: data)
+        QWModelCatalog.loadPrimaryDescriptor(at: packPath)
     }
 
     /// Returns true when drafter metadata matches target `hidden`, `vocab`, and `target_layer_ids` range/count.
@@ -300,14 +266,7 @@ extension QWServerSettings {
         metadata: DrafterMetadata,
         with target: QWModelDescriptor
     ) -> Bool {
-        guard metadata.hiddenSize == target.hidden,
-              metadata.vocabSize == target.vocab,
-              !metadata.targetLayerIds.isEmpty,
-              metadata.targetLayerIds.count == metadata.numLayers,
-              metadata.targetLayerIds.allSatisfy({ (0..<target.numLayers).contains($0) }) else {
-            return false
-        }
-        return true
+        metadata.isCompatible(with: target)
     }
 
     /// Returns true when the drafter pack at `packPath` has `config.json` geometry matching `target`.

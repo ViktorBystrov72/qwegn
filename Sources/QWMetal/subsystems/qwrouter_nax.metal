@@ -37,7 +37,8 @@ kernel void qwg_router_nax(device const ushort* W [[buffer(0)]],
     const short tm = SM * short(simd_gid / WN);
     const short tn = SN * short(simd_gid % WN);
     const int sgp_sm = min(int(SM), Mi - (y_row + int(tm)));
-    if (sgp_sm <= 0) return;
+    const int sgp_sn = min(int(SN), Ni - (y_col + int(tn)));
+    if (sgp_sm <= 0 || sgp_sn <= 0) return;
 
     const short2 sc = BaseNAXFrag::get_coord();
     const device float* xr[TM * 2];
@@ -52,12 +53,14 @@ kernel void qwg_router_nax(device const ushort* W [[buffer(0)]],
         }
     }
     const device ushort* wr[TN * 2];
+    bool wok[TN * 2];
     STEEL_PRAGMA_UNROLL
     for (short n = 0; n < TN; ++n) {
         STEEL_PRAGMA_UNROLL
         for (short i = 0; i < 2; ++i) {
             const int c = y_col + int(tn) + int(n) * 16 + int(sc.y) + int(i) * 8;
-            wr[n * 2 + i] = W + size_t(c) * Ki + int(sc.x);
+            wok[n * 2 + i] = c < Ni;
+            wr[n * 2 + i] = W + size_t(min(c, Ni - 1)) * Ki + int(sc.x);
         }
     }
 
@@ -98,8 +101,8 @@ kernel void qwg_router_nax(device const ushort* W [[buffer(0)]],
             thread auto& f1 = B.template frag_at<n, 1>();
             STEEL_PRAGMA_UNROLL
             for (short i = 0; i < 2; ++i) {
-                const bfloat4 w0 = as_type<bfloat4>(*(const device ushort4*)(wr[n * 2 + i] + k));
-                const bfloat4 w1 = as_type<bfloat4>(*(const device ushort4*)(wr[n * 2 + i] + k + 16));
+                const bfloat4 w0 = wok[n * 2 + i] ? as_type<bfloat4>(*(const device ushort4*)(wr[n * 2 + i] + k)) : bfloat4(0.0bf);
+                const bfloat4 w1 = wok[n * 2 + i] ? as_type<bfloat4>(*(const device ushort4*)(wr[n * 2 + i] + k + 16)) : bfloat4(0.0bf);
                 STEEL_PRAGMA_UNROLL
                 for (short j = 0; j < 4; ++j) { f0[i * 4 + j] = w0[j]; f1[i * 4 + j] = w1[j]; }
             }
@@ -109,6 +112,6 @@ kernel void qwg_router_nax(device const ushort* W [[buffer(0)]],
         tile_matmad_nax(D, Ah, metal::bool_constant<false>{}, B, metal::bool_constant<true>{});
     }
     device float* yp = Y + size_t(y_row + int(tm)) * Ni + y_col + int(tn);
-    if (sgp_sm == SM) D.store(yp, Ni);
-    else D.store_safe(yp, Ni, short2(SN, short(sgp_sm)));
+    if (sgp_sm == SM && sgp_sn == SN) D.store(yp, Ni);
+    else D.store_safe(yp, Ni, short2(short(sgp_sn), short(sgp_sm)));
 }

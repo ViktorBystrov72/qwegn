@@ -288,7 +288,7 @@ final class QWGDNReplayCheckpoint {
         guard (2...rows).contains(verifiedRows), (0...verifiedRows).contains(count) else {
             throw QWEngineDriverError.state("GPU rollback active row count is invalid")
         }
-        try validateRetained(count)
+        try validateRetained(verifiedRows)
         guard layers > 0, count < verifiedRows else { return true }
         let decayValues = glog.region.pointer.advanced(by: glog.offset).assumingMemoryBound(to: Float.self)
         let innovationValues = innovations.region.pointer.advanced(by: innovations.offset)
@@ -347,14 +347,14 @@ final class QWGDNReplayCheckpoint {
             guard (2...rows).contains(verifiedRows), (0...verifiedRows).contains(count) else {
                 throw QWEngineDriverError.state("GPU rollback active row count is invalid")
             }
-            try validateRetained(count)
+            try validateRetained(verifiedRows)
             return
         }
         guard (2...rows).contains(verifiedRows), (0...verifiedRows).contains(count) else {
             throw QWEngineDriverError.state("GPU rollback active row count is invalid")
         }
         try validate(rec, like: recurrent)
-        try validateRetained(count)
+        try validateRetained(verifiedRows)
         guard sameStorage(rec, sourceRec) else {
             throw QWEngineDriverError.state("GPU rollback requires the original recurrent slab")
         }

@@ -1,0 +1,452 @@
+// qw_moe_f32_common.metalh — Shared QuantTraits-parameterized MoE f32 bodies.
+// Powers gateup_r1 and down_shared_combine across HQ4, AQ, and SHVQ.
+#pragma once
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include "qw_quant_traits.metalh"
+using namespace metal;
+
+METAL_FUNC void qwg_moe_write_route4(device float* out, uint slot, uint N, uint r0,
+                                     uint rowsLeft, float4 value) {
+    const size_t base = size_t(slot) * N + r0;
+    out[base] = value.x;
+    if (rowsLeft > 1u) out[base + 1u] = value.y;
+    if (rowsLeft > 2u) out[base + 2u] = value.z;
+    if (rowsLeft > 3u) out[base + 3u] = value.w;
+}
+
+METAL_FUNC void qwg_moe_combine_store4(device float* out, device half* out16, size_t base,
+                                       uint rowsLeft, bool effSkip, bool writeOut16,
+                                       uint filterMode, float g, device const float* shared,
+                                       float4 acc) {
+    const float a[4] = { acc.x, acc.y, acc.z, acc.w };
+    for (uint r = 0u; r < 4u; ++r) {
+        if (rowsLeft <= r) break;
+        const float y = a[r] + ((filterMode == 2u) ? out[base + r] : (effSkip ? 0.0f : (g * shared[base + r])));
+        out[base + r] = y;
+        if (writeOut16) out16[base + r] = half(y);
+    }
+}
+
+template <typename Traits>
+METAL_FUNC float4 qwg_moe_rows4_f32_t(typename Traits::WeightPtr blocks,
+                                      device const float* x,
+                                      size_t rowBase, uint rowsLeft,
+                                      uint K, uint lane,
+                                      threadgroup const typename Traits::TgLut& tgLut) {
+    const uint nBlocks = K >> 5u;
+    const size_t rowStride = Traits::row_stride(K);
+    typename Traits::WeightPtr r0 = Traits::row_ptr(blocks, rowBase, rowStride);
+    typename Traits::WeightPtr r1 = (rowsLeft > 1u) ? (r0 + rowStride) : r0;
+    typename Traits::WeightPtr r2 = (rowsLeft > 2u) ? (r0 + 2u * rowStride) : r0;
+    typename Traits::WeightPtr r3 = (rowsLeft > 3u) ? (r0 + 3u * rowStride) : r0;
+    float4 acc = float4(0.0f);
+    for (uint g = lane; g < nBlocks; g += 32u) {
+        typename Traits::ActSlice a;
+        Traits::load_act_f32(x + (g << 5u), a);
+        const uint byteInGroup = Traits::byte_in_group(g);
+        acc.x += Traits::slice_dot(Traits::group_ptr(r0, g), byteInGroup, a, tgLut);
+        acc.y += Traits::slice_dot(Traits::group_ptr(r1, g), byteInGroup, a, tgLut);
+        acc.z += Traits::slice_dot(Traits::group_ptr(r2, g), byteInGroup, a, tgLut);
+        acc.w += Traits::slice_dot(Traits::group_ptr(r3, g), byteInGroup, a, tgLut);
+    }
+    return qwg_simd_reduce_down<32u>(acc);
+}
+
+template <typename Traits>
+METAL_FUNC void qwg_moe_rows4_f32_2_t(typename Traits::WeightPtr blocks,
+                                        device const float* x0,
+                                        device const float* x1,
+                                        size_t rowBase, uint rowsLeft,
+                                        uint K, uint lane,
+                                        thread float4& acc0, thread float4& acc1,
+                                        threadgroup const typename Traits::TgLut& tgLut) {
+    const uint nBlocks = K >> 5u;
+    const size_t rowStride = Traits::row_stride(K);
+    typename Traits::WeightPtr r0 = Traits::row_ptr(blocks, rowBase, rowStride);
+    typename Traits::WeightPtr r1 = (rowsLeft > 1u) ? (r0 + rowStride) : r0;
+    typename Traits::WeightPtr r2 = (rowsLeft > 2u) ? (r0 + 2u * rowStride) : r0;
+    typename Traits::WeightPtr r3 = (rowsLeft > 3u) ? (r0 + 3u * rowStride) : r0;
+    acc0 = float4(0.0f);
+    acc1 = float4(0.0f);
+    for (uint g = lane; g < nBlocks; g += 32u) {
+        const uint col = g << 5u;
+        typename Traits::ActSlice a0, a1;
+        Traits::load_act_f32(x0 + col, a0);
+        Traits::load_act_f32(x1 + col, a1);
+        const uint byteInGroup = Traits::byte_in_group(g);
+        const float2 d0 = Traits::slice_dot2(Traits::group_ptr(r0, g), byteInGroup, a0, a1, tgLut);
+        const float2 d1 = Traits::slice_dot2(Traits::group_ptr(r1, g), byteInGroup, a0, a1, tgLut);
+        const float2 d2 = Traits::slice_dot2(Traits::group_ptr(r2, g), byteInGroup, a0, a1, tgLut);
+        const float2 d3 = Traits::slice_dot2(Traits::group_ptr(r3, g), byteInGroup, a0, a1, tgLut);
+        acc0 += float4(d0.x, d1.x, d2.x, d3.x);
+        acc1 += float4(d0.y, d1.y, d2.y, d3.y);
+    }
+    acc0 = qwg_simd_reduce_down<32u>(acc0);
+    acc1 = qwg_simd_reduce_down<32u>(acc1);
+}
+
+template <typename Traits>
+METAL_FUNC float4 qwg_moe_down_rows4_1x(typename Traits::WeightPtr wSrc,
+                                        device const float* xRow,
+                                        uint wExp, uint r0, uint rowsLeft,
+                                        uint N, uint K, uint nSlices, uint lane,
+                                        threadgroup const typename Traits::TgLut& tgLut) {
+    const size_t rowStride = Traits::row_stride(K);
+    if (nSlices <= 32u && rowsLeft >= 4u) {
+        float4 vx = float4(0.0f);
+        if (lane < nSlices) {
+            typename Traits::ActSlice a;
+            Traits::load_act_f32(xRow + (lane << 5u), a);
+            const uint byteInGroup = Traits::byte_in_group(lane);
+            typename Traits::WeightPtr rp = Traits::group_ptr(
+                Traits::row_ptr(wSrc, (size_t)wExp * N + r0, rowStride), lane);
+            vx.x = Traits::slice_dot(rp, byteInGroup, a, tgLut);
+            vx.y = Traits::slice_dot(rp + rowStride, byteInGroup, a, tgLut);
+            vx.z = Traits::slice_dot(rp + 2u * rowStride, byteInGroup, a, tgLut);
+            vx.w = Traits::slice_dot(rp + 3u * rowStride, byteInGroup, a, tgLut);
+        }
+        return qwg_simd_reduce_down<32u>(vx);
+    }
+    if ((nSlices & 15u) == 0u && rowsLeft >= 4u) {
+        const uint upHalf = lane >> 4u, hl = lane & 15u;
+        typename Traits::WeightPtr r0p = Traits::row_ptr(
+            wSrc, (size_t)wExp * N + r0 + upHalf * 2u, rowStride);
+        float2 vx = float2(0.0f);
+        for (uint s = hl; s < nSlices; s += 16u) {
+            typename Traits::ActSlice a;
+            Traits::load_act_f32(xRow + (s << 5u), a);
+            const uint byteInGroup = Traits::byte_in_group(s);
+            typename Traits::WeightPtr gp = Traits::group_ptr(r0p, s);
+            vx.x += Traits::slice_dot(gp, byteInGroup, a, tgLut);
+            vx.y += Traits::slice_dot(gp + rowStride, byteInGroup, a, tgLut);
+        }
+        vx = qwg_simd_reduce_down<16u>(vx);
+        const float2 vxHi = simd_shuffle_down(vx, 16);
+        return float4(vx.x, vx.y, vxHi.x, vxHi.y);
+    }
+    return qwg_moe_rows4_f32_t<Traits>(wSrc, xRow, (size_t)wExp * N + r0, rowsLeft, K, lane, tgLut);
+}
+
+template <typename Traits>
+METAL_FUNC void qwg_moe_down_rows4_2x(typename Traits::WeightPtr wSrc,
+                                      device const float* xA, device const float* xB,
+                                      uint wExp, uint r0, uint rowsLeft,
+                                      uint N, uint K, uint nSlices, uint lane,
+                                      threadgroup const typename Traits::TgLut& tgLut,
+                                      thread float4& vx0, thread float4& vx1) {
+    const size_t rowStride = Traits::row_stride(K);
+    if (nSlices <= 32u && rowsLeft >= 4u) {
+        vx0 = float4(0.0f);
+        vx1 = float4(0.0f);
+        if (lane < nSlices) {
+            typename Traits::ActSlice a0, a1;
+            Traits::load_act_f32(xA + (lane << 5u), a0);
+            Traits::load_act_f32(xB + (lane << 5u), a1);
+            const uint byteInGroup = Traits::byte_in_group(lane);
+            typename Traits::WeightPtr rp = Traits::group_ptr(
+                Traits::row_ptr(wSrc, (size_t)wExp * N + r0, rowStride), lane);
+            const float2 d0 = Traits::slice_dot2(rp, byteInGroup, a0, a1, tgLut);
+            const float2 d1 = Traits::slice_dot2(rp + rowStride, byteInGroup, a0, a1, tgLut);
+            const float2 d2 = Traits::slice_dot2(rp + 2u * rowStride, byteInGroup, a0, a1, tgLut);
+            const float2 d3 = Traits::slice_dot2(rp + 3u * rowStride, byteInGroup, a0, a1, tgLut);
+            vx0 = float4(d0.x, d1.x, d2.x, d3.x);
+            vx1 = float4(d0.y, d1.y, d2.y, d3.y);
+        }
+        vx0 = qwg_simd_reduce_down<32u>(vx0);
+        vx1 = qwg_simd_reduce_down<32u>(vx1);
+        return;
+    }
+    if ((nSlices & 15u) == 0u && rowsLeft >= 4u) {
+        const uint upHalf = lane >> 4u, hl = lane & 15u;
+        typename Traits::WeightPtr r0p = Traits::row_ptr(
+            wSrc, (size_t)wExp * N + r0 + upHalf * 2u, rowStride);
+        float2 v0 = float2(0.0f), v1 = float2(0.0f);
+        for (uint s = hl; s < nSlices; s += 16u) {
+            typename Traits::ActSlice a0, a1;
+            Traits::load_act_f32(xA + (s << 5u), a0);
+            Traits::load_act_f32(xB + (s << 5u), a1);
+            const uint byteInGroup = Traits::byte_in_group(s);
+            typename Traits::WeightPtr gp = Traits::group_ptr(r0p, s);
+            const float2 d0 = Traits::slice_dot2(gp, byteInGroup, a0, a1, tgLut);
+            const float2 d1 = Traits::slice_dot2(gp + rowStride, byteInGroup, a0, a1, tgLut);
+            v0 += float2(d0.x, d1.x);
+            v1 += float2(d0.y, d1.y);
+        }
+        v0 = qwg_simd_reduce_down<16u>(v0);
+        v1 = qwg_simd_reduce_down<16u>(v1);
+        const float2 v0Hi = simd_shuffle_down(v0, 16);
+        const float2 v1Hi = simd_shuffle_down(v1, 16);
+        vx0 = float4(v0.x, v0.y, v0Hi.x, v0Hi.y);
+        vx1 = float4(v1.x, v1.y, v1Hi.x, v1Hi.y);
+        return;
+    }
+    qwg_moe_rows4_f32_2_t<Traits>(wSrc, xA, xB, (size_t)wExp * N + r0, rowsLeft, K, lane, vx0, vx1, tgLut);
+}
+
+template <typename Traits>
+METAL_FUNC void qwg_moe_gateup_f32_r1_body(typename Traits::WeightPtr w,
+                                           device const float* x,
+                                           device const int* ids,
+                                           device float* out,
+                                           QWMoEGateUpF32Params p,
+                                           typename Traits::WeightPtr coldW,
+                                           uint3 tg, uint tid, uint sgi, uint lane,
+                                           threadgroup float* tgAct,
+                                           threadgroup typename Traits::TgLut& tgLut) {
+    const bool fuseSiluFwht = (p.E & 0x80000000u) != 0u;
+    const uint residentE = (p.E >> 16u) & 0x7FFFu;
+    const uint realE = p.E & 0x3FFu;
+    const uint numToks = (p.E >> 10u) & 0x7u;
+    const bool skipCold = (p.E & 0x4000u) != 0u;
+    const bool onlyCold = (p.E & 0x8000u) != 0u;
+    const uint k = tg.y, t = tg.z;
+    const int rawExpSigned = ids[t * realE + k];
+    if (rawExpSigned < 0) return;
+    const uint rawExpUnsigned = uint(rawExpSigned);
+    const uint rawExpert = rawExpUnsigned & 0xFFFFu;
+    const uint gIdx = (rawExpUnsigned >> 16u) & 0x7Fu;
+    const uint gStride = (rawExpUnsigned >> 23u) & 0x7Fu;
+    const size_t xRow0 = (gStride > 0u) ? ((size_t)t * gStride + gIdx) : (size_t)t;
+    const bool isCold = (residentE > 0u) && (rawExpert >= residentE);
+    if ((skipCold && isCold) || (onlyCold && !isCold)) return;
+    if (fuseSiluFwht) {
+        uint mCount = 1u;
+        uint4 tokIds = uint4(t, 0u, 0u, 0u);
+        uint4 pairSlots = uint4(t * realE + k, 0u, 0u, 0u);
+        if (numToks >= 2u) {
+            for (uint tPrev = 0u; tPrev <= t; ++tPrev) {
+                const uint kLim = (tPrev == t) ? k : realE;
+                for (uint kPrev = 0u; kPrev < kLim; ++kPrev) {
+                    if (ids[tPrev * realE + kPrev] == rawExpSigned) return;
+                }
+            }
+            for (uint tNext = t + 1u; tNext < numToks && mCount < 4u; ++tNext) {
+                for (uint kNext = 0u; kNext < realE; ++kNext) {
+                    if (ids[tNext * realE + kNext] == rawExpSigned) {
+                        tokIds[mCount] = tNext;
+                        pairSlots[mCount] = tNext * realE + kNext;
+                        ++mCount;
+                        break;
+                    }
+                }
+            }
+        }
+        if constexpr (Traits::has_tg_lut()) {
+            tgLut.load(tid, 256u);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const uint I = p.N >> 1u, rBase = tg.x * 32u, r0 = rBase + sgi * 4u;
+        const uint expert = isCold ? (rawExpert - residentE) : rawExpert;
+        typename Traits::WeightPtr wSrc = isCold ? coldW : w;
+        const uint upHalf = lane >> 4u, hl = lane & 15u, nSlices = p.K >> 5u;
+        const size_t rowStride = Traits::row_stride(p.K);
+        const size_t eBase = (size_t)expert * p.N + (upHalf != 0u ? I : 0u);
+        const uint rows = (r0 < I) ? min(4u, I - r0) : 0u;
+        typename Traits::WeightPtr a0 = Traits::row_ptr(wSrc, eBase + (rows != 0u ? r0 : 0u), rowStride);
+        const size_t st1 = rows > 1u ? rowStride : 0u;
+        const size_t st2 = rows > 2u ? 2u * rowStride : 0u;
+        const size_t st3 = rows > 3u ? 3u * rowStride : 0u;
+        float4 accM[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+        for (uint s = hl; rows != 0u && s < nSlices; s += 16u) {
+            const uint col = s << 5u;
+            typename Traits::WeightPtr gp = Traits::group_ptr(a0, s);
+            const uint byteInGroup = Traits::byte_in_group(s);
+            if (mCount == 1u) {
+                typename Traits::ActSlice a;
+                Traits::load_act_f32(x + xRow0 * p.K + col, a);
+                accM[0].x += Traits::slice_dot(gp, byteInGroup, a, tgLut);
+                accM[0].y += Traits::slice_dot(gp + st1, byteInGroup, a, tgLut);
+                accM[0].z += Traits::slice_dot(gp + st2, byteInGroup, a, tgLut);
+                accM[0].w += Traits::slice_dot(gp + st3, byteInGroup, a, tgLut);
+            } else {
+                const size_t xr0 = (gStride > 0u) ? ((size_t)tokIds[0] * gStride + gIdx) : (size_t)tokIds[0];
+                const size_t xr1 = (gStride > 0u) ? ((size_t)tokIds[1] * gStride + gIdx) : (size_t)tokIds[1];
+                typename Traits::ActSlice a0x, a1x;
+                Traits::load_act_f32(x + xr0 * p.K + col, a0x);
+                Traits::load_act_f32(x + xr1 * p.K + col, a1x);
+                const float2 d0 = Traits::slice_dot2(gp, byteInGroup, a0x, a1x, tgLut);
+                const float2 d1 = Traits::slice_dot2(gp + st1, byteInGroup, a0x, a1x, tgLut);
+                const float2 d2 = Traits::slice_dot2(gp + st2, byteInGroup, a0x, a1x, tgLut);
+                const float2 d3 = Traits::slice_dot2(gp + st3, byteInGroup, a0x, a1x, tgLut);
+                accM[0] += float4(d0.x, d1.x, d2.x, d3.x);
+                accM[1] += float4(d0.y, d1.y, d2.y, d3.y);
+                if (mCount == 3u) {
+                    const size_t xr2 = (gStride > 0u) ? ((size_t)tokIds[2] * gStride + gIdx) : (size_t)tokIds[2];
+                    Traits::load_act_f32(x + xr2 * p.K + col, a0x);
+                    accM[2].x += Traits::slice_dot(gp, byteInGroup, a0x, tgLut);
+                    accM[2].y += Traits::slice_dot(gp + st1, byteInGroup, a0x, tgLut);
+                    accM[2].z += Traits::slice_dot(gp + st2, byteInGroup, a0x, tgLut);
+                    accM[2].w += Traits::slice_dot(gp + st3, byteInGroup, a0x, tgLut);
+                } else if (mCount == 4u) {
+                    const size_t xr2 = (gStride > 0u) ? ((size_t)tokIds[2] * gStride + gIdx) : (size_t)tokIds[2];
+                    const size_t xr3 = (gStride > 0u) ? ((size_t)tokIds[3] * gStride + gIdx) : (size_t)tokIds[3];
+                    Traits::load_act_f32(x + xr2 * p.K + col, a0x);
+                    Traits::load_act_f32(x + xr3 * p.K + col, a1x);
+                    const float2 e0 = Traits::slice_dot2(gp, byteInGroup, a0x, a1x, tgLut);
+                    const float2 e1 = Traits::slice_dot2(gp + st1, byteInGroup, a0x, a1x, tgLut);
+                    const float2 e2 = Traits::slice_dot2(gp + st2, byteInGroup, a0x, a1x, tgLut);
+                    const float2 e3 = Traits::slice_dot2(gp + st3, byteInGroup, a0x, a1x, tgLut);
+                    accM[2] += float4(e0.x, e1.x, e2.x, e3.x);
+                    accM[3] += float4(e0.y, e1.y, e2.y, e3.y);
+                }
+            }
+        }
+        for (uint m = 0u; m < mCount; ++m) {
+            accM[m] = qwg_simd_reduce_down<16u>(accM[m]);
+            const float4 uAcc = simd_shuffle_down(accM[m], 16);
+            if (lane == 0u) {
+                const uint c = m * 32u + sgi * 4u;
+                tgAct[c + 0u] = rows > 0u ? qwg_swiglu_mul(accM[m].x, uAcc.x) : 0.0f;
+                tgAct[c + 1u] = rows > 1u ? qwg_swiglu_mul(accM[m].y, uAcc.y) : 0.0f;
+                tgAct[c + 2u] = rows > 2u ? qwg_swiglu_mul(accM[m].z, uAcc.z) : 0.0f;
+                tgAct[c + 3u] = rows > 3u ? qwg_swiglu_mul(accM[m].w, uAcc.w) : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgi < mCount) {
+            const float act = (rBase + lane < I) ? tgAct[sgi * 32u + lane] : 0.0f;
+            const float v = qwg_fwht32_lane_f32(act, lane);
+            if (rBase + lane < I) out[(size_t)pairSlots[sgi] * I + rBase + lane] = v;
+        }
+        return;
+    }
+    if (tg.x * 4u >= p.N) return;
+    if constexpr (Traits::has_tg_lut()) {
+        tgLut.load(tid, 128u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint r = tg.x * 4u + sgi;
+    if (r >= p.N) return;
+    const uint expert = isCold ? (rawExpert - residentE) : rawExpert;
+    typename Traits::WeightPtr wSrc = isCold ? coldW : w;
+    const float v = Traits::row_f32(wSrc, x + (size_t)xRow0 * p.K, (size_t)expert * p.N + r, p.K, lane, tgLut);
+    if (lane == 0u) out[(size_t)(t * realE + k) * p.N + r] = v;
+}
+
+template <typename Traits>
+METAL_FUNC void qwg_moe_down_shared_combine_f32_body(
+    typename Traits::WeightPtr wBytes, device const float* x, device const float* w,
+    device const float* shared, device const float* gate, device float* out,
+    QWMoEDownF32Params p, device const int* ids, device half* out16,
+    typename Traits::WeightPtr coldWBytes,
+    uint2 tg, uint tid, uint sgi, uint lane,
+    threadgroup typename Traits::TgLut& tgLut) {
+    if (tg.x * 16u >= p.N) return;
+    if constexpr (Traits::has_tg_lut()) {
+        tgLut.load(tid, 128u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint numGroups = (p.E >> 11u) & 0x1Fu;
+    const uint r0 = (tg.x * 4u + sgi) * 4u;
+    const uint t = (numGroups > 0u) ? (tg.y / numGroups) : tg.y;
+    const uint targetGroup = (numGroups > 0u) ? (tg.y % numGroups) : 0u;
+    const uint rowsLeft = (r0 < p.N) ? (p.N - r0) : 0u;
+    if (rowsLeft == 0u) return;
+    const uint filterMode = (p.E >> 30u) & 3u;
+    const uint residentE = (p.E >> 16u) & 0x3FFFu;
+    const uint numToks = (numGroups > 0u) ? 0u : ((p.E >> 8u) & 0x7u);
+    const uint realE = p.E & 0xFFu;
+    const bool writeOut16 = (p.hasOut16 & 1u) != 0u;
+    const bool routeOutput = (p.hasOut16 & 2u) != 0u;
+    const bool skipShared = (p.hasOut16 & 4u) != 0u;
+    const bool tokenIndexedX = (p.hasOut16 & 8u) != 0u;
+    const uint nSlices = p.K >> 5u;
+    if (numToks >= 2u) {
+        float4 accM[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+        for (uint t0 = 0u; t0 < numToks; ++t0) {
+            for (uint k0 = 0u; k0 < realE; ++k0) {
+                const uint slot0 = t0 * realE + k0;
+                const int rawExpSigned = ids[slot0];
+                if (rawExpSigned < 0) continue;
+                const uint rawExp = uint(rawExpSigned) & 0xFFFFu;
+                const bool isCold = (residentE > 0u) && (rawExp >= residentE);
+                if ((filterMode == 1u && isCold) || (filterMode == 2u && !isCold)) continue;
+                bool seen = false;
+                for (uint tp = 0u; tp <= t0 && !seen; ++tp) {
+                    const uint kLim = (tp == t0) ? k0 : realE;
+                    for (uint kp = 0u; kp < kLim; ++kp) {
+                        if (ids[tp * realE + kp] == rawExpSigned) { seen = true; break; }
+                    }
+                }
+                if (seen) continue;
+                uint mCount = 1u;
+                uint4 mTok = uint4(t0, 0u, 0u, 0u), mSlot = uint4(slot0, 0u, 0u, 0u);
+                for (uint tn = t0 + 1u; tn < numToks && mCount < 4u; ++tn) {
+                    for (uint kn = 0u; kn < realE; ++kn) {
+                        if (ids[tn * realE + kn] == rawExpSigned) {
+                            mTok[mCount] = tn;
+                            mSlot[mCount] = tn * realE + kn;
+                            ++mCount;
+                            break;
+                        }
+                    }
+                }
+                const uint wExp = isCold ? (rawExp - residentE) : rawExp;
+                typename Traits::WeightPtr wSrc = isCold ? coldWBytes : wBytes;
+                for (uint pair = 0u; pair < mCount; pair += 2u) {
+                    const uint sA = mSlot[pair], tA = mTok[pair];
+                    const uint xRowA = tokenIndexedX ? tA : sA;
+                    if (pair + 1u < mCount) {
+                        const uint sB = mSlot[pair + 1u], tB = mTok[pair + 1u];
+                        const uint xRowB = tokenIndexedX ? tB : sB;
+                        float4 vx0, vx1;
+                        qwg_moe_down_rows4_2x<Traits>(
+                            wSrc, x + (size_t)xRowA * p.K, x + (size_t)xRowB * p.K,
+                            wExp, r0, rowsLeft, p.N, p.K, nSlices, lane, tgLut, vx0, vx1);
+                        if (routeOutput) {
+                            if (lane == 0u) {
+                                qwg_moe_write_route4(out, sA, p.N, r0, rowsLeft, vx0);
+                                qwg_moe_write_route4(out, sB, p.N, r0, rowsLeft, vx1);
+                            }
+                        } else {
+                            accM[tA] += w[sA] * vx0;
+                            accM[tB] += w[sB] * vx1;
+                        }
+                    } else {
+                        const float4 vx0 = qwg_moe_down_rows4_1x<Traits>(
+                            wSrc, x + (size_t)xRowA * p.K,
+                            wExp, r0, rowsLeft, p.N, p.K, nSlices, lane, tgLut);
+                        if (routeOutput) {
+                            if (lane == 0u) qwg_moe_write_route4(out, sA, p.N, r0, rowsLeft, vx0);
+                        } else {
+                            accM[tA] += w[sA] * vx0;
+                        }
+                    }
+                }
+            }
+        }
+        if (routeOutput || lane != 0u) return;
+        for (uint tm = 0u; tm < numToks; ++tm) {
+            qwg_moe_combine_store4(out, out16, (size_t)tm * p.N + r0, rowsLeft, skipShared,
+                                   writeOut16, filterMode, skipShared ? 0.0f : gate[tm], shared, accM[tm]);
+        }
+        return;
+    }
+    float4 acc = float4(0.0f);
+    for (uint k = 0u; k < realE; ++k) {
+        const uint slot = t * realE + k;
+        const int rawExpSigned = ids[slot];
+        if (rawExpSigned < 0) continue;
+        const uint rawExpUnsigned = uint(rawExpSigned);
+        if (numGroups > 0u && ((rawExpUnsigned >> 16u) & 0x7Fu) != targetGroup) continue;
+        const uint rawExp = rawExpUnsigned & 0xFFFFu;
+        const bool isCold = (residentE > 0u) && (rawExp >= residentE);
+        if ((filterMode == 1u && isCold) || (filterMode == 2u && !isCold)) continue;
+        const uint wExp = isCold ? (rawExp - residentE) : rawExp;
+        typename Traits::WeightPtr wSrc = isCold ? coldWBytes : wBytes;
+        const float4 vx = qwg_moe_down_rows4_1x<Traits>(
+            wSrc, x + (size_t)(tokenIndexedX ? t : slot) * p.K,
+            wExp, r0, rowsLeft, p.N, p.K, nSlices, lane, tgLut);
+        if (routeOutput) {
+            if (lane == 0u) qwg_moe_write_route4(out, slot, p.N, r0, rowsLeft, vx);
+        } else {
+            acc += w[slot] * vx;
+        }
+    }
+    if (routeOutput || lane != 0u) return;
+    const uint outRow = (numGroups > 0u) ? tg.y : t;
+    const bool effSkip = skipShared || numGroups > 0u;
+    qwg_moe_combine_store4(out, out16, (size_t)outRow * p.N + r0, rowsLeft, effSkip,
+                           writeOut16, filterMode, effSkip ? 0.0f : gate[t], shared, acc);
+}

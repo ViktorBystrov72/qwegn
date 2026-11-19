@@ -18,6 +18,10 @@ public protocol QWVisionBackend: Sendable {
     var isLoaded: Bool { get }
     /// True when vision tower weights are configured to stay resident across prompts.
     var keepResident: Bool { get }
+    /// True when on-demand vision loading is permitted for image turns.
+    var allowOnDemand: Bool { get }
+    /// True when the backend is permitted to serve image requests (resident, loaded, or on-demand).
+    var isVisionEnabled: Bool { get }
     /// Config-sourced vision tower geometry served by this backend.
     var visionConfig: QWVisionConfig { get }
 }
@@ -27,6 +31,8 @@ extension QWVisionBackend {
     public func setVisionLoaded(_ loaded: Bool) throws {}
     public var isLoaded: Bool { true }
     public var keepResident: Bool { isLoaded }
+    public var allowOnDemand: Bool { true }
+    public var isVisionEnabled: Bool { isLoaded || keepResident || allowOnDemand }
     public var visionConfig: QWVisionConfig { .qwen3VLReference }
 }
 
@@ -62,27 +68,27 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     private var allowOnDemandFlag: Bool = true
 
     public var visionConfig: QWVisionConfig {
-        lock.lock()
-        defer { lock.unlock() }
-        return resolvedConfig
+        lock.withLock { resolvedConfig }
     }
 
     public var isLoaded: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return residentWeights != nil
+        lock.withLock { residentWeights != nil }
     }
 
     public var keepResident: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return keepResidentFlag
+        lock.withLock { keepResidentFlag }
+    }
+
+    public var allowOnDemand: Bool {
+        lock.withLock { allowOnDemandFlag }
+    }
+
+    public var isVisionEnabled: Bool {
+        lock.withLock { keepResidentFlag || allowOnDemandFlag || residentWeights != nil }
     }
 
     public var residentBytes: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return residentWeights?.residentBytes ?? 0
+        lock.withLock { residentWeights?.residentBytes ?? 0 }
     }
 
     public init(source: Source, keepResident: Bool = false, allowOnDemand: Bool = true) throws {
@@ -134,11 +140,7 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     }
 
     private static func validate(checkpoint ck: QWVisionCheckpoint) throws {
-        defer {
-            ck.shards.removeAll()
-            ck.pack?.adviseDontNeed()
-            ck.pack = nil
-        }
+        defer { ck.releaseBacking() }
         let cfg = ck.config
         guard cfg.dim > 0, cfg.heads > 0, cfg.headDim * cfg.heads == cfg.dim,
               cfg.numPosEmbeds > 0, cfg.posSide * cfg.posSide == cfg.numPosEmbeds else {
@@ -181,36 +183,38 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     }
 
     public func setVisionLoaded(_ loaded: Bool) throws {
-        lock.lock()
-        defer { lock.unlock() }
-        keepResidentFlag = loaded
-        if loaded {
-            _ = try loadWeightsLocked()
-        } else if residentWeights != nil {
-            residentWeights = nil
+        try lock.withLock {
+            keepResidentFlag = loaded
+            if loaded {
+                _ = try loadWeightsLocked()
+            } else if residentWeights != nil {
+                residentWeights = nil
+            }
         }
     }
 
     public func prepareForPrompt(hasImages: Bool) throws {
-        lock.lock()
-        defer { lock.unlock() }
-        if hasImages {
-            guard keepResidentFlag || allowOnDemandFlag || residentWeights != nil else {
-                throw QWVisionError.badLayout("Vision tower is disabled in Model Settings (enable 'Load Vision Tower' in Settings → Model)")
+        try lock.withLock {
+            if hasImages {
+                guard keepResidentFlag || allowOnDemandFlag || residentWeights != nil else {
+                    throw QWVisionError.badLayout(
+                        "Vision tower is disabled in Model Settings (enable 'Load Vision Tower' in Settings → Model)"
+                    )
+                }
+                _ = try loadWeightsLocked()
+            } else if !keepResidentFlag, residentWeights != nil {
+                residentWeights = nil
             }
-            _ = try loadWeightsLocked()
-        } else if !keepResidentFlag, residentWeights != nil {
-            residentWeights = nil
         }
     }
 
     public func unload() {
-        lock.lock()
-        keepResidentFlag = false
-        if residentWeights != nil {
-            residentWeights = nil
+        lock.withLock {
+            keepResidentFlag = false
+            if residentWeights != nil {
+                residentWeights = nil
+            }
         }
-        lock.unlock()
     }
 
     public func encodeSync(
@@ -219,11 +223,14 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         bins: QWVisionRef.InterpBins,
         posIds: [Int32]
     ) throws -> [Float] {
-        let weights: QWVisionWeights = try {
-            lock.lock()
-            defer { lock.unlock() }
+        let weights: QWVisionWeights = try lock.withLock {
+            guard keepResidentFlag || allowOnDemandFlag || residentWeights != nil else {
+                throw QWVisionError.badLayout(
+                    "Vision tower is disabled in Model Settings (enable 'Load Vision Tower' in Settings → Model)"
+                )
+            }
             return try loadWeightsLocked()
-        }()
+        }
         let ref = QWVisionRef(weights: weights)
         return ref.encode(patches: patches, plan: grid, bins: bins, posIds: posIds)
     }

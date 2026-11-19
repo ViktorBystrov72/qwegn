@@ -21,31 +21,77 @@ public enum QWVisionError: Error, CustomStringConvertible, Equatable {
 
 /// Reads ONE safetensors shard for a key prefix, f16/bf16->fp32 on demand.
 struct QWSafetensors {
+    enum DType: Sendable, Equatable {
+        case f16, bf16, f32
+        case unsupported(String)
+
+        init(_ raw: String) {
+            switch raw {
+            case "F16": self = .f16
+            case "BF16": self = .bf16
+            case "F32": self = .f32
+            default: self = .unsupported(raw)
+            }
+        }
+
+        var elemBytes: Int {
+            switch self {
+            case .f16, .bf16: return 2
+            case .f32: return 4
+            case .unsupported: return 0
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .f16: return "F16"
+            case .bf16: return "BF16"
+            case .f32: return "F32"
+            case .unsupported(let raw): return raw
+            }
+        }
+    }
+
+    struct Entry: Sendable {
+        let offset: Int
+        let endOffset: Int
+        let shape: [Int]
+        let dtype: DType
+    }
+
     let data: Data
     var dataStart = 0
-    let tensors: [String: (offset: Int, shape: [Int], dtype: String)]
+    let tensors: [String: Entry]
 
     init(path: String) throws {
         let d = try Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
         self.data = d
         guard d.count > 8 else { throw QWVisionError.badLayout("st too small") }
-        var len = 0
-        d.withUnsafeBytes { (r: UnsafeRawBufferPointer) in for i in 0..<8 { len |= Int(r[i]) << (8 * i) } }
-        guard len > 0, 8 + len <= d.count,
-              let hdr = try JSONSerialization.jsonObject(with: d.subdata(in: 8..<(8 + len))) as? [String: Any] else {
+        var lenU64: UInt64 = 0
+        d.withUnsafeBytes { (r: UnsafeRawBufferPointer) in
+            for i in 0..<8 { lenU64 |= UInt64(r[i]) << (8 * i) }
+        }
+        guard lenU64 > 0, lenU64 <= UInt64(d.count - 8) else {
+            throw QWVisionError.badLayout("invalid safetensors header length in \(path)")
+        }
+        let len = Int(lenU64)
+        guard let hdr = try JSONSerialization.jsonObject(with: d.subdata(in: 8..<(8 + len))) as? [String: Any] else {
             throw QWVisionError.badLayout("invalid safetensors header in \(path)")
         }
         // Data offsets are relative to 8 + len (after header JSON).
         self.dataStart = 8 + len
-        var t: [String: (Int, [Int], String)] = [:]
+        var t: [String: Entry] = [:]
         for (k, v) in hdr where k != "__metadata__" {
             guard let m = v as? [String: Any],
-                  let offsets = m["data_offsets"] as? [Int], !offsets.isEmpty,
+                  let offsets = m["data_offsets"] as? [Int], offsets.count == 2,
                   let shape = m["shape"] as? [Int],
-                  let dtype = m["dtype"] as? String else {
+                  let dtypeRaw = m["dtype"] as? String else {
                 throw QWVisionError.badLayout("malformed safetensors header entry '\(k)'")
             }
-            t[k] = (offsets[0], shape, dtype)
+            guard offsets[0] >= 0, offsets[1] >= offsets[0], shape.allSatisfy({ $0 >= 0 }) else {
+                throw QWVisionError.badLayout("negative offset or shape in safetensors entry '\(k)'")
+            }
+            t[k] = Entry(offset: offsets[0], endOffset: offsets[1], shape: shape, dtype: DType(dtypeRaw))
         }
         self.tensors = t
     }
@@ -55,31 +101,56 @@ struct QWSafetensors {
         if let w = want, t.shape != w {
             throw QWVisionError.shapeMismatch("\(key): \(t.shape) ≠ \(w)")
         }
-        guard t.dtype == "F16" || t.dtype == "BF16" || t.dtype == "F32" else {
-            throw QWVisionError.badLayout("QWVision: unsupported dtype \(t.dtype) for '\(key)'")
+        let elemBytes: Int
+        switch t.dtype {
+        case .f16, .bf16, .f32:
+            elemBytes = t.dtype.elemBytes
+        case .unsupported(let raw):
+            throw QWVisionError.badLayout("QWVision: unsupported dtype \(raw) for '\(key)'")
         }
-        let n = t.shape.reduce(1, *)
+        var n = 1
+        for dim in t.shape {
+            guard dim >= 0 else {
+                throw QWVisionError.badLayout("negative dimension in tensor '\(key)'")
+            }
+            let (prod, overflow) = n.multipliedReportingOverflow(by: dim)
+            guard !overflow else {
+                throw QWVisionError.badLayout("element count overflow in tensor '\(key)'")
+            }
+            n = prod
+        }
+        let (byteCount, bytesOverflow) = n.multipliedReportingOverflow(by: elemBytes)
+        let (absStart, startOverflow) = dataStart.addingReportingOverflow(t.offset)
+        let (absEnd, endOverflow) = absStart.addingReportingOverflow(byteCount)
+        let spanBytes = t.endOffset - t.offset
+        guard t.offset >= 0,
+              !bytesOverflow, !startOverflow, !endOverflow,
+              spanBytes == byteCount,
+              absEnd <= data.count else {
+            throw QWVisionError.badLayout("safetensors data_offsets out of bounds for '\(key)'")
+        }
+        if n == 0 { return [] }
         var out = [Float](repeating: 0, count: n)
         data.withUnsafeBytes { (r: UnsafeRawBufferPointer) in
             out.withUnsafeMutableBufferPointer { ob in
                 guard let rawBase = r.baseAddress, let outBase = ob.baseAddress else { return }
-                let src = rawBase.advanced(by: dataStart + t.offset).assumingMemoryBound(to: UInt8.self)
+                let src = rawBase.advanced(by: absStart).assumingMemoryBound(to: UInt8.self)
                 let outU32 = UnsafeMutableRawPointer(outBase).assumingMemoryBound(to: UInt32.self)
                 switch t.dtype {
-                case "F16":
+                case .f16:
                     for i in 0..<n {
                         let lo = UInt16(src[i &* 2]), hi = UInt16(src[i &* 2 &+ 1])
                         outBase[i] = Float(Float16(bitPattern: lo | (hi << 8)))
                     }
-                case "BF16":
+                case .bf16:
                     for i in 0..<n {
                         let lo = UInt32(src[i &* 2]), hi = UInt32(src[i &* 2 &+ 1])
                         outU32[i] = (lo | (hi << 8)) << 16
                     }
-                case "F32":
-                    memcpy(outBase, src, n * 4)
-                default:
-                    fatalError("QWVision: dtype \(t.dtype) not in the law")
+                case .f32:
+                    memcpy(outBase, src, byteCount)
+                case .unsupported:
+                    break
                 }
             }
         }
@@ -92,12 +163,13 @@ struct QWSafetensors {
 
 /// Multi-shard or `.qwp` view over a model's vision tower weights.
 public final class QWVisionCheckpoint: @unchecked Sendable {
+    private let lock = NSLock()
     let index: [String: String]
-    var shards: [String: QWSafetensors] = [:]
+    private var shards: [String: QWSafetensors] = [:]
     let dir: String
     let prefix: String
     public let config: QWVisionConfig
-    var pack: QWQuant.Pack?
+    private var pack: QWQuant.Pack?
     let packPrefix = "model.visual."
 
     public init(pack packPath: String) throws {
@@ -203,7 +275,15 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
         )
     }
 
-    func shard(_ file: String) throws -> QWSafetensors {
+    func releaseBacking() {
+        lock.withLock {
+            shards.removeAll()
+            pack?.adviseDontNeed()
+            pack = nil
+        }
+    }
+
+    private func shardLocked(_ file: String) throws -> QWSafetensors {
         if let s = shards[file] { return s }
         let s = try QWSafetensors(path: dir + "/" + file)
         shards[file] = s
@@ -211,7 +291,7 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
     }
 
     public func f32(_ key: String, want: [Int]? = nil) throws -> [Float] {
-        if let p = pack {
+        if let p = lock.withLock({ pack }) {
             let f = try p.rawBf16(packPrefix + key)
             if let w = want, f.count != w.reduce(1, *) {
                 throw QWVisionError.badLayout("\(key): pack \(f.count) ≠ \(w)")
@@ -219,13 +299,14 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
             return f
         }
         guard let file = index[key] else { throw QWVisionError.missingTensor(key) }
-        return try shard(file).f32(prefix + key, want: want)
+        let s = try lock.withLock { try shardLocked(file) }
+        return try s.f32(prefix + key, want: want)
     }
 
     public func shape(_ key: String) -> [Int]? {
-        if let p = pack { return try? p.entry(packPrefix + key).shape }
+        if let p = lock.withLock({ pack }) { return try? p.entry(packPrefix + key).shape }
         guard let file = index[key] else { return nil }
-        return try? shard(file).shape(prefix + key)
+        return try? lock.withLock { try shardLocked(file) }.shape(prefix + key)
     }
 
     func has(_ key: String) -> Bool { shape(key) != nil }

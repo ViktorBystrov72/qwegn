@@ -189,7 +189,8 @@ static inline void qwg_decode_general_body(
     }
 
     // The partials row per (head, split): [O head_dim f32][m][l].
-    device float* pb = partials + (head * QW_MAXSPLITS + tg.y) * (QW_HEAD_DIM + 2u);
+    const uint splitStride = max(QW_MAXSPLITS, splits);
+    device float* pb = partials + (head * splitStride + tg.y) * (QW_HEAD_DIM + 2u);
     if (live) {
         for (uint i = 0; i < 8u; i++) pb[d0 + i] = oacc[i];
     }
@@ -377,7 +378,8 @@ kernel void qwg_attn_decode_combine_general(
         constant uint& splits [[buffer(3)]],
         uint lane [[thread_index_in_threadgroup]],
         uint3 tg [[threadgroup_position_in_grid]]) {
-    qwg_decode_combine_general_row(qgate, outp, partials, splits, QW_MAXSPLITS, tg.x, lane);
+    const uint splitStride = max(QW_MAXSPLITS, splits);
+    qwg_decode_combine_general_row(qgate, outp, partials, splits, splitStride, tg.x, lane);
 }
 
 kernel void qwg_attn_decode_combine_batched_general(

@@ -41,9 +41,9 @@ static inline void qwg_q8_load8(const device char* p, uint64_t page,
 static inline void qwg_q8_store_seg(device char* p, uint64_t page, uint rowInPage,
                                     uint kvh, uint dim0, const half x[8],
                                     float segMax) {
-    float s = fmax(segMax / 127.0f, 1e-8f);
+    float s = fmax(segMax / 127.0f, 6.103515625e-5f);
     half s16 = half(s);
-    float inv = 1.0f / float(s16);
+    float inv = (float(s16) > 0.0f) ? (1.0f / float(s16)) : 0.0f;
     device char* d = p + page + (uint64_t)rowInPage * QW_ROW8
                      + (uint64_t)kvh * QW_HEAD_DIM + dim0;
     char4 v0, v1;
@@ -95,10 +95,10 @@ static inline void qwg_q4_load8(const device uchar* p, uint64_t page,
 static inline void qwg_q4_store_seg(device uchar* p, uint64_t page, uint rowInPage,
                                     uint kvh, uint dim0, const half x[8],
                                     float grpMin, float grpMax) {
-    const half sc16 = half(fmax((grpMax - grpMin) / 15.0f, 1e-8f));
+    const half sc16 = half(fmax((grpMax - grpMin) / 15.0f, 6.103515625e-5f));
     const half mn16 = half(grpMin);
     const float sc = float(sc16), mn = float(mn16);
-    const float inv = 1.0f / sc;
+    const float inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
     device uchar* d = p + page + (uint64_t)rowInPage * QW_ROW4
                       + (uint64_t)kvh * (QW_HEAD_DIM >> 1) + (dim0 >> 1);
     uchar4 b4;

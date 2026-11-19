@@ -87,11 +87,11 @@ final class FNNgramShardRowsPerfTests: XCTestCase {
         let ids = FNNgramShardRowsRealTableTests.scatteredIDs(count: 200, rowCount: header.rowCount)
         var buf = [Float](repeating: 0, count: header.headDim)
 
-        func measureNs(_ rows: FNNgramShardRows) -> Double {
+        func measureNs(_ rows: FNNgramShardRows) throws -> Double {
             let start = Date()
             for id in ids {
-                buf.withUnsafeMutableBufferPointer { p in
-                    rows.copyRow(id, to: p.baseAddress!)
+                try buf.withUnsafeMutableBufferPointer { p in
+                    try rows.copyRow(id, to: p.baseAddress!)
                 }
             }
             return Date().timeIntervalSince(start) * 1e9 / Double(ids.count)
@@ -99,13 +99,13 @@ final class FNNgramShardRowsPerfTests: XCTestCase {
 
         // Warm the pages, then interleave the two arms so a burst of load
         // hits both the same way.
-        _ = measureNs(header)
-        _ = measureNs(pread)
+        _ = try measureNs(header)
+        _ = try measureNs(pread)
         var headerSamples: [Double] = []
         var preadSamples: [Double] = []
         for _ in 0..<10 {
-            headerSamples.append(measureNs(header))
-            preadSamples.append(measureNs(pread))
+            headerSamples.append(try measureNs(header))
+            preadSamples.append(try measureNs(pread))
         }
         let headerNs = headerSamples.sorted()[headerSamples.count / 2]
         let preadNs = preadSamples.sorted()[preadSamples.count / 2]

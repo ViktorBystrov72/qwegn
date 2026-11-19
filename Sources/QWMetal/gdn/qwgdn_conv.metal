@@ -33,7 +33,7 @@ kernel void qwg_gdn_conv(const device half* x     [[buffer(0)]],   // [T][10240]
                                       : (((u) == 1u) ? (stIn + QW_GDN_C) : (stIn + 2u * QW_GDN_C))) + c0;                 \
             for (uint _j = 0; _j < 8u; _j++) dst[_j] = _p[_j];            \
         } else {                                                          \
-            const device half* _p = x + ((u) - 3u) * QW_GDN_C + c0;       \
+            const device half* _p = x + (size_t)((u) - 3u) * QW_GDN_C + c0; \
             for (uint _j = 0; _j < 8u; _j++) dst[_j] = _p[_j];            \
         }                                                                 \
     }
@@ -52,7 +52,7 @@ kernel void qwg_gdn_conv(const device half* x     [[buffer(0)]],   // [T][10240]
     QW_SRC(t0 + 3u, p3)
 
     for (uint t = t0; t < t1; t++) {
-        device half* yp = y + t * QW_GDN_C + c0;
+        device half* yp = y + (size_t)t * QW_GDN_C + c0;
         #pragma unroll
         for (uint j = 0; j < 8u; j++) {
             float acc = float(bv[j]);                // fp32 accumulation,
@@ -251,7 +251,7 @@ kernel void qwg_gdn_conv_headnorm(const device half* x       [[buffer(0)]],   //
                                       : (((u) == 1u) ? (stIn + QW_GDN_C) : (stIn + 2u * QW_GDN_C))) + c0; \
             for (uint _j = 0; _j < 8u; _j++) dst[_j] = _p[_j];            \
         } else {                                                          \
-            const device half* _p = x + ((u) - 3u) * QW_GDN_C + c0;       \
+            const device half* _p = x + (size_t)((u) - 3u) * QW_GDN_C + c0; \
             for (uint _j = 0; _j < 8u; _j++) dst[_j] = _p[_j];            \
         }                                                                 \
     }
@@ -270,7 +270,7 @@ kernel void qwg_gdn_conv_headnorm(const device half* x       [[buffer(0)]],   //
     if (tg.x >= QW_GDN_QK_HEADS) {
         // V heads: pass-through SiLU
         for (uint t = t0; t < t1; t++) {
-            device half* yp = y + t * QW_GDN_C + c0;
+            device half* yp = y + (size_t)t * QW_GDN_C + c0;
             #pragma unroll
             for (uint j = 0; j < 8u; j++) {
                 float acc = float(bv[j]);
@@ -291,7 +291,7 @@ kernel void qwg_gdn_conv_headnorm(const device half* x       [[buffer(0)]],   //
         // 16 lanes reside entirely within a single SIMD group half (bits 0..3 of lane ID).
         const float scale = (tg.x < (QW_GDN_QK_HEADS / 2u)) ? 0.08838834764831845f : 1.0f; // 128^-0.5 for Q
         for (uint t = t0; t < t1; t++) {
-            device half* yp = y + t * QW_GDN_C + c0;
+            device half* yp = y + (size_t)t * QW_GDN_C + c0;
             float lane_ss = 0.0f;
             half y_silu[8];
             #pragma unroll
@@ -337,7 +337,7 @@ kernel void qwg_gdn_conv_headnorm(const device half* x       [[buffer(0)]],   //
         for (uint j = 0; j < 8u; j++) so[j] = s2r[j];
     }
 
-    if (gdnY32 != nullptr && tg.x < 2u) {
+    if (gdnY32 != nullptr && (tg.x * 32u) < QW_GDN_V_HEADS) {
         const uint h = tg.x * 32u + tid;
         if (h < QW_GDN_V_HEADS) {
             const float al = aLog[h];
@@ -349,7 +349,8 @@ kernel void qwg_gdn_conv_headnorm(const device half* x       [[buffer(0)]],   //
                 const float bv = gdnY32[in_row + QW_GDN_V_HEADS + h];
                 const size_t outIdx = (size_t)t * QW_GDN_V_HEADS + h;
                 betas[outIdx] = 1.0f / (1.0f + metal::exp(-bv));
-                const float sp = metal::log(1.0f + metal::exp(av + db));
+                const float sp_in = av + db;
+                const float sp = (sp_in > 20.0f) ? sp_in : metal::log(1.0f + metal::exp(sp_in));
                 glog[outIdx] = -metal::exp(al) * sp;
             }
         }
@@ -367,9 +368,9 @@ kernel void qwg_gdn_conv_rotate(
     constant uint& T [[buffer(3)]],
     uint c [[thread_position_in_grid]]) {
     if (c >= QW_GDN_C) return;
-    const half s0 = T < 3u ? stIn[T * QW_GDN_C + c] : x[(T - 3u) * QW_GDN_C + c];
-    const half s1 = T < 2u ? stIn[(T + 1u) * QW_GDN_C + c] : x[(T - 2u) * QW_GDN_C + c];
-    const half s2 = x[(T - 1u) * QW_GDN_C + c];
+    const half s0 = T < 3u ? stIn[(size_t)T * QW_GDN_C + c] : x[(size_t)(T - 3u) * QW_GDN_C + c];
+    const half s1 = T < 2u ? stIn[(size_t)(T + 1u) * QW_GDN_C + c] : x[(size_t)(T - 2u) * QW_GDN_C + c];
+    const half s2 = x[(size_t)(T - 1u) * QW_GDN_C + c];
     stOut[c] = s0;
     stOut[QW_GDN_C + c] = s1;
     stOut[2u * QW_GDN_C + c] = s2;

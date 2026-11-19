@@ -10,12 +10,12 @@ extension QWEngineDriver {
     /// Takes the engine's admission permit for a request that spans several
     /// calls. The caller releases it when the request is over.
     func acquireRequest() throws -> QWGenerationPermit {
-        try requestGate.acquire(flight: flight)
+        try admission.acquireRequest()
     }
 
     /// Gives the admission permit back.
     func releaseRequest(_ permit: QWGenerationPermit) {
-        requestGate.release(permit)
+        admission.releaseRequest(permit)
     }
 
     /// The GPU seconds the prefill spent since the ledger stood at `mark`.

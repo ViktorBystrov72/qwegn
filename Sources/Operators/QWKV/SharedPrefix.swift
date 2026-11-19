@@ -1,5 +1,4 @@
-// SharedPrefix.swift — QWKVCache prefix capture/adoption and shared
-// page refcounting (split from QWKVCache.swift; same-module extension).
+// SharedPrefix.swift — QWKVCache prefix capture/adoption and shared page refcounting.
 import Foundation
 import Metal
 import QWCore
@@ -9,207 +8,190 @@ import QWAlloc
 extension QWKVCache {
     public func serializedPlaneBytes(tokenCount: Int) -> Int {
         guard tokenCount > 0 else { return 0 }
-        if mode == .f16 {
-            return tokenCount * f16RowBytes
-        }
+        if mode == .f16 { return tokenCount * f16RowBytes }
         let required = (tokenCount + Self.pageTokens - 1) / Self.pageTokens
         return required * bytesPerPage
     }
 
+    private func validPageBytes(page: Int, tokenCount: Int) -> Int {
+        mode == .f16 ? min(Self.pageTokens, tokenCount - page * Self.pageTokens) * f16RowBytes : bytesPerPage
+    }
+
     /// The caller must complete all GPU writes before capture or adoption.
     public func capturePrivatePrefix(_ h: QWKVHandle, maxBytes: Int) throws -> QWKVPrivatePrefix {
-        lock.lock(); defer { lock.unlock() }
-        guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
-            throw QWKVError.badArgument("private prefix needs a live sequence in this cache")
-        }
-        let count = st.writtenTokens
-        guard count >= 0, count <= h.tokenCapacity, count <= Self.maxTokensPerSeq, maxBytes >= 0 else {
-            throw QWKVError.badArgument("private prefix capacity or byte budget invalid")
-        }
-        let planeBytes = serializedPlaneBytes(tokenCount: count), total = planeBytes * layers.count * 2
-        guard total <= maxBytes else {
-            throw QWKVError.badArgument("private prefix exceeds capacity or byte budget")
-        }
-        var planes: [Data] = []
-        planes.reserveCapacity(layers.count * 2)
-        for (li, layer) in layers.enumerated() {
-            for kind in QWKVKind.allCases {
-                let table = kind == .k ? st.tablesK[li] : st.tablesV[li]
-                let required = (count + Self.pageTokens - 1) / Self.pageTokens
-                guard table.count >= required else { throw QWKVError.badArgument("short private prefix page table") }
-                let region = pool(layer, kind).pages.region
-                guard table.prefix(required).allSatisfy({ $0 >= 0 && Int($0) < region.length / bytesPerPage }) else {
-                    throw QWKVError.badArgument("invalid private prefix page ID")
-                }
-                var data = Data(count: planeBytes)
-                data.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
-                    for page in 0..<required {
-                        let bytes = mode == .f16
-                            ? min(Self.pageTokens, count - page * Self.pageTokens) * f16RowBytes
-                            : bytesPerPage
-                        destination.baseAddress!.advanced(by: page * bytesPerPage)
-                            .copyMemory(from: region.pointer.advanced(by: Int(table[page]) * bytesPerPage),
-                                        byteCount: bytes)
-                    }
-                }
-                planes.append(data)
+        try lock.withLock {
+            guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
+                throw QWKVError.badArgument("private prefix needs a live sequence in this cache")
             }
+            let count = st.writtenTokens
+            guard count >= 0, count <= h.tokenCapacity, count <= Self.maxTokensPerSeq, maxBytes >= 0 else {
+                throw QWKVError.badArgument("private prefix capacity or byte budget invalid")
+            }
+            let planeBytes = serializedPlaneBytes(tokenCount: count)
+            let total = planeBytes * layers.count * 2
+            guard total <= maxBytes else {
+                throw QWKVError.badArgument("private prefix exceeds capacity or byte budget")
+            }
+            let required = (count + Self.pageTokens - 1) / Self.pageTokens
+            var planes: [Data] = []
+            planes.reserveCapacity(layers.count * 2)
+            for li in layers.indices {
+                for kind in QWKVKind.allCases {
+                    let table = st.layerPairs[li][kind].ids
+                    guard table.count >= required else { throw QWKVError.badArgument("short private prefix page table") }
+                    let region = pool(at: li, kind).pages.region
+                    guard table.prefix(required).allSatisfy({ $0 >= 0 && Int($0) < region.length / bytesPerPage }) else {
+                        throw QWKVError.badArgument("invalid private prefix page ID")
+                    }
+                    var data = Data(count: planeBytes)
+                    data.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
+                        guard let dstBase = destination.baseAddress else { return }
+                        for page in 0..<required {
+                            let bytes = validPageBytes(page: page, tokenCount: count)
+                            dstBase.advanced(by: page * bytesPerPage)
+                                .copyMemory(from: region.pointer.advanced(by: Int(table[page]) * bytesPerPage),
+                                            byteCount: bytes)
+                        }
+                    }
+                    planes.append(data)
+                }
+            }
+            return QWKVPrivatePrefix(tokenCount: count, memoryBytes: total, mode: mode, cache: self, planes: planes)
         }
-        return QWKVPrivatePrefix(tokenCount: count, memoryBytes: total, mode: mode, cache: self, planes: planes)
     }
 
-    /// Capture an immutable shared-page prefix after all device writes have
-    /// completed. The donor's table entries become shared too, so its future
-    /// writes must pass through `prepareWrites` (or `append`, which does so).
+    /// Capture an immutable shared-page prefix after all device writes complete.
     public func captureSharedPrefix(_ h: QWKVHandle) throws -> QWKVSharedPrefix {
-        lock.lock(); defer { lock.unlock() }
-        guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
-            throw QWKVError.badArgument("shared prefix needs a live sequence in this cache")
-        }
-        let count = st.writtenTokens
-        guard count >= 0, count <= h.tokenCapacity, count <= Self.maxTokensPerSeq else {
-            throw QWKVError.badArgument("shared prefix token extent invalid")
-        }
-        let required = (count + Self.pageTokens - 1) / Self.pageTokens
-        var pages = Array(repeating: [Int32](), count: layers.count * 2)
-        for (li, layer) in layers.enumerated() {
-            for (ki, kind) in QWKVKind.allCases.enumerated() {
-                let ids = kind == .k ? st.tablesK[li] : st.tablesV[li]
-                let limit = pool(layer, kind).pages.pageCount
-                guard ids.count >= required else {
-                    throw QWKVError.badArgument("shared prefix page table is short")
-                }
-                let prefixIDs = Array(ids.prefix(required))
-                guard prefixIDs.allSatisfy({ $0 >= 0 && Int($0) < limit }) else {
-                    throw QWKVError.badArgument("shared prefix page ID is invalid")
-                }
-                pages[li * 2 + ki] = prefixIDs
+        try lock.withLock {
+            guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
+                throw QWKVError.badArgument("shared prefix needs a live sequence in this cache")
             }
-        }
-
-        for (li, _) in layers.enumerated() {
-            for (ki, kind) in QWKVKind.allCases.enumerated() {
-                let flags = kind == .k ? st.sharedK[li] : st.sharedV[li]
-                let ids = pages[li * 2 + ki]
-                for index in 0..<required {
-                    if !flags[index] {
-                        if kind == .k { st.sharedK[li][index] = true }
-                        else { st.sharedV[li][index] = true }
-                        retainSharedPage(poolIndex(li, kind), ids[index])
+            let count = st.writtenTokens
+            guard count >= 0, count <= h.tokenCapacity, count <= Self.maxTokensPerSeq else {
+                throw QWKVError.badArgument("shared prefix token extent invalid")
+            }
+            let required = (count + Self.pageTokens - 1) / Self.pageTokens
+            var pages = Array(repeating: [Int32](), count: layers.count * 2)
+            for li in layers.indices {
+                for (ki, kind) in QWKVKind.allCases.enumerated() {
+                    let ids = st.layerPairs[li][kind].ids
+                    let limit = pool(at: li, kind).pages.pageCount
+                    guard ids.count >= required else { throw QWKVError.badArgument("shared prefix page table is short") }
+                    let prefixIDs = Array(ids.prefix(required))
+                    guard prefixIDs.allSatisfy({ $0 >= 0 && Int($0) < limit }) else {
+                        throw QWKVError.badArgument("shared prefix page ID is invalid")
                     }
-                    retainSharedPage(poolIndex(li, kind), ids[index])
+                    pages[li * 2 + ki] = prefixIDs
                 }
             }
+            for li in layers.indices {
+                for (ki, kind) in QWKVKind.allCases.enumerated() {
+                    let ids = pages[li * 2 + ki]
+                    for index in 0..<required {
+                        if !st.layerPairs[li][kind].shared[index] {
+                            st.layerPairs[li][kind].shared[index] = true
+                            retainSharedPage(li: li, kind: kind, page: ids[index])
+                        }
+                        retainSharedPage(li: li, kind: kind, page: ids[index])
+                    }
+                }
+            }
+            return QWKVSharedPrefix(tokenCount: count, cache: self, epoch: cacheEpoch, pages: pages, mode: mode)
         }
-        return QWKVSharedPrefix(tokenCount: count, cache: self, epoch: cacheEpoch, pages: pages, mode: mode)
     }
 
-    /// Release the prefix's owning reference. Safe to call more than once;
-    /// dropping the donor or any adopter does not implicitly release it.
-    /// This method serializes with every page-pool mutation through `lock`;
+    /// Release the prefix's owning reference; safe to call multiple times.
     public func releaseSharedPrefix(_ prefix: QWKVSharedPrefix) {
-        lock.lock(); defer { lock.unlock() }
-        guard prefix.cache === self, prefix.epoch == cacheEpoch, !prefix.released else { return }
-        prefix.released = true
-        for (li, _) in layers.enumerated() {
-            for (ki, kind) in QWKVKind.allCases.enumerated() {
-                for page in prefix.pages[li * 2 + ki] {
-                    releaseSharedPage(poolIndex(li, kind), page)
+        lock.withLock {
+            guard prefix.cache === self, prefix.epoch == cacheEpoch, !prefix.released else { return }
+            prefix.released = true
+            for li in layers.indices {
+                for (ki, kind) in QWKVKind.allCases.enumerated() {
+                    for page in prefix.pages[li * 2 + ki] {
+                        releaseSharedPage(li: li, kind: kind, page: page)
+                    }
                 }
             }
         }
     }
 
-    /// Exports written planes for an immutable shared prefix into contiguous byte buffers for disk serialization.
-    /// Streams shared prefix pages directly to an output closure without intermediate heap allocations.
     public func withSharedPrefixPagePointers(
         _ prefix: QWKVSharedPrefix,
         _ body: (_ planeIndex: Int, _ pageIndex: Int, _ pointer: UnsafeRawPointer, _ byteCount: Int) throws -> Void
     ) throws {
-        lock.lock(); defer { lock.unlock() }
-        guard prefix.cache === self, prefix.epoch == cacheEpoch, !prefix.released else {
-            throw QWKVError.badArgument("shared prefix invalid or released")
-        }
-        let required = (prefix.tokenCount + Self.pageTokens - 1) / Self.pageTokens
-        for (li, layer) in layers.enumerated() {
-            for (ki, kind) in QWKVKind.allCases.enumerated() {
-                let planeIdx = li * 2 + ki
-                let ids = prefix.pages[planeIdx]
-                let region = pool(layer, kind).pages.region
-                for page in 0..<required {
-                    let bytes = mode == .f16
-                        ? min(Self.pageTokens, prefix.tokenCount - page * Self.pageTokens) * f16RowBytes
-                        : bytesPerPage
-                    let ptr = UnsafeRawPointer(region.pointer.advanced(by: Int(ids[page]) * bytesPerPage))
-                    try body(planeIdx, page, ptr, bytes)
+        try lock.withLock {
+            guard prefix.cache === self, prefix.epoch == cacheEpoch, !prefix.released else {
+                throw QWKVError.badArgument("shared prefix invalid or released")
+            }
+            let required = (prefix.tokenCount + Self.pageTokens - 1) / Self.pageTokens
+            for li in layers.indices {
+                for (ki, kind) in QWKVKind.allCases.enumerated() {
+                    let planeIdx = li * 2 + ki
+                    let ids = prefix.pages[planeIdx]
+                    let region = pool(at: li, kind).pages.region
+                    for page in 0..<required {
+                        let ptr = UnsafeRawPointer(region.pointer.advanced(by: Int(ids[page]) * bytesPerPage))
+                        try body(planeIdx, page, ptr, validPageBytes(page: page, tokenCount: prefix.tokenCount))
+                    }
                 }
             }
         }
     }
 
-    /// Streams directly into an admitted sequence's private pages without intermediate heap allocations,
-    /// then marks `tokenCount` tokens written.
     public func populatePrivatePagesDirectly(
         into h: QWKVHandle,
         tokenCount: Int,
         _ body: (_ planeIndex: Int, _ pageIndex: Int, _ pointer: UnsafeMutableRawPointer, _ byteCount: Int) throws -> Void
     ) throws {
-        lock.lock(); defer { lock.unlock() }
-        guard h.cache === self, !h.finished, let st = seqs[h.seq], st.writtenTokens == 0,
-              tokenCount >= 0, tokenCount <= h.tokenCapacity else {
-            throw QWKVError.badArgument("direct page population destination invalid")
-        }
-        let required = (tokenCount + Self.pageTokens - 1) / Self.pageTokens
-        for (li, layer) in layers.enumerated() {
-            for (ki, kind) in QWKVKind.allCases.enumerated() {
-                let planeIdx = li * 2 + ki
-                let table = kind == .k ? st.tablesK[li] : st.tablesV[li]
-                guard table.count >= required else {
-                    throw QWKVError.badArgument("direct page population destination capacity invalid")
-                }
-                let region = pool(layer, kind).pages.region
-                for page in 0..<required {
-                    let bytes = mode == .f16
-                        ? min(Self.pageTokens, tokenCount - page * Self.pageTokens) * f16RowBytes
-                        : bytesPerPage
-                    let ptr = region.pointer.advanced(by: Int(table[page]) * bytesPerPage)
-                    try body(planeIdx, page, ptr, bytes)
-                }
+        try lock.withLock {
+            guard h.cache === self, !h.finished, let st = seqs[h.seq], st.writtenTokens == 0,
+                  tokenCount >= 0, tokenCount <= h.tokenCapacity else {
+                throw QWKVError.badArgument("direct page population destination invalid")
             }
-        }
-        st.writtenTokens = tokenCount
-    }
-
-    /// Reconstructs a private prefix from deserialized plane data for adoption.
-    public func validatePrivateAdoption(_ prefix: QWKVPrivatePrefix, into h: QWKVHandle) throws {
-        lock.lock(); defer { lock.unlock() }
-        try validatePrivateAdoptionLocked(prefix, into: h)
-    }
-
-    /// Requires admission with enough private pages; never grows or shares a
-    /// page. Every check completes before the first destination byte changes.
-    public func adoptPrivatePrefix(_ prefix: QWKVPrivatePrefix, into h: QWKVHandle) throws {
-        lock.lock(); defer { lock.unlock() }
-        try validatePrivateAdoptionLocked(prefix, into: h)
-        let st = seqs[h.seq]!
-        let required = (prefix.tokenCount + Self.pageTokens - 1) / Self.pageTokens
-        for (li, layer) in layers.enumerated() {
-            for (ki, kind) in QWKVKind.allCases.enumerated() {
-                let table = kind == .k ? st.tablesK[li] : st.tablesV[li]
-                let region = pool(layer, kind).pages.region
-                prefix.planes[li * 2 + ki].withUnsafeBytes { (source: UnsafeRawBufferPointer) in
+            let required = (tokenCount + Self.pageTokens - 1) / Self.pageTokens
+            for li in layers.indices {
+                for (ki, kind) in QWKVKind.allCases.enumerated() {
+                    let planeIdx = li * 2 + ki
+                    let table = st.layerPairs[li][kind].ids
+                    guard table.count >= required else {
+                        throw QWKVError.badArgument("direct page population destination capacity invalid")
+                    }
+                    let region = pool(at: li, kind).pages.region
                     for page in 0..<required {
-                        let bytes = mode == .f16
-                            ? min(Self.pageTokens, prefix.tokenCount - page * Self.pageTokens) * f16RowBytes
-                            : bytesPerPage
-                        region.pointer.advanced(by: Int(table[page]) * bytesPerPage)
-                            .copyMemory(from: source.baseAddress!.advanced(by: page * bytesPerPage),
-                                        byteCount: bytes)
+                        let ptr = region.pointer.advanced(by: Int(table[page]) * bytesPerPage)
+                        try body(planeIdx, page, ptr, validPageBytes(page: page, tokenCount: tokenCount))
                     }
                 }
             }
+            st.writtenTokens = tokenCount
         }
-        st.writtenTokens = prefix.tokenCount
+    }
+
+    public func validatePrivateAdoption(_ prefix: QWKVPrivatePrefix, into h: QWKVHandle) throws {
+        try lock.withLock { try validatePrivateAdoptionLocked(prefix, into: h) }
+    }
+
+    public func adoptPrivatePrefix(_ prefix: QWKVPrivatePrefix, into h: QWKVHandle) throws {
+        try lock.withLock {
+            try validatePrivateAdoptionLocked(prefix, into: h)
+            guard let st = seqs[h.seq] else { return }
+            let required = (prefix.tokenCount + Self.pageTokens - 1) / Self.pageTokens
+            for li in layers.indices {
+                for (ki, kind) in QWKVKind.allCases.enumerated() {
+                    let table = st.layerPairs[li][kind].ids
+                    let region = pool(at: li, kind).pages.region
+                    prefix.planes[li * 2 + ki].withUnsafeBytes { (source: UnsafeRawBufferPointer) in
+                        guard let srcBase = source.baseAddress else { return }
+                        for page in 0..<required {
+                            let bytes = validPageBytes(page: page, tokenCount: prefix.tokenCount)
+                            region.pointer.advanced(by: Int(table[page]) * bytesPerPage)
+                                .copyMemory(from: srcBase.advanced(by: page * bytesPerPage), byteCount: bytes)
+                        }
+                    }
+                }
+            }
+            st.writtenTokens = prefix.tokenCount
+        }
     }
 
     func validatePrivateAdoptionLocked(_ prefix: QWKVPrivatePrefix, into h: QWKVHandle) throws {
@@ -223,137 +205,148 @@ extension QWKVCache {
         }
         let required = (prefix.tokenCount + Self.pageTokens - 1) / Self.pageTokens
         for li in layers.indices {
-            guard st.tablesK[li].count >= required, st.tablesV[li].count >= required else {
-                throw QWKVError.badArgument("private prefix destination capacity invalid")
-            }
-            let limitK = poolsFlat[li * 2].pages.region.length / bytesPerPage
-            let limitV = poolsFlat[li * 2 + 1].pages.region.length / bytesPerPage
-            guard st.tablesK[li].prefix(required).allSatisfy({ $0 >= 0 && Int($0) < limitK }),
-                  st.tablesV[li].prefix(required).allSatisfy({ $0 >= 0 && Int($0) < limitV }) else {
-                throw QWKVError.badArgument("invalid private destination page ID")
+            for kind in QWKVKind.allCases {
+                let ids = st.layerPairs[li][kind].ids
+                guard ids.count >= required else {
+                    throw QWKVError.badArgument("private prefix destination capacity invalid")
+                }
+                let limit = pool(at: li, kind).pages.region.length / bytesPerPage
+                guard ids.prefix(required).allSatisfy({ $0 >= 0 && Int($0) < limit }) else {
+                    throw QWKVError.badArgument("invalid private destination page ID")
+                }
             }
         }
     }
 
     public func release(_ snap: QWKVSnap) {
-        lock.lock(); defer { lock.unlock() }
-        guard let st = seqs[snap.seq] else { return }
-        for (l, kind, ids) in snap.pins {
-            let key = "\(l):\(kind.rawValue)"
-            guard let kli = layerToLi[l] else { continue }   // P8: O(1), no alloc
-            var bucket = st.pins[key] ?? [:]
-            let table = kind == .k ? st.tablesK[kli] : st.tablesV[kli]
-            let inTable = Set(table)
-            for p in ids {
-                let c = bucket[p, default: 0] - 1
-                if c <= 0 {
-                    bucket[p] = nil
-                    // A page dropped by rollback (pin held it) returns to its
-                    // pool exactly when its last pin releases and no table
-                    // entry references it — accounting stays exact:
-                    // consumed == total − free == Σ live table entries.
-                    if !inTable.contains(p), !isSharedPageReferenced(poolIndex(kli, kind), p) {
-                        pool(l, kind).pages.freePage(Int(p))
+        lock.withLock {
+            guard let st = seqs[snap.seq] else { return }
+            for (l, kind, ids) in snap.pins {
+                guard let kli = layerToLi[l] else { continue }
+                let inTable = Set(st.layerPairs[kli][kind].ids)
+                for p in ids {
+                    let c = st.layerPairs[kli][kind].pins[p, default: 0] - 1
+                    if c <= 0 {
+                        st.layerPairs[kli][kind].pins[p] = nil
+                        if !inTable.contains(p), !isSharedPageReferenced(li: kli, kind: kind, page: p) {
+                            pool(at: kli, kind).pages.freePage(Int(p))
+                        }
+                    } else {
+                        st.layerPairs[kli][kind].pins[p] = c
                     }
-                } else { bucket[p] = c }
+                }
             }
-            st.pins[key] = bucket
         }
     }
 
-    /// MTP/speculative rollback: drop the last `by` tokens. Whole pages past
-    /// the new end return to their pools; a page still pinned by a snapshot is
-    /// NOT freed (the snapshot owns it until release()) but its TABLE entry
+    /// Speculative rollback: drop trailing tokens beyond `writtenTokens - by`.
     public func rollback(_ h: QWKVHandle, by: Int) throws {
         guard by >= 0 else { throw QWKVError.badArgument("negative rollback") }
-        lock.lock(); defer { lock.unlock() }
-        guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
-            throw QWKVError.badArgument("unknown, foreign, or finished seq")
-        }
-        let newEnd = max(0, st.writtenTokens - by)
-        if newEnd < st.writtenTokens { st.rollbackGeneration += 1 }
-        let keepPages = (newEnd + Self.pageTokens - 1) / Self.pageTokens
-        for (li, l) in layers.enumerated() {
-            for kind in QWKVKind.allCases {
-                let key = "\(l):\(kind.rawValue)"
-                let bucket = st.pins[key] ?? [:]
-                while (kind == .k ? st.tablesK[li].count : st.tablesV[li].count) > keepPages {
-                    let p = (kind == .k ? st.tablesK[li].popLast() : st.tablesV[li].popLast())!
-                    let wasShared = kind == .k ? st.sharedK[li].removeLast() : st.sharedV[li].removeLast()
-                    let cnt = bucket[p, default: 0]
-                    if wasShared {
-                        releaseSharedPage(poolIndex(li, kind), p)
-                    } else if cnt == 0 {
-                        pool(l, kind).pages.freePage(Int(p))   // pinned → snapshot owns it
-                    }
-                }
-                st.pins[key] = bucket
-                uploadSlot(h.seq, li, kind, kind == .k ? st.tablesK[li] : st.tablesV[li])
+        try lock.withLock {
+            guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
+                throw QWKVError.badArgument("unknown, foreign, or finished seq")
             }
+            let newEnd = max(0, st.writtenTokens - by)
+            if newEnd < st.writtenTokens { st.rollbackGeneration += 1 }
+            let keepPages = (newEnd + Self.pageTokens - 1) / Self.pageTokens
+            for li in layers.indices {
+                for kind in QWKVKind.allCases {
+                    while st.layerPairs[li][kind].pageCount > keepPages {
+                        guard let p = st.layerPairs[li][kind].ids.popLast() else { break }
+                        let wasShared = st.layerPairs[li][kind].shared.removeLast()
+                        let cnt = st.layerPairs[li][kind].pins[p, default: 0]
+                        if wasShared {
+                            releaseSharedPage(li: li, kind: kind, page: p)
+                        } else if cnt == 0 {
+                            pool(at: li, kind).pages.freePage(Int(p))
+                        }
+                    }
+                    uploadSlot(h.seq, li, kind, st.layerPairs[li][kind].ids)
+                }
+            }
+            st.writtenTokens = newEnd
+            h.tokenCapacity = (st.layerPairs.first?.k.pageCount ?? 0) * Self.pageTokens
         }
-        st.writtenTokens = newEnd
-        h.tokenCapacity = (st.tablesK.first?.count ?? 0) * Self.pageTokens
     }
 
     public func written(_ h: QWKVHandle) -> Int {
-        lock.lock(); defer { lock.unlock() }
-        return seqs[h.seq]?.writtenTokens ?? 0
+        lock.withLock { seqs[h.seq]?.writtenTokens ?? 0 }
     }
 
     public func validate(_ h: QWKVHandle) throws {
-        lock.lock(); defer { lock.unlock() }
-        guard h.cache === self, !h.finished, seqs[h.seq] != nil else {
-            throw QWKVError.badArgument("handle belongs to another cache or a finished sequence")
-        }
-    }
-
-    /// Diagnostic state snapshots without copied KV bytes are invalidated by
-    /// any rewind, even if subsequent writes return to the same cursor.
-    public func rollbackGeneration(_ h: QWKVHandle) throws -> UInt64 {
-        lock.lock(); defer { lock.unlock() }
-        guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
-            throw QWKVError.badArgument("unknown, foreign, or finished seq")
-        }
-        return st.rollbackGeneration
-    }
-
-    /// H4 FIX: raise the written-tokens cursor for GPU-side row
-    /// materialisation. The decode/fold attention launches write rows
-    /// pos…pos+N−1 IN KERNEL (the split-0 epilogue), so unlike the host
-    public func markWritten(_ h: QWKVHandle, upTo tokens: Int) {
-        lock.lock(); defer { lock.unlock() }
-        guard let st = seqs[h.seq] else { return }
-        st.writtenTokens = max(st.writtenTokens, tokens)
-    }
-
-    /// Finish a sequence: EVERY page it holds returns to its pool and the
-    /// (seq, ·, ·) device table slots are zeroed (a recycled seq id must
-    /// never inherit a stale id binding — uploadSlot's tail-zero invariant
-    public func finish(_ h: QWKVHandle) {
-        lock.lock(); defer { lock.unlock() }
-        guard h.cache === self, !h.finished else { return }
-        guard let st = seqs.removeValue(forKey: h.seq) else { return }   // idempotent
-        h.finished = true
-        freeSeqs.append(h.seq)   // recycle the id (the removeValue guard above
-        // makes double-finish impossible to double-push — the slot is gone)
-        for (li, l) in layers.enumerated() {
-            for kind in QWKVKind.allCases {
-                let ids = kind == .k ? st.tablesK[li] : st.tablesV[li]
-                let shared = kind == .k ? st.sharedK[li] : st.sharedV[li]
-                for (index, p) in ids.enumerated() {
-                    if shared[index] { releaseSharedPage(poolIndex(li, kind), p) }
-                    else { pool(l, kind).pages.freePage(Int(p)) }
-                }
-                uploadSlot(h.seq, li, kind, [])
+        try lock.withLock {
+            guard h.cache === self, !h.finished, seqs[h.seq] != nil else {
+                throw QWKVError.badArgument("handle belongs to another cache or a finished sequence")
             }
         }
-        st.pins.removeAll()
-        h.tokenCapacity = 0
     }
-    public func markSteadyState() { lock.lock(); steady = true; lock.unlock() }
+
+    public func rollbackGeneration(_ h: QWKVHandle) throws -> UInt64 {
+        try lock.withLock {
+            guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
+                throw QWKVError.badArgument("unknown, foreign, or finished seq")
+            }
+            return st.rollbackGeneration
+        }
+    }
+
+    public func markWritten(_ h: QWKVHandle, upTo tokens: Int) {
+        lock.withLock {
+            guard let st = seqs[h.seq] else { return }
+            st.writtenTokens = max(st.writtenTokens, tokens)
+        }
+    }
+
+    /// Finish a sequence, freeing unreferenced private pages and tail-zeroing table slots.
+    public func finish(_ h: QWKVHandle) {
+        lock.withLock {
+            guard h.cache === self, !h.finished, let st = seqs[h.seq] else { return }
+            h.finished = true
+            var liveTables: [[Set<Int32>]] = Array(repeating: [Set<Int32>(), Set<Int32>()], count: layers.count)
+            var leftoverPins: [[ [Int32: Int] ]] = Array(repeating: [[:], [:]], count: layers.count)
+            for li in layers.indices {
+                for (ki, kind) in QWKVKind.allCases.enumerated() {
+                    liveTables[li][ki] = Set(st.layerPairs[li][kind].ids)
+                    leftoverPins[li][ki] = st.layerPairs[li][kind].pins
+                    st.layerPairs[li][kind].pins.removeAll()
+                }
+            }
+            for li in layers.indices {
+                for (ki, kind) in QWKVKind.allCases.enumerated() {
+                    for (p, cnt) in leftoverPins[li][ki] where cnt > 0 && !liveTables[li][ki].contains(p) {
+                        if !isSharedPageReferenced(li: li, kind: kind, page: p)
+                            && !isPagePinned(li: li, kind: kind, page: p) {
+                            pool(at: li, kind).pages.freePage(Int(p))
+                        }
+                    }
+                }
+            }
+            for li in layers.indices {
+                for kind in QWKVKind.allCases {
+                    let stream = st.layerPairs[li][kind]
+                    for (index, p) in stream.ids.enumerated() where stream.shared[index] {
+                        releaseSharedPage(li: li, kind: kind, page: p)
+                    }
+                    uploadSlot(h.seq, li, kind, [])
+                }
+            }
+            seqs.removeValue(forKey: h.seq)
+            freeSeqs.append(h.seq)
+            for li in layers.indices {
+                for kind in QWKVKind.allCases {
+                    let stream = st.layerPairs[li][kind]
+                    for (index, p) in stream.ids.enumerated() where !stream.shared[index] {
+                        pool(at: li, kind).pages.freePage(Int(p))
+                    }
+                }
+            }
+            h.tokenCapacity = 0
+        }
+    }
+
+    public func markSteadyState() { lock.withLock { steady = true } }
     public var freePageCount: Int {
-        lock.lock(); defer { lock.unlock() }
-        return poolsFlat.reduce(0) { $0 + $1.pages.freePages }
+        lock.withLock { poolPairs.reduce(0) { $0 + $1.freePages } }
     }
 
     func validateSharedPrefixLocked(_ prefix: QWKVSharedPrefix) throws {
@@ -364,10 +357,10 @@ extension QWKVCache {
             throw QWKVError.badArgument("shared prefix identity, epoch, mode or extent invalid")
         }
         let required = (prefix.tokenCount + Self.pageTokens - 1) / Self.pageTokens
-        for (li, layer) in layers.enumerated() {
+        for li in layers.indices {
             for (ki, kind) in QWKVKind.allCases.enumerated() {
                 let ids = prefix.pages[li * 2 + ki]
-                let limit = pool(layer, kind).pages.pageCount
+                let limit = pool(at: li, kind).pages.pageCount
                 guard ids.count == required, ids.allSatisfy({ $0 >= 0 && Int($0) < limit }) else {
                     throw QWKVError.badArgument("shared prefix geometry or page IDs invalid")
                 }
@@ -375,39 +368,31 @@ extension QWKVCache {
         }
     }
 
-    func poolIndex(_ li: Int, _ kind: QWKVKind) -> Int {
-        li * 2 + (kind == .k ? 0 : 1)
+    func retainSharedPage(li: Int, kind: QWKVKind, page: Int32) {
+        sharedPageRefs[SharedPage(li: li, kind: kind, page: page), default: 0] += 1
     }
 
-    func retainSharedPage(_ pool: Int, _ page: Int32) {
-        let key = SharedPage(pool: pool, page: page)
-        sharedPageRefs[key, default: 0] += 1
+    func isSharedPageReferenced(li: Int, kind: QWKVKind, page: Int32) -> Bool {
+        sharedPageRefs[SharedPage(li: li, kind: kind, page: page), default: 0] > 0
     }
 
-    func isSharedPageReferenced(_ pool: Int, _ page: Int32) -> Bool {
-        sharedPageRefs[SharedPage(pool: pool, page: page), default: 0] > 0
-    }
-
-    func releaseSharedPage(_ poolIndex: Int, _ page: Int32) {
-        let key = SharedPage(pool: poolIndex, page: page)
+    func releaseSharedPage(li: Int, kind: QWKVKind, page: Int32) {
+        let key = SharedPage(li: li, kind: kind, page: page)
         let count = sharedPageRefs[key, default: 0]
         guard count > 0 else { return }
         if count == 1 {
             sharedPageRefs[key] = nil
-            if !isPagePinned(poolIndex, page) {
-                poolsFlat[poolIndex].pages.freePage(Int(page))
+            if !isPagePinned(li: li, kind: kind, page: page) {
+                pool(at: li, kind).pages.freePage(Int(page))
             }
         } else {
             sharedPageRefs[key] = count - 1
         }
     }
 
-    func isPagePinned(_ poolIndex: Int, _ page: Int32) -> Bool {
-        let li = poolIndex / 2
-        let kind: QWKVKind = poolIndex % 2 == 0 ? .k : .v
-        let key = "\(layers[li]):\(kind.rawValue)"
-        for state in seqs.values {
-            if let pins = state.pins[key], pins[page, default: 0] > 0 { return true }
+    func isPagePinned(li: Int, kind: QWKVKind, page: Int32) -> Bool {
+        for state in seqs.values where state.layerPairs[li][kind].pins[page, default: 0] > 0 {
+            return true
         }
         return false
     }

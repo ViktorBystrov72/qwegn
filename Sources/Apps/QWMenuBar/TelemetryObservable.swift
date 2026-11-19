@@ -5,7 +5,19 @@ import Darwin
 import Foundation
 import Observation
 import QWCore
+import QWQuant
 import QWServer
+
+/// Cached LSA sidecar detection state populated off `@MainActor`.
+public struct QWCachedLSASidecarStatus: Sendable, Equatable {
+    public let hasSidecar: Bool
+    public let statusText: String
+
+    public init(hasSidecar: Bool, statusText: String) {
+        self.hasSidecar = hasSidecar
+        self.statusText = statusText
+    }
+}
 
 @MainActor
 @Observable
@@ -25,6 +37,11 @@ public final class TelemetryObservable {
     public var isLogStreamConnected: Bool = false
     public var settings: QWServerSettings
     public var discoveredModels: [DiscoveredModel] = []
+    public var discoveredDrafterModels: [DiscoveredModel] = []
+    public var cachedPrimaryDescriptors: [String: QWModelDescriptor] = [:]
+    public var cachedLSASidecarStatusByKey: [String: QWCachedLSASidecarStatus] = [:]
+    public var cachedDrafterMaxDrafts: [String: Int] = [:]
+    public var cachedContextEstimates: [String: QWContextMemoryEstimate] = [:]
     public var parentPidWatchdogArmed: Bool = false
     public var serverAppliedSettings: QWServerSettings?
     public var enabledMenuBarMetrics: Set<QWMenuBarMetric> {
@@ -102,13 +119,21 @@ public final class TelemetryObservable {
     private var dashboardGeneration: UInt64 = 0
     @ObservationIgnored
     private var engineInfoGeneration: UInt64 = 0
+    @ObservationIgnored var startTask: Task<Void, Never>?
+    @ObservationIgnored var restartTask: Task<Void, Never>?
+    @ObservationIgnored private(set) var isRestartingProcess: Bool = false
     @ObservationIgnored var lastErrorPhase: QWEngineLifecyclePhase?
+    @ObservationIgnored private var modelDiscoveryTask: Task<Void, Never>?
+    @ObservationIgnored private var scheduledDescriptorPaths: Set<String> = []
+    @ObservationIgnored private var scheduledSidecarKeys: Set<String> = []
+    @ObservationIgnored private var scheduledDrafterKeys: Set<String> = []
+    @ObservationIgnored private var scheduledEstimateKeys: Set<String> = []
+    @ObservationIgnored private var metadataTasks: [String: Task<Void, Never>] = [:]
 
     public init(startServices: Bool = true, enableAutoLifecycle: Bool = true, initialSettings: QWServerSettings? = nil) {
         let resolvedSettings = initialSettings ?? QWSettingsManager.shared.loadSettings()
         self.settings = resolvedSettings
-        self.discoveredModels = (startServices && enableAutoLifecycle)
-            ? QWServerSettings.scanModelsDirectory().filter(\.supported) : []
+        self.discoveredModels = []
         self.engineVersion = QWVersion.current
         self.engineState = .stopped
         self.enabledMenuBarMetrics = Self.loadEnabledMenuBarMetrics()
@@ -117,6 +142,7 @@ public final class TelemetryObservable {
         guard startServices else { return }
         setupLocalLoggerSubscription()
         if enableAutoLifecycle {
+            refreshDiscoveredModelsAsync()
             startPolling()
             applyAutoStartDecision()
         }
@@ -124,6 +150,12 @@ public final class TelemetryObservable {
 
     isolated deinit {
         pollTimer?.invalidate()
+        modelDiscoveryTask?.cancel()
+        for task in metadataTasks.values {
+            task.cancel()
+        }
+        startTask?.cancel()
+        restartTask?.cancel()
         dashboardStreamTask?.cancel()
         logStreamTask?.cancel()
         if let id = loggerSubscriptionId {
@@ -169,13 +201,6 @@ public final class TelemetryObservable {
     }
 
     public func fetchDirectOrHttp() {
-        let snap = QWEngineTelemetryRegistry.shared.snapshot()
-        let isLocalActive = snap.cache.lookupsTotal > 0
-            || snap.throughput.tokensInTotal > 0
-            || snap.throughput.phase != "idle"
-        if isLocalActive && !self.engineState.isTransitioning {
-            self.engineState = .serverUp(isLoaded: engineInfo?.parameters.isLoaded ?? false)
-        }
         fetchHttpEngineInfo()
         let streamFresh = dashboardStreamTask != nil
             && lastDashboardStreamAt.map { Date().timeIntervalSince($0) < 0.85 } == true
@@ -184,16 +209,167 @@ public final class TelemetryObservable {
         }
     }
 
+    /// Scans model and drafter directories off `@MainActor` and populates descriptor caches.
+    public func refreshDiscoveredModelsAsync(
+        completion: (@MainActor ([DiscoveredModel], [DiscoveredModel]) -> Void)? = nil
+    ) {
+        modelDiscoveryTask?.cancel()
+        modelDiscoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let scanned = await Task.detached(priority: .utility) {
+                let models = QWServerSettings.scanModelsDirectory()
+                let drafters = QWServerSettings.scanDrafterModelsDirectory()
+                var descriptors: [String: QWModelDescriptor] = [:]
+                for model in models where model.supported && !model.packPath.isEmpty {
+                    if let desc = QWServerSettings.loadPrimaryDescriptor(packPath: model.packPath) {
+                        descriptors[model.packPath] = desc
+                    }
+                }
+                return (models, drafters, descriptors)
+            }.value
+            guard !Task.isCancelled else { return }
+            self.discoveredModels = scanned.0.filter(\.supported)
+            self.discoveredDrafterModels = scanned.1
+            for (path, desc) in scanned.2 {
+                self.cachedPrimaryDescriptors[path] = desc
+                self.scheduledDescriptorPaths.insert(path)
+            }
+            completion?(scanned.0, scanned.1)
+        }
+    }
+
+    /// Returns a cached primary model descriptor and schedules background loading if absent.
+    public func cachedPrimaryDescriptor(packPath: String) -> QWModelDescriptor? {
+        let key = packPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return nil }
+        if let hit = cachedPrimaryDescriptors[key] { return hit }
+        if scheduledDescriptorPaths.insert(key).inserted {
+            let taskKey = "desc|\(key)"
+            metadataTasks[taskKey]?.cancel()
+            metadataTasks[taskKey] = Task { @MainActor [weak self] in
+                let desc = await Task.detached(priority: .utility) {
+                    QWServerSettings.loadPrimaryDescriptor(packPath: key)
+                }.value
+                guard let self, !Task.isCancelled else { return }
+                if let desc { self.cachedPrimaryDescriptors[key] = desc }
+                self.metadataTasks.removeValue(forKey: taskKey)
+            }
+        }
+        return nil
+    }
+
+    /// Returns cached `.qlsa` sidecar availability and status text, loading off `@MainActor` on miss.
+    public func cachedLSASidecarStatus(packPath: String, explicitPath: String) -> QWCachedLSASidecarStatus? {
+        let normPack = packPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normExplicit = explicitPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normPack.isEmpty || !normExplicit.isEmpty else { return nil }
+        let key = "\(normPack)|\(normExplicit)"
+        if let hit = cachedLSASidecarStatusByKey[key] { return hit }
+        if scheduledSidecarKeys.insert(key).inserted {
+            let taskKey = "lsa|\(key)"
+            metadataTasks[taskKey]?.cancel()
+            metadataTasks[taskKey] = Task { @MainActor [weak self] in
+                let status: QWCachedLSASidecarStatus = await Task.detached(priority: .utility) {
+                    let explicitArg = normExplicit.isEmpty ? nil : normExplicit
+                    guard let url = QWLSAConfig.resolveSidecarURL(
+                        packPath: normPack, explicitSidecarPath: explicitArg
+                    ) else {
+                        return QWCachedLSASidecarStatus(
+                            hasSidecar: false,
+                            statusText: "No .qlsa sidecar detected (Auto uses in-memory Weight-SVD)"
+                        )
+                    }
+                    if let desc = QWServerSettings.loadPrimaryDescriptor(packPath: normPack),
+                       let info = try? QWLSASidecar.peekInfo(url: url, descriptor: desc) {
+                        let matchNote = info.geometryMatches ? "verified" : "digest mismatch"
+                        return QWCachedLSASidecarStatus(
+                            hasSidecar: true,
+                            statusText: "Detected \(url.lastPathComponent) [\(info.method), d=\(info.indexDim), \(matchNote)]"
+                        )
+                    }
+                    return QWCachedLSASidecarStatus(hasSidecar: true, statusText: "Detected \(url.lastPathComponent)")
+                }.value
+                guard let self, !Task.isCancelled else { return }
+                self.cachedLSASidecarStatusByKey[key] = status
+                self.metadataTasks.removeValue(forKey: taskKey)
+            }
+        }
+        return nil
+    }
+
+    /// Returns cached drafter `maxDrafts`, inferring from disk off `@MainActor` on cache miss.
+    public func cachedMaxDrafts(forDrafterPackPath path: String) -> Int? {
+        let key = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return nil }
+        if let hit = cachedDrafterMaxDrafts[key] { return hit }
+        if scheduledDrafterKeys.insert(key).inserted {
+            let taskKey = "draft|\(key)"
+            metadataTasks[taskKey]?.cancel()
+            metadataTasks[taskKey] = Task { @MainActor [weak self] in
+                let maxD = await Task.detached(priority: .utility) {
+                    QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: key).maxDrafts
+                }.value
+                guard let self, !Task.isCancelled else { return }
+                self.cachedDrafterMaxDrafts[key] = maxD
+                self.metadataTasks.removeValue(forKey: taskKey)
+            }
+        }
+        return nil
+    }
+
+    /// Returns cached context memory estimate, computing off `@MainActor` on cache miss.
+    public func cachedContextEstimate(
+        for settings: QWServerSettings,
+        descriptor: QWModelDescriptor?
+    ) -> QWContextMemoryEstimate? {
+        let rawPath = settings.modelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawPath.isEmpty || !settings.modelName.isEmpty else { return nil }
+        let key = [
+            settings.modelName, rawPath, settings.kvMode.lowercased(),
+            "\(settings.maxContext)", "\(settings.speculativeDecodingEnabled)",
+            "\(settings.mtpDrafts)", settings.mtpBackend.lowercased(),
+            "\(settings.prefillChunkSize)", descriptor?.geometryDigestV3Hex ?? "none"
+        ].joined(separator: "|")
+        if let hit = cachedContextEstimates[key] { return hit }
+        if scheduledEstimateKeys.insert(key).inserted {
+            let taskKey = "est|\(key)"
+            metadataTasks[taskKey]?.cancel()
+            metadataTasks[taskKey] = Task { @MainActor [weak self] in
+                let est = await Task.detached(priority: .utility) {
+                    settings.estimateContextMemory(for: descriptor)
+                }.value
+                guard let self, !Task.isCancelled else { return }
+                if let est { self.cachedContextEstimates[key] = est }
+                self.metadataTasks.removeValue(forKey: taskKey)
+            }
+        }
+        return nil
+    }
+
+    public func invalidateLSASidecarCache() {
+        cachedLSASidecarStatusByKey.removeAll()
+        scheduledSidecarKeys.removeAll()
+    }
+
+    public func invalidateModelMetadataCache() {
+        cachedPrimaryDescriptors.removeAll()
+        cachedLSASidecarStatusByKey.removeAll()
+        cachedDrafterMaxDrafts.removeAll()
+        cachedContextEstimates.removeAll()
+        scheduledDescriptorPaths.removeAll()
+        scheduledSidecarKeys.removeAll()
+        scheduledDrafterKeys.removeAll()
+        scheduledEstimateKeys.removeAll()
+    }
+
     /// Fetches the published dashboard view model directly from the server.
     public func fetchDashboard() {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/v1/dashboard") else {
+        guard let req = authorizedRequest(path: "/v1/dashboard", timeoutInterval: 1.5) else {
             connection = .disconnected
             dashboard = nil
             stopDashboardStream()
             return
         }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 1.5
         dashboardGeneration &+= 1
         let generation = dashboardGeneration
         Task {
@@ -245,9 +421,7 @@ public final class TelemetryObservable {
     }
 
     public func fetchHttpEngineInfo() {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/v1/engine/info") else { return }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 1.0
+        guard let req = authorizedRequest(path: "/v1/engine/info", timeoutInterval: 1.0) else { return }
         engineInfoGeneration &+= 1
         let generation = engineInfoGeneration
         Task {
@@ -262,8 +436,8 @@ public final class TelemetryObservable {
                 guard generation == engineInfoGeneration else { return }
                 self.engineInfo = info
                 self.engineVersion = info.version
-                if let pid = info.pid, pid > 0 {
-                    self.lastKnownServerPid = Int32(pid)
+                if let pid = info.pid, let p32 = Int32(exactly: pid), p32 > 0 {
+                    self.lastKnownServerPid = p32
                 }
                 if !self.engineState.isTransitioning {
                     self.engineState = .serverUp(isLoaded: info.parameters.isLoaded)
@@ -280,12 +454,17 @@ public final class TelemetryObservable {
 
     private var serverProcessIsAlive: Bool {
         if let proc = serverProcess, proc.isRunning { return true }
-        if let lockPid = QWEngineInstanceLock.runningEnginePID(), lockPid > 0 {
+        if let lockPid = QWEngineInstanceLock.runningEnginePID(), lockPid > 0,
+           Self.isVerifiedQWGProcess(pid: lockPid) {
             lastKnownServerPid = lockPid
             return true
         }
-        guard let pid = lastKnownServerPid, pid > 0 else { return false }
-        return kill(pid, 0) == 0
+        guard let pid = lastKnownServerPid, pid > 0,
+              kill(pid, 0) == 0,
+              Self.isVerifiedQWGProcess(pid: pid) else {
+            return false
+        }
+        return true
     }
 
     private func applyUnreachableState() {
@@ -321,19 +500,54 @@ public final class TelemetryObservable {
     }
 
     public func openWebDashboard() {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/ui") else { return }
+        guard let url = serverURL(path: "/ui") else { return }
         NSWorkspace.shared.open(url)
     }
 
+    func resolveUnhealthyAttach(pid: Int32, processAlive: Bool) {
+        connection = .disconnected
+        isStartingProcess = false
+        if processAlive {
+            let msg = "Attached qwg daemon (PID \(pid)) failed health check"
+            engineState = .error(msg)
+            fail(msg)
+        } else {
+            if lastKnownServerPid == pid {
+                lastKnownServerPid = nil
+            }
+            engineState = .stopped
+        }
+    }
+
+    private func awaitAttachedDaemonHealth(pid: Int32) async -> Bool {
+        for _ in 0..<20 {
+            if Task.isCancelled { return false }
+            if await self.checkServerHealth() {
+                self.fetchHttpEngineInfo()
+                self.engineState = .serverUp(isLoaded: self.engineInfo?.parameters.isLoaded ?? false)
+                self.connection = .connected
+                return true
+            }
+            if QWEngineInstanceLock.runningEnginePID() == nil || !Self.isVerifiedQWGProcess(pid: pid) {
+                return false
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return false
+    }
+
     public func startEngine() {
-        if engineState.isRunningOrUp || engineState.isTransitioning { return }
+        if engineState.isRunningOrUp || engineState.isTransitioning || startTask != nil { return }
         engineState = .starting
         isStartingProcess = true
         isDaemonTransitioning = true
 
-        Task { [weak self] in
+        startTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.isDaemonTransitioning = false }
+            defer {
+                self.startTask = nil
+                self.isDaemonTransitioning = false
+            }
 
             if await self.checkServerHealth() {
                 self.fetchHttpEngineInfo()
@@ -345,18 +559,15 @@ public final class TelemetryObservable {
                 return
             }
 
-            if let existingPid = QWEngineInstanceLock.runningEnginePID(), existingPid > 0 {
+            if let existingPid = QWEngineInstanceLock.runningEnginePID(), existingPid > 0,
+               Self.isVerifiedQWGProcess(pid: existingPid) {
                 self.lastKnownServerPid = existingPid
                 QWServerLogger.shared.log(.info, "Attached to existing qwg daemon (PID \(existingPid)).")
-                for _ in 0..<20 {
-                    try? await Task.sleep(nanoseconds: 500_000_000)
-                    if await self.checkServerHealth() {
-                        self.fetchHttpEngineInfo()
-                        self.engineState = .serverUp(isLoaded: self.engineInfo?.parameters.isLoaded ?? false)
-                        self.connection = .connected
-                        break
-                    }
-                    if QWEngineInstanceLock.runningEnginePID() == nil { break }
+                let healthy = await self.awaitAttachedDaemonHealth(pid: existingPid)
+                if !healthy {
+                    let alive = QWEngineInstanceLock.runningEnginePID() != nil
+                        && Self.isVerifiedQWGProcess(pid: existingPid)
+                    self.resolveUnhealthyAttach(pid: existingPid, processAlive: alive)
                 }
                 self.isStartingProcess = false
                 self.parentPidWatchdogArmed = false
@@ -434,6 +645,7 @@ public final class TelemetryObservable {
                 self.serverProcess = proc
                 var running = false
                 for _ in 0..<30 {
+                    if Task.isCancelled { break }
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     if await self.checkServerHealth() { running = true; break }
                     if let p = self.serverProcess, !p.isRunning { break }
@@ -453,6 +665,10 @@ public final class TelemetryObservable {
                     self.isStartingProcess = false
                 }
             } catch {
+                pipe.fileHandleForReading.readabilityHandler = nil
+                proc.terminationHandler = nil
+                try? pipe.fileHandleForWriting.close()
+                try? pipe.fileHandleForReading.close()
                 self.engineState = .error(error.localizedDescription)
                 self.isStartingProcess = false
                 QWServerLogger.shared.log(.error, "Failed to launch qwg: \(error.localizedDescription)")
@@ -467,9 +683,16 @@ public final class TelemetryObservable {
 
     /// Restarts the `qwg serve` daemon process so startup settings take effect.
     public func restartServerProcess() {
-        Task { @MainActor in
-            isDaemonTransitioning = true
-            defer { isDaemonTransitioning = false }
+        guard !isRestartingProcess, !isDaemonTransitioning, restartTask == nil else { return }
+        isRestartingProcess = true
+        isDaemonTransitioning = true
+        restartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.isRestartingProcess = false
+                self.isDaemonTransitioning = false
+                self.restartTask = nil
+            }
             self.resolveConfiguredPackFallbackIfMissing()
             do {
                 try self.settings.validateBeforeLaunch()
@@ -478,8 +701,11 @@ public final class TelemetryObservable {
                 return
             }
             await self.stopEngineAsync()
+            self.isDaemonTransitioning = true
             try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
             self.startEngine()
+            await self.startTask?.value
         }
     }
 
@@ -488,10 +714,7 @@ public final class TelemetryObservable {
     }
 
     public func unloadModel() {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/v1/models/unload") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 30.0
+        guard let req = authorizedRequest(path: "/v1/models/unload", method: "POST", timeoutInterval: 30.0) else { return }
         isModelTransitioning = true
         Task {
             defer { self.isModelTransitioning = false }
@@ -513,10 +736,7 @@ public final class TelemetryObservable {
     }
 
     public func reloadModel() {
-        guard let url = URL(string: "http://\(settings.host):\(settings.port)/v1/models/load") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 120.0
+        guard let req = authorizedRequest(path: "/v1/models/load", method: "POST", timeoutInterval: 120.0) else { return }
         isModelTransitioning = true
         Task {
             defer { self.isModelTransitioning = false }

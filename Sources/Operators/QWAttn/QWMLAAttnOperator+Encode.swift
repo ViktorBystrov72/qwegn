@@ -186,6 +186,7 @@ extension QWMLAAttnOperator {
         enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
+        QWCoarsePoolIndex.barrierIfConcurrent(enc)
         enc.setComputePipelineState(psoGateWeightsProj)
         ln1.bind(enc, index: 0)
         mlaW.wGateWeights.bind(enc, index: 1)
@@ -199,6 +200,7 @@ extension QWMLAAttnOperator {
         let endBlock = (pos0 + rows) / 4
         let numBlocks = endBlock - startBlock
         if numBlocks > 0, let ape = mlaW.ape {
+            QWCoarsePoolIndex.barrierIfConcurrent(enc)
             var sB = UInt32(startBlock)
             var nB = UInt32(numBlocks)
             var dU = UInt32(idxDim)
@@ -223,21 +225,11 @@ extension QWMLAAttnOperator {
                                        fullAttnLayer: Int,
                                        pos0: Int,
                                        rows: Int) {
-        guard emeansCoarseEnabled, let pipes = coarsePipelines, let csr = ls.coarseCSR else { return }
-        let chunkTok = QWCoarsePoolIndex.macroChunkTokens(poolShift: poolShift)
-        let curMacro = pos0 / chunkTok
-        if curMacro < clusteredMacros[fullAttnLayer] {
-            clusteredMacros[fullAttnLayer] = curMacro
-        }
-        let targetMacros = min(csr.maxMacros, (pos0 + rows) / chunkTok)
-        let prevMacros = clusteredMacros[fullAttnLayer]
-        if targetMacros > prevMacros {
-            QWCoarsePoolIndex.barrierIfConcurrent(enc)
-            QWCoarsePoolIndex.encodeClusterMacros(
-                enc, pso: pipes.cluster1024, pooledKeys: ls.pooledKeys,
-                csr: csr, startMacro: prevMacros, numMacros: targetMacros - prevMacros, indexDim: idxDim)
-            clusteredMacros[fullAttnLayer] = targetMacros
-        }
+        guard emeansCoarseEnabled, let coarsePipeline, let csr = ls.coarseCSR else { return }
+        coarsePipeline.updateClusters(
+            enc, pooledKeys: ls.pooledKeys, csr: csr,
+            layerIndex: fullAttnLayer, pos0: pos0, rows: rows,
+            indexDim: idxDim, poolShift: poolShift, postBarrier: true)
     }
 
     public func encodeScoreSelectAbsorbAttendAndProjUV(_ enc: any MTLComputeCommandEncoder,
@@ -263,6 +255,11 @@ extension QWMLAAttnOperator {
         encodeIndexerSelection(enc, ls: ls, pos0: pos0, rows: rows,
                                probeClusters: Self.emeansProbeClusters, windowBlocks: 0)
 
+        let isIncumbent: UInt32 = switch mlaW.kvBProj.containerKind {
+        case .incumbentHQ4G32: 1
+        case .shvq: 2
+        case .rotatedHQ, .nativeAffine: 0
+        }
         var absP = AbsorbParams(
             T: UInt32(rows),
             qHeads: UInt32(qHeads),
@@ -270,9 +267,9 @@ extension QWMLAAttnOperator {
             vHeadDim: UInt32(vHeadDim),
             kvLoraRank: UInt32(kvLoraRank),
             qFullStride: UInt32(qFullStride),
-            bits: UInt32(mlaW.kvBProj.bits),
-            group: UInt32(mlaW.kvBProj.groupSize),
-            isIncumbent: mlaW.kvBProj.isIncumbentContainer ? 1 : (mlaW.kvBProj.isSHVQ ? 2 : 0)
+            bits: UInt32(mlaW.kvBProj.containerKind.bits),
+            group: UInt32(mlaW.kvBProj.containerKind.groupSize),
+            isIncumbent: isIncumbent
         )
         let mTiles = (rows + 7) / 8
         mark("mla.absorb_q")
@@ -295,6 +292,7 @@ extension QWMLAAttnOperator {
             && qHeads % 16 == 0) ? psoSparseAttnSplit : nil
         let useH32 = split == nil && useMMA && qHeads % 32 == 0 && psoSparseAttnNAXH32 != nil
         let naxPSO = useH32 ? psoSparseAttnNAXH32 : psoSparseAttnNAX
+        QWCoarsePoolIndex.barrierIfConcurrent(enc)
         enc.setComputePipelineState(split?.attend ?? (useMMA ? (naxPSO ?? psoSparseAttnMMA) : psoSparseAttn))
         qAbsScratch.bind(enc, index: 0)
         kv.k.pool.bindTo(enc, index: 1)
@@ -309,6 +307,7 @@ extension QWMLAAttnOperator {
             enc.dispatchThreadgroups(MTLSize(width: rows, height: qHeads / 16, depth: attnSplits),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
             var nSplitU = UInt32(attnSplits)
+            QWCoarsePoolIndex.barrierIfConcurrent(enc)
             enc.setComputePipelineState(split.combine)
             partOScratch.bind(enc, index: 0)
             partMLScratch.bind(enc, index: 1)
@@ -329,6 +328,7 @@ extension QWMLAAttnOperator {
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
 
+        QWCoarsePoolIndex.barrierIfConcurrent(enc)
         mark("mla.proj_uv")
         encodeProjUV(enc, kvBProj: mlaW.kvBProj, dst: attOut, absP: &absP,
                      absorbMMA: absorbMMA, rows: rows, mTiles: mTiles)

@@ -49,16 +49,22 @@ extension FNGPULayerPasses {
         barrier(enc)
     }
 
-    /// Multi-session batched GDN over `B` active slots (`1 <= B <= 4`), sharing `inProjBA`, `qkvZ`, and `out` projections.
+    /// Multi-session batched GDN over `B` active slots (`1 <= B <= 4`), sharing `inProjBA`, `qkvZ`/`qkv`+`z`, and `out` projections.
     static func gdnBatch(_ enc: any MTLComputeCommandEncoder, ctx: FNGPUContext, layerIndex: Int, g: FNGPUGDNMixer, s: FNGPUScratch,
                          out: QWTensorValue, activeSlots: [Int], slotStates: inout [FNBatchSlotState]) throws {
         let hal = ctx.hal, B = activeSlots.count
         let CONV = g.convDim, VH = g.vHeads, VALUE = g.vHeads * g.vDim
-        guard let qkvZ = g.qkvZ else { return }
         try QWGemm.encodeHQ4F32V4(enc, hal: hal, weight: g.inProjBA, x: s.rot32, y: s.gdnBA, rows: B)
-        try denseProj(enc, hal: hal, s: s, weight: qkvZ, x: s.rot32, y: s.qkvZ32, rows: B)
+        let interleaved = g.qkvZ != nil
+        if let qkvZ = g.qkvZ {
+            try denseProj(enc, hal: hal, s: s, weight: qkvZ, x: s.rot32, y: s.qkvZ32, rows: B)
+        } else {
+            try denseProj(enc, hal: hal, s: s, weight: g.qkv, x: s.rot32, y: s.qkv32, rows: B)
+            try denseProj(enc, hal: hal, s: s, weight: g.z, x: s.rot32, y: s.z32, rows: B)
+        }
         barrier(enc)
-        let xStride = CONV + VALUE
+        let xStride = interleaved ? (CONV + VALUE) : CONV
+        let zStride = interleaved ? (CONV + VALUE) : VALUE
         let baStride = 2 * VH
         for b in 0..<B {
             let slotIdx = activeSlots[b]
@@ -66,7 +72,7 @@ extension FNGPULayerPasses {
             let p1 = (p0 + 1) & QWFourSlotRollbackRing.ringMask
             slotStates[slotIdx].gdnConvParity[layerIndex] = p1
             let convPair = slotStates[slotIdx].gdnConvState[layerIndex]
-            let xRow = view(s.qkvZ32, byteOffset: b * xStride * 4, count: xStride, dtype: .f32)
+            let xRow = view(interleaved ? s.qkvZ32 : s.qkv32, byteOffset: b * xStride * 4, count: xStride, dtype: .f32)
             let bRow = view(s.gdnBA, byteOffset: b * baStride * 4, count: baStride, dtype: .f32)
             let aRow = view(s.gdnBA, byteOffset: (b * baStride + VH) * 4, count: VH, dtype: .f32)
             let yRow = view(s.yDense32, byteOffset: b * CONV * 4, count: CONV, dtype: .f32)
@@ -86,10 +92,12 @@ extension FNGPULayerPasses {
             let yRow = view(s.yDense32, byteOffset: b * CONV * 4, count: CONV, dtype: .f32)
             let glogRow = view(s.glog, byteOffset: b * VH * 4, count: VH, dtype: .f32)
             let betaRow = view(s.beta, byteOffset: b * VH * 4, count: VH, dtype: .f32)
-            let zRow = view(s.qkvZ32, byteOffset: (b * xStride + CONV) * 4, count: VALUE, dtype: .f32)
+            let zRow = interleaved
+                ? view(s.qkvZ32, byteOffset: (b * xStride + CONV) * 4, count: VALUE, dtype: .f32)
+                : view(s.z32, byteOffset: b * VALUE * 4, count: VALUE, dtype: .f32)
             let outNormRow = view(s.outNorm32, byteOffset: b * VALUE * 4, count: VALUE, dtype: .f32)
             try QWGDNF32.encodeRecurrentRowsF32(enc, hal: hal, y: yRow, betas: betaRow, glog: glogRow,
-                                                state: st, stateRow0: st, z: zRow, zStride: xStride,
+                                                state: st, stateRow0: st, z: zRow, zStride: zStride,
                                                 normWeight: g.normWeight, out: outNormRow, rows: 1)
         }
         barrier(enc)

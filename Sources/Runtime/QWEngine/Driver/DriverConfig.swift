@@ -155,46 +155,8 @@ extension QWEngineDriver {
         geometry: QWModelGeometry,
         useGroupedNAX: Bool = true
     ) -> Int {
-        guard geometry.numExperts > 0 else { return 0 }
-        func aligned(_ bytes: Int) -> Int { (bytes + 255) / 256 * 256 }
-        let H = geometry.hidden, I = geometry.moeIntermediate
-        let outDim = geometry.moeRoutedDim
-        let E = geometry.numExperts, K = geometry.expertsPerTok
-        let routerCols = geometry.moeSplitFeatureRouting ? (2 * E) : E
-        let latentDim = geometry.moeLatentSize ?? 0
-        let ISh = geometry.sharedExpertIntermediate
-        let isPrefill = rows > 8 && geometry.supportsGroupedNAXMoEPrefill && useGroupedNAX
-        let aliasGuDnAcc = isPrefill && geometry.effectiveResidentExperts >= E
-        let r1Rows = isPrefill ? min(rows, 8) : rows
-        let dnAccElems = isPrefill ? max(r1Rows * K * outDim, (rows * K * outDim + 1) / 2) : (rows * K * outDim)
-        var total = 2 * aligned(max(1, rows * H) * 4)
-            + aligned(max(1, rows * routerCols) * 4)
-            + aligned(max(1, rows * K) * 4)
-            + aligned(max(1, rows * K) * 4)
-            + aligned(max(1, r1Rows * K * 2 * I) * 4)
-            + aligned(max(1, r1Rows * K * I) * 4)
-            + (ISh > 0 ? aligned(max(1, rows * 2 * ISh) * 4) + aligned(max(1, rows * ISh) * 4) : 0)
-            + aligned(max(1, rows * H) * 4)
-            + aligned(max(1, rows) * 4)
-            + (aliasGuDnAcc ? 0 : aligned(max(1, dnAccElems) * 4))
-        if latentDim > 0 {
-            total += 2 * aligned(max(1, rows * latentDim) * 4)
-            if isPrefill { total += aligned(max(1, rows * latentDim) * 2) }
-        }
-        if isPrefill {
-            let tcInts = QWGemm.MoETilePlan(
-                experts: E, pairs: rows * K, gateUpRows: 2 * I, downRows: outDim).scratchInts
-            let guBytes = max(1, rows * K * 2 * I) * 2
-            let dnBytes = max(1, dnAccElems) * 4
-            let guOrDnBytes = aliasGuDnAcc ? aligned(max(guBytes, dnBytes)) : aligned(guBytes)
-            total += aligned((E + 1) * 4)
-                + 5 * aligned(max(1, rows * K) * 4)
-                + aligned(max(1, tcInts) * 4)
-                + guOrDnBytes
-                + aligned(max(1, rows * K * I) * 2)
-                + aligned(max(1, rows * (H + ISh)) * 2)
-        }
-        return total
+        QWScratchArenaBuilder.MoEScratchPlan(
+            rows: rows, geometry: geometry, useGroupedNAX: useGroupedNAX).allocationBytes
     }
 
     /// The sparse-MoE chain's scratch for `rows` rows. Sized for decode
@@ -203,95 +165,9 @@ extension QWEngineDriver {
                                persistentAlloc: ((Int, QWDType) throws -> QWTensorValue)? = nil,
                                rows: Int, geometry: QWModelGeometry,
                                useGroupedNAX: Bool = true) throws -> MoEScratch {
-        func pAlloc(_ n: Int, _ dt: QWDType) throws -> QWTensorValue {
-            if let persistentAlloc { return try persistentAlloc(n, dt) }
-            return try alloc(n, dt)
-        }
-        let H = geometry.hidden, I = geometry.moeIntermediate
-        let outDim = geometry.moeRoutedDim
-        let E = geometry.numExperts, K = geometry.expertsPerTok
-        let routerCols = geometry.moeSplitFeatureRouting ? (2 * E) : E
-        let latentDim = geometry.moeLatentSize ?? 0
-        let ISh = geometry.sharedExpertIntermediate
-        let isPrefill = rows > 8 && geometry.supportsGroupedNAXMoEPrefill && useGroupedNAX
-        let aliasGuDnAcc = isPrefill && geometry.effectiveResidentExperts >= E
-        let r1Rows = isPrefill ? min(rows, 8) : rows
-        let dnAccElems = isPrefill ? max(r1Rows * K * outDim, (rows * K * outDim + 1) / 2) : (rows * K * outDim)
-        let tcInts = isPrefill ? QWGemm.MoETilePlan(
-            experts: E, pairs: rows * K, gateUpRows: 2 * I, downRows: outDim).scratchInts : 0
-        let latentSc: QWMoEOperator.LatentScratch? = latentDim > 0 ? QWMoEOperator.LatentScratch(
-            bufA32: try alloc(rows * latentDim, .f32),
-            bufB32: try alloc(rows * latentDim, .f32),
-            bufB16: isPrefill ? try alloc(rows * latentDim, .f16) : nil
-        ) : nil
-        let xRot32 = try alloc(rows * H, .f32)
-        let xPlain32 = try alloc(rows * H, .f32)
-        let logits = try alloc(rows * routerCols, .f32)
-        let idx = try alloc(rows * K, .i32)
-        let wts = try alloc(rows * K, .f32)
-        let gu32 = try alloc(r1Rows * K * 2 * I, .f32)
-        let act32 = try alloc(r1Rows * K * I, .f32)
-        let guSh32 = ISh > 0 ? try alloc(rows * 2 * ISh, .f32) : nil
-        let actSh32 = ISh > 0 ? try alloc(rows * ISh, .f32) : nil
-        let shared = try pAlloc(rows * H, .f32)
-        let gate = try pAlloc(rows, .f32)
-        let expOff = isPrefill ? try alloc(E + 1, .i32) : nil
-        let sortedPair = isPrefill ? try alloc(rows * K, .i32) : nil
-        let sortedTok = isPrefill ? try alloc(rows * K, .i32) : nil
-        let invPerm = isPrefill ? try alloc(rows * K, .i32) : nil
-        let tileE = isPrefill ? try alloc(rows * K, .i32) : nil
-        let tileR = isPrefill ? try alloc(rows * K, .i32) : nil
-        let tileCount = isPrefill ? try alloc(tcInts, .i32) : nil
-        let gu16Value: QWTensorValue?
-        let dnAccValue: QWTensorValue
-        if aliasGuDnAcc {
-            let guElems = max(1, rows * K * 2 * I)
-            let dnElems = max(1, dnAccElems)
-            let sharedSlab = try alloc(max(guElems, (dnElems * 4 + 1) / 2), .f16)
-            gu16Value = QWTensorValue(region: sharedSlab.region, offset: sharedSlab.offset,
-                                      shape: QWTensorShape([guElems], .f16))
-            dnAccValue = QWTensorValue(region: sharedSlab.region, offset: sharedSlab.offset,
-                                       shape: QWTensorShape([dnElems], .f32))
-        } else {
-            gu16Value = isPrefill ? try alloc(rows * K * 2 * I, .f16) : nil
-            dnAccValue = try alloc(dnAccElems, .f32)
-        }
-        let s = MoEScratch(
-            xRot32: xRot32,
-            xPlain32: xPlain32,
-            logits: logits,
-            idx: idx,
-            wts: wts,
-            gu32: gu32,
-            act32: act32,
-            guSh32: guSh32,
-            actSh32: actSh32,
-            shared: shared,
-            gate: gate,
-            expOff: expOff,
-            sortedPair: sortedPair,
-            sortedTok: sortedTok,
-            invPerm: invPerm,
-            tileE: tileE,
-            tileR: tileR,
-            tileCount: tileCount,
-            gu16: gu16Value,
-            dnHi: isPrefill ? try alloc(rows * K * I, .f16) : nil,
-            dnAcc: dnAccValue,
-            naxX16: isPrefill ? try alloc(rows * (H + ISh), .f16) : nil,
-            latent: latentSc
-        )
-        // A standard sparse model has no shared expert (C122), so the shared
-        // term is zero — not "whatever was in the buffer". When a model has an
-        // ungated shared expert (e.g. GLM-5.3-Flash), initialize gate to 1.0.
-        memset(s.shared.region.pointer.advanced(by: s.shared.offset), 0, s.shared.bytes)
-        if ISh > 0 && !geometry.sharedExpertHasGate {
-            let gPtr = s.gate.region.pointer.advanced(by: s.gate.offset).assumingMemoryBound(to: Float.self)
-            for i in 0..<rows { gPtr[i] = 1.0 }
-        } else {
-            memset(s.gate.region.pointer.advanced(by: s.gate.offset), 0, s.gate.bytes)
-        }
-        return s
+        try QWScratchArenaBuilder.MoEScratchPlan(
+            rows: rows, geometry: geometry, useGroupedNAX: useGroupedNAX
+        ).carve(alloc, persistentAlloc: persistentAlloc)
     }
 
     /// The prefill scratch's per-token footprint, accounting for disjoint Attention/GDN vs MLP/MoE lifetimes.
@@ -300,43 +176,8 @@ extension QWEngineDriver {
         maxPrefillChunk: Int = 4096,
         useGroupedNAX: Bool = true
     ) -> Int {
-        let H = geometry.hidden, I = geometry.intermediate
-        let qC = geometry.qChannels, qOut = geometry.qProjOut, kvE = geometry.kvChannels
-        let qkvC = geometry.gdnQKVChannels, zC = geometry.gdnZChannels
-        let vh = geometry.gdnVHeads, E = geometry.numExperts
-        let usesMLA = geometry.usesLatentOrCompressedAttention
-        let mhcC = geometry.mhcConfig?.streams ?? 0
-        let glogC = geometry.gdnGlogChannels
-        let persistentF16 = 5 * H
-        let persistentF32 = H
-            + (mhcC > 0 ? (mhcC * H + mhcC + mhcC * mhcC) : 0)
-            + (E > 0 ? (H + 1) : 0)
-        let persistentBytes = persistentF16 * 2 + persistentF32 * 4
-
-        let attnScratchF16 = usesMLA ? 0 : (geometry.attnProjTotalN + 2 * kvE + qOut)
-        let attOutCols = max(qC, geometry.qHeads * geometry.vHeadDim)
-        let fgbC = geometry.gdnVectorDecay ? (2 * geometry.gdnLowRankDim + vh) : 0
-        let gdnYF32 = geometry.gdnVectorDecay ? 0 : (2 * vh)
-        let needsWy = !geometry.gdnVectorDecay && geometry.gdnLayerCount > 0 && maxPrefillChunk > 4096
-        let attnF16 = attnScratchF16 + 2 * qkvC + 2 * zC + attOutCols + fgbC
-        let attnF32 = gdnYF32 + zC + vh + glogC + (needsWy ? 4 * zC : 0)
-        let attnTransientBytes = attnF16 * 2 + attnF32 * 4
-
-        let mlpDenseBytes = (max(2 * I, 2 * H) + I) * 2
-        var moeTransientBytes = 0
-        if E > 0 {
-            let isGroupedNAX = geometry.supportsGroupedNAXMoEPrefill && useGroupedNAX
-            let aliasGuDnAcc = isGroupedNAX && geometry.effectiveResidentExperts >= E
-            let guDnAliasSaved = aliasGuDnAcc
-                ? min(4 * geometry.expertsPerTok * geometry.moeIntermediate,
-                      2 * geometry.expertsPerTok * geometry.moeRoutedDim)
-                : 0
-            let totalMoe = moeBytesPerToken(geometry: geometry)
-                + moeGroupedPrefillExtraBytesPerToken(geometry: geometry, useGroupedNAX: useGroupedNAX)
-            moeTransientBytes = max(0, totalMoe - (H + 1) * 4 - guDnAliasSaved)
-        }
-        let mlpTransientBytes = mlpDenseBytes + moeTransientBytes
-        return persistentBytes + max(attnTransientBytes, mlpTransientBytes)
+        QWScratchArenaBuilder.prefillBytesPerToken(
+            geometry: geometry, maxPrefillChunk: maxPrefillChunk, useGroupedNAX: useGroupedNAX)
     }
 
     /// Non-prefill-chunk activation scratch (`sc` + fixed `psc` tails + optional MTP verify/seeding).

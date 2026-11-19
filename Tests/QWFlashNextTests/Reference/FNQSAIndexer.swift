@@ -1,4 +1,5 @@
 import Foundation
+import QWRope
 @testable import QWFlashNext
 
 // FlashNext QSA indexer (HF Qwen4ExpTextQSAIndexer). Per query token, keeps the top `budget/ratio`
@@ -24,7 +25,7 @@ public struct FNQSAIndexer: Sendable {
 
     /// Returns `selected[t][j]` for a single sequence of `rows` tokens (x: rows x hidden).
     /// j > t is never selected (causality is applied by the caller as well).
-    public func select(_ x: [Float], rows T: Int, hidden: Int, rope: FNRope) -> [[Bool]] {
+    public func select(_ x: [Float], rows T: Int, hidden: Int, rope: QWRopeCPU) -> [[Bool]] {
         let qkWidth = (heads + kvHeads) * headDim
         var q = [Float](repeating: 0, count: T * heads * headDim)
         var rawK = [Float](repeating: 0, count: T * headDim)

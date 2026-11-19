@@ -6,109 +6,8 @@
 #include <metal_simdgroup_matrix>
 #include "qw_dequant.metalh"
 #include "qw_dequant_f32.metalh"
-#include "qw_dequant_multi.metalh"
+#include "qw_gemm_f32_common.metalh"
 using namespace metal;
-
-#define QWG_F32_BM_TOKENS 64
-#define QWG_F32_BM_ROWS   32
-#define QWG_F32_BM_LD     36
-
-template <int TOKENS, int THREADS>
-static inline void qwg_gemm_q4g_f32_bm_body(device const Block_HQ4_G32* blocks,
-                                            device const float*         x,
-                                            device float*               y,
-                                            uint                        M,
-                                            uint                        N,
-                                            uint                        K,
-                                            uint                        epi,
-                                            float                       scale,
-                                            uint2                       tg,
-                                            uint                        tid,
-                                            threadgroup float*          As,
-                                            threadgroup float*          Bs) {
-    threadgroup float* const Cs = As;  // epilogue aliases As: As is dead after the K loop
-    const int t0 = int(tg.y) * TOKENS;
-    if (t0 >= int(M)) return;
-    const int nBase = int(tg.x) * QWG_F32_BM_ROWS;
-    const uint sg = tid >> 5u;   // simdgroup 0..7 (or 0..3) owns tokens sg*8..+8
-    const uint gi = tid >> 3u;   // 8-lane group owns output row
-    const uint dl = tid & 7u;    // lane within the group
-    const int nBlocks = int(K >> 5u);
-    const int nRow = min(nBase + int(gi), int(N) - 1);
-    device const Block_HQ4_G32* wrow = blocks + long(nRow) * long(nBlocks);
-
-    simdgroup_float8x8 acc[4];
-    for (int nb = 0; nb < 4; ++nb) acc[nb] = simdgroup_float8x8(0.0f);
-
-    for (int g = 0; g < nBlocks; ++g) {
-        // stage A: TOKENS x 32 k of the already-rotated activation
-        #pragma unroll
-        for (int pass = 0; pass < TOKENS / (THREADS / 8); ++pass) {
-            const int tk = int(gi) + pass * (THREADS / 8);
-            const int tokAbs = t0 + tk;
-            float4 v = float4(0.0f);
-            if (tokAbs < int(M)) {
-                device const float* xm = x + long(tokAbs) * long(K) + (g << 5) + int(dl << 2u);
-                v = *(device const float4*)xm;
-            }
-            As[tk * QWG_F32_BM_LD + int(dl) * 4 + 0] = v.x;
-            As[tk * QWG_F32_BM_LD + int(dl) * 4 + 1] = v.y;
-            As[tk * QWG_F32_BM_LD + int(dl) * 4 + 2] = v.z;
-            As[tk * QWG_F32_BM_LD + int(dl) * 4 + 3] = v.w;
-        }
-        // stage B: one HQ4 block per output row, 4 values per lane
-        if constexpr (THREADS == 256) {
-            float2 w01, w23;
-            qwg_unpack_hq4_lane4_f32(wrow[g], dl, w01, w23);
-            const int base = int(gi) * QWG_F32_BM_LD + int(dl) * 4;
-            Bs[base + 0] = w01.x;
-            Bs[base + 1] = w01.y;
-            Bs[base + 2] = w23.x;
-            Bs[base + 3] = w23.y;
-        } else {
-            #pragma unroll
-            for (int pass = 0; pass < QWG_F32_BM_ROWS / (THREADS / 8); ++pass) {
-                const int row = int(gi) + pass * (THREADS / 8);
-                const int weightRow = min(nBase + row, int(N) - 1);
-                float2 w01, w23;
-                qwg_unpack_hq4_lane4_f32(blocks[long(weightRow) * long(nBlocks) + g], dl, w01, w23);
-                const int base = row * QWG_F32_BM_LD + int(dl) * 4;
-                Bs[base + 0] = w01.x;
-                Bs[base + 1] = w01.y;
-                Bs[base + 2] = w23.x;
-                Bs[base + 3] = w23.y;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        #pragma unroll
-        for (int k8 = 0; k8 < 4; ++k8) {
-            simdgroup_float8x8 a;
-            simdgroup_load(a, As + int(sg) * 8 * QWG_F32_BM_LD + k8 * 8, QWG_F32_BM_LD, ulong2(0, 0), false);
-            #pragma unroll
-            for (int nb = 0; nb < 4; ++nb) {
-                simdgroup_float8x8 b;
-                simdgroup_load(b, Bs + nb * 8 * QWG_F32_BM_LD + k8 * 8, QWG_F32_BM_LD, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(acc[nb], a, b, acc[nb]);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (int nb = 0; nb < 4; ++nb)
-        simdgroup_store(acc[nb], Cs + int(sg) * 8 * QWG_F32_BM_LD + nb * 8, QWG_F32_BM_LD, ulong2(0, 0), false);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int idx = int(tid); idx < TOKENS * QWG_F32_BM_ROWS; idx += THREADS) {
-        const int m = idx / QWG_F32_BM_ROWS;
-        const int n = idx % QWG_F32_BM_ROWS;
-        const int tokAbs = t0 + m, col = nBase + n;
-        float v = (tokAbs < int(M) && col < int(N)) ? Cs[m * QWG_F32_BM_LD + n] : 0.0f;
-        if (epi == 1u || epi == 3u) { const float z = v / scale; v = z / (1.0f + exp(-z)); }
-        else if (epi == 2u) { v = 1.0f / (1.0f + exp(-v)); }
-        if (epi == 3u) {
-            v = qwg_fwht32_lane_f32(v, uint(n));
-        }
-        if (tokAbs < int(M) && col < int(N)) y[long(tokAbs) * long(N) + col] = v;
-    }
-}
 
 kernel void qwg_gemm_q4g_f32_bm(device const Block_HQ4_G32* blocks [[buffer(0)]],
                                 device const float*         x      [[buffer(1)]],
@@ -122,7 +21,8 @@ kernel void qwg_gemm_q4g_f32_bm(device const Block_HQ4_G32* blocks [[buffer(0)]]
                                 uint  tid  [[thread_index_in_threadgroup]]) {
     threadgroup float As[QWG_F32_BM_TOKENS * QWG_F32_BM_LD];
     threadgroup float Bs[QWG_F32_BM_ROWS * QWG_F32_BM_LD];
-    qwg_gemm_q4g_f32_bm_body<QWG_F32_BM_TOKENS, 256>(blocks, x, y, M, N, K, epi, scale, tg, tid, As, Bs);
+    const QWGemmF32BMParams p = { M, N, K, epi, scale };
+    qwg_gemm_f32_bm_body<QWQuantHQ4, QWG_F32_BM_TOKENS, 256>(blocks, x, y, p, tg, tid, As, Bs);
 }
 
 kernel void qwg_gemm_q4g_f32_bm32(device const Block_HQ4_G32* blocks [[buffer(0)]],
@@ -137,138 +37,29 @@ kernel void qwg_gemm_q4g_f32_bm32(device const Block_HQ4_G32* blocks [[buffer(0)
                                   uint  tid  [[thread_index_in_threadgroup]]) {
     threadgroup float As[32 * QWG_F32_BM_LD];
     threadgroup float Bs[QWG_F32_BM_ROWS * QWG_F32_BM_LD];
-    qwg_gemm_q4g_f32_bm_body<32, 128>(blocks, x, y, M, N, K, epi, scale, tg, tid, As, Bs);
+    const QWGemmF32BMParams p = { M, N, K, epi, scale };
+    qwg_gemm_f32_bm_body<QWQuantHQ4, 32, 128>(blocks, x, y, p, tg, tid, As, Bs);
 }
 
 // GEMV, f32 activations, HQ4_G32 rows in the rot domain (x pre-rotated by qwg_h32_f32).
-// 4 weight rows per simdgroup share the x load; 4 simdgroups per 128-thread threadgroup (16 rows/TG).
-// epi: 0 none, 1 silu(y / scale), 2 sigmoid(y), 3 silu(y / scale) + H_32 across 2x16 row pairs.
 kernel void qwg_gemv_q4g_f32_v4(device const Block_HQ4_G32* blocks [[buffer(0)]],
-                                 device const float*         x      [[buffer(1)]],
-                                 device float*               y      [[buffer(2)]],
-                                 constant uint&              N      [[buffer(3)]],
-                                 constant uint&              K      [[buffer(4)]],
-                                 constant uint&              epi    [[buffer(5)]],
-                                 constant float&             scale  [[buffer(6)]],
-                                 uint3 tg   [[threadgroup_position_in_grid]],
-                                 uint sg   [[simdgroup_index_in_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]]) {
+                                device const float*         x      [[buffer(1)]],
+                                device float*               y      [[buffer(2)]],
+                                constant uint&              N      [[buffer(3)]],
+                                constant uint&              K      [[buffer(4)]],
+                                constant uint&              epi    [[buffer(5)]],
+                                constant float&             scale  [[buffer(6)]],
+                                uint3 tg   [[threadgroup_position_in_grid]],
+                                uint  tid  [[thread_index_in_threadgroup]],
+                                uint  sg   [[simdgroup_index_in_threadgroup]],
+                                uint  lane [[thread_index_in_simdgroup]]) {
     threadgroup float tgC[4 * 32];
-    const uint ep = epi & 0xFFu;
-    const uint M = max(1u, (epi >> 8u) & 0xFFu);
-    if (ep == 3u) {
-        const uint rowBase = tg.x * 32u;
-        if (rowBase >= N) return;
-        const bool multi = M > 1u && M <= 4u;
-        const uint mN = multi ? M : 1u;
-        for (uint pass = 0u; pass < 2u; ++pass) {
-            const uint row0 = rowBase + pass * 16u + sg * 4u;
-            float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
-            if (row0 < N) {
-                if (multi) {
-                    if (M == 2u) {
-                        qwg_gemv_hq4_rows4_m2_f32(blocks, x, x + K, row0, N, K, lane, acc[0], acc[1]);
-                    } else {
-                        qwg_gemv_hq4_rows4_m4_f32(blocks, x, M, row0, N, K, lane, acc);
-                    }
-                } else {
-                    acc[0] = qwg_gemv_hq4_rows4_f32(blocks, x + (size_t)tg.y * K, row0, N, K, lane);
-                }
-            }
-            if (lane == 0u) {
-                for (uint m = 0u; m < mN; ++m) {
-                    const float o[4] = {acc[m].x, acc[m].y, acc[m].z, acc[m].w};
-                    for (uint r = 0u; r < 4u; ++r) {
-                        const uint col = pass * 16u + sg * 4u + r;
-                        float v = (rowBase + col < N) ? o[r] : 0.0f;
-                        const float z = v / scale;
-                        tgC[m * 32u + col] = z / (1.0f + exp(-z));
-                    }
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg < mN) {
-            const float v = qwg_fwht32_lane_f32(tgC[sg * 32u + lane], lane);
-            const uint row = rowBase + lane;
-            const size_t outRow = multi ? size_t(sg) : size_t(tg.y);
-            if (row < N) y[outRow * N + row] = v;
-        }
-        return;
-    }
-    const bool halves = ((K >> 5u) & 31u) == 16u;
-    if (halves) {
-        const uint hl = lane & 15u;
-        const uint row0 = (tg.x * 4u + sg) * 8u + (lane >> 4u) * 4u;
-        if (row0 >= N) return;
-        float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
-        if (M == 2u) {
-            qwg_gemv_hq4_rows4_m2_f32<16u>(blocks, x, x + K, row0, N, K, hl, acc[0], acc[1]);
-        } else if (M > 2u && M <= 4u) {
-            qwg_gemv_hq4_rows4_m4_f32<16u>(blocks, x, M, row0, N, K, hl, acc);
-        } else {
-            acc[0] = qwg_gemv_hq4_rows4_f32<16u>(blocks, x + (size_t)tg.y * K, row0, N, K, hl);
-        }
-        if (hl != 0u) return;
-        const bool multi = M > 1u && M <= 4u;
-        const uint mN = multi ? M : 1u;
-        for (uint m = 0u; m < mN; ++m) {
-            float o[4] = {acc[m].x, acc[m].y, acc[m].z, acc[m].w};
-            const size_t yb = (size_t)(multi ? m : tg.y) * N;
-            for (uint r = 0; r < 4u; ++r) {
-                const uint row = row0 + r;
-                if (row >= N) break;
-                float v = o[r];
-                if (ep == 1u) { const float z = v / scale; v = z / (1.0f + exp(-z)); }
-                else if (ep == 2u) { v = 1.0f / (1.0f + exp(-v)); }
-                y[yb + row] = v;
-            }
-        }
-        return;
-    }
-    const uint row0 = (tg.x * 4u + sg) * 4u;
-    if (row0 >= N) return;
-    if (M > 1u && M <= 4u) {
-        float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
-        if (M == 2u) {
-            qwg_gemv_hq4_rows4_m2_f32(blocks, x, x + K, row0, N, K, lane, acc[0], acc[1]);
-        } else {
-            qwg_gemv_hq4_rows4_m4_f32(blocks, x, M, row0, N, K, lane, acc);
-        }
-        if (lane == 0u) {
-            #pragma unroll
-            for (uint m = 0u; m < 4u; ++m) {
-                if (m < M) {
-                    float o[4] = {acc[m].x, acc[m].y, acc[m].z, acc[m].w};
-                    for (uint r = 0; r < 4u; ++r) {
-                        const uint row = row0 + r;
-                        if (row >= N) break;
-                        float v = o[r];
-                        if (ep == 1u) { const float z = v / scale; v = z / (1.0f + exp(-z)); }
-                        else if (ep == 2u) { v = 1.0f / (1.0f + exp(-v)); }
-                        y[(size_t)m * N + row] = v;
-                    }
-                }
-            }
-        }
-        return;
-    }
-    const float4 acc = qwg_gemv_hq4_rows4_f32(blocks, x + (size_t)tg.y * K, row0, N, K, lane);
-    if (lane != 0u) return;
-    float o[4] = {acc.x, acc.y, acc.z, acc.w};
-    for (uint r = 0; r < 4u; ++r) {
-        const uint row = row0 + r;
-        if (row >= N) break;
-        float v = o[r];
-        if (ep == 1u) { const float z = v / scale; v = z / (1.0f + exp(-z)); }
-        else if (ep == 2u) { v = 1.0f / (1.0f + exp(-v)); }
-        y[(size_t)tg.y * N + row] = v;
-    }
+    threadgroup QWEmptyTgLut tgLut;
+    const QWGemmF32V4Params p = { N, K, epi, scale };
+    qwg_gemv_f32_v4_body<QWQuantHQ4>(blocks, x, y, p, tg, tid, sg, lane, tgC, tgLut);
 }
 
-// GEMV + in-kernel block argmax epilogue (the LM-head T=1 greedy path): same rows as
-// qwg_gemv_q4g_f32_v4, but each threadgroup folds its 16 (logit, row) pairs into one
-// sortable key pair in keysHi/keysLo[tg.y * slots + tg.x] (ties → lowest row; encoding = qwg_head_argmax).
+// GEMV + in-kernel block argmax epilogue for LM-head T=1..4 greedy decoding.
 kernel void qwg_gemv_q4g_f32_v4_am(device const Block_HQ4_G32* blocks [[buffer(0)]],
                                    device const float*         x      [[buffer(1)]],
                                    device float*               y      [[buffer(2)]],
@@ -282,88 +73,13 @@ kernel void qwg_gemv_q4g_f32_v4_am(device const Block_HQ4_G32* blocks [[buffer(0
                                    uint  tid  [[thread_index_in_threadgroup]],
                                    uint  sg   [[simdgroup_index_in_threadgroup]],
                                    uint  lane [[thread_index_in_simdgroup]]) {
-    const uint ep = epi & 0xFFu;
-    const uint M = epi >> 8u;
-    const uint row0 = (tg.x * 4u + sg) * 4u;
     threadgroup uint bHi[16], bLo[16];
-    if (M > 1u && M <= 4u) {
-        float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
-        if (row0 < N) {
-            if (M == 2u) {
-                qwg_gemv_hq4_rows4_m2_f32(blocks, x, x + K, row0, N, K, lane, acc[0], acc[1]);
-            } else {
-                qwg_gemv_hq4_rows4_m4_f32(blocks, x, M, row0, N, K, lane, acc);
-            }
-        }
-        if (lane == 0u) {
-            #pragma unroll
-            for (uint m = 0u; m < 4u; ++m) {
-                if (m < M) {
-                    uint bh = 0u, bl = 0u;
-                    if (row0 < N) {
-                        float o[4] = {acc[m].x, acc[m].y, acc[m].z, acc[m].w};
-                        for (uint r = 0; r < 4u; ++r) {
-                            const uint row = row0 + r;
-                            if (row >= N) break;
-                            float v = o[r];
-                            if (ep == 1u) { const float z = v / scale; v = z / (1.0f + exp(-z)); }
-                            else if (ep == 2u) { v = 1.0f / (1.0f + exp(-v)); }
-                            y[(size_t)m * N + row] = v;
-                            const uint u = as_type<uint>(v);
-                            const uint hi = (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
-                            const uint lo = ~row;
-                            if (r == 0u || hi > bh || (hi == bh && lo > bl)) { bh = hi; bl = lo; }
-                        }
-                    }
-                    bHi[m * 4u + sg] = bh; bLo[m * 4u + sg] = bl;
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < M) {
-            const uint m = tid;
-            uint bh = bHi[m * 4u], bl = bLo[m * 4u];
-            for (uint q = 1u; q < 4u; q++) {
-                const uint idx = m * 4u + q;
-                if (bHi[idx] > bh || (bHi[idx] == bh && bLo[idx] > bl)) { bh = bHi[idx]; bl = bLo[idx]; }
-            }
-            const uint slots = (N + 15u) >> 4u;
-            keysHi[m * slots + tg.x] = bh; keysLo[m * slots + tg.x] = bl;
-        }
-        return;
-    }
-    const float4 acc = qwg_gemv_hq4_rows4_f32(blocks, x + (size_t)tg.y * K, row0, N, K, lane);
-    if (lane == 0u) {
-        uint bh = 0u, bl = 0u;
-        if (row0 < N) {
-            float o[4] = {acc.x, acc.y, acc.z, acc.w};
-            for (uint r = 0; r < 4u; ++r) {
-                const uint row = row0 + r;
-                if (row >= N) break;
-                float v = o[r];
-                if (ep == 1u) { const float z = v / scale; v = z / (1.0f + exp(-z)); }
-                else if (ep == 2u) { v = 1.0f / (1.0f + exp(-v)); }
-                y[(size_t)tg.y * N + row] = v;
-                const uint hi = (as_type<uint>(v) & 0x80000000u) ? ~as_type<uint>(v)
-                                                                 : (as_type<uint>(v) ^ 0x80000000u);
-                const uint lo = ~row;
-                if (r == 0u || hi > bh || (hi == bh && lo > bl)) { bh = hi; bl = lo; }
-            }
-        }
-        bHi[sg] = bh; bLo[sg] = bl;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        uint bh = bHi[0], bl = bLo[0];
-        for (uint q = 1u; q < 4u; q++) {
-            if (bHi[q] > bh || (bHi[q] == bh && bLo[q] > bl)) { bh = bHi[q]; bl = bLo[q]; }
-        }
-        const uint slots = (N + 15u) >> 4u;
-        keysHi[tg.y * slots + tg.x] = bh; keysLo[tg.y * slots + tg.x] = bl;
-    }
+    threadgroup QWEmptyTgLut tgLut;
+    const QWGemmF32V4Params p = { N, K, epi, scale };
+    qwg_gemv_f32_v4_am_body<QWQuantHQ4>(blocks, x, y, keysHi, keysLo, p, tg, tid, sg, lane, bHi, bLo, tgLut);
 }
 
-// 2-row LM-head GEMV + in-kernel block argmax epilogue: reads HQ4 blocks once across both token rows (m = 0, 1).
+// 2-row LM-head GEMV + in-kernel block argmax epilogue across both token rows (m = 0, 1).
 kernel void qwg_gemv_q4g_f32_v4_am2(device const Block_HQ4_G32* blocks [[buffer(0)]],
                                     device const float*         x      [[buffer(1)]],
                                     device uint*                keysHi [[buffer(2)]],
@@ -375,44 +91,9 @@ kernel void qwg_gemv_q4g_f32_v4_am2(device const Block_HQ4_G32* blocks [[buffer(
                                     uint  tid  [[thread_index_in_threadgroup]],
                                     uint  sg   [[simdgroup_index_in_threadgroup]],
                                     uint  lane [[thread_index_in_simdgroup]]) {
-    const uint row0 = (tg.x * 4u + sg) * 4u;
-    float4 a0 = float4(0.0f), a1 = float4(0.0f);
-    if (row0 < N) {
-        qwg_gemv_hq4_rows4_m2_f32(blocks, x, x + K, row0, N, K, lane, a0, a1);
-    }
     threadgroup uint bHi0[4], bLo0[4], bHi1[4], bLo1[4];
-    if (lane == 0u) {
-        uint bh0 = 0u, bl0 = 0u, bh1 = 0u, bl1 = 0u;
-        if (row0 < N) {
-            float o0[4] = {a0.x, a0.y, a0.z, a0.w};
-            float o1[4] = {a1.x, a1.y, a1.z, a1.w};
-            for (uint r = 0; r < 4u; ++r) {
-                const uint row = row0 + r;
-                if (row >= N) break;
-                y[row] = o0[r];
-                y[N + row] = o1[r];
-                const uint u0 = as_type<uint>(o0[r]), u1 = as_type<uint>(o1[r]);
-                const uint hi0 = (u0 & 0x80000000u) ? ~u0 : (u0 ^ 0x80000000u);
-                const uint hi1 = (u1 & 0x80000000u) ? ~u1 : (u1 ^ 0x80000000u);
-                const uint lo = ~row;
-                if (r == 0u || hi0 > bh0 || (hi0 == bh0 && lo > bl0)) { bh0 = hi0; bl0 = lo; }
-                if (r == 0u || hi1 > bh1 || (hi1 == bh1 && lo > bl1)) { bh1 = hi1; bl1 = lo; }
-            }
-        }
-        bHi0[sg] = bh0; bLo0[sg] = bl0;
-        bHi1[sg] = bh1; bLo1[sg] = bl1;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        uint bh0 = bHi0[0], bl0 = bLo0[0], bh1 = bHi1[0], bl1 = bLo1[0];
-        for (uint q = 1u; q < 4u; q++) {
-            if (bHi0[q] > bh0 || (bHi0[q] == bh0 && bLo0[q] > bl0)) { bh0 = bHi0[q]; bl0 = bLo0[q]; }
-            if (bHi1[q] > bh1 || (bHi1[q] == bh1 && bLo1[q] > bl1)) { bh1 = bHi1[q]; bl1 = bLo1[q]; }
-        }
-        const uint slots = (N + 15u) >> 4u;
-        keysHi[tg.x] = bh0; keysLo[tg.x] = bl0;
-        keysHi[slots + tg.x] = bh1; keysLo[slots + tg.x] = bl1;
-    }
+    threadgroup QWEmptyTgLut tgLut;
+    qwg_gemv_f32_v4_am2_body<QWQuantHQ4>(blocks, x, keysHi, keysLo, N, K, y, tg, tid, sg, lane, bHi0, bLo0, bHi1, bLo1, tgLut);
 }
 
 // Embedding gather: out[c * hidden + d] = bf16tof32(table[token * hidden + d]) for
@@ -430,7 +111,7 @@ kernel void qwg_embed_bf16_f32(device const ushort* table [[buffer(0)]],   // [v
     const int tok = max(token[r], 0);   // caller guarantees tok < vocab
     device float* outRow = out + (size_t)r * W;
     for (uint i = tg.x * 256u + tid; i < W; i += 256u * 4096u) {
-        outRow[i] = as_type<float>(uint(table[(uint)tok * hidden + i % hidden]) << 16u);
+        outRow[i] = as_type<float>(uint(table[(size_t)tok * hidden + i % hidden]) << 16u);
     }
 }
 
@@ -448,7 +129,7 @@ kernel void qwg_f32_gemv(device const float* W     [[buffer(0)]],
     threadgroup float partial[8];
     const uint n = tg.x, t = tg.y;
     float acc = 0.0f;
-    for (uint k = tid; k < K; k += 256u) acc += W[n * K + k] * X[t * K + k];
+    for (uint k = tid; k < K; k += 256u) acc += W[(size_t)n * K + k] * X[(size_t)t * K + k];
     acc = simd_sum(acc);
     if ((tid & 31u) == 0u) partial[tid >> 5u] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -458,7 +139,7 @@ kernel void qwg_f32_gemv(device const float* W     [[buffer(0)]],
     if (epi == 1u) { const float z = y / scale; y = z / (1.0f + exp(-z)); }
     else if (epi == 2u) { y = 1.0f / (1.0f + exp(-y)); }
     else if (epi == 3u) { y = 2.0f / (1.0f + exp(-(y / scale))); }
-    Y[t * N + n] = y;
+    Y[(size_t)t * N + n] = y;
 }
 
 // Batched f32 GEMV (M >= 4): 32x32 simdgroup_matrix or 8-SG vectorized when M >= 16; 4-row shared-W GEMV for M < 16.
@@ -514,8 +195,9 @@ kernel void qwg_h32_f32(device const float* x   [[buffer(0)]],
                         uint2 tg   [[threadgroup_position_in_grid]],
                         uint  lane [[thread_index_in_simdgroup]]) {
     const uint g = tg.x, t = tg.y;
-    const float v = qwg_fwht32_lane_f32(x[t * H + g * 32u + lane], lane);
-    out[t * H + g * 32u + lane] = v;
+    const size_t idx = (size_t)t * H + g * 32u + lane;
+    const float v = qwg_fwht32_lane_f32(x[idx], lane);
+    out[idx] = v;
 }
 
 // Optional RMSNorm (1 + gamma) + H_32 rotation on f32 [rows, L], emitting f32 and/or f16.
@@ -536,11 +218,14 @@ kernel void qwg_latent_norm_h32_f32(device const float* x     [[buffer(0)]],
     const bool skip32 = (flags & 4u) != 0u;
     if (!hasNorm) {
         const uint col = gid.x;
-        if (col >= L) return;
+        const bool inBounds = (col < L);
         const size_t idx = (size_t)gid.y * L + col;
-        const float v = qwg_fwht32_lane_f32(x[idx], lane);
-        if (!skip32) out32[idx] = v;
-        if (write16) out16[idx] = half(v);
+        const float raw = inBounds ? x[idx] : 0.0f;
+        const float v = qwg_fwht32_lane_f32(raw, lane);
+        if (inBounds) {
+            if (!skip32) out32[idx] = v;
+            if (write16) out16[idx] = half(v);
+        }
         return;
     }
     threadgroup float partSS[8];
@@ -601,28 +286,7 @@ kernel void qwg_latent_norm_h32_f32(device const float* x     [[buffer(0)]],
     }
 }
 
-// 32-point normalized WHT in f32, same butterflies and scale as fwht32_f32_to_h8 (lane = simdgroup lane).
-// In the STANDARD basis the transform is skipped: the activation stays as it
-// is, matching the weights it is about to meet.
-inline void qwg_fwht32_f32(thread float (&f)[8], uint lane_id) {
-    if (!QW_FWHT_ROTATED) return;
-    for (int i = 0; i < 8; i += 2) { float a = f[i], b = f[i + 1]; f[i] = a + b; f[i + 1] = a - b; }
-    for (int i = 0; i < 8; i += 4) {
-        float a0 = f[i], a1 = f[i + 1], b0 = f[i + 2], b1 = f[i + 3];
-        f[i] = a0 + b0; f[i + 1] = a1 + b1; f[i + 2] = a0 - b0; f[i + 3] = a1 - b1;
-    }
-    for (int i = 0; i < 4; ++i) { float a = f[i], b = f[i + 4]; f[i] = a + b; f[i + 4] = a - b; }
-    bool neg1 = (lane_id & 1u) != 0;
-    for (int i = 0; i < 8; ++i) { float p = simd_shuffle_xor(f[i], ushort(1)); f[i] = neg1 ? (p - f[i]) : (f[i] + p); }
-    bool neg2 = (lane_id & 2u) != 0;
-    constexpr float inv_sqrt32 = 0.17677669529663689f;
-    for (int i = 0; i < 8; ++i) {
-        float p = simd_shuffle_xor(f[i], ushort(2));
-        f[i] = (neg2 ? (p - f[i]) : (f[i] + p)) * inv_sqrt32;
-    }
-}
-
-// silu(gate) * up in f32, then the 32-point WHT (I % 32 == 0), as qwg_silu_mul_f16. Requires I % 8 == 0.
+// silu(gate) * up in f32, then 32-point WHT (I % 32 == 0). Requires I % 8 == 0.
 // buffers: 0 gu f32 [M, 2I] | 1 out f32 [M, I] | 2 M | 3 I | 4 out16 f16 [M, I] | 5 hasOut16; grid (I/8, M), 32-lane simdgroups.
 kernel void qwg_silu_mul_f32(device const float* gu       [[buffer(0)]],
                              device float*       out      [[buffer(1)]],
@@ -641,7 +305,7 @@ kernel void qwg_silu_mul_f32(device const float* gu       [[buffer(0)]],
     for (uint k = 0; k < 8; ++k) {
         ov[k] = qwg_swiglu_mul(g[k], u[k]);
     }
-    if ((I & 31u) == 0u) qwg_fwht32_f32(ov, gid.x & 31u);
+    if ((I & 31u) == 0u) fwht32_f32_inplace(ov, gid.x & 31u);
     const size_t base = (size_t)m * I + mi;
     if (hasOut16 != 0u) {
         device half* o16 = out16 + base;

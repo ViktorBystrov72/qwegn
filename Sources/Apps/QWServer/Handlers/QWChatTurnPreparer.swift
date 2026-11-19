@@ -69,17 +69,19 @@ public enum QWChatTurnPreparer {
         memoryManifest: QWMemoryManifest? = nil,
         effectiveMaxNewTokens: Int? = nil
     ) throws -> QWPreparedChatPrompt {
-        let hasActiveTools = !(request.tools?.isEmpty ?? true) && !request.isToolChoiceNone
         let fmtType = request.responseFormatType
         let isAssistantPrefill = request.isAssistantPrefill
-        let (policyThink, policyBudget) = request.resolvedThinkingPolicy(
+        let streamPolicy = QWChatPolicyResolver.resolveStreamPolicy(
+            for: request,
             defaultEnableThinking: config.enableThinking,
             defaultMaxTokens: config.maxTokens,
             modelMaxLength: config.modelMaxLength,
+            supportsThinkingTags: chatTemplate.supportsThinkingTags,
             overrideMaxNewTokens: effectiveMaxNewTokens
         )
-        let shouldThink = chatTemplate.supportsThinkingTags && policyThink
-        let thinkingBudget = chatTemplate.supportsThinkingTags ? policyBudget : nil
+        let hasActiveTools = streamPolicy.hasActiveTools
+        let shouldThink = streamPolicy.shouldThink
+        let thinkingBudget = streamPolicy.thinkingBudget
 
         var extraSystemLines: [String] = []
         if let fmtType, (fmtType == "json_schema" || fmtType == "json_object") {
@@ -203,19 +205,16 @@ public enum QWChatTurnPreparer {
                 toolCallEndToken: tok.tokenId(for: "</tool_call>"))
         }
         let innerConstraint: (any QWTokenConstraint)? = jsonConstraint ?? builtToolConstraint
-        let hasKnownEndThink = tok.tokenId(for: "</think>") != nil || tok.tokenId(for: "</ernie:think>") != nil
         let activeConstraint: (any QWTokenConstraint)?
-        if let thinkingBudget, shouldThink, supportsTokenConstraints,
-           endThinkTokenId >= 0, endThinkTokenId < vocabularySize,
-           (hasKnownEndThink || endThinkTokenId != QWModelSpecialTokens().endThinkTokenId) {
-            let tokenBytes = QWStructuredOutput.tokenBytes(for: tok, vocabulary: vocabularySize)
-            activeConstraint = QWThinkingBudgetConstraint(
+        if let thinkingBudget, shouldThink {
+            activeConstraint = QWChatPolicyResolver.makeThinkingBudgetConstraint(
                 maxThinkingTokens: thinkingBudget,
                 endThinkTokenId: endThinkTokenId,
                 vocabularySize: vocabularySize,
-                tokenBytes: tokenBytes,
+                tokenizer: tok,
+                supportsTokenConstraints: supportsTokenConstraints,
                 inner: innerConstraint
-            )
+            ) ?? innerConstraint
         } else {
             activeConstraint = innerConstraint
         }

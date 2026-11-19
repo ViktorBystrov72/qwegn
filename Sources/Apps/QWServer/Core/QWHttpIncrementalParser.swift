@@ -21,6 +21,7 @@ public enum QWHttpParseError: Error, Equatable, Sendable {
     case payloadTooLarge
     case badEncoding
     case malformedRequestLine
+    case malformedHeader
     case invalidContentLength
     case unsupportedTransferEncoding
 
@@ -28,7 +29,7 @@ public enum QWHttpParseError: Error, Equatable, Sendable {
         switch self {
         case .headerTooLarge: return 431
         case .payloadTooLarge: return 413
-        case .badEncoding, .malformedRequestLine, .invalidContentLength: return 400
+        case .badEncoding, .malformedRequestLine, .malformedHeader, .invalidContentLength: return 400
         case .unsupportedTransferEncoding: return 501
         }
     }
@@ -39,6 +40,7 @@ public enum QWHttpParseError: Error, Equatable, Sendable {
         case .payloadTooLarge: return "Payload too large"
         case .badEncoding: return "Bad request encoding"
         case .malformedRequestLine: return "Malformed request line"
+        case .malformedHeader: return "Malformed HTTP header"
         case .invalidContentLength: return "Invalid Content-Length header"
         case .unsupportedTransferEncoding: return "Transfer-Encoding is not supported"
         }
@@ -111,6 +113,8 @@ public struct QWHttpIncrementalParser: Sendable {
         ))
     }
 
+    private static let httpSeparators = CharacterSet(charactersIn: "()<>@,;:\\\"/[]?={} \t")
+
     private func parseHead(
         headerData: Data,
         bodyStart: Int
@@ -119,7 +123,8 @@ public struct QWHttpIncrementalParser: Sendable {
             throw QWHttpParseError.badEncoding
         }
         let lines = headerStr.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first, !requestLine.isEmpty else {
+        guard let requestLine = lines.first, !requestLine.isEmpty,
+              !requestLine.contains("\n"), !requestLine.contains("\r"), !requestLine.contains("\0") else {
             throw QWHttpParseError.malformedRequestLine
         }
         let parts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
@@ -132,16 +137,31 @@ public struct QWHttpIncrementalParser: Sendable {
         var headers: [String: String] = [:]
         var parsedContentLength: Int? = nil
 
-        for line in lines.dropFirst() where !line.isEmpty {
-            let kv = line.split(separator: ":", maxSplits: 1)
-            guard kv.count == 2 else { continue }
-            let key = kv[0].trimmingCharacters(in: .whitespaces).lowercased()
-            let val = kv[1].trimmingCharacters(in: .whitespaces)
+        for line in lines.dropFirst() {
+            guard !line.isEmpty,
+                  !line.contains("\n"),
+                  !line.contains("\r"),
+                  !line.contains("\0"),
+                  let colonIdx = line.firstIndex(of: ":") else {
+                throw QWHttpParseError.malformedHeader
+            }
+            let rawName = line[..<colonIdx]
+            guard !rawName.isEmpty,
+                  rawName.unicodeScalars.allSatisfy({ s in
+                      s.value > 0x20 && s.value < 0x7F && !Self.httpSeparators.contains(s)
+                  }) else {
+                throw QWHttpParseError.malformedHeader
+            }
+            let rawVal = line[line.index(after: colonIdx)...]
+            let key = String(rawName).lowercased()
+            let val = rawVal.trimmingCharacters(in: .whitespaces)
             if key == "transfer-encoding" {
                 throw QWHttpParseError.unsupportedTransferEncoding
             }
             if key == "content-length" {
-                guard let len = Int(val), len >= 0 else {
+                guard !val.isEmpty,
+                      val.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }),
+                      let len = Int(val) else {
                     throw QWHttpParseError.invalidContentLength
                 }
                 if len > maxBodyBytes {

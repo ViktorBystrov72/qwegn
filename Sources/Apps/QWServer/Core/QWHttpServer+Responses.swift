@@ -1,5 +1,5 @@
-// QWHttpServer+Responses.swift — OpenAI POST /v1/responses, GET /v1/responses/:id,
-// DELETE /v1/responses/:id, previous_response_id chaining, background mode, and SSE events.
+// QWHttpServer+Responses.swift — OpenAI POST /v1/responses, GET/DELETE /v1/responses/:id,
+// previous_response_id chaining, background mode, and SSE events via QWSSESession.
 
 import Foundation
 import Network
@@ -85,6 +85,7 @@ extension QWHttpServer {
         }
 
         let respId = chatReq.effectiveRequestId ?? ("resp_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))
+        let hasClientRequestId = (chatReq.effectiveRequestId != nil)
         let replyModel = resolveReplyModelName(requested: req.model, strictNotFound: false) ?? actor.getModelName()
         var extraHeaders = ["x-request-id: \(respId)"]
         if let sid = chatReq.effectiveSessionId { extraHeaders.append("x-session-id: \(sid)") }
@@ -98,24 +99,31 @@ extension QWHttpServer {
             textFormat: OpenAIResponsesMapper.resourceTextConfig(from: req.text)
         )
         let shouldStore = req.store ?? true
-        let hasActiveTools = !(normalizedTools?.isEmpty ?? true) && !chatReq.isToolChoiceNone
-        let isConstrainedJson = (chatReq.responseFormatType == "json_schema" || chatReq.responseFormatType == "json_object") && !hasActiveTools
-        let (policyThink, _) = chatReq.resolvedThinkingPolicy(
+        let streamPolicy = QWChatPolicyResolver.resolveStreamPolicy(
+            for: chatReq,
             defaultEnableThinking: serverCfg.enableThinking,
             defaultMaxTokens: serverCfg.maxTokens,
-            modelMaxLength: serverCfg.modelMaxLength
+            modelMaxLength: serverCfg.modelMaxLength,
+            supportsThinkingTags: actor.supportsThinkingTags(),
+            thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
         )
-        let shouldThink = policyThink && actor.supportsThinkingTags()
-        let allowReasoningTags = (!isConstrainedJson || shouldThink) && !thinkingExplicitlyDisabled
 
         if (req.background ?? false) && !(req.stream ?? false) {
             let queued = template.makeResource(status: "queued", completedAt: nil, output: [], usage: nil)
-            responsesStore.put(QWResponsesStore.StoredResponse(resource: queued, historyMessages: conversationMessages))
+            let queuedEntry = QWResponsesStore.StoredResponse(resource: queued, historyMessages: conversationMessages)
+            if hasClientRequestId {
+                guard responsesStore.putIfAbsent(queuedEntry) else {
+                    sendOpenAIError(connection, status: 409, message: "Duplicate response id '\(respId)'.", code: "duplicate_request_id")
+                    return
+                }
+            } else {
+                responsesStore.put(queuedEntry)
+            }
             let bgTask = Task { [weak self] in
                 guard let self else { return }
                 await self.runBackgroundResponse(
                     template: template, chatReq: chatReq, baseHistory: conversationMessages,
-                    hasActiveTools: hasActiveTools, allowReasoningTags: allowReasoningTags,
+                    hasActiveTools: streamPolicy.hasActiveTools, allowReasoningTags: streamPolicy.allowReasoningTags,
                     thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
                 )
             }
@@ -124,11 +132,21 @@ extension QWHttpServer {
             return
         }
 
+        let reservedClientEntry = hasClientRequestId && shouldStore
+        if reservedClientEntry {
+            let reserved = template.makeResource(status: "in_progress", completedAt: nil, output: [], usage: nil)
+            guard responsesStore.putIfAbsent(QWResponsesStore.StoredResponse(resource: reserved, historyMessages: conversationMessages)) else {
+                sendOpenAIError(connection, status: 409, message: "Duplicate response id '\(respId)'.", code: "duplicate_request_id")
+                return
+            }
+        }
+
         if req.stream ?? false {
             try await runStreamingResponse(
                 connection: connection, extraHeaders: extraHeaders, template: template,
                 chatReq: chatReq, baseHistory: conversationMessages, shouldStore: shouldStore,
-                hasActiveTools: hasActiveTools, allowReasoningTags: allowReasoningTags,
+                reservedClientEntry: reservedClientEntry,
+                streamPolicy: streamPolicy,
                 thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
             )
             return
@@ -139,15 +157,19 @@ extension QWHttpServer {
         do {
             result = try await actor.handleChatCompletion(request: chatReq, onToken: nil, shouldStop: shouldStop)
         } catch {
+            if reservedClientEntry { _ = responsesStore.delete(respId) }
             if shouldStop() { return }
             sendChatError(connection, error: error, path: "/v1/responses")
             return
         }
-        guard !shouldStop() else { return }
+        if shouldStop() {
+            if reservedClientEntry { _ = responsesStore.delete(respId) }
+            return
+        }
 
-        let (finalResource, nextHistory) = Self.finalizeResponse(
+        let (finalResource, nextHistory) = OpenAIResponsesMapper.finalizeResponse(
             template: template, req: req, chatReq: chatReq, result: result, baseHistory: conversationMessages,
-            hasActiveTools: hasActiveTools, allowReasoningTags: allowReasoningTags,
+            hasActiveTools: streamPolicy.hasActiveTools, allowReasoningTags: streamPolicy.allowReasoningTags,
             thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
         )
         if shouldStore {
@@ -190,7 +212,7 @@ extension QWHttpServer {
                 request: chatReq, onToken: nil, shouldStop: { Task.isCancelled }
             )
             if Task.isCancelled { return }
-            let (finalResource, nextHistory) = Self.finalizeResponse(
+            let (finalResource, nextHistory) = OpenAIResponsesMapper.finalizeResponse(
                 template: template, req: template.req, chatReq: chatReq, result: result, baseHistory: baseHistory,
                 hasActiveTools: hasActiveTools, allowReasoningTags: allowReasoningTags,
                 thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
@@ -214,26 +236,20 @@ extension QWHttpServer {
         chatReq: ChatCompletionRequest,
         baseHistory: [ChatMessage],
         shouldStore: Bool,
-        hasActiveTools: Bool,
-        allowReasoningTags: Bool,
+        reservedClientEntry: Bool,
+        streamPolicy: QWChatStreamPolicy,
         thinkingExplicitlyDisabled: Bool
     ) async throws {
         let shouldStop = generationShouldStop(for: connection)
         let serverConfig = actor.getConfig()
-        let isConstrainedJson = (chatReq.responseFormatType == "json_schema" || chatReq.responseFormatType == "json_object") && !hasActiveTools
-        let (shouldThink, _) = chatReq.resolvedThinkingPolicy(
-            defaultEnableThinking: serverConfig.enableThinking,
-            defaultMaxTokens: serverConfig.maxTokens,
-            modelMaxLength: serverConfig.modelMaxLength
-        )
-        let initialShouldThink = shouldThink && actor.supportsThinkingTags() && !thinkingExplicitlyDisabled
         let streamParser = QWChatStreamParser(
-            startsInReasoning: initialShouldThink,
-            allowToolCalls: hasActiveTools,
-            allowReasoningTags: allowReasoningTags || (initialShouldThink && !thinkingExplicitlyDisabled)
+            startsInReasoning: streamPolicy.shouldThink,
+            allowToolCalls: streamPolicy.allowToolCalls,
+            allowReasoningTags: streamPolicy.allowReasoningTags
         )
-        let emitter = ResponsesSSECoordinator(connection: connection, template: template)
-        defer { emitter.stopAll() }
+        let session = makeSSESession(for: connection, format: .sse, extraHeaders: extraHeaders)
+        let emitter = ResponsesSSECoordinator(session: session, template: template)
+        defer { session.stopAll() }
 
         let result: ChatCompletionExecutionResult
         do {
@@ -241,17 +257,24 @@ extension QWHttpServer {
                 request: chatReq,
                 onStreamReady: { [weak self] in
                     guard let self else { return }
-                    let readyShouldThink = shouldThink && self.actor.supportsThinkingTags() && !thinkingExplicitlyDisabled
-                    let readyAllowTags = (!isConstrainedJson || readyShouldThink) && !thinkingExplicitlyDisabled
-                    streamParser.setStartsInReasoning(readyShouldThink, allowReasoningTags: readyAllowTags)
-                    self.sendSSEHeaders(connection, extraHeaders: extraHeaders)
+                    let readyPolicy = QWChatPolicyResolver.resolveStreamPolicy(
+                        for: chatReq,
+                        defaultEnableThinking: serverConfig.enableThinking,
+                        defaultMaxTokens: serverConfig.maxTokens,
+                        modelMaxLength: serverConfig.modelMaxLength,
+                        supportsThinkingTags: self.actor.supportsThinkingTags(),
+                        thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
+                    )
+                    streamParser.setStartsInReasoning(
+                        readyPolicy.shouldThink,
+                        allowReasoningTags: readyPolicy.allowReasoningTags
+                    )
+                    session.begin()
                     emitter.emitLifecycleEvent(type: "response.created", status: "in_progress")
                     emitter.emitLifecycleEvent(type: "response.in_progress", status: "in_progress")
-                    let (gate, task) = self.startSSEKeepalive(connection: connection)
-                    emitter.markStarted(gate: gate, task: task)
                 },
                 onToken: { piece in
-                    emitter.stopKeepaliveIfRunning()
+                    session.stopKeepaliveIfRunning()
                     for delta in streamParser.feed(piece) {
                         emitter.handleDelta(delta, allowReasoning: !thinkingExplicitlyDisabled)
                     }
@@ -259,8 +282,9 @@ extension QWHttpServer {
                 shouldStop: shouldStop
             )
         } catch {
+            if reservedClientEntry { _ = responsesStore.delete(template.id) }
             if shouldStop() { return }
-            if !emitter.isStarted {
+            if !session.isStarted {
                 sendChatError(connection, error: error, path: "/v1/responses")
                 return
             }
@@ -269,16 +293,21 @@ extension QWHttpServer {
                 status: "failed", completedAt: nil, output: [], usage: nil,
                 error: OpenAIResponseResource.ErrorInfo(code: code, message: "\(error)")
             )
-            emitter.emitTerminalEvent(type: "response.failed", resource: failed)
-            emitter.sendDoneAndClose()
+            emitter.finishWithFailed(failed)
             return
         }
 
-        guard !shouldStop() else { return }
+        if shouldStop() {
+            if reservedClientEntry { _ = responsesStore.delete(template.id) }
+            return
+        }
         for delta in streamParser.finish() {
             emitter.handleDelta(delta, allowReasoning: !thinkingExplicitlyDisabled)
         }
-        let parsed = streamParser.result(tools: hasActiveTools ? chatReq.tools : nil, truncated: result.truncated)
+        let parsed = streamParser.result(
+            tools: streamPolicy.allowToolCalls ? chatReq.tools : nil,
+            truncated: result.truncated
+        )
         let cappedCalls = OpenAIResponsesMapper.capToolCalls(
             parsed.toolCalls, parallelToolCalls: template.req.parallelToolCalls, maxToolCalls: template.req.maxToolCalls
         )
@@ -289,7 +318,7 @@ extension QWHttpServer {
         }
         emitter.ensureAtLeastOneItem(status: itemStatus)
 
-        let (finalResource, nextHistory) = Self.buildFinalizedResource(
+        let (finalResource, nextHistory) = OpenAIResponsesMapper.buildFinalizedResource(
             template: template, parsed: parsed, effectiveCalls: cappedCalls, result: result,
             baseHistory: baseHistory, thinkingExplicitlyDisabled: thinkingExplicitlyDisabled,
             streamedItemIDs: emitter.snapshotItemIDs
@@ -298,119 +327,7 @@ extension QWHttpServer {
             responsesStore.put(QWResponsesStore.StoredResponse(resource: finalResource, historyMessages: nextHistory))
         }
         let terminalType = result.truncated ? "response.incomplete" : "response.completed"
-        emitter.emitTerminalEvent(type: terminalType, resource: finalResource)
-        emitter.sendDoneAndClose()
-    }
-
-    static func finalizeResponse(
-        template: OpenAIResponseTemplate,
-        req: OpenAIResponseCreateRequest,
-        chatReq: ChatCompletionRequest,
-        result: ChatCompletionExecutionResult,
-        baseHistory: [ChatMessage],
-        hasActiveTools: Bool,
-        allowReasoningTags: Bool,
-        thinkingExplicitlyDisabled: Bool
-    ) -> (OpenAIResponseResource, [ChatMessage]) {
-        let isConstrainedJson = (chatReq.responseFormatType == "json_schema" || chatReq.responseFormatType == "json_object") && !hasActiveTools
-        let effectiveStartsInThinking = result.startsInThinking && !thinkingExplicitlyDisabled
-        let effectiveAllowTags = allowReasoningTags || ((!isConstrainedJson || effectiveStartsInThinking) && !thinkingExplicitlyDisabled)
-        let parsed = QWToolCallParser.parse(
-            text: result.content, tools: chatReq.tools,
-            startsInThinking: effectiveStartsInThinking,
-            truncated: result.truncated, allowToolCalls: hasActiveTools, allowReasoningTags: effectiveAllowTags
-        )
-        let cappedCalls = OpenAIResponsesMapper.capToolCalls(
-            parsed.toolCalls, parallelToolCalls: req.parallelToolCalls, maxToolCalls: req.maxToolCalls
-        )
-        return buildFinalizedResource(
-            template: template, parsed: parsed, effectiveCalls: cappedCalls, result: result,
-            baseHistory: baseHistory, thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
-        )
-    }
-
-    struct StreamedItemIDs: Sendable {
-        var reasoningId: String? = nil
-        var messageId: String? = nil
-        var functionCallIds: [String] = []
-    }
-
-    static func buildFinalizedResource(
-        template: OpenAIResponseTemplate,
-        parsed: QWToolCallParser.ParseResult,
-        effectiveCalls: [ToolCall]?,
-        result: ChatCompletionExecutionResult,
-        baseHistory: [ChatMessage],
-        thinkingExplicitlyDisabled: Bool,
-        streamedItemIDs: StreamedItemIDs? = nil
-    ) -> (OpenAIResponseResource, [ChatMessage]) {
-        let itemStatus = result.truncated ? "incomplete" : "completed"
-        var outputItems: [QWJson] = []
-        let reasoningText = thinkingExplicitlyDisabled ? nil : parsed.reasoningContent
-        if let rText = reasoningText, !rText.isEmpty {
-            let rid = streamedItemIDs?.reasoningId ?? ("rs_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16))
-            outputItems.append(.object([
-                ("type", .string("reasoning")),
-                ("id", .string(rid)),
-                ("summary", .array([.object([("type", .string("summary_text")), ("text", .string(rText))])]))
-            ]))
-        }
-        let msgId = streamedItemIDs?.messageId ?? ("msg_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16))
-        if let text = parsed.content, !text.isEmpty {
-            outputItems.append(makeMessageOutputItem(id: msgId, text: text, status: itemStatus))
-        } else if effectiveCalls?.isEmpty ?? true {
-            outputItems.append(makeMessageOutputItem(id: msgId, text: parsed.content ?? "", status: itemStatus))
-        }
-        for (idx, call) in (effectiveCalls ?? []).enumerated() {
-            let fcid = (streamedItemIDs?.functionCallIds.indices.contains(idx) == true
-                ? streamedItemIDs?.functionCallIds[idx] : nil)
-                ?? ("fc_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16))
-            outputItems.append(.object([
-                ("type", .string("function_call")),
-                ("id", .string(fcid)),
-                ("call_id", .string(call.id)),
-                ("name", .string(call.function.name)),
-                ("arguments", .string(call.function.arguments)),
-                ("status", .string(itemStatus))
-            ]))
-        }
-
-        let rToks = thinkingExplicitlyDisabled ? 0 : (result.reasoningTokens ?? 0)
-        let usage = OpenAIResponseResource.UsageInfo(
-            inputTokens: result.promptTokens, outputTokens: result.completionTokens,
-            cachedTokens: result.cachedTokens, reasoningTokens: rToks
-        )
-        let incomplete = result.truncated
-            ? OpenAIResponseResource.IncompleteDetails(reason: "max_output_tokens")
-            : nil
-        let resource = template.makeResource(
-            status: result.truncated ? "incomplete" : "completed",
-            completedAt: Int(Date().timeIntervalSince1970),
-            output: outputItems,
-            usage: usage,
-            incompleteDetails: incomplete
-        )
-
-        var nextHistory = baseHistory
-        nextHistory.append(ChatMessage(
-            role: "assistant",
-            content: parsed.content.map { ChatMessageContent(string: $0) },
-            toolCalls: effectiveCalls,
-            reasoningContent: reasoningText
-        ))
-        return (resource, nextHistory)
-    }
-
-    private static func makeMessageOutputItem(id: String, text: String, status: String) -> QWJson {
-        .object([
-            ("type", .string("message")),
-            ("id", .string(id)),
-            ("status", .string(status)),
-            ("role", .string("assistant")),
-            ("content", .array([.object([
-                ("type", .string("output_text")), ("text", .string(text)), ("annotations", .array([]))
-            ])]))
-        ])
+        emitter.finishWithCompleted(type: terminalType, resource: finalResource)
     }
 }
 
@@ -426,11 +343,8 @@ private final class ResponsesSSECoordinator: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private let connection: NWConnection
+    private let session: QWSSESession
     private let template: OpenAIResponseTemplate
-    private var started = false
-    private var keepaliveGate: QWStreamKeepaliveGate?
-    private var keepaliveTask: Task<Void, Never>?
     private var seq = 0
     private var nextOutputIndex = 0
     private var reasoningId: String? = nil
@@ -443,16 +357,14 @@ private final class ResponsesSSECoordinator: @unchecked Sendable {
     private var messageClosed = false
     private var functionCallIds: [String] = []
 
-    init(connection: NWConnection, template: OpenAIResponseTemplate) {
-        self.connection = connection
+    init(session: QWSSESession, template: OpenAIResponseTemplate) {
+        self.session = session
         self.template = template
     }
 
-    var isStarted: Bool { lock.withLock { started } }
-
-    var snapshotItemIDs: QWHttpServer.StreamedItemIDs {
+    var snapshotItemIDs: OpenAIResponsesMapper.StreamedItemIDs {
         lock.withLock {
-            QWHttpServer.StreamedItemIDs(
+            OpenAIResponsesMapper.StreamedItemIDs(
                 reasoningId: reasoningId,
                 messageId: messageId,
                 functionCallIds: functionCallIds
@@ -460,37 +372,25 @@ private final class ResponsesSSECoordinator: @unchecked Sendable {
         }
     }
 
-    func markStarted(gate: QWStreamKeepaliveGate, task: Task<Void, Never>) {
-        lock.withLock {
-            started = true
-            keepaliveGate = gate
-            keepaliveTask = task
-        }
-    }
-
-    func stopKeepaliveIfRunning() {
-        let t = lock.withLock { () -> Task<Void, Never>? in
-            guard let g = keepaliveGate, g.stopIfRunning() else { return nil }
-            return keepaliveTask
-        }
-        t?.cancel()
-    }
-
-    func stopAll() {
-        let (g, t) = lock.withLock { (keepaliveGate, keepaliveTask) }
-        g?.stop()
-        t?.cancel()
-    }
-
     func emitLifecycleEvent(type: String, status: String) {
         let resource = template.makeResource(status: status, completedAt: nil, output: [], usage: nil)
         let s = lock.withLock { () -> Int in let v = seq; seq += 1; return v }
-        sendEncoded(type: type, object: LifecyclePayload(type: type, sequenceNumber: s, response: resource))
+        session.sendSSENamedEvent(event: type, object: LifecyclePayload(type: type, sequenceNumber: s, response: resource))
     }
 
-    func emitTerminalEvent(type: String, resource: OpenAIResponseResource) {
+    func finishWithFailed(_ resource: OpenAIResponseResource) {
         let s = lock.withLock { () -> Int in let v = seq; seq += 1; return v }
-        sendEncoded(type: type, object: LifecyclePayload(type: type, sequenceNumber: s, response: resource))
+        session.finishWithNamedSSEErrorObject(
+            event: "response.failed",
+            object: LifecyclePayload(type: "response.failed", sequenceNumber: s, response: resource),
+            doneMarker: true
+        )
+    }
+
+    func finishWithCompleted(type: String, resource: OpenAIResponseResource) {
+        let s = lock.withLock { () -> Int in let v = seq; seq += 1; return v }
+        session.sendSSENamedEvent(event: type, object: LifecyclePayload(type: type, sequenceNumber: s, response: resource))
+        session.finish(doneMarker: true)
     }
 
     func handleDelta(_ delta: QWChatStreamParser.Delta, allowReasoning: Bool) {
@@ -625,12 +525,6 @@ private final class ResponsesSSECoordinator: @unchecked Sendable {
         }
     }
 
-    func sendDoneAndClose() {
-        connection.send(content: Data("data: [DONE]\n\n".utf8), isComplete: true, completion: .contentProcessed({ _ in
-            self.connection.cancel()
-        }))
-    }
-
     private func closeReasoningIfNeeded() {
         let info = lock.withLock { () -> (id: String, idx: Int, text: String)? in
             guard let id = reasoningId, let idx = reasoningIndex, !reasoningClosed else { return nil }
@@ -682,18 +576,6 @@ private final class ResponsesSSECoordinator: @unchecked Sendable {
         var body = fields
         body["type"] = type
         body["sequence_number"] = s
-        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        var out = Data("event: \(type)\ndata: ".utf8)
-        out.append(data)
-        out.append(Data("\n\n".utf8))
-        connection.send(content: out, isComplete: false, completion: .idempotent)
-    }
-
-    private func sendEncoded<T: Encodable>(type: String, object: T) {
-        guard let data = try? JSONEncoder().encode(object) else { return }
-        var out = Data("event: \(type)\ndata: ".utf8)
-        out.append(data)
-        out.append(Data("\n\n".utf8))
-        connection.send(content: out, isComplete: false, completion: .idempotent)
+        session.sendSSEJsonObject(event: type, fields: body)
     }
 }

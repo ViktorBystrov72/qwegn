@@ -163,9 +163,10 @@ static inline void qwg_aq_silu_pair_rows4_m(device const char* blocks,
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sgi < mRows && rBase + lane < I) {
-        const half val = tgAct[sgi * 32u + lane];
-        h16[(size_t)sgi * I + rBase + lane] = fuseFwht ? simd_fwht32(val, lane) : val;
+    if (sgi < mRows) {
+        const half val = (rBase + lane < I) ? tgAct[sgi * 32u + lane] : half(0.0h);
+        const half rot = fuseFwht ? simd_fwht32(val, lane) : val;
+        if (rBase + lane < I) h16[(size_t)sgi * I + rBase + lane] = rot;
     }
 }
 
@@ -276,9 +277,10 @@ static inline float2 qwg_aq_silu_pair_row1(device const char* blocks,
                 }                                                            \
             }                                                                \
             threadgroup_barrier(mem_flags::mem_threadgroup);                 \
-            if (sgi == 0u && rBase + lane < I) {                             \
-                const half val = tgAct[lane];                                \
-                h16[rBase + lane] = fuseFwht ? simd_fwht32(val, lane) : val; \
+            if (sgi == 0u) {                                                 \
+                const half val = (rBase + lane < I) ? tgAct[lane] : half(0.0h); \
+                const half rot = fuseFwht ? simd_fwht32(val, lane) : val;    \
+                if (rBase + lane < I) h16[rBase + lane] = rot;               \
             }                                                                \
             return;                                                          \
         }                                                                    \

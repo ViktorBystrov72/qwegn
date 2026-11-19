@@ -12,12 +12,12 @@ static inline void qwg_mtp_argmax_checked_body(
     device uint* rowHi = keysHi + (size_t)tg.y * nTG;
     device uint* rowLo = keysLo + (size_t)tg.y * nTG;
     const uint i = tg.x * 256u + tid;
-    const float v = i < N ? rowLogits[i] : -INFINITY;
+    const float v = i < N ? rowLogits[i] : 0.0f;
     const uint raw = as_type<uint>(v);
     const bool invalid = i < N && (raw & 0x7f800000u) == 0x7f800000u;
     const uint bits = canonicalZero && (raw & 0x7fffffffu) == 0u ? 0u : raw;
-    const uint hi = invalid ? 0xffffffffu : ((bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u));
-    const uint lo = invalid || i >= N ? 0u : ~i;
+    const uint hi = (i >= N) ? 0u : (invalid ? 0xffffffffu : ((bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u)));
+    const uint lo = (invalid || i >= N) ? 0u : ~i;
     const uint maxHi = simd_max(hi);
     const uint maxLo = simd_max(hi == maxHi ? lo : 0u);
     if ((tid & 31u) == 0u) { sh[tid >> 5u] = maxHi; sl[tid >> 5u] = maxLo; }

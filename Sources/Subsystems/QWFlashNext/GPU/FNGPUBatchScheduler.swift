@@ -52,18 +52,18 @@ public final class FNBatchJob: @unchecked Sendable {
     public let onTokenLogprob: ((QWTokenLogprob) -> Void)?
 
     var session: FNGPUSessionData
-    var generatedTokens: [Int] = []
+    var output = QWBatchSlotOutputState()
     var emittedLogprobsCount: Int = 0
-    var stepMs: [Double] = []
-    var stepTokenCounts: [Int] = []
-    var prefillSeconds: Double = 0
-    var decodeStart: Date?
-    var stopTokenID: Int?
+    var generatedTokens: [Int] { get { output.generated } set { output.generated = newValue } }
+    var stepMs: [Double] { get { output.stepMs } set { output.stepMs = newValue } }
+    var stepTokenCounts: [Int] { get { output.stepTokenCounts } set { output.stepTokenCounts = newValue } }
+    var prefillSeconds: Double { get { output.prefillSeconds } set { output.prefillSeconds = newValue } }
+    var decodeStart: Date? { get { output.decodeStartedAt } set { output.decodeStartedAt = newValue } }
+    var stopTokenID: Int? { get { output.stoppedToken } set { output.stoppedToken = newValue } }
     var lastToken: Int = 0
     var position: Int = 0
     var inBatchMode: Bool = false
-    let done = DispatchSemaphore(value: 0)
-    var outcome: Result<FNBatchJobOutput, any Error>?
+    let promise = QWBatchJobPromise<FNBatchJobOutput>()
 
     public init(prompt: [Int], maxNew: Int, stopIDs: Set<Int>,
                 sampling: QWSamplerConfig, useSpec: Bool, draftMode: QWDraftStrategy,
@@ -113,25 +113,16 @@ public final class FNBatchJob: @unchecked Sendable {
 
 /// Tracks requests currently rendering chat templates / tokenizing on the server so concurrent bursts coalesce cleanly.
 public enum FNBatchAdmissionTracker {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var count: Int = 0
-
     public static func beginPreparing() {
-        lock.lock()
-        count += 1
-        lock.unlock()
+        QWBatchAdmissionCounter.beginPreparing()
     }
 
     public static func endPreparing() {
-        lock.lock()
-        count = max(0, count - 1)
-        lock.unlock()
+        QWBatchAdmissionCounter.endPreparing()
     }
 
     public static var preparingCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return count
+        QWBatchAdmissionCounter.preparingCount
     }
 }
 
@@ -140,10 +131,7 @@ public final class FNGPUBatchScheduler: @unchecked Sendable {
     public static let maxSlots = 4
 
     unowned let engine: FNGPUEngine
-    let lock = NSLock()
-    var pendingQueue: [FNBatchJob] = []
-    var activeJobs: [FNBatchJob?] = [nil, nil, nil, nil]
-    var isDriving = false
+    let coordinator = QWBatchSlotCoordinator<FNBatchJob>(maxSlots: FNGPUBatchScheduler.maxSlots)
 
     var slotStates: [FNBatchSlotState]
     var batchArena: QWArena?
@@ -190,23 +178,21 @@ public final class FNGPUBatchScheduler: @unchecked Sendable {
 
     /// Submits `job` to the scheduler and returns its `FNBatchJobOutput` when completed.
     public func submit(_ job: FNBatchJob) throws -> FNBatchJobOutput {
-        lock.lock()
-        pendingQueue.append(job)
-        let becomeDriver = !isDriving
-        if becomeDriver { isDriving = true }
-        lock.unlock()
-
-        if becomeDriver {
+        if coordinator.submit(job) {
             driveLoop()
         }
-        job.done.wait()
-        return try job.outcome!.get()
+        return try job.promise.wait()
+    }
+
+    public func runExclusive<T>(_ body: () throws -> T) rethrows -> T {
+        try coordinator.runExclusive(body)
     }
 
     func slotCapacity(totalSlots: Int) -> Int {
-        guard totalSlots > 1 else { return engine.capacity }
         let compress = engine.layerRecords.compactMap(\.attn).first?.compress ?? 4
-        return max(compress, ((engine.capacity / totalSlots) / compress) * compress)
+        return QWBatchPartitionSelection.slotCapacity(
+            fullCapacity: engine.capacity, totalSlots: totalSlots, alignment: compress
+        )
     }
 
     func ensureBatchResources() throws {
@@ -368,7 +354,7 @@ public final class FNGPUBatchScheduler: @unchecked Sendable {
         let gdnFlags = engine.layerRecords.map { $0.gdn != nil }
         let pleFlags = engine.layerRecords.map { $0.weights.ple != nil }
         Self.resetExtraSlotRecurrentStates(
-            slotStates: &slotStates, gdnFlags: gdnFlags, pleFlags: pleFlags, arena: engine.arena
+            slotStates: &slotStates, gdnFlags: gdnFlags, pleFlags: pleFlags, arena: batchArena ?? engine.arena
         )
         let sCap = slotCapacity(totalSlots: Self.maxSlots)
         for s in 1..<slotStates.count {
@@ -397,30 +383,29 @@ public final class FNGPUBatchScheduler: @unchecked Sendable {
     }
 
     func finishJob(slot: Int, job: FNBatchJob, error: (any Error)? = nil) {
-        activeJobs[slot] = nil
+        coordinator.setJob(nil, at: slot)
         if let error {
-            job.outcome = .failure(error)
-        } else {
-            let decSec = job.stepMs.isEmpty ? 0 : (job.decodeStart.map { Date().timeIntervalSince($0) } ?? 0)
-            let out = FNBatchJobOutput(
-                tokens: job.generatedTokens,
-                stepMs: job.stepMs,
-                stepTokenCounts: job.stepTokenCounts,
-                prefillSeconds: job.prefillSeconds,
-                firstTokenSeconds: job.prefillSeconds,
-                decodeSeconds: decSec,
-                prefillGPUSeconds: job.session.prefillGPUSec,
-                stopTokenID: job.stopTokenID,
-                prefixCacheHit: job.session.prefixCacheHit,
-                prefixCacheMatchedTokens: job.session.prefixCacheMatchedTokens,
-                prefixCacheTier: job.session.prefixCacheTier,
-                specProposals: job.session.specProposals,
-                specAccepted: job.session.specAccepted,
-                tokenLogprobs: Array(job.session.tokenLogprobs.prefix(job.generatedTokens.count))
-            )
-            job.outcome = .success(out)
+            job.promise.complete(.failure(error))
+            return
         }
-        job.done.signal()
+        let decSec = job.stepMs.isEmpty ? 0 : (job.decodeStart.map { Date().timeIntervalSince($0) } ?? 0)
+        let out = FNBatchJobOutput(
+            tokens: job.generatedTokens,
+            stepMs: job.stepMs,
+            stepTokenCounts: job.stepTokenCounts,
+            prefillSeconds: job.prefillSeconds,
+            firstTokenSeconds: job.prefillSeconds,
+            decodeSeconds: decSec,
+            prefillGPUSeconds: job.session.prefillGPUSec,
+            stopTokenID: job.stopTokenID,
+            prefixCacheHit: job.session.prefixCacheHit,
+            prefixCacheMatchedTokens: job.session.prefixCacheMatchedTokens,
+            prefixCacheTier: job.session.prefixCacheTier,
+            specProposals: job.session.specProposals,
+            specAccepted: job.session.specAccepted,
+            tokenLogprobs: Array(job.session.tokenLogprobs.prefix(job.generatedTokens.count))
+        )
+        job.promise.complete(.success(out))
     }
 
     /// Emits `token` to `job`, returning `true` if `job` finished (hit stop token, `onToken` returned false, or reached `maxNew`).
@@ -429,21 +414,22 @@ public final class FNGPUBatchScheduler: @unchecked Sendable {
             finishJob(slot: slot, job: job, error: FNGPUError.invalidToken(token))
             return true
         }
-        if job.stopIDs.contains(token) {
-            job.stopTokenID = token
-            job.onStopToken?(token)
-            finishJob(slot: slot, job: job)
-            return true
-        }
-        job.generatedTokens.append(token)
-        job.lastToken = token
-        if job.collectLogprobs, job.emittedLogprobsCount < job.session.tokenLogprobs.count {
-            let lp = job.session.tokenLogprobs[job.emittedLogprobsCount]
-            job.emittedLogprobsCount += 1
-            job.onTokenLogprob?(lp)
-        }
-        let keepGoing = job.onToken?(token) ?? true
-        if !keepGoing || job.generatedTokens.count >= job.maxNew {
+        let accepted = job.output.recordPredictedToken(
+            token,
+            stopIDs: job.stopIDs,
+            maxNew: job.maxNew,
+            onStopToken: job.onStopToken,
+            onAccepted: { tok in
+                job.lastToken = tok
+                if job.collectLogprobs, job.emittedLogprobsCount < job.session.tokenLogprobs.count {
+                    let lp = job.session.tokenLogprobs[job.emittedLogprobsCount]
+                    job.emittedLogprobsCount += 1
+                    job.onTokenLogprob?(lp)
+                }
+                return job.onToken?(tok) ?? true
+            }
+        )
+        if !accepted || job.output.finished {
             finishJob(slot: slot, job: job)
             return true
         }

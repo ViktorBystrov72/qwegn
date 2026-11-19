@@ -164,7 +164,7 @@ extension QWEngineLifecycleActor {
         transition(to: .unloaded)
 
         let telemetry = QWEngineTelemetryRegistry.shared
-        telemetry.resetToIdle()
+        telemetry.resetToIdle(resetCacheCounters: true)
         telemetry.updateArena(reserved: 0)
         statusBox.resetLoggedSamplingMessage(nil)
         // The engine is gone, so no turn is running: absent, not empty.

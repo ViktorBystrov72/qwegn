@@ -129,17 +129,17 @@ final class QWMMTests: XCTestCase {
                 while j < S && types[j] == t { j += 1 }
                 switch t {
                 case 0:
-                    blocks.append(QWMMBlock(kind: .text, tokens: Array(0..<(j - i)), grid: nil))
+                    blocks.append(.text(Array(0..<(j - i))))
                 case 1:
                     let g = imgs[ii]; ii += 1
                     XCTAssertEqual(j - i, g.tokens, "image span ≠ grid tokens at \(name) idx \(i)")
-                    blocks.append(QWMMBlock(kind: .image, tokens: Array(repeating: 248056, count: j - i), grid: g))
+                    blocks.append(.image(tokens: Array(repeating: 248056, count: j - i), grid: g))
                 default:
                     if clipFramesLeft == 0 { clip = vids[vi]; vi += 1; clipFramesLeft = clip!.t }
                     let g = clip!
                     XCTAssertEqual(j - i, g.h * g.w / 4, "span ≠ one frame at \(name) idx \(i)")
-                    blocks.append(QWMMBlock(kind: .video, tokens: Array(repeating: 248057, count: j - i),
-                                           grid: try QWVisionGrid(t: 1, h: g.h, w: g.w)))
+                    blocks.append(.video(tokens: Array(repeating: 248057, count: j - i),
+                                         grid: try QWVisionGrid(t: 1, h: g.h, w: g.w)))
                     clipFramesLeft -= 1
                 }
                 i = j

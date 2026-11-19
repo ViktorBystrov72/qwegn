@@ -9,27 +9,6 @@ import QWHead
 import QWToken
 import QWVision
 
-public struct CompletionInvalidInputError: Error, CustomStringConvertible, Sendable {
-    public let message: String
-    public init(_ message: String) { self.message = message }
-    public var description: String { message }
-}
-
-public struct CompletionExecutionChoice: Sendable {
-    public let index: Int
-    public let text: String
-    public let finishReason: String
-    public let promptTokens: Int
-    public let completionTokens: Int
-    public let logprobs: CompletionLogprobs?
-}
-
-public struct CompletionExecutionResult: Sendable {
-    public let choices: [CompletionExecutionChoice]
-    public let totalPromptTokens: Int
-    public let totalCompletionTokens: Int
-}
-
 private final class QWSingleTokenConstraint: QWTokenConstraint, @unchecked Sendable {
     private let tokenId: Int
     private let vocabularySize: Int
@@ -58,9 +37,8 @@ private typealias CompletionLPEntry = (tok: String, lp: Float?, top: [String: Fl
 private final class RawCompletionCapture: @unchecked Sendable {
     private let lock = NSLock()
     let tok: QWTokenizer
-    let customStops: [String]
+    let stopScanner: QWEngineLifecycleActor.IncrementalStopScanner
     var decoder: QWStreamDecoder
-    var fullText = ""
     var fullUTF8: [UInt8] = []
     var emittedUTF8 = 0
     var stoppedByCustomRule = false
@@ -77,7 +55,7 @@ private final class RawCompletionCapture: @unchecked Sendable {
         shouldStop: (@Sendable () -> Bool)?
     ) {
         self.tok = tok
-        self.customStops = customStops
+        self.stopScanner = QWEngineLifecycleActor.IncrementalStopScanner(stops: customStops)
         self.decoder = QWStreamDecoder(tok)
         self.streamOffset = streamOffset
         self.choiceIdx = choiceIdx
@@ -94,26 +72,70 @@ private final class RawCompletionCapture: @unchecked Sendable {
         }
     }
 
-    func emitUpTo(_ utf8Limit: Int) {
-        let emitted: (String, CompletionLogprobs?)? = lock.withLock {
-            guard let _ = onChoiceToken, utf8Limit > emittedUTF8, utf8Limit <= fullUTF8.count else {
-                emittedUTF8 = max(emittedUTF8, utf8Limit)
-                return nil
-            }
-            guard let str = String(bytes: fullUTF8[emittedUTF8..<utf8Limit], encoding: .utf8), !str.isEmpty else {
-                return nil
-            }
-            emittedUTF8 = utf8Limit
-            let lpChunk: CompletionLogprobs? = pendingLPEntries.isEmpty
-                ? nil
-                : QWEngineLifecycleActor.buildCompletionLogprobs(entries: pendingLPEntries, startOffset: streamOffset)
-            streamOffset += str.count
-            pendingLPEntries.removeAll(keepingCapacity: true)
-            return (str, lpChunk)
+    func processToken(_ id: Int) -> Bool {
+        if shouldStop?() == true || Task.isCancelled {
+            lock.withLock { stoppedByCustomRule = true }
+            return false
         }
-        if let (str, lpChunk) = emitted {
+        let result: (shouldContinue: Bool, emitted: (String, CompletionLogprobs?)?) = lock.withLock {
+            guard let piece = try? decoder.decode(id, skipSpecialTokens: true), !piece.isEmpty else {
+                return (true, nil)
+            }
+            let prevCount = fullUTF8.count
+            fullUTF8.append(contentsOf: piece.utf8)
+            if !stopScanner.isEmpty {
+                if let match = stopScanner.firstMatch(in: fullUTF8, previousCount: prevCount) {
+                    stoppedByCustomRule = true
+                    fullUTF8.removeSubrange(match.byteOffset..<fullUTF8.count)
+                    return (false, takeEmissionLocked(upTo: fullUTF8.count))
+                }
+                let hold = stopScanner.heldSuffixUTF8Count(in: fullUTF8)
+                return (true, takeEmissionLocked(upTo: max(0, fullUTF8.count - hold)))
+            }
+            return (true, takeEmissionLocked(upTo: fullUTF8.count))
+        }
+        if let (str, lpChunk) = result.emitted {
             onChoiceToken?(choiceIdx, str, lpChunk)
         }
+        return result.shouldContinue
+    }
+
+    func finishAndSnapshot() -> (fullText: String, stoppedByCustomRule: Bool, logprobs: [CompletionLPEntry]) {
+        let state = lock.withLock { () -> (String, CompletionLogprobs?, String, Bool, [CompletionLPEntry]) in
+            let tail = decoder.flush()
+            if !tail.isEmpty && !stoppedByCustomRule {
+                let prevCount = fullUTF8.count
+                fullUTF8.append(contentsOf: tail.utf8)
+                if !stopScanner.isEmpty, let match = stopScanner.firstMatch(in: fullUTF8, previousCount: prevCount) {
+                    stoppedByCustomRule = true
+                    fullUTF8.removeSubrange(match.byteOffset..<fullUTF8.count)
+                }
+            }
+            let emitted = takeEmissionLocked(upTo: fullUTF8.count)
+            let fullText = String(decoding: fullUTF8, as: UTF8.self)
+            return (emitted?.0 ?? "", emitted?.1, fullText, stoppedByCustomRule, allCompletionLPEntries)
+        }
+        if !state.0.isEmpty || state.1 != nil {
+            onChoiceToken?(choiceIdx, state.0, state.1)
+        }
+        return (state.2, state.3, state.4)
+    }
+
+    private func takeEmissionLocked(upTo utf8Limit: Int) -> (String, CompletionLogprobs?)? {
+        guard onChoiceToken != nil, utf8Limit > emittedUTF8, utf8Limit <= fullUTF8.count else {
+            emittedUTF8 = max(emittedUTF8, utf8Limit)
+            return nil
+        }
+        guard let str = String(bytes: fullUTF8[emittedUTF8..<utf8Limit], encoding: .utf8), !str.isEmpty else {
+            return nil
+        }
+        emittedUTF8 = utf8Limit
+        let lpChunk: CompletionLogprobs? = pendingLPEntries.isEmpty
+            ? nil
+            : QWEngineLifecycleActor.buildCompletionLogprobs(entries: pendingLPEntries, startOffset: streamOffset)
+        streamOffset += str.count
+        pendingLPEntries.removeAll(keepingCapacity: true)
+        return (str, lpChunk)
     }
 }
 
@@ -162,21 +184,24 @@ extension QWEngineLifecycleActor {
             memoryManifest: memState.manifest,
             effectiveMaxNewTokens: hint
         )
-        let encoded = try await encodeWireIncrementallyWithSystemPrefix(
+        let encoded = try encodeWireIncrementallyWithSystemPrefix(
             wire: prepared.wire, tokenizer: tok, packPath: config.packPath,
             cachePrompt: request.effectiveCachePrompt, cacheSalt: request.effectiveCacheSalt
         )
         let imageUrls = request.extractImageUrls()
         guard !imageUrls.isEmpty else { return encoded.tokens.count }
+        try validateRequestCapabilities(request)
         let policy = QWImageDecodePolicy(
             allowDataURLs: true,
             allowLocalImagePaths: config.allowLocalImagePaths,
             allowRemoteImageURLs: config.allowRemoteImageURLs
         )
-        let mmTurn = try await QWImageDecoder.prepareMultimodalTurn(
-            promptTokens: encoded.tokens, imageUrls: imageUrls,
-            hiddenDim: loaded.descriptor.hidden, visionBackend: loaded.visionBackend, policy: policy
-        )
+        let mmTurn = try await visionCoordinator.withLock {
+            try await QWImageDecoder.prepareMultimodalTurn(
+                promptTokens: encoded.tokens, imageUrls: imageUrls,
+                hiddenDim: loaded.descriptor.hidden, visionBackend: loaded.visionBackend, policy: policy
+            )
+        }
         return mmTurn.tokens.count
     }
 
@@ -193,11 +218,14 @@ extension QWEngineLifecycleActor {
         if let maxT = request.maxTokens, maxT < 0 {
             throw CompletionInvalidInputError("max_tokens must be >= 0")
         }
-        try await selectModelIfNeeded(request.model, allowSameFamilyQuantSwitch: false)
-        await beginInFlightRequest()
+        let admitted = try await beginAdmittedRequest(
+            requestedModel: request.model,
+            allowSameFamilyQuantSwitch: false
+        )
         do {
             let res = try await executeTextCompletion(
                 request: request,
+                admitted: admitted,
                 onStreamReady: onStreamReady,
                 onEchoPrompt: onEchoPrompt,
                 onChoiceToken: onChoiceToken,
@@ -213,22 +241,31 @@ extension QWEngineLifecycleActor {
 
     nonisolated private func executeTextCompletion(
         request: CompletionRequest,
+        admitted: AdmittedRequest,
         onStreamReady: (@Sendable () async -> Void)?,
         onEchoPrompt: (@Sendable (Int, String, CompletionLogprobs?) -> Void)?,
         onChoiceToken: (@Sendable (Int, String, CompletionLogprobs?) -> Void)?,
         shouldStop: (@Sendable () -> Bool)?
     ) async throws -> CompletionExecutionResult {
-        let loaded = try await ensureLoaded()
-        let config = getConfig()
+        let loaded = admitted.loaded
+        let config = admitted.config
         let tok = loaded.tokenizer
         let vocab = loaded.descriptor.vocab
         let specialTokens = tok.resolveSpecialTokens(fallback: loaded.descriptor.specialTokens)
 
+        QWConcurrentBatchTracker.beginPreparing()
+        var preparingActive = true
+        defer {
+            if preparingActive { QWConcurrentBatchTracker.endPreparing() }
+        }
+
         let prompts = try Self.resolveCompletionPrompts(
             request.prompt, tokenizer: tok, vocabulary: vocab, specialTokens: specialTokens
         )
-        let backendBudget = loaded.modelBackend.parametersInfo.contextBudget
-        let effectiveMaxContext = min(config.maxContext, backendBudget > 0 ? backendBudget : config.maxContext)
+        let effectiveMaxContext = QWChatPolicyResolver.effectiveContextBudget(
+            configMaxContext: config.maxContext,
+            backendContextBudget: loaded.modelBackend.parametersInfo.contextBudget
+        )
         for p in prompts where p.tokens.count >= effectiveMaxContext {
             throw QWServerContextLengthError(promptTokens: p.tokens.count, maxContext: effectiveMaxContext)
         }
@@ -242,23 +279,23 @@ extension QWEngineLifecycleActor {
         let customStops = (request.ignoreEos == true) ? [] : (request.stop ?? []).filter { !$0.isEmpty }
         let usePrefixCache = request.cachePrompt ?? true
         let cacheSalt = request.cacheSalt ?? request.promptCacheKey
-        let sampling = config.samplingParameters.merging(
-            temperature: request.temperature, topP: request.topP, topK: request.topK,
-            repetitionPenalty: request.repetitionPenalty, seed: request.seed
-        )
+        let sampling = QWChatPolicyResolver.resolveSampling(for: request, config: config).parameters
 
-        var choices: [CompletionExecutionChoice] = []
-        var totalIn = 0
-        var totalOut = 0
+        @Sendable func runPrompt(
+            choiceIdx: Int,
+            promptItem: (tokens: [Int], echoText: String),
+            tracksPreparation: Bool
+        ) async throws -> CompletionExecutionChoice {
+            var localPreparing = tracksPreparation
+            if tracksPreparation { QWConcurrentBatchTracker.beginPreparing() }
+            defer { if localPreparing { QWConcurrentBatchTracker.endPreparing() } }
 
-        for (choiceIdx, promptItem) in prompts.enumerated() {
-            if shouldStop?() == true || Task.isCancelled { break }
             let promptTokens = promptItem.tokens
             let maxNew = requestedMaxNew == 0
                 ? 0
                 : min(requestedMaxNew, max(1, effectiveMaxContext - promptTokens.count))
 
-            var promptLPEntries: [(tok: String, lp: Float?, top: [String: Float]?)] = []
+            var promptLPEntries: [CompletionLPEntry] = []
             var offset = 0
             if echo {
                 if collectLP {
@@ -283,14 +320,16 @@ extension QWEngineLifecycleActor {
             }
 
             if maxNew == 0 {
+                if localPreparing {
+                    localPreparing = false
+                    QWConcurrentBatchTracker.endPreparing()
+                }
                 let lpOut = echo && collectLP ? Self.buildCompletionLogprobs(entries: promptLPEntries, startOffset: 0) : nil
                 let fullText = echo ? promptItem.echoText : ""
-                choices.append(CompletionExecutionChoice(
+                return CompletionExecutionChoice(
                     index: choiceIdx, text: fullText, finishReason: "stop",
                     promptTokens: promptTokens.count, completionTokens: 0, logprobs: lpOut
-                ))
-                totalIn += promptTokens.count
-                continue
+                )
             }
 
             var stops = specialTokens.defaultStopTokenIds
@@ -303,36 +342,7 @@ extension QWEngineLifecycleActor {
                 onChoiceToken: onChoiceToken, shouldStop: shouldStop
             )
             let tokenCallback: @Sendable (Int) -> Bool = { id in
-                if capture.shouldStop?() == true || Task.isCancelled {
-                    capture.stoppedByCustomRule = true
-                    return false
-                }
-                guard let piece = try? capture.decoder.decode(id, skipSpecialTokens: true), !piece.isEmpty else {
-                    return true
-                }
-                capture.fullText += piece
-                capture.fullUTF8.append(contentsOf: piece.utf8)
-                if !capture.customStops.isEmpty {
-                    var earliest: Range<String.Index>? = nil
-                    for s in capture.customStops {
-                        if let r = capture.fullText.range(of: s),
-                           earliest.map({ r.lowerBound < $0.lowerBound }) ?? true {
-                            earliest = r
-                        }
-                    }
-                    if let r = earliest {
-                        capture.stoppedByCustomRule = true
-                        capture.fullText = String(capture.fullText[..<r.lowerBound])
-                        capture.fullUTF8 = Array(capture.fullText.utf8)
-                        capture.emitUpTo(capture.fullUTF8.count)
-                        return false
-                    }
-                    let hold = QWEngineLifecycleActor.heldStopSuffixUTF8(capture.fullText, stops: capture.customStops)
-                    capture.emitUpTo(max(0, capture.fullUTF8.count - hold))
-                } else {
-                    capture.emitUpTo(capture.fullUTF8.count)
-                }
-                return true
+                capture.processToken(id)
             }
 
             var lpCallback: (@Sendable (QWTokenLogprob) -> Void)? = nil
@@ -357,6 +367,10 @@ extension QWEngineLifecycleActor {
                 cacheSalt: cacheSalt
             )
 
+            if localPreparing {
+                localPreparing = false
+                QWConcurrentBatchTracker.endPreparing()
+            }
             let metrics = try await withCheckedThrowingContinuation { cont in
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
@@ -368,49 +382,75 @@ extension QWEngineLifecycleActor {
                 }
             }
 
-            let tail = capture.decoder.flush()
-            if !tail.isEmpty && !capture.stoppedByCustomRule {
-                capture.fullText += tail
-                capture.fullUTF8.append(contentsOf: tail.utf8)
-            }
-            if !customStops.isEmpty {
-                for s in customStops {
-                    if let r = capture.fullText.range(of: s) {
-                        capture.stoppedByCustomRule = true
-                        capture.fullText = String(capture.fullText[..<r.lowerBound])
-                        capture.fullUTF8 = Array(capture.fullText.utf8)
-                        break
-                    }
-                }
-            }
-            capture.emitUpTo(capture.fullUTF8.count)
-
+            let snap = capture.finishAndSnapshot()
             let completionCount = metrics.tokens.count
-            let truncated = !capture.stoppedByCustomRule
+            let truncated = !snap.stoppedByCustomRule
                 && (completionCount >= maxNew)
                 && (metrics.tokens.last.map { !stops.contains($0) } ?? true)
             let finishReason = truncated ? "length" : "stop"
             let suffixStr = (!truncated ? request.suffix : nil) ?? ""
-            let finalChoiceText = (echo ? promptItem.echoText : "") + capture.fullText + suffixStr
+            let finalChoiceText = (echo ? promptItem.echoText : "") + snap.fullText + suffixStr
 
             var finalLogprobs: CompletionLogprobs? = nil
             if collectLP {
                 let completionEntries: [CompletionLPEntry]
-                if !capture.allCompletionLPEntries.isEmpty {
-                    completionEntries = capture.allCompletionLPEntries
+                if !snap.logprobs.isEmpty {
+                    completionEntries = snap.logprobs
                 } else {
-                    completionEntries = metrics.tokenLogprobs.map { completionLogprobTuple(from: $0, tokenizer: tok, topCount: topLPCount) }
+                    completionEntries = metrics.tokenLogprobs.map {
+                        completionLogprobTuple(from: $0, tokenizer: tok, topCount: topLPCount)
+                    }
                 }
                 let combined = echo ? (promptLPEntries + completionEntries) : completionEntries
                 finalLogprobs = Self.buildCompletionLogprobs(entries: combined, startOffset: 0)
             }
 
-            choices.append(CompletionExecutionChoice(
+            return CompletionExecutionChoice(
                 index: choiceIdx, text: finalChoiceText, finishReason: finishReason,
                 promptTokens: promptTokens.count, completionTokens: completionCount, logprobs: finalLogprobs
-            ))
-            totalIn += promptTokens.count
-            totalOut += completionCount
+            )
+        }
+
+        var choices: [CompletionExecutionChoice] = []
+        var totalIn = 0
+        var totalOut = 0
+
+        if prompts.count > 1 && !echo && requestedMaxNew > 0 {
+            preparingActive = false
+            QWConcurrentBatchTracker.endPreparing()
+            var byIdx = [CompletionExecutionChoice?](repeating: nil, count: prompts.count)
+            try await withThrowingTaskGroup(of: CompletionExecutionChoice.self) { group in
+                for (choiceIdx, promptItem) in prompts.enumerated() {
+                    group.addTask {
+                        try await runPrompt(choiceIdx: choiceIdx, promptItem: promptItem, tracksPreparation: true)
+                    }
+                }
+                for try await c in group {
+                    byIdx[c.index] = c
+                }
+            }
+            for c in byIdx.compactMap({ $0 }) {
+                choices.append(c)
+                totalIn += c.promptTokens
+                totalOut += c.completionTokens
+            }
+        } else {
+            for (choiceIdx, promptItem) in prompts.enumerated() {
+                if shouldStop?() == true || Task.isCancelled { break }
+                let tracksLocal = !preparingActive
+                if choiceIdx == 0 && preparingActive {
+                    preparingActive = false
+                    QWConcurrentBatchTracker.endPreparing()
+                }
+                let c = try await runPrompt(
+                    choiceIdx: choiceIdx,
+                    promptItem: promptItem,
+                    tracksPreparation: tracksLocal
+                )
+                choices.append(c)
+                totalIn += c.promptTokens
+                totalOut += c.completionTokens
+            }
         }
 
         return CompletionExecutionResult(choices: choices, totalPromptTokens: totalIn, totalCompletionTokens: totalOut)
@@ -468,8 +508,10 @@ extension QWEngineLifecycleActor {
         if ids.isEmpty && !rawText.isEmpty, let singleId = tok.tokenId(for: rawText) {
             ids = [singleId]
         }
-        let backendBudget = loaded.modelBackend.parametersInfo.contextBudget
-        let effectiveMaxContext = min(config.maxContext, backendBudget > 0 ? backendBudget : config.maxContext)
+        let effectiveMaxContext = QWChatPolicyResolver.effectiveContextBudget(
+            configMaxContext: config.maxContext,
+            backendContextBudget: loaded.modelBackend.parametersInfo.contextBudget
+        )
         let maxModelLen = effectiveMaxContext > 0 ? effectiveMaxContext : config.maxContext
         return TokenizeResponse(tokens: ids, count: ids.count, maxModelLen: maxModelLen)
     }
@@ -504,7 +546,27 @@ extension QWEngineLifecycleActor {
         guard !promptTokens.isEmpty else { return [] }
         let firstStr = (try? tok.decode([promptTokens[0]], skipSpecialTokens: false)) ?? ""
         var out: [CompletionLPEntry] = [(firstStr, nil, nil)]
+        guard promptTokens.count > 1 else { return out }
         let greedy = QWSamplingParameters(temperature: 0, topP: 1, topK: 1, repetitionPenalty: 1.0)
+        if let singlePass = try await withCheckedThrowingContinuation({ (cont: CheckedContinuation<[QWTokenLogprob]?, any Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    cont.resume(returning: try backend.computePromptLogprobs(
+                        promptTokens: promptTokens,
+                        topLogprobsCount: topLPCount,
+                        sampling: greedy,
+                        shouldStop: shouldStop
+                    ))
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }) {
+            out.append(contentsOf: singlePass.map {
+                completionLogprobTuple(from: $0, tokenizer: tok, topCount: topLPCount)
+            })
+            return out
+        }
         for i in 1..<promptTokens.count {
             if shouldStop?() == true || Task.isCancelled { break }
             let targetId = promptTokens[i]

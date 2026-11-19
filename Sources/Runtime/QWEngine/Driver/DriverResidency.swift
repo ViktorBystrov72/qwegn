@@ -2,16 +2,18 @@
 // The planner sizes the resident bank to the memory budget the tuning's
 // memory policy names; the rest of each layer's experts stream from SSD.
 import Foundation
+import Metal
 import os
 import QWCore
 import QWHAL
 import QWHead
 import QWGDN
 import QWKV
+import QWMTP
 import QWQuant
 
 extension QWEngineDriver {
-    private static let cachedPackFormats = OSAllocatedUnfairLock<[String: QWWeightFormat]>(initialState: [:])
+    private static let cachedPackFormats = OSAllocatedUnfairLock<[String: (format: QWWeightFormat, headQ4g: Bool)]>(initialState: [:])
 
     /// Default OS RAM reserve (GiB) per memory policy when `osReserveGiB` is not explicitly set:
     /// 16 GiB under `.maxResident` and 24 GiB under `.safe` (matching `docs/benchmarks.md`).
@@ -33,105 +35,128 @@ extension QWEngineDriver {
         let physical = min(QWCapacityBudget.availableBytes(osReserveGiB: reserveGiB), arenaCap)
         guard let live = liveReclaimableBytes else { return physical }
         let headroom = policy == .safe ? QWEngineTuning.safeHeadroomBytes : (4 << 30)
-        return min(physical, max(1 << 30, live - headroom))
+        return min(physical, max(0, live - headroom))
+    }
+
+    static func prefillTransientBreakdown(
+        geometry: QWModelGeometry,
+        maxPrefillChunk: Int = 4096,
+        useGroupedNAX: Bool = true
+    ) -> (persistent: Int, attnTransient: Int, mlpTransient: Int) {
+        QWScratchArenaBuilder.prefillTransientBreakdown(
+            geometry: geometry, maxPrefillChunk: maxPrefillChunk, useGroupedNAX: useGroupedNAX)
+    }
+
+    static func prefillBytesPerToken(
+        geometry: QWModelGeometry,
+        maxPrefillChunk: Int = 4096,
+        useGroupedNAX: Bool = true,
+        aliasBranches: Bool
+    ) -> Int {
+        QWScratchArenaBuilder.prefillBytesPerToken(
+            geometry: geometry, maxPrefillChunk: maxPrefillChunk,
+            useGroupedNAX: useGroupedNAX, aliasBranches: aliasBranches)
+    }
+
+    static func mhcSplitBufferBytes(geometry: QWModelGeometry) -> Int {
+        guard let cfg = geometry.mhcConfig,
+              ProcessInfo.processInfo.environment["QW_MHC_SPLIT"] != "0" else { return 0 }
+        let parts = (geometry.hidden + 63) / 64
+        let outs = 2 * cfg.streams + cfg.streams * cfg.streams + 1 + cfg.streams * (cfg.streams + 1) / 2
+        return QWMHCSplitRouter.maxRows * parts * outs * 4
+    }
+
+    static func externalMoEDecodeBufferBytes(
+        geometry: QWModelGeometry,
+        tuning: QWEngineTuning,
+        prefillChunkSize: Int
+    ) -> Int {
+        guard geometry.numExperts > 0, geometry.effectiveResidentExperts < geometry.numExperts else { return 0 }
+        var total = 0
+        if tuning.coldEvents { total += 4096 }
+        if tuning.expertCache {
+            total += geometry.numVirtualLayers * 4 * geometry.numExperts
+            total += max(4 * prefillChunkSize * geometry.expertsPerTok, 4096)
+        }
+        return total
+    }
+
+    static func sharedBatchMLPFixedBytes(geometry: QWModelGeometry, mtpDrafts: Int) -> Int {
+        guard mtpDrafts == 0,
+              !geometry.usesLatentOrCompressedAttention,
+              geometry.hcaConfig == nil,
+              geometry.hybridMLAConfig == nil,
+              geometry.blockSparseGQAConfig == nil else {
+            return 0
+        }
+        return QWMTPBatchedMLP.allocationBytes(geometry: geometry, rows: QWBatchHeadScratch.maxBatchRows) + 1024
+    }
+
+    private static func dflashScratchEstimate(config: QWDFlashConfig, sessionSlotCount: Int) -> Int {
+        func aligned(_ bytes: Int) -> Int { ((bytes + 4095) / 4096) * 4096 }
+        let maxCtx = config.maxCacheSize
+        let maxB = max(8, config.blockSize), maxD = maxB - 1
+        let H = config.hiddenSize, V = config.vocabSize, I = config.intermediateSize, R = config.selectorRank
+        let qDim = config.numAttentionHeads * config.headDim
+        let kvDim = config.numKeyValueHeads * config.headDim
+        let hasConv = config.convKernelSize > 0
+        let convProjDim = (2 * config.convKernelSize * H) / max(1, config.convGroupSize)
+        var total = aligned(maxCtx * config.targetLayerIds.count * H * 2) + aligned(maxCtx * H * 2)
+        total += aligned(maxCtx * 2 * kvDim * 2) + aligned(maxB * H * 4) * 2 + aligned(maxB * H * 2) * 3
+        total += aligned(maxB * 4) * 2 + (hasConv ? aligned(maxB * convProjDim * 4) : 0)
+        total += aligned(maxB * (qDim + 2 * kvDim) * 2) + aligned(maxB * qDim * 2) + aligned(maxB * I * 2)
+        total += aligned(maxD * V * 4) + aligned(maxD * 256 * 16 * 4) * 2 + aligned(maxD * 16 * 4) * 2
+        if !config.isDSpine { total += aligned(maxD * R * 4) }
+        if config.isDSpine {
+            let bc = config.bridgeCodeSize, br = config.bridgeRank
+            total += aligned(maxB * 4) + aligned(maxD * bc * 4) + aligned(maxB * bc * 2)
+            total += aligned(maxB * 3 * br * 4) + aligned(maxD * br * 2) + aligned(maxD * H * 4)
+            total += aligned(maxD * 16 * br * 2) + aligned(maxD * 16 * H * 4)
+            total += aligned(maxD * 16 * H * 2) * 2 + aligned(maxD * 16 * 16 * 4)
+        }
+        total += (2 * max(1, sessionSlotCount)) * aligned(config.numLayers * maxCtx * kvDim * 2)
+        return max(32 * 1024 * 1024, total + 16 * 1024 * 1024)
+    }
+
+    static func dflashFootprintBytes(
+        draftPackPath: String?,
+        descriptor: QWModelDescriptor,
+        mtpDrafts: Int,
+        isDFlash: Bool,
+        isDSpineBackend: Bool,
+        selectorTopK: Int? = nil,
+        physicalMemoryBytes: Int?
+    ) -> (weights: Int, scratch: Int) {
+        guard isDFlash, mtpDrafts > 0 else { return (0, 0) }
+        let slots = gdnSlotCount(physicalMemoryBytes: physicalMemoryBytes)
+        let rawPath = draftPackPath?.isEmpty == false ? draftPackPath! : QWDFlashConfig.defaultPackPath(for: descriptor)
+        let url = URL(fileURLWithPath: rawPath)
+        if !rawPath.isEmpty, FileManager.default.fileExists(atPath: url.path),
+           let cfgURL = QWModelRoot(url: url).configURL,
+           let cfgData = try? Data(contentsOf: cfgURL),
+           let dDesc = try? QWModelDescriptor.decodeDrafter(configJSON: cfgData) {
+            let dCfg = QWDFlashConfig.load(from: url, topKOverride: selectorTopK)
+            let weights = (try? QWQuant.Pack(url: url, descriptor: dDesc))
+                .map { QWDFlashDrafter.computeWeightCapacity(pack: $0, isDSpine: dCfg.isDSpine) }
+                ?? (dCfg.isDSpine ? 1_920_000_000 : 1_480_000_000)
+            return (weights, dflashScratchEstimate(config: dCfg, sessionSlotCount: slots))
+        }
+        let defaultWeights = isDSpineBackend ? 1_920_000_000 : 1_480_000_000
+        return (defaultWeights, 256 << 20)
     }
 
     /// The geometry and prefill chunk size fitting resident weights inside the UMA budget.
     static func planResidencyAndChunk(
         raw: QWModelGeometry, cfg: StartupConfig, hal: QWHal, format: QWWeightFormat, tuning: QWEngineTuning,
         osReserveGiB: Double?, prefillChunkSize: Int, maxTokens: Int, ropeRows: Int,
-        mtpDrafts: Int, mtpWeightDrafts: Int, kvMode: QWKVMode
-    ) -> (geometry: QWModelGeometry, prefillChunkSize: Int) {
-        let maxMTP0 = cfg.mtpBackend == .dflash2 ? 15 : 7
-        let arenaCap0 = max(1 << 30, hal.caps.maxWorkingSetBytes - (64 << 20))
-        let avail0 = Self.residencyBudgetBytes(policy: tuning.memoryPolicy, osReserveGiB: osReserveGiB, arenaCap: arenaCap0)
-        let chunk0 = max(32, min(QWPrefillLimits.maxRows, (prefillChunkSize / 32) * 32))
-        let useNax0 = hal.caps.isMetal4TensorCapable
-        let numV0 = raw.numVirtualLayers
-        let attnCount0 = (0..<numV0).filter { raw.isVirtualLayerFullAttention($0) }.count
-        let gdnCount0 = raw.gdnLayerCount
-        let needsMTPCache = (mtpWeightDrafts > 0 || cfg.mtpBackend == .dflash2) && mtpDrafts > 0
-        let slotCount = Self.gdnSlotCount()
-        let slotB0 = gdnCount0 * (QWSlotGeometry.recElems(geometry: raw) * 4 + QWSlotGeometry.ringElems(geometry: raw) * 2)
-        let trunkHidB0 = raw.usesMultiStreamMTPHidden
-            ? raw.mhcConfig!.streams * raw.hidden * 4
-            : raw.hidden * 2
-        let gdn0 = slotCount * slotB0 + Self.partialsScratchBytes(geometry: raw, mtpDrafts: mtpWeightDrafts > 0 ? mtpDrafts : 0, maxTokens: maxTokens)
-            + (mtpDrafts > 0 ? QWGDNReplayCheckpoint.allocationBytes(geometry: raw, layers: gdnCount0, rows: mtpDrafts + 1) : 0)
-            + (mtpDrafts > 0 ? slotCount * trunkHidB0 : 0)
-            + (1 << 20)
-        let activeAttn0 = attnCount0 + (needsMTPCache ? 1 : 0)
-        let modelCap0 = raw.maxPositionEmbeddings > 0 ? min(maxTokens, raw.maxPositionEmbeddings) : maxTokens
-        let minFitTokens0 = min(modelCap0, max(16_384, min(maxTokens, 32_768)))
-        let kv0 = Self.kvBudgetBytes(maxTokens: minFitTokens0, mtpDrafts: needsMTPCache ? mtpDrafts : 0, kvMode: kvMode, geometry: raw)
-            + Self.hcaPerTokenBytes(geometry: raw) * minFitTokens0
-            + Self.mbsaPerTokenBytes(geometry: raw, attnLayerCount: attnCount0) * minFitTokens0
-        let devEmbedEnv = cfg.environment["QW_MTP_DEVICE_EMBEDDING"] ?? cfg.environment["QW_MTP_DEVICE_EMBED"]
-        let forceDeviceEmbed = devEmbedEnv == "1"
-        let disableDeviceEmbed = devEmbedEnv == "0"
-        let fullWPlan = try? QWWeightAllocationPlan(
-            geometry: raw, ropeRows: max(ropeRows, maxTokens),
-            mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP0,
-            format: format)
-        let fullBytes0 = fullWPlan?.bytes ?? 0
-        let embedBytes0 = raw.vocab * raw.hidden * 2
-
-        func safeWeightCap(forChunk chunkRows: Int) -> Int {
-            let bpt = Self.prefillBytesPerToken(geometry: raw, maxPrefillChunk: chunkRows, useGroupedNAX: useNax0)
-            let act = chunkRows * bpt + Self.decodeAndMTPScratchBytes(
-                geometry: raw, prefillChunkRows: chunkRows, mtpDrafts: mtpDrafts,
-                maxTokens: maxTokens, useGroupedNAX: useNax0)
-            let mlaFixed = Self.mlaFixedScratchBytes(geometry: raw, prefillChunkRows: chunkRows, activeAttnLayers: activeAttn0)
-                + Self.hcaFixedScratchBytes(geometry: raw, prefillChunkRows: chunkRows)
-                + Self.mbsaFixedScratchBytes(geometry: raw, prefillChunkRows: chunkRows, attnLayerCount: attnCount0)
-                + (mtpWeightDrafts > 0 && (raw.mtpSharedLastLayer || raw.hasDedicatedMHCMTP) ? (112 << 20) : 0)
-            let baseReserve = act + gdn0 + mlaFixed + kv0 + (256 << 20)
-            let safeCapWithoutEmbed = max(1 << 30, avail0 - baseReserve)
-            let canFitDeviceEmbed = fullBytes0 > 0 && (fullBytes0 + embedBytes0 + (1 << 30) <= safeCapWithoutEmbed)
-            let mtpEmbed = (!disableDeviceEmbed && needsMTPCache
-                && (forceDeviceEmbed || canFitDeviceEmbed)) ? embedBytes0 : 0
-            return max(1 << 30, avail0 - (baseReserve + mtpEmbed))
-        }
-
-        if fullBytes0 <= safeWeightCap(forChunk: chunk0) {
-            return (raw, chunk0)
-        }
-        for candChunk in [3584, 3072, 2560, 2048, 1536, 1024, 512] where candChunk < chunk0 {
-            if fullBytes0 <= safeWeightCap(forChunk: candChunk) {
-                return (raw, candChunk)
-            }
-        }
-
-        let fallbackChunk = min(chunk0, 1024)
-        let fallbackCap = safeWeightCap(forChunk: fallbackChunk)
-        let minE = max(8, raw.expertsPerTok)
-        var chosenE = minE
-        var cand = ((raw.numExperts - 2) / 2) * 2
-        while cand >= minE {
-            let candGeo = raw.withResidentExperts(cand)
-            if let p = try? QWWeightAllocationPlan(
-                geometry: candGeo, ropeRows: max(ropeRows, maxTokens),
-                mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP0,
-                format: format),
-               p.bytes <= fallbackCap {
-                chosenE = cand
-                break
-            }
-            cand -= 2
-        }
-        return (raw.withResidentExperts(chosenE), fallbackChunk)
-    }
-
-    static func planResidentGeometry(
-        raw: QWModelGeometry, cfg: StartupConfig, hal: QWHal, format: QWWeightFormat, tuning: QWEngineTuning,
-        osReserveGiB: Double?, prefillChunkSize: Int, maxTokens: Int, ropeRows: Int,
-        mtpDrafts: Int, mtpWeightDrafts: Int, kvMode: QWKVMode
-    ) -> QWModelGeometry {
-        planResidencyAndChunk(
+        mtpDrafts: Int, mtpWeightDrafts: Int, kvMode: QWKVMode,
+        allowExpertReduction: Bool = true
+    ) throws -> (geometry: QWModelGeometry, prefillChunkSize: Int) {
+        try QWScratchArenaBuilder.planResidencyAndChunk(
             raw: raw, cfg: cfg, hal: hal, format: format, tuning: tuning,
             osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize, maxTokens: maxTokens,
-            ropeRows: ropeRows, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts, kvMode: kvMode
-        ).geometry
+            ropeRows: ropeRows, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts,
+            kvMode: kvMode, allowExpertReduction: allowExpertReduction)
     }
 
     /// Predicts the GPU memory footprint (weights, KV cache, activations/GDN scratch) and
@@ -171,108 +196,51 @@ extension QWEngineDriver {
         tuning: QWEngineTuning = .default,
         physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes()
     ) -> QWContextMemoryEstimate {
-        let clampedContext = max(64, min(1_048_576, contextTokens))
-        let rawGeometry = QWModelGeometry(descriptor: descriptor).withResidentExperts(tuning.residentExpertsPerLayer)
-        let effDrafts = max(0, mtpDrafts)
-        let isDFlash = ["dflash2", "dflash", "dspine"].contains(mtpBackend.lowercased())
-        let maxMTP = isDFlash ? 15 : 7
-        let mtpWeightDrafts = (descriptor.mtpLayers > 0 && !isDFlash) ? min(effDrafts, maxMTP) : 0
-        let needsMTPCache = (mtpWeightDrafts > 0 || isDFlash) && effDrafts > 0
-        let format: QWWeightFormat = {
-            if let path = packPath, !path.isEmpty {
-                if let hit = cachedPackFormats.withLock({ $0[path] }) { return hit }
-                let root = QWModelRoot(url: URL(fileURLWithPath: path))
-                let pk = (root.kind == .qwp1 || root.kind == nil)
-                    ? (try? QWQuant.Pack(url: URL(fileURLWithPath: path), descriptor: descriptor))
-                    : nil
-                if let choice = try? Self.weightFormatChoice(
-                    for: root, quantization: descriptor.quantization, geometry: rawGeometry,
-                    mtpDrafts: mtpWeightDrafts, pack: pk) {
-                    cachedPackFormats.withLock { $0[path] = choice.format }
-                    return choice.format
+        QWScratchArenaBuilder.estimateDriverContextMemory(
+            descriptor: descriptor, packPath: packPath, contextTokens: contextTokens,
+            kvMode: kvMode, mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
+            prefillChunkSize: prefillChunkSize, tuning: tuning,
+            physicalMemoryBytes: physicalMemoryBytes,
+            resolveFormat: { path, desc, rawGeo, weightDrafts in
+                resolvePackFormatForEstimate(
+                    packPath: path, descriptor: desc, rawGeometry: rawGeo, mtpWeightDrafts: weightDrafts)
+            })
+    }
+
+    private static func resolvePackFormatForEstimate(
+        packPath: String?,
+        descriptor: QWModelDescriptor,
+        rawGeometry: QWModelGeometry,
+        mtpWeightDrafts: Int
+    ) -> (QWWeightFormat, Bool) {
+        if let path = packPath, !path.isEmpty {
+            if let hit = cachedPackFormats.withLock({ $0[path] }) { return hit }
+            let root = QWModelRoot(url: URL(fileURLWithPath: path))
+            let isSafetensors = (root.kind == .safetensorsSingle || root.kind == .safetensorsSharded)
+            let pk = (root.kind == .qwp1 || root.kind == nil)
+                ? (try? QWQuant.Pack(url: URL(fileURLWithPath: path), descriptor: descriptor))
+                : nil
+            let resolvedHeadQ4g = isSafetensors
+                ? true
+                : ((try? pk?.entry("lm_head.weight").quantized) ?? false)
+            if let choice = try? Self.weightFormatChoice(
+                for: root, quantization: descriptor.quantization, geometry: rawGeometry,
+                mtpDrafts: mtpWeightDrafts, pack: pk) {
+                cachedPackFormats.withLock { $0[path] = (choice.format, resolvedHeadQ4g) }
+                return (choice.format, resolvedHeadQ4g)
+            }
+            if isSafetensors {
+                if let q = descriptor.quantization, let b = q.bits, let g = q.groupSize,
+                   QWAQBlock.isSupported(bits: b, group: g) {
+                    return (.nativeAffine(bits: b, groupSize: g), true)
                 }
+                return (.hq4G32, true)
             }
-            if let q = descriptor.quantization, let b = q.bits, let g = q.groupSize, QWAQBlock.isSupported(bits: b, group: g) {
-                return .nativeAffine(bits: b, groupSize: g)
-            }
-            return .hq4G32
-        }()
-        let chunkRows = max(32, min(QWPrefillLimits.maxRows, (prefillChunkSize / 32) * 32))
-        let bpt = Self.prefillBytesPerToken(geometry: rawGeometry, maxPrefillChunk: chunkRows)
-        let actBytes = chunkRows * bpt + Self.decodeAndMTPScratchBytes(
-            geometry: rawGeometry, prefillChunkRows: chunkRows, mtpDrafts: effDrafts, maxTokens: clampedContext)
-        let numV = rawGeometry.numVirtualLayers
-        let attnCount = (0..<numV).filter { rawGeometry.isVirtualLayerFullAttention($0) }.count
-        let slotCount = Self.gdnSlotCount(physicalMemoryBytes: physicalMemoryBytes)
-        let gdnCount = rawGeometry.gdnLayerCount
-        let slotBytes = gdnCount * (QWSlotGeometry.recElems(geometry: rawGeometry) * 4
-            + QWSlotGeometry.ringElems(geometry: rawGeometry) * 2)
-        let trunkHidBytes = rawGeometry.usesMultiStreamMTPHidden
-            ? rawGeometry.mhcConfig!.streams * rawGeometry.hidden * 4
-            : rawGeometry.hidden * 2
-        let gdnBytes = slotCount * slotBytes + Self.partialsScratchBytes(geometry: rawGeometry, mtpDrafts: mtpWeightDrafts > 0 ? effDrafts : 0, maxTokens: clampedContext)
-            + (effDrafts > 0 ? QWGDNReplayCheckpoint.allocationBytes(geometry: rawGeometry, layers: gdnCount, rows: effDrafts + 1) : 0)
-            + (effDrafts > 0 ? slotCount * trunkHidBytes : 0) + (1 << 20)
-        let activeAttnLayers = attnCount + (needsMTPCache ? 1 : 0)
-        let mlaFixedBytes = Self.mlaFixedScratchBytes(
-            geometry: rawGeometry, prefillChunkRows: chunkRows, activeAttnLayers: activeAttnLayers)
-            + Self.hcaFixedScratchBytes(geometry: rawGeometry, prefillChunkRows: chunkRows)
-            + Self.mbsaFixedScratchBytes(geometry: rawGeometry, prefillChunkRows: chunkRows, attnLayerCount: attnCount)
-            + (mtpWeightDrafts > 0 && (rawGeometry.mtpSharedLastLayer || rawGeometry.hasDedicatedMHCMTP) ? (112 << 20) : 0)
-        let ropeRows = max(rawGeometry.maxPositionEmbeddings, clampedContext)
-        let isMoE = rawGeometry.numExperts > 0
-        let reserveGiB = isMoE
-            ? Self.effectiveOSReserveGiB(policy: tuning.memoryPolicy, explicitReserveGiB: tuning.osReserveGiB)
-            : (tuning.osReserveGiB ?? Double(QWCapacityBudget.osReserveBytes >> 30))
-        let availBytes = max(0, (physicalMemoryBytes ?? 0) - max(0, Int((reserveGiB * Double(1 << 30)).rounded())))
-        let mbsaPerTokBytes = Self.mbsaPerTokenBytes(geometry: rawGeometry, attnLayerCount: attnCount)
-        let geometry = { () -> QWModelGeometry in
-            guard isMoE, tuning.residentExpertsPerLayer == nil, availBytes > 0 else { return rawGeometry }
-            let modelCap = rawGeometry.maxPositionEmbeddings > 0
-                ? min(clampedContext, rawGeometry.maxPositionEmbeddings)
-                : clampedContext
-            let minFitTokens = min(modelCap, max(16_384, min(clampedContext, 32_768)))
-            let minFitKV = Self.kvBudgetBytes(maxTokens: minFitTokens,
-                                              mtpDrafts: needsMTPCache ? effDrafts : 0, kvMode: kvMode, geometry: rawGeometry)
-                + Self.hcaPerTokenBytes(geometry: rawGeometry) * minFitTokens
-                + mbsaPerTokBytes * minFitTokens
-            let safeWeightCap = max(1 << 30, availBytes - (actBytes + gdnBytes + mlaFixedBytes + minFitKV + (256 << 20)))
-            let fullPlan = try? QWWeightAllocationPlan(geometry: rawGeometry, ropeRows: ropeRows, mtpDrafts: mtpWeightDrafts,
-                                                       headQ4g: true, maxMTPDrafts: maxMTP, format: format)
-            guard let fullBytes = fullPlan?.bytes, fullBytes > safeWeightCap else { return rawGeometry }
-            let minE = max(8, rawGeometry.expertsPerTok)
-            var chosenE = minE
-            var cand = ((rawGeometry.numExperts - 2) / 2) * 2
-            while cand >= minE {
-                let candGeo = rawGeometry.withResidentExperts(cand)
-                if let p = try? QWWeightAllocationPlan(geometry: candGeo, ropeRows: ropeRows, mtpDrafts: mtpWeightDrafts,
-                                                       headQ4g: true, maxMTPDrafts: maxMTP, format: format),
-                   p.bytes <= safeWeightCap {
-                    chosenE = cand; break
-                }
-                cand -= 2
-            }
-            return rawGeometry.withResidentExperts(chosenE)
-        }()
-        let weightsBytes = (try? QWWeightAllocationPlan(
-            geometry: geometry, ropeRows: ropeRows, mtpDrafts: mtpWeightDrafts,
-            headQ4g: true, maxMTPDrafts: maxMTP, format: format).bytes) ?? 0
-        let mlaPerTokBytes = geometry.usesAnyMLA
-            ? activeAttnLayers * ((geometry.indexerHeadDim * 2) / max(1, geometry.indexerCompressRatio))
-            : 0
-        let hcaPerTokBytes = Self.hcaPerTokenBytes(geometry: geometry)
-        let perTokBytes = 2 * activeAttnLayers * (QWKVCache.pageBytes(mode: kvMode, geometry: geometry) / QWKVCache.pageTokens)
-            + mlaPerTokBytes + hcaPerTokBytes + mbsaPerTokBytes
-        let kvBytes = Self.kvBudgetBytes(maxTokens: clampedContext, mtpDrafts: needsMTPCache ? effDrafts : 0, kvMode: kvMode, geometry: geometry)
-            + (mlaPerTokBytes + hcaPerTokBytes + mbsaPerTokBytes) * clampedContext
-        let scratchBytes = actBytes + gdnBytes + mlaFixedBytes
-        let fixedBytes = weightsBytes + scratchBytes
-        let requiredBytes = fixedBytes + kvBytes
-        let maxFitting = availBytes > fixedBytes ? min(1_048_576, (availBytes - fixedBytes) / max(1, perTokBytes)) : 0
-        return QWContextMemoryEstimate(
-            contextTokens: clampedContext, weightsBytes: weightsBytes, kvBytes: kvBytes,
-            scratchAndStateBytes: scratchBytes, requiredBytes: requiredBytes,
-            availableBytes: availBytes, maxFittingContext: maxFitting,
-            fits: availBytes == 0 || requiredBytes <= availBytes)
+        }
+        if let q = descriptor.quantization, let b = q.bits, let g = q.groupSize,
+           QWAQBlock.isSupported(bits: b, group: g) {
+            return (.nativeAffine(bits: b, groupSize: g), false)
+        }
+        return (.hq4G32, false)
     }
 }

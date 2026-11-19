@@ -53,7 +53,7 @@ kernel void qwg_attn_prefill_nax(const device half* qgate [[buffer(0)]],
 
     const short2 sc = BaseNAXFrag::get_coord();    // (fn, fm)
     const short sm = sc.y, sn = sc.x;
-    const short r = short(rowBase) + sm;           // this lane's frag row
+    const int r = int(rowBase) + int(sm);          // this lane's frag row
 
     // Q frags RESIDENT across the whole k-loop (16 × 8 half = 128
     // half-regs/lane; dsplit v2 lives in the bench note).
@@ -112,11 +112,11 @@ kernel void qwg_attn_prefill_nax(const device half* qgate [[buffer(0)]],
             STEEL_PRAGMA_UNROLL
             for (short ik = 0; ik < 2; ik++) {
                 thread auto& fg = Stile.frag_at(0, ik);
-                const short col0 = short(n0) + short(ik * kU) + sn;  // 4 cols
+                const int col0 = int(n0) + int(ik * kU) + int(sn);   // 4 cols
                 STEEL_PRAGMA_UNROLL
                 for (short loc = 0; loc < BaseNAXFrag::kElemsPerFrag; loc++) {
                     const short i = loc >> 2, j = loc & 3;           // row +i·8
-                    const short cc = col0 + j, rr = r + i * 8;
+                    const int cc = col0 + int(j), rr = r + int(i) * 8;
                     fg[loc] = (cc <= rr) ? (fg[loc] * scale2) : (-1e30f);
                 }
             }
@@ -198,7 +198,7 @@ kernel void qwg_attn_prefill_nax(const device half* qgate [[buffer(0)]],
                 STEEL_PRAGMA_UNROLL
                 for (short pair = 0; pair < 8; pair++) {              // 8×(2×16) dim cols
                     NAXTile<half, 1, 2> Vt;
-                    Vt.load(vdev + (n0 + uint(ik * kU)) * QW_KVROW + pair * (2 * kU),
+                    Vt.load(vdev + (size_t)(n0 + uint(ik * kU)) * QW_KVROW + pair * (2 * kU),
                             int(QW_KVROW));
                     BaseNAXFrag::mma(Otile.frag_at(0, 2 * pair),
                                      Otile.frag_at(0, 2 * pair + 1),
@@ -223,7 +223,7 @@ kernel void qwg_attn_prefill_nax(const device half* qgate [[buffer(0)]],
             const uint col0 = uint(d * kU) + uint(sn);          // dim cols 16/lane-frag
             STEEL_PRAGMA_UNROLL
             for (short i = 0; i < 2; i++) {
-                const short rr = r + i * 8;
+                const int rr = r + int(i) * 8;
                 // ABSOLUTE row clamp (v5.1 min(r, S−1) law). v1's
                 // min(tile0 + rr, S−1) double-offset the row → every tile
                 // ≥1 applied the wrong row's σ(gate). See header for the
@@ -297,7 +297,7 @@ kernel void qwg_attn_prefill_nax_x64(const device half* qgate [[buffer(0)]],
 
     const short2 sc = BaseNAXFrag::get_coord();    // (fn, fm)
     const short sm = sc.y, sn = sc.x;
-    const short r = short(rowBase) + sm;           // this lane's frag row
+    const int r = int(rowBase) + int(sm);          // this lane's frag row
 
     // Q frags RESIDENT across the whole k-loop (16 × 8 half = 128
     // half-regs/lane; dsplit v2 lives in the bench note).
@@ -351,11 +351,11 @@ kernel void qwg_attn_prefill_nax_x64(const device half* qgate [[buffer(0)]],
             STEEL_PRAGMA_UNROLL
             for (short ik = 0; ik < 2; ik++) {
                 thread auto& fg = Stile.frag_at(0, ik);
-                const short col0 = short(n0) + short(ik * kU) + sn;  // 4 cols
+                const int col0 = int(n0) + int(ik * kU) + int(sn);   // 4 cols
                 STEEL_PRAGMA_UNROLL
                 for (short loc = 0; loc < BaseNAXFrag::kElemsPerFrag; loc++) {
                     const short i = loc >> 2, j = loc & 3;           // row +i·8
-                    const short cc = col0 + j, rr = r + i * 8;
+                    const int cc = col0 + int(j), rr = r + int(i) * 8;
                     fg[loc] = (cc <= rr) ? (fg[loc] * scale2) : (-1e30f);
                 }
             }
@@ -434,7 +434,7 @@ kernel void qwg_attn_prefill_nax_x64(const device half* qgate [[buffer(0)]],
                 STEEL_PRAGMA_UNROLL
                 for (short pair = 0; pair < 8; pair++) {              // 8×(2×16) dim cols
                     NAXTile<half, 1, 2> Vt;
-                    Vt.load(vdev + (n0 + uint(ik * kU)) * QW_KVROW + pair * (2 * kU),
+                    Vt.load(vdev + (size_t)(n0 + uint(ik * kU)) * QW_KVROW + pair * (2 * kU),
                             int(QW_KVROW));
                     BaseNAXFrag::mma(Otile.frag_at(0, 2 * pair),
                                      Otile.frag_at(0, 2 * pair + 1),
@@ -460,7 +460,7 @@ kernel void qwg_attn_prefill_nax_x64(const device half* qgate [[buffer(0)]],
             const uint col0 = uint(d * kU) + uint(sn);          // dim cols 16/lane-frag
             STEEL_PRAGMA_UNROLL
             for (short i = 0; i < 2; i++) {
-                const short rr = r + i * 8;
+                const int rr = r + int(i) * 8;
                 // ABSOLUTE row clamp (v5.1 min(r, S−1) law). v1's
                 // min(tile0 + rr, S−1) double-offset the row → every tile
                 // ≥1 applied the wrong row's σ(gate). See header for the
@@ -528,7 +528,7 @@ kernel void qwg_attn_prefill_nax_quad(const device half* qgate [[buffer(0)]],
 
     const short2 sc = BaseNAXFrag::get_coord();
     const short sm = sc.y, sn = sc.x;
-    const short r = short(rowBase) + sm;
+    const int r = int(rowBase) + int(sm);
 
     NAXTile<half, 1, 1> Qf[NQ];
     STEEL_PRAGMA_UNROLL
@@ -566,11 +566,11 @@ kernel void qwg_attn_prefill_nax_quad(const device half* qgate [[buffer(0)]],
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < 2; ik++) {
             thread auto& fg = Stile.frag_at(0, ik);
-            const short col0 = short(n0) + short(ik * kU) + sn;
+            const int col0 = int(n0) + int(ik * kU) + int(sn);
             STEEL_PRAGMA_UNROLL
             for (short loc = 0; loc < BaseNAXFrag::kElemsPerFrag; loc++) {
                 const short i = loc >> 2, j = loc & 3;
-                const short cc = col0 + j, rr = r + i * 8;
+                const int cc = col0 + int(j), rr = r + int(i) * 8;
                 fg[loc] = (cc <= rr) ? (fg[loc] * scale2) : (-1e30f);
             }
         }
@@ -640,7 +640,7 @@ kernel void qwg_attn_prefill_nax_quad(const device half* qgate [[buffer(0)]],
             STEEL_PRAGMA_UNROLL
             for (short pair = 0; pair < 8; pair++) {
                 NAXTile<half, 1, 2> Vt;
-                Vt.load(vdev + (n0 + uint(ik * kU)) * QW_KVROW + pair * (2 * kU),
+                Vt.load(vdev + (size_t)(n0 + uint(ik * kU)) * QW_KVROW + pair * (2 * kU),
                         int(QW_KVROW));
                 BaseNAXFrag::mma(Otile.frag_at(0, 2 * pair),
                                  Otile.frag_at(0, 2 * pair + 1),
@@ -665,7 +665,7 @@ kernel void qwg_attn_prefill_nax_quad(const device half* qgate [[buffer(0)]],
                 const uint col0 = uint(d * kU) + uint(sn);
                 STEEL_PRAGMA_UNROLL
                 for (short i = 0; i < 2; i++) {
-                    const uint rg = min(uint(r + i * 8), S - 1u);
+                    const uint rg = min(uint(r + int(i) * 8), S - 1u);
                     const device half* grow = qgate
                         + (uint64_t)rg * QW_QPROJ_OUT
                         + head * (2u * QW_HEAD_DIM) + QW_HEAD_DIM;

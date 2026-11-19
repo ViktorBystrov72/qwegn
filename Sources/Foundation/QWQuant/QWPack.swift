@@ -53,13 +53,14 @@ public enum QWQuant {
         }
 
         private static func mapFileShared(url: URL) throws -> (UnsafeMutableRawPointer, Int) {
-            let fd = open(url.path, O_RDONLY)
+            let fd = open(url.path, O_RDONLY | O_CLOEXEC)
             guard fd >= 0 else { throw QWQuantError.modelFileMissing(url.path) }
             defer { close(fd) }
             var st = stat()
             guard fstat(fd, &st) == 0 else { throw QWQuantError.modelFileMissing(url.path) }
-            let size = Int(st.st_size)
-            guard size > 12 else { throw QWQuantError.truncated }
+            guard st.st_size > 12, let size = Int(exactly: st.st_size) else {
+                throw QWQuantError.truncated
+            }
             let raw = mmap(nil, size, PROT_READ, MAP_SHARED, fd, 0)
             guard let ptr = raw, ptr != MAP_FAILED else {
                 throw QWQuantError.modelFileMissing(url.path)
@@ -76,22 +77,24 @@ public enum QWQuant {
         /// Opens a pack and validates its v1/v2 geometry identity against `descriptor`.
         public init(url: URL, descriptor: QWModelDescriptor, skipIdentityCheck: Bool = false) throws {
             let url = try QWModelLocation(url: url).weights
-            self.url = url
             let (base, count) = try Self.mapFileShared(url: url)
-            self.rawBase = base
-            self.rawCount = count
-            let bytes = base.assumingMemoryBound(to: UInt8.self)
-            let magicSlice = UnsafeBufferPointer(start: bytes, count: 4)
-            guard String(decoding: magicSlice, as: UTF8.self) == QWQuant.magic else {
+            var mappedOwned = true
+            defer {
+                if mappedOwned, count > 0 {
+                    _ = munmap(base, count)
+                }
+            }
+            guard count >= 12 else { throw QWQuantError.truncated }
+            let rawBuf = UnsafeRawBufferPointer(start: base, count: count)
+            guard String(decoding: rawBuf[0..<4], as: UTF8.self) == QWQuant.magic else {
                 throw QWQuantError.badMagic
             }
-            var hdrLen: UInt64 = 0
-            for i in 0..<8 {
-                hdrLen |= UInt64(bytes[4 + i]) << (8 * i)
+            let hdrLenU64 = UInt64(littleEndian: rawBuf.loadUnaligned(fromByteOffset: 4, as: UInt64.self))
+            guard let hdrLen = Int(exactly: hdrLenU64), hdrLen <= count - 12 else {
+                throw QWQuantError.truncated
             }
-            let hdrStart = count - Int(hdrLen)
-            guard hdrStart >= 12 else { throw QWQuantError.truncated }
-            let hdrData = Data(bytes: base.advanced(by: hdrStart), count: Int(hdrLen))
+            let hdrStart = count - hdrLen
+            let hdrData = Data(bytes: base.advanced(by: hdrStart), count: hdrLen)
             let header = try JSONDecoder().decode(Header.self, from: hdrData)
             if !skipIdentityCheck {
                 if let mid = header.provenance.model_id {
@@ -127,8 +130,12 @@ public enum QWQuant {
                     }
                 }
             }
+            self.url = url
+            self.rawBase = base
+            self.rawCount = count
             self.header = header
             self.descriptor = descriptor
+            mappedOwned = false
         }
 
         public func entry(_ name: String) throws -> QWQTensorEntry {
@@ -149,22 +156,46 @@ public enum QWQuant {
             source: String?, sha256Source: String?, tensorCount: Int
         ) {
             let url = try QWModelLocation(url: url).weights
-            let fh = try FileHandle(forReadingFrom: url)
-            defer { try? fh.close() }
-            guard let lenData = try fh.read(upToCount: 12), lenData.count == 12 else {
+            let fd = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
+            guard fd >= 0 else { throw QWQuantError.modelFileMissing(url.path) }
+            defer { Darwin.close(fd) }
+            var st = Darwin.stat()
+            guard Darwin.fstat(fd, &st) == 0, let fileSize = UInt64(exactly: st.st_size) else {
+                throw QWQuantError.modelFileMissing(url.path)
+            }
+            guard fileSize >= 12 else { throw QWQuantError.truncated }
+            var lenData = [UInt8](repeating: 0, count: 12)
+            do {
+                try lenData.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+                    guard let base = raw.baseAddress else { throw QWQuantError.truncated }
+                    try QWPOSIX.preadExact(fd: fd, into: base, count: 12, offset: 0)
+                }
+            } catch {
                 throw QWQuantError.truncated
             }
             guard String(decoding: lenData[0..<4], as: UTF8.self) == magic else {
                 throw QWQuantError.badMagic
             }
-            var hdrLen: UInt64 = 0
-            for i in 0..<8 {
-                hdrLen |= UInt64(lenData[4 + i]) << (8 * i)
+            let hdrLen = lenData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> UInt64 in
+                UInt64(littleEndian: raw.loadUnaligned(fromByteOffset: 4, as: UInt64.self))
             }
-            let fileSize = fh.seekToEndOfFile()
-            guard fileSize >= 12 + hdrLen else { throw QWQuantError.truncated }
-            try fh.seek(toOffset: fileSize - hdrLen)
-            guard let head = try fh.read(upToCount: Int(hdrLen)) else { throw QWQuantError.truncated }
+            let (minRequired, ov) = hdrLen.addingReportingOverflow(12)
+            guard !ov, fileSize >= minRequired,
+                  let hdrCount = Int(exactly: hdrLen),
+                  let hdrOffset = Int64(exactly: fileSize - hdrLen) else {
+                throw QWQuantError.truncated
+            }
+            var head = Data(count: hdrCount)
+            if hdrCount > 0 {
+                do {
+                    try head.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+                        guard let base = raw.baseAddress else { throw QWQuantError.truncated }
+                        try QWPOSIX.preadExact(fd: fd, into: base, count: hdrCount, offset: hdrOffset)
+                    }
+                } catch {
+                    throw QWQuantError.truncated
+                }
+            }
             let h = try JSONDecoder().decode(Header.self, from: head)
             return (h.provenance.model_id, h.provenance.geometry_hash,
                     h.provenance.geometry_digest, h.provenance.source, h.provenance.sha256_source,
@@ -188,10 +219,13 @@ public enum QWQuant {
         public static func dequantHQ4Slab(
             base: UnsafeRawPointer, nRows: Int, kCols: Int
         ) -> [Float] {
+            guard nRows > 0, kCols > 0, kCols % QWQuant.group == 0 else { return [] }
+            let (total, ov) = nRows.multipliedReportingOverflow(by: kCols)
+            guard !ov, total > 0 else { return [] }
             let g = kCols / QWQuant.group
-            var out = [Float](repeating: 0, count: nRows * kCols)
+            var out = [Float](repeating: 0, count: total)
             out.withUnsafeMutableBufferPointer { outBuf in
-                let dstBase = outBuf.baseAddress!
+                guard let dstBase = outBuf.baseAddress else { return }
                 if nRows >= 64 {
                     let rawAddr = Int(bitPattern: base)
                     let dstAddr = Int(bitPattern: dstBase)
@@ -221,13 +255,16 @@ public enum QWQuant {
             base: UnsafeRawPointer, nRows: Int, kCols: Int, bits: Int, group: Int,
             isSHVQ: Bool = false
         ) -> [Float] {
+            guard nRows > 0, kCols > 0, group > 0, kCols % group == 0 else { return [] }
+            let (total, ov) = nRows.multipliedReportingOverflow(by: kCols)
+            guard !ov, total > 0 else { return [] }
             let g = kCols / group
             let blkBytes = isSHVQ
                 ? QWSHVQBlock.bytes(bits: bits, group: group)
                 : QWAQBlock.bytes(bits: bits, group: group)
-            var out = [Float](repeating: 0, count: nRows * kCols)
+            var out = [Float](repeating: 0, count: total)
             out.withUnsafeMutableBufferPointer { outBuf in
-                let dstBase = outBuf.baseAddress!
+                guard let dstBase = outBuf.baseAddress else { return }
                 var groupBuf = [Float]()
                 groupBuf.reserveCapacity(group)
                 for r in 0..<nRows {
@@ -258,11 +295,21 @@ public enum QWQuant {
         public func dequantQ4g(_ name: String) throws -> [Float] {
             let e = try entry(name)
             guard let hq4 = e.hq4Off else { throw QWQuantError.notQuantPlane(name) }
-            guard let n = e.nRows, let g = e.groups, let K = e.kCols else {
+            guard let n = e.nRows, let g = e.groups, let K = e.kCols,
+                  n >= 0, g >= 0, K >= 0, e.hqGroup > 0 else {
                 throw QWQuantError.notQuantPlane(name)
             }
+            if !e.isIncumbentHQ4 {
+                let valid = e.isSHVQ
+                    ? QWSHVQBlock.isSupported(bits: e.hqBits, group: e.hqGroup)
+                    : QWAQBlock.isBlockSupported(bits: e.hqBits, group: e.hqGroup)
+                guard valid else { throw QWQuantError.notQuantPlane(name) }
+            }
             let blkBytes = e.hqBlockBytes
-            guard K % e.hqGroup == 0, hq4 + n * g * blkBytes <= rawCount else {
+            let (ng, ov0) = n.multipliedReportingOverflow(by: g)
+            let (byteCount, ov1) = ng.multipliedReportingOverflow(by: blkBytes)
+            let (endOff, ov2) = hq4.addingReportingOverflow(byteCount)
+            guard hq4 >= 0, K % e.hqGroup == 0, !ov0, !ov1, !ov2, endOff <= rawCount else {
                 throw QWQuantError.truncated
             }
             let ptr = UnsafeRawPointer(rawBase).advanced(by: hq4)
@@ -279,19 +326,24 @@ public enum QWQuant {
         public func dequantHQ8Rot(_ name: String) throws -> [Float] {
             let e = try entry(name)
             guard let p = e.hq8Off, let s = e.hq8SOff,
-                  let ext = e.hq8Extents, let n = e.nRows, let g = e.groups,
-                  let K = e.kCols else { throw QWQuantError.notQuantPlane(name) }
-            guard p + ext.payload <= rawCount,
-                  s + ext.scale <= rawCount else { throw QWQuantError.truncated }
+                  let ext = e.hq8Extents, let n = e.nRows,
+                  let K = e.kCols, n >= 0, K >= 0 else { throw QWQuantError.notQuantPlane(name) }
+            let g = K / QWQuant.group
+            let (pEnd, ov0) = p.addingReportingOverflow(ext.payload)
+            let (sEnd, ov1) = s.addingReportingOverflow(ext.scale)
+            guard p >= 0, s >= 0, !ov0, !ov1,
+                  pEnd <= rawCount, sEnd <= rawCount else { throw QWQuantError.truncated }
             var out = [Float](repeating: 0, count: n * K)
-            let q = UnsafeRawPointer(rawBase).advanced(by: p).assumingMemoryBound(to: Int8.self)
-            let sc = UnsafeRawPointer(rawBase).advanced(by: s).assumingMemoryBound(to: UInt16.self)
+            let qPtr = UnsafeRawPointer(rawBase).advanced(by: p)
+            let scPtr = UnsafeRawPointer(rawBase).advanced(by: s)
             for r in 0..<n {
                 for gg in 0..<g {
-                    let scale = QWQuant.f16tof32Bits(sc[r * g + gg])
+                    let sBits = UInt16(littleEndian: scPtr.loadUnaligned(fromByteOffset: (r * g + gg) * 2, as: UInt16.self))
+                    let scale = QWQuant.f16tof32Bits(sBits)
                     let row = r * K + gg * QWQuant.group
                     for j in 0..<QWQuant.group {
-                        out[row + j] = Float(q[row + j]) * scale
+                        let qVal = qPtr.loadUnaligned(fromByteOffset: row + j, as: Int8.self)
+                        out[row + j] = Float(qVal) * scale
                     }
                 }
             }
@@ -317,18 +369,35 @@ public enum QWQuant {
         public func dequantQ8(_ name: String) throws -> [Float] {
             let e = try entry(name)
             guard let q8 = e.q8Off, let q8s = e.q8SOff else { throw QWQuantError.notQuantPlane(name) }
-            guard let n = e.nRows, let g = e.groups, let K = e.kCols else {
+            guard let n = e.nRows, let K = e.kCols, n >= 0, K >= 0 else {
                 throw QWQuantError.notQuantPlane(name)
             }
-            guard q8s + n * g * 2 <= rawCount else { throw QWQuantError.truncated }
-            var out = [Float](repeating: 0, count: n * K)
-            let q = UnsafeRawPointer(rawBase).advanced(by: q8).assumingMemoryBound(to: Int8.self)
-            let sc = UnsafeRawPointer(rawBase).advanced(by: q8s).assumingMemoryBound(to: UInt16.self)
+            let grp = e.hqGroup
+            guard grp > 0, K % grp == 0 else {
+                throw QWQuantError.notQuantPlane(name)
+            }
+            let g = K / grp
+            let (elemCount, ov0) = n.multipliedReportingOverflow(by: K)
+            let (qEnd, ov1) = q8.addingReportingOverflow(elemCount)
+            let (ng, ov2) = n.multipliedReportingOverflow(by: g)
+            let (sBytes, ov3) = ng.multipliedReportingOverflow(by: 2)
+            let (sEnd, ov4) = q8s.addingReportingOverflow(sBytes)
+            guard q8 >= 0, q8s >= 0, !ov0, !ov1, !ov2, !ov3, !ov4,
+                  qEnd <= rawCount, sEnd <= rawCount else {
+                throw QWQuantError.truncated
+            }
+            var out = [Float](repeating: 0, count: elemCount)
+            let qPtr = UnsafeRawPointer(rawBase).advanced(by: q8)
+            let scPtr = UnsafeRawPointer(rawBase).advanced(by: q8s)
             for r in 0..<n {
                 for gg in 0..<g {
-                    let s = QWQuant.f16tof32Bits(sc[r * g + gg])
-                    let row = r * K + gg * 128
-                    for j in 0..<128 { out[row + j] = Float(q[row + j]) * s }
+                    let sBits = UInt16(littleEndian: scPtr.loadUnaligned(fromByteOffset: (r * g + gg) * 2, as: UInt16.self))
+                    let s = QWQuant.f16tof32Bits(sBits)
+                    let row = r * K + gg * grp
+                    for j in 0..<grp {
+                        let qVal = qPtr.loadUnaligned(fromByteOffset: row + j, as: Int8.self)
+                        out[row + j] = Float(qVal) * s
+                    }
                 }
             }
             return out
@@ -338,22 +407,32 @@ public enum QWQuant {
         public func rawBf16(_ name: String) throws -> [Float] {
             let e = try entry(name)
             guard let off = e.rawOff else { throw QWQuantError.notRawPlane(name) }
-            let count = e.shape.reduce(1, *)
+            guard off >= 0 else { throw QWQuantError.truncated }
+            var count = 1
+            for dim in e.shape {
+                guard dim >= 0 else { throw QWQuantError.truncated }
+                let (m, ov) = count.multipliedReportingOverflow(by: dim)
+                guard !ov else { throw QWQuantError.truncated }
+                count = m
+            }
+            let elemBytes = e.kind == "f32" ? 4 : 2
+            let (byteCount, ov0) = count.multipliedReportingOverflow(by: elemBytes)
+            let (endOff, ov1) = off.addingReportingOverflow(byteCount)
+            guard !ov0, !ov1, endOff <= rawCount else { throw QWQuantError.truncated }
+            if count == 0 { return [] }
+            var out = [Float](repeating: 0, count: count)
+            let srcPtr = UnsafeRawPointer(rawBase).advanced(by: off)
             if e.kind == "f32" {
-                guard off + count * 4 <= rawCount else { throw QWQuantError.truncated }
-                var out = [Float](repeating: 0, count: count)
                 out.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
-                    if let base = dst.baseAddress, count > 0 {
-                        base.copyMemory(from: UnsafeRawPointer(rawBase).advanced(by: off), byteCount: count * 4)
+                    if let base = dst.baseAddress {
+                        base.copyMemory(from: srcPtr, byteCount: byteCount)
                     }
                 }
                 return out
             }
-            guard off + count * 2 <= rawCount else { throw QWQuantError.truncated }
-            var out = [Float](repeating: 0, count: count)
-            let u = UnsafeRawPointer(rawBase).advanced(by: off).assumingMemoryBound(to: UInt16.self)
             for i in 0..<count {
-                out[i] = Float(bitPattern: UInt32(u[i]) << 16)
+                let bits = UInt16(littleEndian: srcPtr.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self))
+                out[i] = Float(bitPattern: UInt32(bits) << 16)
             }
             return out
         }
@@ -361,7 +440,8 @@ public enum QWQuant {
         @inline(__always)
         public func withRawPointer<R>(at byteOffset: Int, byteCount: Int,
                                       _ body: (UnsafeRawPointer) throws -> R) throws -> R {
-            guard byteOffset >= 0, byteCount >= 0, byteOffset + byteCount <= rawCount else {
+            let (endOff, ov) = byteOffset.addingReportingOverflow(byteCount)
+            guard byteOffset >= 0, byteCount >= 0, !ov, endOff <= rawCount else {
                 throw QWQuantError.truncated
             }
             return try body(UnsafeRawPointer(rawBase).advanced(by: byteOffset))
@@ -380,7 +460,7 @@ public enum QWQuant {
             guard wiredBytes == 0 else { return wiredBytes }
             var cap = Swift.max(0, limitBytes)
             var rl = rlimit()
-            if getrlimit(RLIMIT_MEMLOCK, &rl) == 0, rl.rlim_cur < rlim_t(cap) {
+            if getrlimit(RLIMIT_MEMLOCK, &rl) == 0, rl.rlim_cur < UInt64(cap) {
                 cap = Int(rl.rlim_cur)
             }
             let gran = 1 << 30

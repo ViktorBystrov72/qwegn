@@ -31,6 +31,19 @@ public enum QWGDNF32 {
                                             dtBias: QWTensorValue, y: QWTensorValue, glog: QWTensorValue,
                                             beta: QWTensorValue, rows: Int, xStride: Int = 10240,
                                             baStride: Int? = nil) throws {
+        guard rows > 0 else {
+            throw QWGDNConvError.badShape("encodeConvPrepSeqF32 requires positive rows")
+        }
+        let aliasesState = stIn.region.buffer === stOut.region.buffer && {
+            let inStart = stIn.region.base + stIn.offset
+            let inEnd = inStart + stIn.bytes
+            let outStart = stOut.region.base + stOut.offset
+            let outEnd = outStart + stOut.bytes
+            return inStart < outEnd && outStart < inEnd
+        }()
+        guard !aliasesState else {
+            throw QWGDNConvError.badShape("encodeConvPrepSeqF32 requires distinct non-overlapping stIn and stOut")
+        }
         let stride = baStride ?? (aLog.bytes / 4)
         enc.setComputePipelineState(try hal.pipeline("qwg_gdn_conv_prep_seq_f32"))
         enc.bindTensors(x, w, stIn, stOut, b, a, aLog, dtBias, y, glog, beta, startIndex: 0)

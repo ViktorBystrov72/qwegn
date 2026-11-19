@@ -99,42 +99,68 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
     }
 
     public func accept(_ token: Int) throws {
-        enum Action { case none, forward(Int) }
-        let action: Action = lock.withLock {
+        let forwarded: [Int] = lock.withLock {
             guard inThinking else {
-                return .forward(token)
+                return [token]
             }
             if hasValidEndThink && token == endThinkTokenId {
                 inThinking = false
                 recentUTF8.removeAll(keepingCapacity: false)
-                return forwardEndThinkToInner ? .forward(token) : .none
+                return forwardEndThinkToInner ? [token] : []
             }
             thinkingTokens += 1
             if let tokenBytes, token >= 0, token < tokenBytes.count, token < vocabularySize,
                let bytes = tokenBytes[token], !bytes.isEmpty {
                 recentUTF8.append(contentsOf: bytes)
-                if recentUTF8.count > 24 {
-                    recentUTF8.removeFirst(recentUTF8.count - 24)
+                if recentUTF8.count > 64 {
+                    recentUTF8.removeFirst(recentUTF8.count - 64)
                 }
-                if Self.containsSubslice(recentUTF8, Self.endThinkBytes)
-                    || Self.containsSubslice(recentUTF8, Self.ernieEndThinkBytes) {
+                if let matchEnd = Self.endOfSubslice(recentUTF8, Self.endThinkBytes)
+                    ?? Self.endOfSubslice(recentUTF8, Self.ernieEndThinkBytes) {
                     inThinking = false
+                    let trailingBytes = Array(recentUTF8[matchEnd...])
                     recentUTF8.removeAll(keepingCapacity: false)
-                    return (hasValidEndThink && forwardEndThinkToInner) ? .forward(endThinkTokenId) : .none
+                    var tokens: [Int] = []
+                    if hasValidEndThink && forwardEndThinkToInner {
+                        tokens.append(endThinkTokenId)
+                    }
+                    if !trailingBytes.isEmpty {
+                        tokens.append(contentsOf: decomposeBytes(trailingBytes, using: tokenBytes))
+                    }
+                    return tokens
                 }
             }
-            return .none
+            return []
         }
-        switch action {
-        case .none:
-            return
-        case .forward(let forwarded):
-            try inner?.accept(forwarded)
+        for tok in forwarded {
+            try inner?.accept(tok)
         }
     }
 
-    private static func containsSubslice(_ haystack: [UInt8], _ needle: [UInt8]) -> Bool {
-        guard !needle.isEmpty, haystack.count >= needle.count else { return false }
+    private func decomposeBytes(_ target: [UInt8], using table: [[UInt8]?]) -> [Int] {
+        var out: [Int] = []
+        var offset = 0
+        while offset < target.count {
+            var bestLen = 0
+            var bestToken = -1
+            let remaining = target.count - offset
+            for tok in 0..<min(vocabularySize, table.count) where tok != endThinkTokenId {
+                guard let b = table[tok], !b.isEmpty, b.count <= remaining, b.count > bestLen else { continue }
+                if target[offset..<(offset + b.count)].elementsEqual(b) {
+                    bestLen = b.count
+                    bestToken = tok
+                    if bestLen == remaining { break }
+                }
+            }
+            guard bestToken >= 0, bestLen > 0 else { break }
+            out.append(bestToken)
+            offset += bestLen
+        }
+        return out
+    }
+
+    private static func endOfSubslice(_ haystack: [UInt8], _ needle: [UInt8]) -> Int? {
+        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
         let limit = haystack.count - needle.count
         for i in 0...limit where haystack[i] == needle[0] {
             var match = true
@@ -142,8 +168,8 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
                 match = false
                 break
             }
-            if match { return true }
+            if match { return i + needle.count }
         }
-        return false
+        return nil
     }
 }

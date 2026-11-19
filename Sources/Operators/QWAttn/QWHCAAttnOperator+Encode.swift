@@ -185,7 +185,7 @@ extension QWHCAAttnOperator {
         mark("hca.vha_invrope")
         QWCoarsePoolIndex.barrierIfConcurrent(enc)
         let isRawWoA = (hcaW.woA == nil && hcaW.woARawF16 != nil)
-        let skipInterFwht = isRawWoA || (hcaW.woA != nil && !hcaW.woA!.isRotated)
+        let skipInterFwht = isRawWoA || (hcaW.woA.map { !$0.containerKind.isRotated } ?? false)
         var vhaP = VhaInvRopeParams(
             T: UInt32(rows),
             pos0: UInt32(pos0),

@@ -69,6 +69,7 @@ struct Telemetry: AsyncParsableCommand {
     @Option(name: .customLong("last"), help: "Dump the last N per-request records (the server's bounded ring).") var last: Int?
     @Option(name: .customLong("host"), help: "The server host (default: 127.0.0.1).") var host: String = "127.0.0.1"
     @Option(name: .customLong("port"), help: "The server port (default: 8080).") var port: Int = 8080
+    @Option(name: .customLong("api-key"), help: "Bearer API key for authenticated servers.") var apiKey: String?
     @Option(name: .customLong("out"), help: "Write the dump to this file instead of stdout.") var out: String?
 
     func run() async throws {
@@ -87,19 +88,57 @@ struct Telemetry: AsyncParsableCommand {
         try write(report(snapshot: snapshot))
     }
 
+    static func urlHost(for rawHost: String) -> String {
+        let trimmed = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed == "0.0.0.0" || trimmed == "::" || trimmed == "*" {
+            return "127.0.0.1"
+        }
+        if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+            return trimmed
+        }
+        if trimmed.contains(":") {
+            let escaped = trimmed.replacingOccurrences(of: "%", with: "%25")
+            return "[\(escaped)]"
+        }
+        return trimmed
+    }
+
+    static func dashboardURL(host: String, port: Int) -> URL? {
+        guard (1...65535).contains(port) else { return nil }
+        return URL(string: "http://\(urlHost(for: host)):\(port)/v1/dashboard")
+    }
+
     /// What the server published. The records are the requirement: if they
     /// cannot be read the command fails, rather than reporting none.
     private func fetch() async throws -> TelemetrySnapshot {
-        guard let url = URL(string: "http://\(host):\(port)/v1/dashboard") else {
+        guard let url = Self.dashboardURL(host: host, port: port) else {
             throw ExitCode(2)
         }
+        let envKey = ProcessInfo.processInfo.environment["QWG_API_KEY"]
+            ?? ProcessInfo.processInfo.environment["QW_API_KEY"]
+        let settings = QWSettingsManager.shared.loadSettings()
+        let connectHost = Self.urlHost(for: host)
+        let settingsKey = (QWHttpSecurity.isLoopbackHost(connectHost) || host.trimmingCharacters(in: .whitespacesAndNewlines) == settings.host)
+            ? settings.apiKey
+            : ""
+        let bearerKey = [apiKey, envKey, settingsKey]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        if let bearerKey {
+            request.setValue("Bearer \(bearerKey)", forHTTPHeaderField: "Authorization")
+        }
+
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 5
         let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(from: url)
+            (data, response) = try await session.data(for: request)
         } catch {
             FileHandle.standardError.write(Data(
                 "qwg telemetry: the server at \(host):\(port) did not answer: \(error.localizedDescription)\n".utf8))

@@ -108,9 +108,12 @@ public enum QWContextCopyDrafter {
         _ seq: VirtualIntSequence<T>, maxCount: Int, maxPeriod: Int, minRepeats: Int
     ) -> [Int]? {
         let count = seq.count
-        guard maxCount > 0 else { return nil }
-        for p in 1...maxPeriod {
-            guard count >= p * minRepeats else { continue }
+        guard maxCount > 0, maxPeriod >= 1, minRepeats >= 1 else { return nil }
+        let upperPeriod = min(maxPeriod, count / minRepeats)
+        guard upperPeriod >= 1 else { return nil }
+        for p in 1...upperPeriod {
+            let needed = p * minRepeats
+            guard count >= needed else { break }
             var match = true
             let base = count - p
             for r in 1..<minRepeats {
@@ -137,7 +140,7 @@ public enum QWContextCopyDrafter {
         _ seq: VirtualIntSequence<T>, maxCount: Int, minMatchLen: Int, maxMatchLen: Int
     ) -> (tokens: [Int], matchLen: Int)? {
         let count = seq.count
-        guard maxCount > 0, count > minMatchLen else { return nil }
+        guard maxCount > 0, minMatchLen >= 1, maxMatchLen >= minMatchLen, count > minMatchLen else { return nil }
         let maxN = min(maxMatchLen, count - 1)
         guard maxN >= minMatchLen else { return nil }
         let lastTok = seq[count - 1]

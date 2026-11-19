@@ -98,11 +98,25 @@ public final class QWEngine: QWInferenceEngine, @unchecked Sendable {
         pinAsSharedBase: Bool = true,
         onPrefillProgress: (@Sendable (Int, Int) -> Void)?
     ) throws -> Int {
-        try underlying.buildStandalonePrefixCache(
+        try batchScheduler.buildStandalonePrefixCache(
             tokens: tokens,
             outputURL: outputURL,
             pinAsSharedBase: pinAsSharedBase,
             onPrefillProgress: onPrefillProgress
+        )
+    }
+
+    public func computePromptLogprobs(
+        promptTokens: [Int],
+        sampling: QWSamplerConfig,
+        topLogprobsCount: Int,
+        shouldStop: (@Sendable () -> Bool)? = nil
+    ) throws -> [QWTokenLogprob]? {
+        try batchScheduler.computePromptLogprobs(
+            promptTokens: promptTokens,
+            sampling: sampling,
+            topLogprobsCount: topLogprobsCount,
+            shouldStop: shouldStop
         )
     }
 

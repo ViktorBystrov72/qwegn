@@ -17,6 +17,7 @@ kernel void qwg_rope_qk_general(device const uint4* qIn      [[buffer(0)]],
                                 device const uint4* wq       [[buffer(4)]],
                                 device const uint4* wk       [[buffer(5)]],
                                 device const float* table    [[buffer(6)]],
+                                device uint4* normOut        [[buffer(7)]],
                                 constant uint4& flags        [[buffer(8)]],
                                 constant float& eps          [[buffer(9)]],
                                 uint2 tg [[threadgroup_position_in_grid]],
@@ -47,6 +48,16 @@ kernel void qwg_rope_qk_general(device const uint4* qIn      [[buffer(0)]],
         for (int i = 0; i < 8; i++) xn[i] = float(xv.v[i]) * rstd * (float(wv.v[i]) + 1.0f);
     } else {
         for (int i = 0; i < 8; i++) xn[i] = float(xv.v[i]);
+    }
+
+    if (flags.y && active) {
+        H8 n16;
+        for (int i = 0; i < 8; i++) n16.v[i] = half(xn[i]);
+        const size_t qRowU4 = (size_t)QW_QPROJ_OUT / 8u;
+        const size_t kRowU4 = (size_t)QW_KV_HEADS * headU4;
+        const size_t nBase = isQ ? ((size_t)s * qRowU4 + (size_t)head * headU4)
+                                 : ((size_t)flags.z + (size_t)s * kRowU4 + (size_t)row * headU4);
+        normOut[nBase + ti] = *(thread uint4*)&n16;
     }
 
     // The roped dims pair k with k + ropeDims/2, which is ropeDims/16 uint4s

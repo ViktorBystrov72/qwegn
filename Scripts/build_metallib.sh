@@ -21,18 +21,35 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT="${1:-Sources/QWMetal/kernel.metallib}"
 STD_OUT="${2:-Sources/QWMetal/kernel_std.metallib}"
+METAL_MIN_MACOS="${QW_METAL_MIN_MACOS:-26.2}"
 
 if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
   METAL_CC=(xcrun -sdk macosx metal)
   METALLIB_LD=(xcrun -sdk macosx metallib)
+  METAL_READOBJ=(xcrun -sdk macosx metal-readobj)
 else
   CRYPTEX_BIN="$(ls -d /private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-*/Metal.xctoolchain/usr/bin 2>/dev/null | tail -n 1)"
   SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
   METAL_CC=("$CRYPTEX_BIN/metal" -isysroot "$SDK_PATH")
   METALLIB_LD=("$CRYPTEX_BIN/metallib")
+  METAL_READOBJ=("$CRYPTEX_BIN/metal-readobj")
 fi
 
 JOBS="${QW_METAL_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
+
+verify_metallib_target() {
+  local lib="$1" maj="" min=""
+  read -r maj min < <("${METAL_READOBJ[@]}" --headers "$lib" | awk '/PlatformMajor:/ {maj=$2} /PlatformMinor:/ {min=$2} END {print maj, min}')
+  if [ -z "$maj" ] || [ -z "$min" ] || ! [[ "$maj" =~ ^[0-9]+$ ]] || ! [[ "$min" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: could not parse macOS platform target from $lib" >&2
+    return 1
+  fi
+  if [ "$maj" -lt 26 ] || { [ "$maj" -eq 26 ] && [ "$min" -lt 2 ]; }; then
+    echo "FAIL: $lib targets macOS ${maj}.${min}, but Apple MPP NAX matmul2d requires >= 26.2" >&2
+    return 1
+  fi
+  echo "verified $lib target: macOS ${maj}.${min}"
+}
 
 # build_variant <output> [extra compiler flags...]
 build_variant() {
@@ -43,7 +60,7 @@ build_variant() {
   while IFS= read -r -d '' m; do
     a="$(printf '%s/%04d_%s.air' "$tmp" "$idx" "$(basename "${m%.metal}")")"
     err="$a.err"
-    "${METAL_CC[@]}" -std=metal4.0 -O2 "$@" \
+    "${METAL_CC[@]}" -std=metal4.0 -mmacosx-version-min="$METAL_MIN_MACOS" -O2 "$@" \
       -ISources/QWMetal -ISources/QWMetal/include -ISources/QWMetal/gdn \
       -c "$m" -o "$a" 2>"$err" &
     pids+=($!)
@@ -71,6 +88,7 @@ build_variant() {
   fi
   "${METALLIB_LD[@]}" "${airs[@]}" -o "$out"
   rm -rf "$tmp"
+  verify_metallib_target "$out"
 }
 
 build_variant "$OUT"

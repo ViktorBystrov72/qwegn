@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import os
 import QWCore
 
 public enum QWLogLevel: Int, Sendable, Comparable {
@@ -28,100 +29,144 @@ public enum QWLogLevel: Int, Sendable, Comparable {
 public final class QWServerLogger: @unchecked Sendable {
     public static let shared = QWServerLogger()
 
-    private var level: QWLogLevel = .info
-    private var lock = os_unfair_lock_s()
-    private var fileDescriptor: Int32 = -1
-    private var configuredLogPath: String?
+    private struct LogState: Sendable {
+        var level: QWLogLevel
+        var configuredLogPath: String?
+        var ringBuffer: [String] = []
+        var subscribers: [UUID: @Sendable (String) -> Void] = [:]
+    }
 
-    // In-memory ring buffer of recent log lines for streaming to UI
-    private var ringBuffer: [String] = []
+    private struct FileSinkState: Sendable {
+        var fd: Int32 = -1
+        var activeWriters: Int = 0
+        var retiredFDs: [Int32] = []
+    }
+
     private let maxRingBufferSize = 2000
-    private var subscribers: [UUID: @Sendable (String) -> Void] = [:]
+    private let stateLock: OSAllocatedUnfairLock<LogState>
+    private let fileSinkLock = OSAllocatedUnfairLock<FileSinkState>(initialState: FileSinkState())
 
     public init(level: QWLogLevel = .info) {
-        self.level = level
+        self.stateLock = OSAllocatedUnfairLock(initialState: LogState(level: level))
     }
 
     deinit {
-        if fileDescriptor >= 0 {
-            close(fileDescriptor)
+        let fdsToClose = fileSinkLock.withLock { state -> [Int32] in
+            var fds = state.retiredFDs
+            state.retiredFDs.removeAll()
+            if state.fd >= 0 {
+                fds.append(state.fd)
+                state.fd = -1
+            }
+            return fds
+        }
+        for fd in fdsToClose {
+            close(fd)
         }
     }
 
     public func setLevel(_ newLevel: QWLogLevel) {
-        os_unfair_lock_lock(&lock)
-        self.level = newLevel
-        os_unfair_lock_unlock(&lock)
+        stateLock.withLock { $0.level = newLevel }
     }
 
     public func getLevel() -> QWLogLevel {
-        os_unfair_lock_lock(&lock)
-        let l = self.level
-        os_unfair_lock_unlock(&lock)
-        return l
+        stateLock.withLock { $0.level }
     }
 
     /// Configures a persistent log file sink, creating parent directories if needed.
     public func configureFileSink(path: String) {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-
-        if fileDescriptor >= 0 {
-            close(fileDescriptor)
-            fileDescriptor = -1
-        }
-
         let expanded = path.expandingTildePath
-        self.configuredLogPath = expanded
-
         let dir = (expanded as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [
             .posixPermissions: 0o700
         ])
+        let newFD = open(expanded, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o644)
 
-        let fd = open(expanded, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        if fd >= 0 {
-            self.fileDescriptor = fd
+        stateLock.withLock { $0.configuredLogPath = expanded }
+        let retired = fileSinkLock.withLock { state -> [Int32] in
+            let oldFD = state.fd
+            state.fd = newFD
+            guard oldFD >= 0 else { return [] }
+            if state.activeWriters == 0 {
+                return [oldFD]
+            }
+            state.retiredFDs.append(oldFD)
+            return []
+        }
+        for fd in retired {
+            close(fd)
         }
     }
 
     /// Returns a snapshot of the recent in-memory log lines.
     public func getRecentLogs() -> [String] {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-        return ringBuffer
+        stateLock.withLock { $0.ringBuffer }
     }
 
     /// Subscribes a listener to receive new log lines as they arrive.
     public func subscribe(_ handler: @escaping @Sendable (String) -> Void) -> UUID {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-        let id = UUID()
-        subscribers[id] = handler
-        return id
+        stateLock.withLock { state in
+            let id = UUID()
+            state.subscribers[id] = handler
+            return id
+        }
     }
 
     /// Unsubscribes a listener.
     public func unsubscribe(_ id: UUID) {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-        subscribers.removeValue(forKey: id)
+        stateLock.withLock { _ = $0.subscribers.removeValue(forKey: id) }
     }
 
     private func broadcast(_ line: String) {
-        // Collect subscribers under lock, call outside
-        var callbacks: [@Sendable (String) -> Void] = []
-        os_unfair_lock_lock(&lock)
-        ringBuffer.append(line)
-        if ringBuffer.count > maxRingBufferSize {
-            ringBuffer.removeFirst(ringBuffer.count - maxRingBufferSize)
+        let callbacks = stateLock.withLock { state -> [@Sendable (String) -> Void] in
+            state.ringBuffer.append(line)
+            if state.ringBuffer.count > maxRingBufferSize {
+                state.ringBuffer.removeFirst(state.ringBuffer.count - maxRingBufferSize)
+            }
+            return Array(state.subscribers.values)
         }
-        callbacks = Array(subscribers.values)
-        os_unfair_lock_unlock(&lock)
-
         for cb in callbacks {
             cb(line)
         }
+    }
+
+    private static func writeAll(fd: Int32, buffer: UnsafeRawPointer, count: Int) {
+        var written = 0
+        while written < count {
+            let rc = Darwin.write(fd, buffer.advanced(by: written), count - written)
+            if rc > 0 {
+                written += rc
+            } else if rc < 0 && errno == EINTR {
+                continue
+            } else {
+                break
+            }
+        }
+    }
+
+    private func emitOutput(streamFD: Int32, buffer: UnsafeRawPointer, count: Int) {
+        guard count > 0 else { return }
+        Self.writeAll(fd: streamFD, buffer: buffer, count: count)
+
+        let fd = fileSinkLock.withLock { state -> Int32 in
+            guard state.fd >= 0 else { return -1 }
+            state.activeWriters += 1
+            return state.fd
+        }
+        guard fd >= 0 else { return }
+        defer {
+            let retired = fileSinkLock.withLock { state -> [Int32] in
+                state.activeWriters -= 1
+                guard state.activeWriters == 0, !state.retiredFDs.isEmpty else { return [] }
+                let out = state.retiredFDs
+                state.retiredFDs.removeAll()
+                return out
+            }
+            for oldFD in retired {
+                close(oldFD)
+            }
+        }
+        Self.writeAll(fd: fd, buffer: buffer, count: count)
     }
 
     /// Emits a single rate-governed, non-allocating structured request log line directly
@@ -157,8 +202,8 @@ public final class QWServerLogger: @unchecked Sendable {
 
             func appendBytes(_ bytes: UnsafeRawBufferPointer) {
                 let count = min(bytes.count, 510 - idx)
-                if count > 0 {
-                    memcpy(ptr + idx, bytes.baseAddress!, count)
+                if count > 0, let src = bytes.baseAddress {
+                    memcpy(ptr + idx, src, count)
                     idx += count
                 }
             }
@@ -172,12 +217,11 @@ public final class QWServerLogger: @unchecked Sendable {
                     appendByte(UInt8(ascii: "0"))
                     return
                 }
-                var v = val
-                let neg = v < 0
-                if neg { v = -v }
-                var tmp = [UInt8](repeating: 0, count: 20)
+                let neg = val < 0
+                var v: UInt = val.magnitude
+                var tmp = [UInt8](repeating: 0, count: 21)
                 var pos = 0
-                while v > 0 {
+                while v > 0 && pos < tmp.count {
                     tmp[pos] = UInt8(ascii: "0") + UInt8(v % 10)
                     v /= 10
                     pos += 1
@@ -194,13 +238,39 @@ public final class QWServerLogger: @unchecked Sendable {
                     appendStatic("0.0")
                     return
                 }
-                let intPart = Int(val)
+                let clampedPrecision = min(12, max(0, precision))
+                let truncated = val.rounded(.towardZero)
+                guard let intPart = Int(exactly: truncated) else {
+                    if val < 0 { appendByte(UInt8(ascii: "-")) }
+                    var mag = abs(val)
+                    var exp = 0
+                    while mag >= 10.0 && exp < 400 {
+                        mag /= 10.0
+                        exp += 1
+                    }
+                    let lead = min(9, max(0, Int(mag)))
+                    appendByte(UInt8(ascii: "0") + UInt8(lead))
+                    appendByte(UInt8(ascii: "."))
+                    var rem = max(0.0, mag - Double(lead))
+                    for _ in 0..<max(1, clampedPrecision) {
+                        rem *= 10.0
+                        let digit = min(9, max(0, Int(rem)))
+                        appendByte(UInt8(ascii: "0") + UInt8(digit))
+                        rem = max(0.0, rem - Double(digit))
+                    }
+                    appendStatic("e+")
+                    appendInt(exp)
+                    return
+                }
+                if val < 0 && intPart == 0 {
+                    appendByte(UInt8(ascii: "-"))
+                }
                 appendInt(intPart)
                 appendByte(UInt8(ascii: "."))
-                var frac = abs(val - Double(intPart))
-                for _ in 0..<precision {
+                var frac = abs(val - truncated)
+                for _ in 0..<clampedPrecision {
                     frac *= 10
-                    let digit = Int(frac) % 10
+                    let digit = min(9, max(0, Int(frac) % 10))
                     appendByte(UInt8(ascii: "0") + UInt8(digit))
                 }
             }
@@ -267,13 +337,7 @@ public final class QWServerLogger: @unchecked Sendable {
             }
             appendByte(UInt8(ascii: "\n"))
 
-            // Write to stdout and file
-            os_unfair_lock_lock(&self.lock)
-            write(STDOUT_FILENO, ptr, idx)
-            if self.fileDescriptor >= 0 {
-                write(self.fileDescriptor, ptr, idx)
-            }
-            os_unfair_lock_unlock(&self.lock)
+            emitOutput(streamFD: STDOUT_FILENO, buffer: ptr, count: idx)
 
             if let str = String(bytes: UnsafeRawBufferPointer(start: ptr, count: idx), encoding: .utf8) {
                 broadcast(str)
@@ -303,12 +367,10 @@ public final class QWServerLogger: @unchecked Sendable {
 
         let line = "\(timeStr) \(levelTag) \(message)\n"
         line.utf8CString.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            os_unfair_lock_lock(&self.lock)
-            write(lvl >= .warn ? STDERR_FILENO : STDOUT_FILENO, raw.baseAddress, raw.count - 1)
-            if self.fileDescriptor >= 0 {
-                write(self.fileDescriptor, raw.baseAddress, raw.count - 1)
+            let byteCount = max(0, raw.count - 1)
+            if byteCount > 0, let base = raw.baseAddress {
+                emitOutput(streamFD: lvl >= .warn ? STDERR_FILENO : STDOUT_FILENO, buffer: base, count: byteCount)
             }
-            os_unfair_lock_unlock(&self.lock)
         }
 
         broadcast(line)
@@ -329,12 +391,10 @@ public final class QWServerLogger: @unchecked Sendable {
         if isPreformatted {
             let line = rawLine.hasSuffix("\n") ? rawLine : (rawLine + "\n")
             line.utf8CString.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                os_unfair_lock_lock(&self.lock)
-                write(STDOUT_FILENO, raw.baseAddress, raw.count - 1)
-                if self.fileDescriptor >= 0 {
-                    write(self.fileDescriptor, raw.baseAddress, raw.count - 1)
+                let byteCount = max(0, raw.count - 1)
+                if byteCount > 0, let base = raw.baseAddress {
+                    emitOutput(streamFD: STDOUT_FILENO, buffer: base, count: byteCount)
                 }
-                os_unfair_lock_unlock(&self.lock)
             }
             broadcast(line)
         } else {
@@ -345,12 +405,10 @@ public final class QWServerLogger: @unchecked Sendable {
     /// Emits the hardware and engine audit banner directly to stdout and sinks
     public func logStartupBanner(_ banner: String) {
         banner.utf8CString.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            os_unfair_lock_lock(&self.lock)
-            write(STDOUT_FILENO, raw.baseAddress, raw.count - 1)
-            if self.fileDescriptor >= 0 {
-                write(self.fileDescriptor, raw.baseAddress, raw.count - 1)
+            let byteCount = max(0, raw.count - 1)
+            if byteCount > 0, let base = raw.baseAddress {
+                emitOutput(streamFD: STDOUT_FILENO, buffer: base, count: byteCount)
             }
-            os_unfair_lock_unlock(&self.lock)
         }
         broadcast(banner)
     }

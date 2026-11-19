@@ -86,18 +86,13 @@ extension QWLSAOperator {
         }
 
         // 3. Cluster newly completed chunks (4096-token e-means CSR or 512-token Ward superblocks).
-        if isEmeansCoarse, let pipes = coarsePipelines {
-            let startM = pos0 / QWCoarsePoolIndex.macroChunkTokens
-            let endM = min(maxSuperblocks, (pos0 + rows) / QWCoarsePoolIndex.macroChunkTokens)
-            if endM > startM {
-                let csr = QWCoarsePoolIndex.LayerCSR(
-                    centroids: ls.centroids, memberPools: ls.bucketMembers,
-                    clusterSpans: ls.bucketSizes, maxMacros: maxSuperblocks)
-                QWCoarsePoolIndex.barrierIfConcurrent(enc)
-                QWCoarsePoolIndex.encodeClusterMacros(
-                    enc, pso: pipes.cluster1024, pooledKeys: ls.pooledKeys,
-                    csr: csr, startMacro: startM, numMacros: endM - startM, indexDim: indexDim)
-            }
+        if isEmeansCoarse, let coarsePipeline {
+            let csr = QWCoarsePoolIndex.LayerCSR(
+                centroids: ls.centroids, memberPools: ls.bucketMembers,
+                clusterSpans: ls.bucketSizes, maxMacros: maxSuperblocks)
+            coarsePipeline.updateClusters(
+                enc, pooledKeys: ls.pooledKeys, csr: csr,
+                layerIndex: fullAttnLayer, pos0: pos0, rows: rows, indexDim: indexDim)
             return
         }
         let startSB = pos0 / 512
@@ -162,11 +157,7 @@ extension QWLSAOperator {
                 offset: blockCountScratch.offset + r0 * 4,
                 shape: QWTensorShape([remRows], .i32))
 
-            if isEmeansCoarse,
-               let pipes = coarsePipelines,
-               let psoCoarse = psoEmeansScoreCoarse,
-               let psoCands = psoEmeansScoreCands,
-               let psoFallback = psoEmeansFlatFallback {
+            if isEmeansCoarse, let coarsePipeline {
                 let winBlk = QWLSAConfig.windowTokens / QWLSAConfig.poolSize
                 let bg = QWCoarsePoolIndex.batchGeometry(
                     pos0: pos0 + r0, units: batchUnits, rowStep: step, maxRow: remRows,
@@ -180,73 +171,21 @@ extension QWLSAOperator {
                     hasSink: true, writeCount: true, listStride: listStride,
                     rowStep: step, maxRow: remRows, clusterStride: maxBuckets,
                     probeClusters: probe, candCap: Self.selectCandidateCap)
-                let tpg = MTLSize(width: 256, height: 1, depth: 1)
                 if bg.isDense {
-                    let plen = MemoryLayout<QWCoarsePoolIndex.SelectParams>.stride
-                    enc.setComputePipelineState(pipes.finalize)
-                    listSub.bind(enc, index: 0)
-                    countSub.bind(enc, index: 1)
-                    selHist.bind(enc, index: 2)
-                    selCount.bind(enc, index: 3)
-                    selCandM.bind(enc, index: 4)
-                    selCandU.bind(enc, index: 5)
-                    enc.setBytes(&ePrm, length: plen, index: 6)
-                    enc.dispatchThreadgroups(MTLSize(width: batchUnits, height: 1, depth: 1),
-                                             threadsPerThreadgroup: tpg)
+                    coarsePipeline.encodeDenseFinalize(
+                        enc, blockList: listSub, blockCount: countSub,
+                        params: &ePrm, batchUnits: batchUnits)
                     u0 += batchUnits
                     continue
                 }
                 let csr = QWCoarsePoolIndex.LayerCSR(
                     centroids: ls.centroids, memberPools: ls.bucketMembers,
                     clusterSpans: ls.bucketSizes, maxMacros: maxSuperblocks)
-                let scratch = QWCoarsePoolIndex.Scratch(
-                    cScore: selCScore, uHist: selHist, candState: selCount,
-                    candPools: selCandM, candU: selCandU, maxBatchRows: Self.maxSelectBatchRows,
-                    clusterStride: maxBuckets, candCap: Self.selectCandidateCap)
-                if shouldPrune && bg.numClusters > 0 {
-                    let plen = MemoryLayout<QWCoarsePoolIndex.SelectParams>.stride
-                    enc.setComputePipelineState(psoCoarse)
-                    qIdxSub.bind(enc, index: 0)
-                    csr.centroids.bind(enc, index: 1)
-                    csr.clusterSpans.bind(enc, index: 2)
-                    scratch.cScore.bind(enc, index: 3)
-                    scratch.uHist.bind(enc, index: 4)
-                    enc.setBytes(&ePrm, length: plen, index: 5)
-                    enc.dispatchThreadgroups(
-                        MTLSize(width: (bg.numClusters + 255) / 256, height: batchUnits, depth: 1),
-                        threadsPerThreadgroup: tpg)
-                }
-                QWCoarsePoolIndex.encodeHistCollectScoreFinalize(
-                    enc, pipelines: pipes, csr: csr, scratch: scratch,
+                coarsePipeline.encodeSelection(
+                    enc, query: qIdxSub, pooledKeys: ls.pooledKeys, csr: csr,
                     blockList: listSub, blockCount: countSub, params: &ePrm,
-                    numClusters: bg.numClusters, maxMiddlePools: bg.middleEnd,
-                    encodeScoreCands: { enc, maxCand, prm in
-                        let plen = MemoryLayout<QWCoarsePoolIndex.SelectParams>.stride
-                        enc.setComputePipelineState(psoCands)
-                        qIdxSub.bind(enc, index: 0)
-                        ls.pooledKeys.bind(enc, index: 1)
-                        scratch.candState.bind(enc, index: 2)
-                        scratch.candPools.bind(enc, index: 3)
-                        scratch.candU.bind(enc, index: 4)
-                        enc.setBytes(&prm, length: plen, index: 5)
-                        enc.dispatchThreadgroups(
-                            MTLSize(width: (maxCand + 255) / 256, height: batchUnits, depth: 1),
-                            threadsPerThreadgroup: tpg)
-                    },
-                    encodeFlatFallback: { enc, prm in
-                        let plen = MemoryLayout<QWCoarsePoolIndex.SelectParams>.stride
-                        enc.setComputePipelineState(psoFallback)
-                        qIdxSub.bind(enc, index: 0)
-                        ls.pooledKeys.bind(enc, index: 1)
-                        scratch.candState.bind(enc, index: 2)
-                        listSub.bind(enc, index: 3)
-                        countSub.bind(enc, index: 4)
-                        enc.setBytes(&prm, length: plen, index: 5)
-                        enc.dispatchThreadgroups(
-                            MTLSize(width: batchUnits, height: 1, depth: 1),
-                            threadsPerThreadgroup: tpg)
-                    }
-                )
+                    batchUnits: batchUnits, numClusters: bg.numClusters,
+                    middleEnd: bg.middleEnd, shouldPrune: shouldPrune)
                 u0 += batchUnits
                 continue
             }

@@ -45,45 +45,9 @@ METAL_FUNC void qmm_t_nax_swiglu_kloop(
     const device char* aqGroupBase = AQ_BITS > 0
         ? (w_aq_tile + static_cast<int64_t>(aqGroupIndex) * aqGroupBytes)
         : nullptr;
-
-    const_for_loop<0, TN, 1>([&](auto idx_row) {
-      thread auto& f0 = Btile.template frag_at<idx_row.value, 0>();
-      thread auto& f1 = Btile.template frag_at<idx_row.value, 1>();
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < 2; ++i) {
-        const int r_tile = idx_row.value * 16 + int(sc.y) + int(i) * 8;
-        if constexpr (AQ_BITS == 0) {
-          const device Block_HQ4_G32& blk = w_tile[r_tile * K_g];
-          const half2 dm = *(const device half2*)(&blk);
-          const half2 s2 = half2(dm.x);
-          const half2 b2 = half2(dm.y);
-          const ushort2 raw0 = as_type<ushort2>(blk.qs[w_sub]) >> shift;
-          const ushort2 raw1 = as_type<ushort2>(blk.qs[2u + w_sub]) >> shift;
-          const half2 w01 = fma(as_type<half2>((raw0 & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-          const half2 w23 = fma(as_type<half2>(((raw0 >> 4) & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-          const half2 w45 = fma(as_type<half2>((raw1 & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-          const half2 w67 = fma(as_type<half2>(((raw1 >> 4) & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-          f0[i * 4 + 0] = w01.x; f0[i * 4 + 1] = w01.y;
-          f0[i * 4 + 2] = w23.x; f0[i * 4 + 3] = w23.y;
-          f1[i * 4 + 0] = w45.x; f1[i * 4 + 1] = w45.y;
-          f1[i * 4 + 2] = w67.x; f1[i * 4 + 3] = w67.y;
-        } else {
-          const device char* gp = aqGroupBase + static_cast<int64_t>(r_tile) * aqRowBytes;
-          half4 lo, hi;
-          if constexpr (IS_SHVQ) {
-            qwg_shvq_frag8_tg<AQ_BITS, AQ_BITS == 4 || AQ_BITS == 15, HAS_SHVQ_TG_LUT>(
-                gp, aqColInGroup, shvqLut16, lo, hi);
-          } else {
-            (void)shvqLut16;
-            qwg_aq_frag8<AQ_BITS>(gp, aqBitInGroup, lo, hi);
-          }
-          f0[i * 4 + 0] = lo.x; f0[i * 4 + 1] = lo.y;
-          f0[i * 4 + 2] = lo.z; f0[i * 4 + 3] = lo.w;
-          f1[i * 4 + 0] = hi.x; f1[i * 4 + 1] = hi.y;
-          f1[i * 4 + 2] = hi.z; f1[i * 4 + 3] = hi.w;
-        }
-      }
-    });
+    qwg_nax_load_btile<TN, TK, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_SHVQ_TG_LUT, false>(
+        Btile, w_tile, K_g, w_sub, shift, aqGroupBase, aqColInGroup, aqBitInGroup,
+        aqRowBytes, 0, 0, sc, shvqLut16);
 
     tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
     x += SK;

@@ -29,12 +29,18 @@ public final class QWRopeApply: @unchecked Sendable {
     private var tableWidth: Int { geometry.rotaryDims }
 
     /// True when the frozen 27B kernels cannot serve this call: a 256-half
-    /// head (32 lanes, all loaded), a q/k norm, and a partner exchange that
-    /// is a shuffle by `rotaryDims/16` — only a shuffle when that is a power of two.
+    /// head, q/k norm, and hardcoded `simd_shuffle_xor(lo, 4)` (`rotaryDims == 64`).
     private func needsGeneralKernel(hasNorm: Bool) -> Bool {
-        let partner = geometry.rotaryDims / 16
-        let powerOfTwo = partner > 0 && (partner & (partner - 1)) == 0
-        return geometry.headDim != 256 || !hasNorm || !powerOfTwo
+        geometry.headDim != 256 || !hasNorm || geometry.rotaryDims != 64
+    }
+
+    private static func validateGeometry(_ g: QWModelGeometry) throws {
+        guard g.headDim > 0, g.headDim <= 256, g.headDim % 8 == 0,
+              g.rotaryDims > 0, g.rotaryDims <= g.headDim, g.rotaryDims % 16 == 0 else {
+            throw QWRopeError.badShape(
+                "unsupported geometry headDim=\(g.headDim) rotaryDims=\(g.rotaryDims)"
+            )
+        }
     }
 
     /// Test path: bind a PRE-ALLOCATED table tensor (the caller's own arena —
@@ -42,6 +48,9 @@ public final class QWRopeApply: @unchecked Sendable {
     /// earlier tensors; measured bug). Caller copyIns the fixture bytes.
     init(tableTensor t: QWTensorValue, hal: QWHal, nullSlab slab: MTLBuffer,
          geometry: QWModelGeometry) throws {
+        if !geometry.usesLatentOrCompressedAttention {
+            try Self.validateGeometry(geometry)
+        }
         self.tables = nil
         self.geometry = geometry
         self.tableTensor = t
@@ -54,8 +63,12 @@ public final class QWRopeApply: @unchecked Sendable {
 
     public init(tables: QWRopeTables, hal: QWHal, weights: QWSubAllocator, arena: QWArena,
                 geometry: QWModelGeometry? = nil) throws {
+        let g = geometry ?? tables.geometry
+        if !g.usesLatentOrCompressedAttention {
+            try Self.validateGeometry(g)
+        }
         self.tables = tables
-        self.geometry = geometry ?? tables.geometry
+        self.geometry = g
         let t = try weights.allocate(QWTensorShape([tables.rows, tables.width], .f32))
         tables.cosSin.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in arena.copyIn(t, from: Data(raw)) }
         self.tableTensor = t
@@ -77,6 +90,7 @@ public final class QWRopeApply: @unchecked Sendable {
                          qOut: QWTensorValue, kOut: QWTensorValue,
                          normOut: QWTensorValue? = nil,
                          positions: [Int]) throws {
+        try Self.validateGeometry(geometry)
         let S = positions.count
         let nrows = tables?.rows ?? (tableTensor.shape.dims.first ?? 0)
         if let p = positions.max(), let q0 = positions.min(),
@@ -104,6 +118,7 @@ public final class QWRopeApply: @unchecked Sendable {
                          qOut: QWTensorValue, kOut: QWTensorValue,
                          normOut: QWTensorValue? = nil,
                          positionStart: Int, count: Int) throws {
+        try Self.validateGeometry(geometry)
         let nrows = tables?.rows ?? (tableTensor.shape.dims.first ?? 0)
         guard count > 0 else { throw QWRopeError.badShape("q/k/weights/positions mismatch: S=\(count)") }
         guard positionStart >= 0, positionStart + count <= nrows else {
@@ -129,7 +144,7 @@ public final class QWRopeApply: @unchecked Sendable {
               wq.map({ $0.shape.elementCount == geometry.headDim }) ?? true,
               wk.map({ $0.shape.elementCount == geometry.kvHeads * geometry.headDim }) ?? true,
               (wq == nil) == (wk == nil),
-              normOut.map({ $0.shape.elementCount == S * (qSlot + kAll) }) ?? true
+              normOut.map({ $0.shape.dtype == .f16 && $0.shape.elementCount == S * (qSlot + kAll) }) ?? true
         else { throw QWRopeError.badShape("q/k/weights/positions mismatch: S=\(S)") }
         let general = needsGeneralKernel(hasNorm: wq != nil)
         enc.setComputePipelineState(general ? psoGeneral : pso)
@@ -151,7 +166,7 @@ public final class QWRopeApply: @unchecked Sendable {
         // k heads at the tail [S·qProjOut/8, S·(qProjOut+kvWidth)/8). uint4 units.
         var flags = RopeFlags(headU4: UInt32(geometry.headDim / 8),      // 32
                               writeNorm: normOut == nil ? 0 : 1,         // ptr never null → gate
-                              kNormBaseU4: UInt32(S * (geometry.qHeads * geometry.headDim) / 8),
+                              kNormBaseU4: UInt32(S * qSlot / 8),
                               normOn: wq == nil ? 0 : 1)                 // no q/k norm → no norm
         var eps = geometry.rmsEps
         withUnsafeBytes(of: &flags) { (raw: UnsafeRawBufferPointer) in enc.setBytes(raw.baseAddress!, length: 16, index: Buffer.headU4.rawValue) }
@@ -173,6 +188,7 @@ public final class QWRopeApply: @unchecked Sendable {
                                 wq: QWTensorValue?, wk: QWTensorValue?,
                                 positionStart: Int, count: Int,
                                 inRowCols: Int? = nil) throws {
+        try Self.validateGeometry(geometry)
         let nrows = tables?.rows ?? (tableTensor.shape.dims.first ?? 0)
         guard count > 0 else { throw QWRopeError.badShape("count mismatch: S=\(count)") }
         guard positionStart >= 0, positionStart + count <= nrows else {

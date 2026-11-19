@@ -98,6 +98,7 @@ public indirect enum QWJson: Equatable, Sendable {
     }
 
     private final class Parser {
+        private static let maxDepth = 128
         let chars: [Unicode.Scalar]
         var pos = 0
 
@@ -118,12 +119,15 @@ public indirect enum QWJson: Equatable, Sendable {
 
         func parse() throws -> QWJson {
             skipWhitespace()
-            let val = try parseValue()
+            let val = try parseValue(depth: 0)
             skipWhitespace()
+            guard pos == chars.count else {
+                throw QWJsonParseError("Unexpected trailing data at \(pos)")
+            }
             return val
         }
 
-        func parseValue() throws -> QWJson {
+        func parseValue(depth: Int) throws -> QWJson {
             skipWhitespace()
             guard pos < chars.count else {
                 throw QWJsonParseError("Unexpected EOF in JSON")
@@ -131,9 +135,9 @@ public indirect enum QWJson: Equatable, Sendable {
             let c = chars[pos].value
             switch c {
             case 0x7B: // {
-                return try parseObject()
+                return try parseObject(depth: depth)
             case 0x5B: // [
-                return try parseArray()
+                return try parseArray(depth: depth)
             case 0x22: // "
                 return .string(try parseString())
             case 0x74: // t (true)
@@ -161,7 +165,10 @@ public indirect enum QWJson: Equatable, Sendable {
             }
         }
 
-        func parseObject() throws -> QWJson {
+        func parseObject(depth: Int) throws -> QWJson {
+            guard depth < Self.maxDepth else {
+                throw QWJsonParseError("JSON nesting depth exceeds maximum of \(Self.maxDepth)")
+            }
             pos += 1 // skip '{'
             skipWhitespace()
             var pairs: [(String, QWJson)] = []
@@ -180,7 +187,7 @@ public indirect enum QWJson: Equatable, Sendable {
                     throw QWJsonParseError("Expected ':' after key in object at \(pos)")
                 }
                 pos += 1
-                let val = try parseValue()
+                let val = try parseValue(depth: depth + 1)
                 pairs.append((key, val))
                 skipWhitespace()
                 guard pos < chars.count else {
@@ -199,7 +206,10 @@ public indirect enum QWJson: Equatable, Sendable {
             throw QWJsonParseError("Unterminated object")
         }
 
-        func parseArray() throws -> QWJson {
+        func parseArray(depth: Int) throws -> QWJson {
+            guard depth < Self.maxDepth else {
+                throw QWJsonParseError("JSON nesting depth exceeds maximum of \(Self.maxDepth)")
+            }
             pos += 1 // skip '['
             skipWhitespace()
             var items: [QWJson] = []
@@ -208,7 +218,7 @@ public indirect enum QWJson: Equatable, Sendable {
                 return .array(items)
             }
             while pos < chars.count {
-                let val = try parseValue()
+                let val = try parseValue(depth: depth + 1)
                 items.append(val)
                 skipWhitespace()
                 guard pos < chars.count else {
@@ -225,6 +235,26 @@ public indirect enum QWJson: Equatable, Sendable {
                 throw QWJsonParseError("Expected ',' or ']' in array at \(pos)")
             }
             throw QWJsonParseError("Unterminated array")
+        }
+
+        private func parseHex4() throws -> Int {
+            guard pos + 4 <= chars.count else {
+                throw QWJsonParseError("Short \\u escape")
+            }
+            var hex = 0
+            for _ in 0..<4 {
+                let h = chars[pos].value
+                pos += 1
+                let digit: Int
+                switch h {
+                case 0x30...0x39: digit = Int(h - 0x30)
+                case 0x41...0x46: digit = Int(h - 0x41 + 10)
+                case 0x61...0x66: digit = Int(h - 0x61 + 10)
+                default: throw QWJsonParseError("Invalid hex in \\u escape")
+                }
+                hex = (hex << 4) | digit
+            }
+            return hex
         }
 
         func parseString() throws -> String {
@@ -253,52 +283,38 @@ public indirect enum QWJson: Equatable, Sendable {
                     case 0x72: out.append("\r")
                     case 0x74: out.append("\t")
                     case 0x75: // uXXXX
-                        guard pos + 4 <= chars.count else {
-                            throw QWJsonParseError("Short \\u escape")
-                        }
-                        var hex = 0
-                        for _ in 0..<4 {
-                            let h = chars[pos].value
-                            pos += 1
-                            let digit: Int
-                            switch h {
-                            case 0x30...0x39: digit = Int(h - 0x30)
-                            case 0x41...0x46: digit = Int(h - 0x41 + 10)
-                            case 0x61...0x66: digit = Int(h - 0x61 + 10)
-                            default: throw QWJsonParseError("Invalid hex in \\u escape")
-                            }
-                            hex = (hex << 4) | digit
-                        }
+                        let hex = try parseHex4()
                         if hex >= 0xD800 && hex <= 0xDBFF {
-                            if pos + 6 <= chars.count && chars[pos].value == 0x5C && chars[pos+1].value == 0x75 {
-                                pos += 2 // skip \u
-                                var lowHex = 0
-                                for _ in 0..<4 {
-                                    let h = chars[pos].value
-                                    pos += 1
-                                    let digit: Int
-                                    switch h {
-                                    case 0x30...0x39: digit = Int(h - 0x30)
-                                    case 0x41...0x46: digit = Int(h - 0x41 + 10)
-                                    case 0x61...0x66: digit = Int(h - 0x61 + 10)
-                                    default: throw QWJsonParseError("Invalid hex in \\u escape")
-                                    }
-                                    lowHex = (lowHex << 4) | digit
-                                }
-                                if lowHex >= 0xDC00 && lowHex <= 0xDFFF {
-                                    let cp = 0x10000 + ((hex - 0xD800) << 10) + (lowHex - 0xDC00)
-                                    if let u = Unicode.Scalar(cp) {
-                                        out.unicodeScalars.append(u)
-                                    }
-                                }
+                            guard pos + 6 <= chars.count,
+                                  chars[pos].value == 0x5C,
+                                  chars[pos + 1].value == 0x75 else {
+                                throw QWJsonParseError("Unpaired high surrogate in \\u escape")
                             }
-                        } else if let u = Unicode.Scalar(hex) {
+                            pos += 2
+                            let lowHex = try parseHex4()
+                            guard lowHex >= 0xDC00 && lowHex <= 0xDFFF else {
+                                throw QWJsonParseError("Invalid low surrogate in \\u escape")
+                            }
+                            let cp = 0x10000 + ((hex - 0xD800) << 10) + (lowHex - 0xDC00)
+                            guard let u = Unicode.Scalar(cp) else {
+                                throw QWJsonParseError("Invalid UTF-16 surrogate pair in \\u escape")
+                            }
+                            out.unicodeScalars.append(u)
+                        } else if hex >= 0xDC00 && hex <= 0xDFFF {
+                            throw QWJsonParseError("Unpaired low surrogate in \\u escape")
+                        } else {
+                            guard let u = Unicode.Scalar(hex) else {
+                                throw QWJsonParseError("Invalid Unicode scalar in \\u escape")
+                            }
                             out.unicodeScalars.append(u)
                         }
                     default:
-                        out.unicodeScalars.append(esc)
+                        throw QWJsonParseError("Invalid escape '\\\(esc)' in string")
                     }
                 } else {
+                    guard sc.value >= 0x20 else {
+                        throw QWJsonParseError("Unescaped control character in string at \(pos)")
+                    }
                     out.unicodeScalars.append(sc)
                     pos += 1
                 }
@@ -361,7 +377,9 @@ public indirect enum QWJson: Equatable, Sendable {
     }
     static func pyReprKey(_ k: String) -> String { pyReprString(k) }
     static func pyReprString(_ s: String) -> String {
-        "'" + jsonQuote(s).dropFirst().dropLast() + "'"
+        let escaped = jsonQuote(s).dropFirst().dropLast()
+            .replacingOccurrences(of: "'", with: "\\'")
+        return "'" + escaped + "'"
     }
 
     var pyRepr: String {
@@ -419,62 +437,88 @@ public struct QWJsonParseError: Swift.Error, CustomStringConvertible, Equatable,
     public var description: String { "QWJson: \(message)" }
 }
 
+private struct QWJsonCodingKey: CodingKey {
+    var stringValue: String
+    var intValue: Int? { nil }
+    init(_ string: String) { self.stringValue = string }
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { return nil }
+}
+
 extension QWJson: Codable {
     public init(from decoder: Decoder) throws {
-        if let container = try? decoder.singleValueContainer() {
-            if container.decodeNil() {
-                self = .null
-                return
+        if let keyed = try? decoder.container(keyedBy: QWJsonCodingKey.self) {
+            var pairs: [(String, QWJson)] = []
+            pairs.reserveCapacity(keyed.allKeys.count)
+            for key in keyed.allKeys {
+                pairs.append((key.stringValue, try keyed.decode(QWJson.self, forKey: key)))
             }
-            if let b = try? container.decode(Bool.self) {
-                self = .bool(b)
-                return
-            }
-            if let i = try? container.decode(Int.self) {
-                self = .int(i)
-                return
-            }
-            if let d = try? container.decode(Double.self) {
-                self = .double(d)
-                return
-            }
-            if let s = try? container.decode(String.self) {
-                self = .string(s)
-                return
-            }
-            if let a = try? container.decode([QWJson].self) {
-                self = .array(a)
-                return
-            }
-            if let dict = try? container.decode([String: QWJson].self) {
-                self = .object(dict.keys.sorted().map { ($0, dict[$0]!) })
-                return
-            }
+            self = .object(pairs)
+            return
         }
-        self = .null
+        if var unkeyed = try? decoder.unkeyedContainer() {
+            var items: [QWJson] = []
+            if let count = unkeyed.count { items.reserveCapacity(count) }
+            while !unkeyed.isAtEnd {
+                items.append(try unkeyed.decode(QWJson.self))
+            }
+            self = .array(items)
+            return
+        }
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+            return
+        }
+        if let b = try? container.decode(Bool.self) {
+            self = .bool(b)
+            return
+        }
+        if let i = try? container.decode(Int.self) {
+            self = .int(i)
+            return
+        }
+        if let d = try? container.decode(Double.self) {
+            self = .double(d)
+            return
+        }
+        if let s = try? container.decode(String.self) {
+            self = .string(s)
+            return
+        }
+        throw DecodingError.dataCorruptedError(
+            in: container,
+            debugDescription: "Unsupported JSON value for QWJson"
+        )
     }
 
     public func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
         switch self {
         case .undefined, .null:
+            var container = encoder.singleValueContainer()
             try container.encodeNil()
         case .bool(let b):
+            var container = encoder.singleValueContainer()
             try container.encode(b)
         case .int(let i):
+            var container = encoder.singleValueContainer()
             try container.encode(i)
         case .double(let d):
+            var container = encoder.singleValueContainer()
             try container.encode(d)
         case .string(let s):
+            var container = encoder.singleValueContainer()
             try container.encode(s)
         case .array(let a):
-            try container.encode(a)
-        case .object(let pairs):
-            var dict: [String: QWJson] = [:]
-            for (k, v) in pairs {
-                dict[k] = v
+            var container = encoder.unkeyedContainer()
+            for item in a {
+                try container.encode(item)
             }
-            try container.encode(dict)
+        case .object(let pairs):
+            var container = encoder.container(keyedBy: QWJsonCodingKey.self)
+            for (k, v) in pairs {
+                try container.encode(v, forKey: QWJsonCodingKey(k))
+            }
         }
     }
 }

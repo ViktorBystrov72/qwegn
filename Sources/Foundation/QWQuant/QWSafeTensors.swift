@@ -50,8 +50,7 @@ public enum QWSafeTensorsDType: String, Sendable {
         switch self {
         case .f4: return 4
         case .f6E2M3, .f6E3M2: return 6
-        case .bool, .u8, .i8, .f8E5M2, .f8E4M3, .f8E8M0, .f8E4M3FNUZ, .f8E5M2FNUZ:
-            return 8
+        case .bool, .u8, .i8, .f8E5M2, .f8E4M3, .f8E8M0, .f8E4M3FNUZ, .f8E5M2FNUZ: return 8
         case .i16, .u16, .f16, .bf16: return 16
         case .i32, .u32, .f32: return 32
         case .c64, .f64, .i64, .u64: return 64
@@ -114,18 +113,91 @@ public final class QWSafeTensorsShard: @unchecked Sendable {
 ///
 /// The payload is mapped read-only and the header is parsed once.
 public final class QWSafeTensorsContainer: @unchecked Sendable {
+    private struct QuantSpec: Sendable { let bits: Int?; let groupSize: Int? }
+
+    private struct QuantMetadata: Sendable {
+        let defaultSpec: QuantSpec
+        let perPrefix: [String: QuantSpec]
+
+        func spec(for name: String) -> QuantSpec? {
+            let stem = name.hasSuffix(".weight") ? String(name.dropLast(7)) : name
+            let prefixes = ["model.language_model.", "language_model.model.", "model.", "language_model."]
+            var candidates = [stem]
+            if let p = prefixes.first(where: { stem.hasPrefix($0) }) {
+                let rest = String(stem.dropFirst(p.count))
+                candidates.append(rest)
+                candidates.append(contentsOf: prefixes.map { $0 + rest })
+            }
+            for cand in candidates {
+                if let hit = perPrefix[cand] {
+                    return QuantSpec(bits: hit.bits ?? defaultSpec.bits, groupSize: hit.groupSize ?? defaultSpec.groupSize)
+                }
+            }
+            return (defaultSpec.bits != nil || defaultSpec.groupSize != nil) ? defaultSpec : nil
+        }
+
+        static func load(near weightsURL: URL) -> QuantMetadata? {
+            let dir = weightsURL.deletingLastPathComponent()
+            let cfgs = [dir.appendingPathComponent("config.json"),
+                        dir.appendingPathComponent("assets/config.json"),
+                        URL(fileURLWithPath: weightsURL.path + ".assets/config.json")]
+            for cfg in cfgs {
+                guard let data = try? Data(contentsOf: cfg),
+                      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                let text = root["text_config"] as? [String: Any]
+                guard let qObj = (text?["quantization"] as? [String: Any])
+                    ?? (text?["quantization_config"] as? [String: Any])
+                    ?? (root["quantization"] as? [String: Any])
+                    ?? (root["quantization_config"] as? [String: Any]) else { continue }
+                var perPrefix: [String: QuantSpec] = [:]
+                for (k, v) in qObj {
+                    if let sub = v as? [String: Any], (sub["bits"] as? Int) != nil || (sub["group_size"] as? Int) != nil {
+                        perPrefix[k] = QuantSpec(bits: sub["bits"] as? Int, groupSize: sub["group_size"] as? Int)
+                    }
+                }
+                let db = qObj["bits"] as? Int, dg = qObj["group_size"] as? Int
+                if db != nil || dg != nil || !perPrefix.isEmpty {
+                    return QuantMetadata(defaultSpec: QuantSpec(bits: db, groupSize: dg), perPrefix: perPrefix)
+                }
+            }
+            return nil
+        }
+    }
+
     public let url: URL
     public let shards: [URL: QWSafeTensorsShard]
     /// The file's own tensor names -> (shard, tensor).
     private let index: [String: (QWSafeTensorsShard, QWSafeTensorsTensor)]
     /// Canonical names the file does not use -> the tensor they name.
     private let aliases: [String: (QWSafeTensorsShard, QWSafeTensorsTensor)]
+    private let quantMetadata: QuantMetadata?
     /// The file's tensors. The canonical aliases are deliberately NOT here:
     /// a consumer that loads every weight must not load one twice.
     public let tensors: [String: QWSafeTensorsTensor]
 
     public convenience init(url: URL) throws {
         try self.init(url: url, onlyTensors: nil)
+    }
+
+    private static func validatedShardURL(base: URL, fileName: String) throws -> URL {
+        guard !fileName.isEmpty,
+              !fileName.hasPrefix("/"),
+              !fileName.contains("\\"),
+              !fileName.contains("\0") else {
+            throw QWSafeTensorsError.badHeader("invalid shard path '\(fileName)' in index.json")
+        }
+        let parts = fileName.split(separator: "/", omittingEmptySubsequences: false)
+        guard !parts.contains("."), !parts.contains("..") else {
+            throw QWSafeTensorsError.badHeader("path traversal shard '\(fileName)' in index.json")
+        }
+        let resolvedBase = base.resolvingSymlinksInPath().standardizedFileURL
+        let basePrefix = resolvedBase.path.hasSuffix("/") ? resolvedBase.path : resolvedBase.path + "/"
+        let shardURL = base.appendingPathComponent(fileName).standardizedFileURL
+        let resolvedShard = shardURL.resolvingSymlinksInPath().standardizedFileURL
+        guard resolvedShard.path.hasPrefix(basePrefix) else {
+            throw QWSafeTensorsError.badHeader("shard '\(fileName)' escapes index directory")
+        }
+        return shardURL
     }
 
     /// A container over only the named tensors. A reader that needs 33 of a
@@ -145,7 +217,7 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
             }
             for (tensorName, fileName) in weightMap {
                 if let wanted, !wanted.contains(tensorName) { continue }
-                let shardURL = base.appendingPathComponent(fileName).standardizedFileURL
+                let shardURL = try Self.validatedShardURL(base: base, fileName: fileName)
                 let shard: QWSafeTensorsShard
                 if let existing = shards[shardURL] {
                     shard = existing
@@ -173,6 +245,7 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
         self.shards = shards
         self.index = index
         self.aliases = QWSafeTensorsContainer.buildAliases(index)
+        self.quantMetadata = QuantMetadata.load(near: url)
         self.tensors = index.mapValues { $0.1 }
     }
 
@@ -230,8 +303,10 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
     /// The tensor's byte range within its shard **file** (see `shardURL(of:)`).
     public func byteRange(of name: String) -> Range<Int>? {
         guard let (shard, t) = locate(name) else { return nil }
-        let start = shard.dataOffset + t.byteOffset
-        return start..<(start + t.byteLength)
+        let (start, ov0) = shard.dataOffset.addingReportingOverflow(t.byteOffset)
+        let (end, ov1) = start.addingReportingOverflow(t.byteLength)
+        guard !ov0, !ov1, start >= 0, end <= shard.data.count else { return nil }
+        return start..<end
     }
 
     /// Reads a tensor's bytes without copying them into the heap.
@@ -240,12 +315,13 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
     public func withBytes<T>(of name: String, _ body: (UnsafeRawBufferPointer) throws -> T) throws -> T {
         guard let (shard, t) = locate(name) else { throw QWSafeTensorsError.missingTensor(name) }
         return try shard.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            let start = shard.dataOffset + t.byteOffset
-            guard start >= 0, start + t.byteLength <= raw.count else {
+            let (start, ov0) = shard.dataOffset.addingReportingOverflow(t.byteOffset)
+            let (end, ov1) = start.addingReportingOverflow(t.byteLength)
+            guard !ov0, !ov1, start >= 0, end <= raw.count else {
                 throw QWSafeTensorsError.badHeader(
                     "tensor \(name) runs past the end of \(shard.url.lastPathComponent)")
             }
-            return try body(UnsafeRawBufferPointer(rebasing: raw[start..<start + t.byteLength]))
+            return try body(UnsafeRawBufferPointer(rebasing: raw[start..<end]))
         }
     }
 
@@ -255,12 +331,13 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
                                   _ body: (QWSafeTensorsShard, UnsafeRawBufferPointer, Range<Int>) throws -> T) throws -> T {
         guard let (shard, t) = locate(name) else { throw QWSafeTensorsError.missingTensor(name) }
         return try shard.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            let start = shard.dataOffset + t.byteOffset
-            guard start >= 0, start + t.byteLength <= raw.count else {
+            let (start, ov0) = shard.dataOffset.addingReportingOverflow(t.byteOffset)
+            let (end, ov1) = start.addingReportingOverflow(t.byteLength)
+            guard !ov0, !ov1, start >= 0, end <= raw.count else {
                 throw QWSafeTensorsError.badHeader(
                     "tensor \(name) runs past the end of \(shard.url.lastPathComponent)")
             }
-            return try body(shard, raw, start..<(start + t.byteLength))
+            return try body(shard, raw, start..<end)
         }
     }
 
@@ -269,8 +346,9 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
     /// read. The pointer handed to `body` is valid only inside it.
     public func reader(of name: String) throws -> QWSafeTensorsReader {
         guard let (shard, t) = locate(name) else { throw QWSafeTensorsError.missingTensor(name) }
-        let start = shard.dataOffset + t.byteOffset
-        guard start >= 0, start + t.byteLength <= shard.data.count else {
+        let (start, ov0) = shard.dataOffset.addingReportingOverflow(t.byteOffset)
+        let (end, ov1) = start.addingReportingOverflow(t.byteLength)
+        guard !ov0, !ov1, start >= 0, end <= shard.data.count else {
             throw QWSafeTensorsError.badHeader(
                 "tensor \(name) runs past the end of \(shard.url.lastPathComponent)")
         }
@@ -290,14 +368,15 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
         shard.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress, raw.count > 0 else { return }
             let pageSize = Int(sysconf(_SC_PAGESIZE))
-            guard pageSize > 0, Int(bitPattern: base) % pageSize == 0 else { return }
-            let start = shard.dataOffset + t.byteOffset
-            let end = min(raw.count, start + t.byteLength)
+            let (start, ov0) = shard.dataOffset.addingReportingOverflow(t.byteOffset)
+            let (rawEnd, ov1) = start.addingReportingOverflow(t.byteLength)
+            guard pageSize > 0, Int(bitPattern: base) % pageSize == 0, !ov0, !ov1, start >= 0 else { return }
+            let end = min(raw.count, rawEnd)
             let alignedStart = ((start + pageSize - 1) / pageSize) * pageSize
             let alignedEnd = (end / pageSize) * pageSize
             guard alignedEnd > alignedStart else { return }
-            let ptr = UnsafeMutableRawPointer(mutating: base.advanced(by: alignedStart))
-            _ = posix_madvise(ptr, alignedEnd - alignedStart, POSIX_MADV_DONTNEED)
+            _ = posix_madvise(UnsafeMutableRawPointer(mutating: base.advanced(by: alignedStart)),
+                              alignedEnd - alignedStart, POSIX_MADV_DONTNEED)
         }
     }
 
@@ -307,149 +386,244 @@ public final class QWSafeTensorsContainer: @unchecked Sendable {
             || tensor("embed_tokens.scales") != nil
     }
 
-    /// Reads and dequantizes a tensor (`bf16`, `f16`, `f32`, or MLX affine `u32` with `.scales`/`.biases`) into `[Float]`.
-    public func readFloats(_ name: String, expectedElementCount: Int? = nil) throws -> [Float] {
-        let r = try reader(of: name)
-        let info = r.tensorInfo
-        let count = info.elementCount ?? info.shape.reduce(1, *)
-        if info.dtype == .u32 {
-            let basePrefix = name.hasSuffix(".weight") ? String(name.dropLast(".weight".count)) : name
-            let sReader = try reader(of: basePrefix + ".scales")
-            let bReader = try reader(of: basePrefix + ".biases")
-            let sInfo = sReader.tensorInfo
-            let n = info.shape.first ?? 1
-            let wCols = info.shape.count == 2 ? info.shape[1] : count / max(1, n)
-            let sElems = sInfo.elementCount ?? sInfo.shape.reduce(1, *)
-            let gCols = sInfo.shape.count == 2 ? sInfo.shape[1] : sElems / max(1, n)
-            guard n > 0, wCols > 0, gCols > 0 else {
-                throw QWSafeTensorsError.unsupportedDType("u32 invalid shape \(name)")
+    private func resolveMLXAffineParams(
+        name: String,
+        n: Int,
+        wCols: Int,
+        gCols: Int,
+        expectedElementCount: Int?
+    ) throws -> (bits: Int, groupSize: Int, k: Int) {
+        let (wBits, ovBits) = wCols.multipliedReportingOverflow(by: 32)
+        guard !ovBits else {
+            throw QWSafeTensorsError.badHeader("MLX affine width overflow for \(name)")
+        }
+        if let expected = expectedElementCount {
+            guard expected > 0, expected % n == 0 else {
+                throw QWSafeTensorsError.badHeader("invalid MLX affine layout for \(name)")
             }
-            let bits: Int
-            let groupSize: Int
-            let k: Int
-            if let expected = expectedElementCount {
-                k = expected / n
-                guard n * k == expected, k % gCols == 0 else {
-                    throw QWSafeTensorsError.badHeader("invalid MLX affine layout for \(name)")
+            let k = expected / n
+            guard k > 0, k % gCols == 0, wBits % k == 0 else {
+                throw QWSafeTensorsError.badHeader("invalid MLX affine layout for \(name)")
+            }
+            return (bits: wBits / k, groupSize: k / gCols, k: k)
+        }
+        guard wBits % gCols == 0 else {
+            throw QWSafeTensorsError.badHeader("invalid MLX affine group count for \(name)")
+        }
+        let bitsPerGroup = wBits / gCols
+        if let meta = quantMetadata?.spec(for: name) {
+            if let b = meta.bits, let g = meta.groupSize,
+               b > 0, g > 0, b * g == bitsPerGroup, QWBF16.isSupportedMLXAffineBits(b) {
+                return (b, g, gCols * g)
+            }
+            if let g = meta.groupSize, g > 0, bitsPerGroup % g == 0 {
+                let b = bitsPerGroup / g
+                if QWBF16.isSupportedMLXAffineBits(b) { return (b, g, gCols * g) }
+            }
+            if let b = meta.bits, QWBF16.isSupportedMLXAffineBits(b), bitsPerGroup % b == 0 {
+                let g = bitsPerGroup / b
+                if [32, 64, 128, 256].contains(g) { return (b, g, gCols * g) }
+            }
+        }
+        for b in [4, 8, 6, 3, 2, 5] where bitsPerGroup % b == 0 {
+            let g = bitsPerGroup / b
+            if [64, 32, 128, 256].contains(g) {
+                return (b, g, gCols * g)
+            }
+        }
+        throw QWSafeTensorsError.unsupportedDType("u32 unsupported MLX affine bitsPerGroup=\(bitsPerGroup) \(name)")
+    }
+
+    private static func dequantMLXGroupRow(
+        rowRaw: UnsafeRawPointer, dPtr: UnsafeMutablePointer<Float>, dstRowBase: Int,
+        gCols: Int, groupSize: Int, bits: Int, scaleAt: (Int) -> Float, biasAt: (Int) -> Float
+    ) {
+        for g in 0..<gCols {
+            let scale = scaleAt(g), bias = biasAt(g), dstGroupBase = dstRowBase + g * groupSize
+            if bits == 4 && groupSize % 8 == 0 {
+                let wordBase = (g * groupSize) / 8
+                for wIdx in 0..<(groupSize / 8) {
+                    var word = UInt32(littleEndian: rowRaw.loadUnaligned(fromByteOffset: (wordBase + wIdx) * 4, as: UInt32.self))
+                    for nib in 0..<8 { dPtr[dstGroupBase + wIdx * 8 + nib] = Float(word & 0xF) * scale + bias; word >>= 4 }
                 }
-                groupSize = k / gCols
-                bits = (wCols * 32) / k
+            } else if bits == 8 && groupSize % 4 == 0 {
+                let wordBase = (g * groupSize) / 4
+                for wIdx in 0..<(groupSize / 4) {
+                    var word = UInt32(littleEndian: rowRaw.loadUnaligned(fromByteOffset: (wordBase + wIdx) * 4, as: UInt32.self))
+                    for byteIdx in 0..<4 { dPtr[dstGroupBase + wIdx * 4 + byteIdx] = Float(word & 0xFF) * scale + bias; word >>= 8 }
+                }
             } else {
-                bits = (wCols * 32) % (gCols * 64) == 0 ? (wCols * 32) / (gCols * 64) : (wCols * 32) / (gCols * 32)
-                groupSize = (wCols * 32) / max(1, gCols * bits)
-                k = gCols * groupSize
+                for j in 0..<groupSize {
+                    dPtr[dstGroupBase + j] = QWBF16.unpackMLXAffineQ(rowRaw: rowRaw, col: g * groupSize + j, bits: bits) * scale + bias
+                }
             }
-            guard groupSize > 0, k == gCols * groupSize, QWBF16.isSupportedMLXAffineBits(bits) else {
-                throw QWSafeTensorsError.unsupportedDType("u32 unsupported MLX affine bits=\(bits) \(name)")
-            }
-            if sInfo.dtype == .f16 || sInfo.dtype == .bf16 {
-                return r.withBytes { wRaw in
-                    sReader.withBytes { sRaw in
-                        bReader.withBytes { bRaw in
-                            let wWords = wRaw.bindMemory(to: UInt32.self)
-                            guard let wPtr = wWords.baseAddress else { return [] }
-                            let sU16 = sRaw.bindMemory(to: UInt16.self)
-                            let bU16 = bRaw.bindMemory(to: UInt16.self)
-                            let isF16 = sInfo.dtype == .f16
-                            return [Float](unsafeUninitializedCapacity: n * k) { dst, initialized in
-                                nonisolated(unsafe) let dPtr = dst.baseAddress!
-                                nonisolated(unsafe) let wBase = wPtr
-                                nonisolated(unsafe) let sBase = sU16.baseAddress!
-                                nonisolated(unsafe) let bBase = bU16.baseAddress!
-                                let workers = n >= 64 ? min(16, n) : 1
-                                let perWorker = (n + workers - 1) / workers
-                                DispatchQueue.concurrentPerform(iterations: workers) { w in
-                                    let startR = w * perWorker
-                                    let endR = min(n, startR + perWorker)
-                                    guard startR < endR else { return }
-                                    for row in startR..<endR {
-                                        let rowWords = wBase.advanced(by: row * wCols)
-                                        let sbRowBase = row * gCols
-                                        let dstRowBase = row * k
-                                        for g in 0..<gCols {
-                                            let sBits = UInt16(littleEndian: sBase[sbRowBase + g])
-                                            let bBits = UInt16(littleEndian: bBase[sbRowBase + g])
-                                            let scale = isF16 ? Float(Float16(bitPattern: sBits)) : Float(bitPattern: UInt32(sBits) << 16)
-                                            let bias = isF16 ? Float(Float16(bitPattern: bBits)) : Float(bitPattern: UInt32(bBits) << 16)
-                                            let dstGroupBase = dstRowBase + g * groupSize
-                                            if bits == 4 && groupSize % 8 == 0 {
-                                                let wordBase = (g * groupSize) / 8
-                                                let wordsInGroup = groupSize / 8
-                                                for wIdx in 0..<wordsInGroup {
-                                                    var word = UInt32(littleEndian: rowWords[wordBase + wIdx])
-                                                    let baseOut = dstGroupBase + wIdx * 8
-                                                    for nib in 0..<8 {
-                                                        let q = Float(word & 0xF)
-                                                        word >>= 4
-                                                        dPtr[baseOut + nib] = q * scale + bias
-                                                    }
-                                                }
-                                            } else if bits == 8 && groupSize % 4 == 0 {
-                                                let wordBase = (g * groupSize) / 4
-                                                let wordsInGroup = groupSize / 4
-                                                for wIdx in 0..<wordsInGroup {
-                                                    var word = UInt32(littleEndian: rowWords[wordBase + wIdx])
-                                                    let baseOut = dstGroupBase + wIdx * 4
-                                                    for byteIdx in 0..<4 {
-                                                        let q = Float(word & 0xFF)
-                                                        word >>= 8
-                                                        dPtr[baseOut + byteIdx] = q * scale + bias
-                                                    }
-                                                }
-                                            } else {
-                                                for j in 0..<groupSize {
-                                                    let col = g * groupSize + j
-                                                    let q = QWBF16.unpackMLXAffineQ(rowWords: rowWords, col: col, bits: bits)
-                                                    dPtr[dstGroupBase + j] = q * scale + bias
-                                                }
-                                            }
-                                        }
+        }
+    }
+
+    private func readMLXAffineFloats(
+        _ name: String, r: QWSafeTensorsReader, expectedElementCount: Int?
+    ) throws -> [Float] {
+        let info = r.tensorInfo
+        guard let count = info.elementCount else { throw QWSafeTensorsError.badHeader("shape overflow for \(name)") }
+        let basePrefix = name.hasSuffix(".weight") ? String(name.dropLast(".weight".count)) : name
+        let sReader = try reader(of: basePrefix + ".scales")
+        let bReader = try reader(of: basePrefix + ".biases")
+        let sInfo = sReader.tensorInfo, bInfo = bReader.tensorInfo
+        guard info.shape.count >= 2, let wCols = info.shape.last,
+              let sElems = sInfo.elementCount, let bElems = bInfo.elementCount, let gCols = sInfo.shape.last else {
+            throw QWSafeTensorsError.unsupportedDType("u32 invalid shape \(name)")
+        }
+        let n = info.shape.dropLast().reduce(1, *)
+        guard n > 0, wCols > 0, gCols > 0, n * wCols == count,
+              sElems == n * gCols, bElems == sElems, sInfo.shape == bInfo.shape else {
+            throw QWSafeTensorsError.badHeader("u32 scales/biases shape mismatch \(name)")
+        }
+        let (bits, groupSize, k) = try resolveMLXAffineParams(
+            name: name, n: n, wCols: wCols, gCols: gCols, expectedElementCount: expectedElementCount
+        )
+        let (outCount, ovOut) = n.multipliedReportingOverflow(by: k)
+        guard !ovOut, outCount > 0, groupSize > 0, k == gCols * groupSize,
+              QWBF16.isSupportedMLXAffineBits(bits) else {
+            throw QWSafeTensorsError.unsupportedDType("u32 unsupported MLX affine bits=\(bits) \(name)")
+        }
+        let validSBDTypes: [QWSafeTensorsDType] = [.f16, .bf16, .f32]
+        guard validSBDTypes.contains(sInfo.dtype), validSBDTypes.contains(bInfo.dtype) else {
+            throw QWSafeTensorsError.unsupportedDType("u32 unsupported scale/bias dtype \(name)")
+        }
+        if (sInfo.dtype == .f16 || sInfo.dtype == .bf16), bInfo.dtype == sInfo.dtype {
+            return try r.withBytes { wRaw in
+                try sReader.withBytes { sRaw in
+                    try bReader.withBytes { bRaw in
+                        guard let wBase = wRaw.baseAddress, wRaw.count >= n * wCols * 4,
+                              let sBase = sRaw.baseAddress, sRaw.count >= sElems * 2,
+                              let bBase = bRaw.baseAddress, bRaw.count >= bElems * 2 else {
+                            throw QWSafeTensorsError.badHeader("truncated MLX affine tensor \(name)")
+                        }
+                        let isF16 = sInfo.dtype == .f16
+                        return [Float](unsafeUninitializedCapacity: outCount) { dst, initialized in
+                            guard let dBase = dst.baseAddress else { initialized = 0; return }
+                            nonisolated(unsafe) let dPtr = dBase
+                            nonisolated(unsafe) let wPtr = wBase, sPtr = sBase, bPtr = bBase
+                            let workers = n >= 64 ? min(16, n) : 1, perWorker = (n + workers - 1) / workers
+                            DispatchQueue.concurrentPerform(iterations: workers) { w in
+                                let startR = w * perWorker, endR = min(n, startR + perWorker)
+                                guard startR < endR else { return }
+                                for row in startR..<endR {
+                                    let sbRow = row * gCols
+                                    let decode: (UnsafeRawPointer, Int) -> Float = { p, g in
+                                        let u = UInt16(littleEndian: p.loadUnaligned(fromByteOffset: (sbRow + g) * 2, as: UInt16.self))
+                                        return isF16 ? Float(Float16(bitPattern: u)) : Float(bitPattern: UInt32(u) << 16)
                                     }
+                                    Self.dequantMLXGroupRow(
+                                        rowRaw: wPtr.advanced(by: row * wCols * 4),
+                                        dPtr: dPtr, dstRowBase: row * k,
+                                        gCols: gCols, groupSize: groupSize, bits: bits,
+                                        scaleAt: { decode(sPtr, $0) }, biasAt: { decode(bPtr, $0) }
+                                    )
                                 }
-                                initialized = n * k
                             }
+                            initialized = outCount
                         }
                     }
                 }
             }
-            let scales = try readFloats(basePrefix + ".scales", expectedElementCount: sElems)
-            let biases = try readFloats(basePrefix + ".biases", expectedElementCount: sElems)
-            return r.withBytes { wRaw in
-                let wWords = wRaw.bindMemory(to: UInt32.self)
-                guard let wPtr = wWords.baseAddress else { return [] }
-                var out = [Float](repeating: 0, count: n * k)
-                for row in 0..<n {
-                    let rowWords = wPtr.advanced(by: row * wCols)
-                    let sbRowBase = row * gCols
-                    let dstRowBase = row * k
-                    for c in 0..<k {
-                        let g = c / groupSize
-                        let q = QWBF16.unpackMLXAffineQ(rowWords: rowWords, col: c, bits: bits)
-                        out[dstRowBase + c] = q * scales[sbRowBase + g] + biases[sbRowBase + g]
-                    }
-                }
-                return out
+        }
+        let scales = try readFloats(basePrefix + ".scales", expectedElementCount: sElems)
+        let biases = try readFloats(basePrefix + ".biases", expectedElementCount: bElems)
+        guard scales.count == n * gCols, biases.count == n * gCols else {
+            throw QWSafeTensorsError.badHeader("u32 scales/biases element mismatch \(name)")
+        }
+        return try r.withBytes { wRaw in
+            guard let wPtr = wRaw.baseAddress, wRaw.count >= n * wCols * 4 else {
+                throw QWSafeTensorsError.badHeader("truncated MLX affine tensor \(name)")
             }
+            return [Float](unsafeUninitializedCapacity: outCount) { dst, initialized in
+                guard let dPtr = dst.baseAddress else { initialized = 0; return }
+                for row in 0..<n {
+                    let sbRow = row * gCols
+                    Self.dequantMLXGroupRow(
+                        rowRaw: wPtr.advanced(by: row * wCols * 4),
+                        dPtr: dPtr, dstRowBase: row * k,
+                        gCols: gCols, groupSize: groupSize, bits: bits,
+                        scaleAt: { scales[sbRow + $0] }, biasAt: { biases[sbRow + $0] }
+                    )
+                }
+                initialized = outCount
+            }
+        }
+    }
+
+    /// Reads and dequantizes a tensor (`bf16`, `f16`, `f32`, or MLX affine `u32` with `.scales`/`.biases`) into `[Float]`.
+    public func readFloats(_ name: String, expectedElementCount: Int? = nil) throws -> [Float] {
+        let r = try reader(of: name)
+        let info = r.tensorInfo
+        if info.dtype == .u32 {
+            return try readMLXAffineFloats(name, r: r, expectedElementCount: expectedElementCount)
+        }
+        guard let count = info.elementCount else {
+            throw QWSafeTensorsError.badHeader("shape overflow for \(name)")
         }
         if let expected = expectedElementCount, count != expected {
             throw QWSafeTensorsError.badHeader("shape \(count) != \(expected) for \(name)")
         }
-        return try r.withBytes { raw in
-            var out = [Float](repeating: 0, count: count)
+        if count == 0 {
             switch info.dtype {
-            case .bf16:
-                let u16 = raw.bindMemory(to: UInt16.self)
-                for i in 0..<count { out[i] = Float(bitPattern: UInt32(UInt16(littleEndian: u16[i])) << 16) }
-            case .f16:
-                let u16 = raw.bindMemory(to: UInt16.self)
-                for i in 0..<count { out[i] = Float(Float16(bitPattern: UInt16(littleEndian: u16[i]))) }
-            case .f32:
-                let u32 = raw.bindMemory(to: UInt32.self)
-                for i in 0..<count { out[i] = Float(bitPattern: UInt32(littleEndian: u32[i])) }
-            default:
+            case .bf16, .f16, .f32: return []
+            default: throw QWSafeTensorsError.unsupportedDType(info.dtype.rawValue)
+            }
+        }
+        return try r.withBytes { raw in
+            guard let base = raw.baseAddress else { throw QWSafeTensorsError.badHeader("empty tensor buffer for \(name)") }
+            let elemBytes = info.dtype == .f32 ? 4 : 2
+            guard info.dtype == .bf16 || info.dtype == .f16 || info.dtype == .f32 else {
                 throw QWSafeTensorsError.unsupportedDType(info.dtype.rawValue)
             }
+            guard raw.count >= count * elemBytes else {
+                throw QWSafeTensorsError.badHeader("truncated \(info.dtype.rawValue) tensor \(name)")
+            }
+            var out = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                switch info.dtype {
+                case .bf16:
+                    let u = UInt16(littleEndian: base.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self))
+                    out[i] = Float(bitPattern: UInt32(u) << 16)
+                case .f16:
+                    let u = UInt16(littleEndian: base.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self))
+                    out[i] = Float(Float16(bitPattern: u))
+                case .f32:
+                    let u = UInt32(littleEndian: base.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self))
+                    out[i] = Float(bitPattern: u)
+                default: break
+                }
+            }
             return out
+        }
+    }
+}
+
+extension QWBF16 {
+    /// Alignment-safe unaligned MLX `.u32` bit-unpacker shared by `QWSafeTensors` and `QWHQ4Quantizer`.
+    @inline(__always)
+    public static func unpackMLXAffineQ(rowRaw: UnsafeRawPointer, col: Int, bits: Int) -> Float {
+        switch bits {
+        case 2, 4, 8:
+            let valsPerWord = 32 / bits, mask: UInt32 = (1 << bits) - 1
+            let word = UInt32(littleEndian: rowRaw.loadUnaligned(fromByteOffset: (col / valsPerWord) * 4, as: UInt32.self))
+            return Float((word >> ((col % valsPerWord) * bits)) & mask)
+        case 3, 6:
+            let off = (bits == 3 ? (col >> 3) : (col >> 2)) * 3
+            let b0 = UInt32(rowRaw.loadUnaligned(fromByteOffset: off, as: UInt8.self))
+            let b1 = UInt32(rowRaw.loadUnaligned(fromByteOffset: off + 1, as: UInt8.self))
+            let b2 = UInt32(rowRaw.loadUnaligned(fromByteOffset: off + 2, as: UInt8.self))
+            let shift = bits == 3 ? ((col & 7) * 3) : ((col & 3) * 6)
+            return Float(((b0 | (b1 << 8) | (b2 << 16)) >> shift) & UInt32((1 << bits) - 1))
+        case 5:
+            let off = (col >> 3) * 5
+            var u40: UInt64 = 0
+            for i in 0..<5 { u40 |= UInt64(rowRaw.loadUnaligned(fromByteOffset: off + i, as: UInt8.self)) << (8 * i) }
+            return Float((u40 >> ((col & 7) * 5)) & 0x1F)
+        default:
+            return 0
         }
     }
 }
@@ -495,7 +669,7 @@ extension QWSafeTensorsShard {
     }
 
     static func open(_ url: URL) throws -> QWSafeTensorsShard {
-        let fd = Darwin.open(url.path, O_RDONLY)
+        let fd = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
                           userInfo: [NSFilePathErrorKey: url.path])
@@ -506,8 +680,9 @@ extension QWSafeTensorsShard {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
                           userInfo: [NSFilePathErrorKey: url.path])
         }
-        let fileSize = Int(st.st_size)
-        guard fileSize >= 8 else { throw QWSafeTensorsError.badHeader("file too short") }
+        guard st.st_size >= 8, let fileSize = Int(exactly: st.st_size) else {
+            throw QWSafeTensorsError.badHeader("file too short")
+        }
         let rawMap = Darwin.mmap(nil, fileSize, PROT_READ, MAP_SHARED, fd, 0)
         guard let mappedPtr = rawMap, mappedPtr != MAP_FAILED else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
@@ -528,8 +703,8 @@ extension QWSafeTensorsShard {
         guard let headerLength = Int(exactly: headerLength) else {
             throw QWSafeTensorsError.badHeader("header length does not fit")
         }
-        let headerEnd = 8 + headerLength
-        guard headerEnd <= data.count else { throw QWSafeTensorsError.badHeader("header length past EOF") }
+        let (headerEnd, ovHdr) = headerLength.addingReportingOverflow(8)
+        guard !ovHdr, headerEnd <= data.count else { throw QWSafeTensorsError.badHeader("header length past EOF") }
 
         let headerData = data.subdata(in: 8..<headerEnd)
         let parsed: Any

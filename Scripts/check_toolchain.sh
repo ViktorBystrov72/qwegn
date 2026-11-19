@@ -34,8 +34,8 @@ else bad "Xcode ${xv:-unknown}" "Metal 4 requires Xcode 26 or newer."; fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 printf 'kernel void k() {}\n' > "$tmp/k.metal"
-if xcrun -sdk macosx metal -std=metal4.0 -c "$tmp/k.metal" -o "$tmp/k.air" 2>"$tmp/err"; then
-  ok "metal compiler: -std=metal4.0 compiles a kernel"
+if xcrun -sdk macosx metal -std=metal4.0 -mmacosx-version-min=26.2 -c "$tmp/k.metal" -o "$tmp/k.air" 2>"$tmp/err"; then
+  ok "metal compiler: -std=metal4.0 -mmacosx-version-min=26.2 compiles a kernel"
 else
   bad "metal compiler" "$(head -2 "$tmp/err")"
 fi

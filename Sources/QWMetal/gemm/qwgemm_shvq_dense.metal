@@ -5,13 +5,13 @@
 #include <metal_simdgroup>
 #define QW_SHVQ_ROUTED_DIRECT_LUT 1
 #include "qw_dequant_shvq.metalh"
+#include "qw_fastmath_safe.metalh"
 using namespace metal;
 
 #define QW_SHVQ_HEAD_C 8u
 
 static inline uint qwg_shvq_sortable(float v) {
-    const uint b = as_type<uint>(v);
-    return (b & 0x80000000u) ? ~b : (b ^ 0x80000000u);
+    return qw_sortable_f32_u32(v);
 }
 
 template <int BITS, int GROUP, uint ROWS>

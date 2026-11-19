@@ -20,6 +20,44 @@ import QWLoad
 
 extension QWEngineDriver {
     final class ColdExpertStreamer: @unchecked Sendable {
+        enum ExpertWeightLayout: Sendable {
+            case mlpPerExpert
+            case blockSparsePerExpert
+            case fused3D(guName: String, downName: String)
+            case missing
+        }
+
+        struct RangedItem: @unchecked Sendable {
+            let name: String
+            let offset: Int
+            let count: Int
+            let dst: UnsafeMutableRawPointer
+        }
+
+        enum ColdLoadBatch: @unchecked Sendable {
+            case named([(name: String, dst: UnsafeMutableRawPointer)])
+            case ranged([RangedItem])
+
+            var isEmpty: Bool {
+                switch self {
+                case .named(let items): return items.isEmpty
+                case .ranged(let items): return items.isEmpty
+                }
+            }
+        }
+
+        struct PromotionTransaction: @unchecked Sendable {
+            let clock: UInt64
+            let dynamicHitsDelta: Int
+            let dynamicMissesDelta: Int
+            let hitSlots: [Int]
+            let promotions: [(expert: Int, staging: Int, bank: Int)]
+
+            static let empty = PromotionTransaction(
+                clock: 0, dynamicHitsDelta: 0, dynamicMissesDelta: 0, hitSlots: [], promotions: []
+            )
+        }
+
         let io: PlaneIO
         let layerPrefix: String
         let residentExperts: Int
@@ -32,6 +70,8 @@ extension QWEngineDriver {
         let guBasePtr: UnsafeMutableRawPointer
         let downBasePtr: UnsafeMutableRawPointer
         let expertPermutation: [Int]?
+        let expertLayout: ExpertWeightLayout
+        let directStreamer: QWWeightStreamer?
 
         init(io: PlaneIO, layerPrefix: String, residentExperts: Int, totalExperts: Int,
              stagingSlots: Int, intermediate: Int, hidden: Int,
@@ -50,6 +90,60 @@ extension QWEngineDriver {
             self.guBasePtr = guBasePtr
             self.downBasePtr = downBasePtr
             self.expertPermutation = expertPermutation
+            self.expertLayout = Self.resolveExpertLayout(
+                pack: io.pack,
+                layerPrefix: layerPrefix,
+                totalExperts: totalExperts,
+                expertPermutation: expertPermutation
+            )
+            self.directStreamer = io.policy.directIO
+                ? (try? QWWeightStreamer(url: io.pack.url, unbuffered: true))
+                : nil
+        }
+
+        private static func resolveExpertLayout(
+            pack: QWQuant.Pack,
+            layerPrefix: String,
+            totalExperts: Int,
+            expertPermutation: [Int]?
+        ) -> ExpertWeightLayout {
+            let fusedCandidates: [(String, String)] = [
+                ("mlp.experts.gate_up_proj", "mlp.experts.down_proj"),
+                ("mlp.experts.gate_up_proj.weight", "mlp.experts.down_proj.weight"),
+                ("block_sparse_moe.experts.gate_up_proj", "block_sparse_moe.experts.down_proj"),
+                ("block_sparse_moe.experts.gate_up_proj.weight", "block_sparse_moe.experts.down_proj.weight"),
+            ]
+            for (guSuffix, dnSuffix) in fusedCandidates {
+                let gu = layerPrefix + guSuffix
+                let dn = layerPrefix + dnSuffix
+                if (try? pack.entry(gu)) != nil, (try? pack.entry(dn)) != nil {
+                    return .fused3D(guName: gu, downName: dn)
+                }
+            }
+            let sampleE = (expertPermutation.flatMap { $0.first }) ?? 0
+            if (try? pack.entry(layerPrefix + "block_sparse_moe.experts.\(sampleE).w1.weight")) != nil
+                || pack.tensors.keys.contains(where: {
+                    $0.hasPrefix(layerPrefix + "block_sparse_moe.experts.") && $0.hasSuffix(".w1.weight")
+                }) {
+                return .blockSparsePerExpert
+            }
+            if (try? pack.entry(layerPrefix + "mlp.experts.\(sampleE).gate_proj.weight")) != nil
+                || pack.tensors.keys.contains(where: {
+                    $0.hasPrefix(layerPrefix + "mlp.experts.") && $0.hasSuffix(".gate_proj.weight")
+                }) {
+                return .mlpPerExpert
+            }
+            if totalExperts > 0 {
+                for key in pack.tensors.keys where key.hasPrefix(layerPrefix) {
+                    if key.contains("block_sparse_moe.experts.") && key.hasSuffix(".w1.weight") {
+                        return .blockSparsePerExpert
+                    }
+                    if key.contains("mlp.experts.") && key.hasSuffix(".gate_proj.weight") {
+                        return .mlpPerExpert
+                    }
+                }
+            }
+            return .missing
         }
 
         // ── Dynamic residency (trunk layers only) ──────────────────────────
@@ -67,11 +161,11 @@ extension QWEngineDriver {
         /// (staging slot, bank slot) copies to encode after the cold compute.
         var pendingPromotions: [(staging: Int, bank: Int)] = []
         static let verifyPromotions = ProcessInfo.processInfo.environment["QW_EXPERT_CACHE_VERIFY"] == "1"
-        /// Optional MoE-Spec (arXiv:2602.16052) cap on unique cold experts staged per verify pass (`totalRows` in 2...4).
+        /// Optional MoE-Spec (arXiv:2602.16052) cap on unique cold experts staged per speculative verify pass.
         static let draftColdExpertBudget: Int? = ProcessInfo.processInfo.environment["QW_MOE_SPEC_COLD_BUDGET"].flatMap(Int.init)
         var promotedForVerify: [(bank: Int, expert: Int)] = []
-        private(set) var dynamicHits = 0
-        private(set) var dynamicMisses = 0
+        var dynamicHits = 0
+        var dynamicMisses = 0
 
         /// Host-written mirror of `slotOfExpert` (Int32 per physical expert) for GPU-side id mapping.
         private(set) var gpuSlotMap: (any MTLBuffer)?
@@ -114,18 +208,18 @@ extension QWEngineDriver {
         func verifyPromoted(guBank: UnsafeMutableRawPointer, downBank: UnsafeMutableRawPointer) throws -> Int {
             defer { promotedForVerify.removeAll(keepingCapacity: true) }
             var bad = 0
-            let gb = guExpertBytes, db = downExpertBytes, single = intermediate * guRowBytes
+            let gb = guExpertBytes, db = downExpertBytes
             var tmp: UnsafeMutableRawPointer?
             posix_memalign(&tmp, 16_384, gb + db)
             guard let tmp else { return 0 }
             defer { free(tmp) }
             for (bank, p) in promotedForVerify {
-                let e = (expertPermutation.flatMap { p < $0.count ? $0[p] : nil }) ?? p
-                try io.loadBatch([
-                    (name: layerPrefix + "mlp.experts.\(e).gate_proj.weight", dst: tmp),
-                    (name: layerPrefix + "mlp.experts.\(e).up_proj.weight", dst: tmp.advanced(by: single)),
-                    (name: layerPrefix + "mlp.experts.\(e).down_proj.weight", dst: tmp.advanced(by: gb)),
-                ], layout: .hq4)
+                let (guBatch, dnBatch) = try makeBatches(
+                    [(expert: p, slot: 0)],
+                    guBase: tmp,
+                    downBase: tmp.advanced(by: gb)
+                )
+                try executeBatch(guBatch: guBatch, downBatch: dnBatch)
                 if memcmp(tmp, guBank.advanced(by: bank * gb), gb) != 0
                     || memcmp(tmp.advanced(by: gb), downBank.advanced(by: bank * db), db) != 0 {
                     bad += 1
@@ -135,25 +229,41 @@ extension QWEngineDriver {
         }
         var downExpertBytes: Int { hidden * downRowBytes }
 
+        func effectiveColdBudget(
+            isVerifyWindow: Bool,
+            specBudget: Int? = QWEngineDriver.ColdExpertStreamer.draftColdExpertBudget
+        ) -> (apply: Bool, slots: Int) {
+            if isVerifyWindow, let budget = specBudget {
+                return (true, max(1, min(stagingSlots, budget)))
+            }
+            return (false, stagingSlots)
+        }
+
         func prepareSpanDynamic(
             idxPtr: UnsafeMutablePointer<UInt32>,
-            startRow: Int, totalRows: Int, routes: Int
+            startRow: Int, totalRows: Int, routes: Int,
+            isVerifyWindow: Bool = false,
+            specBudget: Int? = QWEngineDriver.ColdExpertStreamer.draftColdExpertBudget
         ) throws -> (
             nextRow: Int,
             stagedCount: Int,
-            guBatch: [(name: String, dst: UnsafeMutableRawPointer)],
-            downBatch: [(name: String, dst: UnsafeMutableRawPointer)]
+            guBatch: ColdLoadBatch,
+            downBatch: ColdLoadBatch,
+            promotions: [(staging: Int, bank: Int)],
+            transaction: PromotionTransaction
         ) {
-            guard startRow < totalRows else { return (totalRows, 0, [], []) }
-            clock &+= 1
-            let now = clock
+            guard startRow < totalRows else {
+                return (totalRows, 0, .named([]), .named([]), [], .empty)
+            }
+            let now = clock &+ 1
             let resU32 = UInt32(residentExperts)
-            let isVerifyWindow = totalRows >= 2 && totalRows <= 4
-            let effectiveColdSlots = isVerifyWindow
-                ? (Self.draftColdExpertBudget.map { max(1, min(stagingSlots, $0)) } ?? stagingSlots)
-                : stagingSlots
+            let (applySpecBudget, effectiveColdSlots) = effectiveColdBudget(
+                isVerifyWindow: isVerifyWindow, specBudget: specBudget)
             var stagedFor: [Int: UInt32] = [:]
             var stagedItems: [(expert: Int, slot: Int)] = []
+            var hitSlots: [Int] = []
+            var hitsDelta = 0
+            var missesDelta = 0
             var r = startRow
             while r < totalRows {
                 let rowBase = r * routes
@@ -167,23 +277,30 @@ extension QWEngineDriver {
                     for prev in 0..<k where Int(idxPtr[rowBase + prev]) == p { seen = true; break }
                     if !seen { need += 1 }
                 }
-                if r > startRow && stagedItems.count + need > effectiveColdSlots && !(isVerifyWindow && Self.draftColdExpertBudget != nil) { break }
+                if (r == startRow || !applySpecBudget) && need > stagingSlots {
+                    throw QWEngineDriverError.state(
+                        "cold expert staging capacity \(stagingSlots) < row \(r) demand \(need)")
+                }
+                if r > startRow && stagedItems.count + need > effectiveColdSlots && !applySpecBudget { break }
                 for k in 0..<routes {
                     let i = rowBase + k
                     let raw = idxPtr[i]
                     if Int32(bitPattern: raw) < 0 { continue }
                     let p = Int(raw)
-                    guard p < totalExperts else { continue }
+                    guard p < totalExperts else {
+                        idxPtr[i] = 0xFFFF_FFFF
+                        continue
+                    }
                     let s = Int(slotOfExpert[p])
                     if s >= 0 {
                         idxPtr[i] = UInt32(s)
-                        slotStamp[s] = now
-                        dynamicHits += 1
+                        hitSlots.append(s)
+                        hitsDelta += 1
                         continue
                     }
                     if let x = stagedFor[p] { idxPtr[i] = x; continue }
-                    dynamicMisses += 1
-                    let slotCap = (r == 0) ? stagingSlots : effectiveColdSlots
+                    missesDelta += 1
+                    let slotCap = (r == startRow) ? stagingSlots : effectiveColdSlots
                     if stagedItems.count < slotCap {
                         let slot = stagedItems.count
                         let x = resU32 + UInt32(slot)
@@ -196,33 +313,43 @@ extension QWEngineDriver {
                 }
                 r += 1
             }
-            let (gu, dn) = try promoteAndBatch(stagedItems, now: now)
-            return (r, stagedItems.count, gu, dn)
+            let (gu, dn, tx) = try promoteAndBatch(
+                stagedItems, now: now, hitSlots: hitSlots,
+                hitsDelta: hitsDelta, missesDelta: missesDelta
+            )
+            let promos = tx.promotions.map { (staging: $0.staging, bank: $0.bank) }
+            return (r, stagedItems.count, gu, dn, promos, tx)
         }
 
         /// Whether a span of `routes` ids can always be mapped by `qwg_moe_span_ids`: every
         /// non-resident expert fits a staging slot, so the span never splits.
-        func canMapWholeSpan() -> Bool {
+        func canMapWholeSpan(
+            isVerifyWindow: Bool = false,
+            specBudget: Int? = QWEngineDriver.ColdExpertStreamer.draftColdExpertBudget
+        ) -> Bool {
             isDynamic && totalExperts <= 512 && stagingSlots >= totalExperts - residentExperts
-                && Self.draftColdExpertBudget == nil
+                && !(isVerifyWindow && specBudget != nil)
         }
 
         /// Dynamic-residency bookkeeping for a span mapped on the GPU by `qwg_moe_span_ids` (`mapped[i]` = bank
-        /// slot, `residentExperts` + staging slot, or -1) from the physical router `ids`: stamps hits, stages
-        /// each miss into its GPU-chosen slot, then promotes and batches exactly like `prepareSpan`.
+        /// slot, `residentExperts` + staging slot, or -1) from the physical router `ids`: computes hit/miss stamps
+        /// and staging batches transactionally for `commitPromotion` after NVMe I/O succeeds.
         func prepareSpanMapped(
             ids: UnsafePointer<UInt32>, mapped: UnsafePointer<Int32>, count: Int
         ) throws -> (
             stagedCount: Int,
-            guBatch: [(name: String, dst: UnsafeMutableRawPointer)],
-            downBatch: [(name: String, dst: UnsafeMutableRawPointer)]
+            guBatch: ColdLoadBatch,
+            downBatch: ColdLoadBatch,
+            transaction: PromotionTransaction
         ) {
             precondition(canMapWholeSpan(), "span map needs a dynamic streamer whose staging holds every miss")
-            clock &+= 1
-            let now = clock
+            let now = clock &+ 1
             let res = Int32(residentExperts)
             var expertOfSlot = [Int](repeating: -1, count: stagingSlots)
             var firstSeen = [Int](repeating: 0, count: stagingSlots)
+            var hitSlots: [Int] = []
+            var hitsDelta = 0
+            var missesDelta = 0
             var staged = 0
             for i in 0..<count {
                 let m = mapped[i]
@@ -231,8 +358,8 @@ extension QWEngineDriver {
                     guard Int(ids[i]) < totalExperts, slotOfExpert[Int(ids[i])] == m else {
                         throw QWEngineDriverError.state("span map slot \(m) disagrees with host residency")
                     }
-                    slotStamp[Int(m)] = now
-                    dynamicHits += 1
+                    hitSlots.append(Int(m))
+                    hitsDelta += 1
                     continue
                 }
                 let slot = Int(m - res)
@@ -243,7 +370,7 @@ extension QWEngineDriver {
                     expertOfSlot[slot] = Int(ids[i])
                     firstSeen[slot] = i
                     staged += 1
-                    dynamicMisses += 1
+                    missesDelta += 1
                 } else if expertOfSlot[slot] != Int(ids[i]) {
                     throw QWEngineDriverError.state("span map gives staging slot \(slot) two experts")
                 }
@@ -259,8 +386,11 @@ extension QWEngineDriver {
             // Promote in route first-appearance order, as `prepareSpanDynamic` does, so the
             // post-span residency (and thus decode) is identical to the host-mapped path.
             stagedItems.sort { firstSeen[$0.slot] < firstSeen[$1.slot] }
-            let (gu, dn) = try promoteAndBatch(stagedItems, now: now)
-            return (staged, gu, dn)
+            let (gu, dn, tx) = try promoteAndBatch(
+                stagedItems, now: now, hitSlots: hitSlots,
+                hitsDelta: hitsDelta, missesDelta: missesDelta
+            )
+            return (staged, gu, dn, tx)
         }
 
     }

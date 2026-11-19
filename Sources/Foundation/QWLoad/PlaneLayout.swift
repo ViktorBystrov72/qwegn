@@ -25,17 +25,43 @@ public enum PlaneLayout: Sendable, Hashable {
         guard !e.shape.isEmpty else { return nil }
         switch self {
         case .raw:
-            return e.shape.reduce(1, *) * e.rawElemBytes
+            var elems = 1
+            for dim in e.shape {
+                guard dim >= 0 else { return nil }
+                let (m, ov) = elems.multipliedReportingOverflow(by: dim)
+                if ov { return nil }
+                elems = m
+            }
+            let (bytes, ov) = elems.multipliedReportingOverflow(by: e.rawElemBytes)
+            return ov ? nil : bytes
         case .hq4:
             if let experts = e.experts, let per = e.eHq4, e.shape.count == 3 {
-                return experts * per
+                guard experts >= 0, per >= 0 else { return nil }
+                let (bytes, ov) = experts.multipliedReportingOverflow(by: per)
+                return ov ? nil : bytes
             }
             guard e.shape.count >= 2 else { return nil }
             let n = e.shape[0]
-            let k = e.shape.dropFirst().reduce(1, *)
+            guard n >= 0 else { return nil }
+            var k = 1
+            for dim in e.shape.dropFirst() {
+                guard dim >= 0 else { return nil }
+                let (m, ov) = k.multipliedReportingOverflow(by: dim)
+                if ov { return nil }
+                k = m
+            }
             let grp = e.hqGroup
-            guard k % grp == 0 else { return nil }
-            return n * (k / grp) * e.hqBlockBytes
+            guard grp > 0, k % grp == 0 else { return nil }
+            if !e.isIncumbentHQ4 {
+                let valid = e.isSHVQ
+                    ? QWSHVQBlock.isSupported(bits: e.hqBits, group: grp)
+                    : QWAQBlock.isBlockSupported(bits: e.hqBits, group: grp)
+                guard valid else { return nil }
+            }
+            let (ng, ov1) = n.multipliedReportingOverflow(by: k / grp)
+            guard !ov1 else { return nil }
+            let (bytes, ov2) = ng.multipliedReportingOverflow(by: e.hqBlockBytes)
+            return ov2 ? nil : bytes
         }
     }
 }

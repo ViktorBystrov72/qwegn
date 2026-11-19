@@ -488,6 +488,7 @@ public final class QWAttnDecode {
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(psoSharedCombine)
         } else {
+            enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(try combineBatchedPipeline())
         }
         qgate.bind(enc, index: 0)

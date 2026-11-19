@@ -154,4 +154,101 @@ final class QWAllocTests: XCTestCase {
         p.pointee = 7.5
         XCTAssertEqual(p.pointee, 7.5)
     }
+
+    func testMultiSlabAllocateBytesDoesNotCorruptCursorOnOOM() throws {
+        let a = Self.arena(32)
+        let buf = a.allBuffers[0]
+        let r0 = QWMRegion(buffer: buf, base: 0, length: 1024)
+        let r1 = QWMRegion(buffer: buf, base: 1024, length: 1024)
+        let sub = QWSubAllocator(regions: [r0, r1])
+
+        let off0 = try sub.allocate(bytes: 768)
+        XCTAssertEqual(off0, 0)
+        // Oversized request fails cleanly without mutating slabIndex/cursor.
+        XCTAssertThrowsError(try sub.allocate(bytes: 2048))
+        XCTAssertThrowsError(try sub.allocate(bytes: -1))
+        XCTAssertThrowsError(try sub.allocate(bytes: Int.max))
+        // Subsequent request that fits in slab 1 still succeeds!
+        let off1 = try sub.allocate(bytes: 512)
+        XCTAssertEqual(off1, 0)
+        XCTAssertEqual(sub.usedBytes, 1280)
+        XCTAssertEqual(sub.freeBytes, 768)
+    }
+
+    func testWeightSlabCapNeverCollapsesAndPageArenaAndCopyReadSafety() throws {
+        XCTAssertEqual(QWArena.weightSlabCap(maxBufferLength: 1024 << 20), 1024 << 20)
+        XCTAssertEqual(QWArena.weightSlabCap(maxBufferLength: 1536 << 20), 1536 << 20)
+        XCTAssertEqual(QWArena.weightSlabCap(maxBufferLength: 3072 << 20), 1536 << 20)
+
+        let shape = QWTensorShape([1 << 30, 8], .q4g)
+        XCTAssertEqual(shape.totalBytes, (1 << 30) * 5)
+        let overflowShape = QWTensorShape([Int.max, 2], .f16)
+        XCTAssertNil(overflowShape.checkedTotalBytes)
+
+        let a = Self.arena(16)
+        let sub = a.weightsRegion()
+        let tv = try sub.allocate(QWTensorShape([8], .f16))
+        a.copyIn(tv, from: Data()) // empty Data must not crash
+        let bytes = withUnsafeBytes(of: Float(3.25).bitPattern.littleEndian) {
+            (raw: UnsafeRawBufferPointer) in Data(raw)
+        }
+        let unalignedSlice = tv.slice(byteOffset: 2, count: 2, dtype: .f32)
+        a.copyIn(unalignedSlice, from: bytes)
+        let readBack = a.read(unalignedSlice, as: Float.self, count: 1)
+        XCTAssertEqual(readBack, [3.25])
+
+        let pages = try a.pages(pageSize: 4096, count: 4)
+        let p0 = try XCTUnwrap(pages.allocPage())
+        pages.freePage(-1)
+        pages.freePage(99)
+        pages.freePage(p0)
+        pages.freePage(p0) // double-free ignored
+        XCTAssertEqual(pages.freePages, 4)
+    }
+
+    func testContainerKindSourceOfTruthAndLegacyCompatibility() throws {
+        let a = Self.arena(16)
+        let sub = a.weightsRegion()
+        let big = try sub.allocate(QWTensorShape([2048], .f16)) // 4096 B
+
+        let inc = try XCTUnwrap(QWWeightView(blocks: big, n: 4, k: 128, containerKind: .incumbentHQ4G32))
+        XCTAssertEqual(inc.containerKind, .incumbentHQ4G32)
+        XCTAssertTrue(inc.isIncumbentContainer)
+        XCTAssertTrue(inc.isRotated)
+        XCTAssertFalse(inc.isSHVQ)
+        XCTAssertEqual(inc.bits, 4)
+        XCTAssertEqual(inc.groupSize, 32)
+        XCTAssertEqual(inc.formatName, "HQ4_G32")
+
+        let legacyInc = try XCTUnwrap(QWWeightView(blocks: big, n: 4, k: 128, isRotated: true))
+        XCTAssertEqual(legacyInc.containerKind, .incumbentHQ4G32)
+        XCTAssertEqual(legacyInc, inc)
+
+        let rotHQ = try XCTUnwrap(QWWeightView(blocks: big, n: 4, k: 128, bits: 4, groupSize: 32,
+                                               isRotated: true, isIncumbentContainer: false))
+        XCTAssertEqual(rotHQ.containerKind, .rotatedHQ(bits: 4, group: 32))
+        XCTAssertFalse(rotHQ.isIncumbentContainer)
+        XCTAssertTrue(rotHQ.isRotated)
+        XCTAssertNotEqual(rotHQ, inc)
+
+        let shvq = try XCTUnwrap(QWWeightView(blocks: big, n: 4, k: 128,
+                                              containerKind: .shvq(bits: 4, group: 32)))
+        XCTAssertTrue(shvq.isSHVQ)
+        XCTAssertTrue(shvq.isRotated)
+        XCTAssertFalse(shvq.isIncumbentContainer)
+        XCTAssertEqual(shvq.formatName, "SHVQ4_G32")
+        let legacySHVQ = try XCTUnwrap(QWWeightView(blocks: big, n: 4, k: 128, bits: 4, groupSize: 32,
+                                                    isRotated: true, isIncumbentContainer: false, isSHVQ: true))
+        XCTAssertEqual(shvq.rowBytes, legacySHVQ.rowBytes)
+        XCTAssertEqual(legacySHVQ, shvq)
+
+        let affine = try XCTUnwrap(QWWeightView(blocks: big, n: 4, k: 128,
+                                                containerKind: .nativeAffine(bits: 3, group: 64)))
+        XCTAssertFalse(affine.isRotated)
+        XCTAssertFalse(affine.isSHVQ)
+        XCTAssertFalse(affine.isIncumbentContainer)
+        XCTAssertEqual(affine.formatName, "AQ3_G64")
+        XCTAssertNil(QWWeightView(blocks: big, n: 4, k: 128, bits: 4, groupSize: 32,
+                                  isRotated: false, isSHVQ: true))
+    }
 }

@@ -76,31 +76,29 @@ final class QWEnginePrefixStore<Value: Sendable> {
     func lookup(tokens: [Int], mode: String) throws -> Hit? {
         try validate(tokens, mode: mode)
         let exact = Key(tokens: tokens, mode: mode)
-        if let entry = core.value(for: exact, touchOnHit: true) {
-            return Hit(value: entry.value, tokenCount: tokens.count)
-        }
         let base = Self.baseMode(of: mode)
-        if base != mode {
-            let sharedExact = Key(tokens: tokens, mode: base)
-            if core.isSharedBaseKey(sharedExact), let entry = core.value(for: sharedExact, touchOnHit: true) {
-                return Hit(value: entry.value, tokenCount: tokens.count)
-            }
-        }
+        let saltedBase = base != mode ? Key(tokens: tokens, mode: base) : nil
         let queryRootHash: UInt64? = tokens.count >= 64
             ? QWPrefixHash.fnv1a64(tokens: Array(tokens.prefix(64)), mode: mode)
             : nil
-        var best: Key?
-        for (key, entry) in core.entries where entry.allowsSuffix &&
-            (key.mode == mode || (base != mode && key.mode == base && core.isSharedBaseKey(key))) &&
-            key.tokens.count < tokens.count && key.tokens.count > (best?.tokens.count ?? 0) {
-            if key.mode == mode, key.tokens.count >= 64, let qHash = queryRootHash,
-               let eHash = entry.rootHash, qHash != eHash {
-                continue
+        let hit = QWTwoTierPrefixCache.lookupWarmPrefix(
+            in: core,
+            exactKey: exact,
+            saltedBaseKey: saltedBase,
+            tokenCount: tokens.count,
+            queryRootHash: queryRootHash,
+            allowExact: true,
+            allowPrefix: true,
+            sharedBaseOnly: false,
+            touchOnHit: true,
+            isCandidate: { key, _, _ in
+                key.mode == mode || (base != mode && key.mode == base && core.isSharedBaseKey(key))
+            },
+            matchesPrefix: { key, _, _ in
+                tokens.starts(with: key.tokens)
             }
-            if tokens.starts(with: key.tokens) { best = key }
-        }
-        guard let best, let entry = core.value(for: best, touchOnHit: true) else { return nil }
-        return Hit(value: entry.value, tokenCount: best.tokens.count)
+        )
+        return hit.map { Hit(value: $0.value, tokenCount: $0.matchedTokens) }
     }
 
     /// Oversized valid entries are not retained. The caller records that result.
@@ -116,25 +114,19 @@ final class QWEnginePrefixStore<Value: Sendable> {
         let key = Key(tokens: tokens, mode: mode)
         let history64 = tokens.map(Int64.init)
         let rootHash = QWPrefixHash.fnv1a64(tokens: Array(tokens.prefix(64)), mode: mode)
-        let slot: Int? = isSharedBase ? nil : core.resolveSlot(rootHash: rootHash, history: history64) { cand, _ in
-            cand.mode == key.mode && key.tokens.starts(with: cand.tokens)
-        }
-        if let slot, tokens.count >= core.rootPrefixTokenCount {
-            core.prepareSlotForStore(slot: slot, history: history64, incomingBytes: charge) { cand, _ in
-                cand.mode == key.mode && key.tokens.starts(with: cand.tokens)
-            }
-        }
-        return core.store(
+        return QWTwoTierPrefixCache.storeWithSlotPinning(
+            in: core,
             key: key,
             value: value,
             charge: charge,
             tokenCount: tokens.count,
             allowsSuffix: allowsSuffix,
-            slot: slot,
             rootHash: rootHash,
             history: history64,
             isSharedBase: isSharedBase
-        )
+        ) { cand, _ in
+            cand.mode == key.mode && key.tokens.starts(with: cand.tokens)
+        }
     }
 
     func isProtectedLastKey(_ key: Key, excludingSlot: Int? = nil) -> Bool {

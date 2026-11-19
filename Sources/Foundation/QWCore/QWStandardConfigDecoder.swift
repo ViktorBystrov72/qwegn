@@ -216,6 +216,13 @@ public enum QWStandardConfigDecoder {
         let rmsEps = try need(raw.rms_norm_eps, "rms_norm_eps")
         let ropeTheta = try need(raw.rope_theta ?? raw.rope_parameters?.ropeTheta, "rope_theta")
         let eosIds = try need(raw.eos_token_id?.ids, "eos_token_id")
+        guard hidden > 0 else { throw Error.badGeometry("hidden_size \(hidden)") }
+        guard vocab > 0 else { throw Error.badGeometry("vocab_size \(vocab)") }
+        guard numLayers > 0 else { throw Error.badGeometry("num_hidden_layers \(numLayers)") }
+        guard intermediate > 0 else { throw Error.badGeometry("intermediate_size \(intermediate)") }
+        guard maxPos > 0 else { throw Error.badGeometry("max_position_embeddings \(maxPos)") }
+        guard rmsEps > 0, rmsEps.isFinite else { throw Error.badGeometry("rms_norm_eps \(rmsEps)") }
+        guard ropeTheta > 0, ropeTheta.isFinite else { throw Error.badGeometry("rope_theta \(ropeTheta)") }
 
         // The family carries the model's defaults; an unknown type is refused.
         guard let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelType) else {
@@ -371,15 +378,16 @@ public enum QWStandardConfigDecoder {
                     "num_experts \(experts) must be a multiple of 32, at least 32 and at most 512")
             }
             let topK = try need(raw.num_experts_per_tok, "num_experts_per_tok")
-            guard topK > 0, topK <= 16 else {
-                throw Error.badGeometry("num_experts_per_tok \(topK) must be in 1...16")
+            guard topK > 0, topK <= 16, topK <= experts else {
+                throw Error.badGeometry("num_experts_per_tok \(topK) must be in 1...min(16, \(experts))")
             }
         }
         // The experts' width is the model's own: the bank is carved with it,
         // so a sparse config without it would carve empty banks and fail
         // later on a weight error instead of a config refusal.
         if spec.family == .qwen3MoE {
-            _ = try need(raw.moe_intermediate_size, "moe_intermediate_size")
+            let moeW = try need(raw.moe_intermediate_size, "moe_intermediate_size")
+            guard moeW > 0 else { throw Error.badGeometry("moe_intermediate_size \(moeW)") }
         }
         // An experts' width on a DENSE family is a mismatch: the model has
         // no experts to give the width to, so it is refused by name.
