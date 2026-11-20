@@ -11,14 +11,6 @@ public enum QWCoolingPolicy: String, Codable, Sendable, CaseIterable {
     case auto = "auto"
     case proactive = "proactive"
     case max = "max"
-
-    public var displayTitle: String {
-        switch self {
-        case .auto: return "System Auto"
-        case .proactive: return "Proactive Pre-Spin"
-        case .max: return "Max Blast"
-        }
-    }
 }
 
 /// Host thermal, fan, and power telemetry read from AppleSMC and ProcessInfo.
@@ -326,7 +318,6 @@ public final class QWFanController: @unchecked Sendable {
     private var lastActiveInferenceAt: Date?
     private var didApplyManualOverride = false
     private var lastWriteAuthorized: Bool?
-    private var cachedSnapshot: QWSMCSnapshot?
     private var pendingReconcile = false
 
     public init() {
@@ -357,27 +348,6 @@ public final class QWFanController: @unchecked Sendable {
         if changed {
             scheduleReconcileAsync()
         }
-    }
-
-    public func currentCachedSnapshot() -> QWSMCSnapshot {
-        if let snap = lock.withLock({ cachedSnapshot }) {
-            return snap
-        }
-        scheduleReconcileAsync()
-        return QWSMCSnapshot(
-            gpuTemperatureCelsius: nil,
-            gpuTemperatureUnavailableReason: "AppleSMC telemetry initial background sample pending",
-            cpuTemperatureCelsius: nil,
-            memoryTemperatureCelsius: nil,
-            fanSpeedRPM: nil,
-            fanSpeedUnavailableReason: "AppleSMC telemetry initial background sample pending",
-            fanMinRPM: nil,
-            fanMaxRPM: nil,
-            fanControlStatus: "System Auto",
-            systemPowerWatts: nil,
-            systemPowerUnavailableReason: "AppleSMC telemetry initial background sample pending",
-            thermalStateLevel: Self.currentThermalState()
-        )
     }
 
     public func scheduleReconcileAsync() {
@@ -444,7 +414,6 @@ public final class QWFanController: @unchecked Sendable {
             systemPowerUnavailableReason: power == nil ? "this host does not publish AppleSMC system power (PSTR)" : nil,
             thermalStateLevel: thermalState
         )
-        lock.withLock { cachedSnapshot = snap }
         return snap
     }
 

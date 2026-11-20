@@ -72,12 +72,11 @@ extension QWEngineDriver {
                 pendingToken: pending, cacheRows: basePairs, drafts: neuralCount,
                 writeLogitsOnFinalDraft: false, journalTokenOffset: 1)
         } else if let mtpDraftEncoder {
-            let draftCB = try QWMTPDraftChain.enqueueDeviceChain(
+            draftCBs = try QWMTPDraftChain.enqueueDeviceChain(
                 hal: hal, draft: mtpDraftEncoder, headStorage: headStorage,
                 draftHead: mtpDraftHead, hidden: hidden, kv: views,
                 pendingToken: pending, drafts: neuralCount, position: session.position,
                 cacheRows: basePairs, table: table, journalTokenOffset: 1)
-            draftCBs = [draftCB]
         } else {
             return nil
         }

@@ -31,11 +31,9 @@ final class QWAQBatchedGemmTests: XCTestCase {
         Shape(m: 128, n: 128, k: 512),
     ]
 
-    /// The name of the prefill twin for a pair: the incumbent's two
-    /// geometries, over the family's container.
-    private func kernelName(bits: Int, group: Int, bm128: Bool) -> String {
-        let base = "qwg_gemm_aq\(bits)_g\(group)_h16"
-        return bm128 ? base + "_bm128" : base
+    /// The name of the prefill twin for a pair over the family's container.
+    private func kernelName(bits: Int, group: Int) -> String {
+        "qwg_gemm_aq\(bits)_g\(group)_h16"
     }
 
     /// A bank of the family's blocks: `n` rows of `k / group` groups. Every
@@ -170,22 +168,19 @@ final class QWAQBatchedGemmTests: XCTestCase {
                 let bank = makeBank(bits: bits, group: group, n: n, k: k)
                 let x = makeActivations(m: m, k: k)
                 let weights = (0..<n).map { rowWeights(bits: bits, group: group, bank: bank, row: $0, k: k) }
-                for bm128 in [false, true] {
-                    let kernel = kernelName(bits: bits, group: group, bm128: bm128)
-                    let got = try runGemm(kernel: kernel, bm: bm128 ? 128 : 64,
-                                         m: m, n: n, k: k, bank: bank, x: x)
-                    for token in 0..<m {
-                        let activations = x[(token * k)..<((token + 1) * k)].map { Float(Float16($0)) }
-                        for row in 0..<n {
-                            let ref = hostRow(weights: weights[row][...], x: activations[...])
-                            let scale = max(abs(Double(ref.value)), Double(ref.magnitude), 1e-6)
-                            let rel = abs(Double(got[token * n + row]) - Double(ref.value)) / scale
-                            let key = "\(bits)-bit group \(group)"
-                            worst[key] = max(worst[key] ?? 0, rel)
-                            XCTAssertLessThan(rel, 1e-3,
-                                              "\(key), \(kernel), token \(token), row \(row): "
-                                              + "got \(got[token * n + row]), want \(ref.value)")
-                        }
+                let kernel = kernelName(bits: bits, group: group)
+                let got = try runGemm(kernel: kernel, bm: 64, m: m, n: n, k: k, bank: bank, x: x)
+                for token in 0..<m {
+                    let activations = x[(token * k)..<((token + 1) * k)].map { Float(Float16($0)) }
+                    for row in 0..<n {
+                        let ref = hostRow(weights: weights[row][...], x: activations[...])
+                        let scale = max(abs(Double(ref.value)), Double(ref.magnitude), 1e-6)
+                        let rel = abs(Double(got[token * n + row]) - Double(ref.value)) / scale
+                        let key = "\(bits)-bit group \(group)"
+                        worst[key] = max(worst[key] ?? 0, rel)
+                        XCTAssertLessThan(rel, 1e-3,
+                                          "\(key), \(kernel), token \(token), row \(row): "
+                                          + "got \(got[token * n + row]), want \(ref.value)")
                     }
                 }
             }
@@ -204,12 +199,9 @@ final class QWAQBatchedGemmTests: XCTestCase {
         let bank = makeBank(bits: 4, group: 64, n: n, k: k, scale: 1.0, bias: 0.25) { _ in 1 }
         var activations = [Float](repeating: 0, count: m * k)
         for row in 0..<m { activations[row * k] = 1 }
-        for bm128 in [false, true] {
-            let kernel = kernelName(bits: 4, group: 64, bm128: bm128)
-            let got = try runGemm(kernel: kernel, bm: bm128 ? 128 : 64,
-                                  m: m, n: n, k: k, bank: bank, x: activations)
-            XCTAssertTrue(got.allSatisfy { $0 == 1.25 }, "\(kernel) lost the affine bias")
-        }
+        let kernel = kernelName(bits: 4, group: 64)
+        let got = try runGemm(kernel: kernel, bm: 64, m: m, n: n, k: k, bank: bank, x: activations)
+        XCTAssertTrue(got.allSatisfy { $0 == 1.25 }, "\(kernel) lost the affine bias")
     }
 
     func testNaxF32PreservesAffineBias() throws {
@@ -254,20 +246,17 @@ final class QWAQBatchedGemmTests: XCTestCase {
                 want += Float(Float16(x[column]))
                 magnitude += abs(Float(Float16(x[column])))
             }
-            for bm128 in [false, true] {
-                let kernel = kernelName(bits: bits, group: group, bm128: bm128)
-                let got = try runGemm(kernel: kernel, bm: bm128 ? 128 : 64,
-                                     m: m, n: n, k: k, bank: bank, x: x)
-                for token in 0..<m {
-                    for row in 0..<n {
-                        let value = got[token * n + row]
-                        let scale = max(abs(Double(want)), Double(magnitude), 1e-6)
-                        let rel = abs(Double(value) - Double(want)) / scale
-                        XCTAssertLessThan(rel, 1e-3,
-                                          "\(bits)-bit group \(group), \(kernel), token \(token), "
-                                          + "row \(row): got \(value), want \(want) — the fragment "
-                                          + "must read the columns sc.x+0..3 and sc.x+16..19")
-                    }
+            let kernel = kernelName(bits: bits, group: group)
+            let got = try runGemm(kernel: kernel, bm: 64, m: m, n: n, k: k, bank: bank, x: x)
+            for token in 0..<m {
+                for row in 0..<n {
+                    let value = got[token * n + row]
+                    let scale = max(abs(Double(want)), Double(magnitude), 1e-6)
+                    let rel = abs(Double(value) - Double(want)) / scale
+                    XCTAssertLessThan(rel, 1e-3,
+                                      "\(bits)-bit group \(group), \(kernel), token \(token), "
+                                      + "row \(row): got \(value), want \(want) — the fragment "
+                                      + "must read the columns sc.x+0..3 and sc.x+16..19")
                 }
             }
         }
@@ -281,20 +270,17 @@ final class QWAQBatchedGemmTests: XCTestCase {
             let bank = makeBank(bits: bits, group: group, n: n, k: k)
             let x = makeActivations(m: m, k: k)
             let weights = (0..<n).map { rowWeights(bits: bits, group: group, bank: bank, row: $0, k: k) }
-            for bm128 in [false, true] {
-                let kernel = kernelName(bits: bits, group: group, bm128: bm128)
-                let got = try runGemm(kernel: kernel, bm: bm128 ? 128 : 64,
-                                     m: m, n: n, k: k, bank: bank, x: x)
-                for token in 0..<m {
-                    let activations = x[(token * k)..<((token + 1) * k)].map { Float(Float16($0)) }
-                    for row in 0..<n {
-                        let ref = hostRow(weights: weights[row][...], x: activations[...])
-                        let scale = max(abs(Double(ref.value)), Double(ref.magnitude), 1e-6)
-                        let rel = abs(Double(got[token * n + row]) - Double(ref.value)) / scale
-                        XCTAssertLessThan(rel, 1e-3,
-                                          "\(bits)-bit group \(group), \(kernel), token \(token), "
-                                          + "row \(row): got \(got[token * n + row]), want \(ref.value)")
-                    }
+            let kernel = kernelName(bits: bits, group: group)
+            let got = try runGemm(kernel: kernel, bm: 64, m: m, n: n, k: k, bank: bank, x: x)
+            for token in 0..<m {
+                let activations = x[(token * k)..<((token + 1) * k)].map { Float(Float16($0)) }
+                for row in 0..<n {
+                    let ref = hostRow(weights: weights[row][...], x: activations[...])
+                    let scale = max(abs(Double(ref.value)), Double(ref.magnitude), 1e-6)
+                    let rel = abs(Double(got[token * n + row]) - Double(ref.value)) / scale
+                    XCTAssertLessThan(rel, 1e-3,
+                                      "\(bits)-bit group \(group), \(kernel), token \(token), "
+                                      + "row \(row): got \(got[token * n + row]), want \(ref.value)")
                 }
             }
         }

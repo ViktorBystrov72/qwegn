@@ -136,7 +136,9 @@ final class FNSafetyAuditTests: XCTestCase {
                     let slot = warm.resolveSlot(rootHash: rootHash, history: history, kvMode: .q8, hasMTP: false)
                     warm.store(name: name, blob: Data(repeating: UInt8(w), count: 512),
                                slot: slot, rootHash: rootHash, history: history)
-                    _ = warm.longestMatch(history: history + [99], kvMode: .q8, hasMTP: false)
+                    let query = history + [99]
+                    _ = warm.lookupWarmHit(exactName: name, history: query, rawHistory: query,
+                                           kvMode: .q8, hasMTP: false, allowExact: true)
                     _ = warm.blob(name: name)
                 }
                 group.leave()

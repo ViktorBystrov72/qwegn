@@ -35,10 +35,6 @@ public final class QWResponsesStore: @unchecked Sendable {
         self.maxBytes = max(1024, maxBytes)
     }
 
-    public var currentTotalBytes: Int {
-        lock.withLock { totalBytes }
-    }
-
     public var count: Int {
         lock.withLock { entries.count }
     }

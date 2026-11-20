@@ -115,7 +115,7 @@ final class QWKernelDispatchTableTests: XCTestCase {
     /// The op axis is only meaningful if the bench and the engine share the
     /// vocabulary, so the list lives in the type both of them use.
     func testTheKnownOpsCoverTheFamilySweepAndTheOperatorSuites() {
-        for op in ["gemv", "mlx_nax_gemm", "gdn_inproj_decode", "mlp_swiglu",
+        for op in ["gemv", "gdn_inproj_decode", "mlp_swiglu",
                    "attn_qkv", "lm_head", "moe_gateup_decode",
                    "moe_gateup_prefill"] {
             XCTAssertTrue(QWKernelDispatchTable.knownOps.contains(op),

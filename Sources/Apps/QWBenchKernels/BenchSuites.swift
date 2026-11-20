@@ -26,34 +26,23 @@ enum BenchCandidate {
     case family(bits: Int, group: Int)
     /// The incumbent's 4-bit G32 GEMV, on the very same blocks.
     case incumbentQ4G32
-    /// MLX's tile GEMM, on MLX's three planes.
-    case mlxNAX(bits: Int, group: Int)
 
     /// The kernel name, exactly as the metallib spells it.
     var name: String {
         switch self {
         case .family(let bits, let group): return "qwg_gemv_aq\(bits)_g\(group)_v4"
         case .incumbentQ4G32: return "qwg_gemv_q4g_v4"
-        case .mlxNAX: return "qwg_gemm_mlx_affine_nax"
         }
     }
 
-    /// The operation the candidate serves. The engine only ever asks for
-    /// "gemv"; the MLX candidate answers to its own name, because the engine
-    /// cannot serve it — it holds MLX's three planes, not ours.
-    var op: String {
-        switch self {
-        case .family, .incumbentQ4G32: return "gemv"
-        case .mlxNAX: return "mlx_nax_gemm"
-        }
-    }
+    /// The operation the candidate serves.
+    var op: String { "gemv" }
 
     /// The quantisation width the candidate reads.
     var bits: Int {
         switch self {
         case .family(let bits, _): return bits
         case .incumbentQ4G32: return 4
-        case .mlxNAX(let bits, _): return bits
         }
     }
 
@@ -62,7 +51,6 @@ enum BenchCandidate {
         switch self {
         case .family(_, let group): return group
         case .incumbentQ4G32: return 32
-        case .mlxNAX(_, let group): return group
         }
     }
 
@@ -75,8 +63,6 @@ enum BenchCandidate {
             return "aq|\(bits)|\(group)"
         case .incumbentQ4G32:
             return "hq4|4|32"
-        case .mlxNAX(let bits, let group):
-            return "mlx|\(bits)|\(group)"
         }
     }
 }
@@ -157,14 +143,6 @@ enum BenchSuites {
         var out: [BenchCandidate] = [.family(bits: bits, group: group)]
         if bits == 4 && group == 32 { out.append(.incumbentQ4G32) }
         return out
-    }
-
-    /// The MLX candidate, on its own operation. The kernel is one
-    /// instantiation — 4-bit, group 64 — so no other pair may be asked for.
-    static func mlxCandidates(bits: Int, group: Int) -> [BenchCandidate] {
-        precondition(bits == 4 && group == 64,
-                     "the MLX candidate kernel is instantiated for 4-bit group 64 only")
-        return [.mlxNAX(bits: bits, group: group)]
     }
 }
 
@@ -283,65 +261,6 @@ enum AQBanks {
                         value += product
                         magnitude += abs(product)
                     }
-                }
-            }
-        }
-        return BenchReference(value: value, magnitude: magnitude)
-    }
-}
-
-/// MLX's three planes for the same logical weights: the packed codes, one
-/// scale per group and one bias per group.
-enum MLXBanks {
-    /// MLX packs 4 bits densely: byte `b` holds elements `2b` and `2b+1`,
-    /// the low nibble first.
-    static func make(bits: Int, group: Int, rows: Int, cols: Int) -> (w: Data, scales: [Float], biases: [Float]) {
-        let groups = cols / group
-        let payload = group * bits / 8
-        var bytes = [UInt8](repeating: 0, count: rows * groups * payload)
-        var scales = [Float](repeating: 0, count: rows * groups)
-        var biases = [Float](repeating: 0, count: rows * groups)
-        for r in 0..<rows {
-            for g in 0..<groups {
-                let scale = LogicalWeights.scale(row: r, group: g)
-                let codes = LogicalWeights.codes(row: r, group: g, bits: bits, count: group)
-                let offset = r * groups + g
-                scales[offset] = scale
-                // The device reads the f16 the bias is stored as, so the
-                // bank holds that value and the reference uses it.
-                biases[offset] = Float(Float16(-Float(1 << (bits - 1)) * scale))
-                let blockOffset = offset * payload
-                for i in 0..<group {
-                    let byte = blockOffset + i / 2
-                    let nibble = UInt8(codes[i] & 0xF)
-                    bytes[byte] = (i % 2 == 0) ? (bytes[byte] | nibble)
-                                               : (bytes[byte] | (nibble << 4))
-                }
-            }
-        }
-        return (Data(bytes), scales, biases)
-    }
-
-    /// The host reference for one row: the plain affine dot. MLX dequantises
-    /// into an f16 tile before the multiply, so the reference rounds the
-    /// weight the same way.
-    static func referenceRow(bits: Int, group: Int, row: Int, cols: Int,
-                              w: Data, scales: [Float], biases: [Float], x: [Float]) -> BenchReference {
-        let groups = cols / group
-        let payload = group * bits / 8
-        var value: Float = 0
-        var magnitude: Float = 0
-        w.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            for g in 0..<groups {
-                let scale = scales[row * groups + g]
-                let bias = biases[row * groups + g]
-                let blockOffset = (row * groups + g) * payload
-                for i in 0..<group {
-                    let byte = raw[blockOffset + i / 2]
-                    let code = (i % 2 == 0) ? Float(byte & 0x0F) : Float(byte >> 4)
-                    let weight = Float(Float16(code * scale + bias))
-                    value += weight * x[g * group + i]
-                    magnitude += abs(weight * x[g * group + i])
                 }
             }
         }

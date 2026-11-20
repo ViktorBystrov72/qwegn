@@ -114,28 +114,4 @@ struct QWMTPGreedySelector {
         }
         return out
     }
-
-    /// Resolves draft acceptance, bonus token, and rollback count via shared `QWSpeculativeTokenResolver`.
-    func resolveGreedyRound(
-        drafts: [Int],
-        targetBuffer: QWTensorValue,
-        logits: QWTensorValue,
-        maxNew: Int,
-        stopIDs: Set<Int> = [],
-        relaxedMargin: Float = 0,
-        relaxedMinProb: Float = 0
-    ) throws -> QWSpeculativeResolution {
-        let targets = try completedTokens(from: targetBuffer, count: drafts.count + 1)
-        let p = logits.region.pointer.advanced(by: logits.offset).assumingMemoryBound(to: Float.self)
-        return try QWSpeculativeTokenResolver.resolveGreedy(
-            drafts: drafts,
-            targetArgmaxes: targets,
-            vocabulary: vocabulary,
-            maxNew: maxNew,
-            stopIDs: stopIDs,
-            relaxedMargin: relaxedMargin,
-            relaxedMinProb: relaxedMinProb,
-            logitRow: { row in UnsafeBufferPointer(start: p + row * vocabulary, count: vocabulary) }
-        )
-    }
 }

@@ -20,7 +20,8 @@ extension QWEngineDriver.WeightLoader {
 
     /// The plane for one weight: the incumbent's container, or the family's.
     mutating func planeView(_ name: String, n: Int, k: Int,
-                             key: KeyPath<QWQTensorEntry, Int?>) throws -> QWTensorValue {
+                             key: KeyPath<QWQTensorEntry, Int?>,
+                             residentExperts: Int? = nil) throws -> QWTensorValue {
         if format.isNativeAffine {
             return try aqPlaneView(name, n: n, k: k)
         }
@@ -29,14 +30,12 @@ extension QWEngineDriver.WeightLoader {
         switch key {
         case \QWQTensorEntry.hq4Off, \QWQTensorEntry.q4gOff:
             if let pk {
-                let entry = try pk.entry(name)
-                if let expCount = entry.experts, let per = entry.eHq4 {
-                    elems = (expCount * per) / 2
-                } else {
-                    elems = (n * (k / entry.hqGroup) * entry.hqBlockBytes) / 2
-                }
+                elems = try packPlaneHalfCount(name, entry: try pk.entry(name),
+                                               n: n, k: k, residentExperts: residentExperts)
             } else {
-                elems = (n * format.rowBytes(k: k)) / 2
+                let rowBytes = residentExperts != nil
+                    ? format.expertDownRowBytes(k: k) : format.rowBytes(k: k)
+                elems = (n * rowBytes) / 2
             }
         default:
             throw QWEngineDriverError.weightMissing(name, "plane key unsupported")
@@ -44,7 +43,7 @@ extension QWEngineDriver.WeightLoader {
         let t = try allocateWeight(QWTensorShape([elems], .f16))
         if let io {
             let dst = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
-            try io.load(name, layout: .hq4, into: dst)
+            try io.loadSlice(name, layout: .hq4, byteOffset: 0, byteCount: elems * 2, into: dst)
         } else {
             try quantizeSafetensorsToHQ4(
                 name, n: n, k: k,
@@ -53,6 +52,59 @@ extension QWEngineDriver.WeightLoader {
             )
         }
         return t
+    }
+
+    private func packPlaneHalfCount(
+        _ name: String, entry: QWQTensorEntry, n: Int, k: Int, residentExperts: Int?
+    ) throws -> Int {
+        let grp = entry.hqGroup
+        guard grp > 0, k > 0, k % grp == 0 else {
+            throw QWEngineDriverError.weightMissing(name, "plane k=\(k) incompatible with group \(grp)")
+        }
+        let rowBytes = (k / grp) * entry.hqBlockBytes
+        let isFused3D = entry.shape.count == 3 || (entry.experts != nil && entry.eHq4 != nil)
+        if isFused3D {
+            guard let expCount = entry.experts ?? (entry.shape.count == 3 ? entry.shape[0] : nil),
+                  expCount > 0 else {
+                throw QWEngineDriverError.weightMissing(name, "3D expert tensor missing expert count")
+            }
+            let rowsPerExpert: Int
+            if entry.shape.count == 3 {
+                rowsPerExpert = entry.shape[1]
+                guard entry.shape[2] == k else {
+                    throw QWEngineDriverError.weightMissing(
+                        name, "3D expert tensor k=\(entry.shape[2]) != expected \(k)")
+                }
+            } else if entry.shape.count == 2, entry.shape[0] % expCount == 0 {
+                rowsPerExpert = entry.shape[0] / expCount
+            } else {
+                throw QWEngineDriverError.weightMissing(name, "3D expert tensor shape invalid: \(entry.shape)")
+            }
+            guard rowsPerExpert > 0 else {
+                throw QWEngineDriverError.weightMissing(name, "3D expert tensor has zero rows per expert")
+            }
+            let expectedPerExpert = rowsPerExpert * rowBytes
+            let per = entry.eHq4 ?? expectedPerExpert
+            guard per == expectedPerExpert else {
+                throw QWEngineDriverError.weightMissing(name, "3D expert e_hq4 \(per) != expected \(expectedPerExpert)")
+            }
+            let sliceExperts = residentExperts ?? (n / rowsPerExpert)
+            let (expectedRows, ovRows) = sliceExperts.multipliedReportingOverflow(by: rowsPerExpert)
+            guard sliceExperts > 0, sliceExperts <= expCount, !ovRows, expectedRows == n else {
+                throw QWEngineDriverError.weightMissing(
+                    name, "3D expert slice \(sliceExperts) invalid for n=\(n), experts=\(expCount)")
+            }
+            let (sliceBytes, ovBytes) = sliceExperts.multipliedReportingOverflow(by: per)
+            guard !ovBytes, sliceBytes % 2 == 0 else {
+                throw QWEngineDriverError.weightMissing(name, "3D expert slice byte count invalid")
+            }
+            return sliceBytes / 2
+        }
+        let (byteCount, ovBytes) = n.multipliedReportingOverflow(by: rowBytes)
+        guard n >= 0, !ovBytes, byteCount % 2 == 0 else {
+            throw QWEngineDriverError.weightMissing(name, "2D plane byte count invalid")
+        }
+        return byteCount / 2
     }
 
     /// The bank's view, carrying the container's own pair and the model's basis.

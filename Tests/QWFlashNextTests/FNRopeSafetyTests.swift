@@ -23,12 +23,12 @@ final class FNRopeSafetyTests: XCTestCase {
         let rope = QWRopeCPU(rotaryDim: 4, theta: 10_000.0, yarnFactor: 2.0, originalMaxPosition: 4096)
         let (c, s) = rope.tables(positions: [0, 3])
         var vec: [Float] = [1, 2, 3, 4, 5, 6]
-        try rope.applyChecked(&vec, base: 0, dim: 6, cos: c, sin: s, row: 1)
+        try QWRopeCPU.applyCPU(&vec, rotaryDim: rope.rotaryDim, base: 0, dim: 6, cos: c, sin: s, row: 1)
         XCTAssertEqual(vec[4], 5)
         XCTAssertEqual(vec[5], 6)
 
-        XCTAssertThrowsError(try rope.applyChecked(&vec, base: 4, dim: 4, cos: c, sin: s, row: 0))
-        XCTAssertThrowsError(try rope.applyChecked(&vec, base: 0, dim: 6, cos: c, sin: s, row: 2))
+        XCTAssertThrowsError(try QWRopeCPU.applyCPU(&vec, rotaryDim: rope.rotaryDim, base: 4, dim: 4, cos: c, sin: s, row: 0))
+        XCTAssertThrowsError(try QWRopeCPU.applyCPU(&vec, rotaryDim: rope.rotaryDim, base: 0, dim: 6, cos: c, sin: s, row: 2))
 
         let tables = QWRopeTables(rows: 4, yarn: QWYaRNConfig(factor: 2.0, originalMaxPosition: 4096),
                                   geometry: .qwen38_27b)

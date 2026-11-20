@@ -3,6 +3,7 @@
 
 import Foundation
 import QWCore
+import QWHAL
 import QWQuant
 
 /// Unified vision-tower contract: C19 patch slab in, merged visual tokens out.
@@ -62,7 +63,9 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
 
     public let source: Source
     private let lock = NSLock()
+    private let preferredHal: QWHal?
     private var resolvedConfig: QWVisionConfig
+    private var metalBackend: QWVisionMetalBackend?
     private var residentWeights: QWVisionWeights?
     private var keepResidentFlag: Bool = false
     private var allowOnDemandFlag: Bool = true
@@ -72,7 +75,7 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     }
 
     public var isLoaded: Bool {
-        lock.withLock { residentWeights != nil }
+        lock.withLock { metalBackend != nil || residentWeights != nil }
     }
 
     public var keepResident: Bool {
@@ -84,15 +87,21 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     }
 
     public var isVisionEnabled: Bool {
-        lock.withLock { keepResidentFlag || allowOnDemandFlag || residentWeights != nil }
+        lock.withLock { keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil }
     }
 
     public var residentBytes: Int {
-        lock.withLock { residentWeights?.residentBytes ?? 0 }
+        lock.withLock { (metalBackend?.residentBytes ?? 0) + (residentWeights?.residentBytes ?? 0) }
     }
 
-    public init(source: Source, keepResident: Bool = false, allowOnDemand: Bool = true) throws {
+    public init(
+        source: Source,
+        keepResident: Bool = false,
+        allowOnDemand: Bool = true,
+        hal: QWHal? = nil
+    ) throws {
         self.source = source
+        self.preferredHal = hal
         self.keepResidentFlag = keepResident
         self.allowOnDemandFlag = allowOnDemand
         switch source {
@@ -108,28 +117,33 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
             self.resolvedConfig = .qwen3VLReference
         }
         if keepResident {
-            _ = try loadWeightsLocked()
+            try loadResidentLocked()
         }
     }
 
     /// Resolves a model path (`.qwp` pack or `.safetensors` directory/file) into an on-demand backend.
-    public convenience init(modelPath: String, keepResident: Bool = false, allowOnDemand: Bool = true) throws {
+    public convenience init(
+        modelPath: String,
+        keepResident: Bool = false,
+        allowOnDemand: Bool = true,
+        hal: QWHal? = nil
+    ) throws {
         let url = URL(fileURLWithPath: modelPath)
         let root = QWModelRoot(url: url)
         switch root.kind {
         case .qwp1:
-            try self.init(source: .pack(root.weights.path), keepResident: keepResident, allowOnDemand: allowOnDemand)
+            try self.init(source: .pack(root.weights.path), keepResident: keepResident, allowOnDemand: allowOnDemand, hal: hal)
         case .safetensorsSingle, .safetensorsSharded:
             let dir = root.weights.hasDirectoryPath
                 ? root.weights.path
                 : root.weights.deletingLastPathComponent().path
-            try self.init(source: .directory(dir), keepResident: keepResident, allowOnDemand: allowOnDemand)
+            try self.init(source: .directory(dir), keepResident: keepResident, allowOnDemand: allowOnDemand, hal: hal)
         case nil:
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: modelPath, isDirectory: &isDir), isDir.boolValue {
-                try self.init(source: .directory(modelPath), keepResident: keepResident, allowOnDemand: allowOnDemand)
+                try self.init(source: .directory(modelPath), keepResident: keepResident, allowOnDemand: allowOnDemand, hal: hal)
             } else {
-                try self.init(source: .pack(modelPath), keepResident: keepResident, allowOnDemand: allowOnDemand)
+                try self.init(source: .pack(modelPath), keepResident: keepResident, allowOnDemand: allowOnDemand, hal: hal)
             }
         }
     }
@@ -137,6 +151,17 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     /// True when the checkpoint at `modelPath` carries valid vision tower weights.
     public static func hasVisionWeights(modelPath: String) -> Bool {
         (try? QWVisionOnDemandBackend(modelPath: modelPath)) != nil
+    }
+
+    private static func shouldUseMetal(hal: QWHal?) -> Bool {
+        if let hal {
+            return !hal.caps.name.localizedCaseInsensitiveContains("paravirtual")
+        }
+        if ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == "true" {
+            return false
+        }
+        guard let caps = QWDeviceCaps.current else { return false }
+        return !caps.name.localizedCaseInsensitiveContains("paravirtual")
     }
 
     private static func validate(checkpoint ck: QWVisionCheckpoint) throws {
@@ -164,31 +189,74 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         }
     }
 
-    private func loadWeightsLocked() throws -> QWVisionWeights {
-        if let existing = residentWeights {
-            return existing
-        }
-        let loaded: QWVisionWeights
+    private func loadCPUWeightsFromSource() throws -> QWVisionWeights {
         switch source {
         case .pack(let packPath):
-            loaded = try QWVisionWeights(pack: packPath)
+            return try QWVisionWeights(pack: packPath)
         case .directory(let dir):
-            loaded = try QWVisionWeights(dir: dir)
+            return try QWVisionWeights(dir: dir)
         case .custom(let builder):
-            loaded = try builder()
+            return try builder()
         }
+    }
+
+    private func loadResidentLocked() throws {
+        if metalBackend != nil || residentWeights != nil {
+            return
+        }
+        let forceCPU = ProcessInfo.processInfo.environment["QWG_VISION_CPU"] == "1"
+        let canTryMetal = !forceCPU && Self.shouldUseMetal(hal: preferredHal)
+        if canTryMetal {
+            switch source {
+            case .pack(let packPath):
+                let ck = try QWVisionCheckpoint(pack: packPath)
+                resolvedConfig = ck.config
+                do {
+                    metalBackend = try QWVisionMetalBackend(checkpoint: ck, hal: preferredHal)
+                    return
+                } catch is QWHalError {
+                    residentWeights = try QWVisionWeights(checkpoint: ck)
+                    return
+                }
+            case .directory(let dir):
+                let ck = try QWVisionCheckpoint(dir: dir)
+                resolvedConfig = ck.config
+                do {
+                    metalBackend = try QWVisionMetalBackend(checkpoint: ck, hal: preferredHal)
+                    return
+                } catch is QWHalError {
+                    residentWeights = try QWVisionWeights(checkpoint: ck)
+                    return
+                }
+            case .custom(let builder):
+                let loaded = try builder()
+                resolvedConfig = loaded.config
+                do {
+                    metalBackend = try QWVisionMetalBackend(weights: loaded, hal: preferredHal)
+                    return
+                } catch is QWHalError {
+                    residentWeights = loaded
+                    return
+                }
+            }
+        }
+        let loaded = try loadCPUWeightsFromSource()
         resolvedConfig = loaded.config
         residentWeights = loaded
-        return loaded
+    }
+
+    private func unloadLocked() {
+        metalBackend = nil
+        residentWeights = nil
     }
 
     public func setVisionLoaded(_ loaded: Bool) throws {
         try lock.withLock {
             keepResidentFlag = loaded
             if loaded {
-                _ = try loadWeightsLocked()
-            } else if residentWeights != nil {
-                residentWeights = nil
+                try loadResidentLocked()
+            } else {
+                unloadLocked()
             }
         }
     }
@@ -196,14 +264,16 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     public func prepareForPrompt(hasImages: Bool) throws {
         try lock.withLock {
             if hasImages {
-                guard keepResidentFlag || allowOnDemandFlag || residentWeights != nil else {
+                guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil else {
                     throw QWVisionError.badLayout(
                         "Vision tower is disabled in Model Settings (enable 'Load Vision Tower' in Settings → Model)"
                     )
                 }
-                _ = try loadWeightsLocked()
-            } else if !keepResidentFlag, residentWeights != nil {
-                residentWeights = nil
+                try loadResidentLocked()
+            } else if !keepResidentFlag {
+                unloadLocked()
+            } else {
+                metalBackend?.releaseScratch()
             }
         }
     }
@@ -211,9 +281,7 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     public func unload() {
         lock.withLock {
             keepResidentFlag = false
-            if residentWeights != nil {
-                residentWeights = nil
-            }
+            unloadLocked()
         }
     }
 
@@ -223,16 +291,43 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         bins: QWVisionRef.InterpBins,
         posIds: [Int32]
     ) throws -> [Float] {
-        let weights: QWVisionWeights = try lock.withLock {
-            guard keepResidentFlag || allowOnDemandFlag || residentWeights != nil else {
+        let forceCPU = ProcessInfo.processInfo.environment["QWG_VISION_CPU"] == "1"
+        enum EngineSelection {
+            case metal(QWVisionMetalBackend)
+            case cpu(QWVisionWeights)
+        }
+        let selection: EngineSelection = try lock.withLock {
+            guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil else {
                 throw QWVisionError.badLayout(
                     "Vision tower is disabled in Model Settings (enable 'Load Vision Tower' in Settings → Model)"
                 )
             }
-            return try loadWeightsLocked()
+            if forceCPU {
+                if let existing = residentWeights {
+                    return .cpu(existing)
+                }
+                let cpuW = try loadCPUWeightsFromSource()
+                resolvedConfig = cpuW.config
+                if metalBackend == nil {
+                    residentWeights = cpuW
+                }
+                return .cpu(cpuW)
+            }
+            try loadResidentLocked()
+            if let metal = metalBackend {
+                return .metal(metal)
+            }
+            guard let weights = residentWeights else {
+                throw QWVisionError.badLayout("Vision weights failed to load")
+            }
+            return .cpu(weights)
         }
-        let ref = QWVisionRef(weights: weights)
-        return ref.encode(patches: patches, plan: grid, bins: bins, posIds: posIds)
+        switch selection {
+        case .metal(let metal):
+            return try metal.encodeSync(patches: patches, grid: grid, bins: bins, posIds: posIds)
+        case .cpu(let weights):
+            return QWVisionRef(weights: weights).encode(patches: patches, plan: grid, bins: bins, posIds: posIds)
+        }
     }
 
     public func encode(

@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 @testable import QWServer
 import QWToken
@@ -483,6 +484,93 @@ final class QWServerSchemaTests: XCTestCase {
             XCTAssertTrue(sysContent.contains("MUST output ONLY a single raw, valid JSON object"))
         } else {
             XCTFail("expected synthesized system message at index 0")
+        }
+    }
+
+    func testServerRequestDecoderPreservesKeyOrderAndTemplateHashAcrossEndpoints() async throws {
+        let toolJson = """
+        {"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"city":{"type":"string"},"alpha":{"type":"integer"}},"required":["city"]}}}
+        """
+        let expectedToolJson = """
+        {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"zeta": {"type": "string"}, "city": {"type": "string"}, "alpha": {"type": "integer"}}, "required": ["city"]}}}
+        """
+        let expectedSchemaJson = """
+        {"type": "object", "properties": {"zeta": {"type": "string"}, "city": {"type": "string"}, "alpha": {"type": "integer"}}, "required": ["city"]}
+        """
+        let chatBody = Data("""
+        {
+          "model": "test",
+          "messages": [{"role": "user", "content": "Weather?"}],
+          "tools": [\(toolJson)],
+          "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+          "response_format": {"type": "json_schema", "json_schema": {"name": "out", "schema": {"type": "object", "properties": {"z": {"type": "string"}, "a": {"type": "integer"}}, "required": ["z"]}}}
+        }
+        """.utf8)
+        let anthropicBody = Data("""
+        {
+          "model": "test",
+          "max_tokens": 64,
+          "messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}],
+          "tools": [{"name": "get_weather", "description": "Get weather", "input_schema": {"type": "object", "properties": {"zeta": {"type": "string"}, "city": {"type": "string"}, "alpha": {"type": "integer"}}, "required": ["city"]}}]
+        }
+        """.utf8)
+        let responsesBody = Data("""
+        {
+          "model": "test",
+          "input": [{"role": "user", "content": "Weather?"}],
+          "tools": [\(toolJson)],
+          "tool_choice": {"type": "function", "name": "get_weather"},
+          "text": {"format": {"type": "json_schema", "name": "out", "schema": {"type": "object", "properties": {"z": {"type": "string"}, "a": {"type": "integer"}}, "required": ["z"]}}}
+        }
+        """.utf8)
+        let ollamaBody = Data("""
+        {
+          "model": "test",
+          "messages": [{"role": "user", "content": "Weather?"}],
+          "tools": [\(toolJson)],
+          "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+          "format": {"type": "object", "properties": {"z": {"type": "string"}, "a": {"type": "integer"}}, "required": ["z"]}
+        }
+        """.utf8)
+
+        let tpl = try QWChatTemplate(source: "{% if tools %}{{ tools | tojson }}{% endif %}{% for m in messages %}{{ m.role }}:{{ m.content }}{% endfor %}")
+        var baselineSha: String? = nil
+
+        for _ in 0..<25 {
+            let (sha, chatTool, respTool, ollamaTool, anthSchema) = try await withCheckedThrowingContinuation {
+                (cont: CheckedContinuation<(String, String, String, String, String), Error>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let chat = try QWServerRequestDecoder.decode(ChatCompletionRequest.self, from: chatBody)
+                        let anth = try QWServerRequestDecoder.decode(AnthropicMessagesRequest.self, from: anthropicBody)
+                        let resp = try QWServerRequestDecoder.decode(OpenAIResponseCreateRequest.self, from: responsesBody)
+                        let ollama = try QWServerRequestDecoder.decode(OllamaChatRequest.self, from: ollamaBody)
+
+                        var opts = QWChatTemplateOptions()
+                        opts.tools = .array(chat.tools ?? [])
+                        let rendered = try tpl.render(messages: chat.toQWJsonMessages(), options: opts)
+                        let digest = SHA256.hash(data: Data(rendered.utf8)).map { String(format: "%02x", $0) }.joined()
+                        cont.resume(returning: (
+                            digest,
+                            chat.tools?.first?.tojson ?? "",
+                            resp.tools?.first?.tojson ?? "",
+                            ollama.tools?.first?.tojson ?? "",
+                            anth.tools?.first?.inputSchema?.tojson ?? ""
+                        ))
+                    } catch {
+                        cont.resume(throwing: error)
+                    }
+                }
+            }
+            if let prev = baselineSha {
+                XCTAssertEqual(sha, prev)
+            } else {
+                baselineSha = sha
+            }
+            XCTAssertEqual(chatTool, expectedToolJson)
+            XCTAssertEqual(respTool, expectedToolJson)
+            XCTAssertEqual(ollamaTool, expectedToolJson)
+            XCTAssertEqual(anthSchema, expectedSchemaJson)
         }
     }
 }

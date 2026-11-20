@@ -87,13 +87,25 @@ public final class QWHal: @unchecked Sendable {
     public let device: any MTLDevice
     public let caps: QWDeviceCaps
     public let queue: any MTLCommandQueue
-    /// Long-lived allocations every encoder references (see QWResidency.swift).
-    let residencyLock = NSLock()
-    var keepAlive: [any MTLResource] = []
-    var keepAliveIDs = Set<ObjectIdentifier>()
-    var keepAliveLastTouch: CFAbsoluteTime = 0
-    var keepAliveHeartbeat: (any DispatchSourceTimer)?
-    var keepAliveNop: (any MTLComputePipelineState)?
+    /// Lock-free snapshot residency state (see QWResidency.swift).
+    final class FrozenResidencySnapshot: @unchecked Sendable {
+        let resources: [any MTLResource]
+        init(_ resources: [any MTLResource]) { self.resources = resources }
+    }
+
+    struct MutableResidencyState: @unchecked Sendable {
+        var resources: [any MTLResource] = []
+        var ids = Set<ObjectIdentifier>()
+        var retiredSnapshots: [FrozenResidencySnapshot] = []
+        var heartbeat: (any DispatchSourceTimer)?
+        var nopPSO: (any MTLComputePipelineState)?
+    }
+
+    let residencyState = OSAllocatedUnfairLock(initialState: MutableResidencyState())
+    let frozenResidencyPtr = Atomic<UnsafeMutableRawPointer?>(nil)
+    let residencyActiveReaders = Atomic<Int>(0)
+    let keepAliveLastTouchNs = Atomic<UInt64>(0)
+    let prefersRetainedCommandBuffers: Bool
     public let metallib: any MTLLibrary
     public let geometry: QWModelGeometry
     private let functionConstants: MTLFunctionConstantValues
@@ -163,7 +175,16 @@ public final class QWHal: @unchecked Sendable {
     }
 
     deinit {
-        keepAliveHeartbeat?.cancel()
+        let heartbeat = residencyState.withLock { state -> (any DispatchSourceTimer)? in
+            let timer = state.heartbeat
+            state.heartbeat = nil
+            state.retiredSnapshots.removeAll()
+            return timer
+        }
+        heartbeat?.cancel()
+        if let raw = frozenResidencyPtr.exchange(nil, ordering: .acquiring) {
+            Unmanaged<FrozenResidencySnapshot>.fromOpaque(raw).release()
+        }
         if let raw = frozenSnapshotPtr.exchange(nil, ordering: .acquiring) {
             Unmanaged<FrozenPSOSnapshot>.fromOpaque(raw).release()
         }
@@ -176,6 +197,8 @@ public final class QWHal: @unchecked Sendable {
                 weightBasis: QWWeightBasis = .rotated) throws {
         self.geometry = geometry
         self.weightBasis = weightBasis
+        self.prefersRetainedCommandBuffers =
+            ProcessInfo.processInfo.environment["QWG_RETAINED_CB"] == "1"
         self.functionConstants = Self.makeFunctionConstants(geometry: geometry, isAQ4: false)
         self.aq4FunctionConstants = Self.makeFunctionConstants(geometry: geometry, isAQ4: true)
         guard let dev = MTLCreateSystemDefaultDevice() else { throw QWHalError.noDevice }
@@ -300,25 +323,53 @@ public final class QWHal: @unchecked Sendable {
 
     /// Begin a command buffer + encoder as a pair.
     public func begin() -> (any MTLCommandBuffer, any MTLComputeCommandEncoder)? {
-        guard let cb = queue.makeCommandBuffer(),
-              let enc = cb.makeComputeCommandEncoder() else { return nil }
-        touchKeepAlive(enc)
-        return (cb, enc)
+        begin(.serial)
     }
 
     /// Begin with explicit compute dispatch type.
     public func begin(_ mode: ComputeDispatchMode) -> (any MTLCommandBuffer, any MTLComputeCommandEncoder)? {
         guard let cb = queue.makeCommandBuffer() else { return nil }
-        switch mode {
-        case .serial:
-            guard let enc = cb.makeComputeCommandEncoder() else { return nil }
-            touchKeepAlive(enc)
-            return (cb, enc)
-        case .concurrent:
-            guard let enc = cb.makeComputeCommandEncoder(dispatchType: .concurrent) else { return nil }
-            touchKeepAlive(enc)
-            return (cb, enc)
+        return openComputeEncoder(on: cb, mode: mode)
+    }
+
+    /// Allocates an unretained-reference command buffer (unless `QWG_RETAINED_CB=1`).
+    /// Callers must guarantee every referenced Metal resource outlives GPU completion.
+    public func makeUnretainedCommandBuffer() -> (any MTLCommandBuffer)? {
+        prefersRetainedCommandBuffers
+            ? queue.makeCommandBuffer()
+            : queue.makeCommandBufferWithUnretainedReferences()
+    }
+
+    /// Begin a hot-path compute encoder on an unretained-reference command buffer.
+    public func beginUnretained(
+        _ mode: ComputeDispatchMode = .serial
+    ) -> (any MTLCommandBuffer, any MTLComputeCommandEncoder)? {
+        guard let cb = makeUnretainedCommandBuffer() else { return nil }
+        return openComputeEncoder(on: cb, mode: mode)
+    }
+
+    /// Begin an unretained-reference compute encoder waiting on `event == value`.
+    public func beginUnretained(
+        _ mode: ComputeDispatchMode,
+        waitingFor event: any MTLSharedEvent,
+        value: UInt64
+    ) -> (any MTLCommandBuffer, any MTLComputeCommandEncoder)? {
+        guard let cb = makeUnretainedCommandBuffer() else { return nil }
+        cb.encodeWaitForEvent(event, value: value)
+        return openComputeEncoder(on: cb, mode: mode)
+    }
+
+    private func openComputeEncoder(
+        on cb: any MTLCommandBuffer,
+        mode: ComputeDispatchMode
+    ) -> (any MTLCommandBuffer, any MTLComputeCommandEncoder)? {
+        let enc: (any MTLComputeCommandEncoder)? = switch mode {
+        case .serial: cb.makeComputeCommandEncoder()
+        case .concurrent: cb.makeComputeCommandEncoder(dispatchType: .concurrent)
         }
+        guard let enc else { return nil }
+        touchKeepAlive(enc)
+        return (cb, enc)
     }
 
     public func end(_ cb: any MTLCommandBuffer, _ enc: any MTLComputeCommandEncoder) {
@@ -332,13 +383,7 @@ public final class QWHal: @unchecked Sendable {
                               _ enc: inout any MTLComputeCommandEncoder) throws {
         let mode: ComputeDispatchMode = (enc.dispatchType == .concurrent) ? .concurrent : .serial
         enc.endEncoding()
-        let next: (any MTLComputeCommandEncoder)?
-        switch mode {
-        case .serial: next = cb.makeComputeCommandEncoder()
-        case .concurrent: next = cb.makeComputeCommandEncoder(dispatchType: .concurrent)
-        }
-        guard let next else { throw QWHalError.noDevice }
-        touchKeepAlive(next)
+        guard let (_, next) = openComputeEncoder(on: cb, mode: mode) else { throw QWHalError.noDevice }
         enc = next
     }
 
@@ -348,14 +393,7 @@ public final class QWHal: @unchecked Sendable {
                       value: UInt64) -> (any MTLCommandBuffer, any MTLComputeCommandEncoder)? {
         guard let cb = queue.makeCommandBuffer() else { return nil }
         cb.encodeWaitForEvent(event, value: value)
-        let enc: (any MTLComputeCommandEncoder)?
-        switch mode {
-        case .serial: enc = cb.makeComputeCommandEncoder()
-        case .concurrent: enc = cb.makeComputeCommandEncoder(dispatchType: .concurrent)
-        }
-        guard let enc else { return nil }
-        touchKeepAlive(enc)
-        return (cb, enc)
+        return openComputeEncoder(on: cb, mode: mode)
     }
 }
 

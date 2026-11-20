@@ -47,11 +47,7 @@ extension QWEngineDriver {
     }
 
     func admitSession(promptTokens: Int, prefix: QWEngineSharedPrefix? = nil) throws -> QWEngineSession {
-        slotLock.lock()
-        guard !freeSlots.isEmpty else { slotLock.unlock(); throw QWEngineDriverError.busy }
-        let slotIndex = freeSlots.firstIndex(where: { $0.dflashSlot != nil }) ?? 0
-        let slot = freeSlots.remove(at: slotIndex)
-        slotLock.unlock()
+        let slot = try admission.acquireSlot(dflashPreferred: true)
         if prefix == nil {
             memset(slot.recSlab.region.buffer.contents()
                    .advanced(by: slot.recSlab.region.base + slot.recSlab.offset),
@@ -106,9 +102,7 @@ extension QWEngineDriver {
         } catch {
             if let mtpHandle { mtpCache?.finish(mtpHandle) }
             if let trunkHandle { kvCache.finish(trunkHandle) }
-            slotLock.lock()
-            freeSlots.append(slot)
-            slotLock.unlock()
+            admission.releaseSlot(slot)
             throw error
         }
     }
@@ -149,13 +143,11 @@ extension QWEngineDriver {
             mtpCache.finish(mtpH)
         }
         kvCache.finish(session.kv)
-        slotLock.lock()
-        freeSlots.append(GdnSlot(recSlab: session.recSlab,
-                                 ringSlab: session.ringSlab,
-                                 rec: session.rec, ring: session.ring,
-                                 trunkHidden: session.trunkHidden,
-                                 dflashSlot: session.dflashSlot))
-        slotLock.unlock()
+        admission.releaseSlot(GdnSlot(recSlab: session.recSlab,
+                                    ringSlab: session.ringSlab,
+                                    rec: session.rec, ring: session.ring,
+                                    trunkHidden: session.trunkHidden,
+                                    dflashSlot: session.dflashSlot))
     }
 
     /// Take an exact snapshot of session state (GDN rec + ring slabs, KV cursors, position).

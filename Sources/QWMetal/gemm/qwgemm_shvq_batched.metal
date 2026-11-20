@@ -23,24 +23,6 @@
         qwg_gemm_h16_mode_dispatch<BITS, GROUP, true, HAS_TG>(                         \
             blocks, x, y16, y32, M, N, K, tg, lid, simd_gid, simd_lid, LUT_PTR);       \
     }                                                                                  \
-    kernel void qwg_gemm_shvq##BITS##_g##GROUP##_h16_bm128(                             \
-        device const char* blocks [[buffer(0)]],                                       \
-        device const half* x      [[buffer(1)]],                                       \
-        device half*       y16    [[buffer(2)]],                                       \
-        device float*      y32    [[buffer(3)]],                                       \
-        constant uint& M [[buffer(4)]], constant uint& N [[buffer(5)]],                \
-        constant uint& K [[buffer(6)]],                                                \
-        uint3 tg       [[threadgroup_position_in_grid]],                               \
-        uint  lid      [[thread_index_in_threadgroup]],                                \
-        uint  simd_gid [[simdgroup_index_in_threadgroup]],                             \
-        uint  simd_lid [[thread_index_in_simdgroup]]) {                                \
-        DECL_TG                                                                        \
-        PREP_TG                                                                        \
-        qmm_t_nax_tgp_dual_impl<half, half, false, 128, 64, 64, 2, 2, false, false,    \
-                                false, BITS, GROUP, true, HAS_TG>(                     \
-            blocks, x, y16, y32, nullptr, int(K), int(N), int(M), tg, lid,             \
-            simd_gid, simd_lid, nullptr, nullptr, LUT_PTR);                            \
-    }                                                                                  \
     kernel void qwg_gemm_shvq##BITS##_g##GROUP##_h16_gdn_inproj(                        \
         device const char* blocks [[buffer(0)]],                                       \
         device const half* x      [[buffer(1)]],                                       \

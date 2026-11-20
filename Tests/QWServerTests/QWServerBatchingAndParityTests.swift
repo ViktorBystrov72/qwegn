@@ -292,7 +292,8 @@ final class QWServerBatchingAndParityTests: XCTestCase {
         let fan = QWFanController()
         fan.setPolicy(.proactive)
         fan.updateInferencePhase("decode")
-        let fanSnap = fan.currentCachedSnapshot()
+        XCTAssertEqual(fan.currentPolicy, .proactive)
+        let fanSnap = fan.sampleAndReconcile()
         XCTAssertFalse(fanSnap.thermalStateLevel.isEmpty)
 
         let s1 = QWSystemMetricsSampler.shared.current()
@@ -381,7 +382,7 @@ final class QWServerBatchingAndParityTests: XCTestCase {
         XCTAssertFalse(store.putIfAbsent(a))
         store.put(b)
         store.put(c)
-        XCTAssertLessThanOrEqual(store.currentTotalBytes, 2200)
+        XCTAssertLessThanOrEqual(store.count, 2)
         XCTAssertNil(store.get("resp_a"), "oldest entry must evict to satisfy maxBytes cap")
         XCTAssertNotNil(store.get("resp_c"))
 
@@ -441,8 +442,8 @@ final class QWServerBatchingAndParityTests: XCTestCase {
         let budget = QWThinkingBudgetConstraint(
             maxThinkingTokens: 5, endThinkTokenId: 4, vocabularySize: pieces.count, table: table, inner: inner
         )
-        try budget.accept(3) // "</think>{" token
-        XCTAssertFalse(budget.isInThinking)
+        try budget.accept(3) // "</think>{" token forwards `{` into JSON grammar
+        XCTAssertEqual(try budget.allowedTokens(), [1]) // only `"a":1}` completes `{`
         try budget.accept(1) // "\"a\":1}" completes the JSON object `{` + `"a":1}`
         XCTAssertTrue(inner.isComplete)
     }

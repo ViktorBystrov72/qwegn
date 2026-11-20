@@ -1,4 +1,5 @@
 // QWMM.swift — Multimodal preprocessing math, grid geometry, and X0 plan (spec-05).
+import Accelerate
 import Foundation
 import QWCore
 import QWHAL
@@ -308,15 +309,14 @@ private func emitCube(t lt: Int, h hh: Int, w ww: Int, merge m: Int, cur: Int,
     }
 }
 
-// MARK: - B: patch-slab builder
+// MARK: - B: patch-slab builder (vDSP-accelerated)
 
-private func buildPatchSlab(
+private func validatePatchSlabInputs(
     grid: QWVisionGrid,
     height: Int,
     width: Int,
-    sampleCount: Int,
-    readValue: (Int) -> Float
-) throws -> [Float] {
+    sampleCount: Int
+) throws {
     guard grid.t == 1 else {
         throw QWGridError.mergeShape(t: grid.t, h: grid.h, w: grid.w)
     }
@@ -330,7 +330,15 @@ private func buildPatchSlab(
     guard sampleCount == expectedCount else {
         throw QWGridError.bufferLength(expected: expectedCount, actual: sampleCount)
     }
+}
 
+private func scatterPlanarPatches(
+    planes: [Float],
+    grid: QWVisionGrid,
+    width: Int,
+    pixelCount: Int
+) -> [Float] {
+    let spec = grid.spec
     let m = spec.merge
     let patch = spec.patch
     let factor = spec.factor
@@ -341,30 +349,30 @@ private func buildPatchSlab(
     let cellsPerBlock = m * m
     let blocksW = grid.w / m
     let totalPatches = grid.patches
+    let patchBytes = patchArea * MemoryLayout<Float>.stride
     var out = [Float](repeating: 0, count: totalPatches * patchChannels)
 
-    out.withUnsafeMutableBufferPointer { dst in
-        for pi in 0..<totalPatches {
-            let hb = pi / (cellsPerBlock * blocksW)
-            let rem = pi % (cellsPerBlock * blocksW)
-            let wb = rem / cellsPerBlock
-            let p = rem % cellsPerBlock
-            let i = p / m
-            let j = p % m
-            let tp = hb * factor + i * patch
-            let wp = wb * factor + j * patch
-
-            let rowOffset = pi * patchChannels
-            for c in 0..<3 {
-                let channelOffset = rowOffset + c * temporalArea
-                for r in 0..<patch {
-                    let srcRowStart = (tp + r) * width * 3 + wp * 3 + c
-                    let dstRasterOffset = channelOffset + r * patch
-                    for col in 0..<patch {
-                        let val = readValue(srcRowStart + col * 3)
-                        for t in 0..<temporal {
-                            dst[dstRasterOffset + t * patchArea + col] = val
-                        }
+    planes.withUnsafeBufferPointer { srcPlanes in
+        out.withUnsafeMutableBufferPointer { dst in
+            guard let planeBase = srcPlanes.baseAddress, let dstBase = dst.baseAddress else { return }
+            let vPatch = vDSP_Length(patch)
+            let vWidth = vDSP_Length(width)
+            for pi in 0..<totalPatches {
+                let hb = pi / (cellsPerBlock * blocksW)
+                let rem = pi % (cellsPerBlock * blocksW)
+                let wb = rem / cellsPerBlock
+                let p = rem % cellsPerBlock
+                let i = p / m
+                let j = p % m
+                let tp = hb * factor + i * patch
+                let wp = wb * factor + j * patch
+                let rowOffset = pi * patchChannels
+                for c in 0..<3 {
+                    let planeC = planeBase + c * pixelCount
+                    let dstPatch0 = dstBase + rowOffset + c * temporalArea
+                    vDSP_mmov(planeC + tp * width + wp, dstPatch0, vPatch, vPatch, vWidth, vPatch)
+                    for t in 1..<temporal {
+                        memcpy(dstPatch0 + t * patchArea, dstPatch0, patchBytes)
                     }
                 }
             }
@@ -375,20 +383,45 @@ private func buildPatchSlab(
 
 /// Construct the patch-slab layout from normalized Float RGB pixels [-1, 1].
 public func qwBuildPatchSlab(normalizedRGB: [Float], height: Int, width: Int, grid: QWVisionGrid) throws -> [Float] {
-    try normalizedRGB.withUnsafeBufferPointer { src in
-        try buildPatchSlab(grid: grid, height: height, width: width, sampleCount: normalizedRGB.count) { idx in
-            src[idx]
+    try validatePatchSlabInputs(grid: grid, height: height, width: width, sampleCount: normalizedRGB.count)
+    let pixelCount = height * width
+    guard pixelCount > 0 else { return [] }
+    var planes = [Float](repeating: 0, count: 3 * pixelCount)
+    let vPixels = vDSP_Length(pixelCount)
+    normalizedRGB.withUnsafeBufferPointer { src in
+        planes.withUnsafeMutableBufferPointer { dst in
+            guard let sBase = src.baseAddress, let pBase = dst.baseAddress else { return }
+            for c in 0..<3 {
+                vDSP_mmov(sBase + c, pBase + c * pixelCount, 1, vPixels, 3, 1)
+            }
         }
     }
+    return scatterPlanarPatches(planes: planes, grid: grid, width: width, pixelCount: pixelCount)
 }
 
 /// Construct the patch-slab layout from raw UInt8 RGB pixels [0, 255], normalizing to [-1, 1].
 public func qwBuildPatchSlab(imageRGB: [UInt8], height: Int, width: Int, grid: QWVisionGrid) throws -> [Float] {
-    try imageRGB.withUnsafeBufferPointer { src in
-        try buildPatchSlab(grid: grid, height: height, width: width, sampleCount: imageRGB.count) { idx in
-            (Float(src[idx]) / 255.0 - 0.5) / 0.5
+    try validatePatchSlabInputs(grid: grid, height: height, width: width, sampleCount: imageRGB.count)
+    let pixelCount = height * width
+    guard pixelCount > 0 else { return [] }
+    var planes = [Float](repeating: 0, count: 3 * pixelCount)
+    let vPixels = vDSP_Length(pixelCount)
+    var div255: Float = 255.0
+    var negHalf: Float = -0.5
+    var two: Float = 2.0
+    imageRGB.withUnsafeBufferPointer { src in
+        planes.withUnsafeMutableBufferPointer { dst in
+            guard let sBase = src.baseAddress, let pBase = dst.baseAddress else { return }
+            for c in 0..<3 {
+                let planeC = pBase + c * pixelCount
+                vDSP_vfltu8(sBase + c, 3, planeC, 1, vPixels)
+                vDSP_vsdiv(planeC, 1, &div255, planeC, 1, vPixels)
+                vDSP_vsadd(planeC, 1, &negHalf, planeC, 1, vPixels)
+                vDSP_vsmul(planeC, 1, &two, planeC, 1, vPixels)
+            }
         }
     }
+    return scatterPlanarPatches(planes: planes, grid: grid, width: width, pixelCount: pixelCount)
 }
 
 // MARK: - A+G: placeholder expansion + the X₀ slab plan

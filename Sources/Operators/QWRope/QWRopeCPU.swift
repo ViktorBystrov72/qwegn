@@ -143,12 +143,6 @@ public struct QWRopeCPU: Sendable, Hashable {
         Self.applyValidated(&v, base: base, rotaryDim: rotaryDim, cos: c, sin: s, row: p)
     }
 
-    /// Checked in-place half-split rotation throwing `QWRopeError` on invalid vector or table bounds.
-    public func applyChecked(_ v: inout [Float], base: Int, dim: Int,
-                             cos c: [Float], sin s: [Float], row p: Int) throws {
-        try Self.applyCPU(&v, rotaryDim: rotaryDim, base: base, dim: dim, cos: c, sin: s, row: p)
-    }
-
     /// Static checked CPU rotation usable without constructing a `QWRopeCPU` instance.
     public static func applyCPU(_ v: inout [Float], rotaryDim: Int, base: Int, dim: Int,
                                 cos c: [Float], sin s: [Float], row p: Int) throws {

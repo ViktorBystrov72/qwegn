@@ -11,18 +11,18 @@ public final class QWTokenRecycler: @unchecked Sendable {
     private static let totalSlots = bucketCount * ways
     private static let mixConstant: UInt64 = 0x9E37_79B9_7F4A_7C15
 
-    private var biKey0: [Int32]
-    private var biKey1: [Int32]
-    private var biNext: [Int32]
-    private var uniKey: [Int32]
-    private var uniNext: [Int32]
+    private var biKey0: ContiguousArray<Int32>
+    private var biKey1: ContiguousArray<Int32>
+    private var biNext: ContiguousArray<Int32>
+    private var uniKey: ContiguousArray<Int32>
+    private var uniNext: ContiguousArray<Int32>
 
     public init() {
-        biKey0 = [Int32](repeating: -1, count: Self.totalSlots)
-        biKey1 = [Int32](repeating: -1, count: Self.totalSlots)
-        biNext = [Int32](repeating: -1, count: Self.totalSlots)
-        uniKey = [Int32](repeating: -1, count: Self.totalSlots)
-        uniNext = [Int32](repeating: -1, count: Self.totalSlots)
+        biKey0 = ContiguousArray<Int32>(repeating: -1, count: Self.totalSlots)
+        biKey1 = ContiguousArray<Int32>(repeating: -1, count: Self.totalSlots)
+        biNext = ContiguousArray<Int32>(repeating: -1, count: Self.totalSlots)
+        uniKey = ContiguousArray<Int32>(repeating: -1, count: Self.totalSlots)
+        uniNext = ContiguousArray<Int32>(repeating: -1, count: Self.totalSlots)
     }
 
     public func reset() {
@@ -38,16 +38,62 @@ public final class QWTokenRecycler: @unchecked Sendable {
     }
 
     public func ingestSequence(_ tokens: ArraySlice<Int>, previousToken: Int? = nil) {
+        ingestCollection(tokens, previousToken: previousToken) { Int32(exactly: $0) }
+    }
+
+    /// Zero-allocation overload ingesting `Int64` history buffers directly.
+    public func ingestSequence(_ tokens: [Int64], previousToken: Int? = nil) {
+        ingestSequence(tokens[...], previousToken: previousToken)
+    }
+
+    /// Zero-allocation slice overload ingesting `Int64` history slices directly.
+    public func ingestSequence(_ tokens: ArraySlice<Int64>, previousToken: Int? = nil) {
+        ingestCollection(tokens, previousToken: previousToken) { Int32(exactly: $0) }
+    }
+
+    private func ingestCollection<C: Collection>(
+        _ tokens: C,
+        previousToken: Int?,
+        toToken32: (C.Element) -> Int32?
+    ) {
         guard let firstIdx = tokens.indices.first else { return }
-        var prevPrev = previousToken
-        var prev = tokens[firstIdx]
+        var prevPrev32: Int32 = -1
+        if let previousToken, let v = Int32(exactly: previousToken), v >= 0 {
+            prevPrev32 = v
+        }
+        var prev32: Int32 = -1
+        if let v = toToken32(tokens[firstIdx]), v >= 0 {
+            prev32 = v
+        }
         var idx = tokens.index(after: firstIdx)
-        while idx < tokens.endIndex {
-            let cur = tokens[idx]
-            recordTransition(previous: prevPrev, current: prev, next: cur)
-            prevPrev = prev
-            prev = cur
-            idx = tokens.index(after: idx)
+        guard idx < tokens.endIndex else { return }
+        biKey0.withUnsafeMutableBufferPointer { bk0 in
+            biKey1.withUnsafeMutableBufferPointer { bk1 in
+                biNext.withUnsafeMutableBufferPointer { bn in
+                    uniKey.withUnsafeMutableBufferPointer { uk in
+                        uniNext.withUnsafeMutableBufferPointer { un in
+                            while idx < tokens.endIndex {
+                                let cur32: Int32
+                                if let v = toToken32(tokens[idx]), v >= 0 {
+                                    cur32 = v
+                                } else {
+                                    cur32 = -1
+                                }
+                                if prev32 >= 0 && cur32 >= 0 {
+                                    Self.writeUnigram(key: prev32, next: cur32, uniKey: uk, uniNext: un)
+                                    if prevPrev32 >= 0 {
+                                        Self.writeBigram(k0: prevPrev32, k1: prev32, next: cur32,
+                                                         biKey0: bk0, biKey1: bk1, biNext: bn)
+                                    }
+                                }
+                                prevPrev32 = prev32
+                                prev32 = cur32
+                                idx = tokens.index(after: idx)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -73,6 +119,9 @@ public final class QWTokenRecycler: @unchecked Sendable {
         guard maxCount > drafts.count,
               let pending32 = Int32(exactly: pendingToken), pending32 >= 0 else { return 0 }
         let initialCount = drafts.count
+        if drafts.capacity < maxCount {
+            drafts.reserveCapacity(maxCount)
+        }
         var prev: Int?
         var cur: Int
         if drafts.isEmpty {
@@ -132,7 +181,34 @@ public final class QWTokenRecycler: @unchecked Sendable {
 
     @inline(__always)
     private func recordBigram(k0: Int32, k1: Int32, next: Int32) {
-        let slot0 = Self.hashBigram(k0, k1) * Self.ways
+        biKey0.withUnsafeMutableBufferPointer { bk0 in
+            biKey1.withUnsafeMutableBufferPointer { bk1 in
+                biNext.withUnsafeMutableBufferPointer { bn in
+                    Self.writeBigram(k0: k0, k1: k1, next: next, biKey0: bk0, biKey1: bk1, biNext: bn)
+                }
+            }
+        }
+    }
+
+    @inline(__always)
+    private func recordUnigram(key: Int32, next: Int32) {
+        uniKey.withUnsafeMutableBufferPointer { uk in
+            uniNext.withUnsafeMutableBufferPointer { un in
+                Self.writeUnigram(key: key, next: next, uniKey: uk, uniNext: un)
+            }
+        }
+    }
+
+    @inline(__always)
+    private static func writeBigram(
+        k0: Int32,
+        k1: Int32,
+        next: Int32,
+        biKey0: UnsafeMutableBufferPointer<Int32>,
+        biKey1: UnsafeMutableBufferPointer<Int32>,
+        biNext: UnsafeMutableBufferPointer<Int32>
+    ) {
+        let slot0 = hashBigram(k0, k1) * ways
         if biKey0[slot0] == k0 && biKey1[slot0] == k1 {
             biNext[slot0] = next
             return
@@ -147,8 +223,13 @@ public final class QWTokenRecycler: @unchecked Sendable {
     }
 
     @inline(__always)
-    private func recordUnigram(key: Int32, next: Int32) {
-        let slot0 = Self.hashUnigram(key) * Self.ways
+    private static func writeUnigram(
+        key: Int32,
+        next: Int32,
+        uniKey: UnsafeMutableBufferPointer<Int32>,
+        uniNext: UnsafeMutableBufferPointer<Int32>
+    ) {
+        let slot0 = hashUnigram(key) * ways
         if uniKey[slot0] == key {
             uniNext[slot0] = next
             return

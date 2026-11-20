@@ -71,7 +71,7 @@ final class FNMetalMultiBitUnpackTests: XCTestCase {
     /// `magnitude` is the sum of the absolute products — the natural scale of
     /// the dot, and the yardstick a relative tolerance must use.
     private func hostRow(bits: Int, group: Int, row: Int, k: Int,
-                         bank: Data, x: [Float], f32Activations: Bool) -> (value: Float, magnitude: Float) {
+                         bank: Data, x: [Float]) -> (value: Float, magnitude: Float) {
         let groups = k / group
         let bytesPerGroup = QWAQBlock.bytes(bits: bits, group: group)
         var acc = 0.0 as Float
@@ -79,7 +79,7 @@ final class FNMetalMultiBitUnpackTests: XCTestCase {
         for g in 0..<groups {
             let offset = (row * groups + g) * bytesPerGroup
             let slice = bank.subdata(in: offset..<(offset + bytesPerGroup))
-            let xs = (0..<group).map { f32Activations ? x[g * group + $0] : Float(Float16(x[g * group + $0])) }
+            let xs = (0..<group).map { Float(Float16(x[g * group + $0])) }
             acc += slice.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.dot(group: raw, bits: bits, group: group, x: xs) }
             var weights: [Float] = []
             slice.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in QWAQBlock.unpack(group: raw, bits: bits, group: group, into: &weights) }
@@ -89,7 +89,7 @@ final class FNMetalMultiBitUnpackTests: XCTestCase {
     }
 
     private func runFamily(bits: Int, group: Int, n: Int, k: Int,
-                            realistic: Bool, f32Activations: Bool) throws -> [Float] {
+                           realistic: Bool) throws -> [Float] {
         let bank = makeBank(bits: bits, group: group, n: n, k: k, realistic: realistic)
         let xs = makeActivations(k: k)
         let bytes = bank.count
@@ -102,39 +102,27 @@ final class FNMetalMultiBitUnpackTests: XCTestCase {
         arena.write(x32, from: xs)
         let x16 = try act.allocate(QWTensorShape([k], .f16))
         let y = try act.allocate(QWTensorShape([n], .f32))
-        if !f32Activations {
-            try step { enc in try QWGemm.encodeCast(enc, hal: Self.hal, x32: x32, y16: x16, count: k) }
-        }
+        try step { enc in try QWGemm.encodeCast(enc, hal: Self.hal, x32: x32, y16: x16, count: k) }
         try step { enc in
-            try QWGemmAQ.encode(enc, hal: Self.hal, blocks: w,
-                                x: f32Activations ? x32 : x16, y: y,
-                                n: n, k: k, bits: bits, group: group,
-                                f32Activations: f32Activations)
+            try QWGemmAQ.encode(enc, hal: Self.hal, blocks: w, x: x16, y: y, n: n, k: k, bits: bits, group: group)
         }
         return arena.read(y, as: Float.self, count: n)
     }
 
     func testTheFamilyMatchesTheHostReference() throws {
-        // The f32 twin computes in fp32, so it agrees with the host to fp32
-        // precision. The f16 twin rounds every weight to fp16, so it agrees
-        // to fp16 precision — one ulp of fp16 is 2^-11.
+        // The f16 twin rounds activations to fp16, so it agrees to fp16 precision (1e-3).
         for realistic in [false, true] {
             for (bits, group) in QWAQBlock.supported {
                 let n = 4, k = group * 2
                 let bank = makeBank(bits: bits, group: group, n: n, k: k, realistic: realistic)
                 let xs = makeActivations(k: k)
-                for f32Activations in [false, true] {
-                    let got = try runFamily(bits: bits, group: group, n: n, k: k,
-                                            realistic: realistic, f32Activations: f32Activations)
-                    let tolerance = f32Activations ? 1e-5 : 1e-3
-                    for r in 0..<n {
-                        let ref = hostRow(bits: bits, group: group, row: r, k: k,
-                                          bank: bank, x: xs, f32Activations: f32Activations)
-                        let scale = max(abs(Double(ref.value)), Double(ref.magnitude), 1e-6)
-                        let rel = abs(Double(got[r]) - Double(ref.value)) / scale
-                        XCTAssertLessThan(rel, tolerance,
-                                          "\(bits)-bit group \(group) row \(r) realistic \(realistic): got \(got[r]), want \(ref.value)")
-                    }
+                let got = try runFamily(bits: bits, group: group, n: n, k: k, realistic: realistic)
+                for r in 0..<n {
+                    let ref = hostRow(bits: bits, group: group, row: r, k: k, bank: bank, x: xs)
+                    let scale = max(abs(Double(ref.value)), Double(ref.magnitude), 1e-6)
+                    let rel = abs(Double(got[r]) - Double(ref.value)) / scale
+                    XCTAssertLessThan(rel, 1e-3,
+                                      "\(bits)-bit group \(group) row \(r) realistic \(realistic): got \(got[r]), want \(ref.value)")
                 }
             }
         }

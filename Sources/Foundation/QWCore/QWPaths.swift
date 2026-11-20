@@ -10,8 +10,6 @@ public enum QWPaths {
         rootDirectoryURL.appendingPathComponent("settings.json", isDirectory: false)
     }
 
-    public static var settingsFilePath: String { settingsFileURL.path }
-
     public static var modelsDirectoryURL: URL {
         rootDirectoryURL.appendingPathComponent("models", isDirectory: true)
     }

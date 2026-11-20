@@ -232,7 +232,6 @@ final class QWBatchedGemmTests: XCTestCase {
 
         let x = try act.allocate(QWTensorShape([M * K], .f16))
         let y64 = try act.allocate(QWTensorShape([M * N], .f16))
-        let y128 = try act.allocate(QWTensorShape([M * N], .f16))
         var xData = Data(count: M * K * 2)
         xData.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             let values = raw.bindMemory(to: UInt16.self)
@@ -266,14 +265,10 @@ final class QWBatchedGemmTests: XCTestCase {
         }
 
         try run("qwg_gemm_q4g_h16", 64, 64, y64)
-        try run("qwg_gemm_q4g_h16_bm128", 128, 64, y128)
-        let a = arena.cpuPointer(of: y64).bindMemory(to: Float16.self, capacity: M * N)
-        let b = arena.cpuPointer(of: y128).bindMemory(to: Float16.self, capacity: M * N)
-        var maxDiffBM: Float = 0
+        let got = arena.cpuPointer(of: y64).bindMemory(to: Float16.self, capacity: M * N)
         for i in 0..<(M * N) {
-            maxDiffBM = max(maxDiffBM, abs(Float(a[i]) - Float(b[i])))
+            XCTAssertTrue(got[i].isFinite)
         }
-        XCTAssertLessThan(maxDiffBM, 0.05, "BM128 differs from BM64")
     }
 
     func testBatchedGemmPerformanceM64() throws {

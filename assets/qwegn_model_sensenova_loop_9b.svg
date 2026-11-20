@@ -41,7 +41,7 @@
   <g transform="translate(28, 24)">
     <rect x="0.0" y="0.0" width="266" height="28" rx="14.0" fill="#062e22" stroke="#10b981" stroke-width="1.2"/>
     <circle cx="15.0" cy="14.0" r="4.5" fill="#34d399"/>
-    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">QWEGN v0.27.0 · MODEL PROFILE</text>
+    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">QWEGN v0.28.0 · MODEL PROFILE</text>
     <rect x="276.0" y="0.0" width="420" height="28" rx="14.0" fill="#064e3b" stroke="#10b981" stroke-width="1.2"/>
     <text x="486.0" y="18.6" text-anchor="middle" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">NEEDLE RECALL: 3/3 @ 16K–64K · 524K YaRN / 1M</text>
     <text x="0" y="64" fill="#f8fafc" class="title" font-size="27">SenseNova-Loop-9B (HQ4_G32 + LSA)</text>
@@ -75,8 +75,8 @@
     <text x="112.0" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#e9d5ff" letter-spacing="0.2">LATENCY &amp; 4-STREAM</text>
     <text x="18" y="90" fill="url(#purpleGrad)" class="title mono" font-size="44">153.0</text>
     <text x="164.5" y="88" fill="#c084fc" class="title mono" font-size="17">tok/s</text>
-    <text x="18" y="120" fill="#f8fafc" class="title" font-size="14.5">4-Stream HTTP · 18 ms Warm TTFT</text>
-    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13">Cold 108 ms · Warm 18 ms (46.1× cache)</text>
+    <text x="18" y="120" fill="#f8fafc" class="title" font-size="14.5">4-Stream HTTP · 9 ms Warm TTFT</text>
+    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13">Cold 98 ms · Warm 9 ms (86.1× cache)</text>
     <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13">4-way mHC + short-ctx LSA batching</text>
     <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
     <text x="18" y="218" fill="#c084fc" class="mono" font-size="12.5">4.87 GiB srv (--no-load-vision)</text>
@@ -111,11 +111,11 @@
     <rect width="904" height="214" rx="16" fill="url(#cardGrad)" stroke="#1f3b3d" stroke-width="1.4"/>
     <rect x="22.0" y="16.0" width="286" height="26" rx="13.0" fill="#17253b" stroke="#38bdf8" stroke-width="1.2"/>
     <text x="165.0" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#7dd3fc" letter-spacing="0.3">QUALIFICATION &amp; BENCHMARK FIDELITY</text>
-    <text x="22" y="68" fill="#f8fafc" class="title" font-size="18">211/211 API Conformance · 92% HumanEval · 98.89% Logit Fidelity</text>
-    <text x="22" y="98" fill="#34d399" class="mono" font-size="14.5">• Eval Scores  : 36/50 Code-50 (23/25 HE) · 10/12 Core-12 think · 80.6% cap</text>
-    <text x="22" y="122" fill="#34d399" class="mono" font-size="14.5">• Parity/Needle: 98.89% fid (0.0236 nats KLD vs BF16) · 3/3 needle 16K–64K</text>
+    <text x="22" y="68" fill="#f8fafc" class="title" font-size="18">291/291 API Conf · 100% Cap &amp; Fidelity · 61/100 Code-100</text>
+    <text x="22" y="98" fill="#34d399" class="mono" font-size="14.5">• Eval Scores  : 61/100 Code-100 (36/50 HE, 25/50 MBPP) · 100% Cap · 65/88 Ag</text>
+    <text x="22" y="122" fill="#34d399" class="mono" font-size="14.5">• Fidelity/VLM : 100% Fidelity · 0.81 s Metal ViT (997 MiB) · 3/3 needle 16K–64K</text>
     <text x="22" y="146" fill="#c084fc" class="mono" font-size="14.5">• Looped State : 14 independent KV + SHVQ4 .qlsa (1,539 KiB) across 2 loops</text>
-    <text x="22" y="170" fill="#fbbf24" class="mono" font-size="14.5">• Memory UMA   : 7.38 GiB pack (4.66 GiB GPU weights · 4.87 GiB text · 6.58 VLM)</text>
+    <text x="22" y="170" fill="#fbbf24" class="mono" font-size="14.5">• Memory UMA   : 7.38 GiB pack (4.66 GiB GPU weights · 4.87 GiB text · 0 B ViT idle)</text>
     <text x="22" y="194" fill="#38bdf8" class="mono" font-size="14.5">• Steady Allocs: 0 heap / 0 Metal buffer allocations · 3.02× 4-stream HTTP</text>
   </g>
 
@@ -125,6 +125,6 @@
     <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
     <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
     <text x="122" y="27" class="mono" font-size="11.5" font-weight="700" fill="#e2e8f0">Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
-    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.27.0 · q4 KV · Zero External Runtimes · Temp 0 · 0 Steady Allocs</text>
+    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26.2+ · Qwegn v0.28.0 · q4 KV · Zero External Runtimes · Temp 0 · 0 Steady Allocs</text>
   </g>
 </svg>

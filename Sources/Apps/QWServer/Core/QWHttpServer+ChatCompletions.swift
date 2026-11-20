@@ -10,10 +10,9 @@ import QWVision
 extension QWHttpServer {
 
     func handleChatCompletions(connection: NWConnection, headers: [String: String] = [:], body: Data) async throws {
-        let decoder = JSONDecoder()
         let req: ChatCompletionRequest
         do {
-            var parsedReq = try decoder.decode(ChatCompletionRequest.self, from: body)
+            var parsedReq = try QWServerRequestDecoder.decode(ChatCompletionRequest.self, from: body)
             parsedReq.httpHeaders = headers
             req = parsedReq
         } catch {

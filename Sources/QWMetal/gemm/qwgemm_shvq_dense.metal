@@ -126,27 +126,6 @@ static inline void qwg_gemv_shvq_dx_body(device const char* blocks,
             if (lane == 0u) y[row] = v;                                                 \
         }                                                                               \
     }                                                                                   \
-    kernel void qwg_gemv_shvq##BITS##_g##GROUP##_v4_f32(                                \
-        device const char*  blocks [[buffer(0)]],                                       \
-        device const float* x      [[buffer(1)]],                                       \
-        device float*       y      [[buffer(3)]],                                       \
-        constant uint&      N      [[buffer(4)]],                                       \
-        constant uint&      K      [[buffer(5)]],                                       \
-        uint tg   [[threadgroup_position_in_grid]],                                     \
-        uint ti   [[thread_index_in_threadgroup]],                                      \
-        uint tptg [[threads_per_threadgroup]]) {                                        \
-        threadgroup ShvqTgLut<BITS> tgLut;                                              \
-        if constexpr (BITS <= 3) {                                                      \
-            tgLut.load(ti, tptg);                                                       \
-            threadgroup_barrier(mem_flags::mem_threadgroup);                            \
-        }                                                                               \
-        const uint simdId = ti >> 5u;                                                   \
-        const uint lane = ti & 31u;                                                     \
-        const uint row = tg * max(1u, tptg >> 5u) + simdId;                             \
-        if (row >= N) return;                                                           \
-        const float v = qwg_gemv_shvq_row_f32_tg<BITS, GROUP>(blocks, x, row, K, lane, tgLut); \
-        if (lane == 0u) y[row] = v;                                                     \
-    }                                                                                   \
     kernel void qwg_head_gemv_shvq##BITS##_g##GROUP##_argmax(                           \
         device const char* blocks [[buffer(0)]],                                        \
         device const half* x      [[buffer(1)]],                                        \

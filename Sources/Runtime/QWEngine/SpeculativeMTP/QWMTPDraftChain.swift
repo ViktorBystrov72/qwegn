@@ -97,7 +97,7 @@ enum QWMTPDraftChain {
             if !useDeviceEmbedding {
                 try embedding(token, draft.scratch.embedding)
             }
-            guard let cb = hal.queue.makeCommandBuffer(),
+            guard let cb = hal.makeUnretainedCommandBuffer(),
                   var enc = cb.makeComputeCommandEncoder() else {
                 throw QWEngineDriverError.state("draft chain command encoder")
             }
@@ -238,7 +238,7 @@ enum QWMTPDraftChain {
         let selector = draft.scratch.greedySelector
         selector.token.region.pointer.advanced(by: selector.token.offset)
             .assumingMemoryBound(to: Int32.self).pointee = Int32(pendingToken)
-        guard let cb = hal.queue.makeCommandBuffer(), var enc = cb.makeComputeCommandEncoder() else {
+        guard let cb = hal.makeUnretainedCommandBuffer(), var enc = cb.makeComputeCommandEncoder() else {
             throw QWEngineDriverError.state("device draft chain encoder")
         }
         hal.touchKeepAlive(enc)
@@ -306,28 +306,15 @@ enum QWMTPDraftChain {
         kv: (k: QWKVLayerView, v: QWKVLayerView), pendingToken: Int,
         drafts: Int, position: Int, cacheRows: Int,
         table: QWMTPEmbeddingTable, journalTokenOffset: Int = 0
-    ) throws -> any MTLCommandBuffer {
+    ) throws -> [any MTLCommandBuffer] {
         let cbs = try runDeviceChain(
             hal: hal, draft: draft, headStorage: headStorage, draftHead: draftHead,
             hidden: hidden, kv: kv, pendingToken: pendingToken, drafts: drafts,
             position: position, cacheRows: cacheRows, table: table,
             journalTokenOffset: journalTokenOffset)
-        if cbs.count > 1 {
-            for earlier in cbs.dropLast() {
-                earlier.waitUntilCompleted()
-                if let err = earlier.error {
-                    if let d = draft.driver { d.commandBufferErrors += 1 }
-                    throw QWEngineDriverError.state("device draft chain cb failure: \(err.localizedDescription)")
-                }
-                if earlier.status != .completed {
-                    if let d = draft.driver { d.commandBufferErrors += 1 }
-                    throw QWEngineDriverError.state("device draft chain cb completion failed (status=\(earlier.status.rawValue))")
-                }
-            }
-        }
-        guard let finalCB = cbs.last else {
+        guard !cbs.isEmpty else {
             throw QWEngineDriverError.state("device draft chain produced no command buffer")
         }
-        return finalCB
+        return cbs
     }
 }

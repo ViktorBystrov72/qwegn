@@ -229,8 +229,8 @@ public final class FNGPUPrefillStack {
             let isLastChunk = (chunkEnd >= slots.count)
             let waitsForPLE = pleWait.map { chunkStart <= $0.layer && $0.layer < max(chunkEnd, chunkStart + 1) } ?? false
             let begun = waitsForPLE
-                ? ctx.hal.begin(.concurrent, waitingFor: pleWait!.event, value: pleWait!.value)
-                : ctx.hal.begin(.concurrent)
+                ? ctx.hal.beginUnretained(.concurrent, waitingFor: pleWait!.event, value: pleWait!.value)
+                : ctx.hal.beginUnretained(.concurrent)
             guard let pair = begun else {
                 throw NSError(domain: "FNGPUPrefillStack", code: 1, userInfo: [NSLocalizedDescriptionKey: "no command buffer"])
             }
@@ -242,8 +242,8 @@ public final class FNGPUPrefillStack {
                 case .host(let streamIn):
                     arena.write(streamA, from: streamIn)
                 case .gathered(let embedTable):
-                    let tokIds = (startPos..<(startPos + rows)).map { Int32(history[$0]) }
-                    arena.write(tokensBuf, from: tokIds)
+                    let tokPtr = arena.cpuPointer(of: tokensBuf).assumingMemoryBound(to: Int32.self)
+                    for i in 0..<rows { tokPtr[i] = Int32(history[startPos + i]) }
                     try embedTable.gather(enc: enc, hal: ctx.hal, token: tokensBuf,
                                           out: streamA, rows: rows, hc: embedTable.hc)
                 }
@@ -299,10 +299,7 @@ public final class FNGPUPrefillStack {
                     }
                 }
                 if let mtp, let lastSlot = slots.last {
-                    let nextToks = (0..<rows).map { i -> Int32 in
-                        (startPos + i + 1 < history.count) ? Int32(history[startPos + i + 1]) : 0
-                    }
-                    mtp.writeTokens(nextToks)
+                    mtp.writeTokensFromHistory(history, startPos: startPos, rows: rows)
                     if startPos + rows >= history.count {
                         let lastTokSlice = mtp.tokensBuf.slice(byteOffset: (rows - 1) * 4, count: 1, dtype: .i32)
                         try QWGemm.encodeArgmaxFin(enc, hal: ctx.hal, keysHi: head.keysHi, keysLo: head.keysLo,

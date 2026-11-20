@@ -249,11 +249,25 @@ public final class FNGPUMTP: @unchecked Sendable {
     }
 
     public func readChain(count: Int) -> [Int] {
-        arena.read(chainTokens, as: Int32.self, count: count).map(Int.init)
+        guard count > 0 else { return [] }
+        let ptr = arena.cpuPointer(of: chainTokens).assumingMemoryBound(to: Int32.self)
+        var out: [Int] = []
+        out.reserveCapacity(count)
+        for i in 0..<count { out.append(Int(ptr[i])) }
+        return out
     }
 
-    public func writeTokens(_ nextTokens: [Int32]) {
-        arena.write(tokensBuf, from: nextTokens)
+    public func writeToken(_ token: Int32) {
+        arena.cpuPointer(of: tokensBuf).assumingMemoryBound(to: Int32.self).pointee = token
+    }
+
+    public func writeTokensFromHistory(_ history: [Int64], startPos: Int, rows: Int) {
+        let ptr = arena.cpuPointer(of: tokensBuf).assumingMemoryBound(to: Int32.self)
+        let limit = history.count
+        for i in 0..<rows {
+            let nextIdx = startPos + i + 1
+            ptr[i] = (nextIdx < limit) ? Int32(history[nextIdx]) : 0
+        }
     }
 
     /// Runs MTP over a prefill chunk of `nextTokens.count` rows starting at `startPos`, reusing `prefillScratch`
@@ -269,7 +283,7 @@ public final class FNGPUMTP: @unchecked Sendable {
         let T = nextTokens.count
         precondition(T >= 1 && prefillScratch.T == T)
         arena.write(tokensBuf, from: nextTokens)
-        guard let pair = ctx.hal.begin(.concurrent) else {
+        guard let pair = ctx.hal.beginUnretained(.concurrent) else {
             throw NSError(domain: "FNGPUMTP", code: 1, userInfo: [NSLocalizedDescriptionKey: "no command buffer"])
         }
         let cb = pair.0

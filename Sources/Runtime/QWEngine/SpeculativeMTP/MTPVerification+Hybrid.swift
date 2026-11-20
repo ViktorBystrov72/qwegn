@@ -66,6 +66,120 @@ extension QWEngineDriver {
             acceptRate: acceptRate, maxDrafts: count)
     }
 
+    private func selectDFlashPLDCandidates(
+        session: QWEngineSession,
+        pending: Int,
+        count: Int,
+        resolvedStrategy: QWDraftStrategy
+    ) -> [Int] {
+        let ctx = pendingHistoryContext(session: session, pending: pending)
+        let minPldTokens = resolvedStrategy == .ngram ? min(4, count) : min(7, count)
+        var cand: [Int] = []
+        if let pld = QWContextCopyDrafter.periodicDrafts(
+            history: session.tokenHistory, extraToken: ctx.extraPending,
+            maxCount: count, minRepeats: 3),
+           pld.count >= minPldTokens {
+            cand = Array(pld.prefix(count))
+        } else if let match = QWContextCopyDrafter.drafts(
+            history: session.tokenHistory, extraToken: ctx.extraPending,
+            maxCount: count, minMatchLen: 6),
+            !match.tokens.isEmpty {
+            var extended = Array(match.tokens.prefix(count))
+            if extended.count < count {
+                session.tokenRecycler.appendDrafts(
+                    into: &extended, maxCount: count,
+                    previousToken: ctx.previousToken, pendingToken: pending,
+                    maxUnigramFallbacks: 0)
+            }
+            if extended.count >= minPldTokens {
+                cand = extended
+            }
+        }
+        if cand.count > 7 && cand.count < 12 {
+            cand = Array(cand.prefix(7))
+        }
+        return cand
+    }
+
+    private func encodeDFlashHeadLogits(
+        _ enc: any MTLComputeCommandEncoder,
+        xRot16: QWTensorValue,
+        xNorm16: QWTensorValue,
+        yLogits32: QWTensorValue,
+        rows: Int,
+        vocabRows: Int
+    ) throws {
+        if let draftHead = mtpDraftHead {
+            if rows == 1 {
+                try draftHead.encode(enc, hal: hal, x: xRot16, y: yLogits32)
+            } else {
+                try draftHead.encodeBatched(enc, hal: hal, x: xRot16, y: yLogits32, m: rows)
+            }
+            return
+        }
+        switch headStorage {
+        case .q4g(let hw):
+            if hal.caps.isMetal4TensorCapable && rows >= 9
+                && vocabRows % 64 == 0 && hw.view.k % 64 == 0 {
+                try QWGemm.encodeNaxF32(
+                    enc, hal: hal, weight: hw.view,
+                    x16: xRot16, y16: xRot16, y32: yLogits32, rows: rows
+                )
+            } else {
+                try head.encode(enc, storage: headStorage, x: xRot16, y: yLogits32, M: rows)
+            }
+        case .f16:
+            try head.encode(enc, storage: headStorage, x: xNorm16, y: yLogits32, M: rows)
+        }
+    }
+
+    func prepareAsyncDFlashOrPLDRound(
+        session: QWEngineSession,
+        dflashDrafter: QWDFlashDrafter,
+        dSlot: QWDFlashSessionSlot,
+        pending: Int,
+        count: Int,
+        table: QWMTPEmbeddingTable
+    ) throws -> AsyncNeuralDraftPlan {
+        let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
+        if resolvedStrategy != .mtp {
+            let cand = selectDFlashPLDCandidates(
+                session: session, pending: pending, count: count, resolvedStrategy: resolvedStrategy)
+            if !cand.isEmpty {
+                session.dflashRoundStartNs = nil
+                return .pld(cand)
+            }
+        }
+        let canAdapt = resolvedStrategy != .mtp
+        let activeCount = canAdapt ? session.dflashPolicy.selectDraftCount(maxDrafts: count) : count
+        session.dflashRoundStartNs = canAdapt ? DispatchTime.now().uptimeNanoseconds : nil
+        let ids = table.tokens.contents().assumingMemoryBound(to: Int32.self)
+        ids[0] = Int32(pending)
+        let draftCB: any MTLCommandBuffer
+        do {
+            draftCB = try dflashDrafter.enqueueGreedyPropose(
+                hal: hal, slot: dSlot, cacheOffset: session.dflashCacheOffset,
+                pendingToken: pending, draftCount: activeCount,
+                headStorage: headStorage,
+                encodeHeadLogits: { enc, xRot16, xNorm16, _, yLogits32, rows, vocabRows in
+                    try self.encodeDFlashHeadLogits(
+                        enc, xRot16: xRot16, xNorm16: xNorm16,
+                        yLogits32: yLogits32, rows: rows, vocabRows: vocabRows)
+                },
+                encodeAnchorMaskEmbed: { enc, propX32, anchorToken, maskToken, rows in
+                    dflashDrafter.encodeStagePropBF16(
+                        enc, tableBuffer: table.buffer, byteOffset: table.byteOffset,
+                        propX: propX32, anchorToken: anchorToken, maskToken: maskToken, rows: rows)
+                },
+                journalBuffer: table.tokens,
+                journalByteOffset: 4)
+        } catch {
+            admission.commandBufferErrors += 1
+            throw error
+        }
+        return .asyncNeural(draftCBs: [draftCB], draftedPairs: activeCount)
+    }
+
     func proposeDFlashOrPLDRound(
         session: QWEngineSession,
         dflashDrafter: QWDFlashDrafter,
@@ -81,32 +195,8 @@ extension QWEngineDriver {
             && !mtpStageProfiling && resolvedStrategy != .mtp)
         let canAdapt = (!mtpStageProfiling && resolvedStrategy != .mtp)
         if canUsePLD {
-            let ctx = pendingHistoryContext(session: session, pending: pending)
-            let minPldTokens = resolvedStrategy == .ngram ? min(4, count) : min(7, count)
-            var cand: [Int] = []
-            if let pld = QWContextCopyDrafter.periodicDrafts(
-                history: session.tokenHistory, extraToken: ctx.extraPending,
-                maxCount: count, minRepeats: 3),
-               pld.count >= minPldTokens {
-                cand = Array(pld.prefix(count))
-            } else if let match = QWContextCopyDrafter.drafts(
-                history: session.tokenHistory, extraToken: ctx.extraPending,
-                maxCount: count, minMatchLen: 6),
-                !match.tokens.isEmpty {
-                var extended = Array(match.tokens.prefix(count))
-                if extended.count < count {
-                    session.tokenRecycler.appendDrafts(
-                        into: &extended, maxCount: count,
-                        previousToken: ctx.previousToken, pendingToken: pending,
-                        maxUnigramFallbacks: 0)
-                }
-                if extended.count >= minPldTokens {
-                    cand = extended
-                }
-            }
-            if cand.count > 7 && cand.count < 12 {
-                cand = Array(cand.prefix(7))
-            }
+            let cand = selectDFlashPLDCandidates(
+                session: session, pending: pending, count: count, resolvedStrategy: resolvedStrategy)
             if !cand.isEmpty {
                 lastRoundUsedPLD = true
                 mtpDraftProposals += cand.count
@@ -135,28 +225,9 @@ extension QWEngineDriver {
                 pendingToken: pending, draftCount: activeCount,
                 headStorage: headStorage,
                 encodeHeadLogits: { enc, xRot16, xNorm16, _, yLogits32, rows, vocabRows in
-                    if let draftHead = self.mtpDraftHead {
-                        if rows == 1 {
-                            try draftHead.encode(enc, hal: self.hal, x: xRot16, y: yLogits32)
-                        } else {
-                            try draftHead.encodeBatched(enc, hal: self.hal, x: xRot16, y: yLogits32, m: rows)
-                        }
-                    } else {
-                        switch self.headStorage {
-                        case .q4g(let hw):
-                            if self.hal.caps.isMetal4TensorCapable && rows >= 9
-                                && vocabRows % 64 == 0 && hw.view.k % 64 == 0 {
-                                try QWGemm.encodeNaxF32(
-                                    enc, hal: self.hal, weight: hw.view,
-                                    x16: xRot16, y16: xRot16, y32: yLogits32, rows: rows
-                                )
-                            } else {
-                                try self.head.encode(enc, storage: self.headStorage, x: xRot16, y: yLogits32, M: rows)
-                            }
-                        case .f16:
-                            try self.head.encode(enc, storage: self.headStorage, x: xNorm16, y: yLogits32, M: rows)
-                        }
-                    }
+                    try self.encodeDFlashHeadLogits(
+                        enc, xRot16: xRot16, xNorm16: xNorm16,
+                        yLogits32: yLogits32, rows: rows, vocabRows: vocabRows)
                 },
                 encodeAnchorMaskEmbed: anchorMaskEmbed,
                 embedding: { try self.copyEmbedRow($0, to: $1) },

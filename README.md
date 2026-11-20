@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2">
   <img src="https://img.shields.io/badge/platform-macOS%2026%20(Apple%20Silicon)-lightgrey.svg" alt="macOS 26, Apple Silicon">
   <a href="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml"><img src="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.27.4-green.svg" alt="Release v0.27.4"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.28.0-green.svg" alt="Release v0.28.0"></a>
 </p>
 
 **Qwegn** (`qwg`) is a from-scratch LLM/VLM inference engine for Apple Silicon,
@@ -63,20 +63,20 @@ Pre-quantized official Qwegn model packs are hosted under [`huggingface.co/qwegn
 - **Model-agnostic runtime** — hybrid, looped and MoE architectures driven by the model descriptor (`QWModelDescriptor`), never by model name. [Supported models](#supported-models)
 - **321B MoE on 128 GB Mac (100% UMA Resident SHVQ or NVMe-Streamed)** — `GLM-5.3-Flash` (`321B` total / `18B` active) runs **100% resident in unified memory** at `100.6 GiB` (`SHVQ4_G32 + SHVQ2_G64 + SHVQ3_G64`, **`1,014 tok/s` @4K / `1,006` @5.2K prefill (`825–869` serve), `46.0–46.4 tok/s` decode / `50.7–53.6 tok/s` NextN speculative**, **`743 / 45.0 tok/s` @242.5K `e-means`**, **`81/100` HumanEval+MBPP (`92%` HE), `184/184` API conformance, `37/37` capability, `99.74%` fidelity**, `0` SSD misses, `0` swap) or cold-expert streamed from NVMe on packs exceeding RAM (`134.4 GiB`, `31.6–34.8 tok/s`). [Cold-expert streaming & SHVQ](docs/tuning.md#cold-expert-streaming)
 - **1M-token context (LSA `Ward-512` & Capacity-Balanced `e-means-4096`)** — **2,317 tok/s prefill / 105.6 tok/s decode at 1M** (`Qwen3.6-35B-A3B`, `13.88×` vs dense @524K), **1,888 tok/s prefill / 63.7 tok/s decode at 1M** (`Qwen3.8-Flash-Next` `+55.3%` `e-means`), **743 tok/s prefill / 45.0 tok/s decode at 242.5K** (`GLM-5.3-Flash` `321B` `e-means`), **3/3 needle recall** across every model, training-free. [LSA manual](docs/lsa.md)
-- **Speculative decoding & mixed quantization** — MTP / Variational / DSpine (`B=2..16`, up to `4.19×` / `12.7 tok/round`) / DFlash 2 / MoE-Spec across 20 Hadamard `HQ*` & affine `AQ*` formats, 20 Spherical `SHVQ{1,15,2,3,4}` e-means VQ formats, and `QNGRAM v3 VQ2_G32` / `VQ4_G32` PLE tables (`50.9 → 27.1 → 15.1 GiB`, up to `-70.4%`). [Quantization guide](docs/quantization.md)
+- **Speculative decoding, Native Metal ViT & mixed quantization** — MTP / Variational / DSpine (`B=2..16`, up to `4.19×` / `12.7 tok/round`) / DFlash 2 / MoE-Spec across 20 Hadamard `HQ*` & affine `AQ*` formats, 20 Spherical `SHVQ{1,15,2,3,4}` e-means VQ formats, `QNGRAM v3 VQ2_G32` / `VQ4_G32` PLE tables (`50.9 → 27.1 → 15.1 GiB`, up to `-70.4%`), Native Metal FP16 ViT + FlashAttention (`807.8 ms` `4.09×` encode in `950.6 MiB`), and `1.66×–1.90×` zero-alloc pure-ASCII/BPE tokenization. [Quantization guide](docs/quantization.md)
 
 ## Benchmarks (headline)
 
 | Model | Prefill (peak) | Decode (spec) | Long-ctx / 1M prefill / decode (LSA · `e-means`) | Repo `.qwcache` / Warm Cache TTFT |
 | :--- | :---: | :---: | :---: | :---: |
-| Qwen3.6-35B-A3B (`HQ4_G32`) | **6,462 tok/s** (`6,316` @6.5K · `6,142` @64K) | **382.8 tok/s** (`324.3` CLI `d=5` · `182.0` srv) | **2,317 / 105.6 tok/s** @1M (`143.7` @64K) | **0.12 s** `.qwcache` (`54.4×` vs 6.53 s) |
-| Apex-35B-V1.0 (`HQ4_G32`, 22.2 GiB) | **6,416 tok/s** (`6,262` @16K · `5,810` srv) | **213.8 tok/s** (`178.0` srv · `174.9` CLI · `148.5` ser) | **5,491 / 100.9 tok/s** @1M (`155.4` @64K `e-means` · `3/3`) | **28 ms** warm cache (`11.5×`) |
-| Maxwell-V1-Flash (`HQ8 + SHVQ3/4` 17.2 GiB) | **5,324 tok/s** (`4,664` @5.4K · `1,620` @64K) | **210.5 tok/s** (`118.1` CLI SQL · `102.3` srv · `100.4` ser) | **1,620 / 20.8 tok/s** @64K (`3/3` needle · `19.3 GiB` `q4`) | **15 ms** warm cache (`25.8×`) |
-| Qwen3.8-Flash-Next (`HQ8+HQ4` + `VQ2` PLE + `DFlash2-shvq4g32`) | **3,035 tok/s** (`2,947` @4K) | **177.2 tok/s** (`DFlash2` spec · `111.8` srv · `89.4` CLI · `83/100` code) | **1,888 / 63.7 tok/s** @1M (`e-means` · `1,350 / 41.1` QSA) | **0.12–0.24 s** `.qwcache` (`74.3×` vs 17.84 s) |
+| Qwen3.6-35B-A3B (`HQ4_G32`) | **6,462 tok/s** (`6,316` @6.5K · `6,142` @64K) | **382.8 tok/s** (`324.3` CLI `d=5` · `182.0` srv · `81/100` code) | **2,317 / 105.6 tok/s** @1M (`143.7` @64K) | **0.12 s** `.qwcache` (`54.4×` vs 6.53 s) · **8 ms** warm (`37.3×`) |
+| Apex-35B-V1.0 (`HQ4_G32`, 22.2 GiB) | **6,416 tok/s** (`6,262` @16K · `5,810` srv) | **261.1 tok/s** spec (`178.0` srv · `174.9` CLI · `148.5` ser) | **5,491 / 100.9 tok/s** @1M (`155.4` @64K `e-means` · `3/3`) | **17–28 ms** warm cache (`11.5×–19.2×`) |
+| Maxwell-V1-Flash (`HQ8 + SHVQ3/4` 17.2 GiB) | **5,324 tok/s** (`4,664` @5.4K · `1,620` @64K) | **210.5 tok/s** (`118.1` CLI SQL · `104.0` srv · `100.4` ser) | **1,620 / 20.8 tok/s** @64K (`3/3` needle · `19.3 GiB` `q4`) | **7–15 ms** warm cache (`25.8×–47.3×`) |
+| Qwen3.8-Flash-Next (`HQ8+HQ4` + `VQ2` PLE + `DFlash2-shvq4g32`) | **3,035 tok/s** (`2,947` @4K) | **177.2 tok/s** (`DFlash2` spec · `111.8` srv · `89.4` CLI · `83/100` code) | **1,888 / 63.7 tok/s** @1M (`e-means` · `1,350 / 41.1` QSA) | **0.12–0.24 s** `.qwcache` (`74.3×` vs 17.84 s) · **11 ms** warm (`60.3×`) |
 | Edge0-145B (`145B`, `HQ8+HQ4` + `VQ2` PLE 83.1 GiB) | **2,568–2,572 tok/s** | **135.6 tok/s** spec (`69.2` CLI `d=1` · `68.5` srv) | **1,886 tok/s** @300K (`3/3` · 1M `69.7 GiB` `q4` / `103.0 GiB` `q8` UMA) | **8 ms** warm cache (`119.8×`) |
-| SenseNova-Loop-9B (`HQ4_G32`, 7.4 GiB) | **2,045 tok/s** (`1,944` @16K · `1,763` @64K) | **165.7 tok/s** (`98.1` CLI code · `153.0` 4-srv · `58.4` srv) | **49.3 / 49.4 tok/s** dec @524K YaRN / @1M (`3/3` @16K–64K · `14.3 / 22.4 GiB`) | **18 ms** warm cache (`46.1×`) |
-| Qwen3.8-27B (+ `DSpine-b16`) | 1,043 tok/s (`914` @64K) | **148.0 tok/s** (`144.1` srv · `4.19×`) | **831 / 36.5 tok/s** @1M (`e-means` / `Ward`) | 6–29 ms warm cache (`2.33M` tok/s @65.5K) |
-| GLM-5.3-Flash (`321B`, `SHVQ4/2/3` 100.6 GiB) | **1,014 tok/s** (`1,006` @5.2K · `869` serve) | **54.7 tok/s** NextN (`51.4` CLI · `50.8` srv · `81/100` code) | **743 / 45.0 tok/s** @242.5K (`e-means`) · 1M UMA | **10–18 ms** warm cache (`96–193×`) |
+| SenseNova-Loop-9B (`HQ4_G32`, 7.4 GiB) | **2,045 tok/s** (`1,944` @16K · `1,763` @64K) | **165.7 tok/s** (`98.1` CLI code · `153.0` 4-srv · `58.4` srv) | **49.3 / 49.4 tok/s** dec @524K YaRN / @1M (`3/3` @16K–64K · `14.3 / 22.4 GiB`) | **9–18 ms** warm cache (`46.1×–86.1×`) · **0.81 s** Metal ViT (`4.09×`) |
+| Qwen3.8-27B (+ `DSpine-b16` / `DFlash2`) | 1,043 tok/s (`914` @64K) | **148.0 tok/s** (`144.1` srv · `4.19×` · `75/100` code) | **831 / 36.5 tok/s** @1M (`e-means` / `Ward`) | **11–12 ms** warm cache (`157×–173×`) · **0.81 s** Metal ViT (`4.12×`) |
+| GLM-5.3-Flash (`321B`, `SHVQ4/2/3` 100.6 GiB) | **1,014 tok/s** (`1,006` @5.2K · `869` serve) | **54.7 tok/s** NextN (`51.4` CLI · `50.8` srv · `80/100` code) | **743 / 45.0 tok/s** @242.5K (`e-means`) · 1M UMA | **10–18 ms** warm cache (`96–193×`) |
 | ERNIE-5.5-Flash-Base (`280B`, `HQ8+SHVQ15/3` 81.6 GiB) | **1,137 tok/s** (`1,015` serve · `909` @16K) | **52.7 tok/s** srv (`45.6` CLI ECHO `d=1` · `64.2` `d=5` code) | **303 / 16.3 tok/s** @300K (`e-means`) · 1M `87.6 GiB` UMA | **0.29 s** `.qwcache` (`78.6×` vs 22.79 s) |
 
 <p align="center">
@@ -92,7 +92,7 @@ Full tables, paired A/B repository memory benchmarks, and thermal protocol: [doc
   <img src="assets/qwegn_model_glm53_flash.svg" alt="GLM-5.3-Flash" width="100%">
 </p>
 
-**GLM-5.3-Flash** · 45L MoE (`321B` total / `18B` active, 288 experts, 8 + 1 active), 11 NoPE MLA (512D latent KV + Key-Pool(4)) + 34 KDA, 4-stream Sinkhorn mHC, NextN MTP, vision (`SHVQ4_G32 + SHVQ2_G64 + SHVQ3_G64`, `100.6 GiB` 100% resident on 128 GB Mac — `1,014 tok/s` `@4K` / `1,006` `@5.2K` prefill, `46.0–54.7 tok/s` decode, `81/100` HumanEval+MBPP)
+**GLM-5.3-Flash** · 45L MoE (`321B` total / `18B` active, 288 experts, 8 + 1 active), 11 NoPE MLA (512D latent KV + Key-Pool(4)) + 34 KDA, 4-stream Sinkhorn mHC, NextN MTP, vision (`SHVQ4_G32 + SHVQ2_G64 + SHVQ3_G64`, `100.6 GiB` 100% resident on 128 GB Mac — `1,014 tok/s` `@4K` / `1,006` `@5.2K` prefill, `46.0–54.7 tok/s` decode, **`292/292` API / `100%` cap & fid / `80/100` `Code-100` (`92%` HE)**)
 
 <p align="center">
   <img src="assets/qwegn_model_ernie55_flash.svg" alt="ERNIE-5.5-Flash-Base" width="100%">
@@ -104,25 +104,25 @@ Full tables, paired A/B repository memory benchmarks, and thermal protocol: [doc
   <img src="assets/qwegn_model_qwen36_35b_a3b.svg" alt="Qwen3.6-35B-A3B" width="100%">
 </p>
 
-**Qwen3.6-35B-A3B** · 40L MoE (256 experts, 8 + 1 active), 10 QSA + 30 GDN, async MoE MTP (`6,462` `@2K` / `6,316` `@6.5K` prefill, **`382.8 tok/s`** serve spec / `324.3` CLI `d=5` / `182.0` serve, `82%` `Code-50`, `83.3%` `Core-30`), vision
+**Qwen3.6-35B-A3B** · 40L MoE (256 experts, 8 + 1 active), 10 QSA + 30 GDN, async MoE MTP (`6,462` `@2K` / `6,316` `@6.5K` prefill, **`382.8 tok/s`** serve spec / `324.3` CLI `d=5` / `182.0` serve, **`291/291` API / `97.3%` cap / `81/100` `Code-100` (`96%` HE)**, `83.3%` `Core-30`), vision
 
 <p align="center">
   <img src="assets/qwegn_model_apex_35b_v1.svg" alt="Apex-35B-V1.0" width="100%">
 </p>
 
-**Apex-35B-V1.0** · 40L MoE (`35.95B`/`3B` active, 256 experts `8+1`), 10 GQA + 30 GDN, Variational MTP-3, AMX vision (`qwg pull qwegnai/Apex-35B-V1.0-hq4g32`, `HQ4_G32_M5`, `22.18 GiB` — **`6,416` `@4K` / `6,262` `@16K` / `5,810` serve** prefill, **`213.8` pred / `178.0` serve / `174.9` CLI** decode, **`5,491 / 100.9 tok/s` `@1M`** `Ward-512` with `3/3` needles across `64K–1M`, **`295/295`** conformance, **`100%`** fidelity, `91.9%` capability, `82%` HumanEval, `3,219` vision prefill)
+**Apex-35B-V1.0** · 40L MoE (`35.95B`/`3B` active, 256 experts `8+1`), 10 GQA + 30 GDN, Variational MTP-3, AMX vision (`qwg pull qwegnai/Apex-35B-V1.0-hq4g32`, `HQ4_G32_M5`, `22.18 GiB` — **`6,416` `@4K` / `6,262` `@16K` / `5,810` serve** prefill, **`261.1` spec / `178.0` serve / `174.9` CLI** decode, **`5,491 / 100.9 tok/s` `@1M`** `Ward-512` with `3/3` needles across `64K–1M`, **`291/291` conformance (`v0.28.0`), `100%` fidelity, `97.3%` capability, `72/100` `Code-100` (`86%` HumanEval)**, `3,219` vision prefill)
 
 <p align="center">
   <img src="assets/qwegn_model_maxwell_v1_flash.svg" alt="Maxwell-V1-Flash" width="100%">
 </p>
 
-**Maxwell-V1-Flash** · 45L all-MBSA (`maxwell_moe`: `1,024+1,024+16×128` tiled-32 NAX/split-K, `32Q/4KV` `head_dim=128` `qk_layernorm`), 4-stream Sinkhorn-20 mHC, 3 dense + 42×256 sigmoid top-12 + shared MoE, dedicated mHC-MTP head (`HQ8_G32 + SHVQ3/4_G64`, `17.18 GiB` `3.84 bpw`, `0.0055` KLD / `100%` top-1 vs BF16 — **`5,324 tok/s`** `@2K–4K`, `100.4` CLI / `102.3` serve / **`210.5 tok/s`** serve spec, `15 ms` warm cache `25.8×`, `92%` HumanEval, `139/139` API, `3/3` needles `@16K`/`64K`)
+**Maxwell-V1-Flash** · 45L all-MBSA (`maxwell_moe`: `1,024+1,024+16×128` tiled-32 NAX/split-K, `32Q/4KV` `head_dim=128` `qk_layernorm`), 4-stream Sinkhorn-20 mHC, 3 dense + 42×256 sigmoid top-12 + shared MoE, dedicated mHC-MTP head (`HQ8_G32 + SHVQ3/4_G64`, `17.18 GiB` `3.84 bpw`, `0.0055` KLD / `100%` top-1 vs BF16 — **`5,324 tok/s`** `@2K–4K`, `100.4` CLI / `104.0` serve / **`210.5 tok/s`** serve spec, `7–15 ms` warm cache `25.8×–47.3×`, **`291/291` API / `100%` cap & fid / `59/100` `Code-100`**, `3/3` needles `@16K`/`64K`)
 
 <p align="center">
   <img src="assets/qwegn_model_flash_next.svg" alt="Qwen3.8-Flash-Next" width="100%">
 </p>
 
-**Qwen3.8-Flash-Next** (+ `DFlash2-shvq4g32`) · 48L MoE (512 experts, 10 + 1 active), 12 QSA + 36 GDN, 4-branch HC, `VQ2_G32` PLE (`27.1 GiB`), MTP-3 & lossless 5L `DFlash 2` (`521.5 MiB` `SHVQ4_G32` — **`177.2 tok/s`** spec / `111.8` serve / `89.4` CLI DF2 / `83/100` Code-100 / `191/191` API), vision (`HQ8_G32 + HQ4_G64`, `71.3 GiB` — **`3,035 tok/s`** peak prefill, `1,888 / 63.7 tok/s` @1M `e-means`)
+**Qwen3.8-Flash-Next** (+ `DFlash2-shvq4g32`) · 48L MoE (512 experts, 10 + 1 active), 12 QSA + 36 GDN, 4-branch HC, `VQ2_G32` PLE (`27.1 GiB`), MTP-3 & lossless 5L `DFlash 2` (`521.5 MiB` `SHVQ4_G32` — **`177.2 tok/s`** spec / `111.8` serve / `89.4` CLI DF2 / **`291/291` API / `100%` cap & fid / `83/100` `Code-100` (`96%` HE)**), vision (`HQ8_G32 + HQ4_G64`, `71.3 GiB` — **`3,035 tok/s`** peak prefill, `1,888 / 63.7 tok/s` @1M `e-means`)
 
 <p align="center">
   <img src="assets/qwegn_model_edge0_145b.svg" alt="Edge0-145B" width="100%">
@@ -134,13 +134,15 @@ Full tables, paired A/B repository memory benchmarks, and thermal protocol: [doc
   <img src="assets/qwegn_model_qwen38_27b.svg" alt="Qwen3.8-27B" width="100%">
 </p>
 
-**Qwen3.8-27B** (+ DSpine-b16 & DFlash 2) · 64L dense hybrid, 5120 hidden, 24Q / 4KV GQA, MTP-3/5, 5-layer DSpine (`148.0` peak / `4.19×`) & DFlash 2 drafters (`154.2 tok/s` serve), vision
+**Qwen3.8-27B** (+ DSpine-b16 & DFlash 2) · 64L dense hybrid, 5120 hidden, 24Q / 4KV GQA, MTP-3/5, 5-layer DSpine (`148.0` peak / `4.19×` · **`291/291` API / `100%` cap & fid / `76/88` agentic / `75/100` `Code-100` (`88%` HE)**) & DFlash 2 drafters (`154.2 tok/s` serve), Native Metal FP16 ViT (**`812.2 ms`** `4.12×` encode, `961.6 MiB`)
 
 <p align="center">
   <img src="assets/qwegn_model_sensenova_loop_9b.svg" alt="SenseNova-Loop-9B" width="100%">
 </p>
 
-**SenseNova-Loop-9B** · 32 physical → 56 effective layers (`2×` loop `[4..28]`), `F32` 2-stream Sinkhorn-20 mHC, `524K` native YaRN-2×, `HQ4_G32` (`qwg pull qwegnai/SenseNova-Loop-9B-hq4g32`, `7.38 GiB` / `4.87 GiB` `--no-load-vision` — **`2,045 tok/s`** `@4K` / `1,944` `@16K` / `1,763` `@64K` prefill, **`165.7 tok/s`** serve spec / `98.1` CLI code / **`153.0 tok/s`** 4-stream HTTP `3.02×`, `92%` HumanEval, `211/211` API, `3/3` needles `@16K`/`64K`; `Preview` MTP-3 `149.2` serve spec / `94.0` CLI / `1,476` `@1M`)
+**SenseNova-Loop-9B** · 32 physical → 56 effective layers (`2×` loop `[4..28]`), `F32` 2-stream Sinkhorn-20 mHC, `524K` native YaRN-2×, `HQ4_G32` (`qwg pull qwegnai/SenseNova-Loop-9B-hq4g32`, `7.38 GiB` / `4.63 GiB` text — **`2,045 tok/s`** `@4K` / `1,944` `@16K` / `1,763` `@64K` prefill, **`165.7 tok/s`** serve spec / `98.1` CLI code / **`153.0 tok/s`** 4-stream HTTP `3.02×`, **Native Metal FP16 ViT (`807.8 ms` `4.09×` encode, `950.6 MiB`, `100%` SHA-256 parity)**, **`291/291` API / `100%` cap & fid / `61/100` `Code-100`**, `3/3` needles `@16K`/`64K`)
+
+**Sage-S2.1-Flash** (`HQ8_G32 + SHVQ2_G64 + SHVQ3_G64`) · Flagship hybrid MoE (`--context-tokens 65536` `v0.28.0`: **`291/292` API / `100%` cap / `99.39%` fidelity / `70/88` agentic / `81/100` `Code-100` (`90%` HE, `72%` MBPP)**, `42.4 / 845.7 tok/s`, spec `49.6 / 39.9` (`1.98 tok/step`), `100.8×` warm cache (`1,814 → 18 ms`))
 
 <p align="center">
   <img src="assets/qwegn_memory_pack_experiments.svg" alt="QWMemoryPack Live Benchmarks" width="100%">

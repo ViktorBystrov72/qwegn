@@ -41,6 +41,25 @@ public final class PlaneIO: @unchecked Sendable {
         try read(name, offset: offset, count: count, into: dst)
     }
 
+    /// Bounded byte slice loader over any verbatim `.raw` or `.hq4` pack plane.
+    public func loadSlice(_ name: String, layout: PlaneLayout,
+                          byteOffset: Int = 0, byteCount: Int,
+                          into dst: UnsafeMutableRawPointer) throws {
+        let (baseOffset, planeBytes) = try region(name, layout)
+        let (endByte, ov0) = byteOffset.addingReportingOverflow(byteCount)
+        let (absOffset, ov1) = baseOffset.addingReportingOverflow(byteOffset)
+        guard byteOffset >= 0, byteCount >= 0, !ov0, !ov1, endByte <= planeBytes else {
+            throw PlaneIOError.readFailed(
+                name: name,
+                message: "slice [\(byteOffset), +\(byteCount)) exceeds \(layout) plane (\(planeBytes) B)")
+        }
+        if byteCount == 0 {
+            try pack.withRawPointer(at: absOffset, byteCount: 0) { _ in }
+            return
+        }
+        try read(name, offset: absOffset, count: byteCount, into: dst)
+    }
+
     /// Parallel batch plane loader using concurrent `pread` across `(name, dst)` pairs.
     public func loadBatch(_ items: [(name: String, dst: UnsafeMutableRawPointer)],
                           layout: PlaneLayout) throws {

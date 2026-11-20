@@ -45,7 +45,6 @@ var candidates: [BenchCandidate] = []
 for (bits, group) in BenchSuites.pairs {
     candidates.append(contentsOf: BenchSuites.gemvCandidates(bits: bits, group: group))
 }
-candidates.append(contentsOf: BenchSuites.mlxCandidates(bits: 4, group: 64))
 
 do {
     // The bench races the 27B's kernels, so the HAL carries the 27B's

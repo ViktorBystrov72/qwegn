@@ -294,6 +294,37 @@ extension QWDFlashDrafter {
         }
     }
 
+    public func enqueueGreedyPropose(
+        hal: QWHal,
+        slot: QWDFlashSessionSlot,
+        cacheOffset: Int,
+        pendingToken: Int,
+        draftCount: Int,
+        draftVocab: Int? = nil,
+        headStorage: QWHeadStorage? = nil,
+        encodeHeadLogits: (_ enc: any MTLComputeCommandEncoder, _ xRot16: QWTensorValue, _ xNorm16: QWTensorValue,
+                           _ xRot32: QWTensorValue?, _ yLogits32: QWTensorValue, _ rows: Int, _ vocabRows: Int) throws -> Void,
+        encodeAnchorMaskEmbed: (_ enc: any MTLComputeCommandEncoder, _ propX32: QWTensorValue,
+                                _ anchorToken: Int, _ maskToken: Int, _ rows: Int) throws -> Void,
+        journalBuffer: any MTLBuffer,
+        journalByteOffset: Int
+    ) throws -> any MTLCommandBuffer {
+        guard journalByteOffset >= 0, journalByteOffset % 4 == 0,
+              journalByteOffset + draftCount * 4 <= journalBuffer.length,
+              journalBuffer !== draftTokensOut.region.buffer else {
+            throw QWDFlashError.state("QWDFlashDrafter: invalid async journal destination")
+        }
+        return try withoutActuallyEscaping(encodeAnchorMaskEmbed) { anchorEmbed in
+            try encodeAndCommitPropose(
+                hal: hal, slot: slot, cacheOffset: cacheOffset, pendingToken: pendingToken,
+                draftCount: draftCount, draftVocab: draftVocab, headStorage: headStorage,
+                encodeHeadLogits: encodeHeadLogits, encodeAnchorMaskEmbed: anchorEmbed,
+                embedding: nil, stochastic: nil, preContextUpdate: nil,
+                journalCopy: (journalBuffer, journalByteOffset)
+            )
+        }
+    }
+
     public func propose(
         hal: QWHal,
         slot: QWDFlashSessionSlot,
@@ -311,6 +342,58 @@ extension QWDFlashDrafter {
         preContextUpdate: (slot: QWDFlashSessionSlot, startPosition: Int, totalCount: Int)? = nil,
         completed: ((any MTLCommandBuffer) throws -> Void)? = nil
     ) throws -> (drafts: [Int], proposals: [QWMTPGumbelProposal]) {
+        let cb = try encodeAndCommitPropose(
+            hal: hal, slot: slot, cacheOffset: cacheOffset, pendingToken: pendingToken,
+            draftCount: draftCount, draftVocab: draftVocab, headStorage: headStorage,
+            encodeHeadLogits: encodeHeadLogits, encodeAnchorMaskEmbed: encodeAnchorMaskEmbed,
+            embedding: embedding, stochastic: stochastic, preContextUpdate: preContextUpdate,
+            journalCopy: nil
+        )
+        cb.waitUntilCompleted()
+        guard cb.status == .completed, cb.error == nil else {
+            throw QWDFlashError.state("QWDFlashDrafter GPU failure: \(String(describing: cb.error))")
+        }
+        try completed?(cb)
+
+        let D = draftCount
+        let V = config.vocabSize
+        let topK = config.selectorTopK
+        let safeAnchor = Self.clampToken(pendingToken, vocab: V)
+        if let stochastic {
+            if let bs = dspineScratch {
+                return try selectDSpineStochastic(
+                    temperature: stochastic.temperature, stream: stochastic.stream, draftCount: D, topK: topK, bs: bs
+                )
+            }
+            return try selectStochastic(
+                temperature: stochastic.temperature, stream: stochastic.stream, anchorToken: safeAnchor, draftCount: D, topK: topK
+            )
+        } else {
+            let ptr = draftTokensOut.region.buffer.contents()
+                .advanced(by: draftTokensOut.region.base + draftTokensOut.offset)
+                .assumingMemoryBound(to: Int32.self)
+            let drafts = (0..<D).map { Self.clampToken(Int(ptr[$0]), vocab: V) }
+            return (drafts, [])
+        }
+    }
+
+    private func encodeAndCommitPropose(
+        hal: QWHal,
+        slot: QWDFlashSessionSlot,
+        cacheOffset: Int,
+        pendingToken: Int,
+        draftCount: Int,
+        draftVocab: Int?,
+        headStorage: QWHeadStorage?,
+        encodeHeadLogits: (_ enc: any MTLComputeCommandEncoder, _ xRot16: QWTensorValue, _ xNorm16: QWTensorValue,
+                           _ xRot32: QWTensorValue?, _ yLogits32: QWTensorValue, _ rows: Int, _ vocabRows: Int) throws -> Void,
+        encodeAnchorMaskEmbed: ((_ enc: any MTLComputeCommandEncoder, _ propX32: QWTensorValue,
+                                 _ anchorToken: Int, _ maskToken: Int, _ rows: Int) throws -> Void)?,
+        embedding: ((Int, QWTensorValue) throws -> Void)?,
+        stochastic: (temperature: Float, stream: QWMTPRandomStream)?,
+        preContextUpdate: (slot: QWDFlashSessionSlot, startPosition: Int, totalCount: Int)?,
+        journalCopy: (buffer: any MTLBuffer, byteOffset: Int)?
+    ) throws -> any MTLCommandBuffer {
         let D = draftCount
         let M = D + 1
         let maxDrafts = max(7, config.blockSize - 1)
@@ -362,7 +445,7 @@ extension QWDFlashDrafter {
             }
         }
 
-        guard let (cb, enc) = hal.begin(.serial) else {
+        guard let (cb, enc) = hal.beginUnretained(.serial) else {
             throw QWDFlashError.state("QWDFlashDrafter: command buffer creation failed")
         }
         var encoderEnded = false
@@ -517,29 +600,22 @@ extension QWDFlashDrafter {
         }
 
         encoderEnded = true
-        hal.end(cb, enc)
-        cb.waitUntilCompleted()
-        guard cb.status == .completed, cb.error == nil else {
-            throw QWDFlashError.state("QWDFlashDrafter GPU failure: \(String(describing: cb.error))")
-        }
-        try completed?(cb)
-
-        if let stochastic {
-            if let bs = dspineScratch {
-                return try selectDSpineStochastic(
-                    temperature: stochastic.temperature, stream: stochastic.stream, draftCount: D, topK: topK, bs: bs
-                )
+        enc.endEncoding()
+        if let journalCopy {
+            guard let blit = cb.makeBlitCommandEncoder() else {
+                throw QWDFlashError.state("QWDFlashDrafter: journal copy encoder failed")
             }
-            return try selectStochastic(
-                temperature: stochastic.temperature, stream: stochastic.stream, anchorToken: safeAnchor, draftCount: D, topK: topK
+            blit.copy(
+                from: draftTokensOut.region.buffer,
+                sourceOffset: draftTokensOut.region.base + draftTokensOut.offset,
+                to: journalCopy.buffer,
+                destinationOffset: journalCopy.byteOffset,
+                size: D * 4
             )
-        } else {
-            let ptr = draftTokensOut.region.buffer.contents()
-                .advanced(by: draftTokensOut.region.base + draftTokensOut.offset)
-                .assumingMemoryBound(to: Int32.self)
-            let drafts = (0..<D).map { Self.clampToken(Int(ptr[$0]), vocab: V) }
-            return (drafts, [])
+            blit.endEncoding()
         }
+        cb.commit()
+        return cb
     }
 
     static func clampToken(_ token: Int, vocab: Int) -> Int {

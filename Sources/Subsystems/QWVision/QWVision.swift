@@ -158,15 +158,8 @@ public final class QWVisionWeights: @unchecked Sendable {
         try self.init(checkpoint: try QWVisionCheckpoint(pack: packPath))
     }
 
-    init(checkpoint ck: QWVisionCheckpoint) throws {
-        self.ck = ck
-        let cfg = ck.config
-        self.config = cfg
-        let d = cfg.dim
-        let patch = cfg.patch
-        let temporal = cfg.temporal
-        let merged = cfg.merged
-        self.posEmbed = try ck.f32("pos_embed.weight", want: [cfg.numPosEmbeds, d])
+    static func loadFoldedPatchWeight(from ck: QWVisionCheckpoint, config cfg: QWVisionConfig) throws -> [Float] {
+        let d = cfg.dim, patch = cfg.patch, temporal = cfg.temporal
         let pw = ck.shape("patch_embed.proj.weight")
         let baseShape = [d, 3, temporal, patch, patch]
         let legacyShape = [d, temporal, patch, patch, 3]
@@ -174,41 +167,59 @@ public final class QWVisionWeights: @unchecked Sendable {
             throw QWVisionError.badLayout(
                 "patch_embed.proj.weight \(pw.debugDescription) ≠ \(baseShape) nor \(legacyShape)")
         }
+        let isBase = (pw == baseShape)
+        let native = try ck.f32("patch_embed.proj.weight", want: isBase ? baseShape : legacyShape)
+        if isBase { return native }
         // Fold legacy (o,t,h,w,c) conv3d kernels to (o,c,t,h,w) to match the C19 slab row layout.
-        self.patchW = try {
-            let isBase = (pw == baseShape)
-            let native = try ck.f32("patch_embed.proj.weight",
-                                    want: isBase ? baseShape : legacyShape)
-            if isBase {
-                return native
-            }
-            let patchArea = cfg.patchArea
-            let temporalArea = cfg.temporalPatchArea
-            let patchChan = cfg.patchChannels
-            let spatialChan = patchArea * 3
-            var f = [Float](repeating: 0, count: d * patchChan)
-            for o in 0..<d {
-                let ob = o * patchChan
-                for t in 0..<temporal {
-                    for raster in 0..<patchArea {
-                        for c in 0..<3 {
-                            f[ob + c * temporalArea + t * patchArea + raster] =
-                                native[ob + t * spatialChan + raster * 3 + c]
-                        }
+        let patchArea = cfg.patchArea, temporalArea = cfg.temporalPatchArea
+        let patchChan = cfg.patchChannels, spatialChan = patchArea * 3
+        var f = [Float](repeating: 0, count: d * patchChan)
+        for o in 0..<d {
+            let ob = o * patchChan
+            for t in 0..<temporal {
+                for raster in 0..<patchArea {
+                    for c in 0..<3 {
+                        f[ob + c * temporalArea + t * patchArea + raster] =
+                            native[ob + t * spatialChan + raster * 3 + c]
                     }
                 }
             }
-            return f
-        }()
-        self.patchB = try ck.f32("patch_embed.proj.bias", want: [d])
-        var bl: [QWVisionBlockW] = []
-        var blkIdx = 0
-        while ck.has("blocks.\(blkIdx).norm1.weight") {
-            bl.append(try QWVisionBlockW(ck, "blocks.\(blkIdx)", config: cfg))
-            blkIdx += 1
         }
-        guard !bl.isEmpty else { throw QWVisionError.missingTensor("blocks.0.norm1.weight") }
-        self.blocks = bl
+        return f
+    }
+
+    static func countBlocks(in ck: QWVisionCheckpoint) throws -> Int {
+        var blkIdx = 0
+        while ck.has("blocks.\(blkIdx).norm1.weight") { blkIdx += 1 }
+        guard blkIdx > 0 else { throw QWVisionError.missingTensor("blocks.0.norm1.weight") }
+        return blkIdx
+    }
+
+    static func resolveFc2Out(in ck: QWVisionCheckpoint, config cfg: QWVisionConfig) -> Int {
+        ck.shape("merger.linear_fc2.bias")?[0]
+            ?? ck.shape("merger.linear_fc2.weight")?[0]
+            ?? cfg.outDim
+    }
+
+    static func computeInvFreq(config cfg: QWVisionConfig) -> [Float] {
+        var f = [Float](repeating: 0, count: cfg.invFreqCount)
+        for i in 0..<f.count {
+            f[i] = Float(1.0 / pow(cfg.ropeTheta, Double(2 * i) / Double(cfg.spatial)))
+        }
+        return f
+    }
+
+    init(checkpoint ck: QWVisionCheckpoint) throws {
+        self.ck = ck
+        let cfg = ck.config
+        self.config = cfg
+        let d = cfg.dim
+        let merged = cfg.merged
+        self.posEmbed = try ck.f32("pos_embed.weight", want: [cfg.numPosEmbeds, d])
+        self.patchW = try Self.loadFoldedPatchWeight(from: ck, config: cfg)
+        self.patchB = try ck.f32("patch_embed.proj.bias", want: [d])
+        let nBlocks = try Self.countBlocks(in: ck)
+        self.blocks = try (0..<nBlocks).map { try QWVisionBlockW(ck, "blocks.\($0)", config: cfg) }
         guard ck.has("merger.norm.weight"), ck.has("merger.norm.bias") else {
             throw QWVisionError.badLayout("merger.norm non-affine law violated (affine weights required)")
         }
@@ -216,17 +227,11 @@ public final class QWVisionWeights: @unchecked Sendable {
         self.mergerBeta = try ck.f32("merger.norm.bias", want: [d])
         self.fc1W = try ck.f32("merger.linear_fc1.weight", want: [merged, merged])
         self.fc1B = try ck.f32("merger.linear_fc1.bias", want: [merged])
-        let outDim = ck.shape("merger.linear_fc2.bias")?[0]
-            ?? ck.shape("merger.linear_fc2.weight")?[0]
-            ?? cfg.outDim
+        let outDim = Self.resolveFc2Out(in: ck, config: cfg)
         self.fc2Out = outDim
         self.fc2W = try ck.f32("merger.linear_fc2.weight", want: [outDim, merged])
         self.fc2B = try ck.f32("merger.linear_fc2.bias", want: [outDim])
-        var f = [Float](repeating: 0, count: cfg.invFreqCount)
-        for i in 0..<f.count {
-            f[i] = Float(1.0 / pow(cfg.ropeTheta, Double(2 * i) / Double(cfg.spatial)))
-        }
-        self.invFreq = f
+        self.invFreq = Self.computeInvFreq(config: cfg)
         ck.releaseBacking()
     }
 }

@@ -35,13 +35,11 @@ extension QWEngineDriver {
         return name
     }
 
-    /// The prefill GEMM for a container, in its two tile sizes.
-    static func gemmKernelName(format: QWWeightFormat, bm128: Bool) throws -> String {
-        guard format.usesDenseAQKernels else {
-            return bm128 ? "qwg_gemm_q4g_h16_bm128" : "qwg_gemm_q4g_h16"
-        }
+    /// The prefill GEMM for a container.
+    static func gemmKernelName(format: QWWeightFormat) throws -> String {
+        guard format.usesDenseAQKernels else { return "qwg_gemm_q4g_h16" }
         guard let name = QWGemmAQ.gemmKernelName(bits: format.bits, group: format.groupSize,
-                                                 bm128: bm128, isSHVQ: format.denseIsSHVQ) else {
+                                                 isSHVQ: format.denseIsSHVQ) else {
             throw QWEngineDriverError.state("no prefill kernel for \(format.bits)-bit group "
                                             + "\(format.groupSize)")
         }

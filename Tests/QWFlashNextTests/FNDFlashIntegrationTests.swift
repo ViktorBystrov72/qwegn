@@ -190,9 +190,13 @@ final class FNDFlashIntegrationTests: XCTestCase {
         // Multi-turn extension of turn1 resolves the same slot and matches only under matching dflashMarker.
         let turn2 = turn1 + [901, 902, 903, 904]
         XCTAssertEqual(
-            store.longestMatch(history: turn2, kvMode: .f16, hasMTP: false, dflashMarker: marker)?.name, name1)
-        XCTAssertNil(store.longestMatch(history: turn2, kvMode: .f16, hasMTP: false, dflashMarker: nil))
-        XCTAssertNil(store.longestMatch(history: turn2, kvMode: .f16, hasMTP: false, dflashMarker: otherMarker))
+            store.lookupWarmHit(exactName: "", history: turn2, rawHistory: turn2,
+                                kvMode: .f16, hasMTP: false, dflashMarker: marker, allowExact: false)?.value,
+            Data(repeating: 1, count: 64))
+        XCTAssertNil(store.lookupWarmHit(exactName: "", history: turn2, rawHistory: turn2,
+                                         kvMode: .f16, hasMTP: false, dflashMarker: nil, allowExact: false))
+        XCTAssertNil(store.lookupWarmHit(exactName: "", history: turn2, rawHistory: turn2,
+                                         kvMode: .f16, hasMTP: false, dflashMarker: otherMarker, allowExact: false))
 
         let r2 = FNPrefixWarmStore.rootHash(history: turn2, kvMode: .f16, hasMTP: false, dflashMarker: marker)
         let slot2 = store.resolveSlot(rootHash: r2, history: turn2, kvMode: .f16, hasMTP: false, dflashMarker: marker)
@@ -203,8 +207,11 @@ final class FNDFlashIntegrationTests: XCTestCase {
         let name2 = String(format: "fn_entry_%016llx_%d.qwcache", h2, turn2.count)
         store.store(name: name2, blob: Data(repeating: 3, count: 64),
                     slot: slot2, rootHash: r2, history: turn2, isSharedBase: false)
+        let turn3 = turn2 + [905]
         XCTAssertEqual(
-            store.longestMatch(history: turn2 + [905], kvMode: .f16, hasMTP: false, dflashMarker: marker)?.name, name2)
+            store.lookupWarmHit(exactName: "", history: turn3, rawHistory: turn3,
+                                kvMode: .f16, hasMTP: false, dflashMarker: marker, allowExact: false)?.value,
+            Data(repeating: 3, count: 64))
 
         // Shared-base matching also honors dflashMarker isolation.
         let baseHist: [Int64] = (8000..<8160).map { Int64($0) }
@@ -212,12 +219,13 @@ final class FNDFlashIntegrationTests: XCTestCase {
         let baseName = String(format: "fn_entry_%016llx_%d.qwcache", hBase, baseHist.count)
         store.store(name: baseName, blob: Data(repeating: 4, count: 64),
                     slot: nil, rootHash: nil, history: baseHist, isSharedBase: true)
-        XCTAssertEqual(
-            store.longestSharedBaseMatch(
-                history: baseHist + [1], kvMode: .f16, hasMTP: false, dflashMarker: marker)?.name,
-            baseName)
-        XCTAssertNil(store.longestSharedBaseMatch(
-            history: baseHist + [1], kvMode: .f16, hasMTP: false, dflashMarker: otherMarker))
+        let baseQuery = baseHist + [1]
+        let baseHit = store.lookupWarmHit(exactName: "", history: baseQuery, rawHistory: baseQuery,
+                                          kvMode: .f16, hasMTP: false, dflashMarker: marker, allowExact: false)
+        XCTAssertEqual(baseHit?.value, Data(repeating: 4, count: 64))
+        XCTAssertEqual(baseHit?.matchedTokens, baseHist.count)
+        XCTAssertNil(store.lookupWarmHit(exactName: "", history: baseQuery, rawHistory: baseQuery,
+                                         kvMode: .f16, hasMTP: false, dflashMarker: otherMarker, allowExact: false))
     }
 
     func testResolveDraftVocabDefaultsTo98304ForLargeVocabs() {

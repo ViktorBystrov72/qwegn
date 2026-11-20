@@ -46,6 +46,13 @@ enum QWKernelInventory {
         "qwg_skinny_m2",
         "qwg_skinny_m3",
         "qwg_verify_copy",
+        "qwg_vis_flash_attn_f16",
+        "qwg_vis_gelu_erf_f16",
+        "qwg_vis_gelu_tanh_f16",
+        "qwg_vis_gemm_f16",
+        "qwg_vis_layernorm_f16",
+        "qwg_vis_pos_embed_f16",
+        "qwg_vis_rope_qkv_f16",
     ]
     static let standard_only: [String] = [
         "qwg_attn_decode",
@@ -87,7 +94,6 @@ enum QWKernelInventory {
         "qwg_emeans_lsa_score_coarse",
         "qwg_extract_rope_norm_qk",
         "qwg_extract_rope_qk_general",
-        "qwg_gemm_q4g_h16_bm128",
         "qwg_gemm_q4g_h16_gdn_inproj",
         "qwg_gemm_q4g_h16_swiglu",
         "qwg_gemv_q4g_dx_h16_dual_t4",

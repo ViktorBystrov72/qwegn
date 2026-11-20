@@ -33,6 +33,11 @@ public final class QWTokenizer: @unchecked Sendable {
         let normalized: Bool
     }
 
+    struct MergeRule: Sendable {
+        let rank: Int
+        let merged: UInt32
+    }
+
     let mode: Mode
     let usesNFC: Bool
     let stripLeadingSpace: Bool
@@ -40,17 +45,13 @@ public final class QWTokenizer: @unchecked Sendable {
     let byteMap: [Unicode.Scalar]
     /// vocab symbol (ByteLevel string) → token id.
     let vocab: [String: Int]
-    /// merged-pair rank (merges file order). Key = a<<32 | b over interner
-    /// ids (sym count supports full UInt32 range).
-    let ranks: [UInt64: Int]
+    /// pair key → merged rank + symbol interner id; ABSENT when unmergeable.
+    let mergeRules: [UInt64: MergeRule]
     /// interner: vocab symbol string → dense id (BPE closure stays in vocab)
     let symId: [String: UInt32]
     let syms: [String]
-    /// pair key → merged symbol interner id; ABSENT when the merged string
-    /// is not a vocab entry (that pair cannot merge — no fatalError path).
-    let pairMerged: [UInt64: UInt32]
-    /// interner id → token id
-    let symTok: [UInt32: Int]
+    /// interner id → token id (-1 when absent)
+    let symTok: [Int]
     /// token id → raw vocab piece (ByteLevel string)
     let idToPiece: [Int: String]
     /// ByteLevel symbol scalar → original byte (inverse of byteMap)
@@ -64,6 +65,8 @@ public final class QWTokenizer: @unchecked Sendable {
     let preSteps: [PreTokenStep]
     /// byte -> symbol interner id (direct O(1) table, zero allocations)
     let byteToSymId: [UInt32]
+    /// byte -> token id (direct O(1) table for 1-byte spans, -1 if unresolved)
+    let byteToTokId: [Int]
     /// pre-encoded added token patterns sorted longest-first (tie-break file order)
     let rawAddedPats: [AddedPattern]
     let rawAddedFirstByte: [Bool]
@@ -234,8 +237,7 @@ public final class QWTokenizer: @unchecked Sendable {
         var sList: [String] = []
         sList.reserveCapacity(vocabObj.count)
         for (s, _) in vocabObj { sId[s] = UInt32(sList.count); sList.append(s) }
-        var rk = [UInt64: Int](minimumCapacity: mergesArr.count)
-        var pm = [UInt64: UInt32](minimumCapacity: mergesArr.count)
+        var mr = [UInt64: MergeRule](minimumCapacity: mergesArr.count)
         for entry in mergesArr {
             let part0: String
             let part1: String
@@ -258,15 +260,15 @@ public final class QWTokenizer: @unchecked Sendable {
             }
             let k = UInt64(a) << 32 | UInt64(b)
             guard let m = sId[sList[Int(a)] + sList[Int(b)]] else { continue }  // unmergeable pair (see law above)
-            if rk[k] == nil { rk[k] = rk.count }   // first rank wins (list order)
-            pm[k] = m
+            if mr[k] == nil { mr[k] = MergeRule(rank: mr.count, merged: m) }   // first rank wins (list order)
         }
-        self.ranks = rk
-        self.pairMerged = pm
+        self.mergeRules = mr
         self.symId = sId
         self.syms = sList
-        var st = [UInt32: Int](minimumCapacity: sList.count)
-        for (s, id) in sId { st[id] = vocabObj[s] }
+        var st = [Int](repeating: -1, count: sList.count)
+        for (s, id) in sId {
+            if let tid = vocabObj[s] { st[Int(id)] = tid }
+        }
         self.symTok = st
         var ip = [Int: String](minimumCapacity: vocabObj.count + addedList.count)
         for (s, id) in vocabObj { ip[id] = s }
@@ -296,6 +298,14 @@ public final class QWTokenizer: @unchecked Sendable {
             }
         }
         self.byteToSymId = b2s
+        var b2t = [Int](repeating: -1, count: 256)
+        for b in 0..<256 {
+            let sid = b2s[b]
+            if sid != UInt32.max, Int(sid) < st.count {
+                b2t[b] = st[Int(sid)]
+            }
+        }
+        self.byteToTokId = b2t
 
         var rawPats: [AddedPattern] = []
         var rawFirst = [Bool](repeating: false, count: 256)
@@ -347,5 +357,123 @@ public final class QWTokenizer: @unchecked Sendable {
             range: NSRange(location: 0, length: ns.length),
             withTemplate: "(?:$1{$2})+"
         )
+    }
+}
+
+/// Thread-local bounded per-`encode` BPE word cache (max 4096 keys, zero per-lookup allocs).
+struct QWWordMergeCache {
+    private struct Entry {
+        let hash: UInt64
+        let keyStart: UInt32
+        let keyLen: UInt16
+        let outStart: UInt32
+        let outLen: UInt16
+    }
+
+    static let maxEntries = 4096
+    static let maxKeyBytes = 256
+
+    private var slots: [Int32] = []
+    private var entries: [Entry] = []
+    private var keyBytes: [UInt8] = []
+    private var outTokens: [Int] = []
+
+    @inline(__always)
+    static func hashBytes(_ ptr: UnsafePointer<UInt8>, count: Int) -> UInt64 {
+        var h: UInt64 = 0xCBF2_9CE4_8422_2325
+        var i = 0
+        while i < count {
+            h ^= UInt64(ptr[i])
+            h &*= 0x0000_0100_0000_01B3
+            i += 1
+        }
+        h ^= h >> 33
+        h &*= 0xFF51_AFD7_ED55_8CCD
+        h ^= h >> 33
+        return h
+    }
+
+    @inline(__always)
+    func lookup(
+        _ ptr: UnsafePointer<UInt8>,
+        count: Int,
+        hash: UInt64,
+        into ids: inout [Int]
+    ) -> Bool {
+        let slotCount = slots.count
+        guard slotCount > 0 else { return false }
+        let mask = slotCount - 1
+        var idx = Int(hash & UInt64(mask))
+        while true {
+            let slotVal = slots[idx]
+            if slotVal < 0 { return false }
+            let e = entries[Int(slotVal)]
+            if e.hash == hash && Int(e.keyLen) == count {
+                let kBase = Int(e.keyStart)
+                let match = keyBytes.withUnsafeBufferPointer { kb -> Bool in
+                    guard let kAddr = kb.baseAddress else { return false }
+                    return memcmp(kAddr.advanced(by: kBase), ptr, count) == 0
+                }
+                if match {
+                    let oStart = Int(e.outStart)
+                    let oEnd = oStart + Int(e.outLen)
+                    ids.append(contentsOf: outTokens[oStart..<oEnd])
+                    return true
+                }
+            }
+            idx = (idx + 1) & mask
+        }
+    }
+
+    mutating func insert(
+        _ ptr: UnsafePointer<UInt8>,
+        count: Int,
+        hash: UInt64,
+        tokens: [Int]
+    ) {
+        guard entries.count < Self.maxEntries,
+              count > 0, count <= Self.maxKeyBytes,
+              tokens.count <= Int(UInt16.max),
+              keyBytes.count <= Int(UInt32.max) - count,
+              outTokens.count <= Int(UInt32.max) - tokens.count else { return }
+        if slots.isEmpty {
+            slots = [Int32](repeating: -1, count: 256)
+            entries.reserveCapacity(128)
+            keyBytes.reserveCapacity(1024)
+            outTokens.reserveCapacity(256)
+        } else if (entries.count + 1) * 2 > slots.count {
+            rehash(to: slots.count * 2)
+        }
+        let keyStart = UInt32(keyBytes.count)
+        keyBytes.append(contentsOf: UnsafeBufferPointer(start: ptr, count: count))
+        let outStart = UInt32(outTokens.count)
+        outTokens.append(contentsOf: tokens)
+        let entryIdx = Int32(entries.count)
+        entries.append(Entry(
+            hash: hash,
+            keyStart: keyStart,
+            keyLen: UInt16(count),
+            outStart: outStart,
+            outLen: UInt16(tokens.count)
+        ))
+        let mask = slots.count - 1
+        var idx = Int(hash & UInt64(mask))
+        while slots[idx] >= 0 {
+            idx = (idx + 1) & mask
+        }
+        slots[idx] = entryIdx
+    }
+
+    private mutating func rehash(to newCap: Int) {
+        var next = [Int32](repeating: -1, count: newCap)
+        let mask = newCap - 1
+        for (i, e) in entries.enumerated() {
+            var idx = Int(e.hash & UInt64(mask))
+            while next[idx] >= 0 {
+                idx = (idx + 1) & mask
+            }
+            next[idx] = Int32(i)
+        }
+        slots = next
     }
 }

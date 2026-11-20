@@ -264,38 +264,35 @@ final class QWSHVQGemmTests: XCTestCase {
                                           "nax_f32 SHVQ\(bits)_G\(group) m=\(m) t=\(t) r=\(r): got \(got32[t * n + r]) want \(ref.val)")
                     }
                 }
-                // Also verify H16 batched paths (BM64 & BM128)
+                // Also verify H16 batched path (BM64)
                 if m == 64 {
-                    for bm128 in [false, true] {
-                        let kName = try XCTUnwrap(
-                            QWGemmAQ.gemmKernelName(bits: bits, group: group, bm128: bm128, isSHVQ: true)
+                    let kName = try XCTUnwrap(
+                        QWGemmAQ.gemmKernelName(bits: bits, group: group, isSHVQ: true)
+                    )
+                    try step { enc in
+                        let pso = try Self.hal.pipeline(kName)
+                        enc.setComputePipelineState(pso)
+                        wBuf.bind(enc, index: 0)
+                        x16.bind(enc, index: 1)
+                        y16.bind(enc, index: 2)
+                        y16.bind(enc, index: 3)
+                        var m32 = UInt32(m), n32 = UInt32(n), k32 = UInt32(k)
+                        enc.setBytes(&m32, length: 4, index: 4)
+                        enc.setBytes(&n32, length: 4, index: 5)
+                        enc.setBytes(&k32, length: 4, index: 6)
+                        enc.dispatchThreadgroups(
+                            MTLSize(width: (n + 63) / 64, height: (m + 63) / 64, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
                         )
-                        let bm = bm128 ? 128 : 64
-                        try step { enc in
-                            let pso = try Self.hal.pipeline(kName)
-                            enc.setComputePipelineState(pso)
-                            wBuf.bind(enc, index: 0)
-                            x16.bind(enc, index: 1)
-                            y16.bind(enc, index: 2)
-                            y16.bind(enc, index: 3)
-                            var m32 = UInt32(m), n32 = UInt32(n), k32 = UInt32(k)
-                            enc.setBytes(&m32, length: 4, index: 4)
-                            enc.setBytes(&n32, length: 4, index: 5)
-                            enc.setBytes(&k32, length: 4, index: 6)
-                            enc.dispatchThreadgroups(
-                                MTLSize(width: (n + 63) / 64, height: (m + bm - 1) / bm, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
-                            )
-                        }
-                        let got16 = arena.read(y16, as: Float16.self, count: m * n).map { Float($0) }
-                        for t in 0..<m {
-                            let xSlice = x[(t * k)..<((t + 1) * k)].map { Float(Float16($0)) }[...]
-                            for r in 0..<n {
-                                let ref = dotRef(w: wRows[r], x: xSlice, roundWeightsToF16: true)
-                                let denom = max(Double(abs(ref.val)), Double(ref.mag), 1e-5)
-                                let rel = abs(Double(got16[t * n + r]) - Double(ref.val)) / denom
-                                XCTAssertLessThan(rel, 1.5e-3, "\(kName) t=\(t) r=\(r): rel=\(rel)")
-                            }
+                    }
+                    let got16 = arena.read(y16, as: Float16.self, count: m * n).map { Float($0) }
+                    for t in 0..<m {
+                        let xSlice = x[(t * k)..<((t + 1) * k)].map { Float(Float16($0)) }[...]
+                        for r in 0..<n {
+                            let ref = dotRef(w: wRows[r], x: xSlice, roundWeightsToF16: true)
+                            let denom = max(Double(abs(ref.val)), Double(ref.mag), 1e-5)
+                            let rel = abs(Double(got16[t * n + r]) - Double(ref.val)) / denom
+                            XCTAssertLessThan(rel, 1.5e-3, "\(kName) t=\(t) r=\(r): rel=\(rel)")
                         }
                     }
                 }
@@ -678,7 +675,7 @@ final class QWSHVQGemmTests: XCTestCase {
             let weight = try XCTUnwrap(QWWeightView(blocks: wBuf, n: n, k: k,
                                                     bits: bits, groupSize: group, isRotated: true, isSHVQ: true))
             let psoH16 = try Self.hal.pipeline(try XCTUnwrap(QWGemmAQ.gemmKernelName(
-                bits: bits, group: group, bm128: false, isSHVQ: true)))
+                bits: bits, group: group, isSHVQ: true)))
             for (r, bm, bn, modeBits) in [(11, 16, 128, 0x2000_0000), (29, 32, 64, 0x4000_0000)] {
                 let xVals = makeActivations(count: r * k, seedInit: UInt32(0x700 + r + bits)).map { Float16($0) }
                 let xT = try ar.allocate(QWTensorShape([r * k], .f16))

@@ -56,16 +56,6 @@ public final class QWPrefixCacheCoordinator: @unchecked Sendable {
         return (diskManager.entryCount, diskManager.chargedBytes)
     }
 
-    func canOpportunisticallySpill(isSharedBase: Bool, entryBytes: Int) -> Bool {
-        QWTwoTierPrefixCache.shouldSpillToCold(
-            isSharedBase: isSharedBase,
-            warmHasSharedBase: warmStore?.hasSharedBase == true,
-            ssdByteLimit: diskManager?.config.ssdByteLimit ?? 0,
-            entryBytes: entryBytes,
-            maxSpillBytes: Self.maxOpportunisticColdWriteBytes
-        )
-    }
-
     static func scheduleColdSpill(
         key: QWEnginePrefixStore<QWEngineCachedPrefix>.Key,
         value: QWEngineCachedPrefix,

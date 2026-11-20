@@ -115,7 +115,7 @@ the owner's private `docs/agent-retrospective-*.md`.
     In Swift Testing (`import Testing`), use `#expect(Bool(true))` instead of `#expect(true)`, and never bind a result to a local variable with the same base name as a helper function called inside `#require(...)` (e.g. `let argument = try #require(argument(for: ...))` shadows `argument(for:)` inside the macro expansion; bind the optional first).
     Use scoped `lock.withLock { ... }` (rather than separate `lock.lock()` / `lock.unlock()` calls) inside `async` functions and `@Sendable` closures so Swift 6 concurrency checks pass on all Apple SDKs.
 26. **CI transparency, pragmatic GitHub Actions gating & diagnostic preservation**:
-    CI scripts (`ci.sh`) must never swallow compiler or test failure output through `tail` or silent pipes on nonzero exit. If a gate step exits nonzero, the full captured build/test log must be printed to standard output before terminating. Distinguish CI runner infrastructure timeouts (queue acquisition) from test/build failures before retrying code changes.
+    CI scripts (`ci.sh`) must never swallow compiler or test failure output through `tail` or silent pipes on nonzero exit. If a gate step exits nonzero, the full captured build/test log must be printed to standard output before terminating. Distinguish CI runner infrastructure timeouts (queue acquisition) from test/build failures before retrying code changes: check `jobs[].steps` and `gh api repos/<owner>/<repo>/check-runs/<job-id>/annotations` first (`steps: []` with `"not acquired by Runner of type hosted"` is pure runner-pool starvation); when simultaneous `main` + tag pushes starve `macos-26` runners, rerun `release` solo first and `ci` sequentially after it completes.
     Never alter or weaken working production code or kernels to work around GitHub Actions virtualized runner limitations (`Apple Paravirtual device`, 16 GiB RAM, no `~/.qwg/models`). Full hardware, Metal kernel, golden-oracle (`Scripts/spike/out`), and performance tests run only on real Apple Silicon machines (`GITHUB_ACTIONS != true`).
     When `GITHUB_ACTIONS=true`, omit `.venv-oracle` / `make goldens` in `.github/workflows/ci.yml`, skip performance harness suites (`test_paired*perf.py`) and `qwg-bench-kernels` execution in `Scripts/ci.sh`, and run only the non-Metal, non-golden host/app unit test targets (`QWCoreTests`, `QWQuantTests`, `QWTokenTests`, `QWCliTests`, `QWServerTests`, `QWMenuBarTests`, with any `Scripts/spike/out` fixture loaders gated via `XCTSkipIf`). In Python scripts that call `subprocess.run(..., timeout=...)`, isolate module `time` via `SimpleNamespace` so `unittest.mock.patch("<mod>.time.sleep")` never intercepts stdlib `subprocess.Popen._wait` backoff sleeps.
 27. **AGX 32 KiB constant-cache ceiling & mixed-plane capacity sizing**:
@@ -129,6 +129,19 @@ the owner's private `docs/agent-retrospective-*.md`.
     budgets, uncached streaming, structured/tool calls, multi-protocol
     endpoints, and concurrent `B=4` batches across flagship architectures
     (follow `.agents/skills/qwegine-inference-qa-and-sampling/SKILL.md`).
+29. **Metal 4 NAX deployment-target floor (`-mmacosx-version-min=26.2`) & GitHub-artifact parity**:
+    Every `metal -std=metal4.0` compilation MUST pass `-mmacosx-version-min=26.2`
+    (`__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ >= 260200`). Below `26.2`, Apple's
+    `MetalPerformancePrimitives` SDK (`MPPTensorOpsAvailability.h`) silently falls
+    back to broken pre-26.2 cooperative-tensor builtins without `operand_index`,
+    corrupting all NAX `matmul2d` prefill kernels with zero compiler warnings;
+    unpinned local `macOS 27.x` builds also emit `27.x` metallibs that fail to
+    load on `macOS 26.2+`. Every standalone NAX Metal header/TU using
+    `mpp::tensor_ops::matmul2d` must guard `< 260200` with `#error` and pass
+    `Scripts/check_metallib_target.py`. Never certify a public release from local
+    uploads alone when `.github/workflows/release.yml` overwrites assets with
+    `--clobber` — validate the final GitHub-compiled tarball/`.pkg` after
+    `release.yml` finishes.
 
 Verification footer: when you finish and merge to `master`, bump the semantic
 version in `Sources/Foundation/QWCore/QWVersion.swift`, `CHANGELOG.md`,

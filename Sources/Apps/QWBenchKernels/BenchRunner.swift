@@ -33,14 +33,10 @@ enum BenchError: Error, CustomStringConvertible {
 /// The buffers one measurement needs, and the host reference they must match.
 struct BenchWork {
     let weights: any MTLBuffer
-    let scales: any MTLBuffer
-    let biases: any MTLBuffer
     let x: any MTLBuffer
     let y: any MTLBuffer
     /// The host's answer for the same weights and the same activations.
     let reference: [BenchReference]
-    /// The output is f16 for the MLX tile GEMM and f32 for the family.
-    let yIsHalf: Bool
 }
 
 /// Builds the banks, dispatches the candidates and times them.
@@ -60,9 +56,6 @@ enum BenchRunner {
                                   rows: rows, cols: cols, xs: xs)
         case .incumbentQ4G32:
             return try makeIncumbentWork(device: device, rows: rows, cols: cols, xs: xs)
-        case .mlxNAX(let bits, let group):
-            return try makeMLXWork(device: device, bits: bits, group: group,
-                                   rows: rows, cols: cols, xs: xs)
         }
     }
 
@@ -93,29 +86,14 @@ enum BenchRunner {
                        pso: any MTLComputePipelineState, candidate: BenchCandidate,
                        work: BenchWork, rows: Int, cols: Int) {
         enc.setComputePipelineState(pso)
-        switch candidate {
-        case .family, .incumbentQ4G32:
-            enc.setBuffer(work.weights, offset: 0, index: 0)
-            enc.setBuffer(work.x, offset: 0, index: 1)
-            enc.setBuffer(work.y, offset: 0, index: 3)
-            var n32 = UInt32(rows), k32 = UInt32(cols)
-            enc.setBytes(&n32, length: 4, index: 4)
-            enc.setBytes(&k32, length: 4, index: 5)
-            enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        case .mlxNAX:
-            enc.setBuffer(work.weights, offset: 0, index: 0)
-            enc.setBuffer(work.scales, offset: 0, index: 1)
-            enc.setBuffer(work.biases, offset: 0, index: 2)
-            enc.setBuffer(work.x, offset: 0, index: 3)
-            enc.setBuffer(work.y, offset: 0, index: 4)
-            var k32 = Int32(cols), n32 = Int32(rows), m32 = Int32(1)
-            enc.setBytes(&k32, length: 4, index: 5)
-            enc.setBytes(&n32, length: 4, index: 6)
-            enc.setBytes(&m32, length: 4, index: 7)
-            enc.dispatchThreadgroups(MTLSize(width: (rows + 63) / 64, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-        }
+        enc.setBuffer(work.weights, offset: 0, index: 0)
+        enc.setBuffer(work.x, offset: 0, index: 1)
+        enc.setBuffer(work.y, offset: 0, index: 3)
+        var n32 = UInt32(rows), k32 = UInt32(cols)
+        enc.setBytes(&n32, length: 4, index: 4)
+        enc.setBytes(&k32, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }
 
     /// Evicts the GPU's cache, so the next dispatch reads its weights cold.
@@ -142,27 +120,14 @@ enum BenchRunner {
     /// Checks a candidate's output against the work's host reference.
     static func verify(candidate: BenchCandidate, work: BenchWork, rows: Int) throws {
         var worst: Double = 0
-        if work.yIsHalf {
-            let got = work.y.contents().bindMemory(to: UInt16.self, capacity: rows)
-            for r in 0..<rows {
-                let v = Float(Float16(bitPattern: got[r]))
-                worst = max(worst, relativeError(got: v, reference: work.reference[r]))
-            }
-        } else {
-            let got = work.y.contents().bindMemory(to: Float.self, capacity: rows)
-            for r in 0..<rows {
-                worst = max(worst, relativeError(got: got[r], reference: work.reference[r]))
-            }
+        let got = work.y.contents().bindMemory(to: Float.self, capacity: rows)
+        for r in 0..<rows {
+            worst = max(worst, relativeError(got: got[r], reference: work.reference[r]))
         }
         guard worst <= 1e-3 else {
-            // The first rows, side by side: a disagreement this size is a
-            // mismatch of arithmetic, not of rounding.
-            if !work.yIsHalf {
-                let got = work.y.contents().bindMemory(to: Float.self, capacity: rows)
-                for r in 0..<min(4, rows) {
-                    print("  row \(r): got \(got[r]) reference \(work.reference[r].value) "
-                          + "magnitude \(work.reference[r].magnitude)")
-                }
+            for r in 0..<min(4, rows) {
+                print("  row \(r): got \(got[r]) reference \(work.reference[r].value) "
+                      + "magnitude \(work.reference[r].magnitude)")
             }
             throw BenchError.verificationFailed(candidate.name, worst)
         }
@@ -292,9 +257,7 @@ enum BenchRunner {
             reference[r] = AQBanks.referenceRow(bits: bits, group: group, row: r,
                                                  cols: cols, bank: bank, x: xs)
         }
-        let empty = try makeBuffer(device: device, bytes: 4)
-        return BenchWork(weights: weights, scales: empty, biases: empty,
-                         x: x, y: y, reference: reference, yIsHalf: false)
+        return BenchWork(weights: weights, x: x, y: y, reference: reference)
     }
 
     /// The incumbent's own container for the same logical weights: its own
@@ -315,39 +278,7 @@ enum BenchRunner {
         for r in 0..<rows {
             reference[r] = AQBanks.incumbentReferenceRow(row: r, cols: cols, bank: bank, x: xs)
         }
-        let empty = try makeBuffer(device: device, bytes: 4)
-        return BenchWork(weights: weights, scales: empty, biases: empty,
-                         x: x, y: y, reference: reference, yIsHalf: false)
-    }
-
-    private static func makeMLXWork(device: any MTLDevice, bits: Int, group: Int,
-                                    rows: Int, cols: Int, xs: [Float]) throws -> BenchWork {
-        let (w, scales, biases) = MLXBanks.make(bits: bits, group: group,
-                                                rows: rows, cols: cols)
-        let weights = try makeBuffer(device: device, bytes: w.count)
-        w.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-            weights.contents().copyMemory(from: src.baseAddress!, byteCount: w.count)
-        }
-        let scaleBuf = try makeBuffer(device: device, bytes: scales.count * 2)
-        let biasBuf = try makeBuffer(device: device, bytes: biases.count * 2)
-        let sb = scaleBuf.contents().bindMemory(to: UInt16.self, capacity: scales.count)
-        let bb = biasBuf.contents().bindMemory(to: UInt16.self, capacity: biases.count)
-        for i in 0..<scales.count {
-            sb[i] = Float16(scales[i]).bitPattern
-            bb[i] = Float16(biases[i]).bitPattern
-        }
-        let x = try makeBuffer(device: device, bytes: cols * 2)
-        let y = try makeBuffer(device: device, bytes: rows * 2)
-        let xb = x.contents().bindMemory(to: UInt16.self, capacity: cols)
-        for i in 0..<cols { xb[i] = Float16(xs[i]).bitPattern }
-        var reference = [BenchReference](repeating: BenchReference(value: 0, magnitude: 0),
-                                         count: rows)
-        for r in 0..<rows {
-            reference[r] = MLXBanks.referenceRow(bits: bits, group: group, row: r, cols: cols,
-                                                 w: w, scales: scales, biases: biases, x: xs)
-        }
-        return BenchWork(weights: weights, scales: scaleBuf, biases: biasBuf,
-                         x: x, y: y, reference: reference, yIsHalf: true)
+        return BenchWork(weights: weights, x: x, y: y, reference: reference)
     }
 
     private static func makeBuffer(device: any MTLDevice, bytes: Int) throws -> any MTLBuffer {

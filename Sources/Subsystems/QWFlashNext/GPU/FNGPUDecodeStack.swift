@@ -23,7 +23,7 @@ public final class FNGPUDecodeStack {
     enum StreamStage {
         case host([Float])
         case gathered(FNGPUEmbedTable)
-        case gatheredRows(FNGPUEmbedTable, [Int32])
+        case gatheredPrewritten(FNGPUEmbedTable)
     }
 
     public let slots: [Slot]
@@ -37,6 +37,7 @@ public final class FNGPUDecodeStack {
     let cuts: [Int]
     let steps: [[Step]]
     public private(set) var lastStreamTensor: QWTensorValue
+    private var batchPositionsScratch: [Int] = []
 
     public init(arena: QWArena, ctx: FNGPUContext, slots: [Slot], hidden: Int, hc: Int,
                 rows: Int = 1, gpuPLETable: FNGPUPLETable? = nil) throws {
@@ -77,13 +78,17 @@ public final class FNGPUDecodeStack {
         } else {
             self.gpuPLE = nil
         }
-        let c = Self.decodeCuts(slotCount: slots.count)
+        let needsHostPLECut = (self.gpuPLE == nil) && !pleTargets.isEmpty
+        let c = QWLayerStackSchedule.decodeCuts(slotCount: slots.count, hasPLE: needsHostPLECut)
         self.cuts = c
         var chunkHasPLE: [Bool] = []
         for idx in 0..<(c.count - 1) {
             var hasPLE = false
-            if self.gpuPLE == nil {
-                for i in c[idx]..<c[idx + 1] where slots[i].ple != nil { hasPLE = true; break }
+            if needsHostPLECut {
+                for i in c[idx]..<c[idx + 1] where slots[i].ple != nil && slots[i].weights.ple != nil {
+                    hasPLE = true
+                    break
+                }
             }
             chunkHasPLE.append(hasPLE)
         }
@@ -102,8 +107,12 @@ public final class FNGPUDecodeStack {
         precondition(k >= 1 && k <= rows && !history.isEmpty && history.count >= k && embedTable.hc * embedTable.hidden == width)
         precondition(!verifyAllRows || Self.supportsRollbackWindow(k),
                      "verify rows exceed the four-slot recurrent and PLE rollback ring")
-        let toks = history.suffix(k).map { Int32($0) }
-        return try runRows(history: history, stage: .gatheredRows(embedTable, toks), head: head,
+        let tokPtr = arena.cpuPointer(of: tokensBuf).assumingMemoryBound(to: Int32.self)
+        let startIdx = history.count - k
+        for r in 0..<k {
+            tokPtr[r] = Int32(history[startIdx + r])
+        }
+        return try runRows(history: history, stage: .gatheredPrewritten(embedTable), head: head,
                            readStream: readStream, verifyAllRows: verifyAllRows, mtp: mtp,
                            activeRows: k, relaxedMargin: relaxedMargin, relaxedRows: relaxedRows,
                            relaxedMinProb: relaxedMinProb, dflash: dflash, preContextUpdate: preContextUpdate)
@@ -216,7 +225,7 @@ public final class FNGPUDecodeStack {
         for c in 0..<(cuts.count - 1) {
             let lo = cuts[c], hi = cuts[c + 1]
             let encodeStart = trace?.clock
-            guard let pair = ctx.hal.begin(.concurrent) else {
+            guard let pair = ctx.hal.beginUnretained(.concurrent) else {
                 throw NSError(domain: "FNGPUDecodeStack", code: 1, userInfo: [NSLocalizedDescriptionKey: "no command buffer"])
             }
             let cb = pair.0
@@ -229,8 +238,7 @@ public final class FNGPUDecodeStack {
                 case .gathered(let embedTable):
                     try embedTable.gather(enc: enc, hal: ctx.hal, token: head.token, out: streamA,
                                           rows: 1, hc: embedTable.hc)
-                case .gatheredRows(let embedTable, let toks):
-                    arena.write(tokensBuf, from: toks)
+                case .gatheredPrewritten(let embedTable):
                     try embedTable.gather(enc: enc, hal: ctx.hal, token: tokensBuf, out: streamA,
                                           rows: k, hc: embedTable.hc)
                 }
@@ -387,14 +395,18 @@ public final class FNGPUDecodeStack {
                              embedTable: FNGPUEmbedTable, head: FNGPUHead) throws -> [Int] {
         let B = activeSlots.count
         precondition(B >= 1 && B <= rows && histories.count == B && embedTable.hc * embedTable.hidden == width)
-        let toks: [Int32] = try histories.map { history in
+        let tokPtr = arena.cpuPointer(of: tokensBuf).assumingMemoryBound(to: Int32.self)
+        batchPositionsScratch.removeAll(keepingCapacity: true)
+        batchPositionsScratch.reserveCapacity(B)
+        for (idx, history) in histories.enumerated() {
             guard let last = history.last else {
                 throw NSError(domain: "FNGPUDecodeStack", code: 2,
                               userInfo: [NSLocalizedDescriptionKey: "forwardBatch received empty history"])
             }
-            return Int32(last)
+            tokPtr[idx] = Int32(last)
+            batchPositionsScratch.append(history.count - 1)
         }
-        let positions = histories.map { $0.count - 1 }
+        let positions = batchPositionsScratch
         let numPLE = pleTargets.count
         var pleGroup: DispatchGroup? = nil
         if let gple = gpuPLE {
@@ -423,14 +435,13 @@ public final class FNGPUDecodeStack {
         var cur = streamA, nxt = streamB
         for c in 0..<(cuts.count - 1) {
             let lo = cuts[c], hi = cuts[c + 1]
-            guard let pair = ctx.hal.begin(.concurrent) else {
+            guard let pair = ctx.hal.beginUnretained(.concurrent) else {
                 throw NSError(domain: "FNGPUDecodeStack", code: 1, userInfo: [NSLocalizedDescriptionKey: "no command buffer"])
             }
             let cb = pair.0
             let enc = pair.1
             openEnc = enc
             if c == 0 {
-                arena.write(tokensBuf, from: toks)
                 try embedTable.gather(enc: enc, hal: ctx.hal, token: tokensBuf, out: streamA,
                                       rows: B, hc: embedTable.hc)
                 if let gple = gpuPLE {

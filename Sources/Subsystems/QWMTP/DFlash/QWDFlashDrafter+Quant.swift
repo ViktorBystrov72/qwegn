@@ -130,7 +130,7 @@ extension QWDFlashDrafter {
             if map[key] != nil { continue }
             guard let decName = QWGemmAQ.decodeKernelName(bits: w.bits, group: w.groupSize, isSHVQ: w.isSHVQ),
                   let siluName = QWGemmAQ.siluPairKernelName(bits: w.bits, group: w.groupSize, isSHVQ: w.isSHVQ),
-                  let gemmName = QWGemmAQ.gemmKernelName(bits: w.bits, group: w.groupSize, bm128: false, isSHVQ: w.isSHVQ) else {
+                  let gemmName = QWGemmAQ.gemmKernelName(bits: w.bits, group: w.groupSize, isSHVQ: w.isSHVQ) else {
                 throw QWDFlashError.state("QWDFlashDrafter: unsupported quant format \(w.formatName)")
             }
             map[key] = DrafterQuantPipelines(

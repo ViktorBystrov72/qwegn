@@ -24,61 +24,6 @@ METAL_FUNC uint qwg_aq_read_bits(device const uchar* p, int bits, int index) {
     return v & ((1u << uint(bits)) - 1u);
 }
 
-/// One group's dot, f16 activations: the group-factored form MLX's `qdot`
-/// uses, with the scale and the bias applied once per group.
-template <int BITS>
-METAL_FUNC float qwg_aq_dot_stream_f16(device const char* gp, uint group, device const half* xg) {
-    const float scale = float(*(device const half*)gp);
-    const float bias = float(*(device const half*)(gp + 2));
-    device const uchar* p = (device const uchar*)(gp + 4);
-    float accum = 0.0f;
-    float sumX = 0.0f;
-    for (uint i = 0; i < group; ++i) {
-        const float v = float(qwg_aq_read_bits(p, BITS, int(i)));
-        const float x = float(xg[i]);
-        accum = fma(v, x, accum);
-        sumX += x;
-    }
-    return fma(scale, accum, bias * sumX);
-}
-
-/// One group's dot, f32 activations: the group-factored form.
-template <int BITS>
-METAL_FUNC float qwg_aq_dot_stream_f32(device const char* gp, uint group, device const float* xg) {
-    const float scale = float(*(device const half*)gp);
-    const float bias = float(*(device const half*)(gp + 2));
-    device const uchar* p = (device const uchar*)(gp + 4);
-    float accum = 0.0f;
-    float sumX = 0.0f;
-    for (uint i = 0; i < group; ++i) {
-        const float v = float(qwg_aq_read_bits(p, BITS, int(i)));
-        const float x = xg[i];
-        accum = fma(v, x, accum);
-        sumX += x;
-    }
-    return fma(scale, accum, bias * sumX);
-}
-
-/// One row's dot, f32 activations.
-template <int BITS, int GROUP>
-METAL_FUNC float qwg_aq_gemv_row_f32(device const char* blocks, device const float* x,
-                                     uint row, uint cols, uint lane) {
-    const uint nGroups = cols / uint(GROUP);
-    const uint bytesPerGroup = uint(GROUP * BITS / 8 + 4);
-    device const char* rowBlocks = blocks + (size_t)row * nGroups * bytesPerGroup;
-    float acc = 0.0f;
-    for (uint g = lane; g < nGroups; g += 32u) {
-        device const char* gp = rowBlocks + (size_t)g * bytesPerGroup;
-        acc += qwg_aq_dot_stream_f32<BITS>(gp, uint(GROUP), x + (size_t)g * uint(GROUP));
-    }
-    acc += simd_shuffle_down(acc, 16);
-    acc += simd_shuffle_down(acc, 8);
-    acc += simd_shuffle_down(acc, 4);
-    acc += simd_shuffle_down(acc, 2);
-    acc += simd_shuffle_down(acc, 1);
-    return acc;
-}
-
 /// Sums 32 half activations (4x lo + 4x hi) in fp32 once per 32-column block.
 METAL_FUNC float qwg_aq_sum32(thread const half4 (&lo)[4],
                               thread const half4 (&hi)[4]) {

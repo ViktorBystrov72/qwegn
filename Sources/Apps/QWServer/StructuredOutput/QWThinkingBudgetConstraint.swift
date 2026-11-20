@@ -12,6 +12,7 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
     private let lock = NSLock()
     private let maxThinkingTokens: Int
     private let endThinkTokenId: Int
+    private let forcedEndThinkAllowed: [Int]
     private let vocabularySize: Int
     private let hasValidEndThink: Bool
     private let forwardEndThinkToInner: Bool
@@ -21,6 +22,12 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
     private var inThinking: Bool = true
     private var thinkingTokens: Int = 0
     private var recentUTF8: [UInt8] = []
+
+    private enum AcceptAction {
+        case none
+        case single(Int)
+        case multiple([Int])
+    }
 
     public init(
         maxThinkingTokens: Int,
@@ -33,19 +40,13 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
     ) {
         self.maxThinkingTokens = max(0, maxThinkingTokens)
         self.endThinkTokenId = endThinkTokenId
+        self.forcedEndThinkAllowed = [endThinkTokenId]
         self.vocabularySize = vocabularySize
         self.hasValidEndThink = endThinkTokenId >= 0 && endThinkTokenId < vocabularySize
         self.forwardEndThinkToInner = forwardEndThinkToInner
         self.tokenBytes = tokenBytes ?? table?.bytes
         self.inner = inner
-    }
-
-    public var isInThinking: Bool {
-        lock.withLock { inThinking }
-    }
-
-    public var thinkingTokenCount: Int {
-        lock.withLock { thinkingTokens }
+        self.recentUTF8.reserveCapacity(128)
     }
 
     public var allowsSpeculation: Bool {
@@ -79,18 +80,22 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
         return inner?.speculationBoundaryToken
     }
 
-    public func allowedTokens() throws -> [Int]? {
-        enum Decision { case forceEndThink, unconstrained, forwardInner }
-        let decision: Decision = lock.withLock {
+    private enum AllowedDecision { case forceEndThink, unconstrained, forwardInner }
+
+    private func currentAllowedDecision() -> AllowedDecision {
+        lock.withLock {
             guard inThinking else { return .forwardInner }
             if thinkingTokens >= maxThinkingTokens && hasValidEndThink {
                 return .forceEndThink
             }
             return .unconstrained
         }
-        switch decision {
+    }
+
+    public func allowedTokens() throws -> [Int]? {
+        switch currentAllowedDecision() {
         case .forceEndThink:
-            return [endThinkTokenId]
+            return forcedEndThinkAllowed
         case .unconstrained:
             return nil
         case .forwardInner:
@@ -98,22 +103,40 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
         }
     }
 
+    public func writeAllowedTokens(into scratch: inout [Int]) throws -> Bool {
+        switch currentAllowedDecision() {
+        case .forceEndThink:
+            scratch.removeAll(keepingCapacity: true)
+            scratch.append(endThinkTokenId)
+            return true
+        case .unconstrained:
+            return false
+        case .forwardInner:
+            return try inner?.writeAllowedTokens(into: &scratch) ?? false
+        }
+    }
+
     public func accept(_ token: Int) throws {
-        let forwarded: [Int] = lock.withLock {
+        let action: AcceptAction = lock.withLock {
             guard inThinking else {
-                return [token]
+                return .single(token)
             }
             if hasValidEndThink && token == endThinkTokenId {
                 inThinking = false
                 recentUTF8.removeAll(keepingCapacity: false)
-                return forwardEndThinkToInner ? [token] : []
+                return forwardEndThinkToInner ? .single(token) : .none
             }
             thinkingTokens += 1
             if let tokenBytes, token >= 0, token < tokenBytes.count, token < vocabularySize,
                let bytes = tokenBytes[token], !bytes.isEmpty {
                 recentUTF8.append(contentsOf: bytes)
                 if recentUTF8.count > 64 {
-                    recentUTF8.removeFirst(recentUTF8.count - 64)
+                    let drop = recentUTF8.count - 64
+                    recentUTF8.withUnsafeMutableBufferPointer { buf in
+                        guard let base = buf.baseAddress else { return }
+                        memmove(base, base.advanced(by: drop), 64)
+                    }
+                    recentUTF8.removeLast(drop)
                 }
                 if let matchEnd = Self.endOfSubslice(recentUTF8, Self.endThinkBytes)
                     ?? Self.endOfSubslice(recentUTF8, Self.ernieEndThinkBytes) {
@@ -127,13 +150,22 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
                     if !trailingBytes.isEmpty {
                         tokens.append(contentsOf: decomposeBytes(trailingBytes, using: tokenBytes))
                     }
-                    return tokens
+                    if tokens.isEmpty { return .none }
+                    if tokens.count == 1 { return .single(tokens[0]) }
+                    return .multiple(tokens)
                 }
             }
-            return []
+            return .none
         }
-        for tok in forwarded {
+        switch action {
+        case .none:
+            break
+        case .single(let tok):
             try inner?.accept(tok)
+        case .multiple(let toks):
+            for tok in toks {
+                try inner?.accept(tok)
+            }
         }
     }
 

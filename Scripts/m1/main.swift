@@ -96,10 +96,10 @@ let repoRoot = URL(fileURLWithPath: #filePath)
 let buildDir = repoRoot.appendingPathComponent(".build", isDirectory: true)
 try? FileManager.default.createDirectory(at: buildDir, withIntermediateDirectories: true)
 let exportPath = optVal("--export")
-    ?? QWCli.SoakRecorder.exportURL(in: buildDir).path
+    ?? SoakRecorder.exportURL(in: buildDir).path
 let exportURL = URL(fileURLWithPath: exportPath)
 try? FileManager.default.removeItem(at: exportURL)
-var recorder = QWCli.SoakRecorder(url: exportURL)
+var recorder = SoakRecorder(url: exportURL)
 
 // ── mode 1: the CPU-only reference soak (no model, no GPU) ─────────────────
 if optFlag("--harness") {
@@ -109,7 +109,7 @@ if optFlag("--harness") {
     }
     let rows = Int(optVal("--rows") ?? "") ?? 2_048
     let started = Date()
-    let samples = QWCli.LocalSoak.run(.init(steps: steps, window: window, rows: rows))
+    let samples = LocalSoak.run(.init(steps: steps, window: window, rows: rows))
     try recorder.record(samples)
     let wall = Date().timeIntervalSince(started)
     print("[m1] local reference soak: \(steps) steps in \(String(format: "%.1f", wall)) s "
@@ -201,9 +201,9 @@ while done < steps {
         _ = try engine.prefill(session, tokens: seed)
         var token = seed[seed.count - 1]
         for _ in 0..<n {
-            let t0 = QWCli.ProcessTelemetry.clockGetNanos()
+            let t0 = ProcessTelemetry.clockGetNanos()
             token = try engine.decodeStep(session, token: token)
-            times.append(Double(QWCli.ProcessTelemetry.clockGetNanos() - t0) / 1_000_000)
+            times.append(Double(ProcessTelemetry.clockGetNanos() - t0) / 1_000_000)
         }
         engine.finishSession(session)
     } catch {
@@ -218,8 +218,8 @@ while done < steps {
         windowP50Ms: percentile(ordered, 0.50),
         windowP95Ms: percentile(ordered, 0.95),
         steadyAllocs: engine.steadyAllocs,
-        rssKb: QWCli.ProcessTelemetry.rssKb(),
-        fds: QWCli.ProcessTelemetry.fdCount(),
+        rssKb: ProcessTelemetry.rssKb(),
+        fds: ProcessTelemetry.fdCount(),
         cbErrors: engine.commandBufferErrors,
         kvFreePages: engine.freeKVPages,
         source: QWCli.SoakSample.engineSource,

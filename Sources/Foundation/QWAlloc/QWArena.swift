@@ -325,9 +325,20 @@ public final class QWPageArena: @unchecked Sendable {
 /// buffers when `totalBytes > hal.device.maxBufferLength`), split at fixed
 /// offsets into weights / activation / KV / GDN-state regions.
 public final class QWArena: @unchecked Sendable {
+    public enum ArenaHazardPolicy: Sendable, Equatable {
+        /// Track mutable/shared arenas (`bigBuffer`, `activations`, `kv`, `gdnStates`);
+        /// untrack split read-only `weights` slabs when `total > maxBufferLength`.
+        case safeDefault
+        /// Force `.hazardTrackingModeTracked` on all arena buffers (`QWG_TRACKED_ARENAS=1`).
+        case forceTracked
+        /// Force `.hazardTrackingModeUntracked` on all arena buffers (`QWG_UNTRACKED_ARENAS=1`).
+        case forceUntracked
+    }
+
     public let hal: QWHal
     public let totalBytes: Int
     public let regionSizes: (weights: Int, act: Int, kv: Int, gdn: Int)
+    public let hazardPolicy: ArenaHazardPolicy
     private let bigBuffer: any MTLBuffer
     public let allBuffers: [any MTLBuffer]
     public private(set) var committedBytes: Int = 0
@@ -348,9 +359,41 @@ public final class QWArena: @unchecked Sendable {
             : alignedMax
     }
 
+    public static func resolveHazardPolicy(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> ArenaHazardPolicy {
+        if environment["QWG_TRACKED_ARENAS"] == "1" { return .forceTracked }
+        if environment["QWG_UNTRACKED_ARENAS"] == "1" { return .forceUntracked }
+        return .safeDefault
+    }
+
+    static func resourceOptions(
+        forWeightSlab: Bool,
+        policy: ArenaHazardPolicy
+    ) -> MTLResourceOptions {
+        switch policy {
+        case .forceTracked:
+            return [.storageModeShared, .hazardTrackingModeTracked]
+        case .forceUntracked:
+            return [.storageModeShared, .hazardTrackingModeUntracked]
+        case .safeDefault:
+            return forWeightSlab
+                ? [.storageModeShared, .hazardTrackingModeUntracked]
+                : .storageModeShared
+        }
+    }
+
     /// Sizes decided once at launch by the caller's allocation plan.
     /// All region capacities and bases are rounded to 256 B.
-    public init(hal: QWHal, weights: Int, activations: Int, kv: Int, gdnStates: Int, keepAlive: Bool = true) throws {
+    public init(
+        hal: QWHal,
+        weights: Int,
+        activations: Int,
+        kv: Int,
+        gdnStates: Int,
+        keepAlive: Bool = true,
+        hazardPolicy: ArenaHazardPolicy? = nil
+    ) throws {
         guard let w = qwCheckedAlignUp(weights, 256),
               let a = qwCheckedAlignUp(activations, 256),
               let k = qwCheckedAlignUp(kv, 256),
@@ -365,11 +408,14 @@ public final class QWArena: @unchecked Sendable {
             throw QWAllocError.arenaTooLarge(asked: (ov0 || ov1 || ov2) ? Int.max : total, limit: limit)
         }
         let maxBuf = max(256, (Int(hal.device.maxBufferLength) / 256) * 256)
+        let resolvedPolicy = hazardPolicy ?? Self.resolveHazardPolicy()
         self.hal = hal
         self.totalBytes = total
         self.regionSizes = (w, a, k, g)
+        self.hazardPolicy = resolvedPolicy
         if total <= maxBuf {
-            guard let buf = hal.device.makeBuffer(length: max(256, total), options: .storageModeShared) else {
+            let bigOpts = Self.resourceOptions(forWeightSlab: false, policy: resolvedPolicy)
+            guard let buf = hal.device.makeBuffer(length: max(256, total), options: bigOpts) else {
                 throw QWAllocError.outOfSpace(region: "arena", asked: total, free: 0)
             }
             self.committedBytes = total
@@ -382,11 +428,12 @@ public final class QWArena: @unchecked Sendable {
             self.kvAuxSub = nil
             self.gdnSub = QWSubAllocator(region: QWMRegion(buffer: buf, base: w + a + k, length: g))
         } else {
-            func allocBuf(_ len: Int, _ name: String) throws -> any MTLBuffer {
+            func allocBuf(_ len: Int, _ name: String, isWeightSlab: Bool = false) throws -> any MTLBuffer {
                 guard len <= maxBuf else {
                     throw QWAllocError.outOfSpace(region: name, asked: len, free: maxBuf)
                 }
-                guard let b = hal.device.makeBuffer(length: max(256, len), options: .storageModeShared) else {
+                let opts = Self.resourceOptions(forWeightSlab: isWeightSlab, policy: resolvedPolicy)
+                guard let b = hal.device.makeBuffer(length: max(256, len), options: opts) else {
                     throw QWAllocError.outOfSpace(region: name, asked: len, free: 0)
                 }
                 return b
@@ -395,7 +442,7 @@ public final class QWArena: @unchecked Sendable {
             var wRegions: [QWMRegion] = []
             var slackBytes = 0
             if w <= maxBuf {
-                let wBuf = try allocBuf(w, "weights")
+                let wBuf = try allocBuf(w, "weights", isWeightSlab: true)
                 bufs.append(wBuf)
                 wRegions.append(QWMRegion(buffer: wBuf, base: 0, length: w))
             } else {
@@ -409,7 +456,7 @@ public final class QWArena: @unchecked Sendable {
                 var slabIdx = 0
                 while remainingW > 0 {
                     let chunk = min(slabCap, remainingW)
-                    let sb = try allocBuf(chunk, "weights.\(slabIdx)")
+                    let sb = try allocBuf(chunk, "weights.\(slabIdx)", isWeightSlab: true)
                     bufs.append(sb)
                     wRegions.append(QWMRegion(buffer: sb, base: 0, length: chunk))
                     remainingW -= chunk

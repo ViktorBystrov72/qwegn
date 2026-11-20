@@ -78,19 +78,19 @@ final class QWTargetGreedyParityTests: XCTestCase {
             let p = window.logits.region.pointer.advanced(by: window.logits.offset).assumingMemoryBound(to: Float.self)
             for i in 0..<rows * 33 { p[i] = -1 }
             for row in 0..<rows { p[row * 33] = -0.0; p[row * 33 + 32] = 0.0 }
-            let accepted = try window.greedyDecision(drafts: Array(repeating: 32, count: rows - 1), maxNew: rows)
+            let accepted = try window.greedyDecisionWithTargets(drafts: Array(repeating: 32, count: rows - 1), maxNew: rows).decision
             XCTAssertEqual(accepted.acceptedDrafts, rows - 1)
             XCTAssertEqual(accepted.tokens, Array(repeating: 32, count: rows))
-            let rejected = try window.greedyDecision(drafts: Array(repeating: 0, count: rows - 1), maxNew: rows)
+            let rejected = try window.greedyDecisionWithTargets(drafts: Array(repeating: 0, count: rows - 1), maxNew: rows).decision
             XCTAssertEqual(rejected.acceptedDrafts, 0)
             XCTAssertEqual(rejected.tokens, [32])
-            let stopped = try window.greedyDecision(drafts: Array(repeating: 32, count: rows - 1),
-                                                    maxNew: rows, stopIDs: [32])
+            let stopped = try window.greedyDecisionWithTargets(drafts: Array(repeating: 32, count: rows - 1),
+                                                               maxNew: rows, stopIDs: [32]).decision
             XCTAssertTrue(stopped.stopped)
             XCTAssertEqual(stopped.retainedRows, 0)
             for invalid in [Float.nan, Float.infinity, -Float.infinity] {
                 p[(rows - 1) * 33 + 1] = invalid
-                XCTAssertThrowsError(try window.greedyDecision(drafts: Array(repeating: 0, count: rows - 1), maxNew: rows),
+                XCTAssertThrowsError(try window.greedyDecisionWithTargets(drafts: Array(repeating: 0, count: rows - 1), maxNew: rows),
                                      "all target rows must be finite even after early rejection")
             }
         }

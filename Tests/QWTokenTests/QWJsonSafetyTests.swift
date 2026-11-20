@@ -183,4 +183,45 @@ final class QWJsonSafetyTests: XCTestCase {
         }
         XCTAssertThrowsError(try QWJson(from: UnsupportedScalarDecoder()))
     }
+
+    func testOrderedRootUserInfoPreservesKeyOrderUnderFoundationJSONDecoder() throws {
+        struct Payload: Decodable {
+            let tools: [QWJson]
+            let nested: QWJson
+        }
+        let raw = """
+        {
+          "tools": [
+            {
+              "z_last": 1,
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "description": "Weather lookup",
+                "parameters": {
+                  "type": "object",
+                  "properties": {"zeta": {"type": "string"}, "alpha": {"type": "integer"}},
+                  "required": ["zeta"]
+                }
+              }
+            }
+          ],
+          "nested": {"x": 1},
+          "nested": {"z": 10, "a": 20}
+        }
+        """
+        let data = Data(raw.utf8)
+        let root = try QWJson.parse(data)
+        let expectedTool = """
+        {"z_last": 1, "type": "function", "function": {"name": "get_weather", "description": "Weather lookup", "parameters": {"type": "object", "properties": {"zeta": {"type": "string"}, "alpha": {"type": "integer"}}, "required": ["zeta"]}}}
+        """
+        for _ in 0..<25 {
+            let decoder = JSONDecoder()
+            decoder.userInfo[QWJson.orderedRootUserInfoKey] = root
+            let decoded = try decoder.decode(Payload.self, from: data)
+            XCTAssertEqual(decoded.tools.count, 1)
+            XCTAssertEqual(decoded.tools[0].tojson, expectedTool)
+            XCTAssertEqual(decoded.nested, .object([("z", .int(10)), ("a", .int(20))]))
+        }
+    }
 }

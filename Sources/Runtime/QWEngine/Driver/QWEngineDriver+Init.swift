@@ -182,7 +182,7 @@ extension QWEngineDriver {
         let psoRMSNormResidualMoE = try hal.pipeline("qwg_rmsnorm_residual_moe")
         let psoRMSNormResidualMoEWide = try hal.pipeline("qwg_rmsnorm_residual_moe_wide")
         let psoHeadF16 = try hal.pipeline("qwg_gemv_f16_v4")
-        let psoGemmBatchedH16 = try hal.pipeline(Self.gemmKernelName(format: weightFormat, bm128: false))
+        let psoGemmBatchedH16 = try hal.pipeline(Self.gemmKernelName(format: weightFormat))
         let psoGemmBatchedH16SwiGLU = try hal.pipeline(Self.swigluGemmKernelName(format: weightFormat))
         let psoGemmBatchedH16GdnInProj = try hal.pipeline(Self.gdnInProjPrefillKernelName(format: weightFormat))
         let psoSiluMulF16 = try hal.pipeline("qwg_silu_mul_f16")
@@ -391,7 +391,7 @@ extension QWEngineDriver {
             case .incumbentHQ4G32:
                 return
             case .shvq(let bits, let group), .rotatedHQ(let bits, let group), .nativeAffine(let bits, let group):
-                guard let name = QWGemmAQ.gemmKernelName(bits: bits, group: group, bm128: false,
+                guard let name = QWGemmAQ.gemmKernelName(bits: bits, group: group,
                                                          isSHVQ: w.containerKind.isSHVQ),
                       seenGemms.insert(name).inserted else { return }
                 _ = try hal.pipeline(name)

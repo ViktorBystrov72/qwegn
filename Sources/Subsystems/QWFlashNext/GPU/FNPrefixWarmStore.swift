@@ -159,64 +159,6 @@ public final class FNPrefixWarmStore: @unchecked Sendable {
         core.contains(name)
     }
 
-    public func longestMatch(history: [Int64], kvMode: FNKVStorageMode,
-                             hasMTP: Bool, dflashMarker: String? = nil) -> (name: String, tokens: Int)? {
-        let queryRootHash: UInt64? = history.count >= Self.rootPrefixTokenCount
-            ? Self.rootHash(history: history, kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker)
-            : nil
-        var matchedName: String?
-        let hit = QWTwoTierPrefixCache.lookupWarmPrefix(
-            in: core,
-            exactKey: "",
-            saltedBaseKey: nil,
-            tokenCount: history.count,
-            queryRootHash: queryRootHash,
-            allowExact: false,
-            allowPrefix: true,
-            sharedBaseOnly: false,
-            touchOnHit: false,
-            isCandidate: { _, _, _ in true },
-            matchesPrefix: { name, count, _ in
-                let ok = Self.matchesEntry(
-                    name: name, count: count, history: history,
-                    kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker
-                )
-                if ok { matchedName = name }
-                return ok
-            }
-        )
-        guard let hit, let name = matchedName else { return nil }
-        core.touchSlot(for: name)
-        return (name, hit.matchedTokens)
-    }
-
-    public func longestSharedBaseMatch(history: [Int64], kvMode: FNKVStorageMode,
-                                       hasMTP: Bool, dflashMarker: String? = nil) -> (name: String, tokens: Int)? {
-        var matchedName: String?
-        let hit = QWTwoTierPrefixCache.lookupWarmPrefix(
-            in: core,
-            exactKey: "",
-            saltedBaseKey: nil,
-            tokenCount: history.count,
-            queryRootHash: nil,
-            allowExact: false,
-            allowPrefix: true,
-            sharedBaseOnly: true,
-            touchOnHit: false,
-            isCandidate: { _, _, _ in true },
-            matchesPrefix: { name, count, _ in
-                let ok = Self.matchesEntry(
-                    name: name, count: count, history: history,
-                    kvMode: kvMode, hasMTP: hasMTP, dflashMarker: dflashMarker
-                )
-                if ok { matchedName = name }
-                return ok
-            }
-        )
-        guard let hit, let name = matchedName else { return nil }
-        return (name, hit.matchedTokens)
-    }
-
     public func lookupWarmHit(
         exactName: String,
         history: [Int64],

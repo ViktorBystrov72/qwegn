@@ -26,12 +26,99 @@ public protocol QWTokenConstraint: AnyObject, Sendable {
     /// Token ID at which an unconstrained speculative round must stop so subsequent
     /// tokens can be verified with full logits.
     var speculationBoundaryToken: Int? { get }
+
+    /// Writes ascending selectable token IDs into `scratch` (keeping capacity),
+    /// returning `false` when unconstrained (`allowedTokens() == nil`).
+    func writeAllowedTokens(into scratch: inout [Int]) throws -> Bool
 }
 
 extension QWTokenConstraint {
     public var allowsSpeculation: Bool { false }
     public var isUnconstrainedNow: Bool { false }
     public var speculationBoundaryToken: Int? { nil }
+
+    public func writeAllowedTokens(into scratch: inout [Int]) throws -> Bool {
+        guard let allowed = try allowedTokens() else { return false }
+        scratch.removeAll(keepingCapacity: true)
+        scratch.append(contentsOf: allowed)
+        return true
+    }
+}
+
+/// Reusable preallocated scratch buffer and bitset for zero-allocation token masking.
+public final class QWTokenMaskScratch: @unchecked Sendable {
+    private var words: [UInt64] = []
+    private var dirtyWords: [Int] = []
+    private var activeVocabSize: Int = 0
+
+    public init(vocabularyCapacity: Int = 0) {
+        ensureVocabularyCapacity(vocabularyCapacity)
+    }
+
+    /// O(log N) membership test on ascending de-duplicated `sorted` token IDs.
+    @inline(__always)
+    public static func sortedTokens(_ sorted: [Int], contains token: Int) -> Bool {
+        var lo = 0
+        var hi = sorted.count - 1
+        while lo <= hi {
+            let mid = lo + ((hi - lo) >> 1)
+            let val = sorted[mid]
+            if val == token { return true }
+            if val < token { lo = mid + 1 } else { hi = mid - 1 }
+        }
+        return false
+    }
+
+    public func ensureVocabularyCapacity(_ vocabularySize: Int) {
+        let clamped = max(0, vocabularySize)
+        let neededWords = (clamped + 63) >> 6
+        if words.count < neededWords {
+            words.append(contentsOf: repeatElement(0, count: neededWords - words.count))
+        }
+        activeVocabSize = clamped
+    }
+
+    /// Clears previously set bits in O(dirtyWords.count) without scanning the full bitset.
+    public func clearBitset() {
+        for wordIdx in dirtyWords {
+            words[wordIdx] = 0
+        }
+        dirtyWords.removeAll(keepingCapacity: true)
+    }
+
+    /// Populates the bitset from a `Set<Int>` or `[Int]` repetition history in O(history.count).
+    public func markTokens<S: Sequence>(_ tokens: S, vocabularySize: Int) throws where S.Element == Int {
+        clearBitset()
+        ensureVocabularyCapacity(vocabularySize)
+        for token in tokens {
+            guard token >= 0, token < vocabularySize else {
+                clearBitset()
+                throw QWTokenConstraintError.rejectedToken(token)
+            }
+            markTokenUnchecked(token)
+        }
+    }
+
+    @inline(__always)
+    func markTokenUnchecked(_ token: Int) {
+        let wordIdx = token >> 6
+        let mask = UInt64(1) &<< UInt64(token & 63)
+        if words[wordIdx] == 0 {
+            dirtyWords.append(wordIdx)
+        }
+        words[wordIdx] |= mask
+    }
+
+    @inline(__always)
+    public func contains(_ token: Int) -> Bool {
+        guard token >= 0, token < activeVocabSize else { return false }
+        return (words[token >> 6] & (UInt64(1) &<< UInt64(token & 63))) != 0
+    }
+
+    @inline(__always)
+    func word(at index: Int) -> UInt64 { words[index] }
+
+    var activeWordCount: Int { (activeVocabSize + 63) >> 6 }
 }
 
 public enum QWTokenConstraintError: Error, CustomStringConvertible, Equatable {

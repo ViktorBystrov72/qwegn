@@ -57,50 +57,68 @@ extension QWTokenizer {
     /// Merge law (engine parity): min-rank adjacent pair wins, leftmost on
     /// ties (strict `<` scan), ALL occurrences of that pair merge in one
     /// left-to-right pass; repeat until no ranked pair remains.
-    func bpeWord(_ bytesSlice: ArraySlice<UInt8>) -> [Int] {
-        guard !bytesSlice.isEmpty else { return [] }
-        var word: [UInt32] = []
-        word.reserveCapacity(bytesSlice.count)
-        for b in bytesSlice {
-            word.append(byteToSymId[Int(b)])
+    private func bpeMergeInPlace(_ word: inout [UInt32]) {
+        var count = word.count
+        while count > 1 {
+            var bestRank = Int.max
+            var bestA: UInt32 = 0
+            var bestB: UInt32 = 0
+            var bestMerged: UInt32 = 0
+            word.withUnsafeBufferPointer { buf in
+                guard let p = buf.baseAddress else { return }
+                var i = 0
+                while i < count - 1 {
+                    let a = p[i]
+                    let b = p[i + 1]
+                    let k = (UInt64(a) << 32) | UInt64(b)
+                    if let rule = mergeRules[k], rule.rank < bestRank {
+                        bestRank = rule.rank
+                        bestA = a
+                        bestB = b
+                        bestMerged = rule.merged
+                    }
+                    i += 1
+                }
+            }
+            guard bestRank != Int.max else { break }
+            var w = 0
+            word.withUnsafeMutableBufferPointer { buf in
+                guard let p = buf.baseAddress else { return }
+                var r = 0
+                while r < count {
+                    if r + 1 < count && p[r] == bestA && p[r + 1] == bestB {
+                        p[w] = bestMerged
+                        r += 2
+                    } else {
+                        p[w] = p[r]
+                        r += 1
+                    }
+                    w += 1
+                }
+            }
+            word.removeSubrange(w..<count)
+            count = w
         }
-        return bpeMerge(word)
     }
 
-    func bpeMerge(_ initialWord: [UInt32]) -> [Int] {
-        var word = initialWord
-        guard !word.isEmpty else { return [] }
-        if word.count == 1 {
-            return [symTok[word[0]] ?? -1]
-        }
-        while word.count > 1 {
-            var bestKey = UInt64.max
-            var bestRank = Int.max
-            let count = word.count
-            for i in 0..<(count - 1) {
-                let k = UInt64(word[i]) << 32 | UInt64(word[i + 1])
-                if let r = ranks[k], r < bestRank {
-                    bestRank = r
-                    bestKey = k
-                }
+    @inline(__always)
+    static func isPureASCII(_ bytes: [UInt8], _ lo: Int, _ hi: Int) -> Bool {
+        guard hi > lo else { return true }
+        return bytes.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return true }
+            var i = lo
+            let end8 = hi - 7
+            while i < end8 {
+                let w = UnsafeRawPointer(base.advanced(by: i)).loadUnaligned(as: UInt64.self)
+                if (w & 0x8080_8080_8080_8080) != 0 { return false }
+                i += 8
             }
-            guard bestKey != UInt64.max, let merged = pairMerged[bestKey] else { break }
-            let a = UInt32(bestKey >> 32), b = UInt32(bestKey & 0xFFFF_FFFF)
-            var w = 0
-            var r = 0
-            while r < word.count {
-                if r + 1 < word.count && word[r] == a && word[r + 1] == b {
-                    word[w] = merged
-                    r += 2
-                } else {
-                    word[w] = word[r]
-                    r += 1
-                }
-                w += 1
+            while i < hi {
+                if base[i] >= 0x80 { return false }
+                i += 1
             }
-            word.removeSubrange(w..<word.count)
+            return true
         }
-        return word.map { symTok[$0] ?? -1 }
     }
 
     // MARK: encode
@@ -108,7 +126,47 @@ extension QWTokenizer {
     /// checkpoint's post-processor adds nothing; pinned by goldens
     public func encode(_ text: String, addSpecialTokens: Bool = false) throws -> [Int] {
         _ = addSpecialTokens   // no-op law (see above)
+        let rawBytes = Array(text.utf8)
+        guard !rawBytes.isEmpty else { return [] }
         var ids: [Int] = []
+        ids.reserveCapacity(max(8, rawBytes.count / 3 + 8))
+        let cacheEnabled = rawBytes.count >= 128
+        var wordCache = QWWordMergeCache()
+        var wordScratch: [UInt32] = []
+        var tokScratch: [Int] = []
+        var pieceBytes: [UInt8] = []
+        var spans: [(Int, Int)] = []
+        var nextSpans: [(Int, Int)] = []
+        wordScratch.reserveCapacity(64)
+        tokScratch.reserveCapacity(32)
+
+        func emitBPEFromScratch(
+            keyBytes: [UInt8],
+            keyLo: Int,
+            keyHi: Int,
+            cacheKeyHash: UInt64?,
+            unresolvedText: @autoclosure () -> String
+        ) throws {
+            bpeMergeInPlace(&wordScratch)
+            tokScratch.removeAll(keepingCapacity: true)
+            let symCount = symTok.count
+            for sid in wordScratch {
+                let idx = Int(sid)
+                let tid = idx < symCount ? symTok[idx] : -1
+                if tid < 0 {
+                    throw Error.unresolvedByte(unresolvedText())
+                }
+                tokScratch.append(tid)
+            }
+            if let hash = cacheKeyHash {
+                let len = keyHi - keyLo
+                keyBytes.withUnsafeBufferPointer { buf in
+                    guard let base = buf.baseAddress else { return }
+                    wordCache.insert(base.advanced(by: keyLo), count: len, hash: hash, tokens: tokScratch)
+                }
+            }
+            ids.append(contentsOf: tokScratch)
+        }
 
         func encodeChunk(
             _ bytes: [UInt8],
@@ -130,43 +188,70 @@ extension QWTokenizer {
                     ? Self.splitMetaspaceMergedWithNext(seg, delimiter: rep)
                     : [seg[...]]
                 for piece in wordPieces where !piece.isEmpty {
-                    var syms: [UInt32] = []
-                    syms.reserveCapacity(piece.unicodeScalars.count)
+                    var missHash: UInt64? = nil
+                    if cacheEnabled {
+                        pieceBytes.removeAll(keepingCapacity: true)
+                        pieceBytes.append(contentsOf: piece.utf8)
+                        let len = pieceBytes.count
+                        if len <= QWWordMergeCache.maxKeyBytes {
+                            let (hit, h) = pieceBytes.withUnsafeBufferPointer { buf -> (Bool, UInt64) in
+                                guard let base = buf.baseAddress else { return (false, 0) }
+                                let hash = QWWordMergeCache.hashBytes(base, count: len)
+                                return (wordCache.lookup(base, count: len, hash: hash, into: &ids), hash)
+                            }
+                            if hit { continue }
+                            missHash = h
+                        }
+                    }
+                    wordScratch.removeAll(keepingCapacity: true)
                     for sc in piece.unicodeScalars {
                         let s = String(sc)
                         if let sid = symId[s] {
-                            syms.append(sid)
+                            wordScratch.append(sid)
                         } else {
-                            for b in s.utf8 { syms.append(byteToSymId[Int(b)]) }
+                            for b in s.utf8 { wordScratch.append(byteToSymId[Int(b)]) }
                         }
                     }
-                    for g in bpeMerge(syms) {
-                        if g < 0 { throw Error.unresolvedByte(String(piece.prefix(16))) }
-                        ids.append(g)
-                    }
+                    try emitBPEFromScratch(
+                        keyBytes: pieceBytes, keyLo: 0, keyHi: pieceBytes.count,
+                        cacheKeyHash: missHash, unresolvedText: String(piece.prefix(16))
+                    )
                 }
                 return
             }
-            var spans: [(Int, Int)] = [(cLo, cHi)]
+            spans.removeAll(keepingCapacity: true)
+            spans.append((cLo, cHi))
+            let chunkIsASCII = Self.isPureASCII(bytes, cLo, cHi)
             for step in preSteps {
                 let re: NSRegularExpression
                 switch step {
                 case .digits(_, let r): re = r
                 case .splitIsolated(let r): re = r
                 }
-                var nextSpans: [(Int, Int)] = []
-                nextSpans.reserveCapacity(spans.count * 2)
+                nextSpans.removeAll(keepingCapacity: true)
                 for (sLo, sHi) in spans where sHi > sLo {
                     let seg = String(decoding: bytes[sLo..<sHi], as: UTF8.self)
-                    let ns = seg as NSString
-                    let u2b = QWTokenizer.utf16ToByteTable(seg)
                     let segBytes = sHi - sLo
+                    let segIsASCII = chunkIsASCII || Self.isPureASCII(bytes, sLo, sHi)
+                    let utf16Len = segIsASCII ? segBytes : (seg as NSString).length
+                    var u2b: [Int]? = nil
                     var cursor = 0
-                    re.enumerateMatches(in: seg,
-                                        range: NSRange(location: 0, length: ns.length)) { mr, _, _ in
+                    re.enumerateMatches(in: seg, range: NSRange(location: 0, length: utf16Len)) { mr, _, _ in
                         guard let r = mr?.range, r.length > 0 else { return }
-                        let b0 = u2b[r.location]
-                        let b1 = u2b[r.location + r.length]
+                        let b0: Int
+                        let b1: Int
+                        if segIsASCII {
+                            b0 = r.location
+                            b1 = r.location + r.length
+                        } else {
+                            let table = u2b ?? {
+                                let built = QWTokenizer.utf16ToByteTable(seg)
+                                u2b = built
+                                return built
+                            }()
+                            b0 = table[r.location]
+                            b1 = table[r.location + r.length]
+                        }
                         if b0 > cursor {
                             nextSpans.append((sLo + cursor, sLo + b0))
                         }
@@ -179,21 +264,38 @@ extension QWTokenizer {
                         nextSpans.append((sLo + cursor, sHi))
                     }
                 }
-                spans = nextSpans
+                swap(&spans, &nextSpans)
             }
             for (pLo, pHi) in spans where pHi > pLo {
-                let got = bpeWord(bytes[pLo..<pHi])
-                if got.isEmpty {
-                    throw Error.unresolvedByte(String(String(
-                        decoding: bytes[pLo..<pHi], as: UTF8.self).prefix(16)))
-                }
-                for g in got {
-                    if g < 0 {
+                let byteLen = pHi - pLo
+                if byteLen == 1 {
+                    let tid = byteToTokId[Int(bytes[pLo])]
+                    if tid < 0 {
                         throw Error.unresolvedByte(String(String(
                             decoding: bytes[pLo..<pHi], as: UTF8.self).prefix(16)))
                     }
-                    ids.append(g)
+                    ids.append(tid)
+                    continue
                 }
+                var missHash: UInt64? = nil
+                if cacheEnabled && byteLen <= QWWordMergeCache.maxKeyBytes {
+                    let (hit, h) = bytes.withUnsafeBufferPointer { buf -> (Bool, UInt64) in
+                        guard let base = buf.baseAddress else { return (false, 0) }
+                        let ptr = base.advanced(by: pLo)
+                        let hash = QWWordMergeCache.hashBytes(ptr, count: byteLen)
+                        return (wordCache.lookup(ptr, count: byteLen, hash: hash, into: &ids), hash)
+                    }
+                    if hit { continue }
+                    missHash = h
+                }
+                wordScratch.removeAll(keepingCapacity: true)
+                for bi in pLo..<pHi {
+                    wordScratch.append(byteToSymId[Int(bytes[bi])])
+                }
+                try emitBPEFromScratch(
+                    keyBytes: bytes, keyLo: pLo, keyHi: pHi, cacheKeyHash: missHash,
+                    unresolvedText: String(String(decoding: bytes[pLo..<pHi], as: UTF8.self).prefix(16))
+                )
             }
         }
 
@@ -215,52 +317,64 @@ extension QWTokenizer {
             }
         }
 
-        func encodeNormalizedSlice(_ sliceBytes: [UInt8], isAtTextStart: Bool) throws {
-            guard !sliceBytes.isEmpty else { return }
+        func encodeNormalizedSlice(_ sliceBytes: [UInt8], _ lo: Int, _ hi: Int, isAtTextStart: Bool) throws {
+            guard hi > lo else { return }
             if normAddedPats.isEmpty {
-                try encodeSegment(sliceBytes, 0, sliceBytes.count, isAtTextStart: isAtTextStart)
+                try encodeSegment(sliceBytes, lo, hi, isAtTextStart: isAtTextStart)
                 return
             }
             let normMatches = Self.matchAddedTokens(
-                in: sliceBytes, patterns: normAddedPats, firstByte: normAddedFirstByte
+                in: sliceBytes, lo: lo, hi: hi, patterns: normAddedPats, firstByte: normAddedFirstByte
             )
-            var pos = 0
+            var pos = lo
             for m in normMatches {
                 if m.loc > pos {
-                    try encodeSegment(sliceBytes, pos, m.loc, isAtTextStart: isAtTextStart && pos == 0)
+                    try encodeSegment(sliceBytes, pos, m.loc, isAtTextStart: isAtTextStart && pos == lo)
                 }
                 ids.append(m.id)
                 pos = m.end
             }
-            if pos < sliceBytes.count {
-                try encodeSegment(sliceBytes, pos, sliceBytes.count, isAtTextStart: isAtTextStart && pos == 0)
+            if pos < hi {
+                try encodeSegment(sliceBytes, pos, hi, isAtTextStart: isAtTextStart && pos == lo)
             }
         }
 
-        let rawBytes = Array(text.utf8)
         let rawMatches = rawAddedPats.isEmpty
             ? []
-            : Self.matchAddedTokens(in: rawBytes, patterns: rawAddedPats, firstByte: rawAddedFirstByte)
+            : Self.matchAddedTokens(in: rawBytes, lo: 0, hi: rawBytes.count, patterns: rawAddedPats, firstByte: rawAddedFirstByte)
         if rawMatches.isEmpty {
-            let nfc = usesNFC ? text.precomposedStringWithCanonicalMapping : text
-            try encodeNormalizedSlice(Array(nfc.utf8), isAtTextStart: true)
+            if !usesNFC || Self.isPureASCII(rawBytes, 0, rawBytes.count) {
+                try encodeNormalizedSlice(rawBytes, 0, rawBytes.count, isAtTextStart: true)
+            } else {
+                let nfc = Array(text.precomposedStringWithCanonicalMapping.utf8)
+                try encodeNormalizedSlice(nfc, 0, nfc.count, isAtTextStart: true)
+            }
             return ids
         }
 
         var rawPos = 0
         for m in rawMatches {
             if m.loc > rawPos {
-                let rawSub = String(decoding: rawBytes[rawPos..<m.loc], as: UTF8.self)
-                let normSub = usesNFC ? rawSub.precomposedStringWithCanonicalMapping : rawSub
-                try encodeNormalizedSlice(Array(normSub.utf8), isAtTextStart: rawPos == 0)
+                let atStart = rawPos == 0
+                if !usesNFC || Self.isPureASCII(rawBytes, rawPos, m.loc) {
+                    try encodeNormalizedSlice(rawBytes, rawPos, m.loc, isAtTextStart: atStart)
+                } else {
+                    let rawSub = String(decoding: rawBytes[rawPos..<m.loc], as: UTF8.self)
+                    let normBytes = Array(rawSub.precomposedStringWithCanonicalMapping.utf8)
+                    try encodeNormalizedSlice(normBytes, 0, normBytes.count, isAtTextStart: atStart)
+                }
             }
             ids.append(m.id)
             rawPos = m.end
         }
         if rawPos < rawBytes.count {
-            let rawSub = String(decoding: rawBytes[rawPos..<rawBytes.count], as: UTF8.self)
-            let normSub = usesNFC ? rawSub.precomposedStringWithCanonicalMapping : rawSub
-            try encodeNormalizedSlice(Array(normSub.utf8), isAtTextStart: false)
+            if !usesNFC || Self.isPureASCII(rawBytes, rawPos, rawBytes.count) {
+                try encodeNormalizedSlice(rawBytes, rawPos, rawBytes.count, isAtTextStart: false)
+            } else {
+                let rawSub = String(decoding: rawBytes[rawPos..<rawBytes.count], as: UTF8.self)
+                let normBytes = Array(rawSub.precomposedStringWithCanonicalMapping.utf8)
+                try encodeNormalizedSlice(normBytes, 0, normBytes.count, isAtTextStart: false)
+            }
         }
         return ids
     }
@@ -338,25 +452,26 @@ extension QWTokenizer {
 
     private static func matchAddedTokens(
         in bytes: [UInt8],
+        lo: Int,
+        hi: Int,
         patterns: [AddedPattern],
         firstByte: [Bool]
     ) -> [(loc: Int, end: Int, id: Int)] {
-        let nBytes = bytes.count
         var matches: [(loc: Int, end: Int, id: Int)] = []
-        var bi = 0
-        var lastMatchEnd = 0
-        while bi < nBytes {
-            while bi < nBytes && !firstByte[Int(bytes[bi])] { bi += 1 }
-            guard bi < nBytes else { break }
+        var bi = lo
+        var lastMatchEnd = lo
+        while bi < hi {
+            while bi < hi && !firstByte[Int(bytes[bi])] { bi += 1 }
+            guard bi < hi else { break }
             var matched = false
             for p in patterns {
                 let patEnd = bi + p.pat.count
-                guard patEnd <= nBytes, bytes[bi..<patEnd].elementsEqual(p.pat) else { continue }
+                guard patEnd <= hi, bytes[bi..<patEnd].elementsEqual(p.pat) else { continue }
                 if p.singleWord {
                     if bi > lastMatchEnd, let prev = utf8ScalarBefore(bytes, index: bi, minIndex: lastMatchEnd), isWordScalar(prev.scalar) {
                         continue
                     }
-                    if patEnd < nBytes, let next = utf8ScalarAt(bytes, index: patEnd), isWordScalar(next.scalar) {
+                    if patEnd < hi, let next = utf8ScalarAt(bytes, index: patEnd, maxIndex: hi), isWordScalar(next.scalar) {
                         continue
                     }
                 }
@@ -370,8 +485,8 @@ extension QWTokenizer {
                     }
                 }
                 if p.rstrip {
-                    while matchEnd < nBytes,
-                          let next = utf8ScalarAt(bytes, index: matchEnd),
+                    while matchEnd < hi,
+                          let next = utf8ScalarAt(bytes, index: matchEnd, maxIndex: hi),
                           next.scalar.properties.isWhitespace {
                         matchEnd = next.end
                     }
@@ -407,9 +522,9 @@ extension QWTokenizer {
         return (sc, start)
     }
 
-    private static func utf8ScalarAt(_ bytes: [UInt8], index: Int) -> (scalar: Unicode.Scalar, end: Int)? {
-        guard index < bytes.count else { return nil }
-        let limit = min(bytes.count, index + 4)
+    private static func utf8ScalarAt(_ bytes: [UInt8], index: Int, maxIndex: Int) -> (scalar: Unicode.Scalar, end: Int)? {
+        guard index < maxIndex else { return nil }
+        let limit = min(maxIndex, index + 4)
         var iter = bytes[index..<limit].makeIterator()
         var utf8 = UTF8()
         guard case .scalarValue(let sc) = utf8.decode(&iter) else { return nil }

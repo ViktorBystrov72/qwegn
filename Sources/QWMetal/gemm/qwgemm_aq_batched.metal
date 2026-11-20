@@ -5,7 +5,7 @@
 #include "include/qw_moe_tile.metalh"
 #include "include/qw_gemm_nax.metalh"
 
-#define QW_AQ_GEMM_KERNEL(BITS, GROUP, NAME, BM)                                     \
+#define QW_AQ_GEMM_KERNEL(BITS, GROUP, NAME)                                         \
     kernel void NAME(device const char* blocks [[buffer(0)]],                          \
                      device const half* x [[buffer(1)]],                               \
                      device half* y16 [[buffer(2)]],                                   \
@@ -16,15 +16,8 @@
                      uint lid [[thread_index_in_threadgroup]],                        \
                      uint simd_gid [[simdgroup_index_in_threadgroup]],               \
                      uint simd_lid [[thread_index_in_simdgroup]]) {                  \
-        if constexpr (BM == 64) {                                                     \
-            qwg_gemm_h16_mode_dispatch<BITS, GROUP>(                                  \
-                blocks, x, y16, y32, M, N, K, tg, lid, simd_gid, simd_lid);           \
-        } else {                                                                      \
-            qmm_t_nax_tgp_dual_impl<half, half, false, BM, 64, 64, 2, 2, false,       \
-                                    false, false, BITS, GROUP>(                       \
-                blocks, x, y16, y32, nullptr, int(K), int(N), int(M & 0x1FFFFFFFu),   \
-                tg, lid, simd_gid, simd_lid);                                         \
-        }                                                                             \
+        qwg_gemm_h16_mode_dispatch<BITS, GROUP>(                                      \
+            blocks, x, y16, y32, M, N, K, tg, lid, simd_gid, simd_lid);               \
     }
 
 #define QW_AQ_GEMM_GDN_KERNEL(BITS, GROUP, NAME)                                     \
@@ -97,8 +90,7 @@
     }
 
 #define QW_AQ_BATCHED_SUITE(BITS, GROUP)                                             \
-    QW_AQ_GEMM_KERNEL(BITS, GROUP, qwg_gemm_aq##BITS##_g##GROUP##_h16, 64)           \
-    QW_AQ_GEMM_KERNEL(BITS, GROUP, qwg_gemm_aq##BITS##_g##GROUP##_h16_bm128, 128)    \
+    QW_AQ_GEMM_KERNEL(BITS, GROUP, qwg_gemm_aq##BITS##_g##GROUP##_h16)               \
     QW_AQ_GEMM_GDN_KERNEL(BITS, GROUP, qwg_gemm_aq##BITS##_g##GROUP##_h16_gdn_inproj) \
     QW_AQ_NAX_F32_KERNELS(BITS, GROUP)
 

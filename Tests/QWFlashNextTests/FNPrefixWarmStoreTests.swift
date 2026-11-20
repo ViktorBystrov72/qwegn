@@ -73,9 +73,10 @@ final class FNPrefixWarmStoreTests: XCTestCase {
         let prompt: [Int64] = [11, 22, 33, 44, 55, 66]
         store.store(name: entryName(tokens: Array(prompt.prefix(2))), blob: Data(repeating: 1, count: 10))
         store.store(name: entryName(tokens: Array(prompt.prefix(4))), blob: Data(repeating: 2, count: 10))
-        let match = store.longestMatch(history: prompt, kvMode: .q4, hasMTP: false)
-        XCTAssertEqual(match?.tokens, 4)
-        XCTAssertEqual(match?.name, entryName(tokens: Array(prompt.prefix(4))))
+        let match = store.lookupWarmHit(exactName: "", history: prompt, rawHistory: prompt,
+                                        kvMode: .q4, hasMTP: false, allowExact: false)
+        XCTAssertEqual(match?.matchedTokens, 4)
+        XCTAssertEqual(match?.value, Data(repeating: 2, count: 10))
     }
 
     /// A prefix of another prompt is not a prefix of this one, however
@@ -84,7 +85,9 @@ final class FNPrefixWarmStoreTests: XCTestCase {
         let store = FNPrefixWarmStore(byteLimit: 4096)
         let other: [Int64] = [99, 98, 97, 96]
         store.store(name: entryName(tokens: other), blob: Data(repeating: 1, count: 10))
-        let match = store.longestMatch(history: [11, 22, 33, 44], kvMode: .q4, hasMTP: false)
+        let query: [Int64] = [11, 22, 33, 44]
+        let match = store.lookupWarmHit(exactName: "", history: query, rawHistory: query,
+                                        kvMode: .q4, hasMTP: false, allowExact: false)
         XCTAssertNil(match)
     }
 
@@ -214,8 +217,9 @@ final class FNPrefixWarmStoreTests: XCTestCase {
             let turn2Delta: [Int64] = (0..<96).map { Int64(90_000 * (agentIdx + 1) + $0) }
             let h2 = h1 + turn2Delta
 
-            let match = store.longestMatch(history: h2, kvMode: .f16, hasMTP: true)
-            XCTAssertEqual(match?.tokens, h1.count, "Session \(agentIdx) Turn 2 must match its full Turn 1 checkpoint")
+            let match = store.lookupWarmHit(exactName: "", history: h2, rawHistory: h2,
+                                            kvMode: .f16, hasMTP: true, allowExact: false)
+            XCTAssertEqual(match?.matchedTokens, h1.count, "Session \(agentIdx) Turn 2 must match its full Turn 1 checkpoint")
 
             let slot2 = store.resolveSlot(rootHash: root, history: h2, kvMode: .f16, hasMTP: true)
             XCTAssertEqual(slot2, assignedSlots[agentIdx], "Session \(agentIdx) Turn 2 must resolve to its existing slot")
@@ -244,9 +248,10 @@ final class FNPrefixWarmStoreTests: XCTestCase {
         for agentIdx in 0..<5 {
             let t1 = sharedBase + (0..<100).map { Int64(20_000 * (agentIdx + 1) + $0) }
             // Turn 1 of every subagent must hit the 512-token shared base checkpoint!
-            let baseMatch = store.longestMatch(history: t1, kvMode: .f16, hasMTP: true)
-            XCTAssertEqual(baseMatch?.tokens, sharedBase.count)
-            XCTAssertEqual(baseMatch?.name, baseName)
+            let baseMatch = store.lookupWarmHit(exactName: "", history: t1, rawHistory: t1,
+                                                kvMode: .f16, hasMTP: true, allowExact: false)
+            XCTAssertEqual(baseMatch?.matchedTokens, sharedBase.count)
+            XCTAssertEqual(baseMatch?.value, Data(repeating: 0xAA, count: 400))
 
             let s = store.resolveSlot(rootHash: root, history: t1, kvMode: .f16, hasMTP: true)
             let n1 = entryName(tokens: t1, kvMode: .f16, hasMTP: true)
@@ -270,9 +275,10 @@ final class FNPrefixWarmStoreTests: XCTestCase {
 
         // A 6th subagent spawning later must still find the shared base checkpoint intact.
         let subagent6Turn1 = sharedBase + (0..<120).map { Int64(99_000 + $0) }
-        let match6 = store.longestMatch(history: subagent6Turn1, kvMode: .f16, hasMTP: true)
-        XCTAssertEqual(match6?.tokens, sharedBase.count)
-        XCTAssertEqual(match6?.name, baseName)
+        let match6 = store.lookupWarmHit(exactName: "", history: subagent6Turn1, rawHistory: subagent6Turn1,
+                                         kvMode: .f16, hasMTP: true, allowExact: false)
+        XCTAssertEqual(match6?.matchedTokens, sharedBase.count)
+        XCTAssertEqual(match6?.value, Data(repeating: 0xAA, count: 400))
     }
 }
 

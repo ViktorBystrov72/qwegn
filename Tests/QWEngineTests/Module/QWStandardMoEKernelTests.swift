@@ -590,9 +590,6 @@ final class QWStandardMoEKernelTests: XCTestCase {
             XCTAssertFalse(dense.contains(door), door)
         }
         XCTAssertTrue(sparse.isSubset(of: Set(DenseModule.requiredDoors)))
-        for grouped in ["qwg_moe_gateup_group_f32"] {
-            XCTAssertFalse(sparse.contains(grouped), grouped)
-        }
     }
 
     /// The config laws: what the chain cannot serve is refused by name, and

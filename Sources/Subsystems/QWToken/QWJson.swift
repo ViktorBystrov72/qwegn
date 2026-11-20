@@ -446,7 +446,31 @@ private struct QWJsonCodingKey: CodingKey {
 }
 
 extension QWJson: Codable {
+    public static let orderedRootUserInfoKey = CodingUserInfoKey(rawValue: "qwegine.qwjson.orderedRoot")!
+
+    private static func resolve(in root: QWJson, codingPath: [any CodingKey]) -> QWJson? {
+        var current = root
+        for key in codingPath {
+            switch current {
+            case .array(let items):
+                guard let idx = key.intValue, idx >= 0, idx < items.count else { return nil }
+                current = items[idx]
+            case .object(let pairs):
+                guard let match = pairs.last(where: { $0.0 == key.stringValue }) else { return nil }
+                current = match.1
+            default:
+                return nil
+            }
+        }
+        return current
+    }
+
     public init(from decoder: Decoder) throws {
+        if let root = decoder.userInfo[Self.orderedRootUserInfoKey] as? QWJson,
+           let ordered = Self.resolve(in: root, codingPath: decoder.codingPath) {
+            self = ordered
+            return
+        }
         if let keyed = try? decoder.container(keyedBy: QWJsonCodingKey.self) {
             var pairs: [(String, QWJson)] = []
             pairs.reserveCapacity(keyed.allKeys.count)

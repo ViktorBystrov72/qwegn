@@ -23,7 +23,7 @@ final class QWCommandFrame: @unchecked Sendable {
 
     /// Starts a command frame by acquiring an initial `(cb, enc)` pair and tracking `stepCBs`.
     func begin(hal: QWHal) throws -> (cb: any MTLCommandBuffer, enc: any MTLComputeCommandEncoder) {
-        guard let pair = hal.begin() else { throw QWEngineDriverError.state("cmdbuffer") }
+        guard let pair = hal.beginUnretained() else { throw QWEngineDriverError.state("cmdbuffer") }
         activeCB = pair.0
         activeEnc = pair.1
         stepCBs = []
@@ -53,7 +53,7 @@ final class QWCommandFrame: @unchecked Sendable {
             cb.waitUntilCompleted()
             flushPendingColdUnloads()
         }
-        guard let nextPair = hal.begin() else {
+        guard let nextPair = hal.beginUnretained() else {
             throw QWEngineDriverError.state("cmdbuffer slice")
         }
         activeCB = nextPair.0

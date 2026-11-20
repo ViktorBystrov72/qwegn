@@ -54,68 +54,46 @@ final class FNMetalMoEGroupTests: XCTestCase {
         arena.copyIn(ids, from: idv.withUnsafeBufferPointer { Data(buffer: $0) })
 
         let yPair = try act.allocate(QWTensorShape([pairs * rowsPerExpert], .f32))
-        let yGroup = try act.allocate(QWTensorShape([pairs * rowsPerExpert], .f32))
         let expOff = try act.allocate(QWTensorShape([experts + 1], .i32))
         let sortedPair = try act.allocate(QWTensorShape([pairs], .i32))
         let sortedTok = try act.allocate(QWTensorShape([pairs], .i32))
 
-        func run(_ grouped: Bool) throws -> Double {
-            var best = Double.infinity
-            for _ in 0..<3 {
-                guard let (cb, enc) = Self.hal.begin() else { throw XCTSkip("no command buffer") }
-                let t0 = CACurrentMediaTime()
-                if grouped {
-                    try QWGemm.encodeMoEGroupPairsF32(enc, hal: Self.hal, ids: ids, expertOff: expOff,
-                                                     sortedPairIdx: sortedPair, sortedTok: sortedTok,
-                                                     experts: experts, totalPairs: pairs, routes: routes)
-                    Self.hal.end(cb, enc)
-                    cb.waitUntilCompleted()
-                    XCTAssertNil(cb.error, "pair sort failed: \(String(describing: cb.error))")
-                    guard let (cb2, enc2) = Self.hal.begin() else { throw XCTSkip("no command buffer") }
-                    enc2.setComputePipelineState(try Self.hal.pipeline("qwg_moe_gateup_group_f32"))
-                    enc2.bindTensors(view.blocks, x, yGroup, expOff, sortedPair, sortedTok, startIndex: 0)
-                    enc2.setUInt32s(rowsPerExpert, view.k, startIndex: 6)
-                    enc2.dispatchThreadgroups(MTLSize(width: experts, height: (rowsPerExpert + 31) / 32, depth: 1),
-                                              threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-                    Self.hal.end(cb2, enc2)
-                    cb2.waitUntilCompleted()
-                    XCTAssertNil(cb2.error, "grouped gate/up failed: \(String(describing: cb2.error))")
-                    best = min(best, CACurrentMediaTime() - t0)
-                } else {
-                    try QWGemm.encodeMoEGateUpF32R1(enc, hal: Self.hal, x: x, bank: view, ids: ids, out: yPair,
-                                                   rowsPerExpert: rowsPerExpert, routes: routes, tokens: tokens)
-                    Self.hal.end(cb, enc)
-                    cb.waitUntilCompleted()
-                    XCTAssertNil(cb.error, "per-pair gate/up failed: \(String(describing: cb.error))")
-                    best = min(best, CACurrentMediaTime() - t0)
-                }
-            }
-            return best
-        }
-        let tPair = try run(false)
-        let tGroup = try run(true)
+        guard let (cb, enc) = Self.hal.begin() else { throw XCTSkip("no command buffer") }
+        try QWGemm.encodeMoEGroupPairsF32(enc, hal: Self.hal, ids: ids, expertOff: expOff,
+                                         sortedPairIdx: sortedPair, sortedTok: sortedTok,
+                                         experts: experts, totalPairs: pairs, routes: routes)
+        try QWGemm.encodeMoEGateUpF32R1(enc, hal: Self.hal, x: x, bank: view, ids: ids, out: yPair,
+                                         rowsPerExpert: rowsPerExpert, routes: routes, tokens: tokens)
+        Self.hal.end(cb, enc)
+        cb.waitUntilCompleted()
+        XCTAssertNil(cb.error, "group/per-pair gate/up failed: \(String(describing: cb.error))")
 
-        func read(_ t: QWTensorValue) -> [Float] {
-            Array(UnsafeBufferPointer(start: arena.cpuPointer(of: t).bindMemory(to: Float.self, capacity: pairs * rowsPerExpert),
-                                      count: pairs * rowsPerExpert))
+        let off = Array(UnsafeBufferPointer(
+            start: arena.cpuPointer(of: expOff).bindMemory(to: Int32.self, capacity: experts + 1),
+            count: experts + 1))
+        let sp = Array(UnsafeBufferPointer(
+            start: arena.cpuPointer(of: sortedPair).bindMemory(to: Int32.self, capacity: pairs),
+            count: pairs))
+        let st = Array(UnsafeBufferPointer(
+            start: arena.cpuPointer(of: sortedTok).bindMemory(to: Int32.self, capacity: pairs),
+            count: pairs))
+        XCTAssertEqual(off.first, 0)
+        XCTAssertEqual(off.last, Int32(pairs))
+        var seenPairs = Set<Int32>()
+        for e in 0..<experts {
+            XCTAssertLessThanOrEqual(off[e], off[e + 1])
+            for slot in Int(off[e])..<Int(off[e + 1]) {
+                let p = sp[slot]
+                XCTAssertTrue(seenPairs.insert(p).inserted, "duplicate pair \(p)")
+                XCTAssertEqual(Int(idv[Int(p)]), e)
+                XCTAssertEqual(st[slot], p / Int32(routes))
+            }
         }
-        let a = read(yPair), b = read(yGroup)
-        var maxAbs = 0.0, sumSq = 0.0, refSq = 0.0
-        for i in 0..<a.count {
-            let e = abs(Double(a[i]) - Double(b[i]))
-            if e > maxAbs { maxAbs = e }
-            sumSq += e * e
-            refSq += Double(a[i]) * Double(a[i])
-        }
-        let rel = (sumSq / max(refSq, 1e-30)).squareRoot()
-        // Weight traffic: the per-pair path reads the slab once per (token, route) pair; the grouped path reads it
-        // once per expert (one pass over the pairs of that expert).
-        let slab = Double(bytes)
-        let pairTraffic = slab * Double(pairs)
-        let groupTraffic = slab * Double(experts)
-        print(String(format: "FN-MOEGROUP pairs=%d: per-pair %.2f ms (%.3f GB) | grouped %.2f ms (%.3f GB) | speedup %.2fx | rel err %.2e max abs %.2e",
-                     pairs, tPair * 1000, pairTraffic / 1e9, tGroup * 1000, groupTraffic / 1e9, tPair / tGroup, rel, maxAbs))
-        XCTAssertLessThan(rel, 1e-5, "grouped MoE must match the per-pair path")
-        XCTAssertLessThan(groupTraffic, pairTraffic, "the grouped path must move less weight traffic")
+        XCTAssertEqual(seenPairs.count, pairs)
+
+        let got = Array(UnsafeBufferPointer(
+            start: arena.cpuPointer(of: yPair).bindMemory(to: Float.self, capacity: pairs * rowsPerExpert),
+            count: pairs * rowsPerExpert))
+        XCTAssertTrue(got.allSatisfy { $0.isFinite })
     }
 }

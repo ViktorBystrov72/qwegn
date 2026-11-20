@@ -373,7 +373,7 @@ extension QWHttpServer {
     ) -> (req: ChatCompletionRequest, replyModel: String, thinkingEnabled: Bool)? {
         let parsed: AnthropicMessagesRequest
         do {
-            parsed = try JSONDecoder().decode(AnthropicMessagesRequest.self, from: body)
+            parsed = try QWServerRequestDecoder.decode(AnthropicMessagesRequest.self, from: body)
         } catch let decErr as DecodingError {
             let msg: String
             switch decErr {

@@ -235,12 +235,10 @@ extension QWEngineDriver {
         session.sessionFinished = true
         if let handle = session.mtpKV { mtpCache?.finish(handle) }
         kvCache.finish(session.kv)
-        slotLock.withLock {
-            freeSlots.append(GdnSlot(recSlab: session.recSlab, ringSlab: session.ringSlab,
+        admission.releaseSlot(GdnSlot(recSlab: session.recSlab, ringSlab: session.ringSlab,
                                     rec: session.rec, ring: session.ring,
                                     trunkHidden: session.trunkHidden,
                                     dflashSlot: session.dflashSlot))
-        }
     }
 
     func retainCachedPrompt(_ session: QWEngineSession, prompt: [Int], mode: GDNPrefillMode,

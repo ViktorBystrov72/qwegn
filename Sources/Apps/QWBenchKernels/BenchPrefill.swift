@@ -22,13 +22,13 @@ enum PrefillCandidate {
     /// `QWGemmAQ.gemmKernelName`, which is what the engine resolves them by.
     var name: String {
         switch self {
-        case .family(let bits, let group): return "qwg_gemm_aq\(bits)_g\(group)_h16_bm128"
-        case .incumbent: return "qwg_gemm_q4g_h16_bm128"
+        case .family(let bits, let group): return "qwg_gemm_aq\(bits)_g\(group)_h16"
+        case .incumbent: return "qwg_gemm_q4g_h16"
         }
     }
 
-    /// The tokens one tile holds: both kernels are raced at BM=128.
-    static let bm = 128
+    /// The tokens one tile holds: both kernels are raced at BM=64.
+    static let bm = 64
 }
 
 /// The buffers one prefill measurement needs.

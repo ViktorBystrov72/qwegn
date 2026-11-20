@@ -364,20 +364,6 @@ public struct ChatCompletionRequest: Codable, Sendable {
         QWChatPolicyResolver.effectiveEnableThinking(for: self, defaultValue: defaultValue)
     }
 
-    public func resolvedThinkingPolicy(
-        defaultEnableThinking: Bool, defaultMaxTokens: Int,
-        modelMaxLength: Int? = nil, overrideMaxNewTokens: Int? = nil
-    ) -> (shouldThink: Bool, thinkingBudget: Int?) {
-        let p = QWChatPolicyResolver.resolveThinkingPolicy(
-            for: self,
-            defaultEnableThinking: defaultEnableThinking,
-            defaultMaxTokens: defaultMaxTokens,
-            modelMaxLength: modelMaxLength,
-            overrideMaxNewTokens: overrideMaxNewTokens
-        )
-        return (p.shouldThink, p.thinkingBudget)
-    }
-
     /// True when the final message in `messages` is an assistant text message to be continued in-place.
     public var isAssistantPrefill: Bool {
         guard addGenerationPrompt != true, continueFinalMessage != false,

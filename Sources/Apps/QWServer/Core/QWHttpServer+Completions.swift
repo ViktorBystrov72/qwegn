@@ -10,7 +10,7 @@ extension QWHttpServer {
     func handleCompletions(connection: NWConnection, headers: [String: String] = [:], body: Data) async throws {
         var req: CompletionRequest
         do {
-            req = try JSONDecoder().decode(CompletionRequest.self, from: body)
+            req = try QWServerRequestDecoder.decode(CompletionRequest.self, from: body)
             req.httpHeaders = headers
         } catch {
             sendOpenAIError(connection, status: 400, message: "Malformed JSON payload: \(error.localizedDescription)")
@@ -122,7 +122,7 @@ extension QWHttpServer {
     func handleTokenize(connection: NWConnection, body: Data) async throws {
         let req: TokenizeRequest
         do {
-            req = try JSONDecoder().decode(TokenizeRequest.self, from: body)
+            req = try QWServerRequestDecoder.decode(TokenizeRequest.self, from: body)
         } catch {
             sendOpenAIError(connection, status: 400, message: "Malformed JSON payload: \(error.localizedDescription)")
             return
@@ -138,7 +138,7 @@ extension QWHttpServer {
     func handleDetokenize(connection: NWConnection, body: Data) async throws {
         let req: DetokenizeRequest
         do {
-            req = try JSONDecoder().decode(DetokenizeRequest.self, from: body)
+            req = try QWServerRequestDecoder.decode(DetokenizeRequest.self, from: body)
         } catch {
             sendOpenAIError(connection, status: 400, message: "Malformed JSON payload: \(error.localizedDescription)")
             return

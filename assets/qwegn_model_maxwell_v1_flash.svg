@@ -41,7 +41,7 @@
   <g transform="translate(28, 24)">
     <rect x="0.0" y="0.0" width="266" height="28" rx="14.0" fill="#1c1936" stroke="#818cf8" stroke-width="1.2"/>
     <circle cx="15.0" cy="14.0" r="4.5" fill="#a5b4fc"/>
-    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#c7d2fe" letter-spacing="0.25">QWEGN v0.27.0 · MODEL PROFILE</text>
+    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#c7d2fe" letter-spacing="0.25">QWEGN v0.28.0 · MODEL PROFILE</text>
     <rect x="276.0" y="0.0" width="420" height="28" rx="14.0" fill="#064e3b" stroke="#10b981" stroke-width="1.2"/>
     <text x="486.0" y="18.6" text-anchor="middle" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">5,324 TOK/S PREFILL · 3/3 NEEDLE (16K–64K)</text>
     <text x="0" y="64" fill="#f8fafc" class="title" font-size="27">Maxwell-V1-Flash (HQ8_G32 + SHVQ3/4_G64)</text>
@@ -65,7 +65,7 @@
     <text x="164.5" y="88" fill="#38bdf8" class="title mono" font-size="17">tok/s</text>
     <text x="18" y="120" fill="#f8fafc" class="title" font-size="15.5">5,324 @2K–4K · 4,664 @5.4K</text>
     <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13.5">4,067 @8K · 2,943 @16K · 1,620 @64K</text>
-    <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13.5">15 ms warm prefix hit (25.8×)</text>
+    <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13.5">7 ms warm prefix hit (47.3×)</text>
     <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
     <text x="18" y="218" fill="#38bdf8" class="mono" font-size="13">Tiled-32 MBSA Selector</text>
     <text x="18" y="238" fill="#38bdf8" class="mono" font-size="13">+ Apple10 NAX Sparse Kernel</text>
@@ -108,7 +108,7 @@
     <text x="22" y="122" fill="#38bdf8" class="mono" font-size="14.5">• 4-Stream mHC   : Sinkhorn-20 doubly-stochastic highway + fused FWHT32 MoE bridge</text>
     <text x="22" y="146" fill="#38bdf8" class="mono" font-size="14.5">• Sparse MoE     : 3 dense L0–2 (6144) + 42 MoE × 256 experts (sigmoid top-12 + 1024)</text>
     <text x="22" y="170" fill="#fbbf24" class="mono" font-size="14.5">• Context Ladder : 5,324 @4K · 4,067 @8K · 2,943 @16K · 2,097 @32K · 1,620 @64K tok/s</text>
-    <text x="22" y="194" fill="#34d399" class="mono" font-size="14.5">• Fidelity &amp; API : 3/3 (100%) @ 16K &amp; 64K · 139/139 (100%) API conformance · 0 allocs</text>
+    <text x="22" y="194" fill="#34d399" class="mono" font-size="14.5">• Fidelity &amp; API : 3/3 (100%) @ 16K &amp; 64K · 291/291 (100%) API conf · 0 allocs</text>
   </g>
 
   <g transform="translate(28, 676)">
@@ -119,7 +119,7 @@
     <text x="22" y="98" fill="#34d399" class="mono" font-size="14.5">• Routed Gate/Up : 22,016 tensors @ SHVQ3_G64 (3.25 bpw) — spherical codebook LUT</text>
     <text x="22" y="122" fill="#34d399" class="mono" font-size="14.5">• Routed Down    : 11,008 tensors @ SHVQ4_G64 (4.25 bpw) + 415 HQ8_G32 trunk/head</text>
     <text x="22" y="146" fill="#c084fc" class="mono" font-size="14.5">• BF16 Parity    : 0.00010 head KL · 0.0055 E2E KLD · 100.0% top-1 agreement vs BF16</text>
-    <text x="22" y="170" fill="#fbbf24" class="mono" font-size="14.5">• Code &amp; STEM    : 23/25 (92%) HumanEval · 100% (12/12) finished MMLU-Pro · 98.9% fid</text>
+    <text x="22" y="170" fill="#fbbf24" class="mono" font-size="14.5">• Full llmprobe  : 100% Cap &amp; Fidelity · 59/100 Code (35 HE, 24 MBPP) · 50/88 Ag</text>
     <text x="22" y="194" fill="#38bdf8" class="mono" font-size="14.5">• UMA Footprint  : 16.41 GiB weights · 17.10 GiB @4K · 19.28 GiB @64K q4 · 0 allocs</text>
   </g>
 
@@ -129,6 +129,6 @@
     <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
     <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
     <text x="122" y="27" class="mono" font-size="11.5" font-weight="700" fill="#e2e8f0">Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
-    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26+ · Qwegn v0.27.0 · q4 KV · Temp 0 · 0 Steady Allocs</text>
+    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26.2+ · Qwegn v0.28.0 · q4 KV · Temp 0 · 0 Steady Allocs</text>
   </g>
 </svg>

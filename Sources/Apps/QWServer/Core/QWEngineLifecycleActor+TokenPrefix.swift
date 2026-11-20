@@ -24,10 +24,6 @@ extension QWEngineLifecycleActor {
         return ChatLogprobTokenEntry(token: tokStr, logprob: lp.logprob, bytes: tokBytes, topLogprobs: tops)
     }
 
-    nonisolated static func heldStopSuffixUTF8(_ text: String, stops: [String]) -> Int {
-        IncrementalStopScanner(stops: stops).heldSuffixUTF8Count(in: Array(text.utf8))
-    }
-
     struct IncrementalStopScanner: @unchecked Sendable {
         struct Entry {
             let stop: String

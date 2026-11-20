@@ -7,19 +7,12 @@
 
 import Foundation
 
-/// One cached row and the clock reading of its last use.
-/// A **class**, so the hit path refreshes the stamp with one field write
-/// instead of writing the entry back into the dictionary.
-final class FNNgramRowCacheEntry {
-    let id: Int
-    let row: [Float]
-    var used: UInt64
-
-    init(id: Int, row: [Float], used: UInt64) {
-        self.id = id
-        self.row = row
-        self.used = used
-    }
+/// One intrusive doubly-linked node in a stripe's LRU list.
+struct FNNgramLRUEntry {
+    var id: Int
+    var row: [Float]
+    var prev: Int32
+    var next: Int32
 }
 
 /// The cache refuses a row whose size is not the one it was built for: a
@@ -35,34 +28,94 @@ public enum FNNgramRowCacheError: Error, CustomStringConvertible {
     }
 }
 
-/// One stripe of the cache: its own lock, its own rows, its own budget.
+/// One stripe of the cache: its own lock, its own rows, its own O(1) LRU list.
 /// A **class**, not a struct — a struct stripe puts every stripe's mutable
 /// state in one array's buffer, so two concurrent element writes conflict.
 final class FNNgramRowCacheStripe: @unchecked Sendable {
     let lock = NSLock()
-    var rows: [Int: FNNgramRowCacheEntry] = [:]
+    var rows: [Int: Int] = [:]
+    private var nodes: [FNNgramLRUEntry] = []
+    private var head: Int32 = -1
+    private var tail: Int32 = -1
+    private var freeHead: Int32 = -1
     var bytes = 0
     var hits = 0
     var misses = 0
-    private var clock: UInt64 = 0
 
-    /// The next clock reading. The caller holds the lock.
-    func nextStamp() -> UInt64 {
-        clock &+= 1
-        return clock
+    /// Promotes `index` to the MRU head in O(1). Caller holds `lock`.
+    @inline(__always)
+    func promoteToFront(_ index: Int) {
+        let idx32 = Int32(index)
+        guard idx32 != head else { return }
+        let prev = nodes[index].prev
+        let next = nodes[index].next
+        if prev >= 0 { nodes[Int(prev)].next = next }
+        if next >= 0 { nodes[Int(next)].prev = prev }
+        if idx32 == tail { tail = prev }
+        nodes[index].prev = -1
+        nodes[index].next = head
+        if head >= 0 { nodes[Int(head)].prev = idx32 }
+        head = idx32
+        if tail < 0 { tail = idx32 }
     }
 
-    /// The least recently used entry, if any. The caller holds the lock.
-    /// The scan is over one stripe only, and a stripe holds a bounded number
-    /// of rows, so the scan stays cheap.
-    func leastRecentlyUsed() -> FNNgramRowCacheEntry? {
-        var victim: FNNgramRowCacheEntry?
-        var oldest = UInt64.max
-        for entry in rows.values where entry.used < oldest {
-            oldest = entry.used
-            victim = entry
+    /// Returns the row stored at node `index`. Caller holds `lock`.
+    @inline(__always)
+    func row(at index: Int) -> [Float] {
+        nodes[index].row
+    }
+
+    /// Inserts a fresh `(id, row)` at the MRU head in O(1). Caller holds `lock`.
+    @inline(__always)
+    func insertFront(id: Int, row: [Float]) {
+        let index: Int
+        if freeHead >= 0 {
+            index = Int(freeHead)
+            freeHead = nodes[index].next
+            nodes[index] = FNNgramLRUEntry(id: id, row: row, prev: -1, next: head)
+        } else {
+            index = nodes.count
+            nodes.append(FNNgramLRUEntry(id: id, row: row, prev: -1, next: head))
         }
-        return victim
+        let idx32 = Int32(index)
+        if head >= 0 { nodes[Int(head)].prev = idx32 }
+        head = idx32
+        if tail < 0 { tail = idx32 }
+        rows[id] = index
+    }
+
+    /// Evicts and returns the LRU victim id in O(1), if any. Caller holds `lock`.
+    @inline(__always)
+    func popLeastRecentlyUsed() -> Int? {
+        let victimIdx32 = tail
+        guard victimIdx32 >= 0 else { return nil }
+        let victimIdx = Int(victimIdx32)
+        let victimId = nodes[victimIdx].id
+        let prev = nodes[victimIdx].prev
+        if prev >= 0 {
+            nodes[Int(prev)].next = -1
+        } else {
+            head = -1
+        }
+        tail = prev
+        nodes[victimIdx].row = []
+        nodes[victimIdx].prev = -1
+        nodes[victimIdx].next = freeHead
+        freeHead = victimIdx32
+        rows.removeValue(forKey: victimId)
+        return victimId
+    }
+
+    /// Clears every entry while retaining buffer capacities. Caller holds `lock`.
+    func resetAll() {
+        rows.removeAll(keepingCapacity: true)
+        nodes.removeAll(keepingCapacity: true)
+        head = -1
+        tail = -1
+        freeHead = -1
+        bytes = 0
+        hits = 0
+        misses = 0
     }
 }
 
@@ -70,8 +123,7 @@ final class FNNgramRowCacheStripe: @unchecked Sendable {
 /// Locking is **striped** — one `NSLock` per stripe — because `FNNgramEmbedding.embedLast` reads rows from
 /// `DispatchQueue.concurrentPerform`; a single mutex would serialise them.
 public final class FNNgramRowCache: @unchecked Sendable {
-    /// How many rows one stripe aims to hold. The eviction victim is found by
-    /// scanning a stripe, so a stripe must not grow without bound.
+    /// Target rows per stripe used to size the stripe count cleanly for concurrency.
     static let targetRowsPerStripe = 32
     /// The most stripes the cache will ever build, whatever the budget.
     static let maxStripeCount = 1 << 16
@@ -110,13 +162,13 @@ public final class FNNgramRowCache: @unchecked Sendable {
         let s = stripe(for: id)
         s.lock.lock()
         defer { s.lock.unlock() }
-        guard let entry = s.rows[id] else {
+        guard let idx = s.rows[id] else {
             s.misses += 1
             return nil
         }
         s.hits += 1
-        entry.used = s.nextStamp()
-        return entry.row
+        s.promoteToFront(idx)
+        return s.row(at: idx)
     }
 
     /// Cache a row. A row that is already cached is left alone.
@@ -128,12 +180,11 @@ public final class FNNgramRowCache: @unchecked Sendable {
         s.lock.lock()
         defer { s.lock.unlock() }
         guard s.rows[id] == nil else { return }
-        while s.bytes + rowBytes > stripeBudget, let victim = s.leastRecentlyUsed() {
-            s.rows[victim.id] = nil
+        while s.bytes + rowBytes > stripeBudget, s.popLeastRecentlyUsed() != nil {
             s.bytes -= rowBytes
         }
         guard s.bytes + rowBytes <= stripeBudget else { return }
-        s.rows[id] = FNNgramRowCacheEntry(id: id, row: row, used: s.nextStamp())
+        s.insertFront(id: id, row: row)
         s.bytes += rowBytes
     }
 
@@ -150,10 +201,7 @@ public final class FNNgramRowCache: @unchecked Sendable {
     public func clear() {
         for s in stripes {
             s.lock.lock()
-            s.rows.removeAll(keepingCapacity: true)
-            s.bytes = 0
-            s.hits = 0
-            s.misses = 0
+            s.resetAll()
             s.lock.unlock()
         }
     }

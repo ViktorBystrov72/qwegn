@@ -38,10 +38,8 @@ final class QWControlSeamsTests: XCTestCase {
         XCTAssertEqual(QWBatchAdmissionCounter.preparingCount, 0)
 
         let promise = QWBatchJobPromise<Int>()
-        XCTAssertFalse(promise.isCompleted)
         promise.complete(.success(42))
         promise.complete(.failure(QWBatchSchedulerError.missingJobOutcome))
-        XCTAssertTrue(promise.isCompleted)
         XCTAssertEqual(try promise.wait(), 42)
 
         let errPromise = QWBatchJobPromise<Int>()
@@ -102,10 +100,9 @@ final class QWControlSeamsTests: XCTestCase {
         XCTAssertEqual(coord.queuedCount, 2)
         let polled = coord.pollPending(maxCount: 1)
         XCTAssertEqual(polled.map(\.id), [1])
-        coord.requeueAtFront(polled)
-        XCTAssertEqual(coord.pollPending(maxCount: 2).map(\.id), [1, 2])
+        XCTAssertEqual(coord.queuedCount, 1)
         XCTAssertFalse(coord.tryParkDriverIfIdle { _ = coord.submit(j3) })
-        _ = coord.pollPending(maxCount: 1)
+        _ = coord.pollPending(maxCount: 2)
         XCTAssertTrue(coord.tryParkDriverIfIdle {})
 
         let ranExclusive = LockedFlag()

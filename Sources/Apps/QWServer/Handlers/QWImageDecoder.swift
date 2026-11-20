@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import CoreGraphics
 import CryptoKit
@@ -596,10 +597,31 @@ public enum QWImageDecoder {
         }
 
         var rgb = [UInt8](repeating: 0, count: targetWidth * targetHeight * 3)
-        for i in 0..<(targetWidth * targetHeight) {
-            rgb[i * 3 + 0] = rgba[i * 4 + 0]
-            rgb[i * 3 + 1] = rgba[i * 4 + 1]
-            rgb[i * 3 + 2] = rgba[i * 4 + 2]
+        rgba.withUnsafeBytes { srcRaw in
+            rgb.withUnsafeMutableBytes { dstRaw in
+                guard let sBase = srcRaw.baseAddress, let dBase = dstRaw.baseAddress else { return }
+                var srcBuf = vImage_Buffer(
+                    data: UnsafeMutableRawPointer(mutating: sBase),
+                    height: vImagePixelCount(targetHeight),
+                    width: vImagePixelCount(targetWidth),
+                    rowBytes: targetWidth * 4
+                )
+                var dstBuf = vImage_Buffer(
+                    data: dBase,
+                    height: vImagePixelCount(targetHeight),
+                    width: vImagePixelCount(targetWidth),
+                    rowBytes: targetWidth * 3
+                )
+                if vImageConvert_RGBA8888toRGB888(&srcBuf, &dstBuf, vImage_Flags(kvImageNoFlags)) != kvImageNoError {
+                    let sPtr = sBase.assumingMemoryBound(to: UInt8.self)
+                    let dPtr = dBase.assumingMemoryBound(to: UInt8.self)
+                    for i in 0..<(targetWidth * targetHeight) {
+                        dPtr[i * 3 + 0] = sPtr[i * 4 + 0]
+                        dPtr[i * 3 + 1] = sPtr[i * 4 + 1]
+                        dPtr[i * 3 + 2] = sPtr[i * 4 + 2]
+                    }
+                }
+            }
         }
         return DecodedImage(rgb: rgb, width: targetWidth, height: targetHeight)
     }

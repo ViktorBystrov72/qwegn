@@ -209,12 +209,6 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
     public var order: [Key] { lock.withLock { _order } }
     public var chargedBytes: Int { lock.withLock { _chargedBytes } }
     public var evictions: Int { lock.withLock { _evictions } }
-    public var keySlot: [Key: Int] { lock.withLock { _keySlot } }
-    public var slotLastKey: [Int: Key] { lock.withLock { _slotLastKey } }
-    public var slotBaseKey: [Int: Key] { lock.withLock { _slotBaseKey } }
-    public var slotLastTokens: [Int: [Int64]] { lock.withLock { _slotLastTokens } }
-    public var slotRootHash: [Int: UInt64] { lock.withLock { _slotRootHash } }
-    public var slotLastTouch: [Int: UInt64] { lock.withLock { _slotLastTouch } }
     public var sharedBaseKeys: Set<Key> { lock.withLock { _sharedBaseKeys } }
     public var onEvict: ((Key, StoredEntry) -> Void)? {
         get { lock.withLock { _onEvict } }
@@ -495,10 +489,6 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
             if touchOnHit { touchLocked(key) }
             return entry
         }
-    }
-
-    public func touch(_ key: Key) {
-        lock.withLock { touchLocked(key) }
     }
 
     private func touchLocked(_ key: Key) {

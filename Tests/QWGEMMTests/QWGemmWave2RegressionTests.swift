@@ -463,19 +463,6 @@ final class QWGemmWave2RegressionTests: XCTestCase {
                                 y: yRef16.slice(byteOffset: r * n * 4, count: n, dtype: .f32),
                                 n: n, k: k, bits: 4, group: 32, rows: 1)
         }
-        // f32Activations && rows > 1 must also match row-by-row.
-        let x32 = try act.allocate(QWTensorShape([3 * k], .f32))
-        arena.write(x32, from: (0..<(3 * k)).map { Float(($0 * 3) % 11 - 5) * 0.125 })
-        let yMulti32 = try act.allocate(QWTensorShape([3 * n], .f32))
-        let yRef32 = try act.allocate(QWTensorShape([3 * n], .f32))
-        try QWGemmAQ.encode(enc, hal: hal, blocks: wBuf, x: x32, y: yMulti32,
-                            n: n, k: k, bits: 4, group: 32, f32Activations: true, rows: 3)
-        for r in 0..<3 {
-            try QWGemmAQ.encode(enc, hal: hal, blocks: wBuf,
-                                x: x32.slice(byteOffset: r * k * 4, count: k, dtype: .f32),
-                                y: yRef32.slice(byteOffset: r * n * 4, count: n, dtype: .f32),
-                                n: n, k: k, bits: 4, group: 32, f32Activations: true, rows: 1)
-        }
         hal.end(cb, enc)
         cb.waitUntilCompleted()
         XCTAssertNil(cb.error)
@@ -483,8 +470,6 @@ final class QWGemmWave2RegressionTests: XCTestCase {
                        Array(arena.read(yRef16, as: Float.self, count: 2 * n)))
         XCTAssertEqual(arena.read(yMulti16, as: Float.self, count: 10 * n),
                        arena.read(yRef16, as: Float.self, count: 10 * n))
-        XCTAssertEqual(arena.read(yMulti32, as: Float.self, count: 3 * n),
-                       arena.read(yRef32, as: Float.self, count: 3 * n))
     }
 
     func testLatentNormFwhtNonMultipleOf32ConvergesUniformly() throws {

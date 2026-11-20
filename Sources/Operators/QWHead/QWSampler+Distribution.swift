@@ -4,43 +4,6 @@ import Accelerate
 import QWCore
 
 extension QWSampler {
-    static func topIndices(_ weights: [Double], count: Int) -> [Int] {
-        let before: (Int, Int) -> Bool = { a, b in
-            weights[a] != weights[b] ? weights[a] > weights[b] : a < b
-        }
-        if count >= weights.count {
-            return weights.indices.sorted(by: before)
-        }
-        // Min-heap (by `before`) of the current best `count` indices.
-        var heap: [Int] = []
-        heap.reserveCapacity(count)
-        func siftDown(_ start: Int) {
-            var p = start
-            while true {
-                let l = 2 * p + 1, r = l + 1
-                var m = p
-                if l < heap.count && before(heap[m], heap[l]) { m = l }
-                if r < heap.count && before(heap[m], heap[r]) { m = r }
-                if m == p { return }
-                heap.swapAt(p, m); p = m
-            }
-        }
-        for index in weights.indices {
-            if heap.count < count {
-                heap.append(index)
-                var c = heap.count - 1
-                while c > 0 {
-                    let p = (c - 1) >> 1
-                    if before(heap[p], heap[c]) { heap.swapAt(c, p); c = p } else { break }
-                }
-            } else if before(index, heap[0]) {
-                heap[0] = index
-                siftDown(0)
-            }
-        }
-        return heap.sorted(by: before)
-    }
-
     /// The greedy token of a logit row: the largest logit, ties broken by the
     /// lowest id. A repetition penalty shifts the row first.
     public static func greedyToken(logits: [Float], repetitionHistory: [Int] = [],

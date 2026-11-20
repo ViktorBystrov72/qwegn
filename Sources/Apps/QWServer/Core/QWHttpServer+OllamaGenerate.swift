@@ -37,7 +37,7 @@ extension QWHttpServer {
     func handleOllamaGenerate(connection: NWConnection, body: Data) async throws {
         let parsed: OllamaGenerateRequest
         do {
-            parsed = try JSONDecoder().decode(OllamaGenerateRequest.self, from: body)
+            parsed = try QWServerRequestDecoder.decode(OllamaGenerateRequest.self, from: body)
         } catch {
             sendJsonResponse(connection, status: 400, object: ["error": "invalid request: malformed JSON body"])
             return

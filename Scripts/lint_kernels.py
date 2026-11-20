@@ -129,7 +129,7 @@ def prod_swift_refs() -> tuple[dict[str, list[str]], set[str]]:
     lit = re.compile(r"[\"'](q[a-z0-9_]{6,})[\"']")
     interp = re.compile(r"[\"'](q[a-z0-9_]+_[a-z0-9_]*?)\\?\(")
     for path in (ROOT / "Sources").rglob("*.swift"):
-        if "QWMetal" in path.parts or path.name == "QWKernelInventory.swift":
+        if "QWMetal" in path.parts or "QWBenchKernels" in path.parts or path.name == "QWKernelInventory.swift":
             continue
         text = strip_comments(path.read_text(encoding="utf-8", errors="ignore"))
         for name in lit.findall(text):
@@ -257,10 +257,10 @@ SHARED_OPERATOR_DIRS = ["Sources/Operators/QWAttn", "Sources/Operators/QWGDN",
                         "Sources/Operators/QWGEMM", "Sources/Operators/QWHead",
                         "Sources/Operators/QWKV", "Sources/Subsystems/QWMTP",
                         "Sources/Operators/QWNorm", "Sources/Operators/QWRope",
-                        "Sources/Foundation/QWQuant"]
+                        "Sources/Foundation/QWQuant", "Sources/Subsystems/QWVision"]
 FLASH_NEXT_OPERATOR_DIRS = ["Sources/Operators/QWGDN", "Sources/Operators/QWGEMM",
                             "Sources/Subsystems/QWMTP",
-                            "Sources/Foundation/QWQuant"]
+                            "Sources/Foundation/QWQuant", "Sources/Subsystems/QWVision"]
 
 
 def door_problems(available: set[str], dynamic: set[str] | None = None) -> list[str]:

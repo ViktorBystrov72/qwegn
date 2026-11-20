@@ -223,7 +223,7 @@ extension QWHttpServer {
     func handleOllamaChat(connection: NWConnection, body: Data) async throws {
         let req: ChatCompletionRequest
         do {
-            let ollamaReq = try JSONDecoder().decode(OllamaChatRequest.self, from: body)
+            let ollamaReq = try QWServerRequestDecoder.decode(OllamaChatRequest.self, from: body)
             req = ollamaReq.toChatCompletionRequest()
             try req.validateMetadata()
             _ = try QWStructuredOutput.grammar(for: req)

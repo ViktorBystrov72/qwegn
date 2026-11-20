@@ -150,7 +150,7 @@ final class QWHttpSecurityTests: XCTestCase {
         ]
         for raw in blockedURLs {
             let url = try XCTUnwrap(URL(string: raw))
-            XCTAssertThrowsError(try QWImageDecodePolicy.validateRemoteURL(url), "Expected SSRF refusal for \(raw)") { err in
+            XCTAssertThrowsError(try QWImageDecodePolicy.validateAndResolveRemoteURL(url), "Expected SSRF refusal for \(raw)") { err in
                 guard case .disallowedImageSource = err as? QWImageDecoderError else {
                     return XCTFail("Expected disallowedImageSource for \(raw), got \(err)")
                 }

@@ -74,10 +74,6 @@ public final class QWBatchJobPromise<Output: Sendable>: @unchecked Sendable {
         }
         return try result.get()
     }
-
-    public var isCompleted: Bool {
-        outcomeLock.withLock { outcome != nil }
-    }
 }
 
 /// Pure partition capacity, slot admission, eligibility, and round-robin scheduling math.
@@ -342,13 +338,6 @@ public final class QWBatchSlotCoordinator<Job: AnyObject>: @unchecked Sendable {
             let polled = Array(pendingQueue.prefix(n))
             pendingQueue.removeFirst(n)
             return polled
-        }
-    }
-
-    public func requeueAtFront(_ jobs: [Job]) {
-        guard !jobs.isEmpty else { return }
-        lock.withLock {
-            pendingQueue.insert(contentsOf: jobs, at: 0)
         }
     }
 

@@ -218,12 +218,23 @@ public struct FNGPUSessionData {
     /// Records a generated token in the trailing `repetitionPenaltyWindow` and refreshes active loop tokens.
     public mutating func recordSeenToken(_ token: Int, vocab: Int) {
         guard token >= 0, token < vocab else { return }
+        if recentGeneratedTokens.capacity < Self.repetitionPenaltyWindow + 1 {
+            recentGeneratedTokens.reserveCapacity(Self.repetitionPenaltyWindow + 1)
+        }
         recentGeneratedTokens.append(token)
         if recentGeneratedTokens.count > Self.repetitionPenaltyWindow {
-            recentGeneratedTokens.removeFirst(recentGeneratedTokens.count - Self.repetitionPenaltyWindow)
+            let drop = recentGeneratedTokens.count - Self.repetitionPenaltyWindow
+            let keep = recentGeneratedTokens.count - drop
+            recentGeneratedTokens.withUnsafeMutableBufferPointer { buf in
+                if let base = buf.baseAddress, keep > 0 {
+                    memmove(base, base.advanced(by: drop), keep * MemoryLayout<Int>.stride)
+                }
+            }
+            recentGeneratedTokens.removeLast(drop)
         }
-        seenTokenList = Self.loopRepetitionTokens(in: recentGeneratedTokens)
-        seenTokens = Set(seenTokenList)
+        QWSampler.loopRepetitionTokens(in: recentGeneratedTokens, into: &seenTokenList)
+        seenTokens.removeAll(keepingCapacity: true)
+        for tok in seenTokenList { seenTokens.insert(tok) }
     }
 }
 
@@ -366,7 +377,7 @@ extension FNGPUEngine {
         session.hasFirstToken = true
         session.tokenRecycler.reset()
         if dflash != nil, !session.history.isEmpty {
-            session.tokenRecycler.ingestSequence(session.history.map(Int.init))
+            session.tokenRecycler.ingestSequence(session.history)
         }
         let tok = try sampleFromHead(argmaxToken: session.lastArgmax,
                                      seenTokens: session.seenTokens,
@@ -421,17 +432,17 @@ extension FNGPUEngine {
                                            sampler: sampler, row: row)
         }
         let token: Int
-        if let allowed = try constraint.allowedTokens() {
-            if sampler.config.isGreedy && sampler.config.repetitionPenalty == 1.0 && allowed.contains(argmaxToken) {
+        if try constraint.writeAllowedTokens(into: &sampler.allowedScratch) {
+            if sampler.config.isGreedy && sampler.config.repetitionPenalty == 1.0
+                && QWTokenMaskScratch.sortedTokens(sampler.allowedScratch, contains: argmaxToken) {
                 token = argmaxToken
             } else {
                 let rawLogits = arena.cpuPointer(of: head.logits)
                     .assumingMemoryBound(to: Float.self)
                     .advanced(by: row * vocab)
-                token = try sampler.constrainedToken(
+                token = try sampler.constrainedTokenFromScratch(
                     logits: UnsafeBufferPointer(start: rawLogits, count: vocab),
-                    allowed: allowed,
-                    repetitionHistory: sampler.config.repetitionPenalty == 1.0 ? [] : seenTokens)
+                    repetitionHistory: sampler.config.repetitionPenalty == 1.0 ? [] : seenTokenList)
             }
         } else {
             token = try unconstrainedSample(argmaxToken: argmaxToken, seenTokens: seenTokens,
@@ -454,7 +465,7 @@ extension FNGPUEngine {
             .advanced(by: row * n)
         let rowBuf = UnsafeBufferPointer(start: rawLogits, count: n)
         if config.isGreedy {
-            return try sampler.penalisedGreedyToken(logits: rowBuf, repetitionHistory: seenTokens)
+            return try sampler.penalisedGreedyToken(logits: rowBuf, repetitionHistory: seenTokenList)
         }
         return try sampler.sampleToken(
             logits: rowBuf,
@@ -549,7 +560,7 @@ extension FNGPUEngine {
                 if !needsResync {
                     firstStream = stepMTP.lastProjectedStream(verifyRows: activeRows)
                 } else {
-                    stepMTP.writeTokens([Int32(lastTok)])
+                    stepMTP.writeToken(Int32(lastTok))
                     let selStream = vStack.lastStreamTensor.slice(
                         byteOffset: accepted * vStack.width * 4,
                         count: vStack.width,

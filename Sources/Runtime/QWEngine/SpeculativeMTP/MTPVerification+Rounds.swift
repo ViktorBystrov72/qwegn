@@ -213,8 +213,42 @@ extension QWEngineDriver {
                 { try accumulator.record($0) }
             }
             let window: QWVerifyWindow
+            let isUnconstrained = activeConstraint?.constraint.isUnconstrainedNow ?? true
             if owner == nil, !mtpStageProfiling, !mtpVerificationProfiling, coldEvents == nil,
-               !mtpAdaptiveDepth, activeConstraint == nil, dflashDrafter == nil, !isWeightFreeSpeculation,
+               !mtpAdaptiveDepth, isUnconstrained, let dflashDrafter,
+               let table = mtpDeviceEmbedding {
+                guard let dSlot = session.dflashSlot else {
+                    try? drainPendingCommitIfNeeded()
+                    throw QWEngineDriverError.state("DFlash slot unavailable for speculative round")
+                }
+                let draftPlan = try prepareAsyncDFlashOrPLDRound(
+                    session: session, dflashDrafter: dflashDrafter, dSlot: dSlot,
+                    pending: pending, count: count, table: table)
+                let commitCB = pendingCommitCB
+                pendingCommitCB = nil
+                switch draftPlan {
+                case .pld(let chosen):
+                    window = try verifyTokensCore(
+                        session, explicitTokens: [pending] + chosen, rowCount: 1 + chosen.count,
+                        pendingToken: nil, useDeviceEmbed: table, priorCommitCB: commitCB,
+                        inFlightDraftCBs: []).window
+                    drafts = chosen
+                    draftedPairs = chosen.count
+                    lastRoundUsedPLD = true
+                    mtpDraftProposals += chosen.count
+                case .asyncNeural(let draftCBs, let neuralCount):
+                    let (verifiedWindow, resolvedTokens) = try verifyTokensCore(
+                        session, explicitTokens: nil, rowCount: 1 + neuralCount,
+                        pendingToken: pending, useDeviceEmbed: table,
+                        priorCommitCB: commitCB, inFlightDraftCBs: draftCBs)
+                    window = verifiedWindow
+                    drafts = Array(resolvedTokens.dropFirst())
+                    draftedPairs = neuralCount
+                    lastRoundUsedPLD = false
+                    mtpDraftProposals += drafts.count
+                }
+            } else if owner == nil, !mtpStageProfiling, !mtpVerificationProfiling, coldEvents == nil,
+               !mtpAdaptiveDepth, isUnconstrained, dflashDrafter == nil, !isWeightFreeSpeculation,
                let mtpCache, let handle = session.mtpKV, let views,
                let table = mtpDeviceEmbedding,
                let draftPlan = try prepareAsyncNeuralDraft(
@@ -319,11 +353,15 @@ extension QWEngineDriver {
             let minProb: Float = margin > 0 ? effectiveRelaxedMinProb : 0
             if let owner {
                 let ctx = pendingHistoryContext(session: session, pending: pending)
-                let extraPending = ctx.extraPending.map { [$0] } ?? []
+                var extraHistoryScratch: [Int] = []
+                extraHistoryScratch.reserveCapacity(1 + drafts.count)
                 if proposals.isEmpty {
                     var targetTokens = [Int](repeating: 0, count: drafts.count + 1)
                     for row in 0..<(drafts.count + 1) {
-                        let history = session.activeRepetitionHistory(extraTokens: extraPending + Array(drafts.prefix(row)))
+                        extraHistoryScratch.removeAll(keepingCapacity: true)
+                        if let extra = ctx.extraPending { extraHistoryScratch.append(extra) }
+                        if row > 0 { extraHistoryScratch.append(contentsOf: drafts.prefix(row)) }
+                        let history = session.activeRepetitionHistory(extraTokens: extraHistoryScratch)
                         let dist = try owner.distribution(logits: window.logitRow(row), repetitionHistory: history)
                         let sampled = try owner.stream.sampleTarget(dist)
                         targetTokens[row] = sampled
@@ -337,8 +375,12 @@ extension QWEngineDriver {
                     evidence = nil
                 } else {
                     var targets: [QWSamplingDistribution] = []
+                    targets.reserveCapacity(drafts.count + 1)
                     for row in 0..<(drafts.count + 1) {
-                        let history = session.activeRepetitionHistory(extraTokens: extraPending + Array(drafts.prefix(row)))
+                        extraHistoryScratch.removeAll(keepingCapacity: true)
+                        if let extra = ctx.extraPending { extraHistoryScratch.append(extra) }
+                        if row > 0 { extraHistoryScratch.append(contentsOf: drafts.prefix(row)) }
+                        let history = session.activeRepetitionHistory(extraTokens: extraHistoryScratch)
                         targets.append(try owner.distribution(logits: window.logitRow(row),
                                                               repetitionHistory: history))
                     }
@@ -493,7 +535,7 @@ extension QWEngineDriver {
         } else {
             retainedPairs = 0
         }
-        guard let cb = hal.queue.makeCommandBuffer() else { throw QWEngineDriverError.state("greedy commit command buffer") }
+        guard let cb = hal.makeUnretainedCommandBuffer() else { throw QWEngineDriverError.state("greedy commit command buffer") }
         if let echoDrafter {
             try encodeEchoCommitResolution(cb, session: session, echoDrafter: echoDrafter,
                                            window: verifyWindow, trunkHidden: trunkHidden,

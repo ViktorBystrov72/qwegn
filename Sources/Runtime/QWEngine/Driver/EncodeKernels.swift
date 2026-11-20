@@ -126,7 +126,7 @@ extension QWEngineDriver {
             for: wQ4, weightFormat: weightFormat, hal: hal,
             defaultPSO: psoGemmBatchedH16, opName: "prefill GEMM",
             incumbentKernel: "qwg_gemm_q4g_h16",
-            aqKernel: { QWGemmAQ.gemmKernelName(bits: wQ4.bits, group: wQ4.groupSize, bm128: false, isSHVQ: wQ4.isSHVQ) }
+            aqKernel: { QWGemmAQ.gemmKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ) }
         )
         enc.setComputePipelineState(pso)
         enc.bindTensors(wQ4.blocks, x, y16, y16, startIndex: 0) // index 3 is dummy slot for unused y32

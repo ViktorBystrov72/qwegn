@@ -94,7 +94,7 @@ extension QWEngineDriver {
                     try copyEmbedRow(token, to: verifyWindow.hiddenRow(row))
                 }
             }
-            guard let cb = hal.queue.makeCommandBuffer() else {
+            guard let cb = hal.makeUnretainedCommandBuffer() else {
                 throw QWEngineDriverError.state("verify command buffer")
             }
             let stageProfiler = mtpVerificationProfiling
@@ -179,8 +179,9 @@ extension QWEngineDriver {
             } else {
                 let table = useDeviceEmbed!
                 let ids = table.tokens.contents().assumingMemoryBound(to: Int32.self)
-                var seq = [pendingToken!]
+                var seq: [Int] = []
                 seq.reserveCapacity(rowCount)
+                seq.append(pendingToken!)
                 for idx in 1..<rowCount {
                     let id = Int(ids[idx])
                     guard (0..<geometry.vocab).contains(id) else {

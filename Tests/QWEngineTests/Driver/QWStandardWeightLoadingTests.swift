@@ -8,6 +8,7 @@ import XCTest
 import QWAlloc
 import QWCore
 import QWHAL
+import QWLoad
 import QWQuant
 @testable import QWEngine
 
@@ -17,6 +18,7 @@ final class QWStandardWeightLoadingTests: XCTestCase {
     private enum Plane {
         case raw([Float])
         case hq4(n: Int, k: Int, tag: UInt8)
+        case fused3D(experts: Int, rows: Int, k: Int, perExpertBytes: Int, hq: [String: Any]?, tags: [UInt8])
     }
 
     /// The pack's names, spelled the way a standard checkpoint spells them.
@@ -78,6 +80,19 @@ final class QWStandardWeightLoadingTests: XCTestCase {
                 entries[name] = ["shape": [n, k], "hq4_off": offset]
                 payload.append(Data(repeating: tag, count: bytes))
                 offset += bytes
+            case .fused3D(let experts, let rows, let k, let perExpertBytes, let hq, let tags):
+                var entry: [String: Any] = [
+                    "shape": [experts, rows, k],
+                    "hq4_off": offset,
+                    "experts": experts,
+                    "e_hq4": perExpertBytes,
+                ]
+                if let hq { entry["hq"] = hq }
+                entries[name] = entry
+                for e in 0..<experts {
+                    payload.append(Data(repeating: tags[e % tags.count], count: perExpertBytes))
+                }
+                offset += experts * perExpertBytes
             }
         }
         let header = try JSONSerialization.data(withJSONObject: [
@@ -117,23 +132,40 @@ final class QWStandardWeightLoadingTests: XCTestCase {
     /// A loader over a synthetic pack. The plan's allocation order is
     /// strict, so each test drives the loader in the engine's own order.
     private func makeLoader(geometry: QWModelGeometry,
-                            planes: [String: Plane]) throws -> QWEngineDriver.WeightLoader {
+                            planes: [String: Plane],
+                            resolvePackFormat: Bool = false) throws -> (
+        loader: QWEngineDriver.WeightLoader,
+        plan: QWWeightAllocationPlan,
+        wsub: QWSubAllocator
+    ) {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("qw-standard-load-\(UUID().uuidString).qwp").path
         try writePack(at: path, planes: planes)
         addTeardownBlock { try? FileManager.default.removeItem(atPath: path) }
-        let pack = try QWQuant.Pack(url: URL(fileURLWithPath: path),
-                                    descriptor: geometry.descriptor,
-                                    skipIdentityCheck: true)
+        let packURL = URL(fileURLWithPath: path)
+        let pack = try QWQuant.Pack(url: packURL, descriptor: geometry.descriptor, skipIdentityCheck: true)
         let hal = try QWHal(geometry: .qwen38_27b)
-        let arena = try QWArena(hal: hal, weights: 1 << 20, activations: 1 << 20,
-                                kv: 1 << 16, gdnStates: 1 << 16)
+        let format = resolvePackFormat
+            ? try QWEngineDriver.weightFormat(
+                for: QWModelRoot(url: packURL, preference: .auto),
+                quantization: geometry.descriptor.quantization,
+                geometry: geometry, mtpDrafts: 0, pack: pack)
+            : .hq4G32
         let plan = try QWWeightAllocationPlan(geometry: geometry, ropeRows: 1,
-                                               mtpDrafts: 0, headQ4g: true)
-        return QWEngineDriver.WeightLoader(pk: pack, hl: hal,
-                                           psoCvt: try hal.pipeline("qwg_bf16_to_f16"),
-                                           wsub: arena.weightsRegion(), plan: plan,
-                                           geometry: geometry)
+                                               mtpDrafts: 0, headQ4g: true, format: format)
+        let arena = try QWArena(hal: hal, weights: max(1 << 20, plan.bytes + 4096),
+                                activations: 1 << 20, kv: 1 << 16, gdnStates: 1 << 16)
+        let wsub = arena.weightsRegion()
+        let loader = QWEngineDriver.WeightLoader(pk: pack, hl: hal,
+                                                 psoCvt: try hal.pipeline("qwg_bf16_to_f16"),
+                                                 wsub: wsub, plan: plan,
+                                                 geometry: geometry, format: format)
+        return (loader, plan, wsub)
+    }
+
+    private func makeLoader(geometry: QWModelGeometry,
+                            planes: [String: Plane]) throws -> QWEngineDriver.WeightLoader {
+        try makeLoader(geometry: geometry, planes: planes, resolvePackFormat: false).loader
     }
 
     /// The loader driven through the engine's own order: the head, then the
@@ -274,6 +306,104 @@ final class QWStandardWeightLoadingTests: XCTestCase {
         _ = try L.q4(Pack.head, n: geometry.vocab, k: geometry.hidden)
         XCTAssertThrowsError(try L.loadDecoderWeights(geometry: geometry)) { e in
             XCTAssertTrue("\(e)".contains("q_norm"), "\(e)")
+        }
+    }
+
+    func testFused3DPartialResidentExpertsMatchesPlanAndLoadsOnlyResidentSlice() throws {
+        let resE = 8
+        let geometry = try QWModelGeometry.stubPureMoE().withResidentExperts(resE)
+        let h = geometry.hidden, inter = geometry.moeIntermediate, totalE = geometry.numExperts
+        let kv = geometry.kvHeads * geometry.headDim
+        let guPerExpert = 2 * inter * (h / 32) * 20
+        let dnPerExpert = h * (inter / 32) * 20
+        let guTags = (0..<totalE).map { UInt8(0x20 + $0) }
+        let dnTags = (0..<totalE).map { UInt8(0x60 + $0) }
+        let planes: [String: Plane] = [
+            Pack.ln1: .raw(gammaVector(h)),
+            Pack.ln2: .raw(gammaVector(h)),
+            Pack.q: .hq4(n: geometry.qProjOut, k: h, tag: Tag.q),
+            Pack.k: .hq4(n: kv, k: h, tag: Tag.k),
+            Pack.v: .hq4(n: kv, k: h, tag: Tag.v),
+            Pack.o: .hq4(n: h, k: geometry.qHeads * geometry.headDim, tag: Tag.o),
+            Pack.qNorm: .raw(gammaVector(geometry.headDim)),
+            Pack.kNorm: .raw(gammaVector(geometry.headDim)),
+            "model.layers.0.mlp.gate.weight": .raw([Float](repeating: 0.25, count: totalE * h)),
+            "model.layers.0.mlp.experts.gate_up_proj": .fused3D(
+                experts: totalE, rows: 2 * inter, k: h,
+                perExpertBytes: guPerExpert, hq: nil, tags: guTags),
+            "model.layers.0.mlp.experts.down_proj": .fused3D(
+                experts: totalE, rows: h, k: inter,
+                perExpertBytes: dnPerExpert, hq: nil, tags: dnTags),
+            Pack.finalNorm: .raw(gammaVector(h)),
+            Pack.head: .hq4(n: geometry.vocab, k: h, tag: Tag.head),
+        ]
+        var (L, plan, wsub) = try makeLoader(geometry: geometry, planes: planes, resolvePackFormat: true)
+        _ = try L.q4(Pack.head, n: geometry.vocab, k: h)
+        let (layers, _) = try L.loadDecoderWeights(geometry: geometry)
+        if let ropeShape = plan.shapes.last { _ = try L.allocateWeight(ropeShape) }
+        try plan.finish(requests: L.weightRequest, usedBytes: wsub.usedBytes)
+
+        let moe = try XCTUnwrap(layers[0].moe)
+        XCTAssertEqual(moe.gateUp.n, resE * 2 * inter)
+        XCTAssertEqual(moe.down.n, resE * h)
+        XCTAssertNotNil(moe.coldStreamer)
+        let guLoaded = bytes(moe.gateUp.blocks, count: resE * guPerExpert)
+        let dnLoaded = bytes(moe.down.blocks, count: resE * dnPerExpert)
+        for e in 0..<resE {
+            let guSlice = guLoaded[(e * guPerExpert)..<((e + 1) * guPerExpert)]
+            let dnSlice = dnLoaded[(e * dnPerExpert)..<((e + 1) * dnPerExpert)]
+            XCTAssertTrue(guSlice.allSatisfy { $0 == guTags[e] })
+            XCTAssertTrue(dnSlice.allSatisfy { $0 == dnTags[e] })
+        }
+    }
+
+    func testFused3DPartialResidentExpertsSHVQBlockSparseMatchesPlan() throws {
+        let resE = 8
+        let geometry = try QWModelGeometry.stubPureMoE().withResidentExperts(resE)
+        let h = geometry.hidden, inter = geometry.moeIntermediate, totalE = geometry.numExperts
+        let kv = geometry.kvHeads * geometry.headDim
+        let shvqBlockBytes = QWSHVQBlock.bytes(bits: 3, group: 64)
+        let guPerExpert = 2 * inter * (h / 64) * shvqBlockBytes
+        let dnPerExpert = h * (inter / 64) * shvqBlockBytes
+        let shvqMeta: [String: Any] = ["bits": 3, "group": 64, "vq": "shvq1"]
+        let guTags = (0..<totalE).map { UInt8(0x80 + $0) }
+        let dnTags = (0..<totalE).map { UInt8(0xC0 + $0) }
+        let planes: [String: Plane] = [
+            Pack.ln1: .raw(gammaVector(h)),
+            Pack.ln2: .raw(gammaVector(h)),
+            Pack.q: .hq4(n: geometry.qProjOut, k: h, tag: Tag.q),
+            Pack.k: .hq4(n: kv, k: h, tag: Tag.k),
+            Pack.v: .hq4(n: kv, k: h, tag: Tag.v),
+            Pack.o: .hq4(n: h, k: geometry.qHeads * geometry.headDim, tag: Tag.o),
+            Pack.qNorm: .raw(gammaVector(geometry.headDim)),
+            Pack.kNorm: .raw(gammaVector(geometry.headDim)),
+            "model.layers.0.block_sparse_moe.gate.weight": .raw([Float](repeating: 0.5, count: totalE * h)),
+            "model.layers.0.block_sparse_moe.experts.gate_up_proj.weight": .fused3D(
+                experts: totalE, rows: 2 * inter, k: h,
+                perExpertBytes: guPerExpert, hq: shvqMeta, tags: guTags),
+            "model.layers.0.block_sparse_moe.experts.down_proj.weight": .fused3D(
+                experts: totalE, rows: h, k: inter,
+                perExpertBytes: dnPerExpert, hq: shvqMeta, tags: dnTags),
+            Pack.finalNorm: .raw(gammaVector(h)),
+            Pack.head: .hq4(n: geometry.vocab, k: h, tag: Tag.head),
+        ]
+        var (L, plan, wsub) = try makeLoader(geometry: geometry, planes: planes, resolvePackFormat: true)
+        _ = try L.q4(Pack.head, n: geometry.vocab, k: h)
+        let (layers, _) = try L.loadDecoderWeights(geometry: geometry)
+        if let ropeShape = plan.shapes.last { _ = try L.allocateWeight(ropeShape) }
+        try plan.finish(requests: L.weightRequest, usedBytes: wsub.usedBytes)
+
+        let moe = try XCTUnwrap(layers[0].moe)
+        XCTAssertTrue(moe.gateUp.isSHVQ)
+        XCTAssertTrue(moe.down.isSHVQ)
+        XCTAssertEqual(moe.gateUp.bits, 3)
+        XCTAssertEqual(moe.gateUp.groupSize, 64)
+        XCTAssertEqual(moe.gateUp.blocks.bytes, resE * guPerExpert)
+        XCTAssertEqual(moe.down.blocks.bytes, resE * dnPerExpert)
+        let guLoaded = bytes(moe.gateUp.blocks, count: resE * guPerExpert)
+        for e in 0..<resE {
+            let slice = guLoaded[(e * guPerExpert)..<((e + 1) * guPerExpert)]
+            XCTAssertTrue(slice.allSatisfy { $0 == guTags[e] })
         }
     }
 }

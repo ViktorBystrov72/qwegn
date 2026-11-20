@@ -175,8 +175,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             maxThinkingTokens: 3, endThinkTokenId: 13, vocabularySize: 16, table: table, inner: inner
         )
 
-        XCTAssertTrue(c.isInThinking)
-        XCTAssertEqual(c.thinkingTokenCount, 0)
+        XCTAssertEqual(try c.allowedTokens(), try inner.allowedTokens(), "mirrors inner while thinking within budget")
         XCTAssertEqual(c.allowsSpeculation, inner.allowsSpeculation, "mirrors inner while thinking within budget")
         XCTAssertFalse(c.isUnconstrainedNow, "within 16 tokens of budget disables unconstrained spec")
         XCTAssertEqual(c.speculationBoundaryToken, 13)
@@ -194,15 +193,12 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
         for step in 0..<3 {
             XCTAssertNil(try c.allowedTokens(), "free thinking at step \(step)")
             try c.accept(3)
-            XCTAssertEqual(c.thinkingTokenCount, step + 1)
         }
 
-        XCTAssertTrue(c.isInThinking)
         XCTAssertFalse(c.allowsSpeculation)
         XCTAssertEqual(try c.allowedTokens(), [13], "must force </think> once budget exhausted")
 
         try c.accept(13)
-        XCTAssertFalse(c.isInThinking)
         XCTAssertEqual(try c.allowedTokens(), [0, 9], "delegates to JSON constraint after </think>")
 
         try c.accept(0)
@@ -244,10 +240,9 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
         )
         try c2.accept(0)
         try c2.accept(1)
-        XCTAssertTrue(c2.isInThinking)
+        XCTAssertNil(try c2.allowedTokens())
         try c2.accept(2)
-        XCTAssertFalse(c2.isInThinking, "multi-token </ + think + > exits thinking")
-        XCTAssertEqual(try c2.allowedTokens(), [4])
+        XCTAssertEqual(try c2.allowedTokens(), [4], "multi-token </ + think + > exits thinking")
     }
 
     func testThinkingBudgetConstraintComposesWithToolCallConstraint() throws {
@@ -268,7 +263,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
         try c.accept(6)
         XCTAssertEqual(try c.allowedTokens(), [5])
         try c.accept(5)
-        XCTAssertFalse(c.isInThinking)
+        XCTAssertEqual(try c.allowedTokens(), nil, "tool call constraint begins after </think>")
 
         try c.accept(0)
         try c.accept(2)
@@ -281,7 +276,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":32}"#.utf8)
         )
-        let p32 = implicit32.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let p32 = QWChatPolicyResolver.resolveThinkingPolicy(for: implicit32, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertFalse(p32.shouldThink)
         XCTAssertNil(p32.thinkingBudget)
 
@@ -289,7 +284,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":64}"#.utf8)
         )
-        let p64 = implicit64.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let p64 = QWChatPolicyResolver.resolveThinkingPolicy(for: implicit64, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(p64.shouldThink)
         XCTAssertEqual(p64.thinkingBudget, 48)
 
@@ -297,7 +292,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":256}"#.utf8)
         )
-        let p256 = implicit256.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let p256 = QWChatPolicyResolver.resolveThinkingPolicy(for: implicit256, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(p256.shouldThink)
         XCTAssertEqual(p256.thinkingBudget, 192)
 
@@ -305,7 +300,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":2048}"#.utf8)
         )
-        let p2048 = implicit2048.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let p2048 = QWChatPolicyResolver.resolveThinkingPolicy(for: implicit2048, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(p2048.shouldThink)
         XCTAssertEqual(p2048.thinkingBudget, 1792)
 
@@ -313,7 +308,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":32,"enable_thinking":true}"#.utf8)
         )
-        let pExplicitEnable = explicitEnable.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pExplicitEnable = QWChatPolicyResolver.resolveThinkingPolicy(for: explicitEnable, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pExplicitEnable.shouldThink)
         XCTAssertNil(pExplicitEnable.thinkingBudget)
 
@@ -321,7 +316,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":32,"reasoning_budget":20}"#.utf8)
         )
-        let pExplicitBudget = explicitBudget.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pExplicitBudget = QWChatPolicyResolver.resolveThinkingPolicy(for: explicitBudget, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pExplicitBudget.shouldThink)
         XCTAssertEqual(pExplicitBudget.thinkingBudget, 20)
 
@@ -329,7 +324,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":256,"reasoning_effort":"none"}"#.utf8)
         )
-        let pNone = effortNone.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pNone = QWChatPolicyResolver.resolveThinkingPolicy(for: effortNone, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertFalse(pNone.shouldThink)
         XCTAssertNil(pNone.thinkingBudget)
     }
@@ -593,7 +588,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":256,"enable_thinking":true,"response_format":{"type":"json_schema"}}"#.utf8)
         )
-        let pJson = explicitJson.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pJson = QWChatPolicyResolver.resolveThinkingPolicy(for: explicitJson, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pJson.shouldThink)
         XCTAssertEqual(pJson.thinkingBudget, 192)
 
@@ -601,7 +596,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":32,"enable_thinking":true,"response_format":{"type":"json_object"}}"#.utf8)
         )
-        let pTiny = tinyJson.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pTiny = QWChatPolicyResolver.resolveThinkingPolicy(for: tinyJson, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pTiny.shouldThink)
         XCTAssertEqual(pTiny.thinkingBudget, 16)
 
@@ -609,7 +604,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":256,"enable_thinking":true,"reasoning_budget":24,"response_format":{"type":"json_schema"}}"#.utf8)
         )
-        let pBudget = explicitJsonBudget.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pBudget = QWChatPolicyResolver.resolveThinkingPolicy(for: explicitJsonBudget, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pBudget.shouldThink)
         XCTAssertEqual(pBudget.thinkingBudget, 24)
     }
@@ -619,7 +614,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true,"reasoning_effort":"low"}"#.utf8)
         )
-        let pLow = lowReq.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pLow = QWChatPolicyResolver.resolveThinkingPolicy(for: lowReq, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pLow.shouldThink)
         XCTAssertEqual(pLow.thinkingBudget, 256)
 
@@ -627,7 +622,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true,"reasoning_effort":"medium"}"#.utf8)
         )
-        let pMed = medReq.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pMed = QWChatPolicyResolver.resolveThinkingPolicy(for: medReq, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pMed.shouldThink)
         XCTAssertEqual(pMed.thinkingBudget, 1024)
 
@@ -635,7 +630,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true,"reasoning_effort":"high"}"#.utf8)
         )
-        let pHigh = highReq.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pHigh = QWChatPolicyResolver.resolveThinkingPolicy(for: highReq, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pHigh.shouldThink)
         XCTAssertEqual(pHigh.thinkingBudget, 4096)
 
@@ -643,7 +638,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true,"reasoning_effort":"xhigh"}"#.utf8)
         )
-        let pXHigh = xhighReq.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pXHigh = QWChatPolicyResolver.resolveThinkingPolicy(for: xhighReq, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pXHigh.shouldThink)
         XCTAssertEqual(pXHigh.thinkingBudget, 8192)
 
@@ -651,7 +646,7 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             ChatCompletionRequest.self,
             from: Data(#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536,"enable_thinking":true}"#.utf8)
         )
-        let pExplicitLarge = explicitEnableLarge.resolvedThinkingPolicy(defaultEnableThinking: true, defaultMaxTokens: 512)
+        let pExplicitLarge = QWChatPolicyResolver.resolveThinkingPolicy(for: explicitEnableLarge, defaultEnableThinking: true, defaultMaxTokens: 512)
         XCTAssertTrue(pExplicitLarge.shouldThink)
         XCTAssertEqual(pExplicitLarge.thinkingBudget, 65280)
     }

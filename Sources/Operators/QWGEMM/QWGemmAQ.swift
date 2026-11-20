@@ -19,10 +19,9 @@ public enum QWGemmAQ {
     }
 
     /// The kernel for a `(bits, group)` pair.
-    public static func kernelName(bits: Int, group: Int, f32Activations: Bool = false, isSHVQ: Bool = false) -> String? {
+    public static func kernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
         guard isSupported(bits: bits, group: group, isSHVQ: isSHVQ) else { return nil }
-        let base = isSHVQ ? "qwg_gemv_shvq\(bits)_g\(group)_v4" : "qwg_gemv_aq\(bits)_g\(group)_v4"
-        return f32Activations ? base + "_f32" : base
+        return isSHVQ ? "qwg_gemv_shvq\(bits)_g\(group)_v4" : "qwg_gemv_aq\(bits)_g\(group)_v4"
     }
 
     /// The decode kernel for a `(bits, group)` pair: four output rows per simdgroup, f16 in and f16 out.
@@ -48,10 +47,9 @@ public enum QWGemmAQ {
     }
 
     /// The prefill GEMM for a `(bits, group)` pair.
-    public static func gemmKernelName(bits: Int, group: Int, bm128: Bool = false, isSHVQ: Bool = false) -> String? {
+    public static func gemmKernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
         guard isSupported(bits: bits, group: group, isSHVQ: isSHVQ) else { return nil }
-        let base = isSHVQ ? "qwg_gemm_shvq\(bits)_g\(group)_h16" : "qwg_gemm_aq\(bits)_g\(group)_h16"
-        return base + (bm128 ? "_bm128" : "")
+        return isSHVQ ? "qwg_gemm_shvq\(bits)_g\(group)_h16" : "qwg_gemm_aq\(bits)_g\(group)_h16"
     }
 
     /// The fused gate_up + SwiGLU + FWHT-32 prefill GEMM for a `(bits, group)` pair.
@@ -194,9 +192,8 @@ public enum QWGemmAQ {
     public static func encode(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
                                blocks: QWTensorValue, x: QWTensorValue, y: QWTensorValue,
                                n: Int, k: Int, bits: Int, group: Int,
-                               f32Activations: Bool = false,
                                rows: Int = 1, isSHVQ: Bool = false) throws {
-        guard let name = kernelName(bits: bits, group: group, f32Activations: f32Activations, isSHVQ: isSHVQ) else {
+        guard let name = kernelName(bits: bits, group: group, isSHVQ: isSHVQ) else {
             throw QWGemmError.badWeights("no affine-quantised kernel for \(bits)-bit group \(group)")
         }
         guard k % group == 0, n > 0, rows > 0 else {
@@ -209,9 +206,8 @@ public enum QWGemmAQ {
         guard blocks.bytes >= needed else {
             throw QWGemmError.badWeights("block bank holds \(blocks.bytes) bytes, \(needed) needed")
         }
-        let wantX: QWDType = f32Activations ? .f32 : .f16
-        guard x.shape.dtype == wantX else {
-            throw QWGemmError.badWeights("activations must be \(wantX), got \(x.shape.dtype)")
+        guard x.shape.dtype == .f16 else {
+            throw QWGemmError.badWeights("activations must be f16, got \(x.shape.dtype)")
         }
         guard x.shape.elementCount >= rows * k else {
             throw QWGemmError.badWeights("activations hold \(x.shape.elementCount), \(rows * k) needed")
@@ -221,27 +217,6 @@ public enum QWGemmAQ {
         }
         guard y.shape.elementCount >= rows * n else {
             throw QWGemmError.badWeights("output holds \(y.shape.elementCount), \(rows * n) needed")
-        }
-        if f32Activations {
-            guard n < (1 << 30) else {
-                throw QWGemmError.badWeights("a bank of \(n) rows does not fit row-count flags")
-            }
-            let pso = try hal.pipeline(name)
-            enc.setComputePipelineState(pso)
-            blocks.bind(enc, index: 0)
-            var n32 = UInt32(n)
-            var k32 = UInt32(k)
-            enc.setBytes(&n32, length: 4, index: 4)
-            enc.setBytes(&k32, length: 4, index: 5)
-            for row in 0..<rows {
-                let xRow = rows == 1 ? x : x.slice(byteOffset: row * k * 4, count: k, dtype: .f32)
-                let yRow = rows == 1 ? y : y.slice(byteOffset: row * n * 4, count: n, dtype: .f32)
-                xRow.bind(enc, index: 1)
-                yRow.bind(enc, index: 3)
-                enc.dispatchThreadgroups(MTLSize(width: n, height: 1, depth: 1),
-                                         threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-            }
-            return
         }
         guard n < (rows > 1 ? (1 << 24) : (1 << 30)) else {
             throw QWGemmError.badWeights("a bank of \(n) rows does not fit row-count flags")

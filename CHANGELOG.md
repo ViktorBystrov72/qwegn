@@ -8,6 +8,35 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.28.0] - 2026-11-20
+
+What's changed since `v0.27.4`: ships Wave 5 speculative pipeline and hot-path allocation fixes plus Wave 6 HAL Stage 1 lock-free residency, Native Metal FP16 ViT + FlashAttention (`4.09×–4.12×` faster vision encode, `-45%` active vision weights), `1.66×–1.90×` zero-allocation pure-ASCII/BPE tokenizer acceleration, deterministic JSON key-order preservation for server prefix caching, and dead-code/kernel hygiene.
+
+### Added & Performance
+- **Native Metal FP16 ViT, `O(N)` FlashAttention & `vDSP`/`vImage` Patch Slab (`QWVision`, `QWVisionMetalBackend`, `QWMM`, `QWServer`, `Sources/QWMetal`)**:
+  - Replaced CPU/AMX-only vision encoding with basis-independent FP16 Metal ViT kernels + `O(N)` FlashAttention and `vDSP`/`vImage` patch slab preprocessing wired into `QWVisionOnDemandBackend` (`--load-vision` / `--no-load-vision` residency toggles honored).
+  - Cut vision encode latency `4.09×` on `SenseNova-Loop-9B-hq4g32` (`3,304.7 -> 807.8 ms` vision encode; `7.19 -> 4.61 s` paired CLI wall; `996.7 MB` / `950.6 MiB` vs `1.82 GB` resident vision weights with `100%` SHA-256 output parity) and `4.12×` on `Qwen3.8-27B-hq4g32` (`3,348.6 -> 812.2 ms`; `9.45 -> 6.94 s` paired wall; `1.01 GB` / `961.6 MiB` vs `1.84 GB`, `0.8856` text similarity). `--no-load-vision --image` cleanly exits `2`.
+- **`QWTokenizer` Pure-ASCII Skip, Zero-Alloc BPE & Bounded Word Cache (`QWToken`)**:
+  - Added ASCII fast-path scanning, zero-allocation BPE scratch buffers, and a bounded word cache in `QWTokenizer`, delivering `1.88×–1.90×` speedup at `2K` (`0.69 -> 0.36 ms`) and `1.66×–1.67×` at `32K` (`10.54–10.62 -> 6.35–6.36 ms`) with `4/4` bit-exact token-ID identity across `SenseNova-Loop-9B` and `Qwen3.8-27B`.
+- **HAL Lock-Free Residency, Unretained CBs & Arena Hazard Policy (Stage 1: `QWHAL`, `QWAlloc`)**:
+  - Added `QWResidencyRegistry` lock-free snapshot adoption, unretained command buffer handling, and `.safeDefault` arena hazard policy, covered by `QWWave6HALResidencyTests` and `QWWave6ArenaHazardTests`.
+- **Wave 5 Speculative Sync & Hot-Path Scratch Reuse (`QWMTP`, `QWHead`, `QWEngine`, `QWFlashNext`)**:
+  - Eliminated `DFlash`/`NextN` sync bubbles, redundant GDN rollback scans/copies, and 3-CB decode splits, and introduced `O(1)` N-gram LRU eviction and zero-allocation constraint, sampler, and recycler scratch buffers.
+
+### Fixed
+- **Ordered JSON Root Key Preservation Across HTTP Decoding (`QWCore`, `QWServer`, `QWServerRequestDecoder`)**:
+  - Added `QWJson.orderedRootUserInfoKey` and routed HTTP JSON request decoding through ordered root decoding across endpoints so prefix-cache prompts remain deterministic regardless of client key serialization order (`a313027a`).
+- **Fused-3D Cold-Expert Slicing & Bounds Safety (`01f09cf0`)**:
+  - Fixed fused-3D cold-expert plane slicing offsets and bounds checks during pack loading.
+
+### Removed & Cleaned
+- **Engine & Kernel Dead-Code Purge (`033a6a5d`, `f3076c25`)**:
+  - Removed unused/MLX/bench-only Metal kernels (`1,183` live production kernels / `308` dispatches) and dead/test-only Swift symbols, deduplicated admission/HAL/greedy helpers, moved `m1` soak helpers out of production sources, and tightened `Scripts/lint_kernels.py` reachability enforcement.
+
+### Verified
+- **Unit & CI Gates**: `Scripts/ci.sh` (`ci ok`, `check_metallib_target.py` `macOS 26.2`, `14/14` paired_perf Python tests, `103` `qwg-bench-kernels` entries), `swift test --no-parallel` (`1,708` executed: `1,656` XCTest + `52` Swift Testing, `25` skipped, `0` failed, `0` compiler warnings under `-Xswiftc -warnings-as-errors`).
+- **Paired Quiet-GPU A/B, Law 28 QA & `llmprobe`**: `10/10` Stage 2 paired A/B checks (`0` steady allocs, bit-exact text SHA-256 across all text runs, `-27.13 GiB` `--stream-ngrams`), `36/36` Law 28 `QWServer` QA scenarios (`S1–S9` across `SenseNova-Loop-9B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B + DFlash2`, `Qwen3.8-Flash-Next`, `0` server errors), and `8/8` model `llmprobe --full` + `Code-100` runs (`17` reports archived in `out/llmprobe/`).
+
 ## [0.27.4] - 2026-11-19
 
 What's changed since `v0.27.3`: fixed silent Metal 4 NAX `matmul2d` cooperative-tensor prefill corruption in macOS 26 release builds by pinning `-mmacosx-version-min=26.2`, added compile-time and CI metallib deployment-target guards, and landed Wave 1–4 security, memory-safety, kernel, concurrency, and architecture hardening across the runtime and server.

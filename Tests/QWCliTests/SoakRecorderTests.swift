@@ -9,6 +9,7 @@
 import Foundation
 import Testing
 @testable import QWCli
+@testable import m1
 
 /// A throwaway directory for the artifacts a test writes.
 private func scratchDir() throws -> URL {
@@ -116,10 +117,10 @@ func seededRegressionFails() throws {
 func recorderRoundTrip() throws {
     let dir = try scratchDir()
     defer { try? FileManager.default.removeItem(at: dir) }
-    let url = QWCli.SoakRecorder.exportURL(in: dir)
+    let url = SoakRecorder.exportURL(in: dir)
     #expect(url.lastPathComponent.hasPrefix("m1_export_"))
-    var recorder = QWCli.SoakRecorder(url: url)
-    let samples = QWCli.LocalSoak.run(.init(steps: 500, window: 250, rows: 64))
+    var recorder = SoakRecorder(url: url)
+    let samples = LocalSoak.run(.init(steps: 500, window: 250, rows: 64))
     try recorder.record(samples)
     #expect(recorder.written == samples.count)
     let loaded = try QWCli.SoakSample.load(url)

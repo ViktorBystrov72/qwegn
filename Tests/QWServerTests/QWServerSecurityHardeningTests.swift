@@ -453,7 +453,7 @@ final class QWServerSecurityHardeningTests: XCTestCase {
             "http://[::8.8.8.8]/img.png"
         ] {
             let url = try XCTUnwrap(URL(string: badURLStr))
-            XCTAssertThrowsError(try QWImageDecodePolicy.validateRemoteURL(url), "Expected SSRF throw for \(badURLStr)")
+            XCTAssertThrowsError(try QWImageDecodePolicy.validateAndResolveRemoteURL(url), "Expected SSRF throw for \(badURLStr)")
         }
 
         // Local loopback HTTP fixture exercising pinned IP connection, Host preservation, and 302 redirect handling.

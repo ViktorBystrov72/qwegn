@@ -11,7 +11,7 @@ public struct QWKernelDispatchEntry: Sendable, Hashable, Codable {
     /// The row-count bucket the measurement was taken at. The bucket is the
     /// GEMV's **output-row count** — the N extent, not M.
     public let nBucket: Int
-    /// The operation the kernel serves: "gemv", "mlx_nax_gemm", and so on.
+    /// The operation the kernel serves: "gemv", "mlp_swiglu", and so on.
     public let op: String
     /// The quantisation width the kernel reads.
     public let bits: Int
@@ -69,7 +69,7 @@ public struct QWKernelDispatchTable: Sendable, Codable, Equatable {
     /// cannot drift; reading a map refuses no unknown operation.
     public static let knownOps = [
         // The family sweep.
-        "gemv", "mlx_nax_gemm",
+        "gemv",
         // The per-operator suites.
         "gdn_inproj_decode", "mlp_swiglu", "attn_qkv", "lm_head",
         // The routed-MoE suites.

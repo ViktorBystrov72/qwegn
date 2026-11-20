@@ -13,7 +13,7 @@ extension QWHttpServer {
     func handleCreateResponse(connection: NWConnection, headers: [String: String] = [:], body: Data) async throws {
         let req: OpenAIResponseCreateRequest
         do {
-            req = try JSONDecoder().decode(OpenAIResponseCreateRequest.self, from: body)
+            req = try QWServerRequestDecoder.decode(OpenAIResponseCreateRequest.self, from: body)
         } catch {
             sendOpenAIError(connection, status: 400, message: "Malformed JSON payload: \(error.localizedDescription)")
             return

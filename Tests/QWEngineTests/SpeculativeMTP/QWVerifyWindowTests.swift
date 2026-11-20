@@ -217,10 +217,10 @@ final class QWVerifyWindowTests: XCTestCase {
             let lp = window.logits.region.pointer.advanced(by: window.logits.offset).assumingMemoryBound(to: Float.self)
             for i in 0..<(b * v) { lp[i] = -1 }
             for row in 0..<b { lp[row * v + row + 1] = 2; lp[row * v + row + 20] = 2 }
-            let decision = try window.greedyDecision(drafts: Array(1..<b), maxNew: b)
+            let decision = try window.greedyDecisionWithTargets(drafts: Array(1..<b), maxNew: b).decision
             XCTAssertEqual(decision.tokens, Array(1...b), "argmax ties choose the lowest vocabulary ID")
             lp[0] = .nan
-            XCTAssertThrowsError(try window.greedyDecision(drafts: Array(1..<b), maxNew: b))
+            XCTAssertThrowsError(try window.greedyDecisionWithTargets(drafts: Array(1..<b), maxNew: b))
             XCTAssertEqual(bytes(checkpoint.recurrent), originalRec)
             XCTAssertEqual(bytes(checkpoint.rings), originalRing)
             XCTAssertEqual(a.steadyStateAllocs, 0)

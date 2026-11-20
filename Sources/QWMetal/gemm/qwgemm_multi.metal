@@ -54,23 +54,6 @@ using namespace metal;
         }                                                                      \
     }
 
-#define QWG_AQ_KERNEL_F32(BITS, GROUP, NAME)                                   \
-    kernel void NAME(device const char* blocks [[buffer(0)]],                   \
-                     device const float* x [[buffer(1)]],                       \
-                     device float* y [[buffer(3)]],                              \
-                     constant uint& N [[buffer(4)]],                            \
-                     constant uint& K [[buffer(5)]],                            \
-                     uint tg [[threadgroup_position_in_grid]],                  \
-                     uint ti [[thread_index_in_threadgroup]],                  \
-                     uint tptg [[threads_per_threadgroup]]) {                 \
-        const uint simd_id = ti >> 5u;                                         \
-        const uint lane = ti & 31u;                                            \
-        const uint row = tg * max(1u, tptg >> 5u) + simd_id;                   \
-        if (row >= N) return;                                                  \
-        const float v = qwg_aq_gemv_row_f32<BITS, GROUP>(blocks, x, row, K, lane); \
-        if (lane == 0u) { y[row] = v; }                                         \
-    }
-
 QWG_AQ_KERNEL(2, 32, qwg_gemv_aq2_g32_v4)
 QWG_AQ_KERNEL(2, 64, qwg_gemv_aq2_g64_v4)
 QWG_AQ_KERNEL(2, 128, qwg_gemv_aq2_g128_v4)
@@ -91,24 +74,3 @@ QWG_AQ_KERNEL(8, 32, qwg_gemv_aq8_g32_v4)
 QWG_AQ_KERNEL(8, 64, qwg_gemv_aq8_g64_v4)
 QWG_AQ_KERNEL(8, 128, qwg_gemv_aq8_g128_v4)
 QWG_AQ_KERNEL(8, 256, qwg_gemv_aq8_g256_v4)
-
-QWG_AQ_KERNEL_F32(2, 32, qwg_gemv_aq2_g32_v4_f32)
-QWG_AQ_KERNEL_F32(2, 64, qwg_gemv_aq2_g64_v4_f32)
-QWG_AQ_KERNEL_F32(2, 128, qwg_gemv_aq2_g128_v4_f32)
-QWG_AQ_KERNEL_F32(2, 256, qwg_gemv_aq2_g256_v4_f32)
-QWG_AQ_KERNEL_F32(3, 32, qwg_gemv_aq3_g32_v4_f32)
-QWG_AQ_KERNEL_F32(3, 64, qwg_gemv_aq3_g64_v4_f32)
-QWG_AQ_KERNEL_F32(3, 128, qwg_gemv_aq3_g128_v4_f32)
-QWG_AQ_KERNEL_F32(3, 256, qwg_gemv_aq3_g256_v4_f32)
-QWG_AQ_KERNEL_F32(4, 32, qwg_gemv_aq4_g32_v4_f32)
-QWG_AQ_KERNEL_F32(4, 64, qwg_gemv_aq4_g64_v4_f32)
-QWG_AQ_KERNEL_F32(4, 128, qwg_gemv_aq4_g128_v4_f32)
-QWG_AQ_KERNEL_F32(4, 256, qwg_gemv_aq4_g256_v4_f32)
-QWG_AQ_KERNEL_F32(6, 32, qwg_gemv_aq6_g32_v4_f32)
-QWG_AQ_KERNEL_F32(6, 64, qwg_gemv_aq6_g64_v4_f32)
-QWG_AQ_KERNEL_F32(6, 128, qwg_gemv_aq6_g128_v4_f32)
-QWG_AQ_KERNEL_F32(6, 256, qwg_gemv_aq6_g256_v4_f32)
-QWG_AQ_KERNEL_F32(8, 32, qwg_gemv_aq8_g32_v4_f32)
-QWG_AQ_KERNEL_F32(8, 64, qwg_gemv_aq8_g64_v4_f32)
-QWG_AQ_KERNEL_F32(8, 128, qwg_gemv_aq8_g128_v4_f32)
-QWG_AQ_KERNEL_F32(8, 256, qwg_gemv_aq8_g256_v4_f32)

@@ -63,8 +63,6 @@ public struct QWSpeculativeResolution: Sendable, Equatable {
 
     public var firstToken: Int { tokens[0] }
     public var trailingTokens: [Int] { tokens.count > 1 ? Array(tokens.dropFirst()) : [] }
-    public var allAccepted: Bool { rollbackCount == 0 }
-    public var retainedVerifyRows: Int { tokens.count }
     public var pendingToken: Int? { tokens.last }
 
     /// True when the MTP chain/seed must re-sync to the last committed token instead of draft-0.

@@ -229,18 +229,6 @@ struct QWVerifyWindow {
         return result
     }
 
-    /// Completed target logits use shipping bit-key order (+0 above -0),
-    /// with lowest-ID ties. Never call before command-buffer completion.
-    func greedyDecision(drafts: [Int], maxNew: Int, stopIDs: Set<Int> = [],
-                        activeRows: Int? = nil, relaxedMargin: Float = 0,
-                        relaxedMinProb: Float = 0) throws -> QWGreedyRoundDecision {
-        try greedyDecisionWithTargets(
-            drafts: drafts, maxNew: maxNew, stopIDs: stopIDs,
-            activeRows: activeRows, relaxedMargin: relaxedMargin,
-            relaxedMinProb: relaxedMinProb
-        ).decision
-    }
-
     /// Computes both the accepted prefix decision and the unrelaxed target argmax
     /// vector across every active verification row in a single logit pass.
     func greedyDecisionWithTargets(
@@ -274,9 +262,10 @@ struct QWVerifyWindow {
                     let draftScore = rowLogits[draftId]
                     let targetScore = rowLogits[targetId]
                     if draftScore.isFinite && targetScore.isFinite && draftScore >= targetScore - relaxedMargin,
-                       Self.clearsProbabilityFloor(UnsafeBufferPointer(start: rowLogits, count: vocabulary),
-                                                   draftScore: draftScore, maxScore: targetScore,
-                                                   minProbability: relaxedMinProb) {
+                       QWSpeculativeTokenResolver.clearsProbabilityFloor(
+                           UnsafeBufferPointer(start: rowLogits, count: vocabulary),
+                           draftScore: draftScore, maxScore: targetScore,
+                           minProbability: relaxedMinProb) {
                         acceptedTargets[row] = draftId
                     } else {
                         break
@@ -288,22 +277,6 @@ struct QWVerifyWindow {
             geometry: geometry, drafts: drafts, targetTokens: acceptedTargets,
             maxNew: maxNew, stopIDs: stopIDs)
         return (decision: decision, targets: rawTargets)
-    }
-
-    /// Variational fidelity floor: a relaxed draft also needs
-    /// `softmax(logits)[draft] >= minProbability`, so a flat row cannot
-    /// wave through a low-probability token that merely sits within the margin.
-    static func clearsProbabilityFloor(_ logits: UnsafeBufferPointer<Float>, draftScore: Float,
-                                       maxScore: Float, minProbability: Float) -> Bool {
-        guard minProbability > 0 else { return true }
-        guard minProbability < 1 else { return false }
-        var sum: Double = 0
-        for score in logits {
-            let diff = score - maxScore
-            if diff > -45.0 { sum += exp(Double(diff)) }
-        }
-        let logProb = Double(draftScore - maxScore) - log(sum)
-        return logProb >= log(Double(minProbability))
     }
 
     enum GreedyOrdering {
@@ -338,8 +311,10 @@ struct QWVerifyWindow {
         }
         try checkpoint.validateResolution(rec: rec, ring: ring, activeRows: verifiedRows)
         let carryFromStream = trunkHidden.shape.dtype == .f32
-        if count > 0 {
-            let carrySource = carryFromStream ? try mhcStreamRow(count - 1) : try hiddenRow(count - 1)
+        let carrySource: QWTensorValue? = count > 0
+            ? (carryFromStream ? try mhcStreamRow(count - 1) : try hiddenRow(count - 1))
+            : nil
+        if let carrySource {
             let carryStorage = carryFromStream ? mhcStream! : hidden
             try Self.validateCopy(source: carrySource, destination: trunkHidden)
             if carryStorage.region.buffer === trunkHidden.region.buffer {
@@ -351,6 +326,20 @@ struct QWVerifyWindow {
             }
             _ = try hal.pipeline("qwg_verify_copy")
         }
+        if checkpoint.layers == 0 {
+            if count < verifiedRows {
+                try checkpoint.validateRetained(verifiedRows)
+            }
+            if let carrySource {
+                guard let enc = cb.makeComputeCommandEncoder() else {
+                    throw QWEngineDriverError.state("retained hidden encoder")
+                }
+                hal.touchKeepAlive(enc)
+                defer { enc.endEncoding() }
+                try Self.encodeCopy(enc, hal: hal, source: carrySource, destination: trunkHidden)
+            }
+            return
+        }
         // Even all-accept can be shortened by stops, callbacks, or maxNew.
         if count < verifiedRows {
             if try checkpoint.rollbackTapeIsStable(retaining: count, activeRows: verifiedRows) {
@@ -360,7 +349,11 @@ struct QWVerifyWindow {
                 hal.touchKeepAlive(enc)
                 do {
                     try checkpoint.encodeRollbackTape(enc, decoder: decoder, rec: rec,
-                                                      activeRows: verifiedRows, retaining: count)
+                                                      activeRows: verifiedRows, retaining: count,
+                                                      verifyStability: false)
+                    if let carrySource {
+                        try Self.encodeCopy(enc, hal: hal, source: carrySource, destination: trunkHidden)
+                    }
                 } catch {
                     enc.endEncoding()
                     throw error
@@ -381,37 +374,31 @@ struct QWVerifyWindow {
                     throw QWEngineDriverError.state("retained restore encoder")
                 }
                 do {
-                    try checkpoint.encodeRestore(blit, rec: rec, ring: ring)
+                    try checkpoint.encodeRestore(blit, rec: rec, ring: ring, restoreRing: false)
+                    try checkpoint.encodeReplayRings(blit, ring: ring, retaining: count)
                 } catch {
                     blit.endEncoding()
                     throw error
                 }
                 blit.endEncoding()
-                guard let enc = cb.makeComputeCommandEncoder() else {
-                    throw QWEngineDriverError.state("retained replay encoder")
-                }
-                hal.touchKeepAlive(enc)
-                do {
-                    try checkpoint.encodeReplay(enc, decoder: decoder, rec: rec, retaining: count)
-                } catch {
+                if count > 0 {
+                    guard let enc = cb.makeComputeCommandEncoder() else {
+                        throw QWEngineDriverError.state("retained replay encoder")
+                    }
+                    hal.touchKeepAlive(enc)
+                    do {
+                        try checkpoint.encodeReplay(enc, decoder: decoder, rec: rec, retaining: count)
+                        if let carrySource {
+                            try Self.encodeCopy(enc, hal: hal, source: carrySource, destination: trunkHidden)
+                        }
+                    } catch {
+                        enc.endEncoding()
+                        throw error
+                    }
                     enc.endEncoding()
-                    throw error
                 }
-                enc.endEncoding()
-                guard let rings = cb.makeBlitCommandEncoder() else {
-                    throw QWEngineDriverError.state("retained ring encoder")
-                }
-                do {
-                    try checkpoint.encodeReplayRings(rings, ring: ring, retaining: count)
-                } catch {
-                    rings.endEncoding()
-                    throw error
-                }
-                rings.endEncoding()
             }
-        }
-        if count > 0 {
-            let carrySource = carryFromStream ? try mhcStreamRow(count - 1) : try hiddenRow(count - 1)
+        } else if let carrySource {
             guard let enc = cb.makeComputeCommandEncoder() else { throw QWEngineDriverError.state("retained hidden encoder") }
             hal.touchKeepAlive(enc)
             defer { enc.endEncoding() }
@@ -436,14 +423,18 @@ struct QWVerifyWindow {
         guard checkpoint.rows == rows, (2...rows).contains(count) else {
             throw QWEngineDriverError.state("verify/checkpoint row mismatch")
         }
-        guard let blit = cb.makeBlitCommandEncoder() else { throw QWEngineDriverError.state("verify backup encoder") }
-        do {
-            try checkpoint.encodeBackup(blit, rec: rec, ring: ring)
-        } catch {
+        if checkpoint.layers == 0 {
+            try checkpoint.markZeroLayerBackup(rec: rec, ring: ring)
+        } else {
+            guard let blit = cb.makeBlitCommandEncoder() else { throw QWEngineDriverError.state("verify backup encoder") }
+            do {
+                try checkpoint.encodeBackup(blit, rec: rec, ring: ring)
+            } catch {
+                blit.endEncoding()
+                throw error
+            }
             blit.endEncoding()
-            throw error
         }
-        blit.endEncoding()
         if let windowEncoder { try windowEncoder() }
         else { for row in 0..<count { try rowEncoder(row) } }
         try checkpoint.validateCompleteCapture(activeRows: count)

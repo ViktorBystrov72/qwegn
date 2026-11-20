@@ -481,7 +481,7 @@ final class QWColdStreamingAndDrainTests: XCTestCase {
             for: mismatchedAQ, weightFormat: .hq4G32, hal: hal,
             defaultPSO: defaultPSO, opName: "prefill GEMM",
             incumbentKernel: "qwg_gemm_q4g_h16",
-            aqKernel: { QWGemmAQ.gemmKernelName(bits: mismatchedAQ.bits, group: mismatchedAQ.groupSize, bm128: false) }
+            aqKernel: { QWGemmAQ.gemmKernelName(bits: mismatchedAQ.bits, group: mismatchedAQ.groupSize) }
         )
         XCTAssertTrue(resolvedAQ !== defaultPSO)
 
@@ -570,5 +570,38 @@ final class QWColdStreamingAndDrainTests: XCTestCase {
             count: extraZero * rowBytes)
         XCTAssertFalse(dataPtr.allSatisfy { $0 == 0 })
         XCTAssertTrue(tailPtr.allSatisfy { $0 == 0 })
+    }
+
+    func testPlaneIOLoadSliceReadsExactRangeAndRejectsOutOfBounds() throws {
+        let dir = try makeTempDir()
+        let rowBytes = 2 * 20
+        let totalE = 3, perExpert = 4 * rowBytes
+        var payload = Data()
+        for e in 0..<totalE {
+            payload.append(Data(repeating: UInt8(0x30 + e), count: perExpert))
+        }
+        let packURL = dir.appendingPathComponent("slice.qwp")
+        try writeQWP1(at: packURL, tensors: [
+            "w": SyntheticTensor(shape: [totalE, 4, 64], payload: payload, experts: totalE, eHq4: perExpert)
+        ])
+        let pack = try QWQuant.Pack(url: packURL, descriptor: .qwen38_27b, skipIdentityCheck: true)
+        let io = PlaneIO(pack: pack, policy: LoadPolicy(descriptor: .qwen38_27b, env: ["QW_PLANE_BUFFERED": "1"]))
+
+        var dst = [UInt8](repeating: 0, count: 2 * perExpert)
+        try dst.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+            let ptr = try XCTUnwrap(raw.baseAddress)
+            try io.loadSlice("w", layout: .hq4, byteOffset: perExpert, byteCount: perExpert, into: ptr)
+        }
+        XCTAssertTrue(dst[0..<perExpert].allSatisfy { $0 == 0x31 })
+        XCTAssertTrue(dst[perExpert..<(2 * perExpert)].allSatisfy { $0 == 0 })
+
+        XCTAssertThrowsError(try dst.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+            let ptr = try XCTUnwrap(raw.baseAddress)
+            try io.loadSlice("w", layout: .hq4, byteOffset: totalE * perExpert, byteCount: 1, into: ptr)
+        })
+        XCTAssertThrowsError(try dst.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+            let ptr = try XCTUnwrap(raw.baseAddress)
+            try io.loadSlice("w", layout: .hq4, byteOffset: -1, byteCount: 4, into: ptr)
+        })
     }
 }

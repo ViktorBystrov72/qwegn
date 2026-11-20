@@ -42,10 +42,6 @@ public struct QWImageDecodePolicy: Sendable, Equatable {
         let resolvedIPs: [String]
     }
 
-    public static func validateRemoteURL(_ url: URL) throws {
-        _ = try validateAndResolveRemoteURL(url)
-    }
-
     static func validateAndResolveRemoteURLAsync(_ url: URL) async throws -> ResolvedRemoteTarget {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {

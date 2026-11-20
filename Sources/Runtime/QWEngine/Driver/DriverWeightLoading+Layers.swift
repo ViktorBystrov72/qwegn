@@ -68,7 +68,7 @@ extension QWEngineDriver.WeightLoader {
                 }
                 let downBlocks = try planeView(
                     blk + "mlp.switch_mlp.down_proj.weight",
-                    n: resE * outDim, k: I, key: \QWQTensorEntry.hq4Off
+                    n: resE * outDim, k: I, key: \QWQTensorEntry.hq4Off, residentExperts: resE
                 )
                 guard let guView = QWWeightView(blocks: guBlocks, n: resE * 2 * I, k: outDim,
                                              bits: format.bits, groupSize: format.groupSize,
@@ -80,26 +80,35 @@ extension QWEngineDriver.WeightLoader {
                 }
                 gu = guView
                 down = downView
-            } else if pk != nil, hasTensor(blk + "mlp.experts.gate_up_proj") {
+            } else if pk != nil,
+                      let fusedPair = ColdExpertStreamer.fusedExpertCandidates.first(where: {
+                          hasTensor(blk + $0.gateUp) && hasTensor(blk + $0.down)
+                      }) {
+                let guName = blk + fusedPair.gateUp
+                let dnName = blk + fusedPair.down
                 let guBlocks = try planeView(
-                    blk + "mlp.experts.gate_up_proj",
-                    n: resE * 2 * I, k: outDim, key: \QWQTensorEntry.hq4Off
+                    guName, n: resE * 2 * I, k: outDim,
+                    key: \QWQTensorEntry.hq4Off, residentExperts: resE
                 )
                 let downBlocks = try planeView(
-                    blk + "mlp.experts.down_proj",
-                    n: resE * outDim, k: I, key: \QWQTensorEntry.hq4Off
+                    dnName, n: resE * outDim, k: I,
+                    key: \QWQTensorEntry.hq4Off, residentExperts: resE
                 )
+                let guEntry = try? pk?.entry(resolveName(guName))
+                let dnEntry = try? pk?.entry(resolveName(dnName))
                 guard let guView = QWWeightView(blocks: guBlocks, n: resE * 2 * I, k: outDim,
-                                             bits: format.expertBits, groupSize: format.expertGroupSize,
-                                             isRotated: hl.weightBasis.rotatesActivations,
-                                             isIncumbentContainer: format.expertIsIncumbentContainer,
-                                             isSHVQ: format.expertIsSHVQ),
+                                                bits: guEntry?.hqBits ?? format.expertBits,
+                                                groupSize: guEntry?.hqGroup ?? format.expertGroupSize,
+                                                isRotated: hl.weightBasis.rotatesActivations,
+                                                isIncumbentContainer: guEntry?.isIncumbentHQ4 ?? format.expertIsIncumbentContainer,
+                                                isSHVQ: guEntry?.isSHVQ ?? format.expertIsSHVQ),
                       let downView = QWWeightView(blocks: downBlocks, n: resE * outDim, k: I,
-                                                 bits: format.expertDownBits, groupSize: format.expertDownGroupSize,
-                                                 isRotated: hl.weightBasis.rotatesActivations,
-                                                 isIncumbentContainer: format.expertDownIsIncumbentContainer,
-                                                 isSHVQ: format.expertDownIsSHVQ) else {
-                    throw QWEngineDriverError.weightMissing(blk + "mlp.experts.gate_up_proj", "moe bank view invalid")
+                                                  bits: dnEntry?.hqBits ?? format.expertDownBits,
+                                                  groupSize: dnEntry?.hqGroup ?? format.expertDownGroupSize,
+                                                  isRotated: hl.weightBasis.rotatesActivations,
+                                                  isIncumbentContainer: dnEntry?.isIncumbentHQ4 ?? format.expertDownIsIncumbentContainer,
+                                                  isSHVQ: dnEntry?.isSHVQ ?? format.expertDownIsSHVQ) else {
+                    throw QWEngineDriverError.weightMissing(guName, "moe bank view invalid")
                 }
                 gu = guView
                 down = downView

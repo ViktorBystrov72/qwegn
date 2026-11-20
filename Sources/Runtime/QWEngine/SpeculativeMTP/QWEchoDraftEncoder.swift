@@ -493,7 +493,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         }
         greedySelector.token.region.pointer.advanced(by: greedySelector.token.offset)
             .assumingMemoryBound(to: Int32.self).pointee = Int32(pendingToken)
-        guard let cb = driver.hal.queue.makeCommandBuffer(),
+        guard let cb = driver.hal.makeUnretainedCommandBuffer(),
               var enc = cb.makeComputeCommandEncoder() else {
             throw QWEngineDriverError.state("ECHO draft command buffer creation failed")
         }
@@ -680,7 +680,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             let needLogits = (sampledToken != nil) || (shouldStopAfterDraft != nil)
                 || (isLast && writeLogitsOnFinalDraft)
 
-            guard let cb = driver.hal.queue.makeCommandBuffer(),
+            guard let cb = driver.hal.makeUnretainedCommandBuffer(),
                   var enc = cb.makeComputeCommandEncoder() else {
                 throw QWEngineDriverError.state("ECHO draft command buffer creation failed")
             }

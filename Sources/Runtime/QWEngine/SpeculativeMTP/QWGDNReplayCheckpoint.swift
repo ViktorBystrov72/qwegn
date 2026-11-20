@@ -98,7 +98,7 @@ final class QWGDNReplayCheckpoint {
             && a.region.base + a.offset == b.region.base + b.offset && a.bytes == b.bytes
     }
 
-    private func validateRetained(_ count: Int) throws {
+    func validateRetained(_ count: Int) throws {
         guard sourceRec != nil, sourceRing != nil, (0...rows).contains(count) else {
             throw QWEngineDriverError.state("GPU replay has no checkpoint or retained row count is invalid")
         }
@@ -133,6 +133,14 @@ final class QWGDNReplayCheckpoint {
                  size: source.bytes)
     }
 
+    func markZeroLayerBackup(rec: QWTensorValue, ring: QWTensorValue) throws {
+        guard layers == 0 else {
+            throw QWEngineDriverError.state("zero-layer backup requires layers == 0")
+        }
+        sourceRec = rec
+        sourceRing = ring
+    }
+
     func encodeBackup(_ enc: any MTLBlitCommandEncoder,
                       rec: QWTensorValue, ring: QWTensorValue) throws {
         if layers == 0 {
@@ -156,7 +164,8 @@ final class QWGDNReplayCheckpoint {
     }
 
     func encodeRestore(_ enc: any MTLBlitCommandEncoder,
-                       rec: QWTensorValue, ring: QWTensorValue) throws {
+                       rec: QWTensorValue, ring: QWTensorValue,
+                       restoreRing: Bool = true) throws {
         if layers == 0 {
             guard sourceRec != nil, sourceRing != nil else {
                 throw QWEngineDriverError.state("GPU restore requires the checkpoint's original state buffers")
@@ -169,7 +178,9 @@ final class QWGDNReplayCheckpoint {
             throw QWEngineDriverError.state("GPU restore requires the checkpoint's original state buffers")
         }
         copy(enc, recurrent, rec)
-        copy(enc, rings, ring)
+        if restoreRing {
+            copy(enc, rings, ring)
+        }
     }
 
     func encodeBatchedKDA(_ enc: any MTLComputeCommandEncoder,
@@ -289,50 +300,70 @@ final class QWGDNReplayCheckpoint {
             throw QWEngineDriverError.state("GPU rollback active row count is invalid")
         }
         try validateRetained(verifiedRows)
-        guard layers > 0, count < verifiedRows else { return true }
+        let gdnVH = geometry.gdnVHeads
+        guard layers > 0, count < verifiedRows, gdnVH > 0 else { return true }
         let decayValues = glog.region.pointer.advanced(by: glog.offset).assumingMemoryBound(to: Float.self)
         let innovationValues = innovations.region.pointer.advanced(by: innovations.offset)
             .assumingMemoryBound(to: Float.self)
         let normalizedValues = normalized.region.pointer.advanced(by: normalized.offset)
             .assumingMemoryBound(to: UInt16.self)
-        let qkvC = geometry.gdnQKVChannels, gdnVH = geometry.gdnVHeads, gdnHD = geometry.gdnHeadDim
+        let qkvC = geometry.gdnQKVChannels, gdnHD = geometry.gdnHeadDim
         let zC = geometry.gdnZChannels, kOffset = geometry.gdnQKHeads * gdnHD
         let glogC = geometry.gdnGlogChannels
-        let vPerQK = gdnVH / geometry.gdnQKHeads
+        let vPerQK = max(1, gdnVH / max(1, geometry.gdnQKHeads))
+        let qkHeads = min(geometry.gdnQKHeads, (gdnVH - 1) / vPerQK + 1)
+        let innovSpan = gdnVH * gdnHD
+        let keySpan = qkHeads * gdnHD
+        let minVecDecay = SIMD8<Float>(repeating: 1.0e-3)
+        let maxVecDecay = SIMD8<Float>(repeating: 1.0e38)
         for layer in 0..<layers {
-            for head in 0..<gdnVH {
-                if geometry.gdnVectorDecay {
-                    for channel in 0..<gdnHD {
+            let layerRowBase = layer * rows
+            if geometry.gdnVectorDecay {
+                for head in 0..<gdnVH {
+                    let headColBase = head * gdnHD
+                    var chunkStart = 0
+                    while chunkStart + 8 <= gdnHD {
+                        var cumDecay = SIMD8<Float>(repeating: 1.0)
+                        for row in count..<verifiedRows {
+                            let base = (layerRowBase + row) * glogC + headColBase + chunkStart
+                            let v = UnsafeRawPointer(decayValues.advanced(by: base)).loadUnaligned(as: SIMD8<Float>.self)
+                            guard all((v .>= minVecDecay) .& (v .<= maxVecDecay)) else { return false }
+                            cumDecay *= v
+                            guard all((cumDecay .>= minVecDecay) .& (cumDecay .<= maxVecDecay)) else { return false }
+                        }
+                        chunkStart += 8
+                    }
+                    while chunkStart < gdnHD {
                         var cumDecay: Float = 1.0
                         for row in count..<verifiedRows {
-                            let rowIndex = layer * rows + row
-                            let decay = decayValues[rowIndex * glogC + head * gdnHD + channel]
+                            let decay = decayValues[(layerRowBase + row) * glogC + headColBase + chunkStart]
                             guard decay.isFinite && decay >= 1.0e-3 && decay <= 1.0e38 else { return false }
                             cumDecay *= decay
                             guard cumDecay.isFinite && cumDecay >= 1.0e-3 && cumDecay <= 1.0e38 else { return false }
                         }
+                        chunkStart += 1
                     }
-                } else {
+                }
+            } else {
+                for head in 0..<gdnVH {
                     var cumLogDecay: Float = 0.0
                     for row in count..<verifiedRows {
-                        let rowIndex = layer * rows + row
-                        let decay = decayValues[rowIndex * glogC + head]
+                        let decay = decayValues[(layerRowBase + row) * glogC + head]
                         guard decay.isFinite && decay >= -6.907755 && decay <= 88.0 else { return false }
                         cumLogDecay += decay
                         guard cumLogDecay.isFinite && cumLogDecay >= -6.907755 else { return false }
                     }
                 }
-                for row in count..<verifiedRows {
-                    let rowIndex = layer * rows + row
-                    let innovationStart = rowIndex * zC + head * gdnHD
-                    for channel in 0..<gdnHD where !innovationValues[innovationStart + channel].isFinite {
-                        return false
-                    }
-                    let keyStart = rowIndex * qkvC + kOffset + (head / vPerQK) * gdnHD
-                    for channel in 0..<gdnHD
-                    where !Float16(bitPattern: normalizedValues[keyStart + channel]).isFinite {
-                        return false
-                    }
+            }
+            for row in count..<verifiedRows {
+                let rowIndex = layerRowBase + row
+                let innovBase = rowIndex * zC
+                for idx in 0..<innovSpan where !innovationValues[innovBase + idx].isFinite {
+                    return false
+                }
+                let keyBase = rowIndex * qkvC + kOffset
+                for idx in 0..<keySpan where (normalizedValues[keyBase + idx] & 0x7C00) == 0x7C00 {
+                    return false
                 }
             }
         }
@@ -341,7 +372,7 @@ final class QWGDNReplayCheckpoint {
 
     func encodeRollbackTape(_ enc: any MTLComputeCommandEncoder, decoder: QWGDNDecode,
                             rec: QWTensorValue, activeRows: Int? = nil,
-                            retaining count: Int) throws {
+                            retaining count: Int, verifyStability: Bool = true) throws {
         let verifiedRows = activeRows ?? rows
         if layers == 0 {
             guard (2...rows).contains(verifiedRows), (0...verifiedRows).contains(count) else {
@@ -358,8 +389,10 @@ final class QWGDNReplayCheckpoint {
         guard sameStorage(rec, sourceRec) else {
             throw QWEngineDriverError.state("GPU rollback requires the original recurrent slab")
         }
-        guard try rollbackTapeIsStable(retaining: count, activeRows: verifiedRows) else {
-            throw QWEngineDriverError.state("GPU innovation tape is ill-conditioned; restore and replay instead")
+        if verifyStability {
+            guard try rollbackTapeIsStable(retaining: count, activeRows: verifiedRows) else {
+                throw QWEngineDriverError.state("GPU innovation tape is ill-conditioned; restore and replay instead")
+            }
         }
         let rollbackRows = verifiedRows - count
         if rollbackRows > 0 {

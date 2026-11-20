@@ -101,19 +101,20 @@ extension QWEngineDriver {
                 : nil
         }
 
+        static let fusedExpertCandidates: [(gateUp: String, down: String)] = [
+            ("mlp.experts.gate_up_proj", "mlp.experts.down_proj"),
+            ("mlp.experts.gate_up_proj.weight", "mlp.experts.down_proj.weight"),
+            ("block_sparse_moe.experts.gate_up_proj", "block_sparse_moe.experts.down_proj"),
+            ("block_sparse_moe.experts.gate_up_proj.weight", "block_sparse_moe.experts.down_proj.weight"),
+        ]
+
         private static func resolveExpertLayout(
             pack: QWQuant.Pack,
             layerPrefix: String,
             totalExperts: Int,
             expertPermutation: [Int]?
         ) -> ExpertWeightLayout {
-            let fusedCandidates: [(String, String)] = [
-                ("mlp.experts.gate_up_proj", "mlp.experts.down_proj"),
-                ("mlp.experts.gate_up_proj.weight", "mlp.experts.down_proj.weight"),
-                ("block_sparse_moe.experts.gate_up_proj", "block_sparse_moe.experts.down_proj"),
-                ("block_sparse_moe.experts.gate_up_proj.weight", "block_sparse_moe.experts.down_proj.weight"),
-            ]
-            for (guSuffix, dnSuffix) in fusedCandidates {
+            for (guSuffix, dnSuffix) in fusedExpertCandidates {
                 let gu = layerPrefix + guSuffix
                 let dn = layerPrefix + dnSuffix
                 if (try? pack.entry(gu)) != nil, (try? pack.entry(dn)) != nil {
