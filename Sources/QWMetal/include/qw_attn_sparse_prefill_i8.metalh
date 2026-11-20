@@ -44,7 +44,7 @@ static inline void lsa_sparse_resolve_slot_page(
 }
 
 template <uint STAGE_HDIM>
-static inline void lsa_sparse_nax_epilogue(
+METAL_FUNC void lsa_sparse_nax_epilogue(
         thread mlx::steel::NAXTile<float, 1, STAGE_HDIM / 16u>& Otile,
         thread float (&lrow)[2],
         const device half* qdev, device half* outp,

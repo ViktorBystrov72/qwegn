@@ -168,7 +168,7 @@ kernel void qwg_attn_prefill_paged_general_sparse(
 // 3. M5 NAX Cooperative Tensor Sparse Paged Prefill (f16, q8, q4)
 // Uses the tile's last query row `qRef = min(tile0 + 31, T - 1)` block list on 16x32 NAX MMA tiles.
 template <uint MODE, uint STAGE_HDIM = QW_LSA_NAX_HDIM>
-static inline void lsa_prefill_paged_nax_sparse_body(
+METAL_FUNC void lsa_prefill_paged_nax_sparse_body(
         const device half* qgate, const device half* kpool, const device half* vpool,
         const device int* ktab, const device int* vtab, device half* outp,
         constant uint& pos, constant uint& T,

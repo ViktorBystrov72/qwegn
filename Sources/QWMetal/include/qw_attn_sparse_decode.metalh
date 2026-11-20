@@ -86,7 +86,7 @@ static inline void lsa_load_window_kv8(
 }
 
 template <uint MODE, bool BATCHED>
-static inline void lsa_decode_sparse_core(
+METAL_FUNC void lsa_decode_sparse_core(
         const device half* qgate, device half* kpool, device half* vpool,
         const device int* ktab, const device int* vtab,
         const device half* knew, const device half* vnew,

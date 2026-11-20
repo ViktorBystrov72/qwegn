@@ -8,6 +8,18 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.28.2] - 2026-11-20
+
+What's changed since `v0.28.1`: fixes the GitHub Actions basis-gate failure in LSA sparse paged attention kernels by enforcing `METAL_FUNC` (`inline __attribute__((__always_inline__))`) on basis-dependent Metal helpers.
+
+### Fixed
+- **Compile-Time Basis Inlining in LSA Sparse Kernels (`qw_attn_sparse_prefill_i8.metalh`, `qwattn_paged_sparse.metal`, `qw_attn_sparse_decode.metalh`, `e16adf03`)**:
+  - Replaced `static inline` with `METAL_FUNC` on `lsa_sparse_nax_epilogue`, `lsa_prefill_paged_nax_sparse_body`, and `lsa_decode_sparse_core`.
+  - Prevents Metal's LLVM frontend from emitting an out-of-line `lsa_sparse_nax_epilogue` call whose dead `uint sn` parameter under `-DQW_BASIS_STANDARD=1` triggered dead-argument elimination IR divergence across all 6 `qwg_attn_prefill_paged_nax_sparse_pair*` kernels (`Scripts/check_basis.py`), while eliminating the out-of-line `Otile` pointer call boundary in AIR.
+
+### Verified
+- **Unit, Basis & CI Gates**: `python3 Scripts/check_basis.py` (`788` of `1,141` `simd_shuffle_xor` instructions dropped in standard build, `60` basis-independent functions identical), `Scripts/check_metallib_target.py` (`macOS 26.2` on both metallibs, `26.0` guard enforced), `make lint` (`0` style/geometry/DAG/kernel violations, `1,183` kernels / `308` dispatches), `swift build --build-tests -Xswiftc -warnings-as-errors` (`0` warnings/errors), `swift test -Xswiftc -warnings-as-errors --no-parallel` (`1,711` executed: `1,659` XCTest across `23` bundles + `52` Swift Testing in `1` suite, `25` skipped, `0` failures), and full `make ci` (`ci ok`, `14/14` Python harness tests, `101` `qwg-bench-kernels` entries).
+
 ## [0.28.1] - 2026-11-20
 
 What's changed since `v0.28.0`: ships end-to-end Latent Sparse Attention (LSA) prefill/selector kernel optimizations, out-of-place batched GDN speculative verification with GPU suffix-stability detection, and DFlash 2 / DSpine sliding-window prefill capture skipping across dense and hybrid MoE architectures and all KV modes (`f16`/`q8`/`q4`).
