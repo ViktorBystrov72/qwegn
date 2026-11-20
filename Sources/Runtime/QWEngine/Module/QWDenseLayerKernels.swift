@@ -295,12 +295,11 @@ class DenseLayerKernel: @unchecked Sendable {
                                       residual: driver.prefixRows(psc.x, rows: T, cols: H, dt: .f16),
                                       rows: T, rowParallel: false)
         }
-        if let dflashDrafter = driver.dflashDrafter {
+        if let dflashDrafter = driver.dflashDrafter, let cap = context.dflashCapture {
             let captureIdx = dflashDrafter.usesVirtualLayerCapture ? l : p
             guard captureIdx < dflashDrafter.targetLayerSlotMap.count else { return }
             let slot = dflashDrafter.targetLayerSlotMap[captureIdx]
             if slot >= 0 {
-                let capRows = min(T, dflashDrafter.config.maxCacheSize)
                 if let _ = lw.mhc, let mhcCfg = geometry.mhcConfig,
                    let mhcStream = psc.mhcStream, let mhcControls = psc.mhcControls {
                     let isLeave = (p == mhcCfg.end - 1)
@@ -308,12 +307,13 @@ class DenseLayerKernel: @unchecked Sendable {
                     let deferPostFFN = !isLeave && nextIsMHC && (nextP != mhcCfg.start)
                     let activeDn16 = driver.prefixRows(psc.dn16, rows: T, cols: H, dt: .f16)
                     dflashDrafter.encodeCaptureHCTargetHidden(
-                        enc, base: mhcStream, srcRowOffset: T - capRows, dstRowOffset: 0, rows: capRows,
-                        slot: slot, hc: mhcCfg.streams,
+                        enc, base: mhcStream, srcRowOffset: cap.localStart, dstRowOffset: 0,
+                        rows: cap.captureRows, slot: slot, hc: mhcCfg.streams,
                         deferredInject: deferPostFFN ? (src: activeDn16, inj: mhcControls, isMHC: true) : nil)
                 } else {
                     dflashDrafter.encodeCaptureTargetHidden(
-                        enc, source: psc.x, srcRowOffset: T - capRows, dstRowOffset: 0, rows: capRows, slot: slot)
+                        enc, source: psc.x, srcRowOffset: cap.localStart, dstRowOffset: 0,
+                        rows: cap.captureRows, slot: slot)
                 }
             }
         }

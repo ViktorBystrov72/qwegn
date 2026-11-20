@@ -33,6 +33,27 @@ static inline void lsa_pick_radix_bin_qsa(threadgroup uint* hist,
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
+static inline float lsa_dot_row_tg(threadgroup const float* x,
+                                   device const half* row,
+                                   uint inputDim,
+                                   uint lane) {
+    float acc = 0.0f;
+    if ((inputDim & 3u) == 0u) {
+        const uint n4 = inputDim >> 2u;
+        device const half4* row4 = (device const half4*)row;
+        for (uint j4 = lane; j4 < n4; j4 += 32u) {
+            const float4 w = float4(row4[j4]);
+            const uint j = j4 << 2u;
+            acc = fma(x[j], w.x, fma(x[j + 1u], w.y, fma(x[j + 2u], w.z, fma(x[j + 3u], w.w, acc))));
+        }
+    } else {
+        for (uint j = lane; j < inputDim; j += 32u) {
+            acc = fma(x[j], float(row[j]), acc);
+        }
+    }
+    return simd_sum(acc);
+}
+
 // 1. qwg_lsa_index_prep: projects unrotated post-RMSNorm Q/K slices into
 // L2-normalized qIdxOut [T, indexDim] and raw kPending [ringCap, indexDim].
 kernel void qwg_lsa_index_prep(device const half* qgate      [[buffer(0)]],
@@ -60,7 +81,10 @@ kernel void qwg_lsa_index_prep(device const half* qgate      [[buffer(0)]],
     threadgroup float qProj[128];
     threadgroup float partial[4];
 
+    const uint sg = tid >> 5u;
+    const uint lane = tid & 31u;
     const uint inputDim = min(kvHeads * sliceDim, 2048u);
+    const uint dCap = min(indexDim, 128u);
     const uint gqaRatio = max(1u, qHeads / max(1u, kvHeads));
     const float invGqa = 1.0f / float(gqaRatio);
     device const half* kRow = kIn + uint64_t(t) * (kvHeads * headDim);
@@ -72,14 +96,12 @@ kernel void qwg_lsa_index_prep(device const half* qgate      [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid < indexDim) {
-        device const half* wkRow = wkIdx + uint64_t(tid) * inputDim;
-        float accK = 0.0f;
-        for (uint j = 0u; j < inputDim; j++) {
-            accK = fma(sliceBuf[j], float(wkRow[j]), accK);
+    const uint ringSlot = (pos0 + t) & ringMask;
+    for (uint ch = sg; ch < indexDim; ch += 4u) {
+        const float accK = lsa_dot_row_tg(sliceBuf, wkIdx + uint64_t(ch) * inputDim, inputDim, lane);
+        if (lane == 0u) {
+            kPending[ringSlot * indexDim + ch] = half(accK);
         }
-        const uint ringSlot = (pos0 + t) & ringMask;
-        kPending[ringSlot * indexDim + tid] = half(accK);
     }
 
     const bool needQ = (qMode == 1u) || (qMode == 2u && (((t & 31u) == 31u) || (t + 1u == T)));
@@ -99,25 +121,23 @@ kernel void qwg_lsa_index_prep(device const half* qgate      [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float qVal = 0.0f;
-    if (tid < indexDim) {
-        device const half* wqRow = wqIdx + uint64_t(tid) * inputDim;
-        float accQ = 0.0f;
-        for (uint j = 0u; j < inputDim; j++) {
-            accQ = fma(sliceBuf[j], float(wqRow[j]), accQ);
+    for (uint ch = sg; ch < dCap; ch += 4u) {
+        const float accQ = lsa_dot_row_tg(sliceBuf, wqIdx + uint64_t(ch) * inputDim, inputDim, lane);
+        if (lane == 0u) {
+            qProj[ch] = accQ;
         }
-        qVal = accQ;
-        qProj[tid] = qVal;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    const float qVal = (tid < dCap) ? qProj[tid] : 0.0f;
     const float ss = simd_sum(qVal * qVal);
-    if ((tid & 31u) == 0u) partial[tid >> 5u] = ss;
+    if (lane == 0u) partial[sg] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float qNormSq = partial[0] + partial[1] + partial[2] + partial[3];
     const float qInv = rsqrt(max(qNormSq, 1e-12f));
-    if (tid < indexDim) {
-        qIdxOut[t * indexDim + tid] = half(qProj[tid] * qInv);
+    if (tid < dCap) {
+        qIdxOut[t * indexDim + tid] = half(qVal * qInv);
     }
 }
 
@@ -158,6 +178,17 @@ kernel void qwg_lsa_pool_keys(device const half* kPending   [[buffer(0)]],
 
 // 3. qwg_lsa_ward_cluster_512: dynamic greedy Ward clustering over 128 pooled
 // 4-token blocks (512 tokens) into 64 buckets with hard cap <= 4 blocks (16 tokens).
+static inline float lsa_tg_dot64(threadgroup const half* aPtr,
+                                 threadgroup const half* bPtr) {
+    float dot = 0.0f;
+    for (uint d = 0u; d < 64u; d += 4u) {
+        const float4 a = float4(*(threadgroup const half4*)(aPtr + d));
+        const float4 b = float4(*(threadgroup const half4*)(bPtr + d));
+        dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    return dot;
+}
+
 kernel void qwg_lsa_ward_cluster_512(device const half* pooledKeys    [[buffer(0)]],
                                      device half*       centroids     [[buffer(1)]],
                                      device uchar4*     bucketMembers [[buffer(2)]],
@@ -183,6 +214,8 @@ kernel void qwg_lsa_ward_cluster_512(device const half* pooledKeys    [[buffer(0
     threadgroup uint   sgMinPair[4];
     threadgroup uint   tgWinnerA;
     threadgroup uint   tgWinnerB;
+    threadgroup uchar  tgRescan[128];
+    threadgroup uint   sgScan[4];
 
     const uint stride = max(1u, indexDim / 64u);
     device const half* myPool = pooledKeys + uint64_t(baseBlock + tid) * indexDim;
@@ -210,12 +243,7 @@ kernel void qwg_lsa_ward_cluster_512(device const half* pooledKeys    [[buffer(0
         uchar bestJ = 255u;
         const float nSqI = tgNormSq[tid];
         for (uint j = tid + 1u; j < 128u; j++) {
-            float dot = 0.0f;
-            for (uint d = 0u; d < 64u; d += 4u) {
-                const float4 a = float4(*(threadgroup const half4*)(&tgSum[tid * 64u + d]));
-                const float4 b = float4(*(threadgroup const half4*)(&tgSum[j * 64u + d]));
-                dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
-            }
+            const float dot = lsa_tg_dot64(tgSum + tid * 64u, tgSum + j * 64u);
             const float distSq = max(0.0f, nSqI + tgNormSq[j] - 2.0f * dot);
             const float wardCost = 0.5f * distSq;
             if (wardCost < bestC) {
@@ -233,57 +261,78 @@ kernel void qwg_lsa_ward_cluster_512(device const half* pooledKeys    [[buffer(0
             const uint prevA = tgWinnerA;
             const uint prevB = tgWinnerB;
             const uchar myCnt = tgCount[tid];
-            if (myCnt > 0u && myCnt < 4u && tid < 127u) {
-                const uchar partner = tgBestPartner[tid];
-                const bool needFullRescan = (tid == prevA) || (partner == prevA) || (partner == prevB) ||
-                    (partner < 128u && (tgCount[partner] == 0u || (myCnt + tgCount[partner]) > 4u));
-                if (needFullRescan) {
-                    float bestC = 1e30f;
-                    uchar bestJ = 255u;
-                    const float invSi = 1.0f / float(myCnt);
-                    const float nSqI = tgNormSq[tid] * (invSi * invSi);
-                    for (uint j = tid + 1u; j < 128u; j++) {
-                        const uchar cntJ = tgCount[j];
-                        if (cntJ == 0u || (myCnt + cntJ) > 4u) continue;
-                        const float invSj = 1.0f / float(cntJ);
-                        float dot = 0.0f;
-                        for (uint d = 0u; d < 64u; d += 4u) {
-                            const float4 a = float4(*(threadgroup const half4*)(&tgSum[tid * 64u + d]));
-                            const float4 b = float4(*(threadgroup const half4*)(&tgSum[j * 64u + d]));
-                            dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
-                        }
-                        const float distSq = max(0.0f, nSqI + tgNormSq[j] * (invSj * invSj) - 2.0f * dot * (invSi * invSj));
-                        const float wardCost = (float(myCnt * cntJ) / float(myCnt + cntJ)) * distSq;
-                        if (wardCost < bestC) {
-                            bestC = wardCost;
-                            bestJ = uchar(j);
-                        }
-                    }
-                    tgBestCost[tid] = bestC;
-                    tgBestPartner[tid] = bestJ;
-                } else if (tid < prevA && tgCount[prevA] > 0u && (myCnt + tgCount[prevA]) <= 4u) {
-                    const uchar cntA = tgCount[prevA];
-                    float dot = 0.0f;
-                    for (uint d = 0u; d < 64u; d += 4u) {
-                        const float4 a = float4(*(threadgroup const half4*)(&tgSum[tid * 64u + d]));
-                        const float4 b = float4(*(threadgroup const half4*)(&tgSum[prevA * 64u + d]));
-                        dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
-                    }
-                    const float invSi = 1.0f / float(myCnt);
-                    const float invSa = 1.0f / float(cntA);
-                    const float distSq = max(0.0f,
-                        tgNormSq[tid] * (invSi * invSi) + tgNormSq[prevA] * (invSa * invSa) - 2.0f * dot * (invSi * invSa));
-                    const float wardCost = (float(myCnt * cntA) / float(myCnt + cntA)) * distSq;
-                    if (wardCost < tgBestCost[tid]) {
-                        tgBestCost[tid] = wardCost;
-                        tgBestPartner[tid] = uchar(prevA);
-                    }
-                }
-            } else {
+            const bool eligible = (myCnt > 0u && myCnt < 4u && tid < 127u);
+            const uchar partner = eligible ? tgBestPartner[tid] : 255u;
+            const bool needFullRescan = eligible && ((tid == prevA) || (partner == prevA) || (partner == prevB) ||
+                (partner < 128u && (tgCount[partner] == 0u || (myCnt + tgCount[partner]) > 4u)));
+            const uint isRescan = needFullRescan ? 1u : 0u;
+            const uint excl = simd_prefix_exclusive_sum(isRescan);
+            const uint sgTot = simd_sum(isRescan);
+            if (lane == 0u) sgScan[sg] = sgTot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint outIdx = excl;
+            for (uint s = 0u; s < sg; s++) outIdx += sgScan[s];
+            const uint rescanCount = sgScan[0] + sgScan[1] + sgScan[2] + sgScan[3];
+            if (needFullRescan) tgRescan[outIdx] = uchar(tid);
+            if (!eligible) {
                 tgBestCost[tid] = 1e30f;
                 tgBestPartner[tid] = 255u;
+            } else if (!needFullRescan && tid < prevA && tgCount[prevA] > 0u && (myCnt + tgCount[prevA]) <= 4u) {
+                const uchar cntA = tgCount[prevA];
+                const float dot = lsa_tg_dot64(tgSum + tid * 64u, tgSum + prevA * 64u);
+                const float invSi = 1.0f / float(myCnt);
+                const float invSa = 1.0f / float(cntA);
+                const float distSq = max(0.0f,
+                    tgNormSq[tid] * (invSi * invSi) + tgNormSq[prevA] * (invSa * invSa) - 2.0f * dot * (invSi * invSa));
+                const float wardCost = (float(myCnt * cntA) / float(myCnt + cntA)) * distSq;
+                if (wardCost < tgBestCost[tid]) {
+                    tgBestCost[tid] = wardCost;
+                    tgBestPartner[tid] = uchar(prevA);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint r = 0u; r < rescanCount; r++) {
+                const uint i = uint(tgRescan[r]);
+                const uchar cntI = tgCount[i];
+                const uchar cntJ = tgCount[tid];
+                float myCost = 1e30f;
+                uint myJ = 255u;
+                if (tid > i && cntJ > 0u && (cntI + cntJ) <= 4u) {
+                    const float invSi = 1.0f / float(cntI);
+                    const float invSj = 1.0f / float(cntJ);
+                    const float dot = lsa_tg_dot64(tgSum + i * 64u, tgSum + tid * 64u);
+                    const float distSq = max(0.0f,
+                        tgNormSq[i] * (invSi * invSi) + tgNormSq[tid] * (invSj * invSj) - 2.0f * dot * (invSi * invSj));
+                    myCost = (float(cntI * cntJ) / float(cntI + cntJ)) * distSq;
+                    myJ = tid;
+                }
+                for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+                    const float oC = simd_shuffle_down(myCost, offset);
+                    const uint  oJ = simd_shuffle_down(myJ, offset);
+                    if (oC < myCost || (oC == myCost && oJ < myJ)) {
+                        myCost = oC;
+                        myJ = oJ;
+                    }
+                }
+                if (lane == 0u) {
+                    sgMinCost[sg] = myCost;
+                    sgMinPair[sg] = myJ;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0u) {
+                    float bestC = sgMinCost[0];
+                    uint  bestJ = sgMinPair[0];
+                    for (uint s = 1u; s < 4u; s++) {
+                        if (sgMinCost[s] < bestC || (sgMinCost[s] == bestC && sgMinPair[s] < bestJ)) {
+                            bestC = sgMinCost[s];
+                            bestJ = sgMinPair[s];
+                        }
+                    }
+                    tgBestCost[i] = bestC;
+                    tgBestPartner[i] = uchar(bestJ);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
 
         float cVal = (tgCount[tid] > 0u && tgBestPartner[tid] < 128u) ? tgBestCost[tid] : 1e30f;

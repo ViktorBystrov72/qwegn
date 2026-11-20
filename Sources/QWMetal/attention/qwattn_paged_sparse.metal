@@ -8,12 +8,11 @@
 #include "mlx/backend/metal/kernels/steel/utils/integral_constant.h"
 #include "mlx/backend/metal/kernels/steel/gemm/nax.h"
 #include "include/qw_attn_sparse_decode.metalh"
+#include "include/qw_attn_sparse_prefill_i8.metalh"
 
 using namespace metal;
 using namespace mlx::steel;
 
-#define QW_LSA_KU           16u
-#define QW_LSA_BK           32u
 #define QW_LSA_NAX_HDIM     256u
 
 // 1. Sparse Split-K Decode & Batched Decode over Paged KV Pool (f16, q8, q4)
@@ -238,15 +237,12 @@ static inline void lsa_prefill_paged_nax_sparse_body(
             const uint kr = (QW_HEAD_DIM == 256u) ? (e >> 5u) : (e / VecPerRow);
             const uint dim0 = (QW_HEAD_DIM == 256u) ? ((e & 31u) << 3u) : ((e % VecPerRow) << 3u);
             const uint slotIdx = s0 + kr;
-            const uint absKey = (slotIdx < uCount * 4u)
-                ? (uint(myList[slotIdx >> 2u]) * 4u + (slotIdx & 3u))
-                : (tailStart + (slotIdx - uCount * 4u));
+            uint absKey, pk, pv;
+            lsa_sparse_resolve_slot_page(slotIdx, uCount, tailStart, totalSlots, kEnd,
+                                         myList, ktab, vtab, tid, absKey, pk, pv);
             const uint ob = kr * kStageStride + dim0;
             if (slotIdx < totalSlots && absKey < kEnd) {
-                const uint page = absKey >> 8u;
                 const uint slot = absKey & 255u;
-                const uint pk = (uint)ktab[page];
-                const uint pv = (uint)vtab[page];
                 if (MODE == 0u) {
                     const uint64_t rowOff = (uint64_t)slot * QW_ROW + (uint64_t)kvh * QW_HEAD_DIM + dim0;
                     device const half* sk = kpool + (uint64_t)pk * QW_PGEL + rowOff;
@@ -375,25 +371,24 @@ static inline void lsa_prefill_paged_nax_sparse_body(
             psum[i] += simd_shuffle_xor(psum[i], ushort(8));
         }
 
-        float corr[2];
         STEEL_PRAGMA_UNROLL
         for (short i = 0; i < 2; i++) {
-            corr[i] = (mrow[i] > -1e29f) ? fast::exp2(mrow[i] - mnew[i]) : 0.0f;
-            lrow[i] = lrow[i] * corr[i] + psum[i];
-            mrow[i] = mnew[i];
-        }
-
-        if (corr[0] != 1.0f || corr[1] != 1.0f) {
-            STEEL_PRAGMA_UNROLL
-            for (short id = 0; id < kMaxNq; id++) {
-                if (id < nq) {
-                    thread auto& of = Otile.frag_at(0, id);
-                    STEEL_PRAGMA_UNROLL
-                    for (short loc = 0; loc < BaseNAXFrag::kElemsPerFrag; loc++) {
-                        of[loc] *= corr[loc >> 2];
+            const bool grew = (mnew[i] > mrow[i]) && (mrow[i] > -1e29f);
+            const float corr = grew ? fast::exp2(mrow[i] - mnew[i]) : 1.0f;
+            lrow[i] = lrow[i] * corr + psum[i];
+            if (grew) {
+                STEEL_PRAGMA_UNROLL
+                for (short id = 0; id < kMaxNq; id++) {
+                    if (id < nq) {
+                        thread auto& of = Otile.frag_at(0, id);
+                        STEEL_PRAGMA_UNROLL
+                        for (short loc = 0; loc < 4; loc++) {
+                            of[i * 4 + loc] *= corr;
+                        }
                     }
                 }
             }
+            mrow[i] = mnew[i];
         }
 
         STEEL_PRAGMA_UNROLL
@@ -415,91 +410,7 @@ static inline void lsa_prefill_paged_nax_sparse_body(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float linv[2];
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < 2; i++) linv[i] = (lrow[i] > 0.0f) ? (1.0f / lrow[i]) : 0.0f;
-
-    const device half* gdev = qdev + QW_HEAD_DIM;
-    device half* odev = outp + (uint64_t)rowBase * (QW_Q_HEADS * QW_HEAD_DIM)
-                        + (uint64_t)head * QW_HEAD_DIM;
-
-    STEEL_PRAGMA_UNROLL
-    for (short idp = 0; idp < kMaxPair; idp++) {
-        if (idp < npair) {
-            const short id0 = idp * 2;
-            const short id1 = id0 + 1;
-            NAXTile<half, 1, 1> G0, G1;
-            if (QW_HAS_Q_GATE) {
-                if (validRows == 16) {
-                    G0.load(gdev + id0 * kU, int(QW_QPROJ_OUT));
-                    G1.load(gdev + id1 * kU, int(QW_QPROJ_OUT));
-                } else {
-                    G0.load_safe(gdev + id0 * kU, int(QW_QPROJ_OUT), short2(kU, validRows));
-                    G1.load_safe(gdev + id1 * kU, int(QW_QPROJ_OUT), short2(kU, validRows));
-                }
-            }
-            thread auto& of0 = Otile.frag_at(0, id0);
-            thread auto& of1 = Otile.frag_at(0, id1);
-            thread auto& gf0 = G0.frag_at(0, 0);
-            thread auto& gf1 = G1.frag_at(0, 0);
-
-            STEEL_PRAGMA_UNROLL
-            for (short i = 0; i < 2; i++) {
-                float w[8];
-                STEEL_PRAGMA_UNROLL
-                for (short j = 0; j < 4; j++) {
-                    const short loc = i * 4 + j;
-                    const float g0 = QW_HAS_Q_GATE ? (1.0f / (1.0f + fast::exp(-float(gf0[loc])))) : 1.0f;
-                    const float g1 = QW_HAS_Q_GATE ? (1.0f / (1.0f + fast::exp(-float(gf1[loc])))) : 1.0f;
-                    w[j]     = of0[loc] * linv[i] * g0;
-                    w[4 + j] = of1[loc] * linv[i] * g1;
-                }
-                if (QW_FWHT_ROTATED) {
-                    const float a0 = w[0] + w[1], a1 = w[0] - w[1];
-                    const float a2 = w[2] + w[3], a3 = w[2] - w[3];
-                    const float b0 = a0 + a2,     b2 = a0 - a2;
-                    const float b1 = a1 + a3,     b3 = a1 - a3;
-                    const float c0 = w[4] + w[5], c1 = w[4] - w[5];
-                    const float c2 = w[6] + w[7], c3 = w[6] - w[7];
-                    const float d0 = c0 + c2,     d2 = c0 - c2;
-                    const float d1 = c1 + c3,     d3 = c1 - c3;
-                    w[0] = b0; w[1] = b1; w[2] = b2; w[3] = b3;
-                    w[4] = d0; w[5] = d1; w[6] = d2; w[7] = d3;
-                    const bool hi4  = (sn & 4) != 0;
-                    const bool hi8  = (sn & 8) != 0;
-                    STEEL_PRAGMA_UNROLL
-                    for (short k = 0; k < 8; k++) {
-                        const float p4 = simd_shuffle_xor(w[k], ushort(1));
-                        w[k] = hi4 ? (p4 - w[k]) : (w[k] + p4);
-                    }
-                    STEEL_PRAGMA_UNROLL
-                    for (short k = 0; k < 8; k++) {
-                        const float p8 = simd_shuffle_xor(w[k], ushort(8));
-                        w[k] = hi8 ? (p8 - w[k]) : (w[k] + p8);
-                    }
-                    STEEL_PRAGMA_UNROLL
-                    for (short j = 0; j < 4; j++) {
-                        const float u = w[j], v = w[4 + j];
-                        w[j]     = (u + v) * 0.17677669529663689f;
-                        w[4 + j] = (u - v) * 0.17677669529663689f;
-                    }
-                }
-                STEEL_PRAGMA_UNROLL
-                for (short j = 0; j < 4; j++) {
-                    const short loc = i * 4 + j;
-                    gf0[loc] = half(w[j]);
-                    gf1[loc] = half(w[4 + j]);
-                }
-            }
-            if (validRows == 16) {
-                G0.store(odev + id0 * kU, int(QW_Q_HEADS * QW_HEAD_DIM));
-                G1.store(odev + id1 * kU, int(QW_Q_HEADS * QW_HEAD_DIM));
-            } else if (validRows > 0) {
-                G0.store_safe(odev + id0 * kU, int(QW_Q_HEADS * QW_HEAD_DIM), short2(kU, validRows));
-                G1.store_safe(odev + id1 * kU, int(QW_Q_HEADS * QW_HEAD_DIM), short2(kU, validRows));
-            }
-        }
-    }
+    lsa_sparse_nax_epilogue<STAGE_HDIM>(Otile, lrow, qdev, outp, rowBase, head, validRows, uint(sn), nq, npair);
 }
 
 #define QW_NAX_SPARSE_PREFILL_ENTRY(SFX, MODE, STAGE_HDIM) \
@@ -520,8 +431,17 @@ kernel void qwg_attn_prefill_paged_nax_sparse_pair##SFX( \
         uint3 tg [[threadgroup_position_in_grid]]) { \
     threadgroup half kvblk[QW_LSA_BK * STAGE_HDIM]; \
     threadgroup half vblk[QW_LSA_BK * STAGE_HDIM]; \
-    lsa_prefill_paged_nax_sparse_body<MODE, STAGE_HDIM>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, \
-                                                        blockList, blockCountBuf, listStride, tid, sgi, tg, kvblk, vblk); \
+    if (MODE != 0u && (QW_HEAD_DIM & (QW_HEAD_DIM - 1u)) == 0u) { \
+        threadgroup int8_t* kvblk_i8 = (threadgroup int8_t*)kvblk; \
+        threadgroup float* kScale = (threadgroup float*)(kvblk_i8 + QW_LSA_BK * (STAGE_HDIM + 16u)); \
+        lsa_prefill_paged_nax_sparse_i8_body<MODE, STAGE_HDIM>( \
+            qgate, kpool, vpool, ktab, vtab, outp, pos, T, \
+            blockList, blockCountBuf, listStride, tid, sgi, tg, kvblk_i8, kScale, vblk); \
+    } else { \
+        lsa_prefill_paged_nax_sparse_body<MODE, STAGE_HDIM>( \
+            qgate, kpool, vpool, ktab, vtab, outp, pos, T, \
+            blockList, blockCountBuf, listStride, tid, sgi, tg, kvblk, vblk); \
+    } \
 }
 QW_NAX_SPARSE_PREFILL_ENTRY(, 0u, 256u)
 QW_NAX_SPARSE_PREFILL_ENTRY(_q8, 1u, 256u)

@@ -8,6 +8,28 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.28.1] - 2026-11-20
+
+What's changed since `v0.28.0`: ships end-to-end Latent Sparse Attention (LSA) prefill/selector kernel optimizations, out-of-place batched GDN speculative verification with GPU suffix-stability detection, and DFlash 2 / DSpine sliding-window prefill capture skipping across dense and hybrid MoE architectures and all KV modes (`f16`/`q8`/`q4`).
+
+### Performance
+- **DFlash 2 / DSpine Sliding-Window Prefill Capture Skipping (`QWDFlashConfig`, `FNGPUDFlash`, `QWLayerKernel`, `QWDenseLayerKernels`, `MTPSeeding`, `DriverPrefill`, `DenseModule`, `471f2f53`)**:
+  - Skips dead drafter hidden-state captures and context KV updates outside the drafter sliding window during prefill chunks (`-16.3 ms/chunk` non-trunk overhead on `Qwen3.8-27B`, `+1.06%` at `32K q4` with `100%` SHA-256 identity).
+- **Out-of-Place Batched GDN Verify & GPU `unstableSuffixMask` (`qwgdn_decode.metal`, `QWGDNDecode`, `QWGDNReplayCheckpoint`, `QWVerifyWindow`, `MTPVerification`, `291c1d6d`)**:
+  - Eliminated the `~6.2 MB` synchronous CPU `rollbackTapeIsStable()` scan via a GPU `-ffast-math`-safe `unstableSuffixMask` and replaced unconditional `144 MiB` GDN `encodeBackup` blits with out-of-place state verification (`+2.78%` med / `+1.85%` max decode at `2K q4`, `+1.79%` med / `+2.06%` max at `16K q4`).
+- **Parallelized Ward Rescan & Vectorized LSA Index Projection (`qwlsa.metal`, `15c4ff69`)**:
+  - Parallelized `qwg_lsa_ward_cluster_512` full rescan across all 128 threads (`1.973 -> 0.344 ms` / `5.74×`, `-27.9 ms/2K chunk`) with bit-exact cluster hashes and vectorized `qwg_lsa_index_prep` with contiguous `half4` loads (`2.24×–3.86×` speedup).
+- **INT8 NAX Q×K Path & Warp-Broadcast Lookup for Sparse Paged Prefill (`qw_attn_sparse_prefill_i8.metalh`, `qwattn_paged_sparse.metal`, `c33a0a10`)**:
+  - Generalized dense `i8_body` (`kvblk` aliasing `kvblk_i8 + kScale` with zero extra TG SRAM and zero-barrier `simd_shuffle` page lookup) to sparse paged prefill across `hd256` and `hd128` (`q8`/`q4`), yielding `1.72×–1.76×` sparse prefill kernel speedups (`2.535/2.515/2.506 -> 1.440/1.448/1.458 ms`) and `< 2e-3` parity vs the scalar general kernel.
+- **Vectorized LSA Block Selector Dot Products & SRAM Score Cache (`qwlsa_select.metal`, `1d051005`)**:
+  - Added `half4` IEEE-754-identical `lsa_dot_q_half`, removed redundant device fences in `lsa_select_blocks_body`, and added `tgScores[2304]` SRAM score caching (`1.21×–1.30×` `decode_select` and `1.47×–2.24×` `prefill_select_512` across `64K–256K` with bit-exact hashes).
+
+### Verified
+- **Unit & Lint Gates**: `swift build -c release -Xswiftc -warnings-as-errors --product qwg` (`0` warnings/errors), `Scripts/check_metallib_target.py` (`macOS 26.2` on rotated & standard metallibs), `make lint` (`0` style/geometry/DAG/kernel violations, `1,183` kernels / `308` dispatches), and `swift test -Xswiftc -warnings-as-errors --no-parallel` (`3,318` executed across `23` bundles, `50` skipped, `0` failed).
+- **Paired A/B, Parity, Vision Residency & Law 28 `QWServer` QA**:
+  - Paired 3-round A/B vs `v0.28.0` (`44d07982`, `0` steady allocs): `Qwen3.8-27B` `DFlash2 w=8` prefill `+0.50%..+9.52%` across `2K..32K` (`32K q4`: `759.7 -> 783.6 tok/s`, `+3.15%`, decode `40.96 -> 41.48 tok/s`; `16K q4` cool-GPU: `752.4 -> 818.7 tok/s`, `+8.81%`, decode `40.92 -> 48.19 tok/s`), `DSpine-b16` `16K q4` (`+4.19%` prefill / `+3.08%` dec med), `Qwen3.6-35B-A3B` HybridMoE (`+4.27%` at `2K q4`, `+11.86%` prefill / `+3.72%` dec med at `16K q4`).
+  - `10/10` Candidate-Serial ≡ Candidate-DFlash2/DSpine greedy SHA-256 identity (`2K/16K/32K × f16/q8/q4` + `DSpine 16K/q4`); `--no-load-vision` vs `--load-vision` saved `1.01 GiB` (`27B`) / `0.99 GiB` (`35B-MoE`) RSS; `18/18` Law 28 `QWServer` QA scenarios passed (`9/9` on `Qwen3.8-27B`+DFlash2 and `Qwen3.6-35B-A3B`, `0` errors). `llmprobe` was not run (`llmprobe` binary not installed on host).
+
 ## [0.28.0] - 2026-11-20
 
 What's changed since `v0.27.4`: ships Wave 5 speculative pipeline and hot-path allocation fixes plus Wave 6 HAL Stage 1 lock-free residency, Native Metal FP16 ViT + FlashAttention (`4.09×–4.12×` faster vision encode, `-45%` active vision weights), `1.66×–1.90×` zero-allocation pure-ASCII/BPE tokenizer acceleration, deterministic JSON key-order preservation for server prefix caching, and dead-code/kernel hygiene.

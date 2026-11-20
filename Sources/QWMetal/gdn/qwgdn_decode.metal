@@ -204,20 +204,22 @@ kernel void qwg_gdn_recurrent(
 }
 
 // Verify rows: R tokens through the T = 1 recurrence (qwg_gdn_recurrent) in ONE dispatch.
-// Carries S in registers across rows so the 151 MB GDN state is read once and written once per verify round.
+// Carries S in registers across rows, optionally writing to separate `stateOut` and computing suffix stability.
 kernel void qwg_gdn_recurrent_rows(
-        device const half*  y          [[buffer(0)]],   // [R][10240] post-conv q̂‖k̂‖v
-        device const float* betas      [[buffer(1)]],   // [R][48]
-        device const float* glog       [[buffer(2)]],   // [R][48] or [R][Z_CH]
-        device float*       state      [[buffer(3)]],   // [48][128][128] in place
-        device const half*  zBase      [[buffer(4)]],   // row r at zBase + r * zStride
-        device const half*  w          [[buffer(5)]],   // norm weight [128]
-        device half*        o_out      [[buffer(6)]],   // [R][48][128] f16 (gated norm + fwht32 out)
-        device float*       innovation [[buffer(7)]],   // optional [R][48][128] rank-1 update vector
-        constant uint&      R          [[buffer(8)]],
-        constant uint&      zStride    [[buffer(9)]],
-        uint3 tg                       [[threadgroup_position_in_grid]],
-        uint tid                       [[thread_index_in_threadgroup]]) {
+        device const half*        y                  [[buffer(0)]],   // [R][10240] post-conv q̂‖k̂‖v
+        device const float*       betas              [[buffer(1)]],   // [R][48]
+        device const float*       glog               [[buffer(2)]],   // [R][48] or [R][Z_CH]
+        device const float*       state              [[buffer(3)]],   // [48][128][128] input
+        device const half*        zBase              [[buffer(4)]],   // row r at zBase + r * zStride
+        device const half*        w                  [[buffer(5)]],   // norm weight [128]
+        device half*              o_out              [[buffer(6)]],   // [R][48][128] f16 (gated norm + fwht32 out)
+        device float*             innovation         [[buffer(7)]],   // optional [R][48][128] rank-1 update vector
+        constant uint&            R                  [[buffer(8)]],
+        constant uint&            zStride            [[buffer(9)]],
+        device float*             stateOut           [[buffer(10)]],  // [48][128][128] output (may alias state)
+        device atomic_uint*       unstableSuffixMask [[buffer(11)]],  // optional bit s => suffix s..<R unstable
+        uint3 tg                                     [[threadgroup_position_in_grid]],
+        uint tid                                     [[thread_index_in_threadgroup]]) {
     const uint h = tg.x;                 // v-head 0..V_HEADS-1
     const uint c = tid & 127u;           // v-column (32 consecutive per SG)
     const uint kch = tid >> 7u;          // k-chunk 0..7
@@ -225,17 +227,19 @@ kernel void qwg_gdn_recurrent_rows(
     const uint qCh = QW_GDN_QK_HEADS * 128u;
     const uint qkCh = 2u * qCh;
     const uint k0 = kch * QW_KC;
-    device float* S = state + (uint64_t)h * 16384u;
+    device const float* S_in = state + (uint64_t)h * 16384u;
+    device float* S_out = ((stateOut != nullptr) ? stateOut : (device float*)state) + (uint64_t)h * 16384u;
 
     float sreg[QW_KC];
     #pragma unroll
     for (uint j = 0u; j < QW_KC; ++j) {
-        sreg[j] = S[(k0 + j) * 128u + c];
+        sreg[j] = S_in[(k0 + j) * 128u + c];
     }
 
     threadgroup float2 red[1024];
     threadgroup float rho_shared;
     threadgroup float redNorm[4];
+    uint badMask = 0u;
 
     for (uint r = 0u; r < R; ++r) {
         device const half* yRow = y + (uint64_t)r * QW_GDN_QKV_CH;
@@ -285,6 +289,13 @@ kernel void qwg_gdn_recurrent_rows(
             if (innovation != nullptr) {
                 innovation[(uint64_t)r * QW_GDN_Z_CH + (uint64_t)h * 128u + c] = delta;
             }
+            if (unstableSuffixMask != nullptr && R <= 16u) {
+                const bool badDelta = (as_type<uint>(delta) & 0x7F800000u) == 0x7F800000u;
+                const bool badKey = (as_type<ushort>(krow[c]) & 0x7C00u) == 0x7C00u;
+                if (badDelta || badKey) {
+                    badMask |= (1u << (r + 1u)) - 1u;
+                }
+            }
             const float sq = simd_sum(o * o);
             if ((tid & 31u) == 0u) {
                 redNorm[tid >> 5u] = sq;
@@ -315,7 +326,49 @@ kernel void qwg_gdn_recurrent_rows(
 
     #pragma unroll
     for (uint j = 0u; j < QW_KC; ++j) {
-        S[(k0 + j) * 128u + c] = sreg[j];
+        S_out[(k0 + j) * 128u + c] = sreg[j];
+    }
+
+    if (unstableSuffixMask != nullptr && R <= 16u) {
+        if (QW_GDN_VECTOR_DECAY) {
+            if (kch == 0u) {
+                for (uint s = 0u; s < R; ++s) {
+                    float cum = 1.0f;
+                    for (uint rr = s; rr < R; ++rr) {
+                        const float d = glog[((uint64_t)rr * QW_GDN_V_HEADS + h) * 128u + c];
+                        if ((as_type<uint>(d) & 0x7F800000u) == 0x7F800000u || d < 1.0e-3f || d > 1.0e38f) {
+                            badMask |= (1u << s);
+                            break;
+                        }
+                        cum *= d;
+                        if ((as_type<uint>(cum) & 0x7F800000u) == 0x7F800000u || cum < 1.0e-3f || cum > 1.0e38f) {
+                            badMask |= (1u << s);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (tid == 0u) {
+            for (uint s = 0u; s < R; ++s) {
+                float cum = 0.0f;
+                for (uint rr = s; rr < R; ++rr) {
+                    const float d = glog[(uint64_t)rr * QW_GDN_V_HEADS + h];
+                    if ((as_type<uint>(d) & 0x7F800000u) == 0x7F800000u || d < -6.907755f || d > 88.0f) {
+                        badMask |= (1u << s);
+                        break;
+                    }
+                    cum += d;
+                    if ((as_type<uint>(cum) & 0x7F800000u) == 0x7F800000u || cum < -6.907755f) {
+                        badMask |= (1u << s);
+                        break;
+                    }
+                }
+            }
+        }
+        badMask = simd_or(badMask);
+        if ((tid & 31u) == 0u && badMask != 0u) {
+            atomic_fetch_or_explicit(unstableSuffixMask, badMask, memory_order_relaxed);
+        }
     }
 }
 
@@ -324,19 +377,21 @@ kernel void qwg_gdn_rollback_rows(
         device const half*  y          [[buffer(0)]],   // [R][QKV_CH]
         device const float* innovation [[buffer(1)]],   // [R][Z_CH]
         device const float* glog       [[buffer(2)]],   // [R][V_HEADS] or [R][Z_CH]
-        device float*       state      [[buffer(3)]],   // [V_HEADS][128][128]
+        device const float* state      [[buffer(3)]],   // [V_HEADS][128][128] input
         constant uint&      R          [[buffer(4)]],
+        device float*       stateOut   [[buffer(5)]],   // [V_HEADS][128][128] output (may alias state)
         uint h                         [[threadgroup_position_in_grid]],
         uint tid                       [[thread_index_in_threadgroup]]) {
     const uint c = tid & 127u;
     const uint kChunk = tid >> 7u;
     const uint k0 = kChunk * 16u;
     const uint qCh = QW_GDN_QK_HEADS * 128u;
-    device float* S = state + (uint64_t)h * 16384u;
+    device const float* S_in = state + (uint64_t)h * 16384u;
+    device float* S_out = ((stateOut != nullptr) ? stateOut : (device float*)state) + (uint64_t)h * 16384u;
     float sreg[16];
     #pragma unroll
     for (uint j = 0u; j < 16u; ++j) {
-        sreg[j] = S[(k0 + j) * 128u + c];
+        sreg[j] = S_in[(k0 + j) * 128u + c];
     }
     for (int r = int(R) - 1; r >= 0; --r) {
         device const half* key = y + (uint64_t)r * QW_GDN_QKV_CH + qCh + (uint64_t)(h / QW_GDN_V_PER_QK) * 128u;
@@ -351,7 +406,7 @@ kernel void qwg_gdn_rollback_rows(
     }
     #pragma unroll
     for (uint j = 0u; j < 16u; ++j) {
-        S[(k0 + j) * 128u + c] = sreg[j];
+        S_out[(k0 + j) * 128u + c] = sreg[j];
     }
 }
 

@@ -245,11 +245,63 @@ final class QWLSATests: XCTestCase {
 
         let denseF = QWAttnPagedPrefillTests.readOut(outDenseBuf, T * Self.geometry.qChannels)
         let sparseF = QWAttnPagedPrefillTests.readOut(outSparseBuf, T * Self.geometry.qChannels)
-        var maxDiff: Float = 0
-        for i in 0..<denseF.count {
-            maxDiff = max(maxDiff, abs(denseF[i] - sparseF[i]))
-        }
+        let maxDiff = denseF.indices.reduce(Float(0)) { max($0, abs(denseF[$1] - sparseF[$1])) }
         XCTAssertLessThan(maxDiff, 1e-3, "sparse paged prefill with full block list must match dense paged prefill")
+    }
+
+    func testSparsePagedPrefillQuantKVAndCausalBoundaryParity() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable, "Sparse paged NAX prefill requires Metal 4 tensor hardware")
+        let pos = 256, T = 40, sp = 64, ceiling = pos + T + 256
+        let kAll = QWAttnPagedPrefillTests.synthKV(n: pos + T, seed: 0x7711)
+        let vAll = QWAttnPagedPrefillTests.synthV(n: pos + T, seed: 0x8822)
+        let qgateBits = QWAttnPagedPrefillTests.synthQGate(n: sp, seed: 0x9933)
+        let qgateTV = QWAttnPagedPrefillTests.tv(QWAttnPagedPrefillTests.buf(qgateBits), sp * Self.geometry.qProjOut)
+        let prefixBlocks: [Int32] = [0, 3, 9, 17, 31, 48, 60, 63]
+        let listStride = prefixBlocks.count + 16
+        var blockList = [Int32](repeating: 0, count: T * listStride)
+        var blockCount = [UInt32](repeating: 0, count: T)
+        for r in 0..<T {
+            let cur = ((pos + r + 1) >> 2) - 64
+            blockCount[r] = UInt32(prefixBlocks.count + cur)
+            for (i, b) in prefixBlocks.enumerated() { blockList[r * listStride + i] = b }
+            for i in 0..<cur { blockList[r * listStride + prefixBlocks.count + i] = Int32(64 + i) }
+        }
+        let lBuf = Self.hal.device.makeBuffer(bytes: blockList, length: blockList.count * 4, options: .storageModeShared)!
+        let cBuf = Self.hal.device.makeBuffer(bytes: blockCount, length: blockCount.count * 4, options: .storageModeShared)!
+        let lTV = QWTensorValue(region: QWMRegion(buffer: lBuf, base: 0, length: lBuf.length),
+                                offset: 0, shape: QWTensorShape([T * listStride], .i32))
+        let cTV = QWTensorValue(region: QWMRegion(buffer: cBuf, base: 0, length: cBuf.length),
+                                offset: 0, shape: QWTensorShape([T], .i32))
+        let paged = try QWAttnPagedPrefill(hal: Self.hal, geometry: Self.geometry)
+        let gen = try QWAttnPagedPrefillGeneral(hal: Self.hal, geometry: Self.geometry)
+        for mode in [QWKVMode.f16, .q8, .q4] {
+            let needPages = (ceiling + 255) / 256
+            let arena = try QWArena(hal: Self.hal, weights: 0, activations: 0,
+                                    kv: QWKVCache.pageBytes(mode: mode, geometry: Self.geometry) * needPages * 2
+                                        + QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs, gdnStates: 0)
+            let cache = try QWKVCache(hal: Self.hal, arena: arena, layers: [3], mode: mode, geometry: Self.geometry)
+            let h = try cache.allocate(promptTokens: ceiling)
+            try cache.append(h, positions: 0..<(pos + T), layer: 3, kind: .k, src: kAll)
+            try cache.append(h, positions: 0..<(pos + T), layer: 3, kind: .v, src: vAll)
+            let views = try cache.layerViews(h, layer: 3)
+            let oNaxBuf = Self.hal.device.makeBuffer(length: T * Self.geometry.qChannels * 2, options: .storageModeShared)!
+            let oGenBuf = Self.hal.device.makeBuffer(length: T * Self.geometry.qChannels * 2, options: .storageModeShared)!
+            let oNaxTV = QWAttnPagedPrefillTests.tv(oNaxBuf, T * Self.geometry.qChannels)
+            let oGenTV = QWAttnPagedPrefillTests.tv(oGenBuf, T * Self.geometry.qChannels)
+            guard let (cb, enc) = Self.hal.begin() else { XCTFail("hal.begin"); return }
+            try paged.encodeSparse(enc, qgate: qgateTV, kv: views, out: oNaxTV, blockList: lTV, blockCount: cTV, pos: pos, T: T, listStride: listStride)
+            try gen.encodeSparse(enc, qgate: qgateTV, kv: views, out: oGenTV, blockList: lTV, blockCount: cTV, pos: pos, T: T, listStride: listStride)
+            Self.hal.end(cb, enc); cb.waitUntilCompleted(); XCTAssertNil(cb.error)
+            let naxF = QWAttnPagedPrefillTests.readOut(oNaxBuf, T * Self.geometry.qChannels)
+            let genF = QWAttnPagedPrefillTests.readOut(oGenBuf, T * Self.geometry.qChannels)
+            var worst: Float = 0
+            for i in 0..<naxF.count {
+                XCTAssertTrue(naxF[i].isFinite, "non-finite sparse NAX output at \(i) mode=\(mode)")
+                worst = max(worst, abs(naxF[i] - genF[i]))
+            }
+            XCTAssertLessThan(worst, 2e-3, "hd256 sparse NAX vs general parity failed for \(mode): maxDiff=\(worst)")
+            cache.finish(h)
+        }
     }
 
     func testLSAIndexerStateCaptureAndRestoreRoundTripPreservesBitExactBlockSelection() throws {

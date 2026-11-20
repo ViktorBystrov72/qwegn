@@ -8,8 +8,8 @@ import QWHAL
 
 final class QWGDNReplayCheckpointTests: XCTestCase {
     func testCheckpointBudgetIncludesEveryAlignedRequest() throws {
-        XCTAssertEqual(QWGDNReplayCheckpoint.allocationBytes(geometry: QWTestGeometry.g27, layers: 48, rows: 2), 160_272_384)
-        XCTAssertEqual(QWGDNReplayCheckpoint.allocationBytes(geometry: QWTestGeometry.g27, layers: 48, rows: 3), 163_436_544)
+        XCTAssertEqual(QWGDNReplayCheckpoint.allocationBytes(geometry: QWTestGeometry.g27, layers: 48, rows: 2), 160_272_640)
+        XCTAssertEqual(QWGDNReplayCheckpoint.allocationBytes(geometry: QWTestGeometry.g27, layers: 48, rows: 3), 163_436_800)
         let hal = try QWHal(geometry: .qwen38_27b)
         for rows in 1...16 {
             let budget = QWGDNReplayCheckpoint.allocationBytes(geometry: QWTestGeometry.g27, layers: 1, rows: rows)
@@ -445,6 +445,183 @@ final class QWGDNReplayCheckpointTests: XCTestCase {
                 }
             }
         }
+    }
+
+    func testBatchedOutOfPlaceAndGPUStabilityParity() throws {
+        let hal27 = try QWHal(geometry: .qwen38_27b)
+        try XCTSkipUnless(hal27.caps.isMetal4TensorCapable,
+                          "1024-thread GDN recurrent kernel requires bare-metal Apple Silicon GPU")
+
+        // 1. Out-of-place verify & GPU suffix-stability across scalar GDN (`retained = 0...rows`).
+        let layers = 2, rows = 4
+        let cpBytes = QWGDNReplayCheckpoint.allocationBytes(geometry: QWTestGeometry.g27, layers: layers, rows: rows)
+        let arena = try QWArena(hal: hal27, weights: 256, activations: 8 << 20, kv: 256, gdnStates: 4 * cpBytes + (16 << 20))
+        let g = arena.gdnRegion(), a = arena.activationsRegion()
+        let refCp = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: layers, rows: rows)
+        let oopCp = try QWGDNReplayCheckpoint(geometry: QWTestGeometry.g27, allocator: g, layers: layers, rows: rows)
+        let window = try QWVerifyWindow(geometry: QWTestGeometry.g27, allocator: a, rows: rows, vocabulary: 1)
+        let hiddenCarry = try a.allocate(QWTensorShape([QWModelGeometry.qwen38_27b.hidden], .f16))
+        let initRec = try g.allocate(QWTensorShape([layers * QWSlotGeometry.recElems(geometry: .qwen38_27b)], .f32))
+        let refRec = try g.allocate(initRec.shape)
+        let oopRec = try g.allocate(initRec.shape)
+        let initRing = try g.allocate(QWTensorShape([layers * QWSlotGeometry.ringElems(geometry: .qwen38_27b)], .f16))
+        let refRing = try g.allocate(initRing.shape)
+        let oopRing = try g.allocate(initRing.shape)
+        let gdnProj = try a.allocate(QWTensorShape([rows * QWModelGeometry.qwen38_27b.gdnTotalN], .f16))
+        let controls = try a.allocate(QWTensorShape([rows * 96], .f32))
+        let convW = try a.allocate(QWTensorShape([4 * 10240], .f16))
+        let normW = try a.allocate(QWTensorShape([128], .f16))
+        let refOut = try a.allocate(QWTensorShape([rows * 6144], .f16))
+        let oopOut = try a.allocate(QWTensorShape([rows * 6144], .f16))
+        let convY = try a.allocate(QWTensorShape([10240], .f16))
+        let oScratch = try a.allocate(QWTensorShape([6144], .f32))
+
+        let initRp = initRec.region.pointer.advanced(by: initRec.offset).assumingMemoryBound(to: Float.self)
+        for i in 0..<initRec.shape.elementCount { initRp[i] = Float(i % 37 - 18) / 10000 }
+        func fillHalf(_ t: QWTensorValue, _ fn: (Int) -> Float16) {
+            let p = t.region.pointer.advanced(by: t.offset).assumingMemoryBound(to: Float16.self)
+            for i in 0..<t.shape.elementCount { p[i] = fn(i) }
+        }
+        fillHalf(initRing) { Float16(Float($0 % 53 - 26) / 137) }
+        fillHalf(gdnProj) { Float16(Float(($0 * 17 + $0 / 16480) % 113 - 56) / 173) }
+        fillHalf(convW) { Float16(Float($0 % 7 - 3) / 13) }
+        fillHalf(normW) { Float16(1.0 + Float($0 % 5) * 0.05) }
+        fillHalf(window.hidden) { Float16(Float($0 / QWModelGeometry.qwen38_27b.hidden + 1) / 7) }
+        let cpPtr = controls.region.pointer.advanced(by: controls.offset).assumingMemoryBound(to: Float.self)
+        let dec = try QWGDNDecode(hal: hal27), conv = try QWGDNConv(hal: hal27, geometry: .qwen38_27b)
+
+        func view(_ t: QWTensorValue, index: Int, count: Int) -> QWTensorValue {
+            QWTensorValue(region: t.region, offset: t.offset + index * count * (t.shape.dtype == .f32 ? 4 : 2),
+                          shape: QWTensorShape([count], t.shape.dtype))
+        }
+        func bytes(_ t: QWTensorValue) -> Data { Data(bytes: t.region.pointer.advanced(by: t.offset), count: t.bytes) }
+
+        for injectUnstable in [true, false] {
+            for r in 0..<rows {
+                for h in 0..<48 {
+                    cpPtr[r * 96 + h] = Float(h + r + 1) / 64.0
+                    cpPtr[r * 96 + 48 + h] = (injectUnstable && r == 2 && h == 0) ? -10.0 : (-Float(h + r + 1) / 97.0)
+                }
+            }
+            for retained in 0...rows {
+                memcpy(refRec.region.pointer.advanced(by: refRec.offset),
+                       initRec.region.pointer.advanced(by: initRec.offset), initRec.bytes)
+                memcpy(oopRec.region.pointer.advanced(by: oopRec.offset),
+                       initRec.region.pointer.advanced(by: initRec.offset), initRec.bytes)
+                memcpy(refRing.region.pointer.advanced(by: refRing.offset),
+                       initRing.region.pointer.advanced(by: initRing.offset), initRing.bytes)
+                memcpy(oopRing.region.pointer.advanced(by: oopRing.offset),
+                       initRing.region.pointer.advanced(by: initRing.offset), initRing.bytes)
+
+                let cb = try XCTUnwrap(hal27.queue.makeCommandBuffer())
+                let blit = try XCTUnwrap(cb.makeBlitCommandEncoder())
+                try refCp.encodeBackup(blit, rec: refRec, ring: refRing, skipRecCopy: false)
+                try oopCp.encodeBackup(blit, rec: oopRec, ring: oopRing, skipRecCopy: true)
+                blit.endEncoding()
+                XCTAssertTrue(oopCp.outOfPlaceVerifyActive)
+
+                let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
+                for layer in 0..<layers {
+                    let refState = view(refRec, index: layer, count: QWSlotGeometry.recElems(geometry: .qwen38_27b))
+                    let refHist = view(refRing, index: layer, count: QWSlotGeometry.ringElems(geometry: .qwen38_27b))
+                    for row in 0..<rows {
+                        let rb = row * QWModelGeometry.qwen38_27b.gdnTotalN
+                        let rawRow = QWTensorValue(region: gdnProj.region, offset: gdnProj.offset + rb * 2, shape: QWTensorShape([10240], .f16))
+                        let zRow = QWTensorValue(region: gdnProj.region, offset: gdnProj.offset + (rb + 10240) * 2, shape: QWTensorShape([6144], .f16))
+                        let betaRow = QWTensorValue(region: controls.region, offset: controls.offset + row * 96 * 4, shape: QWTensorShape([48], .f32))
+                        let decayRow = QWTensorValue(region: controls.region, offset: controls.offset + (row * 96 + 48) * 4, shape: QWTensorShape([48], .f32))
+                        try conv.encodeT1WithHeadnorm(enc, x: rawRow, w: convW, bias: nil, stIn: refHist, y: convY, stOut: refHist)
+                        enc.memoryBarrier(scope: .buffers)
+                        try refCp.encodeCapture(enc, hal: hal27, layer: layer, row: row, rawInput: rawRow, postConv: convY, beta: betaRow, decay: decayRow)
+                        try dec.encode(enc, y: convY, betas: betaRow, glog: decayRow, state: refState,
+                                       z: zRow, w: normW, o: view(refOut, index: row, count: 6144), oScratch: oScratch,
+                                       innovation: try refCp.innovationRow(layer: layer, row: row))
+                        enc.memoryBarrier(scope: .buffers)
+                    }
+                    try oopCp.encodeBatchedGDN(
+                        enc, conv: conv, decoder: dec, layer: layer, activeRows: rows,
+                        gdnProjection: gdnProj, controls: controls, convWeight: convW, normWeight: normW,
+                        ring: view(oopRing, index: layer, count: QWSlotGeometry.ringElems(geometry: .qwen38_27b)),
+                        state: view(oopRec, index: layer, count: QWSlotGeometry.recElems(geometry: .qwen38_27b)),
+                        output: oopOut)
+                }
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                XCTAssertEqual(cb.status, .completed)
+                XCTAssertEqual(bytes(oopOut), bytes(refOut))
+                // Verify pre-commit `oopRec` stayed equal to `initRec`!
+                XCTAssertEqual(bytes(oopRec), bytes(initRec), "out-of-place verify must leave rec undisturbed")
+
+                let cpuStable = try refCp.rollbackTapeIsStable(retaining: retained, activeRows: rows)
+                let gpuStable = try oopCp.rollbackTapeIsStable(retaining: retained, activeRows: rows)
+                XCTAssertEqual(gpuStable, cpuStable, "injectUnstable=\(injectUnstable) retained=\(retained)")
+                XCTAssertEqual(gpuStable, !injectUnstable || retained > 2)
+
+                let resolveCB = try XCTUnwrap(hal27.queue.makeCommandBuffer())
+                try window.encodeRetainedPrefix(resolveCB, hal: hal27, checkpoint: refCp, decoder: dec,
+                                                rec: refRec, ring: refRing, trunkHidden: hiddenCarry, retaining: retained)
+                try window.encodeRetainedPrefix(resolveCB, hal: hal27, checkpoint: oopCp, decoder: dec,
+                                                rec: oopRec, ring: oopRing, trunkHidden: hiddenCarry, retaining: retained)
+                resolveCB.commit(); resolveCB.waitUntilCompleted()
+                XCTAssertEqual(resolveCB.status, .completed)
+                XCTAssertEqual(bytes(oopRing), bytes(refRing), "ring retained=\(retained)")
+                if retained == rows || !gpuStable {
+                    XCTAssertEqual(bytes(oopRec), bytes(refRec), "bit-exact rec retained=\(retained)")
+                } else {
+                    if retained == 0 {
+                        XCTAssertEqual(bytes(oopRec), bytes(initRec), "zero-accept out-of-place keeps exact initial rec")
+                    }
+                    let op = oopRec.region.pointer.advanced(by: oopRec.offset).assumingMemoryBound(to: Float.self)
+                    let rp2 = refRec.region.pointer.advanced(by: refRec.offset).assumingMemoryBound(to: Float.self)
+                    var maxErr: Float = 0
+                    for idx in 0..<oopRec.shape.elementCount { maxErr = max(maxErr, abs(op[idx] - rp2[idx])) }
+                    XCTAssertLessThanOrEqual(maxErr, 1.0e-4, "rollback error retained=\(retained)")
+                }
+            }
+        }
+
+        // 2. KDA vector-decay + NaN key/innovation GPU suffix-mask parity (`QWGDNDecode.encodeRows` directly).
+        let vecGeo = Self.vectorDecayGeometry
+        let halVec = try QWHal(geometry: vecGeo)
+        let vh = vecGeo.gdnVHeads, qkvC = vecGeo.gdnQKVChannels, zC = vecGeo.gdnZChannels
+        let glogC = vecGeo.gdnGlogChannels, recElems = QWSlotGeometry.recElems(geometry: vecGeo)
+        let arenaV = try QWArena(hal: halVec, weights: 256, activations: 4 << 20, kv: 256, gdnStates: 8 << 20)
+        let gv = arenaV.gdnRegion(), av = arenaV.activationsRegion()
+        let vY = try av.allocate(QWTensorShape([rows * qkvC], .f16))
+        let vBeta = try av.allocate(QWTensorShape([rows * vh], .f32))
+        let vGlog = try av.allocate(QWTensorShape([rows * glogC], .f32))
+        let vZ = try av.allocate(QWTensorShape([rows * zC], .f16))
+        let vW = try av.allocate(QWTensorShape([128], .f16))
+        let vOut = try av.allocate(QWTensorShape([rows * zC], .f16))
+        let vIn = try gv.allocate(QWTensorShape([recElems], .f32))
+        let vStOut = try gv.allocate(QWTensorShape([recElems], .f32))
+        let vMask = try gv.allocate(QWTensorShape([1], .i32))
+        let vDec = try QWGDNDecode(hal: halVec)
+        fillHalf(vY) { _ in Float16(0.05) }
+        fillHalf(vZ) { _ in Float16(0.5) }
+        fillHalf(vW) { _ in Float16(1.0) }
+        let vBp = vBeta.region.pointer.advanced(by: vBeta.offset).assumingMemoryBound(to: Float.self)
+        let vGp = vGlog.region.pointer.advanced(by: vGlog.offset).assumingMemoryBound(to: Float.self)
+        for i in 0..<vBeta.shape.elementCount { vBp[i] = 0.1 }
+        for i in 0..<vGlog.shape.elementCount { vGp[i] = 0.2 }
+        func runVectorMaskCheck() throws -> UInt32 {
+            let cbV = try XCTUnwrap(halVec.queue.makeCommandBuffer())
+            let bV = try XCTUnwrap(cbV.makeBlitCommandEncoder())
+            bV.fill(buffer: vMask.region.buffer, range: (vMask.region.base + vMask.offset)..<(vMask.region.base + vMask.offset + 4), value: 0)
+            bV.endEncoding()
+            let eV = try XCTUnwrap(cbV.makeComputeCommandEncoder())
+            try vDec.encodeRows(eV, y: vY, betas: vBeta, glog: vGlog, state: vIn, zBase: vZ, w: vW, o: vOut,
+                                rows: rows, stateOut: vStOut, unstableSuffixMask: vMask)
+            eV.endEncoding(); cbV.commit(); cbV.waitUntilCompleted()
+            XCTAssertEqual(cbV.status, .completed)
+            return vMask.region.pointer.advanced(by: vMask.offset).assumingMemoryBound(to: UInt32.self).pointee
+        }
+        vGp[2 * glogC + 3] = 5.0e-4
+        // 0.2^4 = 0.0016 >= 1e-3 everywhere else; low decay at row 2 makes suffixes 0..2 unstable (bit 3 clear).
+        XCTAssertEqual(try runVectorMaskCheck(), 0b0111)
+        vGp[2 * glogC + 3] = 0.2
+        vY.region.pointer.advanced(by: vY.offset).assumingMemoryBound(to: UInt16.self)[2 * qkvC + vecGeo.gdnQKHeads * 128 + 3] = 0x7E00
+        // NaN key at row 2 corrupts sreg -> row 3 innovation becomes NaN -> all 4 suffix bits set.
+        XCTAssertEqual(try runVectorMaskCheck(), 0b1111)
     }
 
     private static let vectorDecayGeometry: QWModelGeometry = {

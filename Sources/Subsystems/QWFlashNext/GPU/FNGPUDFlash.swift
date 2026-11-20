@@ -113,13 +113,9 @@ public enum FNGPUDFlash {
     }
 
     static func prefillCaptureSlice(startPos: Int, rows: Int, historyCount: Int, maxCacheSize: Int) -> (localStart: Int, captureRows: Int, ctxStartPos: Int)? {
-        guard rows > 0, maxCacheSize > 0 else { return nil }
-        let windowStart = max(0, max(historyCount, startPos + rows) - maxCacheSize)
-        guard startPos + rows > windowStart else { return nil }
-        let rawLocal = max(0, windowStart - startPos), rawCount = rows - rawLocal
-        guard rawCount > 0 else { return nil }
-        let captureRows = min(rawCount, maxCacheSize), localStart = rawLocal + (rawCount - captureRows)
-        return (localStart, captureRows, startPos + localStart)
+        QWDFlashConfig.prefillCaptureSlice(
+            startPos: startPos, rows: rows, windowEnd: historyCount, maxCacheSize: maxCacheSize
+        ).map { ($0.localStart, $0.captureRows, $0.ctxStartPos) }
     }
 
     static func encodeLayerCapture(

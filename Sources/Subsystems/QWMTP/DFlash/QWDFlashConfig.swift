@@ -71,6 +71,34 @@ public struct QWDFlashConfig: Sendable, Equatable {
         self.virtualLayerCapture = virtualLayerCapture
     }
 
+    public struct PrefillCaptureSlice: Sendable, Equatable {
+        public let localStart: Int
+        public let captureRows: Int
+        public let ctxStartPos: Int
+
+        public init(localStart: Int, captureRows: Int, ctxStartPos: Int) {
+            self.localStart = localStart
+            self.captureRows = captureRows
+            self.ctxStartPos = ctxStartPos
+        }
+    }
+
+    /// Computes the live `[localStart..<localStart+captureRows]` slice intersecting `[windowEnd-maxCacheSize..<windowEnd]`.
+    public static func prefillCaptureSlice(
+        startPos: Int, rows: Int, windowEnd: Int, maxCacheSize: Int
+    ) -> PrefillCaptureSlice? {
+        guard rows > 0, maxCacheSize > 0 else { return nil }
+        let windowStart = max(0, max(windowEnd, startPos + rows) - maxCacheSize)
+        guard startPos + rows > windowStart else { return nil }
+        let rawLocal = max(0, windowStart - startPos)
+        let rawCount = rows - rawLocal
+        guard rawCount > 0 else { return nil }
+        let captureRows = min(rawCount, maxCacheSize)
+        let localStart = rawLocal + (rawCount - captureRows)
+        return PrefillCaptureSlice(
+            localStart: localStart, captureRows: captureRows, ctxStartPos: startPos + localStart)
+    }
+
     /// True when capture indices follow virtual `executionPlan` layers (`0..<executionPlan.count`) on looped targets.
     public func usesVirtualCapture(for target: QWModelDescriptor) -> Bool {
         virtualLayerCapture || (target.executionPlan.count > target.numLayers

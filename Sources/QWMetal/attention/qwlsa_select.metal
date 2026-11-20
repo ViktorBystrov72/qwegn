@@ -37,6 +37,25 @@ static inline void lsa_pick_radix_bin(threadgroup uint* hist,
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
+static inline float lsa_dot_q_half(threadgroup const float* qShared,
+                                   device const half* ptr,
+                                   uint dLim,
+                                   uint stride) {
+    float dot = 0.0f;
+    if ((dLim & 3u) == 0u && (stride & 3u) == 0u) {
+        for (uint d = 0u; d < dLim; d += 4u) {
+            const half4 v = *(device const half4*)(ptr + d);
+            dot = fma(qShared[d],      float(v.x), dot);
+            dot = fma(qShared[d + 1u], float(v.y), dot);
+            dot = fma(qShared[d + 2u], float(v.z), dot);
+            dot = fma(qShared[d + 3u], float(v.w), dot);
+        }
+    } else {
+        for (uint d = 0u; d < dLim; d++) dot = fma(qShared[d], float(ptr[d]), dot);
+    }
+    return dot;
+}
+
 // Single-TG hierarchical LSA block selector (sink block 0 + top-k middle + local window).
 // Shared with `qwg_lsa_select_finalize` fallback for bit-exact parity.
 static inline void lsa_select_blocks_body(device const half*   qIdx,
@@ -55,7 +74,8 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
                                           threadgroup uint*  scanSum,
                                           threadgroup uint&  sgTotal,
                                           threadgroup uint&  chosenBin,
-                                          threadgroup uint&  greaterAccum) {
+                                          threadgroup uint&  greaterAccum,
+                                          threadgroup uint*  tgScores) {
     const uint qRow = (rowStep > 1u) ? min(t * rowStep + (rowStep - 1u), maxRow - 1u) : t;
     const uint pq = pos0 + qRow;
     const uint totalBlocks = (pq + 1u) >> 2u;
@@ -80,6 +100,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
     const uint middleEnd = totalBlocks - windowBlocks;
     const uint numMiddle = middleEnd - 1u;
     const uint kEff = min(budgetBlocks, numMiddle);
+    const bool useSram = (tgScores != nullptr) && (numMiddle <= 2304u);
     device atomic_uint* rowScores = scoreScratch + uint64_t(t) * scoreStride;
 
     const uint numClusters = middleEnd >> 7u;
@@ -92,9 +113,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint b = tid; b < numBuckets; b += 256u) {
-            device const half* cPtr = centroids + uint64_t(b) * indexDim;
-            float dot = 0.0f;
-            for (uint d = 0u; d < dLim; d++) dot = fma(qShared[d], float(cPtr[d]), dot);
+            const float dot = lsa_dot_q_half(qShared, centroids + uint64_t(b) * indexDim, dLim, indexDim);
             const uint u = lsa_float_to_sortable_u32(dot);
             atomic_fetch_add_explicit((threadgroup atomic_uint*)&hist[(u >> 24u) & 0xFFu], 1u, memory_order_relaxed);
         }
@@ -108,9 +127,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint b = tid; b < numBuckets; b += 256u) {
-            device const half* cPtr = centroids + uint64_t(b) * indexDim;
-            float dot = 0.0f;
-            for (uint d = 0u; d < dLim; d++) dot = fma(qShared[d], float(cPtr[d]), dot);
+            const float dot = lsa_dot_q_half(qShared, centroids + uint64_t(b) * indexDim, dLim, indexDim);
             const uint u = lsa_float_to_sortable_u32(dot);
             if ((u & 0xFF000000u) == topByte) {
                 atomic_fetch_add_explicit((threadgroup atomic_uint*)&hist[(u >> 16u) & 0xFFu], 1u, memory_order_relaxed);
@@ -124,14 +141,16 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
     }
 
     if (centroidThresh > -1e20f) {
-        for (uint m = 1u + tid; m < numClusters * 128u; m += 256u) atomic_store_explicit(&rowScores[m - 1u], 0u, memory_order_relaxed);
-        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-        threadgroup_barrier(mem_flags::mem_device);
+        if (useSram) {
+            for (uint m = 1u + tid; m < numClusters * 128u; m += 256u) tgScores[m - 1u] = 0u;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            for (uint m = 1u + tid; m < numClusters * 128u; m += 256u) atomic_store_explicit(&rowScores[m - 1u], 0u, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_device);
+        }
 
         for (uint b = tid; b < numBuckets; b += 256u) {
-            device const half* cPtr = centroids + uint64_t(b) * indexDim;
-            float cDot = 0.0f;
-            for (uint d = 0u; d < dLim; d++) cDot = fma(qShared[d], float(cPtr[d]), cDot);
+            const float cDot = lsa_dot_q_half(qShared, centroids + uint64_t(b) * indexDim, dLim, indexDim);
             if (cDot >= centroidThresh) {
                 const uint baseBlk = (b >> 6u) * 128u;
                 const uchar4 mem = bucketMembers[b];
@@ -140,30 +159,29 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
                 for (uint k = 0u; k < nMem; k++) {
                     const uint m = baseBlk + uint(mArr[k]);
                     if (m >= 1u && m < middleEnd) {
-                        device const half* kPtr = pooledKeys + uint64_t(m) * indexDim;
-                        float kDot = 0.0f;
-                        for (uint d = 0u; d < dLim; d++) kDot = fma(qShared[d], float(kPtr[d]), kDot);
-                        atomic_store_explicit(&rowScores[m - 1u], lsa_float_to_sortable_u32(kDot), memory_order_relaxed);
+                        const float kDot = lsa_dot_q_half(qShared, pooledKeys + uint64_t(m) * indexDim, dLim, indexDim);
+                        const uint su = lsa_float_to_sortable_u32(kDot);
+                        if (useSram) tgScores[m - 1u] = su;
+                        else atomic_store_explicit(&rowScores[m - 1u], su, memory_order_relaxed);
                     }
                 }
             }
         }
         for (uint m = max(1u, numClusters * 128u) + tid; m < middleEnd; m += 256u) {
-            device const half* kPtr = pooledKeys + uint64_t(m) * indexDim;
-            float kDot = 0.0f;
-            for (uint d = 0u; d < dLim; d++) kDot = fma(qShared[d], float(kPtr[d]), kDot);
-            atomic_store_explicit(&rowScores[m - 1u], lsa_float_to_sortable_u32(kDot), memory_order_relaxed);
+            const float kDot = lsa_dot_q_half(qShared, pooledKeys + uint64_t(m) * indexDim, dLim, indexDim);
+            const uint su = lsa_float_to_sortable_u32(kDot);
+            if (useSram) tgScores[m - 1u] = su;
+            else atomic_store_explicit(&rowScores[m - 1u], su, memory_order_relaxed);
         }
     } else {
         for (uint m = 1u + tid; m < middleEnd; m += 256u) {
-            device const half* kPtr = pooledKeys + uint64_t(m) * indexDim;
-            float kDot = 0.0f;
-            for (uint d = 0u; d < dLim; d++) kDot = fma(qShared[d], float(kPtr[d]), kDot);
-            atomic_store_explicit(&rowScores[m - 1u], lsa_float_to_sortable_u32(kDot), memory_order_relaxed);
+            const float kDot = lsa_dot_q_half(qShared, pooledKeys + uint64_t(m) * indexDim, dLim, indexDim);
+            const uint su = lsa_float_to_sortable_u32(kDot);
+            if (useSram) tgScores[m - 1u] = su;
+            else atomic_store_explicit(&rowScores[m - 1u], su, memory_order_relaxed);
         }
     }
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup_barrier(useSram ? mem_flags::mem_threadgroup : mem_flags::mem_device);
 
     if (tid == 0u) { greaterAccum = 0u; chosenBin = 0u; sgTotal = 0u; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -176,7 +194,7 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint i = tid; i < numMiddle; i += 256u) {
-            const uint u = atomic_load_explicit(&rowScores[i], memory_order_relaxed);
+            const uint u = useSram ? tgScores[i] : atomic_load_explicit(&rowScores[i], memory_order_relaxed);
             if ((u & mask) == threshU) {
                 atomic_fetch_add_explicit((threadgroup atomic_uint*)&hist[(u >> shift) & 0xFFu], 1u, memory_order_relaxed);
             }
@@ -199,7 +217,9 @@ static inline void lsa_select_blocks_body(device const half*   qIdx,
     const uint numChunks = (numMiddle + 255u) >> 8u;
     for (uint c = 0u; c < numChunks; c++) {
         const uint idx = (c << 8u) + tid;
-        const uint u = (idx < numMiddle) ? atomic_load_explicit(&rowScores[idx], memory_order_relaxed) : 0u;
+        const uint u = (idx < numMiddle)
+            ? (useSram ? tgScores[idx] : atomic_load_explicit(&rowScores[idx], memory_order_relaxed))
+            : 0u;
         const bool isGt = (idx < numMiddle) && (u > threshU);
         const bool isTie = (idx < numMiddle) && (u == threshU);
 
@@ -273,10 +293,11 @@ kernel void qwg_lsa_select_blocks(device const half*   qIdx          [[buffer(0)
     threadgroup uint  sgTotal;
     threadgroup uint  chosenBin;
     threadgroup uint  greaterAccum;
+    threadgroup uint  tgScores[2304];
     lsa_select_blocks_body(qIdx, pooledKeys, centroids, bucketMembers, bucketSizes, scoreScratch,
                            blockList, blockCount, pos0, indexDim, budgetBlocks, windowBlocks,
                            listStride, scoreStride, rowStep, maxRow, t, tid,
-                           qShared, hist, scanSum, sgTotal, chosenBin, greaterAccum);
+                           qShared, hist, scanSum, sgTotal, chosenBin, greaterAccum, tgScores);
 }
 
 // Parallel 4-stage selector (`_score` -> `_hist2` -> `_expand` -> `_finalize`),
@@ -374,9 +395,7 @@ kernel void qwg_lsa_select_score(device const half* qIdx      [[buffer(0)]],
     const uint b = tg.x * 256u + tid;
     if (b < g.numBuckets) {
         const uint dLim = min(p.indexDim, 128u);
-        device const half* cPtr = centroids + uint64_t(b) * p.indexDim;
-        float dot = 0.0f;
-        for (uint d = 0u; d < dLim; d++) dot = fma(qShared[d], float(cPtr[d]), dot);
+        const float dot = lsa_dot_q_half(qShared, centroids + uint64_t(b) * p.indexDim, dLim, p.indexDim);
         const uint u = lsa_float_to_sortable_u32(dot);
         cScore[uint64_t(unit) * p.bucketStride + b] = u;
         atomic_fetch_add_explicit(&hist[(u >> 24u) & 0xFFu], 1u, memory_order_relaxed);
@@ -473,9 +492,7 @@ kernel void qwg_lsa_select_expand(device const half*   qIdx          [[buffer(0)
             for (uint k = 0u; k < nMem; k++) {
                 const uint m = baseBlk + uint(mArr[k]);
                 if (m >= 1u && m < g.middleEnd) {
-                    device const half* kPtr = pooledKeys + uint64_t(m) * p.indexDim;
-                    float kDot = 0.0f;
-                    for (uint d = 0u; d < dLim; d++) kDot = fma(qShared[d], float(kPtr[d]), kDot);
+                    const float kDot = lsa_dot_q_half(qShared, pooledKeys + uint64_t(m) * p.indexDim, dLim, p.indexDim);
                     lsa_add_candidate(unit, m, kDot, p, marks, candCount, candM, candU);
                 }
             }
@@ -483,9 +500,7 @@ kernel void qwg_lsa_select_expand(device const half*   qIdx          [[buffer(0)
     }
     if (tg.x == 0u) {
         for (uint m = max(1u, g.numClusters * 128u) + tid; m < g.middleEnd; m += 256u) {
-            device const half* kPtr = pooledKeys + uint64_t(m) * p.indexDim;
-            float kDot = 0.0f;
-            for (uint d = 0u; d < dLim; d++) kDot = fma(qShared[d], float(kPtr[d]), kDot);
+            const float kDot = lsa_dot_q_half(qShared, pooledKeys + uint64_t(m) * p.indexDim, dLim, p.indexDim);
             lsa_add_candidate(unit, m, kDot, p, marks, candCount, candM, candU);
         }
     }
@@ -611,7 +626,7 @@ kernel void qwg_lsa_select_finalize(device const half*   qIdx          [[buffer(
         lsa_select_blocks_body(qIdx, pooledKeys, centroids, bucketMembers, bucketSizes, scoreScratch,
                                blockList, blockCount, p.pos0, p.indexDim, p.budgetBlocks, p.windowBlocks,
                                p.listStride, p.scoreStride, p.rowStep, p.maxRow, unit, tid,
-                               qShared, hist, scanSum, sgTotal, chosenBin, greaterAccum);
+                               qShared, hist, scanSum, sgTotal, chosenBin, greaterAccum, keep);
     }
 
     if (g.filter) {

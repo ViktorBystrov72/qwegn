@@ -343,22 +343,25 @@ struct QWVerifyWindow {
         // Even all-accept can be shortened by stops, callbacks, or maxNew.
         if count < verifiedRows {
             if try checkpoint.rollbackTapeIsStable(retaining: count, activeRows: verifiedRows) {
-                guard let enc = cb.makeComputeCommandEncoder() else {
-                    throw QWEngineDriverError.state("retained rollback encoder")
-                }
-                hal.touchKeepAlive(enc)
-                do {
-                    try checkpoint.encodeRollbackTape(enc, decoder: decoder, rec: rec,
-                                                      activeRows: verifiedRows, retaining: count,
-                                                      verifyStability: false)
-                    if let carrySource {
-                        try Self.encodeCopy(enc, hal: hal, source: carrySource, destination: trunkHidden)
+                let skipEmptyRollback = checkpoint.outOfPlaceVerifyActive && count == 0 && carrySource == nil
+                if !skipEmptyRollback {
+                    guard let enc = cb.makeComputeCommandEncoder() else {
+                        throw QWEngineDriverError.state("retained rollback encoder")
                     }
-                } catch {
+                    hal.touchKeepAlive(enc)
+                    do {
+                        try checkpoint.encodeRollbackTape(enc, decoder: decoder, rec: rec,
+                                                          activeRows: verifiedRows, retaining: count,
+                                                          verifyStability: false)
+                        if let carrySource {
+                            try Self.encodeCopy(enc, hal: hal, source: carrySource, destination: trunkHidden)
+                        }
+                    } catch {
+                        enc.endEncoding()
+                        throw error
+                    }
                     enc.endEncoding()
-                    throw error
                 }
-                enc.endEncoding()
                 guard let rings = cb.makeBlitCommandEncoder() else {
                     throw QWEngineDriverError.state("retained ring encoder")
                 }
@@ -381,13 +384,15 @@ struct QWVerifyWindow {
                     throw error
                 }
                 blit.endEncoding()
-                if count > 0 {
+                if count > 0 || carrySource != nil {
                     guard let enc = cb.makeComputeCommandEncoder() else {
                         throw QWEngineDriverError.state("retained replay encoder")
                     }
                     hal.touchKeepAlive(enc)
                     do {
-                        try checkpoint.encodeReplay(enc, decoder: decoder, rec: rec, retaining: count)
+                        if count > 0 {
+                            try checkpoint.encodeReplay(enc, decoder: decoder, rec: rec, retaining: count)
+                        }
                         if let carrySource {
                             try Self.encodeCopy(enc, hal: hal, source: carrySource, destination: trunkHidden)
                         }
@@ -398,11 +403,25 @@ struct QWVerifyWindow {
                     enc.endEncoding()
                 }
             }
-        } else if let carrySource {
-            guard let enc = cb.makeComputeCommandEncoder() else { throw QWEngineDriverError.state("retained hidden encoder") }
-            hal.touchKeepAlive(enc)
-            defer { enc.endEncoding() }
-            try Self.encodeCopy(enc, hal: hal, source: carrySource, destination: trunkHidden)
+        } else {
+            if checkpoint.outOfPlaceVerifyActive {
+                guard let commitBlit = cb.makeBlitCommandEncoder() else {
+                    throw QWEngineDriverError.state("retained full rec commit encoder")
+                }
+                do {
+                    try checkpoint.encodeCommitFullRec(commitBlit, rec: rec)
+                } catch {
+                    commitBlit.endEncoding()
+                    throw error
+                }
+                commitBlit.endEncoding()
+            }
+            if let carrySource {
+                guard let enc = cb.makeComputeCommandEncoder() else { throw QWEngineDriverError.state("retained hidden encoder") }
+                hal.touchKeepAlive(enc)
+                defer { enc.endEncoding() }
+                try Self.encodeCopy(enc, hal: hal, source: carrySource, destination: trunkHidden)
+            }
         }
     }
 
@@ -415,6 +434,7 @@ struct QWVerifyWindow {
                 activeRows: Int? = nil,
                 unrotateForF16Head: Bool = false,
                 multimaxParams: QWTensorValue? = nil,
+                outOfPlaceGDN: Bool = false,
                 windowEncoder: (() throws -> Void)? = nil,
                 currentCommandBuffer: (() -> (any MTLCommandBuffer))? = nil,
                 stageProfiler: QWGPUStageProfiler<QWMTPVerificationStage>? = nil,
@@ -428,7 +448,8 @@ struct QWVerifyWindow {
         } else {
             guard let blit = cb.makeBlitCommandEncoder() else { throw QWEngineDriverError.state("verify backup encoder") }
             do {
-                try checkpoint.encodeBackup(blit, rec: rec, ring: ring)
+                try checkpoint.encodeBackup(blit, rec: rec, ring: ring,
+                                            skipRecCopy: outOfPlaceGDN && windowEncoder != nil)
             } catch {
                 blit.endEncoding()
                 throw error

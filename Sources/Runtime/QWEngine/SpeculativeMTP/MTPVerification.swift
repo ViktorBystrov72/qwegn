@@ -126,6 +126,7 @@ extension QWEngineDriver {
                                     activeRows: rowCount,
                                     unrotateForF16Head: true,
                                     multimaxParams: multimaxParams,
+                                    outOfPlaceGDN: gdnReplayCheckpoint.layers > 0,
                                     windowEncoder: {
                                         try self.encodeLayerMajorVerification(
                                             cb, session: session, window: verifyWindow,

@@ -17,13 +17,18 @@ final class QWGDNReplayCheckpoint {
     let betas: QWTensorValue
     let glog: QWTensorValue
     let innovations: QWTensorValue
+    let stabilityMask: QWTensorValue
     var sourceRec: QWTensorValue?
     var sourceRing: QWTensorValue?
     var captured: [UInt32]
+    private(set) var outOfPlaceVerifyActive: Bool = false
+    private var batchedLayerRecorded: [Bool]
+    private var batchedLayerCount: Int = 0
+    private var batchedActiveRows: Int = 0
 
     static func allocationBytes(geometry: QWModelGeometry, layers: Int, rows: Int) -> Int {
         precondition((0...128).contains(layers) && (1...16).contains(rows))
-        if layers == 0 { return 7 * 256 }
+        if layers == 0 { return 8 * 256 }
         func aligned(_ bytes: Int) -> Int { (bytes + 255) / 256 * 256 }
         let qkvC = geometry.gdnQKVChannels, gdnVH = geometry.gdnVHeads, zC = geometry.gdnZChannels
         let glogC = geometry.gdnGlogChannels
@@ -33,6 +38,7 @@ final class QWGDNReplayCheckpoint {
             + aligned(layers * rows * gdnVH * 4)
             + aligned(layers * rows * glogC * 4)
             + aligned(layers * rows * zC * 4)
+            + 256
     }
 
     init(geometry: QWModelGeometry, allocator: QWSubAllocator, layers: Int = 48, rows: Int) throws {
@@ -43,6 +49,7 @@ final class QWGDNReplayCheckpoint {
         self.layers = layers
         self.rows = rows
         captured = [UInt32](repeating: 0, count: layers)
+        batchedLayerRecorded = [Bool](repeating: false, count: layers)
         let qkvC = geometry.gdnQKVChannels, gdnVH = geometry.gdnVHeads, zC = geometry.gdnZChannels
         let glogC = geometry.gdnGlogChannels
         let recElems = max(1, layers * QWSlotGeometry.recElems(geometry: geometry))
@@ -58,6 +65,7 @@ final class QWGDNReplayCheckpoint {
         betas = try allocator.allocate(QWTensorShape([rowVH], .f32))
         glog = try allocator.allocate(QWTensorShape([rowGlog], .f32))
         innovations = try allocator.allocate(QWTensorShape([rowZ], .f32))
+        stabilityMask = try allocator.allocate(QWTensorShape([1], .i32))
     }
 
     func view(_ tensor: QWTensorValue, index: Int, count: Int) -> QWTensorValue {
@@ -85,7 +93,7 @@ final class QWGDNReplayCheckpoint {
             let start = t.region.base + t.offset
             let end = start + t.bytes
             let workspaceStart = recurrent.region.base + recurrent.offset
-            let workspaceEnd = innovations.region.base + innovations.offset + innovations.bytes
+            let workspaceEnd = stabilityMask.region.base + stabilityMask.offset + stabilityMask.bytes
             guard end <= workspaceStart || workspaceEnd <= start else {
                 throw QWEngineDriverError.state("GPU checkpoint source aliases workspace")
             }
@@ -133,19 +141,47 @@ final class QWGDNReplayCheckpoint {
                  size: source.bytes)
     }
 
+    func resetGPUBatchedStability() {
+        batchedLayerCount = 0
+        batchedActiveRows = 0
+        for layer in 0..<layers { batchedLayerRecorded[layer] = false }
+    }
+
+    private func prepareBatchedVerifyTarget(
+        layer: Int, activeRows: Int, state: QWTensorValue
+    ) -> (stateOut: QWTensorValue, stabilityMask: QWTensorValue?) {
+        if batchedLayerCount > 0 && batchedActiveRows != activeRows {
+            resetGPUBatchedStability()
+        }
+        batchedActiveRows = activeRows
+        if !batchedLayerRecorded[layer] {
+            batchedLayerRecorded[layer] = true
+            batchedLayerCount += 1
+        }
+        let recOut = outOfPlaceVerifyActive
+            ? view(recurrent, index: layer, count: QWSlotGeometry.recElems(geometry: geometry))
+            : state
+        return (recOut, activeRows <= 16 ? stabilityMask : nil)
+    }
+
     func markZeroLayerBackup(rec: QWTensorValue, ring: QWTensorValue) throws {
         guard layers == 0 else {
             throw QWEngineDriverError.state("zero-layer backup requires layers == 0")
         }
         sourceRec = rec
         sourceRing = ring
+        outOfPlaceVerifyActive = false
+        resetGPUBatchedStability()
     }
 
     func encodeBackup(_ enc: any MTLBlitCommandEncoder,
-                      rec: QWTensorValue, ring: QWTensorValue) throws {
+                      rec: QWTensorValue, ring: QWTensorValue,
+                      skipRecCopy: Bool = false) throws {
         if layers == 0 {
             sourceRec = rec
             sourceRing = ring
+            outOfPlaceVerifyActive = false
+            resetGPUBatchedStability()
             return
         }
         try validate(rec, like: recurrent)
@@ -156,10 +192,16 @@ final class QWGDNReplayCheckpoint {
                 throw QWEngineDriverError.state("GPU checkpoint recurrent and ring slabs alias")
             }
         }
-        copy(enc, rec, recurrent)
+        let maskStart = stabilityMask.region.base + stabilityMask.offset
+        enc.fill(buffer: stabilityMask.region.buffer, range: maskStart..<(maskStart + stabilityMask.bytes), value: 0)
+        if !skipRecCopy {
+            copy(enc, rec, recurrent)
+        }
         copy(enc, ring, rings)
         sourceRec = rec
         sourceRing = ring
+        outOfPlaceVerifyActive = skipRecCopy
+        resetGPUBatchedStability()
         for layer in 0..<layers { captured[layer] = 0 }
     }
 
@@ -177,9 +219,22 @@ final class QWGDNReplayCheckpoint {
         guard sameStorage(rec, sourceRec), sameStorage(ring, sourceRing) else {
             throw QWEngineDriverError.state("GPU restore requires the checkpoint's original state buffers")
         }
-        copy(enc, recurrent, rec)
+        if !outOfPlaceVerifyActive {
+            copy(enc, recurrent, rec)
+        }
         if restoreRing {
             copy(enc, rings, ring)
+        }
+    }
+
+    func encodeCommitFullRec(_ enc: any MTLBlitCommandEncoder, rec: QWTensorValue) throws {
+        guard layers > 0 else { return }
+        try validate(rec, like: recurrent)
+        guard sameStorage(rec, sourceRec) else {
+            throw QWEngineDriverError.state("GPU full rec commit requires original recurrent slab")
+        }
+        if outOfPlaceVerifyActive {
+            copy(enc, recurrent, rec)
         }
     }
 
@@ -209,6 +264,7 @@ final class QWGDNReplayCheckpoint {
                                   shape: QWTensorShape([activeRows * qkvC], .f16))
         let zView = QWTensorValue(region: zScratch.region, offset: zScratch.offset,
                                   shape: QWTensorShape([activeRows * zC], .f16))
+        let recTarget = prepareBatchedVerifyTarget(layer: layer, activeRows: activeRows, state: state)
         try decoder.encodeKDAGates(
             enc, fgb: fgbProjection, fB: fBWeight, gB: gBWeight,
             aLog: aLog, dtBias: dtBias, betas: b, glog: g, zOut: zView, rows: activeRows)
@@ -220,7 +276,8 @@ final class QWGDNReplayCheckpoint {
         try decoder.encodeRows(
             enc, y: n, betas: b, glog: g, state: state,
             zBase: zView, w: normWeight, o: output, innovation: inv,
-            rows: activeRows, zStride: zC)
+            rows: activeRows, zStride: zC,
+            stateOut: recTarget.stateOut, unstableSuffixMask: recTarget.stabilityMask)
         enc.memoryBarrier(scope: .buffers)
         captured[layer] |= UInt32((1 << activeRows) - 1)
     }
@@ -247,6 +304,7 @@ final class QWGDNReplayCheckpoint {
                                   shape: QWTensorShape([activeRows * geometry.gdnTotalN], .f16))
         let cView = QWTensorValue(region: controls.region, offset: controls.offset,
                                   shape: QWTensorShape([activeRows * (2 * gdnVH)], .f32))
+        let recTarget = prepareBatchedVerifyTarget(layer: layer, activeRows: activeRows, state: state)
         try conv.encodeRowsWithHeadnorm(
             enc, x: xView, w: convWeight, bias: nil,
             stIn: ring, y: n, stOut: ring,
@@ -261,7 +319,8 @@ final class QWGDNReplayCheckpoint {
         try decoder.encodeRows(
             enc, y: n, betas: b, glog: g, state: state,
             zBase: zBase, w: normWeight, o: output, innovation: inv,
-            rows: activeRows, zStride: geometry.gdnTotalN)
+            rows: activeRows, zStride: geometry.gdnTotalN,
+            stateOut: recTarget.stateOut, unstableSuffixMask: recTarget.stabilityMask)
         enc.memoryBarrier(scope: .buffers)
         captured[layer] |= UInt32((1 << activeRows) - 1)
     }
@@ -302,6 +361,11 @@ final class QWGDNReplayCheckpoint {
         try validateRetained(verifiedRows)
         let gdnVH = geometry.gdnVHeads
         guard layers > 0, count < verifiedRows, gdnVH > 0 else { return true }
+        if batchedLayerCount == layers, batchedActiveRows == verifiedRows, verifiedRows <= 16 {
+            let mask = stabilityMask.region.pointer.advanced(by: stabilityMask.offset)
+                .assumingMemoryBound(to: UInt32.self).pointee
+            return (mask & (UInt32(1) << UInt32(count))) == 0
+        }
         let decayValues = glog.region.pointer.advanced(by: glog.offset).assumingMemoryBound(to: Float.self)
         let innovationValues = innovations.region.pointer.advanced(by: innovations.offset)
             .assumingMemoryBound(to: Float.self)
@@ -395,18 +459,21 @@ final class QWGDNReplayCheckpoint {
             }
         }
         let rollbackRows = verifiedRows - count
-        if rollbackRows > 0 {
+        if rollbackRows > 0, !(outOfPlaceVerifyActive && count == 0) {
             let qkvC = geometry.gdnQKVChannels, zC = geometry.gdnZChannels, glogC = geometry.gdnGlogChannels
+            let recElems = QWSlotGeometry.recElems(geometry: geometry)
             for layer in 0..<layers {
-                let state = view(rec, index: layer, count: QWSlotGeometry.recElems(geometry: geometry))
+                let dstState = view(rec, index: layer, count: recElems)
+                let srcState = outOfPlaceVerifyActive ? view(recurrent, index: layer, count: recElems) : dstState
                 let startRow = layer * rows + count
                 try decoder.encodeStateRollbackRows(
                     enc,
                     y: slice(normalized, startRow: startRow, rowCount: rollbackRows, rowWidth: qkvC),
                     innovation: slice(innovations, startRow: startRow, rowCount: rollbackRows, rowWidth: zC),
                     glog: slice(glog, startRow: startRow, rowCount: rollbackRows, rowWidth: glogC),
-                    state: state,
-                    rows: rollbackRows)
+                    state: srcState,
+                    rows: rollbackRows,
+                    stateOut: dstState)
             }
             enc.memoryBarrier(scope: .buffers)
         }

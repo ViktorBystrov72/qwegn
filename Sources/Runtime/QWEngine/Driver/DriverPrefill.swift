@@ -42,7 +42,8 @@ extension QWEngineDriver {
     func prefillChunk(_ session: QWEngineSession, tokens: [Int],
                               start: Int, count: Int,
                               runsHead: Bool = true, mode: GDNPrefillMode,
-                              permit: QWGenerationPermit?) throws -> Int {
+                              permit: QWGenerationPermit?,
+                              dflashWindowEnd: Int? = nil) throws -> Int {
         let T = count
         guard T > 0, T <= psc.maxChunk, start >= 0, start + T <= tokens.count else {
             throw QWEngineDriverError.state("prefillChunk invalid T=\(T)")
@@ -104,6 +105,13 @@ extension QWEngineDriver {
             memcpy(dst, src, T * H * 2)
         }
 
+        let dflashCapture: QWDFlashConfig.PrefillCaptureSlice? = dflashDrafter.flatMap { drafter in
+            QWDFlashConfig.prefillCaptureSlice(
+                startPos: pos, rows: T,
+                windowEnd: dflashWindowEnd ?? (pos + T),
+                maxCacheSize: drafter.config.maxCacheSize)
+        }
+
         for (v, p) in geometry.executionPlan.enumerated() {
             let lw = layersW[p]
             cb = activeCB ?? cb
@@ -122,7 +130,7 @@ extension QWEngineDriver {
             // looks the kernel up instead of switching on the kind.
             try layerKernels[p].encodePrefillChunk(QWLayerPrefillContext(
                 driver: self, enc: activeEnc ?? enc, session: session, position: pos, layer: v,
-                weights: lw, rows: T, mode: mode))
+                weights: lw, rows: T, mode: mode, dflashCapture: dflashCapture))
         }
         cb = activeCB ?? cb
         enc = activeEnc ?? enc
@@ -138,7 +146,8 @@ extension QWEngineDriver {
             // left the count honest.
         }
 
-        if mtpPromptEmbeddings != nil || dflashDrafter != nil {
+        let needsSeedingPass = mtpPromptEmbeddings != nil || (dflashDrafter != nil && dflashCapture != nil)
+        if needsSeedingPass {
             if T >= 1024 {
                 activeEnc = nil
                 activeCB = nil
@@ -162,7 +171,8 @@ extension QWEngineDriver {
             try encodeMTPSeeding(cb, session: session,
                                  embeddings: seedEmbeddings,
                                  hidden: seedHidden,
-                                 count: T, cacheRows: mtpRows)
+                                 count: T, cacheRows: mtpRows,
+                                 dflashCapture: dflashCapture)
             cb.commit()
         } else {
             activeEnc = nil
@@ -327,6 +337,7 @@ extension QWEngineDriver {
             var offset = 0
             var lastToken = 0
             let maxChunk = psc.maxChunk
+            let prefillEndPos = session.position + tokens.count
             while offset < tokens.count {
                 let stepCap = Self.adaptivePrefillChunkCap(
                     position: session.position,
@@ -336,7 +347,8 @@ extension QWEngineDriver {
                 let isLast = (offset + count == tokens.count)
                 lastToken = try prefillChunk(session, tokens: tokens,
                                              start: offset, count: count,
-                                             runsHead: isLast, mode: effectiveMode, permit: permit)
+                                             runsHead: isLast, mode: effectiveMode, permit: permit,
+                                             dflashWindowEnd: prefillEndPos)
                 offset += count
                 emitPrefillProgress(session, done: offset, promptCount: tokens.count)
             }

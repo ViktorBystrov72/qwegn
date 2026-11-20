@@ -397,4 +397,87 @@ final class QWDFlashSeedingRegressionTests: XCTestCase {
         driver.finishSession(specSession)
         XCTAssertEqual(specOut, baseline)
     }
+
+    func testDFlashPrefillCaptureSliceWindowingAndMultiChunkSlotByteParity() throws {
+        XCTAssertNil(QWDFlashConfig.prefillCaptureSlice(startPos: 0, rows: 2048, windowEnd: 5000, maxCacheSize: 2047))
+        XCTAssertNil(QWDFlashConfig.prefillCaptureSlice(startPos: 0, rows: 2953, windowEnd: 5000, maxCacheSize: 2047))
+        XCTAssertEqual(
+            QWDFlashConfig.prefillCaptureSlice(startPos: 2048, rows: 2048, windowEnd: 5000, maxCacheSize: 2047),
+            QWDFlashConfig.PrefillCaptureSlice(localStart: 905, captureRows: 1143, ctxStartPos: 2953)
+        )
+        XCTAssertEqual(
+            QWDFlashConfig.prefillCaptureSlice(startPos: 4096, rows: 904, windowEnd: 5000, maxCacheSize: 2047),
+            QWDFlashConfig.PrefillCaptureSlice(localStart: 0, captureRows: 904, ctxStartPos: 4096)
+        )
+        XCTAssertEqual(
+            QWDFlashConfig.prefillCaptureSlice(startPos: 0, rows: 4096, windowEnd: 4096, maxCacheSize: 2047),
+            QWDFlashConfig.PrefillCaptureSlice(localStart: 2049, captureRows: 2047, ctxStartPos: 2049)
+        )
+        XCTAssertNil(QWDFlashConfig.prefillCaptureSlice(startPos: 0, rows: 0, windowEnd: 512, maxCacheSize: 2047))
+
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] != "true"
+                && QWDeviceCaps.current?.familyApple9 == true
+                && QWDeviceCaps.current?.isMetal4TensorCapable == true,
+            "Synthetic DFlash2 windowed capture GPU parity test requires bare-metal Apple Silicon GPU"
+        )
+        let baseDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qw-dflash-win-\(UUID().uuidString)")
+        let targetDir = baseDir.appendingPathComponent("target")
+        let dflashDir = baseDir.appendingPathComponent("drafter")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+
+        _ = try Self.buildSyntheticTargetPack(at: targetDir, maxPos: 256)
+        try Self.buildSyntheticDFlash2Pack(at: dflashDir, slidingWindow: 64)
+
+        let driver = try QWEngineDriver(
+            packPath: targetDir.path, maxTokens: 256, ropeRows: 256, kvMode: .q4,
+            mtpDrafts: 4, mtpBackend: .dflash2, mtpAdaptiveDepth: false,
+            mtpRelaxedMargin: 0, dflashDraftPackPath: dflashDir.path,
+            dflashSelectorTopK: 8, prefillChunkSize: 64)
+        let chunk = driver.prefillChunkSize
+        let prompt = (0..<160).map { 10 + ($0 % 200) }
+
+        // Reference: force every chunk to update context (dflashWindowEnd = nil -> pos + T).
+        let unwindowed = try driver.makeSession(promptTokens: 256)
+        try driver.requestGate.withRequest(flight: driver.flight) { permit in
+            for off in stride(from: 0, to: prompt.count, by: chunk) {
+                let count = min(chunk, prompt.count - off)
+                _ = try driver.prefillChunk(
+                    unwindowed, tokens: prompt, start: off, count: count,
+                    runsHead: off + count == prompt.count, mode: .chunked, permit: permit,
+                    dflashWindowEnd: nil)
+            }
+        }
+        let unwinSlot = try XCTUnwrap(unwindowed.dflashSlot)
+        let refK = Data(bytes: unwinSlot.kSlab.region.pointer.advanced(by: unwinSlot.kSlab.offset),
+                        count: unwinSlot.kSlab.bytes)
+        let refV = Data(bytes: unwinSlot.vSlab.region.pointer.advanced(by: unwinSlot.vSlab.offset),
+                        count: unwinSlot.vSlab.bytes)
+        let refOffset = unwindowed.dflashCacheOffset
+        driver.finishSession(unwindowed)
+
+        // Windowed prefill: chunks before prompt.count - maxCacheSize (192 - 63 = 129) skip capture & ctx update.
+        let windowed = try driver.makeSession(promptTokens: 256)
+        let winFirst = try driver.prefill(windowed, tokens: prompt)
+        let winSlot = try XCTUnwrap(windowed.dflashSlot)
+        let gotK = Data(bytes: winSlot.kSlab.region.pointer.advanced(by: winSlot.kSlab.offset),
+                        count: winSlot.kSlab.bytes)
+        let gotV = Data(bytes: winSlot.vSlab.region.pointer.advanced(by: winSlot.vSlab.offset),
+                        count: winSlot.vSlab.bytes)
+        XCTAssertEqual(windowed.dflashCacheOffset, refOffset)
+        XCTAssertEqual(gotK, refK, "windowed DFlash2 prefill must preserve exact ring K slab bytes")
+        XCTAssertEqual(gotV, refV, "windowed DFlash2 prefill must preserve exact ring V slab bytes")
+        driver.finishSession(windowed)
+
+        let baseSession = try driver.makeSession(promptTokens: 256)
+        let baseline = try driver.generate(session: baseSession, prompt: prompt, maxNew: 8)
+        driver.finishSession(baseSession)
+        XCTAssertEqual(winFirst, baseline[0])
+
+        let specSession = try driver.makeSession(promptTokens: 256)
+        let specOut = try driver.generateExperimentalGreedy(session: specSession, prompt: prompt, maxNew: 8)
+        driver.finishSession(specSession)
+        XCTAssertEqual(specOut, baseline)
+    }
 }

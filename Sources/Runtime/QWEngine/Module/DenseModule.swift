@@ -280,6 +280,7 @@ open class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendabl
         engineSession.tokenHistory = tokens
         var offset = chunk.lowerBound
         var token = 0
+        let prefillEndPos = engineSession.position + (tokens.count - chunk.lowerBound)
         while offset < chunk.upperBound {
             let stepCap = QWEngineDriver.adaptivePrefillChunkCap(
                 position: engineSession.position,
@@ -291,7 +292,8 @@ open class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendabl
             token = try engine.prefillChunk(engineSession, tokens: tokens,
                                             start: offset, count: count,
                                             runsHead: runsHead && last,
-                                            mode: engine.gdnPrefillMode, permit: permit)
+                                            mode: engine.gdnPrefillMode, permit: permit,
+                                            dflashWindowEnd: prefillEndPos)
             offset += count
         }
         if runsHead {

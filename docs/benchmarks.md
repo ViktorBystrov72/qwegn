@@ -332,6 +332,16 @@ Measured on an idle (`0%` pre-run GPU, `0` external co-runners) Apple M5 Max (`M
 
 *(1) `GLM-5.3-Flash` and `Sage-S2.1-Flash` launched with `--context-tokens 65536`; the `~65.5k` probe rung (`65,658` tokens > `65,536`) returns clean HTTP `400` as expected.* *(2) `Sage-S2.1-Flash` retains `36/36` fidelity correctness and `3/3` determinism checks while exhibiting a pre-existing intermittent FP tie in `chat-seed` (`"**Velvet Thunder** — soft meets loud, in"` token `741` vs `"wh"` `845`) verified identically on frozen `v0.27.4`/`6c602de1` (`2/10` cycles) and candidate (`1/6`).*
 
+### 6. `v0.28.1` LSA Prefill/Selector, Out-of-Place GDN Verify & DFlash2 Window Seeding (`v0.28.0` `44d07982` → `v0.28.1`)
+
+Measured on Apple M5 Max (`Mac17,6`, 128 GB UMA, macOS 26.2+) with 3-round interleaved paired A/B (`master` `44d07982` vs candidate `1d051005`, `--no-profile --no-prefix-cache --no-thinking --no-load-vision --mtp-draft-strategy neural`, `steady-state allocs: 0`):
+
+| Model Configuration (`v0.28.1`) | Throughput (`master → cand`, prefill GPU med / dec max or med) | UMA / GPU Memory & Residency Toggles | `llmprobe` Task Eval | Determinism & Parity |
+| :--- | :--- | :--- | :--- | :--- |
+| **`Qwen3.8-27B` + `DFlash2` (`w=8`, `2K/16K/32K`)** | `2K` (`f16`/`q8`/`q4`): `1032.8→1068.3` (`+3.44%`) / `969.6→974.4` (`+0.50%`) / `1061.7→1072.5` (`+1.02%`); Dec max `58.68→59.22`, `58.50→59.04`, `62.43→63.08`; `16K` (`f16`/`q8`/`q4`): `660.6→723.5` (`+9.52%`) / `709.5→731.5` (`+3.10%`) / `661.5→665.1` (`+0.54%` w/ `26%–34%` UI spikes; `752.4→818.7` `+8.81%` & dec `40.92→48.19` `+17.77%` on clean-GPU `out/slice4_2_q4_ab.json`); `32K` (`f16`/`q8`/`q4`): `688.2→675.6` (`-1.83%`, `40%` r0 UI spike; clean r2 `711.9→739.4` `+3.86%`) / `737.9→772.5` (`+4.69%`, dec med `-6.52%` on 22 vs 21 rounds from `i8_body` word diff) / `759.7→783.6` (`+3.15%`, dec `40.96→41.48`) | `19.08→19.10 GiB` (`2K/f16`), `19.86→19.88` (`16K/f16`), `20.92→20.92` (`32K/f16`), `19.42→19.41` (`32K/q4`); `--no-load-vision` vs `--load-vision`: `18.38→19.39 GiB` (`-1.01 GiB`) | Not run (`llmprobe` binary not installed; `i8_body` matches dense `master`, `< 2e-3` vs general across `hd256`/`hd128` `q8`/`q4`) | **`9/9` Candidate-Serial ≡ Candidate-DFlash2 `SHA-256` exact**; matches `master` on `2K`, `16K f16/q8`, `32K f16/q4`; 1-token `i8_body` rounding diffs on `16K q4` & `32K q8`; **`9/9` Law 28 `QWServer` QA PASS** |
+| **`Qwen3.8-27B` + `DSpine-b16` (`w=8`, `16K/q4`)** | `16K/q4`: `792.4→825.6 tok/s` prefill (`+4.19%`), dec med `+3.08%` (`max 33.66→33.55`) | `20.37→20.40 GiB` RAM, `0` allocs | Not run (`llmprobe` not installed) | **Candidate-Serial ≡ Candidate-DSpine `SHA-256` exact** (`0a071650...`); matches `cand 16K/q4` DFlash2 |
+| **`Qwen3.6-35B-A3B-hq4g32` (`HybridMoE`, `serial`)** | `2K/q4`: `6300.8→6569.9` (`+4.27%`) / dec `137.03→140.95` (`+1.00%` med); `16K/q4`: **`5638.0→6306.7` (`+11.86%`)** / dec `126.36→128.15` (`+3.72%` med) | `20.96→20.97 GiB` (`2K`), `21.04→21.03` (`16K`); `--no-load-vision` vs `--load-vision`: `21.74→22.73 GiB` (`-0.99 GiB`) | Not run (`llmprobe` not installed) | `2K/q4` `SHA-256` exact vs `master`; `16K/q4` wording diff (`1. ...`→`Section 01 —`) from `i8_body` sparse prefill; **`9/9` Law 28 `QWServer` QA PASS** |
+
 ## Reproducing these numbers
 
 For thermal-controlled A/B measurements, both `Scripts/paired_perf.py` and

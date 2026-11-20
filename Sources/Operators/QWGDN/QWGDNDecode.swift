@@ -188,9 +188,12 @@ public final class QWGDNDecode {
                            y: QWTensorValue, betas: QWTensorValue, glog: QWTensorValue,
                            state: QWTensorValue, zBase: QWTensorValue, w: QWTensorValue,
                            o: QWTensorValue, innovation: QWTensorValue? = nil,
-                           rows: Int, zStride: Int? = nil) throws {
+                           rows: Int, zStride: Int? = nil,
+                           stateOut: QWTensorValue? = nil,
+                           unstableSuffixMask: QWTensorValue? = nil) throws {
         let vh = instVHeads, hd = instHeadDim, qkv = instQKVCh, zCh = instZCh, gCh = instGlogCh
         let effectiveZStride = zStride ?? zCh
+        let targetState = stateOut ?? state
         let S = vh * hd * hd
         func ok(_ t: QWTensorValue, _ n: Int, _ dt: QWDType) -> Bool {
             t.shape.elementCount >= n && t.shape.dtype == dt
@@ -198,12 +201,18 @@ public final class QWGDNDecode {
         }
         guard rows > 0, effectiveZStride >= zCh,
               ok(y, rows * qkv, .f16), ok(betas, rows * vh, .f32), ok(glog, rows * gCh, .f32),
-              ok(state, S, .f32), ok(zBase, (rows - 1) * effectiveZStride + zCh, .f16), ok(w, hd, .f16),
+              ok(state, S, .f32), ok(targetState, S, .f32),
+              ok(zBase, (rows - 1) * effectiveZStride + zCh, .f16), ok(w, hd, .f16),
               ok(o, rows * zCh, .f16)
         else { throw QWGDNDecodeError.badShape("encodeRows rows=\(rows) y=\(y.shape.elementCount)") }
         if let innovation {
             guard ok(innovation, rows * zCh, .f32) else {
                 throw QWGDNDecodeError.badShape("innovation=\(innovation.shape.elementCount)")
+            }
+        }
+        if let unstableSuffixMask {
+            guard ok(unstableSuffixMask, 1, .i32) else {
+                throw QWGDNDecodeError.badShape("unstableSuffixMask=\(unstableSuffixMask.shape.elementCount)")
             }
         }
         enc.setComputePipelineState(psoRecRows)
@@ -219,6 +228,9 @@ public final class QWGDNDecode {
         var rU = UInt32(rows), strideU = UInt32(effectiveZStride)
         enc.setBytes(&rU, length: 4, index: 8)
         enc.setBytes(&strideU, length: 4, index: 9)
+        targetState.bind(enc, index: 10)
+        if let unstableSuffixMask { unstableSuffixMask.bind(enc, index: 11) }
+        else { enc.setBuffer(nil, offset: 0, index: 11) }
         enc.dispatchThreadgroups(MTLSize(width: vh, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: hd * 8, height: 1, depth: 1))
     }
@@ -227,8 +239,9 @@ public final class QWGDNDecode {
     public func encodeStateRollbackRows(_ enc: any MTLComputeCommandEncoder,
                                         y: QWTensorValue, innovation: QWTensorValue,
                                         glog: QWTensorValue, state: QWTensorValue,
-                                        rows: Int) throws {
+                                        rows: Int, stateOut: QWTensorValue? = nil) throws {
         let vh = instVHeads, hd = instHeadDim, qkv = instQKVCh, zCh = instZCh, gCh = instGlogCh
+        let targetState = stateOut ?? state
         func valid(_ t: QWTensorValue, count: Int, type: QWDType) -> Bool {
             t.shape.elementCount == count && t.shape.dtype == type
                 && t.offset >= 0 && t.region.base >= 0
@@ -242,17 +255,20 @@ public final class QWGDNDecode {
               valid(y, count: rows * qkv, type: .f16),
               valid(innovation, count: rows * zCh, type: .f32),
               valid(glog, count: rows * gCh, type: .f32),
-              valid(state, count: stateElements, type: .f32) else {
+              valid(state, count: stateElements, type: .f32),
+              valid(targetState, count: stateElements, type: .f32) else {
             throw QWGDNDecodeError.badShape("state rollback rows input extent, alignment, or geometry")
         }
-        func disjoint(_ input: QWTensorValue) -> Bool {
-            guard input.region.buffer === state.region.buffer else { return true }
+        func disjoint(_ input: QWTensorValue, from dst: QWTensorValue) -> Bool {
+            guard input.region.buffer === dst.region.buffer else { return true }
             let start = input.region.base + input.offset
-            let stateStart = state.region.base + state.offset
-            return start + input.bytes <= stateStart || stateStart + state.bytes <= start
+            let stateStart = dst.region.base + dst.offset
+            return start + input.bytes <= stateStart || stateStart + dst.bytes <= start
         }
-        guard disjoint(y), disjoint(innovation), disjoint(glog) else {
-            throw QWGDNDecodeError.badShape("state rollback rows input aliases mutable state")
+        guard disjoint(y, from: state), disjoint(innovation, from: state), disjoint(glog, from: state),
+              disjoint(y, from: targetState), disjoint(innovation, from: targetState),
+              disjoint(glog, from: targetState) else {
+            throw QWGDNDecodeError.badShape("state rollback rows input aliases state")
         }
         enc.setComputePipelineState(psoRollbackRows)
         y.bind(enc, index: 0)
@@ -261,6 +277,7 @@ public final class QWGDNDecode {
         state.bind(enc, index: 3)
         var rU = UInt32(rows)
         enc.setBytes(&rU, length: 4, index: 4)
+        targetState.bind(enc, index: 5)
         enc.dispatchThreadgroups(MTLSize(width: vh, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: hd * 8, height: 1, depth: 1))
     }

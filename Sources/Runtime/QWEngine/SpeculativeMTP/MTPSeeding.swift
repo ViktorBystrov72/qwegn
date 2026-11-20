@@ -42,11 +42,13 @@ extension QWEngineDriver {
     /// ordinary decode uses explicit-barrier concurrent dispatch.
     func encodeMTPSeeding(_ cb: any MTLCommandBuffer, session: QWEngineSession,
                                   embeddings: QWTensorValue, hidden: QWTensorValue,
-                                  count: Int, cacheRows: Int) throws {
+                                  count: Int, cacheRows: Int,
+                                  dflashCapture: QWDFlashConfig.PrefillCaptureSlice? = nil) throws {
         if isWeightFreeSpeculation { return }
         if dflashDrafter != nil {
-            if let dflashDrafter, let dSlot = session.dflashSlot {
-                try dflashDrafter.encodeContextUpdate(cb, slot: dSlot, startPosition: session.position, totalCount: count)
+            if let dflashDrafter, let dSlot = session.dflashSlot, let cap = dflashCapture {
+                try dflashDrafter.encodeContextUpdate(
+                    cb, slot: dSlot, startPosition: cap.ctxStartPos, totalCount: cap.captureRows)
             }
             return
         }

@@ -7,6 +7,7 @@
 import Foundation
 import Metal
 import QWCore
+import QWMTP
 
 /// One layer kind's kernels.
 public protocol QWLayerKernel: AnyObject, Sendable {
@@ -151,10 +152,13 @@ public struct QWLayerPrefillContext {
     let rows: Int
     /// Which prefill path the recurrent layers take.
     let mode: GDNPrefillMode
+    /// Trailing DFlash/DSpine prefill capture slice for this chunk, or `nil` when outside the ring window.
+    let dflashCapture: QWDFlashConfig.PrefillCaptureSlice?
 
     init(driver: QWEngineDriver, enc: any MTLComputeCommandEncoder,
          session: QWEngineSession, position: Int, layer: Int, weights: QWEngineDriver.LayerW,
-         rows: Int, mode: GDNPrefillMode) {
+         rows: Int, mode: GDNPrefillMode,
+         dflashCapture: QWDFlashConfig.PrefillCaptureSlice? = nil) {
         self.driver = driver
         self._enc = enc
         self.session = session
@@ -163,5 +167,6 @@ public struct QWLayerPrefillContext {
         self.weights = weights
         self.rows = rows
         self.mode = mode
+        self.dflashCapture = dflashCapture
     }
 }

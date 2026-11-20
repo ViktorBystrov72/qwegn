@@ -9,10 +9,11 @@ extension QWGDNReplayCheckpoint {
     func encodeCapture(_ enc: any MTLBlitCommandEncoder, layer: Int, row: Int,
                        rawInput: QWTensorValue, postConv: QWTensorValue,
                        beta: QWTensorValue, decay: QWTensorValue) throws {
-        guard sourceRec != nil, sourceRing != nil,
+        guard sourceRec != nil, sourceRing != nil, !outOfPlaceVerifyActive,
               (0..<layers).contains(layer), (0..<rows).contains(row) else {
             throw QWEngineDriverError.state("GPU replay capture index is invalid")
         }
+        resetGPUBatchedStability()
         let index = layer * rows + row
         let qkvC = geometry.gdnQKVChannels, gdnVH = geometry.gdnVHeads, glogC = geometry.gdnGlogChannels
         let r = view(raw, index: index, count: qkvC)
@@ -33,10 +34,11 @@ extension QWGDNReplayCheckpoint {
     func encodeCapture(_ enc: any MTLComputeCommandEncoder, hal: QWHal, layer: Int, row: Int,
                        rawInput: QWTensorValue, postConv: QWTensorValue,
                        beta: QWTensorValue, decay: QWTensorValue) throws {
-        guard sourceRec != nil, sourceRing != nil,
+        guard sourceRec != nil, sourceRing != nil, !outOfPlaceVerifyActive,
               (0..<layers).contains(layer), (0..<rows).contains(row) else {
             throw QWEngineDriverError.state("GPU replay capture index is invalid")
         }
+        resetGPUBatchedStability()
         let index = layer * rows + row
         let qkvC = geometry.gdnQKVChannels, gdnVH = geometry.gdnVHeads, glogC = geometry.gdnGlogChannels
         let r = view(raw, index: index, count: qkvC)
