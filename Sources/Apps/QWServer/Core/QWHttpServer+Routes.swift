@@ -103,6 +103,7 @@ extension QWHttpServer {
                 "memory_mount": "POST /v1/memory/mount",
                 "memory_unmount": "POST /v1/memory/unmount",
                 "restart": "POST /v1/engine/restart",
+                "update": "GET /v1/update",
                 "ui": "GET /ui"
             ]
         )
@@ -241,6 +242,7 @@ extension QWHttpServer {
         "/v1/memory/inspect", "/api/memory/inspect",
         "/v1/memory/index", "/api/memory/index",
         "/v1/memory/mount", "/api/memory/mount",
+        "/v1/update/skip", "/api/update/skip",
     ]
 
     func validateMutationRequest(
@@ -602,6 +604,9 @@ extension QWHttpServer {
             try newSettings.validateBeforeLaunch()
             try QWSettingsManager.shared.saveSettings(newSettings)
             QWFanController.shared.setPolicy(QWCoolingPolicy(rawValue: newSettings.coolingPolicy) ?? .auto)
+            let updatedSchedule = QWUpdateCheckSchedule.resolve(newSettings.updateCheckSchedule)
+            let svc = self.updateService
+            Task { await svc.updateSchedule(updatedSchedule) }
             if !modelChanged {
                 try await actor.setVisionLoaded(newSettings.loadVision)
             }

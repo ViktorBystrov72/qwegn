@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import QWFlashNext
+@testable import QWEngine
 
 final class FNGPURouteTraceTests: XCTestCase {
     func testRowsRetainOrderAndPrunedRoutes() throws {

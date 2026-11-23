@@ -47,36 +47,24 @@ final class QWModuleRegistryTests: XCTestCase {
 
     func testEverySupportedFamilyResolvesToAModule() throws {
         for family in QWModuleRegistry.supportedFamilies {
-            XCTAssertNotNil(QWModuleRegistry.moduleType(for: family), family.rawValue)
+            let mod = try XCTUnwrap(QWModuleRegistry.moduleType(for: family), family.rawValue)
+            XCTAssertEqual(ObjectIdentifier(mod), ObjectIdentifier(DenseModule.self), family.rawValue)
         }
 
-        XCTAssertEqual(QWModuleRegistry.supportedFamilies.count, 12)
+        XCTAssertEqual(QWModuleRegistry.supportedFamilies.count, 13)
         XCTAssertEqual(Set(QWModuleRegistry.supportedFamilies), Set(QWModelDescriptor.Family.allCases))
-        // Each hybrid family resolves to its dedicated non-overloaded module class.
-        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen38Dense))),
-                       ObjectIdentifier(DenseModule.self))
-        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen38MoE))),
-                       ObjectIdentifier(Qwen38MoEModule.self))
-        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .senseNovaLoop))),
-                       ObjectIdentifier(SenseNovaLoopModule.self))
-        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .glm5Next))),
-                       ObjectIdentifier(Glm5NextModule.self))
-        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .ernie55MoE))),
-                       ObjectIdentifier(Ernie55MoEModule.self))
-        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .maxwellMoE))),
-                       ObjectIdentifier(MaxwellMoEModule.self))
     }
 
     func testSpeculationPolicyForInitialLoadAndModelSwitch() throws {
         let flash = flashNextDescriptor(advertising: [.mtp])
         let requested = QWSpeculativeParameters(mtpDrafts: 7, mtpBackend: "dflash2")
-        let switched = try FlashNextModule.resolveSpeculation(
+        let switched = try DenseModule.resolveSpeculation(
             requested, descriptor: flash, environment: ["FN_DRAFT": "ngram"], modelSwitch: true)
         XCTAssertEqual(switched.parameters.mtpBackend, "variational")
         XCTAssertEqual(switched.parameters.mtpDrafts, 3)
         XCTAssertEqual(switched.reportedDrafts, 3)
         XCTAssertEqual(switched.reportedBackend, "ngram")
-        let loaded = try FlashNextModule.resolveSpeculation(
+        let loaded = try DenseModule.resolveSpeculation(
             switched.parameters, descriptor: flash, environment: ["FN_DRAFT": "ngram"], modelSwitch: false)
         XCTAssertEqual(loaded.reportedBackend, switched.reportedBackend)
         XCTAssertEqual(loaded.reportedDrafts, switched.reportedDrafts)
@@ -104,14 +92,13 @@ final class QWModuleRegistryTests: XCTestCase {
         }
     }
 
-    func testTheQwen3FamiliesDeclareTheStandardContract() {
-        // The standard families ship none of the 27B's hybrid-only extras (DFlash, MTP, vision, GDN prefill);
-        // they support universal Q8 and Q4 KV cache quantization and model-agnostic LSA.
-        let expected: Set<QWKnobCapability> = [.kvQuantQ8, .kvQuantQ4, .lsa]
-        XCTAssertEqual(QWModuleRegistry.capabilities(for: .qwen3Dense), expected)
-        XCTAssertEqual(QWModuleRegistry.capabilities(for: .qwen3MoE), expected)
-        XCTAssertNotNil(QWModuleRegistry.moduleType(for: .qwen3Dense))
-        XCTAssertNotNil(QWModuleRegistry.moduleType(for: .qwen3MoE))
+    func testTheQwen3FamiliesExposeUnifiedDenseCapabilities() throws {
+        XCTAssertEqual(QWModuleRegistry.capabilities(for: .qwen3Dense), DenseModule.capabilities)
+        XCTAssertEqual(QWModuleRegistry.capabilities(for: .qwen3MoE), DenseModule.capabilities)
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen3Dense))),
+                       ObjectIdentifier(DenseModule.self))
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen3MoE))),
+                       ObjectIdentifier(DenseModule.self))
     }
 
     func testUnknownPackModelIdYieldsNilNotATypedError() {
@@ -134,58 +121,58 @@ final class QWModuleRegistryTests: XCTestCase {
     }
 
     func testFlashNextModuleDeclaresWiderKVStorageModes() throws {
-        let type = try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen38FlashNext))
-        XCTAssertTrue(type.supportedKVStorageModes.contains("f32"))
-        XCTAssertTrue(type.supportedKVStorageModes.contains("q4"))
+        let modes = QWModuleRegistry.supportedKVStorageModes(for: flashNextDescriptor(advertising: [.mtp]))
+        XCTAssertTrue(modes.contains("f32"))
+        XCTAssertTrue(modes.contains("q4"))
+        XCTAssertEqual(modes, DenseModule.supportedKVStorageModes(for: flashNextDescriptor(advertising: [.mtp])))
+        XCTAssertFalse(QWModuleRegistry.supportedKVStorageModes(for: .qwen38_27b).contains("f32"))
     }
 
     func testCapabilitiesSayWhatEachEngineCanDo() {
         let dense = DenseModule.capabilities
-        let flash = FlashNextModule.capabilities
+        let flash = QWModelCapabilities.resolve(descriptor: flashNextDescriptor(advertising: [.mtp, .vision]),
+                                                hasVisionWeights: true)
         XCTAssertTrue(dense.contains(.dflash), "Dense supports DFlash drafters")
-        XCTAssertTrue(flash.contains(.dflash), "Flash-Next supports DFlash 2 drafters")
+        XCTAssertTrue(flash.contains(.dflash), "HyperStream supports DFlash 2 drafters")
         XCTAssertTrue(dense.contains(.ropeYaRN))
-        XCTAssertFalse(flash.contains(.ropeYaRN), "Flash-Next has no rope-YaRN path")
+        XCTAssertFalse(flash.contains(.ropeYaRN), "HyperStream has no rope-YaRN path")
         XCTAssertFalse(flash.contains(.gdnPrefill),
-                       "Flash-Next echoes gdnPrefill, it does not choose it")
+                       "HyperStream echoes gdnPrefill, it does not choose it")
         XCTAssertTrue(dense.contains(.gdnPrefill))
     }
 
     func testFlashNextAndDenseSupportVision() {
-        XCTAssertTrue(FlashNextModule.capabilities.contains(.vision),
-                      "Flash-Next (qwen4_exp) supports the 27-block ViT vision tower")
+        let flash = QWModelCapabilities.resolve(descriptor: flashNextDescriptor(advertising: [.vision]),
+                                                hasVisionWeights: true)
+        XCTAssertTrue(flash.contains(.vision),
+                      "HyperStream (qwen4_exp) supports the 27-block ViT vision tower")
         XCTAssertTrue(DenseModule.capabilities.contains(.vision),
                       "the dense pack advertises a vision tower")
     }
 
     func testAdaptiveMTPIsDenseOnly() {
-        // Flash-Next speculates but has no adaptive-depth or entropy gate.
+        let flash = QWModelCapabilities.resolve(descriptor: flashNextDescriptor(advertising: [.mtp]))
         XCTAssertTrue(DenseModule.capabilities.contains(.mtpAdaptive))
-        XCTAssertFalse(FlashNextModule.capabilities.contains(.mtpAdaptive))
-        XCTAssertTrue(FlashNextModule.capabilities.contains(.speculative))
+        XCTAssertFalse(flash.contains(.mtpAdaptive))
+        XCTAssertTrue(flash.contains(.speculative))
     }
 
     func testEveryFamilyDeclaresACapabilitySetAndADoorSet() throws {
         for family in QWModuleRegistry.supportedFamilies {
             let type = try XCTUnwrap(QWModuleRegistry.moduleType(for: family))
-            // The standard families declare no knobs: an empty capability set
-            // is their declaration, not a missing one.
-            if !(type is StandardModule.Type) {
-                XCTAssertFalse(type.capabilities.isEmpty, family.rawValue)
-            }
+            XCTAssertFalse(type.capabilities.isEmpty, family.rawValue)
             XCTAssertFalse(type.requiredDoors.isEmpty, family.rawValue)
             XCTAssertFalse(type.supportedKVStorageModes.isEmpty, family.rawValue)
         }
     }
 
     func testDoorsAreDistinctWithinAModule() {
-        for type in [DenseModule.self as any QWInferenceModule.Type,
-                     FlashNextModule.self as any QWInferenceModule.Type,
-                     Qwen3DenseModule.self as any QWInferenceModule.Type,
-                     Qwen3MoEModule.self as any QWInferenceModule.Type] {
-            XCTAssertEqual(Set(type.requiredDoors).count, type.requiredDoors.count,
-                           "a repeated door would prewarm twice")
-        }
+        XCTAssertEqual(Set(DenseModule.requiredDoors).count, DenseModule.requiredDoors.count,
+                       "a repeated door would prewarm twice")
+        let hyperDoors = DenseModule.requiredDoors(for: flashNextDescriptor(advertising: [.mtp]))
+        XCTAssertEqual(Set(hyperDoors).count, hyperDoors.count)
+        let stdDoors = DenseModule.requiredDoors(for: .qwen38_27b)
+        XCTAssertEqual(Set(stdDoors).count, stdDoors.count)
     }
 
     func testRegistryBuildsTheModuleThatServesThePlan() throws {
@@ -199,15 +186,13 @@ final class QWModuleRegistryTests: XCTestCase {
     func testRegistryBuildsTheFlashNextModuleForItsOwnFamily() throws {
         let plan = try flashNextPlan(advertising: [.mtp])
         let module = try QWModuleRegistry.makeModule(plan: plan, engine: nil)
-        XCTAssertTrue(module is FlashNextModule)
+        XCTAssertTrue(module is DenseModule)
     }
 
-    func testAModuleThatCannotHonourAnAdvertisedCapabilityIsRefused() throws {
-        // Flash-Next supports vision, so advertising [.vision, .mtp] succeeds.
+    func testGeometryDerivedCapabilitiesPreserveUniversalAndTraitKnobs() throws {
         let fnVisionPlan = try flashNextPlan(advertising: [.vision, .mtp])
-        XCTAssertTrue(try QWModuleRegistry.makeModule(plan: fnVisionPlan, engine: nil) is FlashNextModule)
+        XCTAssertTrue(try QWModuleRegistry.makeModule(plan: fnVisionPlan, engine: nil) is DenseModule)
 
-        // Standard qwen3-dense has no vision tower; advertising .vision is refused.
         let stdDesc = QWModelDescriptor(
             family: .qwen3Dense, modelType: "qwen3",
             capabilities: [.vision],
@@ -237,10 +222,71 @@ final class QWModuleRegistryTests: XCTestCase {
             prefillChunkRows: 512,
             kvStorageMode: "f16"
         )
-        XCTAssertThrowsError(try QWModuleRegistry.makeModule(plan: stdVisionPlan, engine: nil)) { error in
-            XCTAssertEqual(error as? QWModuleError,
-                           .unsupportedCapability(model: "qwen3-dense", capability: .vision))
-        }
+        XCTAssertTrue(try QWModuleRegistry.makeModule(plan: stdVisionPlan, engine: nil) is DenseModule)
+
+        let noVision = QWModelCapabilities.resolve(descriptor: stdDesc, hasVisionWeights: false)
+        XCTAssertTrue(noVision.isSuperset(of: [.prefixCache, .kvQuantQ8, .kvQuantQ4, .lsa, .speculative, .dflash, .ropeYaRN, .mtpAdaptive]))
+        XCTAssertFalse(noVision.contains(.vision))
+        XCTAssertFalse(noVision.contains(.gdnPrefill))
+        XCTAssertFalse(noVision.contains(.expertStreaming))
+
+        let withVision = QWModelCapabilities.resolve(descriptor: stdDesc, hasVisionWeights: true)
+        XCTAssertTrue(withVision.contains(.vision))
+        XCTAssertEqual(QWModuleRegistry.capabilities(for: stdDesc, hasVisionWeights: true), withVision)
+
+        let gdnHybrid = QWModelCapabilities.resolve(descriptor: .qwen38_27b, hasVisionWeights: false)
+        XCTAssertTrue(gdnHybrid.contains(.gdnPrefill))
+
+        let fnCaps = QWModelCapabilities.resolve(
+            descriptor: flashNextDescriptor(advertising: [.vision, .mtp, .moe, .hyperConnections]),
+            hasVisionWeights: true
+        )
+        XCTAssertEqual(fnCaps, [.prefixCache, .kvQuantQ8, .kvQuantQ4, .lsa, .speculative, .dflash, .vision])
+
+        let hugeVocabDesc = QWModelDescriptor(
+            family: .qwen3Dense, modelType: "qwen3", capabilities: [],
+            hidden: 2560, vocab: 400_000,
+            denseIntermediate: 9728, numLayers: 2,
+            layerTypes: ["full_attention", "full_attention"],
+            fullAttentionInterval: 1, rmsEps: 1e-6, maxPositionEmbeddings: 32768,
+            qHeads: 32, kvHeads: 8, headDim: 128,
+            attnOutputGate: false, partialRotaryFactor: 1.0, ropeTheta: 1e6,
+            indexerHeads: nil, indexerKvHeads: nil, indexerHeadDim: nil,
+            indexerBudget: nil, indexerCompressRatio: nil,
+            numExperts: nil, expertsPerTok: nil, moeIntermediate: nil,
+            sharedExpertIntermediate: nil, expertGateType: nil,
+            hcCount: nil, hcLowrank: nil,
+            gdnQKHeads: 0, gdnVHeads: 0, gdnHeadDim: 0,
+            gdnQKVChannels: 0, gdnZChannels: 0, gdnConvKernel: 0,
+            pleLayerIds: nil, pleEmbedDim: nil, pleConvKernel: nil,
+            ngramSize: nil, headsPerNgram: nil, ngramVocabSizeBase: nil,
+            makeNgramVocabDivisibleBy: nil, splitNgramParts: nil,
+            mtpLayers: 0, mtpUseDedicatedEmbeddings: false, eosTokenId: 151645
+        )
+        XCTAssertFalse(QWModelCapabilities.resolve(descriptor: hugeVocabDesc).contains(.dflash))
+
+        let drafterDesc = QWModelDescriptor(
+            family: .qwen3Dense, modelType: "dflash_drafter", capabilities: [],
+            hidden: 2560, vocab: 151936,
+            denseIntermediate: 9728, numLayers: 2,
+            layerTypes: ["full_attention", "full_attention"],
+            fullAttentionInterval: 1, rmsEps: 1e-6, maxPositionEmbeddings: 32768,
+            qHeads: 32, kvHeads: 8, headDim: 128,
+            attnOutputGate: false, partialRotaryFactor: 1.0, ropeTheta: 1e6,
+            indexerHeads: nil, indexerKvHeads: nil, indexerHeadDim: nil,
+            indexerBudget: nil, indexerCompressRatio: nil,
+            numExperts: nil, expertsPerTok: nil, moeIntermediate: nil,
+            sharedExpertIntermediate: nil, expertGateType: nil,
+            hcCount: nil, hcLowrank: nil,
+            gdnQKHeads: 0, gdnVHeads: 0, gdnHeadDim: 0,
+            gdnQKVChannels: 0, gdnZChannels: 0, gdnConvKernel: 0,
+            pleLayerIds: nil, pleEmbedDim: nil, pleConvKernel: nil,
+            ngramSize: nil, headsPerNgram: nil, ngramVocabSizeBase: nil,
+            makeNgramVocabDivisibleBy: nil, splitNgramParts: nil,
+            mtpLayers: 0, mtpUseDedicatedEmbeddings: false, eosTokenId: 151645,
+            role: .speculativeDrafter
+        )
+        XCTAssertEqual(QWModelCapabilities.resolve(descriptor: drafterDesc, hasVisionWeights: true), [])
     }
 
     func testAdvertisedCapabilitiesMapToTheKnobCapabilitiesTheyNeed() {
@@ -252,7 +298,12 @@ final class QWModuleRegistryTests: XCTestCase {
     func testModuleStubsFailLoudRatherThanPretendingToWork() throws {
         let plan = try densePlan()
         let module = DenseModule(plan: plan)
-        XCTAssertThrowsError(try module.makeSessionState()) { error in
+        XCTAssertThrowsError(
+            try module.generate(
+                request: QWGenerationRequest(prompt: [1, 2], maxNew: 1, sampling: .greedy),
+                onToken: nil
+            )
+        ) { error in
             guard case QWModuleError.notImplemented = error else {
                 return XCTFail("expected notImplemented, got \(error)")
             }
@@ -277,7 +328,7 @@ final class QWModuleRegistryTests: XCTestCase {
         let plan = try QWEnginePlan(geometry: QWModelGeometry(descriptor: desc),
                                     modelId: "qwen3.8-flash-next", geometryDigest: "d",
                                     prefillChunkRows: 512, kvStorageMode: "f16")
-        let flashModule = FlashNextModule(plan: plan)
+        let flashModule = DenseModule(plan: plan)
         let unified = try QWEngine(engine: flashModule, descriptor: desc, plan: plan)
         XCTAssertEqual(unified.plan.modelId, "qwen3.8-flash-next")
         XCTAssertEqual(unified.plan.layers.count, 4)

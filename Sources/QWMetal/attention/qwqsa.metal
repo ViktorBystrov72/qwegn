@@ -30,7 +30,7 @@ kernel void qwg_index_prep(device const float* src      [[buffer(0)]],
     const uint r = tg - t * (NI + 1u);
     const uint rowBase = t * rowStride;
     if (r == NI) {
-        idxK[t * DI + d] = half(src[rowBase + ikOff + d]);
+        idxK[size_t(t) * DI + d] = half(src[rowBase + ikOff + d]);
         return;
     }
     const float x = src[rowBase + iqOff + r * DI + d];
@@ -46,7 +46,7 @@ kernel void qwg_index_prep(device const float* src      [[buffer(0)]],
         const float rot = (d < HALF) ? -staged[d + HALF] : staged[d - HALF];
         o = staged[d] * cosT[t * ROT + d] + rot * sinT[t * ROT + d];
     }
-    idxQ[(t * NI + r) * DI + d] = o;
+    idxQ[(size_t(t) * NI + r) * DI + d] = o;
 }
 
 // pool buffers: 0 idxK f16 [T,128] | 1 ikNorm f32 [128] | 2 bcos f32 [B,64] | 3 bsin f32 [B,64] | 4 pooled f16 [B,128]
@@ -63,7 +63,7 @@ kernel void qwg_index_pool(device const half*  idxK   [[buffer(0)]],
     threadgroup float partial[4];
     threadgroup float staged[DI];
     float acc = 0.0f;
-    for (uint k = 0u; k < compress; k++) acc += float(idxK[(b * compress + k) * DI + d]);
+    for (uint k = 0u; k < compress; k++) acc += float(idxK[(size_t(b) * compress + k) * DI + d]);
     const float x = acc / float(compress);
     const float ss = simd_sum(x * x);
     if ((d & 31u) == 0u) partial[d >> 5u] = ss;
@@ -75,9 +75,9 @@ kernel void qwg_index_pool(device const half*  idxK   [[buffer(0)]],
     float o = staged[d];
     if (d < ROT) {
         const float rot = (d < HALF) ? -staged[d + HALF] : staged[d - HALF];
-        o = staged[d] * bcos[b * ROT + d] + rot * bsin[b * ROT + d];
+        o = staged[d] * bcos[size_t(b) * ROT + d] + rot * bsin[size_t(b) * ROT + d];
     }
-    pooled[b * DI + d] = half(o);
+    pooled[size_t(b) * DI + d] = half(o);
 }
 
 // Stage 1A — qwg_qsa_scores: 2D grid (blockChunks, T). Each TG of 256 threads stages idxQ[t] in threadgroup memory
@@ -100,11 +100,11 @@ kernel void qwg_qsa_scores(device const float* idxQ        [[buffer(0)]],
     const uint n = (t + pos0 + 1u) / 4u;
     if (n <= topK) return;
     const uint b = (s << 8u) + tid;
-    for (uint i = tid; i < NI * DI; i += 256u) qs[i] = idxQ[t * NI * DI + i];
+    for (uint i = tid; i < NI * DI; i += 256u) qs[i] = idxQ[size_t(t) * NI * DI + i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (b >= n) return;
     float score = 0.0f;
-    device const half4* pb = (device const half4*)(pooled + b * DI);
+    device const half4* pb = (device const half4*)(pooled + size_t(b) * DI);
     for (uint h = 0u; h < NI; h++) {
         threadgroup const float4* qh = (threadgroup const float4*)(qs + h * DI);
         float dot = 0.0f;
@@ -332,7 +332,7 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
             if (s >= numChunks) break;
             const uint f = (selMask >> s) & 1u;
             const uint r = rankBase[s * 8u + sg] + simd_prefix_exclusive_sum(f);
-            if (f != 0u) list[t * topK + r] = int((s << 8u) + tid);
+            if (f != 0u) list[(size_t)t * topK + r] = int((s << 8u) + tid);
         }
         return;
     } else {
@@ -386,7 +386,7 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
             if (chunkSel != 0u) {
                 uint outBase = outCount;
                 for (uint j = 0u; j < sg; j++) outBase += sgSum[j];
-                if (sel != 0u) list[t * topK + outBase + sgSelPref] = int(b);
+                if (sel != 0u) list[(size_t)t * topK + outBase + sgSelPref] = int(b);
                 outCount += chunkSel;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -416,7 +416,7 @@ kernel void qwg_qsa_topk_radix(device const uint* scores      [[buffer(0)]],
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint outBase = outCount;
             for (uint j = 0u; j < sg; j++) outBase += sgSum[j];
-            if (sel != 0u) list[t * topK + outBase + sgSelPref] = int(b);
+            if (sel != 0u) list[(size_t)t * topK + outBase + sgSelPref] = int(b);
             const uint chunkSel = sgSum[0] + sgSum[1] + sgSum[2] + sgSum[3]
                                 + sgSum[4] + sgSum[5] + sgSum[6] + sgSum[7];
             threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -4,7 +4,7 @@ import QWCore
 import QWHAL
 import QWAlloc
 import QWGEMM
-import QWFlashNext
+@testable import QWEngine
 
 /// The dense row-batched NAX/MPP projections (Single-Pass f16 default and Hi/Lo Split f16 greedy fallback)
 /// against the f32 batched GEMM they replace. Prefill-sized rows (>= 64).

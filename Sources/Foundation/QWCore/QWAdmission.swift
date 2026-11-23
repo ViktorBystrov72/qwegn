@@ -114,6 +114,9 @@ public struct QWAdmissionPlan: Sendable, Equatable {
     /// Resident weights of the model: HQ4_G32_M5 for standard dense/MoE models, and
     /// config-derived mixed-precision (`HQ8_G32` trunk + `SHVQ` routed experts) for hybrid HCA / Latent-MoE models.
     public static func modelResidentBytes(descriptor d: QWModelDescriptor) throws -> Int {
+        if d.family == .inkling2Loop {
+            return inkling2ModelResidentBytes(descriptor: d)
+        }
         let hcaLayers = d.compressedAttentionLayers.count
         if hcaLayers > 0 || d.moeLatentSize != nil || d.hybridMLAConfig != nil {
             return try hybridModelResidentBytes(descriptor: d)
@@ -249,11 +252,65 @@ public struct QWAdmissionPlan: Sendable, Equatable {
         return bytes
     }
 
+    private static func inkling2ModelResidentBytes(descriptor d: QWModelDescriptor) -> Int {
+        let ink = d.inkling2Config
+        let qDim = d.qHeads * d.headDim
+        let kvDim = d.kvHeads * d.headDim
+        let dRel = ink?.dRel ?? 16
+        let relExt = ink?.relExtent ?? 1024
+        let convK = ink?.sconvKernelSize ?? 4
+        let nExp = d.numExperts ?? 0
+        let moeI = d.moeIntermediate ?? 0
+        var total = 2 * d.vocab * d.hidden * 2 // BF16 embed + lm_head
+        let perLayerDenseElems = (2 * qDim + 2 * kvDim + qDim) * d.hidden
+            + dRel * d.qHeads * d.hidden + d.qHeads * d.hidden
+            + (2 * d.hidden + 2 * kvDim) * convK + dRel * relExt + d.hidden * 4 + nExp * d.hidden
+        total += d.numLayers * perLayerDenseElems * 2
+        if let ink {
+            let loopLayers = max(0, ink.loopCoreEnd - ink.loopCoreStart)
+            total += loopLayers * 4 * (ink.loopGateRank * 2 * d.hidden + 2 * d.hidden * ink.loopGateRank) * 2
+        }
+        let expPerLayerElems = 3 * nExp * moeI * d.hidden
+        for layer in 0..<d.numLayers {
+            let mode = ink?.expertProjSpec(layer: layer, projection: "gate_proj").mode ?? .bf16
+            switch mode {
+            case .nvfp4: total += (expPerLayerElems / 16) * 9 + 3 * nExp * 4
+            case .mxfp8: total += (expPerLayerElems / 32) * 33
+            case .bf16: total += expPerLayerElems * 2
+            }
+        }
+        if let vis = ink?.vision {
+            let vh = vis.hiddenSize
+            let mlpH = Int(Double(vh) * vis.mlpRatio)
+            let visElems = vis.numHiddenLayers * (4 * vh * vh + 2 * vh * mlpH)
+                + vis.projectionHiddenDim * (vis.projectionHiddenDim + vis.textHiddenSize)
+            total += visElems * 2
+        }
+        if let ds = ink?.dspark {
+            let dsKV = ds.kvHeads * ds.headDim
+            let dsQ = ds.qHeads * ds.headDim
+            let perL = (dsQ + 4 * dsKV + dsQ) * ds.hiddenSize + 3 * ds.hiddenSize * ds.intermediateSize
+            total += (ds.numLayers * perL + ds.hiddenSize * d.vocab) * 2
+        }
+        return total
+    }
+
+    private static func effectiveGQAKeyTokens(descriptor d: QWModelDescriptor,
+                                              contextTokens: Int,
+                                              prefillChunk: Int) -> Int {
+        d.executionPlan.reduce(0) { acc, l in
+            guard d.isFullAttention(l) else { return acc }
+            let w = d.layerSlidingWindow(l)
+            return acc + (w > 0 ? min(contextTokens, w + prefillChunk + 256) : contextTokens)
+        }
+    }
+
     /// Per-sequence state bytes: KV cache, GDN recurrent + conv state, and scratch.
     public static func perSequenceStateBytes(descriptor d: QWModelDescriptor,
                                              kvDtype: QWAdmissionDtype,
                                              contextTokens: Int,
-                                             scratchPerSeq: Int)
+                                             scratchPerSeq: Int,
+                                             prefillChunk: Int = 4096)
         -> (kv: Int, gdn: Int, scratch: Int) {
         let execPlan = d.executionPlan
         let attnLayers = execPlan.filter { d.isFullAttention($0) }.count
@@ -279,13 +336,19 @@ public struct QWAdmissionPlan: Sendable, Equatable {
         } else {
             let kvElems = d.mlaUseNoPE
                 ? attnLayers * contextTokens * ((d.kvLoraRank ?? 512) + (d.qkRopeHeadDim ?? 64))
-                : 2 * attnLayers * contextTokens * d.kvHeads * d.headDim
+                : 2 * effectiveGQAKeyTokens(descriptor: d, contextTokens: contextTokens, prefillChunk: prefillChunk)
+                    * d.kvHeads * d.headDim
             kv = kvDtype.kvBytes(elements: kvElems)
         }
         let gdnLayers = execPlan.filter { d.isLinearAttention($0) }.count
         let rec = d.gdnVHeads * d.gdnHeadDim * d.gdnHeadDim
         let ring = max(0, d.gdnConvKernel - 1) * d.gdnQKVChannels
-        let gdn = gdnLayers * (rec * 4 + ring * 2)
+        var gdn = gdnLayers * (rec * 4 + ring * 2)
+        if d.family == .inkling2Loop {
+            let sconvSlots = max(0, (d.inkling2Config?.sconvKernelSize ?? 4) - 1)
+            let convElems = 2 * d.hidden + 2 * d.kvHeads * d.headDim
+            gdn += execPlan.count * sconvSlots * convElems * 4
+        }
         return (kv, gdn, scratchPerSeq)
     }
 
@@ -293,13 +356,17 @@ public struct QWAdmissionPlan: Sendable, Equatable {
     public static func perSequenceStateBytes(descriptor d: QWModelDescriptor,
                                              kvBytesPerParam: Int,
                                              contextTokens: Int,
-                                             scratchPerSeq: Int)
+                                             scratchPerSeq: Int,
+                                             prefillChunk: Int = 4096)
         -> (kv: Int, gdn: Int, scratch: Int) {
         let dtype: QWAdmissionDtype = kvBytesPerParam >= 2 ? .f16 : .q8
-        var res = perSequenceStateBytes(descriptor: d, kvDtype: dtype, contextTokens: contextTokens, scratchPerSeq: scratchPerSeq)
+        var res = perSequenceStateBytes(descriptor: d, kvDtype: dtype, contextTokens: contextTokens,
+                                        scratchPerSeq: scratchPerSeq, prefillChunk: prefillChunk)
         if kvBytesPerParam > 0 && kvBytesPerParam != dtype.bytesPerParam {
-            let attnLayers = d.executionPlan.filter { d.isFullAttention($0) }.count
-            res.kv = 2 * attnLayers * contextTokens * d.kvHeads * d.headDim * kvBytesPerParam
+            let effTokens = d.hcaConfig == nil && d.hybridMLAConfig == nil && !d.mlaUseNoPE
+                ? effectiveGQAKeyTokens(descriptor: d, contextTokens: contextTokens, prefillChunk: prefillChunk)
+                : d.executionPlan.filter { d.isFullAttention($0) }.count * contextTokens
+            res.kv = 2 * effTokens * d.kvHeads * d.headDim * kvBytesPerParam
         }
         return res
     }

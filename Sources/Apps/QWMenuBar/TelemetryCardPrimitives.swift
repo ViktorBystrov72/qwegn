@@ -18,8 +18,14 @@ extension CupertinoTelemetryView {
             .frame(width: 0.5)
     }
 
-    func heroMetricColumn(title: String, card: QWDashboardCard?, tint: Color) -> some View {
+    func heroMetricColumn(
+        title: String,
+        card: QWDashboardCard?,
+        tint: Color,
+        valueTemplate: String = "999.9"
+    ) -> some View {
         let modeBadge = extractRateModeBadge(from: card?.title)
+        let isCached = card?.value == "from cache"
         return VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Text(title)
@@ -31,6 +37,7 @@ extension CupertinoTelemetryView {
                     Text(modeBadge)
                         .font(TelemetryTheme.ui(9.5, .medium))
                         .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                        .frame(minWidth: 28)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
                         .background(TelemetryTheme.rowSubstrate)
@@ -38,26 +45,46 @@ extension CupertinoTelemetryView {
                 }
             }
 
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                if card?.value == "from cache" {
+            ZStack(alignment: .leading) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(valueTemplate)
+                        .font(TelemetryTheme.numeric(20, .bold))
+                        .lineLimit(1)
+                    Text(card?.unit ?? "tok/s")
+                        .font(TelemetryTheme.ui(11, .medium))
+                        .lineLimit(1)
+                }
+                .hidden()
+                .accessibilityHidden(true)
+
+                if isCached {
                     Text("From cache")
                         .font(TelemetryTheme.ui(16, .semibold))
                         .foregroundStyle(TelemetryTheme.cool)
                         .lineLimit(1)
                 } else {
-                    Text(card?.value ?? "—")
-                        .font(TelemetryTheme.numeric(20, .bold))
-                        .foregroundStyle(card?.value == nil ? TelemetryTheme.quiet(increasedContrast: contrast == .increased) : tint)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                    Text(card?.unit ?? "tok/s")
-                        .font(TelemetryTheme.ui(11, .medium))
-                        .foregroundStyle(
-                            card?.value == nil
-                                ? TelemetryTheme.quiet(increasedContrast: contrast == .increased)
-                                : TelemetryTheme.secondary(increasedContrast: contrast == .increased)
-                        )
-                        .lineLimit(1)
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        ZStack(alignment: .trailing) {
+                            Text(valueTemplate)
+                                .font(TelemetryTheme.numeric(20, .bold))
+                                .lineLimit(1)
+                                .hidden()
+                                .accessibilityHidden(true)
+                            Text(card?.value ?? "—")
+                                .font(TelemetryTheme.numeric(20, .bold))
+                                .foregroundStyle(card?.value == nil ? TelemetryTheme.quiet(increasedContrast: contrast == .increased) : tint)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
+                        Text(card?.unit ?? "tok/s")
+                            .font(TelemetryTheme.ui(11, .medium))
+                            .foregroundStyle(
+                                card?.value == nil
+                                    ? TelemetryTheme.quiet(increasedContrast: contrast == .increased)
+                                    : TelemetryTheme.secondary(increasedContrast: contrast == .increased)
+                            )
+                            .lineLimit(1)
+                    }
                 }
             }
         }
@@ -153,19 +180,23 @@ extension CupertinoTelemetryView {
             if let num = card.number {
                 let n = Int(num.rounded())
                 return n >= 10_000
-                    ? QWMenuBarStatusFormatter.formatCompactBudget(n)
+                    ? QWMenuBarStatusFormatter.formatFixedActiveTokens(n)
                     : QWTokenCountFormatter.format(n)
             }
             return card.value
         }()
         let budgetText = telemetry.contextBudget.map { QWMenuBarStatusFormatter.formatCompactBudget($0) }
+        func padActive(_ raw: String) -> String {
+            let width = QWMenuBarStatusFormatter.activeContextFieldWidth
+            return raw.count >= width ? raw : String(repeating: " ", count: width - raw.count) + raw
+        }
         switch (activeText, budgetText) {
         case let (.some(active), .some(budget)):
-            return "\(active) / \(budget)"
+            return "\(padActive(active)) / \(budget)"
         case let (.some(active), .none):
-            return "\(active) tok"
+            return "\(padActive(active)) tok"
         case let (.none, .some(budget)):
-            return "— / \(budget)"
+            return "\(padActive("—")) / \(budget)"
         case (.none, .none):
             return "—"
         }
@@ -193,12 +224,15 @@ extension CupertinoTelemetryView {
         }
     }
 
-    func formattedCardValue(_ card: QWDashboardCard?) -> String {
+    func formattedCardValue(_ card: QWDashboardCard?, minValueWidth: Int = 0) -> String {
         guard let card, let val = card.value else { return "—" }
+        let padded = (minValueWidth > 0 && val.count < minValueWidth)
+            ? String(repeating: " ", count: minValueWidth - val.count) + val
+            : val
         if let unit = card.unit, !unit.isEmpty {
-            return "\(val) \(unit)"
+            return "\(padded) \(unit)"
         }
-        return val
+        return padded
     }
 
     func factPill(_ text: String, tint: Color) -> some View {

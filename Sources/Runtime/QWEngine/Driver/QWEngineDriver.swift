@@ -23,6 +23,7 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
+import QWVision
 
 public final class QWEngineDriver: @unchecked Sendable {
     static let P = "model.language_model."
@@ -35,56 +36,11 @@ public final class QWEngineDriver: @unchecked Sendable {
     public let weightFormatDeclineReason: String?
 
     let hal: QWHal
-    let pack: QWQuant.Pack?
-    let embedReader: QWSafeTensorsReader?
-    let embedScalesReader: QWSafeTensorsReader?
-    let embedBiasesReader: QWSafeTensorsReader?
-    let arena: QWArena
-    let kvCache: QWKVCache
-    let ropeApply: QWRopeApply
+    let hasVisionWeights: Bool
     public let ropeRows: Int
-    let attnLayers: [Int]
-    let hcaLayers: [Int]
-    let gdnLayers: [Int]
-
-    let attnDecode: QWAttnDecode?
-    let pagedAttnPrefill: QWAttnPagedPrefill
-    /// The standard path's paged prefill: one scalar kernel over the pool.
-    let pagedAttnPrefillGeneral: QWAttnPagedPrefillGeneral
-    let gdnConv: QWGDNConv
-    let gdnDecode: QWGDNDecode
-    let gdnPrefill: QWGDNPrefill
-    let head: QWHead
-    let psoBf16F16: any MTLComputePipelineState
-    let psoGEMVDxH16T4: any MTLComputePipelineState
-    let psoGEMVDxH16DualT4: any MTLComputePipelineState
-    let psoGEMVDxH16GdnInProjT4: any MTLComputePipelineState
-    let psoGEMVSiluPairH16: any MTLComputePipelineState
-    let psoFwht32: any MTLComputePipelineState
-    let psoRMSNorm: any MTLComputePipelineState
-    let psoRMSNormResidual: any MTLComputePipelineState
-    let psoRMSNormResidualWide: any MTLComputePipelineState
-    let psoRMSNormResidualMoE: any MTLComputePipelineState
-    let psoRMSNormResidualMoEWide: any MTLComputePipelineState
-    let psoHeadF16: any MTLComputePipelineState
-    let psoGemmBatchedH16: any MTLComputePipelineState
-    let psoGemmBatchedH16SwiGLU: any MTLComputePipelineState
-    let psoGemmBatchedH16GdnInProj: any MTLComputePipelineState
-    let psoSiluMulF16: any MTLComputePipelineState
-    let psoKVPagedWrite: any MTLComputePipelineState
-    /// The general writer: a head narrower than 256 halves (C103).
-    let psoKVPagedWriteGeneral: any MTLComputePipelineState
-    let psoZeroPadAttn: any MTLComputePipelineState
-    let psoMHCEnter: (any MTLComputePipelineState)?
-    let psoMHCRouterNorm: (any MTLComputePipelineState)?
-    let psoMHCRouterNormRows: (any MTLComputePipelineState)?
-    let psoMHCMerge: (any MTLComputePipelineState)?
-    let psoMHCExitHead: (any MTLComputePipelineState)?
-    let mhcSplit: QWMHCSplitRouter?
-    let attnPrefill: QWAttnPrefill
-    let gdnIndexMap: [Int]
-    let attnIndexMap: [Int]
-    let hcaIndexMap: [Int]
+    let hyperRuntime: QWHyperStreamRuntime?
+    let inkling2Runtime: QWInkling2Runtime?
+    let standardState: QWDriverStandardState?
     let prefillModeLock = NSLock()
     var storedPrefillMode: GDNPrefillMode = .chunked
     public var gdnPrefillMode: GDNPrefillMode {
@@ -96,25 +52,11 @@ public final class QWEngineDriver: @unchecked Sendable {
         set { prefillModeLock.withLock { gdnPrefill.solveBackend = newValue } }
     }
 
-    // Weight views are module-internal: an internal property may not expose a private type.
-    let layersW: [LayerW]
-    /// The kernel each layer runs. The plan resolved the kinds when the
-    /// model was loaded, so the hot loop looks a kernel up instead of
-    /// switching on the kind.
+    /// The kernel each layer runs. Resolved once at load time.
     let layerKernels: [any QWLayerKernel]
 
     /// 15 MTP Layer weights (Phase 4, section 5A.4 / 5A.5).
     typealias MTPWeights = QWMTPDraftWeights
-    let mtpWeights: MTPWeights?
-    let echoWeights: EchoDraftWeights?
-    let mhcExitHead: MHCExitHeadWeights?
-    let multimaxParams: QWTensorValue?
-    // P6 FIX: the 2.5 GB f16 embed table is GONE from GPU memory — it
-    // existed only so copyEmbedRow could memcpy a row. A decode step now
-    // pulls its ONE 10 KiB row straight from the pack's mmap'd bf16 plane
-    let embedPlane: String                       // pack name of the bf16 embed plane
-    let embedRawOff: Int                         // cached byte offset in pack.data
-    let mtpDeviceEmbedding: QWMTPEmbeddingTable?
     public let mtpAdaptiveDepth: Bool
     public let mtpAdaptiveEntropyThreshold: Double
     public var mtpRelaxedMargin: Double
@@ -125,7 +67,9 @@ public final class QWEngineDriver: @unchecked Sendable {
     var activeConstraint: (constraint: any QWTokenConstraint, sampler: QWSampler)? = nil
     var activeVisualSpans: [QWVisualSpan] = []
     var activeCacheSalt: String? = nil
-    public var mtpRelaxedMinProb: Double = QWSpeculativeParameters.defaultRelaxedMinProb
+    public var mtpRelaxedMinProb: Double = QWSpeculativeParameters.defaultRelaxedMinProb {
+        didSet { inkling2Runtime?.configuredRelaxedMinProb = mtpRelaxedMinProb }
+    }
 
     /// Effective log-probability / logit margin for Variational MTP verification.
     public var effectiveRelaxedMargin: Float {
@@ -147,9 +91,6 @@ public final class QWEngineDriver: @unchecked Sendable {
         get { speculativeCoordinator.verificationGpuMsByStage }
         set { speculativeCoordinator.verificationGpuMsByStage = newValue }
     }
-    let mtpBatchedMLP: QWMTPBatchedMLP?
-    let mtpBatchedTrunk: QWMTPBatchedTrunk?
-    let mtpSharedAttentionPartials: QWMRegion?
     var pendingMTPProfile: (draft: QWMTPStageTiming, verification: QWMTPStageTiming)? {
         get { speculativeCoordinator.pendingMTPProfile }
         set { speculativeCoordinator.pendingMTPProfile = newValue }
@@ -162,13 +103,9 @@ public final class QWEngineDriver: @unchecked Sendable {
         get { speculativeCoordinator.lastMTPRoundProfile }
         set { speculativeCoordinator.lastMTPRoundProfile = newValue }
     }
-    let embedStaging: any MTLBuffer              // one [H] f16 host-shared row buffer (init-time)
-    let headStorage: QWHeadStorage
-    let finalNorm: QWTensorValue
-    /// L1 (P4-AD-60): the draft-only q4g head (nil = the bf16 head serves
-    /// both draft and verify — the pre-L1 behavior). File-backed via mmap;
-    /// the weight arena never carries it.
-    let mtpDraftHead: QWMTPTDraftHead?
+
+    /// Dedicated MTP draft scratch buffers (Phase 4, section 5A.6).
+    typealias MTPScratch = QWMTPDraftScratch
 
     public internal(set) var mtpDraftProposals: Int {
         get { speculativeCoordinator.mtpDraftProposals }
@@ -178,13 +115,6 @@ public final class QWEngineDriver: @unchecked Sendable {
         get { speculativeCoordinator.mtpDraftAccepted }
         set { speculativeCoordinator.mtpDraftAccepted = newValue }
     }
-
-    /// Dedicated MTP draft scratch buffers (Phase 4, section 5A.6).
-    typealias MTPScratch = QWMTPDraftScratch
-    let mtpScratch: MTPScratch?
-    let mtpDraftEncoder: QWMTPDraftEncoder?
-    let echoDrafter: QWEchoDraftEncoder?
-    let dflashDrafter: QWDFlashDrafter?
     var lastRoundUsedPLD: Bool {
         get { speculativeCoordinator.lastRoundUsedPLD }
         set { speculativeCoordinator.lastRoundUsedPLD = newValue }
@@ -193,11 +123,12 @@ public final class QWEngineDriver: @unchecked Sendable {
         get { speculativeCoordinator.lastDraftedPairs }
         set { speculativeCoordinator.lastDraftedPairs = newValue }
     }
-    public var dflashDraftPackPath: String? { dflashDrafter?.packPath }
-    public var dflashSelectorTopK: Int? { dflashDrafter?.config.selectorTopK }
-    let gdnReplayCheckpoint: QWGDNReplayCheckpoint?
-    let mtpPromptEmbeddings: QWTensorValue?
-    let verifyWindow: QWVerifyWindow?
+    public var dflashDraftPackPath: String? {
+        hyperRuntime?.dflash?.packPath ?? standardState?.dflashDrafter?.packPath
+    }
+    public var dflashSelectorTopK: Int? {
+        hyperRuntime?.dflash?.config.selectorTopK ?? standardState?.dflashDrafter?.config.selectorTopK
+    }
     var verifiedSession: QWEngineSession? {
         get { speculativeCoordinator.verifiedSession }
         set { speculativeCoordinator.verifiedSession = newValue }
@@ -215,20 +146,17 @@ public final class QWEngineDriver: @unchecked Sendable {
         set { speculativeCoordinator.preparedStochasticWitness = newValue }
     }
     var requestGate: QWGenerationRequestGate { admission.requestGate }
-    var prefixStore: QWEnginePrefixStore<QWEngineCachedPrefix>?
-    var cacheDiskManager: QWCacheDiskManager?
-    let coldWriteController = QWAsyncColdWriteController()
     private let statsLock = NSLock()
     private var _lastPrefixCacheStats: QWPrefixCacheStats?
     public internal(set) var lastPrefixCacheStats: QWPrefixCacheStats? {
         get { statsLock.withLock { _lastPrefixCacheStats } }
         set { statsLock.withLock { _lastPrefixCacheStats = newValue } }
     }
-    let mtpCache: QWKVCache?
     public let mtpDrafts: Int
     /// Performance and memory tunables, environment overrides applied.
     public let tuning: QWEngineTuning
     public let kvMode: QWKVMode
+    public let rawKVMode: String
     public let capacityPlan: QWCapacityPlan
     public let capacityLogMessage: String
     /// The MTP execution backend (LighteningMTP L1). The selection is
@@ -248,26 +176,12 @@ public final class QWEngineDriver: @unchecked Sendable {
         return base
     }
 
-    let sc: Scratch
-    let psc: PrefillScratch
     public let prefillScratchEviction: QWPrefillScratchEvictionPolicy
     public let prefillChunkSize: Int
     /// Latent Sparse Attention configuration for this driver instance.
     public let lsaConfig: QWLSAConfig
-    /// Latent Sparse Attention GPU operator (nil when `lsaConfig.mode == .off` or no full-attention layers).
-    public let lsaOperator: QWLSAOperator?
-    /// Native NoPE / Decoupled-RoPE MLA + Key-Pool Indexer operator.
-    public let mlaOperator: QWMLAAttnOperator?
-    /// Native Maxwell Block-Sparse GQA (MBSA) operator.
-    public let mbsaOperator: QWMBSAAttnOperator?
-    /// Native Hybrid Compressed Attention (HCA) operator.
-    public let hcaOperator: QWHCAAttnOperator?
-    let hcaLsaBuffer: (any MTLBuffer)?
     /// The frozen numeric plan of the loaded model.
     public let plan: QWEnginePlan
-    let pscBuffer: any MTLBuffer
-    let pscByteOffset: Int
-    let pscByteLength: Int
     var flight: NSLock { admission.flight }
     var generateLock: NSRecursiveLock { admission.generateLock }
     var activeCB: (any MTLCommandBuffer)? {
@@ -304,6 +218,7 @@ public final class QWEngineDriver: @unchecked Sendable {
 
     public init(packPath: String, maxTokens: Int = 4096, ropeRows: Int = 8192,
                 kvMode: QWKVMode = .f16,
+                rawKVMode: String? = nil,
                 gdnPrefillMode: GDNPrefillMode = .chunked,
                 weightArenaSizing: QWWeightArenaSizing = .planned,
                 mtpDrafts: Int = 0,
@@ -322,10 +237,17 @@ public final class QWEngineDriver: @unchecked Sendable {
                 prewarmDoors: [String] = DenseModule.requiredDoors,
                 lsaConfig: QWLSAConfig = QWLSAConfig(),
                 residentExpertsPerLayer: Int? = nil,
-                tuning: QWEngineTuning = .default) throws {
+                tuning: QWEngineTuning = .default,
+                prefixCacheConfig: QWCacheConfig? = nil,
+                prefixCacheDirectory: URL? = nil,
+                maxConcurrentSessions: Int? = nil) throws {
+        let resolvedRawKV = rawKVMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            ?? String(describing: kvMode)
         self.kvMode = kvMode
+        self.rawKVMode = resolvedRawKV
         self.lsaConfig = lsaConfig
         let cfg = try Self.resolveStartup(packPath: packPath, kvMode: kvMode,
+                                          rawKVMode: rawKVMode,
                                           mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
                                           prefillScratchEviction: prefillScratchEviction,
                                           mtpAdaptiveDepth: mtpAdaptiveDepth,
@@ -335,85 +257,192 @@ public final class QWEngineDriver: @unchecked Sendable {
                                           mtpQuadraticSeeding: mtpQuadraticSeeding,
                                           dflashDraftPackPath: dflashDraftPackPath,
                                           dflashSelectorTopK: dflashSelectorTopK)
+        if cfg.isHyperStream {
+            let resolvedTuning = tuning.overlaid(environment: cfg.environment)
+            let evictPrefill: Bool = switch cfg.prefillScratchEviction {
+            case .always: true
+            case .never: false
+            case .auto: Double(ProcessInfo.processInfo.physicalMemory) / 1_000_000_000.0 <= 36.5
+            }
+            let cacheDir = prefixCacheDirectory ?? prefixCacheConfig?.cacheDirectory
+            let warmLimit = prefixCacheConfig?.warmByteLimit ?? 0
+            let ssdLimit = prefixCacheConfig?.ssdByteLimit ?? 0
+            let sessions = maxConcurrentSessions
+                ?? prefixCacheConfig?.maxConcurrentSessions
+                ?? FNPrefixWarmStore.defaultMaxSlots
+            let runtime = try autoreleasepool {
+                try QWHyperStreamRuntime(
+                    packPath: packPath,
+                    maxTokens: maxTokens,
+                    kvMode: resolvedRawKV,
+                    osReserveGiB: osReserveGiB ?? resolvedTuning.osReserveGiB,
+                    prefillChunkSize: prefillChunkSize,
+                    prefixCacheDirectory: cacheDir,
+                    prefixCacheWarmByteLimit: warmLimit,
+                    prefixCacheSSDByteLimit: ssdLimit,
+                    maxConcurrentSessions: sessions,
+                    evictPrefillScratch: evictPrefill,
+                    prewarmDoors: QWKernelInventory.flash,
+                    lsaConfig: lsaConfig,
+                    streamNgrams: resolvedTuning.streamNgrams,
+                    ropeYarnFactor: ropeYarnFactor,
+                    mtpBackend: mtpBackend?.rawValue,
+                    mtpDrafts: mtpDrafts,
+                    dflashDraftPackPath: dflashDraftPackPath ?? cfg.dflashDraftPackPath,
+                    dflashSelectorTopK: dflashSelectorTopK ?? cfg.dflashSelectorTopK,
+                    mtpDraftStrategy: cfg.mtpDraftStrategy
+                )
+            }
+            let root = QWModelRoot(url: URL(fileURLWithPath: packPath))
+            let formatChoice = try Self.weightFormatChoice(
+                for: root,
+                quantization: runtime.descriptor.quantization,
+                geometry: runtime.geometry,
+                mtpDrafts: 0,
+                pack: runtime.pack
+            )
+            self.geometry = runtime.geometry
+            self.plan = runtime.plan
+            self.weightFormat = formatChoice.format
+            self.weightFormatDeclineReason = formatChoice.declineReason
+            self.hal = runtime.hal
+            self.hasVisionWeights = runtime.hasVisionWeights
+            self.ropeRows = runtime.geometry.descriptor.maxPositionEmbeddings
+            self.layerKernels = runtime.layerKernels
+            self.mtpAdaptiveDepth = cfg.mtpAdaptiveDepth
+            self.mtpAdaptiveEntropyThreshold = cfg.mtpAdaptiveEntropyThreshold
+            self.mtpRelaxedMargin = cfg.mtpRelaxedMargin
+            self.mtpDraftStrategy = cfg.mtpDraftStrategy
+            self.mtpQuadraticSeeding = cfg.mtpQuadraticSeeding
+            self.mtpStageProfiling = cfg.mtpStageProfiling
+            self.mtpVerificationProfiling = cfg.mtpVerificationProfiling
+            self.mtpVerifyHeadQ4 = cfg.verifyHeadQ4Enabled
+            self.storedPrefillMode = gdnPrefillMode
+            self.mtpDrafts = mtpDrafts
+            self.tuning = resolvedTuning
+            self.capacityPlan = runtime.capacityPlan
+            self.capacityLogMessage = runtime.capacityLogMessage
+            self.mtpBackend = cfg.mtpBackend
+            self.prefillScratchEviction = cfg.prefillScratchEviction
+            self.prefillChunkSize = runtime.maxPrefillRows
+            self.hyperRuntime = runtime
+            self.inkling2Runtime = nil
+            self.standardState = nil
+            return
+        }
+        if cfg.isInkling2 {
+            let resolvedTuning = tuning.overlaid(environment: cfg.environment)
+            let warmLimit = prefixCacheConfig?.warmByteLimit ?? 0
+            let sessions = maxConcurrentSessions ?? prefixCacheConfig?.maxConcurrentSessions ?? 8
+            let inkRelaxedMargin = cfg.mtpBackend == .variational ? cfg.mtpRelaxedMargin : 0.0
+            let initialMinProb = mtpRelaxedMinProb
+            let runtime = try autoreleasepool {
+                try QWInkling2Runtime(
+                    packPath: packPath,
+                    maxTokens: maxTokens,
+                    kvMode: kvMode,
+                    rawKVMode: resolvedRawKV,
+                    osReserveGiB: osReserveGiB ?? resolvedTuning.osReserveGiB,
+                    prewarmDoors: QWKernelInventory.inkling2,
+                    prefixCacheWarmByteLimit: warmLimit,
+                    maxConcurrentSessions: sessions,
+                    mtpDrafts: mtpDrafts,
+                    prefillChunkSize: prefillChunkSize,
+                    lsaConfig: lsaConfig,
+                    mtpRelaxedMargin: inkRelaxedMargin,
+                    mtpRelaxedMinProb: initialMinProb,
+                    moeSpecBudget: resolvedTuning.moeSpecBudget
+                )
+            }
+            self.geometry = runtime.geometry
+            self.plan = runtime.plan
+            self.weightFormat = runtime.weightFormat
+            self.weightFormatDeclineReason = runtime.weightFormatDeclineReason
+            self.hal = runtime.hal
+            self.hasVisionWeights = runtime.hasVisionWeights
+            self.ropeRows = runtime.geometry.descriptor.maxPositionEmbeddings
+            self.layerKernels = runtime.layerKernels
+            self.mtpAdaptiveDepth = cfg.mtpAdaptiveDepth
+            self.mtpAdaptiveEntropyThreshold = cfg.mtpAdaptiveEntropyThreshold
+            self.mtpRelaxedMargin = cfg.mtpRelaxedMargin
+            self.mtpDraftStrategy = cfg.mtpDraftStrategy
+            self.mtpQuadraticSeeding = cfg.mtpQuadraticSeeding
+            self.mtpStageProfiling = cfg.mtpStageProfiling
+            self.mtpVerificationProfiling = cfg.mtpVerificationProfiling
+            self.mtpVerifyHeadQ4 = cfg.verifyHeadQ4Enabled
+            self.storedPrefillMode = gdnPrefillMode
+            self.mtpDrafts = runtime.dspark != nil ? runtime.requestedMtpDrafts : max(0, min(15, mtpDrafts))
+            self.tuning = resolvedTuning
+            self.capacityPlan = runtime.capacityPlan
+            self.capacityLogMessage = runtime.capacityLogMessage
+            self.mtpBackend = cfg.mtpBackend
+            self.prefillScratchEviction = cfg.prefillScratchEviction
+            self.prefillChunkSize = runtime.session.maxChunk
+            self.hyperRuntime = nil
+            self.inkling2Runtime = runtime
+            self.standardState = nil
+            return
+        }
         let startup = try Self.prepareContainersAndGeometry(
             packPath: packPath, maxTokens: maxTokens, ropeRows: ropeRows, kvMode: kvMode,
             prefillChunkSize: prefillChunkSize, mtpDrafts: mtpDrafts,
             residentExpertsPerLayer: residentExpertsPerLayer, osReserveGiB: osReserveGiB,
             cfg: cfg, baseTuning: tuning)
+        let resolvedCfg = startup.cfg
         let chunkRows = startup.prefillChunkSize
         let geometry = startup.geometry
         let prelimHal = startup.hal
         let stContainer = startup.stContainer
-        self.pack = startup.pack
         self.mtpDrafts = startup.mtpDrafts
         self.weightFormat = startup.weightFormat
         self.weightFormatDeclineReason = startup.weightFormatDeclineReason
         self.tuning = startup.tuning
         self.geometry = geometry
         self.hal = prelimHal
-        self.mtpBackend = cfg.mtpBackend
+        self.mtpBackend = resolvedCfg.mtpBackend
         self.prefillChunkSize = chunkRows
-        self.plan = try QWEngineBootstrap.makePlan(
+        let frozenPlan = try QWEngineBootstrap.makePlan(
             geometry: geometry, packPath: packPath,
             prefillChunkRows: chunkRows, kvStorageMode: String(describing: kvMode))
-        self.prefillScratchEviction = cfg.prefillScratchEviction
-        self.mtpAdaptiveDepth = cfg.mtpAdaptiveDepth
-        self.mtpAdaptiveEntropyThreshold = cfg.mtpAdaptiveEntropyThreshold
-        self.mtpRelaxedMargin = cfg.mtpRelaxedMargin
-        self.mtpDraftStrategy = cfg.mtpDraftStrategy
-        self.mtpQuadraticSeeding = cfg.mtpQuadraticSeeding
-        self.mtpStageProfiling = cfg.mtpStageProfiling
-        self.mtpVerificationProfiling = cfg.mtpVerificationProfiling
-        self.mtpVerifyHeadQ4 = cfg.verifyHeadQ4Enabled
+        self.plan = frozenPlan
+        self.prefillScratchEviction = resolvedCfg.prefillScratchEviction
+        self.mtpAdaptiveDepth = resolvedCfg.mtpAdaptiveDepth
+        self.mtpAdaptiveEntropyThreshold = resolvedCfg.mtpAdaptiveEntropyThreshold
+        self.mtpRelaxedMargin = resolvedCfg.mtpRelaxedMargin
+        self.mtpDraftStrategy = resolvedCfg.mtpDraftStrategy
+        self.mtpQuadraticSeeding = resolvedCfg.mtpQuadraticSeeding
+        self.mtpStageProfiling = resolvedCfg.mtpStageProfiling
+        self.mtpVerificationProfiling = resolvedCfg.mtpVerificationProfiling
+        self.mtpVerifyHeadQ4 = resolvedCfg.verifyHeadQ4Enabled
         self.storedPrefillMode = gdnPrefillMode
-        let environment = cfg.environment
+        let environment = resolvedCfg.environment
         let numV = geometry.numVirtualLayers
         let attnL = (0..<numV).filter { geometry.isVirtualLayerFullAttention($0) }
         let hcaL = (0..<numV).filter { geometry.isVirtualLayerCompressedAttention($0) }
         let gdnL = (0..<numV).filter { geometry.isVirtualLayerGDN($0) }
-        self.attnLayers = attnL; self.hcaLayers = hcaL; self.gdnLayers = gdnL
 
         let pipes = try Self.resolveCorePipelines(
             hal: prelimHal, weightFormat: startup.weightFormat, mhcConfig: geometry.mhcConfig)
-        self.psoBf16F16 = pipes.psoBf16F16; self.psoGEMVDxH16T4 = pipes.psoGEMVDxH16T4
-        self.psoGEMVDxH16DualT4 = pipes.psoGEMVDxH16DualT4
-        self.psoGEMVDxH16GdnInProjT4 = pipes.psoGEMVDxH16GdnInProjT4
-        self.psoGEMVSiluPairH16 = pipes.psoGEMVSiluPairH16; self.psoFwht32 = pipes.psoFwht32
-        self.psoRMSNorm = pipes.psoRMSNorm; self.psoRMSNormResidual = pipes.psoRMSNormResidual
-        self.psoRMSNormResidualWide = pipes.psoRMSNormResidualWide
-        self.psoRMSNormResidualMoE = pipes.psoRMSNormResidualMoE
-        self.psoRMSNormResidualMoEWide = pipes.psoRMSNormResidualMoEWide
-        self.psoHeadF16 = pipes.psoHeadF16
-        self.psoGemmBatchedH16 = pipes.psoGemmBatchedH16
-        self.psoGemmBatchedH16SwiGLU = pipes.psoGemmBatchedH16SwiGLU
-        self.psoGemmBatchedH16GdnInProj = pipes.psoGemmBatchedH16GdnInProj
-        self.psoSiluMulF16 = pipes.psoSiluMulF16; self.psoKVPagedWrite = pipes.psoKVPagedWrite
-        self.psoKVPagedWriteGeneral = pipes.psoKVPagedWriteGeneral
-        self.psoZeroPadAttn = pipes.psoZeroPadAttn
-        self.psoMHCEnter = pipes.psoMHCEnter; self.psoMHCRouterNorm = pipes.psoMHCRouterNorm
-        self.psoMHCRouterNormRows = pipes.psoMHCRouterNormRows
-        self.psoMHCMerge = pipes.psoMHCMerge; self.psoMHCExitHead = pipes.psoMHCExitHead
-        self.mhcSplit = try QWMHCSplitRouter(hal: prelimHal, geometry: geometry)
-        self.attnPrefill = try QWAttnPrefill(hal: prelimHal, backend: .naxX64, geometry: geometry)
-        self.pagedAttnPrefill = try QWAttnPagedPrefill(hal: prelimHal, geometry: geometry)
-        self.pagedAttnPrefillGeneral = try QWAttnPagedPrefillGeneral(hal: prelimHal, geometry: geometry)
+        let mhcSplitVal = try QWMHCSplitRouter(hal: prelimHal, geometry: geometry)
+        let attnPrefillVal = try QWAttnPrefill(hal: prelimHal, backend: .naxX64, geometry: geometry)
+        let pagedAttnPrefillVal = try QWAttnPagedPrefill(hal: prelimHal, geometry: geometry)
+        let pagedAttnPrefillGenVal = try QWAttnPagedPrefillGeneral(hal: prelimHal, geometry: geometry)
 
         var gMap = [Int](repeating: -1, count: numV); for (i, gl) in gdnL.enumerated() { gMap[gl] = i }
         var aMap = [Int](repeating: -1, count: numV); for (i, al) in attnL.enumerated() { aMap[al] = i }
         var hMap = [Int](repeating: -1, count: numV); for (i, hl) in hcaL.enumerated() { hMap[hl] = i }
-        self.gdnIndexMap = gMap; self.attnIndexMap = aMap; self.hcaIndexMap = hMap
-        self.head = try QWHead(hal: prelimHal, geometry: geometry)
-        self.gdnPrefill = try QWGDNPrefill(hal: prelimHal, scanBackend: .hybrid, solveBackend: .scalar)
+        let headVal = try QWHead(hal: prelimHal, geometry: geometry)
+        let gdnPrefillVal = try QWGDNPrefill(hal: prelimHal, scanBackend: .hybrid, solveBackend: .scalar)
 
         let budget = try Self.planArenaAndBudget(
             geometry: geometry, hal: prelimHal, weightFormat: startup.weightFormat,
             weightFormatDeclineReason: startup.weightFormatDeclineReason, tuning: startup.tuning,
             osReserveGiB: startup.osReserveGiB, prefillChunkSize: chunkRows, maxTokens: maxTokens,
             ropeRows: ropeRows, kvMode: kvMode, attnLayerCount: attnL.count, gdnLayerCount: gdnL.count,
-            cfg: cfg, mtpDrafts: startup.mtpDrafts, mtpWeightDrafts: startup.mtpWeightDrafts)
+            cfg: resolvedCfg, mtpDrafts: startup.mtpDrafts, mtpWeightDrafts: startup.mtpWeightDrafts)
         self.capacityPlan = budget.capacityPlan
         self.capacityLogMessage = budget.capacityLogMessage
-        self.arena = budget.arena
+        let arenaVal = budget.arena
 
         let wsub = budget.arena.weightsRegion()
         var L: WeightLoader
@@ -428,31 +457,39 @@ public final class QWEngineDriver: @unchecked Sendable {
             throw QWEngineDriverError.packMissing(packPath)
         }
 
-        let hasMTPDrafter = (startup.mtpWeightDrafts > 0 || cfg.mtpBackend == .dflash2) && startup.mtpDrafts > 0
+        let hasMTPDrafter = (startup.mtpWeightDrafts > 0 || resolvedCfg.mtpBackend == .dflash2) && startup.mtpDrafts > 0
         let embHead = try Self.loadEmbeddingsAndHead(
             loader: &L, pack: startup.pack, stContainer: stContainer, packPath: packPath,
-            hal: prelimHal, geometry: geometry, cfg: cfg,
+            hal: prelimHal, geometry: geometry, cfg: resolvedCfg,
             mtpDrafts: startup.mtpDrafts, hasMTPDrafter: hasMTPDrafter, budget: budget)
-        self.embedPlane = embHead.embedPlane; self.embedRawOff = embHead.embedRawOff
-        self.embedReader = embHead.embedReader; self.embedScalesReader = embHead.embedScalesReader
-        self.embedBiasesReader = embHead.embedBiasesReader
-        self.mtpDeviceEmbedding = embHead.mtpDeviceEmbedding; self.embedStaging = embHead.embedStaging
-        self.mtpDraftHead = embHead.mtpDraftHead; self.headStorage = embHead.headStorage
+        let visionWeightsPresent: Bool
+        if geometry.descriptor.capabilities.contains(.vision), geometry.descriptor.visDepth > 0 {
+            if let pk = startup.pack {
+                visionWeightsPresent = QWVisionOnDemandBackend.hasVisionWeights(modelPath: pk.url.path)
+            } else if let er = embHead.embedReader {
+                visionWeightsPresent = QWVisionOnDemandBackend.hasVisionWeights(
+                    modelPath: er.shardURL.deletingLastPathComponent().path)
+            } else {
+                visionWeightsPresent = false
+            }
+        } else {
+            visionWeightsPresent = false
+        }
+        self.hasVisionWeights = visionWeightsPresent
 
         let hcaSidecar = Self.loadHCALSASidecar(
             hal: prelimHal, geometry: geometry, lsaConfig: lsaConfig,
             packPath: packPath, pack: startup.pack, safetensors: stContainer, hcaLayers: hcaL)
-        self.hcaLsaBuffer = hcaSidecar?.buffer
+        let hcaLsaBufferVal = hcaSidecar?.buffer
         L.hcaLsaByLayer = hcaSidecar?.byLayer ?? [:]
         let decoder = try L.loadDecoderWeights(geometry: geometry)
-        self.layersW = decoder.layers
         if startup.tuning.expertCache {
             for lw in decoder.layers { lw.moe?.coldStreamer?.enableDynamicResidency() }
         }
-        self.layerKernels = try QWLayerKernelRegistry.resolve(layers: decoder.layers, plan: plan)
-        self.finalNorm = decoder.finalNorm
-        self.mhcExitHead = try L.loadMHCExitHeadIfNeeded()
-        self.multimaxParams = try L.loadMultimaxIfNeeded()
+        self.layerKernels = try QWLayerKernelRegistry.resolve(layers: decoder.layers, plan: frozenPlan)
+        let finalNormVal = decoder.finalNorm
+        let mhcExitHeadVal = try L.loadMHCExitHeadIfNeeded()
+        let multimaxParamsVal = try L.loadMultimaxIfNeeded()
 
         let origMaxPos = geometry.originalMaxPositionEmbeddings
         let nativeYarn = geometry.yarnRopeConfig
@@ -473,11 +510,9 @@ public final class QWEngineDriver: @unchecked Sendable {
         self.ropeRows = budget.effectiveRopeRows
         try budget.weightPlan.check(QWTensorShape([tableRopeRows, geometry.rotaryDims], .f32), at: L.weightRequest)
         let ropeApp = try QWRopeApply(tables: tables, hal: prelimHal, weights: wsub, arena: budget.arena, geometry: geometry)
-        self.ropeApply = ropeApp
         L.weightRequest += 1
         let eWeights = try L.loadEchoDraftWeightsIfNeeded(drafts: startup.mtpWeightDrafts)
         let mWeights = try Self.loadMTPWeights(&L, drafts: startup.mtpWeightDrafts, geometry: geometry)
-        self.echoWeights = eWeights; self.mtpWeights = mWeights
         try budget.weightPlan.finish(requests: L.weightRequest, usedBytes: wsub.usedBytes)
         wsub.markSteadyState()
         startup.pack?.adviseDontNeed()
@@ -486,15 +521,13 @@ public final class QWEngineDriver: @unchecked Sendable {
         let aDec = geometry.usesLatentOrCompressedAttention ? nil
             : try QWAttnDecode(hal: prelimHal, sharedPrefixRows: startup.mtpDrafts > 0 ? min(8, startup.mtpDrafts + 1) : nil,
                                kvMode: kvMode, geometry: geometry)
-        self.attnDecode = aDec
-        self.gdnConv = try QWGDNConv(hal: prelimHal, geometry: geometry)
-        self.gdnDecode = try QWGDNDecode(hal: prelimHal)
+        let gdnConvVal = try QWGDNConv(hal: prelimHal, geometry: geometry)
+        let gdnDecodeVal = try QWGDNDecode(hal: prelimHal)
         let needsMTPCache = startup.mtpWeightDrafts > 0 && startup.mtpDrafts > 0
         let caches = try Self.makeKVCaches(
             hal: prelimHal, arena: budget.arena, attnLayers: attnL, kvMode: kvMode,
             geometry: geometry, mtpDrafts: needsMTPCache ? startup.mtpDrafts : 0,
             trunkKVBytes: budget.trunkKVBytes, mtpKVBytes: budget.mtpKVBytes)
-        self.kvCache = caches.kvCache; self.mtpCache = caches.mtpCache
 
         let asub = budget.arena.activationsRegion(); let gsub = budget.arena.gdnRegion()
         let pOff = try gsub.allocate(bytes: budget.pCarveBytes)
@@ -502,20 +535,15 @@ public final class QWEngineDriver: @unchecked Sendable {
         let builtScratch = try Self.makeDecodeAndPrefillScratch(
             asub: asub, gsub: gsub, geometry: geometry, maxPrefillChunk: chunkRows,
             pOff: pOff, pCarveBytes: budget.pCarveBytes, useGroupedNAX: budget.useGroupedNAX)
-        self.sc = builtScratch.sc; self.psc = builtScratch.psc
-        self.pscBuffer = asub.region.buffer
-        self.pscByteOffset = asub.region.base + builtScratch.gsOff
-        self.pscByteLength = asub.usedBytes - builtScratch.gsOff
-        let dflash: QWDFlashDrafter? = (cfg.mtpBackend == .dflash2 && startup.mtpDrafts > 0)
-            ? try QWDFlashDrafter(geometry: geometry, hal: prelimHal, packPath: cfg.dflashDraftPackPath,
-                                  drafts: startup.mtpDrafts, selectorTopK: cfg.dflashSelectorTopK,
+        let dflash: QWDFlashDrafter? = (resolvedCfg.mtpBackend == .dflash2 && startup.mtpDrafts > 0)
+            ? try QWDFlashDrafter(geometry: geometry, hal: prelimHal, packPath: resolvedCfg.dflashDraftPackPath,
+                                  drafts: startup.mtpDrafts, selectorTopK: resolvedCfg.dflashSelectorTopK,
                                   sessionSlotCount: Self.gdnSlotCount()) : nil
-        self.dflashDrafter = dflash
         admission.freeSlots = try Self.buildGDNSlots(
             gsub: gsub, geometry: geometry, gdnLayerCount: gdnL.count,
             mtpDrafts: startup.mtpDrafts, dflashDrafter: dflash)
 
-        self.lsaOperator = try QWLSAOperator.makeIfEnabled(
+        let lsaOp = try QWLSAOperator.makeIfEnabled(
             hal: prelimHal, geometry: geometry, lsaConfig: lsaConfig, packPath: packPath,
             pack: startup.pack, safetensors: stContainer, attnLayers: attnL,
             maxContext: budget.effectiveMaxTokens, maxPrefillChunk: chunkRows)
@@ -523,11 +551,10 @@ public final class QWEngineDriver: @unchecked Sendable {
             hal: prelimHal, geometry: geometry, attnLayers: attnL,
             maxContext: budget.effectiveMaxTokens, maxPrefillChunk: chunkRows,
             lsaConfig: lsaConfig, extraAttnLayers: needsMTPCache ? 1 : 0)
-        self.mlaOperator = mlaOp
-        self.mbsaOperator = try QWMBSAAttnOperator.makeIfEnabled(
+        let mbsaOp = try QWMBSAAttnOperator.makeIfEnabled(
             hal: prelimHal, geometry: geometry, attnLayers: attnL,
             kvMode: kvMode, maxContext: budget.effectiveMaxTokens, maxPrefillChunk: chunkRows)
-        self.hcaOperator = try QWHCAAttnOperator.makeIfEnabled(
+        let hcaOp = try QWHCAAttnOperator.makeIfEnabled(
             hal: prelimHal, geometry: geometry, hcaLayers: hcaL,
             maxContext: budget.effectiveMaxTokens, maxPrefillChunk: chunkRows,
             lsaConfig: lsaConfig, indexDim: hcaSidecar?.indexDim ?? QWLSAConfig.defaultIndexDim)
@@ -539,14 +566,70 @@ public final class QWEngineDriver: @unchecked Sendable {
             mtpWeights: mWeights, echoWeights: eWeights, dflashDrafter: dflash,
             mtpDrafts: startup.mtpDrafts, effectiveMaxTokens: budget.effectiveMaxTokens,
             maxT: chunkRows, mtpPartialsOff: mtpPartialsOff, pCarveBytes: budget.pCarveBytes,
-            headIsQ4g: cfg.headIsQ4g, verifyHeadQ4Enabled: cfg.verifyHeadQ4Enabled,
+            headIsQ4g: resolvedCfg.headIsQ4g, verifyHeadQ4Enabled: resolvedCfg.verifyHeadQ4Enabled,
             useGroupedNAX: budget.useGroupedNAX, scratch: builtScratch.sc,
             ropeApply: ropeApp, effectiveRopeRows: budget.effectiveRopeRows, kvMode: kvMode)
-        self.gdnReplayCheckpoint = mtpRes.gdnReplayCheckpoint; self.verifyWindow = mtpRes.verifyWindow
-        self.mtpBatchedMLP = mtpRes.mtpBatchedMLP; self.mtpBatchedTrunk = mtpRes.mtpBatchedTrunk
-        self.mtpSharedAttentionPartials = mtpRes.mtpSharedAttentionPartials
-        self.mtpScratch = mtpRes.mtpScratch; self.mtpPromptEmbeddings = mtpRes.mtpPromptEmbeddings
-        self.mtpDraftEncoder = mtpRes.mtpDraftEncoder; self.echoDrafter = mtpRes.echoDrafter
+
+        self.hyperRuntime = nil
+        self.inkling2Runtime = nil
+        self.standardState = QWDriverStandardState(
+            pack: startup.pack,
+            embedReader: embHead.embedReader,
+            embedScalesReader: embHead.embedScalesReader,
+            embedBiasesReader: embHead.embedBiasesReader,
+            arena: arenaVal,
+            kvCache: caches.kvCache,
+            ropeApply: ropeApp,
+            attnLayers: attnL,
+            hcaLayers: hcaL,
+            gdnLayers: gdnL,
+            attnDecode: aDec,
+            pagedAttnPrefill: pagedAttnPrefillVal,
+            pagedAttnPrefillGeneral: pagedAttnPrefillGenVal,
+            gdnConv: gdnConvVal,
+            gdnDecode: gdnDecodeVal,
+            gdnPrefill: gdnPrefillVal,
+            head: headVal,
+            pipelines: pipes,
+            mhcSplit: mhcSplitVal,
+            attnPrefill: attnPrefillVal,
+            gdnIndexMap: gMap,
+            attnIndexMap: aMap,
+            hcaIndexMap: hMap,
+            layersW: decoder.layers,
+            mtpWeights: mWeights,
+            echoWeights: eWeights,
+            mhcExitHead: mhcExitHeadVal,
+            multimaxParams: multimaxParamsVal,
+            embedPlane: embHead.embedPlane,
+            embedRawOff: embHead.embedRawOff,
+            mtpDeviceEmbedding: embHead.mtpDeviceEmbedding,
+            mtpBatchedMLP: mtpRes.mtpBatchedMLP,
+            mtpBatchedTrunk: mtpRes.mtpBatchedTrunk,
+            mtpSharedAttentionPartials: mtpRes.mtpSharedAttentionPartials,
+            embedStaging: embHead.embedStaging,
+            headStorage: embHead.headStorage,
+            finalNorm: finalNormVal,
+            mtpDraftHead: embHead.mtpDraftHead,
+            mtpScratch: mtpRes.mtpScratch,
+            mtpDraftEncoder: mtpRes.mtpDraftEncoder,
+            echoDrafter: mtpRes.echoDrafter,
+            dflashDrafter: dflash,
+            gdnReplayCheckpoint: mtpRes.gdnReplayCheckpoint,
+            mtpPromptEmbeddings: mtpRes.mtpPromptEmbeddings,
+            verifyWindow: mtpRes.verifyWindow,
+            mtpCache: caches.mtpCache,
+            sc: builtScratch.sc,
+            psc: builtScratch.psc,
+            lsaOperator: lsaOp,
+            mlaOperator: mlaOp,
+            mbsaOperator: mbsaOp,
+            hcaOperator: hcaOp,
+            hcaLsaBuffer: hcaLsaBufferVal,
+            pscBuffer: asub.region.buffer,
+            pscByteOffset: asub.region.base + builtScratch.gsOff,
+            pscByteLength: asub.usedBytes - builtScratch.gsOff
+        )
         self.mtpDraftEncoder?.driver = self
 
         asub.markSteadyState(); gsub.markSteadyState()
@@ -565,6 +648,7 @@ public final class QWEngineDriver: @unchecked Sendable {
         }
         prelimHal.adoptPendingResidency()
         prelimHal.makeResident(allResidentBuffers())
+        prelimHal.primeResidency()
         try Self.prewarmPipelines(hal: prelimHal, doors: prewarmDoors)
         if let (cb, enc) = prelimHal.begin() {
             enc.useResource(wsub.region.buffer, usage: .read)
@@ -583,8 +667,22 @@ public final class QWEngineDriver: @unchecked Sendable {
 
     private var _onCacheEvent: (@Sendable (QWPrefixCacheEvent) -> Void)?
     public var onCacheEvent: (@Sendable (QWPrefixCacheEvent) -> Void)? {
-        get { statsLock.withLock { _onCacheEvent } }
-        set { statsLock.withLock { _onCacheEvent = newValue } }
+        get {
+            if let hyper = hyperRuntime { return hyper.onCacheEvent }
+            if let ink = inkling2Runtime { return ink.onCacheEvent }
+            return statsLock.withLock { _onCacheEvent }
+        }
+        set {
+            if let hyper = hyperRuntime {
+                hyper.onCacheEvent = newValue
+                return
+            }
+            if let ink = inkling2Runtime {
+                ink.onCacheEvent = newValue
+                return
+            }
+            statsLock.withLock { _onCacheEvent = newValue }
+        }
     }
     var activePrefillProgress: (@Sendable (Int, Int) -> Void)?
     var activePrefillTotalTokens: Int?
@@ -639,9 +737,10 @@ public final class QWEngineDriver: @unchecked Sendable {
     }
 
     deinit {
-        coldWriteController.closeAndDrain()
-        if cacheDiskManager?.config.wipeOnStart == true {
-            cacheDiskManager?.purgeAll()
+        guard let std = standardState else { return }
+        std.coldWriteController.closeAndDrain()
+        if std.cacheDiskManager?.config.wipeOnStart == true {
+            std.cacheDiskManager?.purgeAll()
         }
     }
 }

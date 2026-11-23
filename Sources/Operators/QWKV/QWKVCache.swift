@@ -27,6 +27,7 @@ public final class QWKVCache: @unchecked Sendable {
     public let geometry: QWModelGeometry
     let arena: QWArena?
     let layers: [Int]
+    public let layerSlidingWindows: [Int]
     public let mode: QWKVMode
     public let bytesPerPage: Int
 
@@ -75,19 +76,32 @@ public final class QWKVCache: @unchecked Sendable {
     var steady = false
 
     public convenience init(hal: QWHal, arena: QWArena, layers: [Int], mode: QWKVMode,
-                            geometry: QWModelGeometry) throws {
+                            geometry: QWModelGeometry, layerSlidingWindows: [Int]? = nil,
+                            layerPoolWeights: [Int]? = nil) throws {
         try self.init(hal: hal, subAllocator: arena.kvRegion(), vSubAllocator: arena.kvVSub,
-                      layers: layers, mode: mode, arena: arena, geometry: geometry)
+                      layers: layers, mode: mode, arena: arena, geometry: geometry,
+                      layerSlidingWindows: layerSlidingWindows, layerPoolWeights: layerPoolWeights)
     }
 
     public init(hal: QWHal, subAllocator: QWSubAllocator, vSubAllocator: QWSubAllocator? = nil,
                 auxSubAllocator: QWSubAllocator? = nil,
                 layers: [Int], mode: QWKVMode,
-                arena: QWArena? = nil, geometry: QWModelGeometry) throws {
+                arena: QWArena? = nil, geometry: QWModelGeometry,
+                layerSlidingWindows: [Int]? = nil, layerPoolWeights: [Int]? = nil) throws {
         guard !layers.isEmpty else { throw QWKVError.badArgument("no layers") }
+        let resolvedWindows: [Int]
+        if let layerSlidingWindows {
+            guard layerSlidingWindows.count == layers.count else {
+                throw QWKVError.badArgument("layerSlidingWindows count \(layerSlidingWindows.count) != \(layers.count)")
+            }
+            resolvedWindows = layerSlidingWindows.map { max(0, $0) }
+        } else {
+            resolvedWindows = layers.map { geometry.virtualLayerSlidingWindow($0) }
+        }
         self.geometry = geometry
         self.arena = arena
         self.layers = layers
+        self.layerSlidingWindows = resolvedWindows
         self.mode = mode
         let pageBytes = Self.pageBytes(mode: mode, geometry: geometry)
         self.bytesPerPage = pageBytes
@@ -95,7 +109,8 @@ public final class QWKVCache: @unchecked Sendable {
         let tablesTotal = Self.tableSlotBytes * 2 * layers.count * Self.maxSeqs
         let built = try QWKVHostCodec.buildPoolsAndTables(
             hal: hal, kv: subAllocator, vSubAllocator: vSubAllocator, kvAux: kvAux,
-            layers: layers, pageBytes: pageBytes, tablesTotal: tablesTotal)
+            layers: layers, pageBytes: pageBytes, tablesTotal: tablesTotal,
+            layerPoolWeights: layerPoolWeights)
         self.poolPairs = built.poolPairs
         var lmap: [Int: Int] = [:]
         for (li, layer) in layers.enumerated() { lmap[layer] = li }
@@ -105,7 +120,23 @@ public final class QWKVCache: @unchecked Sendable {
     }
 
     func layerIndex(_ l: Int) -> Int? { layerToLi[l] }
+    func isSlidingLayer(_ li: Int) -> Bool { layerSlidingWindows[li] > 0 }
     func pool(at li: Int, _ kind: QWKVKind) -> QWKVLayerPoolPair.Pool { poolPairs[li][kind] }
+
+    public func liveStartPage(layerIndex li: Int, tokenCount: Int) -> Int {
+        guard li >= 0, li < layerSlidingWindows.count else { return 0 }
+        let w = layerSlidingWindows[li]
+        guard w > 0, tokenCount > w else { return 0 }
+        return max(0, (tokenCount - w) / Self.pageTokens)
+    }
+
+    public func allocatedPhysicalPages(_ h: QWKVHandle, layer: Int) -> Int {
+        lock.withLock {
+            guard h.cache === self, !h.finished,
+                  let st = seqs[h.seq], let li = layerIndex(layer) else { return 0 }
+            return st.layerPairs[li].k.ids.filter { $0 >= 0 }.count
+        }
+    }
     func slotBase(_ seq: QWKVSeqID, _ li: Int, _ kind: QWKVKind) -> Int {
         tableBase + ((Int(seq) * layers.count + li) * 2 + (kind == .k ? 0 : 1)) * Self.tableSlotBytes
     }
@@ -142,18 +173,24 @@ public final class QWKVCache: @unchecked Sendable {
         var taken: [(Int, QWKVKind, Int32)] = []
         do {
             for li in layers.indices {
+                let lazy = isSlidingLayer(li)
                 for kind in QWKVKind.allCases {
-                    var ids: [Int32] = []
-                    ids.reserveCapacity(pagesNeeded)
-                    for _ in 0..<pagesNeeded {
-                        guard let p = pool(at: li, kind).pages.allocPage() else {
-                            throw QWKVError.outOfPages(asked: pagesNeeded, free: pool(at: li, kind).pages.freePages)
+                    if lazy {
+                        st.layerPairs[li][kind].ids = [Int32](repeating: -1, count: pagesNeeded)
+                        st.layerPairs[li][kind].shared = [Bool](repeating: false, count: pagesNeeded)
+                    } else {
+                        var ids: [Int32] = []
+                        ids.reserveCapacity(pagesNeeded)
+                        for _ in 0..<pagesNeeded {
+                            guard let p = pool(at: li, kind).pages.allocPage() else {
+                                throw QWKVError.outOfPages(asked: pagesNeeded, free: pool(at: li, kind).pages.freePages)
+                            }
+                            ids.append(Int32(p))
+                            taken.append((li, kind, Int32(p)))
                         }
-                        ids.append(Int32(p))
-                        taken.append((li, kind, Int32(p)))
+                        st.layerPairs[li][kind].ids = ids
+                        st.layerPairs[li][kind].shared = [Bool](repeating: false, count: pagesNeeded)
                     }
-                    st.layerPairs[li][kind].ids = ids
-                    st.layerPairs[li][kind].shared = [Bool](repeating: false, count: pagesNeeded)
                 }
             }
         } catch {
@@ -193,19 +230,30 @@ public final class QWKVCache: @unchecked Sendable {
         var taken: [(Int, QWKVKind, Int32)] = []
         do {
             for li in layers.indices {
+                let isSWA = isSlidingLayer(li)
+                let startPage = min(prefixPages, liveStartPage(layerIndex: li, tokenCount: prefix.tokenCount))
                 for (ki, kind) in QWKVKind.allCases.enumerated() {
                     let cached = prefix.pages[li * 2 + ki]
-                    var ids = Array(cached.prefix(prefixPages))
-                    var shared = [Bool](repeating: true, count: prefixPages)
-                    for _ in prefixPages..<pagesNeeded {
-                        guard let page = pool(at: li, kind).pages.allocPage() else {
-                            throw QWKVError.outOfPages(asked: pagesNeeded - prefixPages,
-                                                       free: pool(at: li, kind).pages.freePages)
+                    var ids = [Int32](repeating: -1, count: startPage)
+                    var shared = [Bool](repeating: false, count: startPage)
+                    if startPage < prefixPages {
+                        ids.append(contentsOf: cached[startPage..<prefixPages])
+                        shared.append(contentsOf: repeatElement(true, count: prefixPages - startPage))
+                    }
+                    if isSWA {
+                        ids.append(contentsOf: repeatElement(Int32(-1), count: pagesNeeded - prefixPages))
+                        shared.append(contentsOf: repeatElement(false, count: pagesNeeded - prefixPages))
+                    } else {
+                        for _ in prefixPages..<pagesNeeded {
+                            guard let page = pool(at: li, kind).pages.allocPage() else {
+                                throw QWKVError.outOfPages(asked: pagesNeeded - prefixPages,
+                                                           free: pool(at: li, kind).pages.freePages)
+                            }
+                            let pageID = Int32(page)
+                            ids.append(pageID)
+                            shared.append(false)
+                            taken.append((li, kind, pageID))
                         }
-                        let pageID = Int32(page)
-                        ids.append(pageID)
-                        shared.append(false)
-                        taken.append((li, kind, pageID))
                     }
                     st.layerPairs[li][kind].ids = ids
                     st.layerPairs[li][kind].shared = shared
@@ -217,7 +265,7 @@ public final class QWKVCache: @unchecked Sendable {
         }
         for li in layers.indices {
             for (ki, kind) in QWKVKind.allCases.enumerated() {
-                for page in prefix.pages[li * 2 + ki].prefix(prefixPages) {
+                for page in prefix.pages[li * 2 + ki].prefix(prefixPages) where page >= 0 {
                     retainSharedPage(li: li, kind: kind, page: page)
                 }
                 uploadSlot(id, li, kind, st.layerPairs[li][kind].ids)
@@ -246,20 +294,27 @@ public final class QWKVCache: @unchecked Sendable {
         var grabbed: [(Int, QWKVKind, [Int32])] = []
         do {
             for li in layers.indices {
+                let lazy = isSlidingLayer(li)
                 for kind in QWKVKind.allCases {
-                    var ids: [Int32] = []
-                    ids.reserveCapacity(add)
-                    for _ in 0..<add {
-                        guard let p = pool(at: li, kind).pages.allocPage() else {
-                            throw QWKVError.outOfPages(asked: add, free: pool(at: li, kind).pages.freePages)
+                    if lazy {
+                        grabbed.append((li, kind, [Int32](repeating: -1, count: add)))
+                    } else {
+                        var ids: [Int32] = []
+                        ids.reserveCapacity(add)
+                        for _ in 0..<add {
+                            guard let p = pool(at: li, kind).pages.allocPage() else {
+                                throw QWKVError.outOfPages(asked: add, free: pool(at: li, kind).pages.freePages)
+                            }
+                            ids.append(Int32(p))
                         }
-                        ids.append(Int32(p))
+                        grabbed.append((li, kind, ids))
                     }
-                    grabbed.append((li, kind, ids))
                 }
             }
         } catch {
-            for (li, kind, ids) in grabbed { for p in ids { pool(at: li, kind).pages.freePage(Int(p)) } }
+            for (li, kind, ids) in grabbed {
+                for p in ids where p >= 0 { pool(at: li, kind).pages.freePage(Int(p)) }
+            }
             throw error
         }
         for (li, kind, ids) in grabbed {
@@ -316,9 +371,28 @@ public final class QWKVCache: @unchecked Sendable {
             let last = (positions.upperBound - 1) / Self.pageTokens
             for pair in st.layerPairs {
                 for kind in QWKVKind.allCases {
-                    let shared = pair[kind].shared
-                    guard last < shared.count else { continue }
-                    for index in first...last where shared[index] { return true }
+                    let stream = pair[kind]
+                    guard last < stream.shared.count else { continue }
+                    for index in first...last where stream.shared[index] && stream.ids[index] >= 0 { return true }
+                }
+            }
+            return false
+        }
+    }
+
+    public func hasUnallocatedPages(_ h: QWKVHandle, positions: Range<Int>) -> Bool {
+        lock.withLock {
+            guard h.cache === self, !h.finished,
+                  let st = seqs[h.seq], !positions.isEmpty else { return false }
+            let first = positions.lowerBound / Self.pageTokens
+            let last = (positions.upperBound - 1) / Self.pageTokens
+            for pair in st.layerPairs {
+                for kind in QWKVKind.allCases {
+                    let ids = pair[kind].ids
+                    let end = min(last, ids.count - 1)
+                    if first <= end {
+                        for index in first...end where ids[index] < 0 { return true }
+                    }
                 }
             }
             return false
@@ -361,10 +435,12 @@ public final class QWKVCache: @unchecked Sendable {
             guard let st = seqs[h.seq] else { throw QWKVError.badArgument("unknown seq") }
             var pins: [(Int, QWKVKind, [Int32])] = []
             for (li, l) in layers.enumerated() {
+                let startPage = liveStartPage(layerIndex: li, tokenCount: st.writtenTokens)
                 for kind in QWKVKind.allCases {
                     let ids = st.layerPairs[li][kind].ids
-                    for p in ids { st.layerPairs[li][kind].pins[p, default: 0] += 1 }
-                    pins.append((l, kind, ids))
+                    let retained = ids.enumerated().map { idx, p in idx >= startPage && p >= 0 ? p : Int32(-1) }
+                    for p in retained where p >= 0 { st.layerPairs[li][kind].pins[p, default: 0] += 1 }
+                    pins.append((l, kind, retained))
                 }
             }
             return QWKVSnap(seq: h.seq, tokenCount: st.writtenTokens, cache: self, pins: pins)
@@ -380,6 +456,7 @@ public final class QWKVCache: @unchecked Sendable {
         let firstPage = positions.lowerBound / Self.pageTokens
         let lastPage = (positions.upperBound - 1) / Self.pageTokens
         var copies: [(li: Int, kind: QWKVKind, index: Int, old: Int32, new: Int32)] = []
+        var freshAllocs: [(li: Int, kind: QWKVKind, index: Int, new: Int32)] = []
         var grabbed: [(Int, QWKVKind, Int32)] = []
         do {
             for li in layers.indices {
@@ -390,13 +467,23 @@ public final class QWKVCache: @unchecked Sendable {
                           stream.shared.count == stream.pageCount, lastPage < stream.pageCount else {
                         throw QWKVError.badArgument("write range exceeds admitted page capacity")
                     }
-                    for index in firstPage...lastPage where stream.shared[index] {
-                        guard let page = pool(at: li, kind).pages.allocPage() else {
-                            throw QWKVError.outOfPages(asked: 1, free: pool(at: li, kind).pages.freePages)
+                    for index in firstPage...lastPage {
+                        let cur = stream.ids[index]
+                        if cur < 0 {
+                            guard let page = pool(at: li, kind).pages.allocPage() else {
+                                throw QWKVError.outOfPages(asked: 1, free: pool(at: li, kind).pages.freePages)
+                            }
+                            let allocated = Int32(page)
+                            grabbed.append((li, kind, allocated))
+                            freshAllocs.append((li, kind, index, allocated))
+                        } else if stream.shared[index] {
+                            guard let page = pool(at: li, kind).pages.allocPage() else {
+                                throw QWKVError.outOfPages(asked: 1, free: pool(at: li, kind).pages.freePages)
+                            }
+                            let replacement = Int32(page)
+                            grabbed.append((li, kind, replacement))
+                            copies.append((li, kind, index, cur, replacement))
                         }
-                        let replacement = Int32(page)
-                        grabbed.append((li, kind, replacement))
-                        copies.append((li, kind, index, stream.ids[index], replacement))
                     }
                 }
             }
@@ -410,11 +497,79 @@ public final class QWKVCache: @unchecked Sendable {
                 .copyMemory(from: pa.region.pointer.advanced(by: Int(copy.old) * bytesPerPage),
                             byteCount: bytesPerPage)
         }
+        var touched: [(Int, QWKVKind)] = []
+        for alloc in freshAllocs {
+            st.layerPairs[alloc.li][alloc.kind].ids[alloc.index] = alloc.new
+            st.layerPairs[alloc.li][alloc.kind].shared[alloc.index] = false
+            if !touched.contains(where: { $0.0 == alloc.li && $0.1 == alloc.kind }) {
+                touched.append((alloc.li, alloc.kind))
+            }
+        }
         for copy in copies {
             st.layerPairs[copy.li][copy.kind].ids[copy.index] = copy.new
             st.layerPairs[copy.li][copy.kind].shared[copy.index] = false
-            uploadSlot(handle.seq, copy.li, copy.kind, st.layerPairs[copy.li][copy.kind].ids)
             releaseSharedPage(li: copy.li, kind: copy.kind, page: copy.old)
+            if !touched.contains(where: { $0.0 == copy.li && $0.1 == copy.kind }) {
+                touched.append((copy.li, copy.kind))
+            }
+        }
+        for (li, kind) in touched {
+            uploadSlot(handle.seq, li, kind, st.layerPairs[li][kind].ids)
+        }
+    }
+
+    @discardableResult
+    public func recycleExpiredWindowPages(_ h: QWKVHandle, validStart: Int,
+                                          safetyMargin: Int = QWKVCache.pageTokens) throws -> Int {
+        guard validStart >= 0, safetyMargin >= 0 else {
+            throw QWKVError.badArgument("negative validStart or safetyMargin")
+        }
+        return try recycleExpiredLocked(h, value: validStart, useCurrentPosition: false, safetyMargin: safetyMargin)
+    }
+
+    @discardableResult
+    public func recycleExpiredWindowPages(_ h: QWKVHandle, currentPosition: Int,
+                                          safetyMargin: Int = QWKVCache.pageTokens) throws -> Int {
+        guard currentPosition >= 0, safetyMargin >= 0 else {
+            throw QWKVError.badArgument("negative currentPosition or safetyMargin")
+        }
+        return try recycleExpiredLocked(h, value: currentPosition, useCurrentPosition: true, safetyMargin: safetyMargin)
+    }
+
+    private func recycleExpiredLocked(_ h: QWKVHandle, value: Int,
+                                      useCurrentPosition: Bool, safetyMargin: Int) throws -> Int {
+        try lock.withLock {
+            guard h.cache === self, !h.finished, let st = seqs[h.seq] else {
+                throw QWKVError.badArgument("unknown, foreign, or finished seq")
+            }
+            var recycled = 0
+            for li in layers.indices {
+                let w = layerSlidingWindows[li]
+                guard w > 0 else { continue }
+                let layerValidStart = useCurrentPosition ? max(0, value - w) : value
+                let firstRetainedPage = max(0, layerValidStart - safetyMargin) / Self.pageTokens
+                guard firstRetainedPage > 0 else { continue }
+                for kind in QWKVKind.allCases {
+                    let count = st.layerPairs[li][kind].ids.count
+                    let upper = min(firstRetainedPage, count)
+                    var modified = false
+                    for p in 0..<upper {
+                        let pageID = st.layerPairs[li][kind].ids[p]
+                        guard pageID >= 0 else { continue }
+                        if st.layerPairs[li][kind].shared[p] {
+                            releaseSharedPage(li: li, kind: kind, page: pageID)
+                        } else if st.layerPairs[li][kind].pins[pageID, default: 0] == 0 {
+                            pool(at: li, kind).pages.freePage(Int(pageID))
+                        }
+                        st.layerPairs[li][kind].ids[p] = -1
+                        st.layerPairs[li][kind].shared[p] = false
+                        modified = true
+                        recycled += 1
+                    }
+                    if modified { uploadSlot(h.seq, li, kind, st.layerPairs[li][kind].ids) }
+                }
+            }
+            return recycled
         }
     }
 

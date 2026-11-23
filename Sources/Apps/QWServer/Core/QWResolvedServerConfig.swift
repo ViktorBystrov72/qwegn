@@ -25,6 +25,8 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
     public var gdnPrefill: String, evictPrefillScratch: String, prefillChunkSize: Int
     public var maxConcurrentSessions: Int
     public var lsaMode: String, lsaBudget: Int, lsaClusterBlock: Int, lsaSidecarPath: String
+    public var lsaCrossLoopReuse: Bool = false
+    public var lsaLoopShareStride: Int = 0
     public var warmRAMLimitGB: Double, ssdCacheEnabled: Bool, ssdCacheLimitGB: Double, cacheDir: String
     public var logDir: String, logFileName: String, logLevel: String
     public var lazy: Bool, sourceSummary: [String: String]
@@ -53,6 +55,7 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
         maxConcurrentSessions: Int = 8,
         lsaMode: String = "auto", lsaBudget: Int = QWLSAConfig.defaultBudget,
         lsaClusterBlock: Int = QWLSAConfig.defaultClusterBlock, lsaSidecarPath: String = "",
+        lsaCrossLoopReuse: Bool = false, lsaLoopShareStride: Int = 0,
         warmRAMLimitGB: Double = 4.0, ssdCacheEnabled: Bool = false, ssdCacheLimitGB: Double = 10.0, cacheDir: String = "~/.qwg/cache",
         logDir: String = "~/.qwg/logs", logFileName: String = "qwg.log", logLevel: String = "info",
         lazy: Bool = true, loadVision: Bool = false, sourceSummary: [String: String] = [:]
@@ -76,6 +79,7 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
         self.maxConcurrentSessions = max(1, min(16, maxConcurrentSessions))
         self.lsaMode = lsaMode; self.lsaBudget = lsaBudget
         self.lsaClusterBlock = lsaClusterBlock; self.lsaSidecarPath = lsaSidecarPath
+        self.lsaCrossLoopReuse = lsaCrossLoopReuse; self.lsaLoopShareStride = lsaLoopShareStride
         self.warmRAMLimitGB = warmRAMLimitGB; self.ssdCacheEnabled = ssdCacheEnabled; self.ssdCacheLimitGB = ssdCacheLimitGB; self.cacheDir = cacheDir
         self.logDir = logDir; self.logFileName = logFileName; self.logLevel = logLevel
         self.lazy = lazy; self.loadVision = loadVision; self.sourceSummary = sourceSummary
@@ -98,6 +102,7 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
     /// Cohesive Latent Sparse Attention configuration resolved for the server.
     public var lsaConfig: QWLSAConfig {
         QWLSAConfig(mode: QWLSAMode.resolve(lsaMode) ?? .off, budget: lsaBudget,
-                    clusterBlock: lsaClusterBlock, sidecarPath: lsaSidecarPath)
+                    clusterBlock: lsaClusterBlock, sidecarPath: lsaSidecarPath,
+                    crossLoopReuse: lsaCrossLoopReuse, loopShareStride: lsaLoopShareStride)
     }
 }

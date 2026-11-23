@@ -147,3 +147,124 @@ kernel void qwg_moe_group_pairs_f32(device const int* selected [[buffer(0)]],
     }
 }
 
+struct QWGemmMoEGroupBucketsParams {
+    uint experts;
+    uint totalPairs;
+    uint topK;
+    uint flags;
+    uint guGridX;
+    uint dnGridX;
+};
+
+/// Fuses pair counting sort (totalPairs <= 512, experts <= 1024) with active-bucket compaction.
+kernel void qwg_moe_group_build_buckets_f32(
+    device const int* selected [[buffer(0)]],
+    device int* expertOff [[buffer(1)]],
+    device int* sortedPairIdx [[buffer(2)]],
+    device int* sortedTok [[buffer(3)]],
+    device int* invPerm [[buffer(4)]],
+    device int* activeExperts [[buffer(5)]],
+    device uint* indirectArgs [[buffer(6)]],
+    constant QWGemmMoEGroupBucketsParams& p [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgi [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (p.experts == 0u || p.experts > 1024u || p.totalPairs > 512u) return;
+    threadgroup atomic_int tgCount[1024];
+    threadgroup int sgSumC[8], sgOffC[8], chunkTotalC;
+    threadgroup uint sgSumA[8], sgOffA[8], chunkTotalA;
+
+    for (uint e = tid; e < p.experts; e += 256u) {
+        atomic_store_explicit(&tgCount[e], 0, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int pairIdx[2] = { int(tid), int(tid) + 256 };
+    int pairRaw[2] = { -1, -1 };
+    for (uint k = 0u; k < 2u; ++k) {
+        const int i = pairIdx[k];
+        if (i < int(p.totalPairs)) {
+            const int rawS = selected[i];
+            pairRaw[k] = rawS;
+            if (rawS >= 0) {
+                const uint e = uint(rawS) & 0xFFFFu;
+                if (e < p.experts) {
+                    atomic_fetch_add_explicit(&tgCount[e], 1, memory_order_relaxed);
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int runningC = 0;
+    uint runningA = 0u;
+    for (uint base = 0u; base < p.experts; base += 256u) {
+        const uint e = base + tid;
+        const int c = (e < p.experts)
+            ? atomic_load_explicit(&tgCount[e], memory_order_relaxed) : 0;
+        const uint isAct = (c > 0) ? 1u : 0u;
+        const int laneOffC = simd_prefix_exclusive_sum(c);
+        const uint laneOffA = simd_prefix_exclusive_sum(isAct);
+        if (lane == 31u) {
+            sgSumC[sgi] = laneOffC + c;
+            sgSumA[sgi] = laneOffA + isAct;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgi == 0u) {
+            const int vc = (lane < 8u) ? sgSumC[lane] : 0;
+            const int soc = simd_prefix_exclusive_sum(vc);
+            if (lane < 8u) sgOffC[lane] = soc;
+            if (lane == 7u) chunkTotalC = soc + vc;
+            const uint va = (lane < 8u) ? sgSumA[lane] : 0u;
+            const uint soa = simd_prefix_exclusive_sum(va);
+            if (lane < 8u) sgOffA[lane] = soa;
+            if (lane == 7u) chunkTotalA = soa + va;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (e < p.experts) {
+            const int off = runningC + sgOffC[sgi] + laneOffC;
+            expertOff[e] = off;
+            atomic_store_explicit(&tgCount[e], off, memory_order_relaxed);
+            if (isAct != 0u) {
+                activeExperts[runningA + sgOffA[sgi] + laneOffA] = int(e);
+            }
+        }
+        runningC += chunkTotalC;
+        runningA += chunkTotalA;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        expertOff[p.experts] = runningC;
+        indirectArgs[0] = runningA;
+        indirectArgs[4] = (runningA > 0u) ? p.guGridX : 0u;
+        indirectArgs[5] = runningA;
+        indirectArgs[6] = (runningA > 0u) ? 1u : 0u;
+        indirectArgs[8] = (runningA > 0u) ? p.dnGridX : 0u;
+        indirectArgs[9] = runningA;
+        indirectArgs[10] = (runningA > 0u) ? 1u : 0u;
+    }
+
+    const bool writeInv = (p.flags & 1u) != 0u;
+    const bool directSlotTok = (p.flags & 2u) != 0u;
+    for (uint k = 0u; k < 2u; ++k) {
+        const int rawS = pairRaw[k];
+        if (rawS < 0) continue;
+        const uint raw = uint(rawS);
+        const uint e = raw & 0xFFFFu;
+        if (e >= p.experts) continue;
+        const int i = pairIdx[k];
+        const int at = atomic_fetch_add_explicit(&tgCount[e], 1, memory_order_relaxed);
+        sortedPairIdx[at] = i;
+        if (directSlotTok) {
+            sortedTok[at] = i;
+        } else {
+            const uint gIdx = (raw >> 16u) & 0x7Fu;
+            const uint gStride = (raw >> 23u) & 0x7Fu;
+            const int t = (p.topK > 0u) ? (i / int(p.topK)) : 0;
+            sortedTok[at] = (gStride > 0u) ? (t * int(gStride) + int(gIdx)) : t;
+        }
+        if (writeInv) invPerm[i] = at;
+    }
+}
+

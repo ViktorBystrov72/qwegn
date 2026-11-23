@@ -14,12 +14,12 @@ static inline uint qwg_shvq_sortable(float v) {
     return qw_sortable_f32_u32(v);
 }
 
-template <int BITS, int GROUP, uint ROWS>
+template <int BITS, int GROUP, uint ROWS, typename OutT = half>
 static inline void qwg_gemv_shvq_dx_body(device const char* blocks,
                                          device const half* x,
                                          uint realN,
                                          constant uint& K,
-                                         device half* y16,
+                                         device OutT* y,
                                          uint tg,
                                          uint ti,
                                          uint tptg,
@@ -40,8 +40,108 @@ static inline void qwg_gemv_shvq_dx_body(device const char* blocks,
         #pragma unroll
         for (uint r = 0u; r < ROWS; ++r) {
             const uint row = row0 + r;
-            if (row < realN) y16[row] = half(acc[r]);
+            if (row < realN) y[row] = OutT(acc[r]);
         }
+    }
+}
+
+template <int BITS, int GROUP, uint MAX_M>
+static inline void qwg_head_gemv_shvq_argmax_m_body(
+    device const char* blocks, device const half* x, device float* y,
+    uint realN, uint K, uint mRows, uint row0, uint tg, uint ti, uint sg, uint lane,
+    bool skipY, threadgroup const ShvqTgLut<BITS> &tgLut,
+    threadgroup uint* sh, threadgroup uint* sl,
+    device uint* keysHi, device uint* keysLo) {
+    float4 acc[MAX_M];
+    if (row0 < realN) {
+        qwg_gemv_shvq_rows4_m_acc<BITS, GROUP, MAX_M>(
+            blocks, x, row0, realN, K, mRows, lane, tgLut, acc);
+    } else {
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) acc[m] = float4(-INFINITY);
+    }
+    if (lane == 0u && sg < QW_SHVQ_HEAD_C) {
+        for (uint m = 0u; m < MAX_M; ++m) {
+            if (m >= mRows) break;
+            uint bh = qwg_shvq_sortable(-INFINITY), bl = 0u;
+            const float4 am = acc[m];
+            const float vals[4] = { am.x, am.y, am.z, am.w };
+            #pragma unroll
+            for (uint r = 0u; r < 4u; ++r) {
+                const uint row = row0 + r;
+                if (row < realN) {
+                    const float v = vals[r];
+                    if (!skipY) y[size_t(m) * realN + row] = v;
+                    const uint kh = qwg_shvq_sortable(v);
+                    const uint kl = ~row;
+                    if (kh > bh || (kh == bh && kl > bl)) { bh = kh; bl = kl; }
+                }
+            }
+            sh[m * QW_SHVQ_HEAD_C + sg] = bh;
+            sl[m * QW_SHVQ_HEAD_C + sg] = bl;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ti < mRows) {
+        const uint base = ti * QW_SHVQ_HEAD_C;
+        uint bh = sh[base], bl = sl[base];
+        for (uint q = 1u; q < QW_SHVQ_HEAD_C; ++q) {
+            const uint kh = sh[base + q], kl = sl[base + q];
+            if (kh > bh || (kh == bh && kl > bl)) { bh = kh; bl = kl; }
+        }
+        const uint slots = (realN + 31u) >> 5u;
+        keysHi[size_t(ti) * slots + tg] = bh;
+        keysLo[size_t(ti) * slots + tg] = bl;
+    }
+}
+
+template <int BITS, int GROUP>
+static inline void qwg_head_gemv_shvq_argmax_m16_body(
+    device const char* blocks, device const half* x, device float* y,
+    uint realN, uint K, uint mRows, uint row0, uint tg, uint ti, uint sg, uint lane,
+    bool skipY, threadgroup const ShvqTgLut<BITS> &tgLut,
+    threadgroup uint* sh, threadgroup uint* sl,
+    device uint* keysHi, device uint* keysLo) {
+    float2 acc[16];
+    if (row0 < realN) {
+        qwg_gemv_shvq_rows2_m16_acc<BITS, GROUP>(
+            blocks, x, row0, realN, K, mRows, lane, tgLut, acc);
+    } else {
+        #pragma unroll
+        for (uint m = 0u; m < 16u; ++m) acc[m] = float2(-INFINITY);
+    }
+    if (lane == 0u && sg < QW_SHVQ_HEAD_C) {
+        for (uint m = 0u; m < 16u; ++m) {
+            if (m >= mRows) break;
+            uint bh = qwg_shvq_sortable(-INFINITY), bl = 0u;
+            const float2 am = acc[m];
+            const float vals[2] = { am.x, am.y };
+            #pragma unroll
+            for (uint r = 0u; r < 2u; ++r) {
+                const uint row = row0 + r;
+                if (row < realN) {
+                    const float v = vals[r];
+                    if (!skipY) y[size_t(m) * realN + row] = v;
+                    const uint kh = qwg_shvq_sortable(v);
+                    const uint kl = ~row;
+                    if (kh > bh || (kh == bh && kl > bl)) { bh = kh; bl = kl; }
+                }
+            }
+            sh[m * QW_SHVQ_HEAD_C + sg] = bh;
+            sl[m * QW_SHVQ_HEAD_C + sg] = bl;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ti < mRows) {
+        const uint base = ti * QW_SHVQ_HEAD_C;
+        uint bh = sh[base], bl = sl[base];
+        for (uint q = 1u; q < QW_SHVQ_HEAD_C; ++q) {
+            const uint kh = sh[base + q], kl = sl[base + q];
+            if (kh > bh || (kh == bh && kl > bl)) { bh = kh; bl = kl; }
+        }
+        const uint slots = (realN + 15u) >> 4u;
+        keysHi[size_t(ti) * slots + tg] = bh;
+        keysLo[size_t(ti) * slots + tg] = bl;
     }
 }
 
@@ -63,24 +163,70 @@ static inline void qwg_gemv_shvq_dx_body(device const char* blocks,
             threadgroup_barrier(mem_flags::mem_threadgroup);                            \
         }                                                                               \
         if ((N & 0x40000000u) != 0u) {                                                  \
-            const uint mRows = (N >> 24u) & 0x3Fu;                                      \
+            const bool outBF16 = (N & 0x20000000u) != 0u;                               \
+            const bool twoRows = (N & 0x80000000u) != 0u;                               \
+            const uint mRows = (N >> 24u) & 0x1Fu;                                      \
+            const uint realN = N & 0x00FFFFFFu;                                         \
             if (mRows >= 2u) {                                                          \
-                const uint realN = N & 0x00FFFFFFu;                                     \
                 const uint simdPerTG = max(1u, tptg >> 5u);                             \
                 const uint row0 = (tg * simdPerTG + (ti >> 5u)) * 4u;                   \
                 if (row0 < realN) {                                                     \
-                    qwg_gemv_shvq_rows4_m<BITS, GROUP, half>(                           \
-                        blocks, x, y16, row0, realN, K, mRows, ti & 31u, tgLut);        \
+                    if (outBF16) {                                                      \
+                        qwg_gemv_shvq_rows4_m<BITS, GROUP, bfloat, 8u>(                 \
+                            blocks, x, (device bfloat*)y16, row0, realN, K, mRows,      \
+                            ti & 31u, tgLut);                                           \
+                    } else {                                                            \
+                        qwg_gemv_shvq_rows4_m<BITS, GROUP, half, 8u>(                   \
+                            blocks, x, y16, row0, realN, K, mRows, ti & 31u, tgLut);    \
+                    }                                                                   \
+                }                                                                       \
+            } else if (outBF16) {                                                       \
+                if (twoRows) {                                                          \
+                    qwg_gemv_shvq_dx_body<BITS, GROUP, 2u, bfloat>(                     \
+                        blocks, x, realN, K, (device bfloat*)y16, tg, ti, tptg, tgLut); \
+                } else {                                                                \
+                    qwg_gemv_shvq_dx_body<BITS, GROUP, 4u, bfloat>(                     \
+                        blocks, x, realN, K, (device bfloat*)y16, tg, ti, tptg, tgLut); \
                 }                                                                       \
             } else {                                                                    \
-                qwg_gemv_shvq_dx_body<BITS, GROUP, 4u>(blocks, x, N & 0x3FFFFFFFu,      \
-                                                       K, y16, tg, ti, tptg, tgLut);    \
+                qwg_gemv_shvq_dx_body<BITS, GROUP, 4u, half>(                           \
+                    blocks, x, realN, K, y16, tg, ti, tptg, tgLut);                     \
             }                                                                           \
         } else if ((N & 0x80000000u) != 0u) {                                           \
             qwg_gemv_shvq_dx_body<BITS, GROUP, 2u>(blocks, x, N & 0x7FFFFFFFu,          \
                                                    K, y16, tg, ti, tptg, tgLut);        \
         } else {                                                                        \
             qwg_gemv_shvq_dx_body<BITS, GROUP, 1u>(blocks, x, N, K, y16, tg, ti, tptg, tgLut); \
+        }                                                                               \
+    }                                                                                   \
+    kernel void qwg_gemv_shvq##BITS##_g##GROUP##_dx_h16_t4_m4(                          \
+        device const char* blocks [[buffer(0)]],                                        \
+        device const half* x      [[buffer(1)]],                                        \
+        device float*      y32    [[buffer(3)]],                                        \
+        constant uint&     N      [[buffer(4)]],                                        \
+        constant uint&     K      [[buffer(5)]],                                        \
+        device half*       y16    [[buffer(8)]],                                        \
+        uint tg   [[threadgroup_position_in_grid]],                                     \
+        uint ti   [[thread_index_in_threadgroup]],                                      \
+        uint tptg [[threads_per_threadgroup]]) {                                        \
+        (void)y32;                                                                      \
+        threadgroup ShvqTgLut<BITS> tgLut;                                              \
+        if constexpr (BITS <= 3) {                                                      \
+            tgLut.load(ti, tptg);                                                       \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                            \
+        }                                                                               \
+        const bool outBF16 = (N & 0x20000000u) != 0u;                                   \
+        const uint mRows = (N >> 24u) & 0x1Fu;                                          \
+        const uint realN = N & 0x00FFFFFFu;                                             \
+        const uint simdPerTG = max(1u, tptg >> 5u);                                     \
+        const uint row0 = (tg * simdPerTG + (ti >> 5u)) * 4u;                           \
+        if (row0 >= realN) return;                                                      \
+        if (outBF16) {                                                                  \
+            qwg_gemv_shvq_rows4_m<BITS, GROUP, bfloat, 4u>(                             \
+                blocks, x, (device bfloat*)y16, row0, realN, K, mRows, ti & 31u, tgLut); \
+        } else {                                                                        \
+            qwg_gemv_shvq_rows4_m<BITS, GROUP, half, 4u>(                               \
+                blocks, x, y16, row0, realN, K, mRows, ti & 31u, tgLut);                \
         }                                                                               \
     }                                                                                   \
     kernel void qwg_gemv_shvq##BITS##_g##GROUP##_v4(                                    \
@@ -105,7 +251,8 @@ static inline void qwg_gemv_shvq_dx_body(device const char* blocks,
             const uint realN = N & 0x00FFFFFFu;                                         \
             const uint row0 = (tg * simdPerTG + simdId) * 4u;                           \
             if (row0 >= realN) return;                                                  \
-            qwg_gemv_shvq_rows4_m<BITS, GROUP>(blocks, x, y, row0, realN, K, mRows, lane, tgLut); \
+            qwg_gemv_shvq_rows4_m<BITS, GROUP, float, 8u>(                              \
+                blocks, x, y, row0, realN, K, mRows, lane, tgLut);                      \
         } else if ((N & 0x40000000u) != 0u) {                                           \
             const uint realN = N & 0x3FFFFFFFu;                                         \
             const uint row0 = (tg * simdPerTG + simdId) * 4u;                           \
@@ -126,6 +273,58 @@ static inline void qwg_gemv_shvq_dx_body(device const char* blocks,
             if (lane == 0u) y[row] = v;                                                 \
         }                                                                               \
     }                                                                                   \
+    kernel void qwg_head_gemv_shvq##BITS##_g##GROUP##_argmax_m4(                        \
+        device const char* blocks [[buffer(0)]],                                        \
+        device const half* x      [[buffer(1)]],                                        \
+        device float*      y      [[buffer(3)]],                                        \
+        constant uint&     N      [[buffer(4)]],                                        \
+        constant uint&     K      [[buffer(5)]],                                        \
+        device uint*       keysHi [[buffer(6)]],                                        \
+        device uint*       keysLo [[buffer(7)]],                                        \
+        uint tg [[threadgroup_position_in_grid]],                                       \
+        uint ti [[thread_index_in_threadgroup]]) {                                      \
+        const uint sg = ti >> 5u;                                                       \
+        const uint lane = ti & 31u;                                                     \
+        threadgroup ShvqTgLut<BITS> tgLut;                                              \
+        if constexpr (BITS <= 3) {                                                      \
+            tgLut.load(ti, QW_SHVQ_HEAD_C * 32u);                                       \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                            \
+        }                                                                               \
+        threadgroup uint sh[4u * QW_SHVQ_HEAD_C], sl[4u * QW_SHVQ_HEAD_C];              \
+        const bool skipY = (N & 0x40000000u) != 0u;                                     \
+        const uint mRows = (N >> 24u) & 0x1Fu;                                          \
+        const uint realN = N & 0x00FFFFFFu;                                             \
+        const uint row0 = (tg * QW_SHVQ_HEAD_C + sg) * 4u;                              \
+        qwg_head_gemv_shvq_argmax_m_body<BITS, GROUP, 4u>(                              \
+            blocks, x, y, realN, K, mRows, row0, tg, ti, sg, lane,                      \
+            skipY, tgLut, sh, sl, keysHi, keysLo);                                      \
+    }                                                                                   \
+    kernel void qwg_head_gemv_shvq##BITS##_g##GROUP##_argmax_m16(                       \
+        device const char* blocks [[buffer(0)]],                                        \
+        device const half* x      [[buffer(1)]],                                        \
+        device float*      y      [[buffer(3)]],                                        \
+        constant uint&     N      [[buffer(4)]],                                        \
+        constant uint&     K      [[buffer(5)]],                                        \
+        device uint*       keysHi [[buffer(6)]],                                        \
+        device uint*       keysLo [[buffer(7)]],                                        \
+        uint tg [[threadgroup_position_in_grid]],                                       \
+        uint ti [[thread_index_in_threadgroup]]) {                                      \
+        const uint sg = ti >> 5u;                                                       \
+        const uint lane = ti & 31u;                                                     \
+        threadgroup ShvqTgLut<BITS> tgLut;                                              \
+        if constexpr (BITS <= 3) {                                                      \
+            tgLut.load(ti, QW_SHVQ_HEAD_C * 32u);                                       \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                            \
+        }                                                                               \
+        threadgroup uint sh[16u * QW_SHVQ_HEAD_C], sl[16u * QW_SHVQ_HEAD_C];            \
+        const bool skipY = (N & 0x40000000u) != 0u;                                     \
+        const uint mRows = (N >> 24u) & 0x1Fu;                                          \
+        const uint realN = N & 0x00FFFFFFu;                                             \
+        const uint row0 = (tg * QW_SHVQ_HEAD_C + sg) * 2u;                              \
+        qwg_head_gemv_shvq_argmax_m16_body<BITS, GROUP>(                                \
+            blocks, x, y, realN, K, mRows, row0, tg, ti, sg, lane,                      \
+            skipY, tgLut, sh, sl, keysHi, keysLo);                                      \
+    }                                                                                   \
     kernel void qwg_head_gemv_shvq##BITS##_g##GROUP##_argmax(                           \
         device const char* blocks [[buffer(0)]],                                        \
         device const half* x      [[buffer(1)]],                                        \
@@ -143,11 +342,18 @@ static inline void qwg_gemv_shvq_dx_body(device const char* blocks,
             tgLut.load(ti, QW_SHVQ_HEAD_C * 32u);                                       \
             threadgroup_barrier(mem_flags::mem_threadgroup);                            \
         }                                                                               \
-        threadgroup uint sh[QW_SHVQ_HEAD_C], sl[QW_SHVQ_HEAD_C];                        \
+        threadgroup uint sh[8u * QW_SHVQ_HEAD_C], sl[8u * QW_SHVQ_HEAD_C];              \
         const bool skipY = (N & 0x40000000u) != 0u;                                     \
         if ((N & 0x80000000u) != 0u) {                                                  \
-            const uint realN = N & 0x3FFFFFFFu;                                         \
+            const uint mRows = (N >> 24u) & 0x1Fu;                                      \
+            const uint realN = N & 0x00FFFFFFu;                                         \
             const uint row0 = (tg * QW_SHVQ_HEAD_C + sg) * 4u;                          \
+            if (mRows >= 2u) {                                                          \
+                qwg_head_gemv_shvq_argmax_m_body<BITS, GROUP, 8u>(                      \
+                    blocks, x, y, realN, K, mRows, row0, tg, ti, sg, lane,              \
+                    skipY, tgLut, sh, sl, keysHi, keysLo);                              \
+                return;                                                                 \
+            }                                                                           \
             const float4 vx = (row0 < realN)                                            \
                 ? qwg_gemv_shvq_rowsN_tg<BITS, GROUP, 4u>(blocks, x, row0, realN, K, lane, tgLut) \
                 : float4(-INFINITY);                                                    \

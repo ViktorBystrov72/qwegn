@@ -19,6 +19,7 @@ kernel void qwg_attn_prefill_paged_general(const device half* qgate [[buffer(0)]
                                            device half*       outp  [[buffer(5)]],
                                            constant uint&     pos   [[buffer(6)]],
                                            constant uint&     q8mode [[buffer(7)]],
+                                           constant uint&     slidingWindow [[buffer(8)]],
                                            uint tid [[thread_index_in_threadgroup]],
                                            uint3 tg [[threadgroup_position_in_grid]]) {
     const uint head = tg.x;                       // the q head
@@ -49,12 +50,13 @@ kernel void qwg_attn_prefill_paged_general(const device half* qgate [[buffer(0)]
     const uint kvRow = QW_FC_KV_ROW;
     const uint kvPgel = QW_FC_KV_PGEL;
     const uint kvEnd = pos + qi + 1u;              // causal: [0, pos+qi]
+    const uint kvStart = (slidingWindow > 0u && kvEnd > slidingWindow) ? (kvEnd - slidingWindow) : 0u;
 
     float m = -1e30f, lsum = 0.0f;
     float acc[8];
     for (uint i = 0; i < 8u; i++) acc[i] = 0.0f;
 
-    for (uint j = 0; j < kvEnd; j++) {
+    for (uint j = kvStart; j < kvEnd; j++) {
         // The page table's indirection: a physical page id, then the row.
         const uint page = j >> 8, slot = j & 255u;
         const uint pk = (uint)ktab[page];

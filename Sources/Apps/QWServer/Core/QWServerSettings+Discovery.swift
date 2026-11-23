@@ -197,11 +197,15 @@ extension QWServerSettings {
 
     /// Scans ~/.qwg/models and the Hugging Face hub cache for installed primary model packs.
     public static func scanModelsDirectory() -> [DiscoveredModel] {
-        QWModelCatalog.scanInstalledPrimaryModels().map { e in
+        let drafters = scanDrafterModelsDirectory()
+        return QWModelCatalog.scanInstalledPrimaryModels().map { e in
             var caps = Set(e.capabilities.map(\.rawValue))
-            if e.supported, let family = e.family,
-               QWModuleRegistry.capabilities(for: family).contains(.dflash) || family == .qwen38FlashNext {
-                caps.insert(QWKnobCapability.dflash.rawValue)
+            if e.supported {
+                let hasMatchedDrafter = loadPrimaryDescriptor(packPath: e.path)
+                    .map { !compatibleDrafterModels(for: $0, in: drafters).isEmpty } ?? false
+                if e.capabilities.contains(.mtp) || hasMatchedDrafter {
+                    caps.insert(QWKnobCapability.dflash.rawValue)
+                }
             }
             return DiscoveredModel(name: e.name, packPath: e.path, family: e.family?.rawValue,
                                    nativeWindow: e.nativeWindow, supported: e.supported, reason: e.reason,
@@ -344,24 +348,17 @@ extension QWServerSettings {
         discoveredModel: DiscoveredModel? = nil,
         drafters: [DiscoveredModel] = []
     ) -> Bool {
-        if let disc = discoveredModel, disc.capabilities.contains(QWKnobCapability.dflash.rawValue) {
+        if let disc = discoveredModel,
+           disc.capabilities.contains(QWKnobCapability.dflash.rawValue)
+            || disc.capabilities.contains("mtp") {
             return true
         }
         if let desc = descriptor {
-            if QWModuleRegistry.capabilities(for: desc.family).contains(.dflash)
-                || desc.family == .qwen38FlashNext {
-                return true
-            }
-            return !compatibleDrafterModels(for: desc, in: drafters).isEmpty
+            return desc.capabilities.contains(.mtp)
+                || !compatibleDrafterModels(for: desc, in: drafters).isEmpty
         }
-        if let disc = discoveredModel {
-            if let famRaw = disc.family, let fam = QWModelDescriptor.Family(rawValue: famRaw) {
-                return QWModuleRegistry.capabilities(for: fam).contains(.dflash)
-                    || fam == .qwen38FlashNext
-            }
-            if !disc.capabilities.isEmpty {
-                return disc.capabilities.contains(QWKnobCapability.dflash.rawValue)
-            }
+        if discoveredModel != nil {
+            return false
         }
         return true
     }

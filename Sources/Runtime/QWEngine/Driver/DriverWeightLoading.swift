@@ -95,7 +95,10 @@ extension QWEngineDriver {
         }
 
         var isMLXCheckpoint: Bool {
-            st?.isMLXCheckpoint == true
+            guard let st else { return false }
+            return st.isMLXCheckpoint
+                || (st.tensors.keys.contains { $0.hasSuffix(".scales") }
+                    && st.tensors.keys.contains { $0.hasSuffix(".biases") })
         }
 
         mutating func allocateWeight(_ shape: QWTensorShape) throws -> QWTensorValue {
@@ -104,44 +107,82 @@ extension QWEngineDriver {
             weightRequest += 1
             return tensor
         }
-        // ── W2: embed + lm_head bf16 → f16 (device gather, chunked upload) ──
+        // ── W2: embed + lm_head bf16/f16/f32 → f16 (device gather, chunked upload) ──
         mutating func convertBF16(_ name: String) throws -> QWTensorValue {
             let name = resolveName(name)
-            guard let pk, let io else {
-                throw QWEngineDriverError.weightMissing(name, "convertBF16 requires a QWP pack")
-            }
-            let e = try pk.entry(name)
-            guard e.rawOff != nil else {
-                throw QWEngineDriverError.weightMissing(name, "not a bf16 raw plane")
-            }
-            let total = e.shape.reduce(1, *)
-            let dst = try allocateWeight(QWTensorShape([total], .f16))
-            // THE GRID LAW: threadgroups-per-dimension ≤ 65535 (Metal cap;
-            // an over-cap dispatch silently no-ops — half a matrix would
-            // upload as zeros). 65535·256 elems = 32 MB bf16 per chunk.
+            // THE GRID LAW: threadgroups-per-dimension <= 65535 (32 MB bf16 per chunk).
             let chunk = 65535 * 256
-            guard let tmp = hl.device.makeBuffer(length: chunk * 2, options: .storageModeShared) else {
-                throw QWEngineDriverError.state("bf16 conversion staging buffer allocation failed")
+            func convertChunks(total: Int, dst: QWTensorValue,
+                               loadChunk: (Int, Int, UnsafeMutableRawPointer) throws -> Void) throws {
+                guard let tmp = hl.device.makeBuffer(length: chunk * 2, options: .storageModeShared) else {
+                    throw QWEngineDriverError.state("bf16 conversion staging buffer allocation failed")
+                }
+                var done = 0
+                while done < total {
+                    let n = min(chunk, total - done)
+                    try loadChunk(done, n, tmp.contents())
+                    guard let (cb, enc) = hl.begin() else { throw QWEngineDriverError.state("cmdbuffer") }
+                    var start = UInt32(0), nn = UInt32(n)
+                    enc.setComputePipelineState(psoCvt)
+                    enc.setBuffer(tmp, offset: 0, index: 0)          // bf16 bytes (ushort)
+                    enc.setBuffer(dst.region.buffer,
+                                  offset: dst.region.base + dst.offset + done * 2, index: 1)
+                    enc.setBytes(&start, length: 4, index: 2)
+                    enc.setBytes(&nn, length: 4, index: 3)
+                    enc.dispatchThreadgroups(MTLSize(width: (n + 255) / 256, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                    hl.end(cb, enc); cb.waitUntilCompleted()
+                    if let e = cb.error { throw QWEngineDriverError.state("bf16→f16 cb: \(e.localizedDescription)") }
+                    done += n
+                }
             }
-            var done = 0
-            while done < total {
-                let n = min(chunk, total - done)
-                try io.loadRaw(name, elemOffset: done, elems: n, into: tmp.contents())
-                guard let (cb, enc) = hl.begin() else { throw QWEngineDriverError.state("cmdbuffer") }
-                var start = UInt32(0), nn = UInt32(n)
-                enc.setComputePipelineState(psoCvt)
-                enc.setBuffer(tmp, offset: 0, index: 0)          // bf16 bytes (ushort)
-                enc.setBuffer(dst.region.buffer,
-                              offset: dst.region.base + dst.offset + done * 2, index: 1)
-                enc.setBytes(&start, length: 4, index: 2)
-                enc.setBytes(&nn, length: 4, index: 3)
-                enc.dispatchThreadgroups(MTLSize(width: (n + 255) / 256, height: 1, depth: 1),
-                                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-                hl.end(cb, enc); cb.waitUntilCompleted()
-                // H3 FIX (load path): a failed conversion chunk would
-                // silently upload zeros into embed/head — throw.
-                if let e = cb.error { throw QWEngineDriverError.state("bf16→f16 cb: \(e.localizedDescription)") }
-                done += n
+            if let pk, let io {
+                let e = try pk.entry(name)
+                guard e.rawOff != nil else {
+                    throw QWEngineDriverError.weightMissing(name, "not a bf16 raw plane")
+                }
+                let total = e.shape.reduce(1, *)
+                let dst = try allocateWeight(QWTensorShape([total], .f16))
+                try convertChunks(total: total, dst: dst) { done, n, outPtr in
+                    try io.loadRaw(name, elemOffset: done, elems: n, into: outPtr)
+                }
+                return dst
+            }
+            guard let st, let info = st.tensor(name) else {
+                throw QWEngineDriverError.weightMissing(name, "convertBF16 requires a QWP pack or SafeTensors tensor")
+            }
+            let total = info.elementCount ?? info.shape.reduce(1, *)
+            let dst = try allocateWeight(QWTensorShape([total], .f16))
+            let reader = try st.reader(of: name)
+            switch info.dtype {
+            case .bf16:
+                try reader.withBytes { raw in
+                    guard raw.count >= total * 2, let base = raw.baseAddress else {
+                        throw QWEngineDriverError.weightMissing(name, "bf16 tensor byte length mismatch")
+                    }
+                    try convertChunks(total: total, dst: dst) { done, n, outPtr in
+                        outPtr.copyMemory(from: base.advanced(by: done * 2), byteCount: n * 2)
+                    }
+                }
+            case .f16:
+                try reader.withBytes { raw in
+                    guard raw.count >= total * 2, let base = raw.baseAddress else {
+                        throw QWEngineDriverError.weightMissing(name, "f16 tensor byte length mismatch")
+                    }
+                    dst.region.buffer.contents()
+                        .advanced(by: dst.region.base + dst.offset)
+                        .copyMemory(from: base, byteCount: total * 2)
+                }
+            case .f32:
+                let floats = try st.readFloats(name, expectedElementCount: total)
+                let dstPtr = dst.region.buffer.contents()
+                    .advanced(by: dst.region.base + dst.offset)
+                    .assumingMemoryBound(to: UInt16.self)
+                for idx in 0..<total {
+                    dstPtr[idx] = QWQuant.f32tof16Bits(floats[idx])
+                }
+            default:
+                throw QWEngineDriverError.weightMissing(name, "expected bf16/f16 raw plane, got \(info.dtype.rawValue)")
             }
             return dst
         }
@@ -250,13 +291,20 @@ extension QWEngineDriver {
         /// HF checkpoint stores γ itself, so it becomes `γ − 1` here.
         func normGammaBits(_ name: String, _ elems: Int) throws -> [UInt16] {
             let src = try rawFloats(name, elems)
-            let shift: Float = (geometry.normGammaIsPlusOne && !isMLXCheckpoint) ? 0.0 : 1.0
+            let shift = QWCheckpointTensorLoader.normGammaShift(
+                normGammaIsPlusOne: geometry.normGammaIsPlusOne,
+                isMLXCheckpoint: isMLXCheckpoint
+            )
             return src.map { QWQuant.f32tof16Bits($0 - shift) }
         }
 
         /// A norm gamma, stored the way the engine's norm law reads it.
         mutating func f16wNorm(_ name: String, _ elems: Int) throws -> QWTensorValue {
-            guard !geometry.normGammaIsPlusOne || isMLXCheckpoint else { return try f16w(name, elems) }
+            let shift = QWCheckpointTensorLoader.normGammaShift(
+                normGammaIsPlusOne: geometry.normGammaIsPlusOne,
+                isMLXCheckpoint: isMLXCheckpoint
+            )
+            guard shift != 0 else { return try f16w(name, elems) }
             let bits = try normGammaBits(name, elems)
             let t = try allocateWeight(QWTensorShape([elems], .f16))
             bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in

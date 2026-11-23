@@ -1,0 +1,363 @@
+// qw_dequant_fp.metalh — Constant-cache LUTs (2.5 KiB << 32 KiB) & branchless SIMD unpack + BF16 GEMV helpers.
+#pragma once
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+struct QWGemmFPBF16Params {
+    uint M, N, K, strideX, strideY, inIsF32, outIsF32, addResidual;
+    float softcap;
+};
+
+struct QWGemmFPCompactMoEParams {
+    uint N, K, topK, numExperts, wExpertRows, upRowBias, inDtype, outDtype, flags;
+    float gateCap, upCap;
+};
+
+/// IEEE-754 round-to-nearest-even float -> bfloat conversion.
+inline bfloat qwg_fp_bf16(float v) {
+    uint u = as_type<uint>(v);
+    if ((u & 0x7F800000u) == 0x7F800000u) return bfloat(v);
+    u = u + 0x7FFFu + ((u >> 16u) & 1u);
+    return bfloat(as_type<float>(u & 0xFFFF0000u));
+}
+
+inline float qwg_fp_dot4_init(float4 a, float4 b) {
+    return fma(a.w, b.w, fma(a.z, b.z, fma(a.y, b.y, a.x * b.x)));
+}
+
+inline float qwg_fp_dot4_fma(float4 a, float4 b, float acc) {
+    return fma(a.w, b.w, fma(a.z, b.z, fma(a.y, b.y, fma(a.x, b.x, acc))));
+}
+
+inline float qwg_fp_dot8_fma(float4 w0, float4 w1, float4 x0, float4 x1, float acc) {
+    return qwg_fp_dot4_fma(w1, x1, qwg_fp_dot4_fma(w0, x0, acc));
+}
+
+static constant float kQWGFP8E4M3FN[256] = {
+    0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
+    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
+    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
+    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,
+    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,
+    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,
+    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,
+    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,
+    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,
+    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,
+    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,
+    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,
+    256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, NAN,
+    -0.0f, -0.001953125f, -0.00390625f, -0.005859375f, -0.0078125f, -0.009765625f, -0.01171875f, -0.013671875f,
+    -0.015625f, -0.017578125f, -0.01953125f, -0.021484375f, -0.0234375f, -0.025390625f, -0.02734375f, -0.029296875f,
+    -0.03125f, -0.03515625f, -0.0390625f, -0.04296875f, -0.046875f, -0.05078125f, -0.0546875f, -0.05859375f,
+    -0.0625f, -0.0703125f, -0.078125f, -0.0859375f, -0.09375f, -0.1015625f, -0.109375f, -0.1171875f,
+    -0.125f, -0.140625f, -0.15625f, -0.171875f, -0.1875f, -0.203125f, -0.21875f, -0.234375f,
+    -0.25f, -0.28125f, -0.3125f, -0.34375f, -0.375f, -0.40625f, -0.4375f, -0.46875f,
+    -0.5f, -0.5625f, -0.625f, -0.6875f, -0.75f, -0.8125f, -0.875f, -0.9375f,
+    -1.0f, -1.125f, -1.25f, -1.375f, -1.5f, -1.625f, -1.75f, -1.875f,
+    -2.0f, -2.25f, -2.5f, -2.75f, -3.0f, -3.25f, -3.5f, -3.75f,
+    -4.0f, -4.5f, -5.0f, -5.5f, -6.0f, -6.5f, -7.0f, -7.5f,
+    -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,
+    -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f,
+    -32.0f, -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f,
+    -64.0f, -72.0f, -80.0f, -88.0f, -96.0f, -104.0f, -112.0f, -120.0f,
+    -128.0f, -144.0f, -160.0f, -176.0f, -192.0f, -208.0f, -224.0f, -240.0f,
+    -256.0f, -288.0f, -320.0f, -352.0f, -384.0f, -416.0f, -448.0f, NAN
+};
+
+static constant half kQWGFP8E4M3FN_H[256] = {
+    0.0h, 0.001953125h, 0.00390625h, 0.005859375h, 0.0078125h, 0.009765625h, 0.01171875h, 0.013671875h,
+    0.015625h, 0.017578125h, 0.01953125h, 0.021484375h, 0.0234375h, 0.025390625h, 0.02734375h, 0.029296875h,
+    0.03125h, 0.03515625h, 0.0390625h, 0.04296875h, 0.046875h, 0.05078125h, 0.0546875h, 0.05859375h,
+    0.0625h, 0.0703125h, 0.078125h, 0.0859375h, 0.09375h, 0.1015625h, 0.109375h, 0.1171875h,
+    0.125h, 0.140625h, 0.15625h, 0.171875h, 0.1875h, 0.203125h, 0.21875h, 0.234375h,
+    0.25h, 0.28125h, 0.3125h, 0.34375h, 0.375h, 0.40625h, 0.4375h, 0.46875h,
+    0.5h, 0.5625h, 0.625h, 0.6875h, 0.75h, 0.8125h, 0.875h, 0.9375h,
+    1.0h, 1.125h, 1.25h, 1.375h, 1.5h, 1.625h, 1.75h, 1.875h,
+    2.0h, 2.25h, 2.5h, 2.75h, 3.0h, 3.25h, 3.5h, 3.75h,
+    4.0h, 4.5h, 5.0h, 5.5h, 6.0h, 6.5h, 7.0h, 7.5h,
+    8.0h, 9.0h, 10.0h, 11.0h, 12.0h, 13.0h, 14.0h, 15.0h,
+    16.0h, 18.0h, 20.0h, 22.0h, 24.0h, 26.0h, 28.0h, 30.0h,
+    32.0h, 36.0h, 40.0h, 44.0h, 48.0h, 52.0h, 56.0h, 60.0h,
+    64.0h, 72.0h, 80.0h, 88.0h, 96.0h, 104.0h, 112.0h, 120.0h,
+    128.0h, 144.0h, 160.0h, 176.0h, 192.0h, 208.0h, 224.0h, 240.0h,
+    256.0h, 288.0h, 320.0h, 352.0h, 384.0h, 416.0h, 448.0h, half(NAN),
+    -0.0h, -0.001953125h, -0.00390625h, -0.005859375h, -0.0078125h, -0.009765625h, -0.01171875h, -0.013671875h,
+    -0.015625h, -0.017578125h, -0.01953125h, -0.021484375h, -0.0234375h, -0.025390625h, -0.02734375h, -0.029296875h,
+    -0.03125h, -0.03515625h, -0.0390625h, -0.04296875h, -0.046875h, -0.05078125h, -0.0546875h, -0.05859375h,
+    -0.0625h, -0.0703125h, -0.078125h, -0.0859375h, -0.09375h, -0.1015625h, -0.109375h, -0.1171875h,
+    -0.125h, -0.140625h, -0.15625h, -0.171875h, -0.1875h, -0.203125h, -0.21875h, -0.234375h,
+    -0.25h, -0.28125h, -0.3125h, -0.34375h, -0.375h, -0.40625h, -0.4375h, -0.46875h,
+    -0.5h, -0.5625h, -0.625h, -0.6875h, -0.75h, -0.8125h, -0.875h, -0.9375h,
+    -1.0h, -1.125h, -1.25h, -1.375h, -1.5h, -1.625h, -1.75h, -1.875h,
+    -2.0h, -2.25h, -2.5h, -2.75h, -3.0h, -3.25h, -3.5h, -3.75h,
+    -4.0h, -4.5h, -5.0h, -5.5h, -6.0h, -6.5h, -7.0h, -7.5h,
+    -8.0h, -9.0h, -10.0h, -11.0h, -12.0h, -13.0h, -14.0h, -15.0h,
+    -16.0h, -18.0h, -20.0h, -22.0h, -24.0h, -26.0h, -28.0h, -30.0h,
+    -32.0h, -36.0h, -40.0h, -44.0h, -48.0h, -52.0h, -56.0h, -60.0h,
+    -64.0h, -72.0h, -80.0h, -88.0h, -96.0h, -104.0h, -112.0h, -120.0h,
+    -128.0h, -144.0h, -160.0h, -176.0h, -192.0h, -208.0h, -224.0h, -240.0h,
+    -256.0h, -288.0h, -320.0h, -352.0h, -384.0h, -416.0h, -448.0h, half(NAN)
+};
+
+static constant half2 kQWGFP4Pair_H2[256] = {
+    half2(0.0h, 0.0h), half2(0.5h, 0.0h), half2(1.0h, 0.0h), half2(1.5h, 0.0h), half2(2.0h, 0.0h), half2(3.0h, 0.0h), half2(4.0h, 0.0h), half2(6.0h, 0.0h),
+    half2(-0.0h, 0.0h), half2(-0.5h, 0.0h), half2(-1.0h, 0.0h), half2(-1.5h, 0.0h), half2(-2.0h, 0.0h), half2(-3.0h, 0.0h), half2(-4.0h, 0.0h), half2(-6.0h, 0.0h),
+    half2(0.0h, 0.5h), half2(0.5h, 0.5h), half2(1.0h, 0.5h), half2(1.5h, 0.5h), half2(2.0h, 0.5h), half2(3.0h, 0.5h), half2(4.0h, 0.5h), half2(6.0h, 0.5h),
+    half2(-0.0h, 0.5h), half2(-0.5h, 0.5h), half2(-1.0h, 0.5h), half2(-1.5h, 0.5h), half2(-2.0h, 0.5h), half2(-3.0h, 0.5h), half2(-4.0h, 0.5h), half2(-6.0h, 0.5h),
+    half2(0.0h, 1.0h), half2(0.5h, 1.0h), half2(1.0h, 1.0h), half2(1.5h, 1.0h), half2(2.0h, 1.0h), half2(3.0h, 1.0h), half2(4.0h, 1.0h), half2(6.0h, 1.0h),
+    half2(-0.0h, 1.0h), half2(-0.5h, 1.0h), half2(-1.0h, 1.0h), half2(-1.5h, 1.0h), half2(-2.0h, 1.0h), half2(-3.0h, 1.0h), half2(-4.0h, 1.0h), half2(-6.0h, 1.0h),
+    half2(0.0h, 1.5h), half2(0.5h, 1.5h), half2(1.0h, 1.5h), half2(1.5h, 1.5h), half2(2.0h, 1.5h), half2(3.0h, 1.5h), half2(4.0h, 1.5h), half2(6.0h, 1.5h),
+    half2(-0.0h, 1.5h), half2(-0.5h, 1.5h), half2(-1.0h, 1.5h), half2(-1.5h, 1.5h), half2(-2.0h, 1.5h), half2(-3.0h, 1.5h), half2(-4.0h, 1.5h), half2(-6.0h, 1.5h),
+    half2(0.0h, 2.0h), half2(0.5h, 2.0h), half2(1.0h, 2.0h), half2(1.5h, 2.0h), half2(2.0h, 2.0h), half2(3.0h, 2.0h), half2(4.0h, 2.0h), half2(6.0h, 2.0h),
+    half2(-0.0h, 2.0h), half2(-0.5h, 2.0h), half2(-1.0h, 2.0h), half2(-1.5h, 2.0h), half2(-2.0h, 2.0h), half2(-3.0h, 2.0h), half2(-4.0h, 2.0h), half2(-6.0h, 2.0h),
+    half2(0.0h, 3.0h), half2(0.5h, 3.0h), half2(1.0h, 3.0h), half2(1.5h, 3.0h), half2(2.0h, 3.0h), half2(3.0h, 3.0h), half2(4.0h, 3.0h), half2(6.0h, 3.0h),
+    half2(-0.0h, 3.0h), half2(-0.5h, 3.0h), half2(-1.0h, 3.0h), half2(-1.5h, 3.0h), half2(-2.0h, 3.0h), half2(-3.0h, 3.0h), half2(-4.0h, 3.0h), half2(-6.0h, 3.0h),
+    half2(0.0h, 4.0h), half2(0.5h, 4.0h), half2(1.0h, 4.0h), half2(1.5h, 4.0h), half2(2.0h, 4.0h), half2(3.0h, 4.0h), half2(4.0h, 4.0h), half2(6.0h, 4.0h),
+    half2(-0.0h, 4.0h), half2(-0.5h, 4.0h), half2(-1.0h, 4.0h), half2(-1.5h, 4.0h), half2(-2.0h, 4.0h), half2(-3.0h, 4.0h), half2(-4.0h, 4.0h), half2(-6.0h, 4.0h),
+    half2(0.0h, 6.0h), half2(0.5h, 6.0h), half2(1.0h, 6.0h), half2(1.5h, 6.0h), half2(2.0h, 6.0h), half2(3.0h, 6.0h), half2(4.0h, 6.0h), half2(6.0h, 6.0h),
+    half2(-0.0h, 6.0h), half2(-0.5h, 6.0h), half2(-1.0h, 6.0h), half2(-1.5h, 6.0h), half2(-2.0h, 6.0h), half2(-3.0h, 6.0h), half2(-4.0h, 6.0h), half2(-6.0h, 6.0h),
+    half2(0.0h, -0.0h), half2(0.5h, -0.0h), half2(1.0h, -0.0h), half2(1.5h, -0.0h), half2(2.0h, -0.0h), half2(3.0h, -0.0h), half2(4.0h, -0.0h), half2(6.0h, -0.0h),
+    half2(-0.0h, -0.0h), half2(-0.5h, -0.0h), half2(-1.0h, -0.0h), half2(-1.5h, -0.0h), half2(-2.0h, -0.0h), half2(-3.0h, -0.0h), half2(-4.0h, -0.0h), half2(-6.0h, -0.0h),
+    half2(0.0h, -0.5h), half2(0.5h, -0.5h), half2(1.0h, -0.5h), half2(1.5h, -0.5h), half2(2.0h, -0.5h), half2(3.0h, -0.5h), half2(4.0h, -0.5h), half2(6.0h, -0.5h),
+    half2(-0.0h, -0.5h), half2(-0.5h, -0.5h), half2(-1.0h, -0.5h), half2(-1.5h, -0.5h), half2(-2.0h, -0.5h), half2(-3.0h, -0.5h), half2(-4.0h, -0.5h), half2(-6.0h, -0.5h),
+    half2(0.0h, -1.0h), half2(0.5h, -1.0h), half2(1.0h, -1.0h), half2(1.5h, -1.0h), half2(2.0h, -1.0h), half2(3.0h, -1.0h), half2(4.0h, -1.0h), half2(6.0h, -1.0h),
+    half2(-0.0h, -1.0h), half2(-0.5h, -1.0h), half2(-1.0h, -1.0h), half2(-1.5h, -1.0h), half2(-2.0h, -1.0h), half2(-3.0h, -1.0h), half2(-4.0h, -1.0h), half2(-6.0h, -1.0h),
+    half2(0.0h, -1.5h), half2(0.5h, -1.5h), half2(1.0h, -1.5h), half2(1.5h, -1.5h), half2(2.0h, -1.5h), half2(3.0h, -1.5h), half2(4.0h, -1.5h), half2(6.0h, -1.5h),
+    half2(-0.0h, -1.5h), half2(-0.5h, -1.5h), half2(-1.0h, -1.5h), half2(-1.5h, -1.5h), half2(-2.0h, -1.5h), half2(-3.0h, -1.5h), half2(-4.0h, -1.5h), half2(-6.0h, -1.5h),
+    half2(0.0h, -2.0h), half2(0.5h, -2.0h), half2(1.0h, -2.0h), half2(1.5h, -2.0h), half2(2.0h, -2.0h), half2(3.0h, -2.0h), half2(4.0h, -2.0h), half2(6.0h, -2.0h),
+    half2(-0.0h, -2.0h), half2(-0.5h, -2.0h), half2(-1.0h, -2.0h), half2(-1.5h, -2.0h), half2(-2.0h, -2.0h), half2(-3.0h, -2.0h), half2(-4.0h, -2.0h), half2(-6.0h, -2.0h),
+    half2(0.0h, -3.0h), half2(0.5h, -3.0h), half2(1.0h, -3.0h), half2(1.5h, -3.0h), half2(2.0h, -3.0h), half2(3.0h, -3.0h), half2(4.0h, -3.0h), half2(6.0h, -3.0h),
+    half2(-0.0h, -3.0h), half2(-0.5h, -3.0h), half2(-1.0h, -3.0h), half2(-1.5h, -3.0h), half2(-2.0h, -3.0h), half2(-3.0h, -3.0h), half2(-4.0h, -3.0h), half2(-6.0h, -3.0h),
+    half2(0.0h, -4.0h), half2(0.5h, -4.0h), half2(1.0h, -4.0h), half2(1.5h, -4.0h), half2(2.0h, -4.0h), half2(3.0h, -4.0h), half2(4.0h, -4.0h), half2(6.0h, -4.0h),
+    half2(-0.0h, -4.0h), half2(-0.5h, -4.0h), half2(-1.0h, -4.0h), half2(-1.5h, -4.0h), half2(-2.0h, -4.0h), half2(-3.0h, -4.0h), half2(-4.0h, -4.0h), half2(-6.0h, -4.0h),
+    half2(0.0h, -6.0h), half2(0.5h, -6.0h), half2(1.0h, -6.0h), half2(1.5h, -6.0h), half2(2.0h, -6.0h), half2(3.0h, -6.0h), half2(4.0h, -6.0h), half2(6.0h, -6.0h),
+    half2(-0.0h, -6.0h), half2(-0.5h, -6.0h), half2(-1.0h, -6.0h), half2(-1.5h, -6.0h), half2(-2.0h, -6.0h), half2(-3.0h, -6.0h), half2(-4.0h, -6.0h), half2(-6.0h, -6.0h)
+};
+
+/// Constant-cache scalar E4M3FN byte -> half.
+inline half qwg_fp8_e4m3_to_half(uchar b) {
+    return kQWGFP8E4M3FN_H[b];
+}
+
+/// Constant-cache scalar E4M3FN byte -> float.
+inline float qwg_fp8_e4m3_to_float(uchar b) {
+    return kQWGFP8E4M3FN[b];
+}
+
+/// Constant-cache SIMD E4M3FN (4 packed bytes in uint) -> half4.
+inline half4 qwg_fp8_e4m3_to_half4(uint packed4) {
+    const uchar4 u = as_type<uchar4>(packed4);
+    return half4(kQWGFP8E4M3FN_H[u.x], kQWGFP8E4M3FN_H[u.y],
+                 kQWGFP8E4M3FN_H[u.z], kQWGFP8E4M3FN_H[u.w]);
+}
+
+/// Branchless OCP MXFP8 UE8M0 byte -> float (0 -> 2^-127, 255 -> NaN, else 2^(e-127)).
+inline float qwg_ue8m0_to_float(uchar e) {
+    uint bits = uint(e) << 23u;
+    bits = (e == 0u) ? 0x00400000u : bits;
+    bits = (e == 0xFFu) ? 0x7FC00000u : bits;
+    return as_type<float>(bits);
+}
+
+/// Constant-cache SIMD FP4 E2M1 (4 nibbles in low 16 bits) -> half4.
+inline half4 qwg_fp4_e2m1_to_half4(ushort nibbles4) {
+    return half4(kQWGFP4Pair_H2[nibbles4 & 0xFFu], kQWGFP4Pair_H2[nibbles4 >> 8u]);
+}
+
+/// Unpacks 4 scaled FP4 E2M1 elements for NAX B-fragment construction.
+inline half4 qwg_nvfp4_frag4(ushort nibbles4, uchar scByte) {
+    return qwg_fp4_e2m1_to_half4(nibbles4) * half4(kQWGFP8E4M3FN_H[scByte]);
+}
+
+/// Unpacks 8 NVFP4 weights from w2.x scaled by E4M3FN scByte into lo (0..3) and hi (4..7).
+inline void qwg_nvfp4_frag8(uint2 w2, uchar scByte, thread half4 &lo, thread half4 &hi) {
+    const half4 sc4 = half4(kQWGFP8E4M3FN_H[scByte]);
+    lo = qwg_fp4_e2m1_to_half4(ushort(w2.x & 0xFFFFu)) * sc4;
+    hi = qwg_fp4_e2m1_to_half4(ushort(w2.x >> 16u)) * sc4;
+}
+
+/// Unpacks a full 16-weight NVFP4 group (w2, scByte) into four half4 vectors.
+inline void qwg_nvfp4_group16(uint2 w2, uchar scByte,
+                                thread half4 &q0, thread half4 &q1,
+                                thread half4 &q2, thread half4 &q3) {
+    const half4 sc4 = half4(kQWGFP8E4M3FN_H[scByte]);
+    q0 = qwg_fp4_e2m1_to_half4(ushort(w2.x & 0xFFFFu)) * sc4;
+    q1 = qwg_fp4_e2m1_to_half4(ushort(w2.x >> 16u)) * sc4;
+    q2 = qwg_fp4_e2m1_to_half4(ushort(w2.y & 0xFFFFu)) * sc4;
+    q3 = qwg_fp4_e2m1_to_half4(ushort(w2.y >> 16u)) * sc4;
+}
+
+/// Unpacks 16 NVFP4 E2M1 weights into FP32 float4 vectors via constant LUT (deferred group scale).
+inline void qwg_nvfp4_unpack16_f32(uint2 w2, thread float4 (&a)[4]) {
+    const uchar4 b0 = as_type<uchar4>(w2.x);
+    const uchar4 b1 = as_type<uchar4>(w2.y);
+    a[0] = float4(half4(kQWGFP4Pair_H2[b0.x], kQWGFP4Pair_H2[b0.y]));
+    a[1] = float4(half4(kQWGFP4Pair_H2[b0.z], kQWGFP4Pair_H2[b0.w]));
+    a[2] = float4(half4(kQWGFP4Pair_H2[b1.x], kQWGFP4Pair_H2[b1.y]));
+    a[3] = float4(half4(kQWGFP4Pair_H2[b1.z], kQWGFP4Pair_H2[b1.w]));
+}
+
+/// Unnormalized LUT-backed FP32 dot product over a 16-weight NVFP4 group.
+inline float qwg_nvfp4_dm16_f32(uint2 w2, thread const float4 (&xv)[4]) {
+    float4 a[4];
+    qwg_nvfp4_unpack16_f32(w2, a);
+    return dot(a[0], xv[0]) + dot(a[1], xv[1]) + dot(a[2], xv[2]) + dot(a[3], xv[3]);
+}
+
+/// Direct FP32 LUT dot product over a 16-weight NVFP4 group.
+inline float qwg_nvfp4_dot16_f32(uint2 w2, uchar scByte, thread const float4 (&xv)[4]) {
+    return qwg_nvfp4_dm16_f32(w2, xv) * kQWGFP8E4M3FN[scByte];
+}
+
+/// Generalized SwiGLU supporting standard (cap == 0) and tanh-softcapped (cap > 0) gates/ups.
+inline float qwg_fp_softcap_swiglu(float gate, float up, float gateCap, float upCap) {
+    const float sig = 1.0f / (1.0f + exp(-gate));
+    const float g = (gateCap > 0.0f)
+        ? (precise::tanh(clamp(gate / gateCap, -15.0f, 15.0f)) * gateCap * sig)
+        : (gate * sig);
+    const float u = (upCap > 0.0f) ? (precise::tanh(clamp(up / upCap, -15.0f, 15.0f)) * upCap) : up;
+    return g * u;
+}
+
+inline float qwg_fp_read(device const char* base, size_t idx, uint dtype) {
+    if (dtype == 1u) return float(((device const bfloat*)base)[idx]);
+    if (dtype == 2u) return ((device const float*)base)[idx];
+    return float(((device const half*)base)[idx]);
+}
+
+inline void qwg_fp_write(device char* base, size_t idx, float val, uint dtype) {
+    if (dtype == 1u) ((device bfloat*)base)[idx] = qwg_fp_bf16(val);
+    else if (dtype == 2u) ((device float*)base)[idx] = val;
+    else ((device half*)base)[idx] = half(val);
+}
+
+inline float4 qwg_fp_read4(device const char* base, size_t idx, uint dtype) {
+    if (dtype == 2u) return *(device const float4*)((device const float*)base + idx);
+    const ushort4 raw = *(device const ushort4*)((device const ushort*)base + idx);
+    if (dtype == 1u) {
+        return float4(as_type<bfloat>(raw.x), as_type<bfloat>(raw.y),
+                      as_type<bfloat>(raw.z), as_type<bfloat>(raw.w));
+    }
+    return float4(as_type<half>(raw.x), as_type<half>(raw.y),
+                  as_type<half>(raw.z), as_type<half>(raw.w));
+}
+
+inline void qwg_fp_write4(device char* base, size_t idx, float4 v, uint dtype) {
+    if (dtype == 2u) { *(device float4*)((device float*)base + idx) = v; return; }
+    if (dtype == 1u) {
+        *(device ushort4*)((device ushort*)base + idx) = ushort4(
+            as_type<ushort>(qwg_fp_bf16(v.x)), as_type<ushort>(qwg_fp_bf16(v.y)),
+            as_type<ushort>(qwg_fp_bf16(v.z)), as_type<ushort>(qwg_fp_bf16(v.w)));
+        return;
+    }
+    *(device half4*)((device half*)base + idx) = half4(v);
+}
+
+inline void qwg_fp_load_x16(device const char* xPtr, uint dtype, thread float4 (&dst)[4]) {
+    dst[0] = qwg_fp_read4(xPtr, 0u, dtype);
+    dst[1] = qwg_fp_read4(xPtr, 4u, dtype);
+    dst[2] = qwg_fp_read4(xPtr, 8u, dtype);
+    dst[3] = qwg_fp_read4(xPtr, 12u, dtype);
+}
+
+template <uint M, uint R>
+inline void qwg_gemv_bf16_rows_r_m_body(
+    device const bfloat* W, device const bfloat* xBF16, device const float* xF32,
+    device bfloat* yBF16, device float* yF32, constant QWGemmFPBF16Params& p,
+    uint2 tg, uint simd_id, uint lane) {
+    const uint rBase = tg.x * (4u * R) + simd_id * R;
+    if (rBase >= p.N) return;
+    const uint rowsLeft = min(R, p.N - rBase);
+    device const bfloat* wRows[R];
+    #pragma unroll
+    for (uint r = 0u; r < R; ++r) {
+        wRows[r] = (r < rowsLeft) ? (W + size_t(rBase + r) * p.K) : (W + size_t(rBase) * p.K);
+    }
+    float acc[R][M];
+    #pragma unroll
+    for (uint r = 0u; r < R; ++r) {
+        #pragma unroll
+        for (uint m = 0u; m < M; ++m) acc[r][m] = 0.0f;
+    }
+
+    const bool vecW = ((p.K & 7u) == 0u) && ((size_t(W) & 15u) == 0u);
+    const bool vecX = (p.inIsF32 == 1u)
+        ? (((p.strideX & 3u) == 0u) && ((size_t(xF32) & 15u) == 0u))
+        : (((p.strideX & 7u) == 0u) && ((size_t(xBF16) & 15u) == 0u));
+
+    if (vecW && vecX) {
+        for (uint k = lane * 8u; k < p.K; k += 256u) {
+            float4 wf0[R], wf1[R];
+            #pragma unroll
+            for (uint r = 0u; r < R; ++r) {
+                const uint4 va = *(device const uint4*)(wRows[r] + k);
+                wf0[r] = float4(as_type<bfloat>(ushort(va.x)), as_type<bfloat>(ushort(va.x >> 16u)),
+                                as_type<bfloat>(ushort(va.y)), as_type<bfloat>(ushort(va.y >> 16u)));
+                wf1[r] = float4(as_type<bfloat>(ushort(va.z)), as_type<bfloat>(ushort(va.z >> 16u)),
+                                as_type<bfloat>(ushort(va.w)), as_type<bfloat>(ushort(va.w >> 16u)));
+            }
+            #pragma unroll
+            for (uint m = 0u; m < M; ++m) {
+                float4 xf0, xf1;
+                if (p.inIsF32 == 1u) {
+                    device const float* xr = xF32 + size_t(m) * p.strideX + k;
+                    xf0 = *(device const float4*)xr; xf1 = *(device const float4*)(xr + 4u);
+                } else {
+                    const uint4 vb = *(device const uint4*)((device const ushort*)xBF16 + size_t(m) * p.strideX + k);
+                    if (p.inIsF32 == 2u) {
+                        xf0 = float4(as_type<half>(ushort(vb.x)), as_type<half>(ushort(vb.x >> 16u)),
+                                     as_type<half>(ushort(vb.y)), as_type<half>(ushort(vb.y >> 16u)));
+                        xf1 = float4(as_type<half>(ushort(vb.z)), as_type<half>(ushort(vb.z >> 16u)),
+                                     as_type<half>(ushort(vb.w)), as_type<half>(ushort(vb.w >> 16u)));
+                    } else {
+                        xf0 = float4(as_type<bfloat>(ushort(vb.x)), as_type<bfloat>(ushort(vb.x >> 16u)),
+                                     as_type<bfloat>(ushort(vb.y)), as_type<bfloat>(ushort(vb.y >> 16u)));
+                        xf1 = float4(as_type<bfloat>(ushort(vb.z)), as_type<bfloat>(ushort(vb.z >> 16u)),
+                                     as_type<bfloat>(ushort(vb.w)), as_type<bfloat>(ushort(vb.w >> 16u)));
+                    }
+                }
+                #pragma unroll
+                for (uint r = 0u; r < R; ++r) acc[r][m] = qwg_fp_dot8_fma(wf0[r], wf1[r], xf0, xf1, acc[r][m]);
+            }
+        }
+    } else {
+        for (uint k = lane; k < p.K; k += 32u) {
+            float wv[R];
+            #pragma unroll
+            for (uint r = 0u; r < R; ++r) wv[r] = float(wRows[r][k]);
+            #pragma unroll
+            for (uint m = 0u; m < M; ++m) {
+                const size_t xIdx = size_t(m) * p.strideX + k;
+                const float xv = (p.inIsF32 == 1u) ? xF32[xIdx]
+                    : ((p.inIsF32 == 2u) ? float(((device const half*)xBF16)[xIdx]) : float(xBF16[xIdx]));
+                #pragma unroll
+                for (uint r = 0u; r < R; ++r) acc[r][m] = fma(wv[r], xv, acc[r][m]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (uint r = 0u; r < R; ++r) {
+        #pragma unroll
+        for (uint m = 0u; m < M; ++m) {
+            float val = simd_sum(acc[r][m]);
+            if (lane == 0u && r < rowsLeft && m < p.M) {
+                const size_t yIdx = size_t(m) * p.strideY + rBase + r;
+                if (p.addResidual != 0u) {
+                    if (p.outIsF32 == 1u) val += yF32[yIdx];
+                    else if (p.outIsF32 == 2u) val += float(((device const half*)yBF16)[yIdx]);
+                    else val += float(yBF16[yIdx]);
+                }
+                if (p.softcap > 0.0f) val = precise::tanh(clamp(val / p.softcap, -15.0f, 15.0f)) * p.softcap;
+                if (p.outIsF32 == 1u) yF32[yIdx] = val;
+                else if (p.outIsF32 == 2u) ((device half*)yBF16)[yIdx] = half(val);
+                else yBF16[yIdx] = qwg_fp_bf16(val);
+            }
+        }
+    }
+}

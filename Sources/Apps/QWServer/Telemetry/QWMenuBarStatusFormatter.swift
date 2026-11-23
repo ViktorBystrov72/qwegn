@@ -44,8 +44,14 @@ public enum QWMenuBarMetric: String, CaseIterable, Codable, Sendable, Hashable, 
     }
 }
 
-/// Pure formatter turning published `QWDashboardViewModel` cards into a compact menu bar title.
+/// Pure formatter turning published `QWDashboardViewModel` cards into a fixed-width menu bar title.
 public enum QWMenuBarStatusFormatter {
+    public static let decodeFieldWidth = 5
+    public static let prefillFieldWidth = 6
+    public static let memoryFieldWidth = 6
+    public static let activeContextFieldWidth = 5
+    public static let temperatureDigitsWidth = 3
+
     /// Formats a token budget compactly (e.g. `262144` -> `"256k"`, `1048576` -> `"1M"`).
     public static func formatCompactBudget(_ tokens: Int) -> String {
         guard tokens > 0 else { return "0" }
@@ -64,7 +70,56 @@ public enum QWMenuBarStatusFormatter {
         return "\(tokens)"
     }
 
-    /// Formats a compact status-bar string from published cards and user metric selections.
+    /// Formats a rate into an exact character width (`maxIntegerDigits + 2`, e.g. `" 91.9"` or `"  93.3"`).
+    public static func formatFixedRate(_ value: Double?, maxIntegerDigits: Int) -> String {
+        let width = maxIntegerDigits + 2
+        guard let raw = value, raw.isFinite else {
+            return padLeft("—", to: width)
+        }
+        let v = max(0.0, raw)
+        let decimalThreshold = pow(10.0, Double(maxIntegerDigits)) - 0.05
+        if v < decimalThreshold {
+            return padLeft(String(format: "%.1f", v), to: width)
+        }
+        let k = v / 1000.0
+        let kDecimalThreshold = pow(10.0, Double(max(1, width - 3))) - 0.05
+        if k < kDecimalThreshold {
+            return padLeft(String(format: "%.1fk", k), to: width)
+        }
+        let maxIntK = Int(pow(10.0, Double(max(1, width - 1))) - 1)
+        let roundedK = Int(min(Double(maxIntK), k.rounded()))
+        return padLeft("\(roundedK)k", to: width)
+    }
+
+    /// Formats an active context count into a fixed 5-character slot (`"   38"`, `"4,096"`, `" 128k"`).
+    public static func formatFixedActiveTokens(_ tokens: Int?) -> String {
+        guard let tokens else {
+            return padLeft("—", to: activeContextFieldWidth)
+        }
+        let n = max(0, tokens)
+        if n < 1_000 {
+            return padLeft("\(n)", to: activeContextFieldWidth)
+        }
+        if n < 10_000 {
+            return padLeft(QWTokenCountFormatter.groupedThousands(n), to: activeContextFieldWidth)
+        }
+        let k = Double(n) / 1024.0
+        if k < 99.95 {
+            return padLeft(String(format: "%.1fk", k), to: activeContextFieldWidth)
+        }
+        let roundedK = Int(k.rounded())
+        if roundedK < 1_000 {
+            return padLeft("\(roundedK)k", to: activeContextFieldWidth)
+        }
+        let m = Double(n) / 1_048_576.0
+        if m < 99.95 {
+            return padLeft(String(format: "%.1fM", m), to: activeContextFieldWidth)
+        }
+        let roundedM = Int(min(9999.0, m.rounded()))
+        return padLeft("\(roundedM)M", to: activeContextFieldWidth)
+    }
+
+    /// Formats a compact fixed-width status-bar string from published cards and user metric selections.
     public static func statusTitle(
         dashboard: QWDashboardViewModel?,
         isConnected: Bool,
@@ -90,25 +145,22 @@ public enum QWMenuBarStatusFormatter {
             parts.append(speedSegment)
         }
 
-        if enabledMetrics.contains(.engineMemory),
-           let memSegment = formatMemorySegment(dashboard: dashboard) {
-            parts.append(memSegment)
+        if enabledMetrics.contains(.engineMemory) {
+            parts.append(formatMemorySegment(dashboard: dashboard))
         }
 
-        if enabledMetrics.contains(.contextSize),
-           let ctxSegment = formatContextSegment(dashboard: dashboard) {
-            parts.append(ctxSegment)
+        if enabledMetrics.contains(.contextSize) {
+            parts.append(formatContextSegment(dashboard: dashboard))
         }
 
-        if enabledMetrics.contains(.gpuTemperature),
-           let tempSegment = formatTemperatureSegment(dashboard: dashboard) {
-            parts.append(tempSegment)
+        if enabledMetrics.contains(.gpuTemperature) {
+            parts.append(formatTemperatureSegment(dashboard: dashboard))
         }
 
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    /// Representative preview string used in Settings when the engine is offline or idle.
+    /// Representative fixed-width preview string used in Settings when the engine is offline or idle.
     public static func samplePreviewTitle(
         enabledMetrics: Set<QWMenuBarMetric>,
         hideSpeedsWhenIdle: Bool
@@ -117,26 +169,34 @@ public enum QWMenuBarStatusFormatter {
         var parts: [String] = []
         let wantDecode = enabledMetrics.contains(.decodeSpeed)
         let wantPrefill = enabledMetrics.contains(.prefillSpeed)
-        if !hideSpeedsWhenIdle {
+        let sampleDecode = formatFixedRate(91.9, maxIntegerDigits: 3)
+        let samplePrefill = formatFixedRate(93.3, maxIntegerDigits: 4)
+        let speedPreview: String? = {
             if wantDecode && wantPrefill {
-                parts.append("↓91.9 · ↑93.3 tok/s")
-            } else if wantDecode {
-                parts.append("91.9 tok/s")
-            } else if wantPrefill {
-                parts.append("↑93.3 tok/s")
+                return "↓\(sampleDecode) t/s · ↑\(samplePrefill) t/s"
             }
+            if wantDecode {
+                return "\(sampleDecode) tok/s"
+            }
+            if wantPrefill {
+                return "↑\(samplePrefill) tok/s"
+            }
+            return nil
+        }()
+        if !hideSpeedsWhenIdle, let speedPreview {
+            parts.append(speedPreview)
         }
         if enabledMetrics.contains(.engineMemory) {
-            parts.append("25.01 GiB")
+            parts.append("\(formatFixedMemory(25.01)) GiB")
         }
         if enabledMetrics.contains(.contextSize) {
-            parts.append("38/256k")
+            parts.append("\(formatFixedActiveTokens(38))/\(formatCompactBudget(262_144))")
         }
         if enabledMetrics.contains(.gpuTemperature) {
-            parts.append("54°C")
+            parts.append(formatFixedTemperature(54))
         }
-        if parts.isEmpty && hideSpeedsWhenIdle && (wantDecode || wantPrefill) {
-            return wantDecode && wantPrefill ? "↓91.9 · ↑93.3 tok/s (active)" : "91.9 tok/s (active)"
+        if parts.isEmpty, hideSpeedsWhenIdle, let speedPreview {
+            return "\(speedPreview) (active)"
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -146,77 +206,88 @@ public enum QWMenuBarStatusFormatter {
         wantDecode: Bool,
         wantPrefill: Bool
     ) -> String? {
+        guard wantDecode || wantPrefill else { return nil }
         let decodeCard = wantDecode ? card("throughput.display_decode_tokens_per_sec", in: dashboard) : nil
         let prefillCard = wantPrefill ? card("throughput.display_prefill_tokens_per_sec", in: dashboard) : nil
 
-        let decodeVal = (decodeCard?.unit == "tok/s") ? decodeCard?.value : nil
-        let prefillRate = (prefillCard?.unit == "tok/s") ? prefillCard?.value : nil
+        let decodeVal: Double? = (decodeCard?.unit == "tok/s") ? numericValue(of: decodeCard) : nil
+        let prefillRate: Double? = (prefillCard?.unit == "tok/s") ? numericValue(of: prefillCard) : nil
         let prefillCached = prefillCard?.value == "from cache"
 
-        if let d = decodeVal, let p = prefillRate {
-            return "↓\(d) · ↑\(p) tok/s"
+        let decodeSlot = formatFixedRate(decodeVal, maxIntegerDigits: 3)
+        let prefillSlot = formatFixedRate(prefillRate, maxIntegerDigits: 4)
+
+        if wantDecode && wantPrefill {
+            let prefillPart = prefillCached ? "↑from cache" : "↑\(prefillSlot) t/s"
+            return "↓\(decodeSlot) t/s · \(prefillPart)"
         }
-        if let d = decodeVal, prefillCached {
-            return "↓\(d) tok/s · ↑cache"
+        if wantDecode {
+            return "\(decodeSlot) tok/s"
         }
-        if let d = decodeVal {
-            return wantPrefill ? "↓\(d) tok/s" : "\(d) tok/s"
-        }
-        if let p = prefillRate {
-            return "↑\(p) tok/s"
-        }
-        if prefillCached {
-            return "↑cache"
-        }
-        return nil
+        return prefillCached ? "↑  from cache" : "↑\(prefillSlot) tok/s"
     }
 
-    private static func formatMemorySegment(dashboard: QWDashboardViewModel) -> String? {
+    private static func formatMemorySegment(dashboard: QWDashboardViewModel) -> String {
         let arena = card("memory.arena_reserved_bytes", in: dashboard)
         let resident = card("memory.resident_bytes", in: dashboard)
-        guard let mem = (arena?.value != nil ? arena : resident),
-              let val = mem.value else {
-            return nil
-        }
-        let unit = mem.unit.map { " \($0)" } ?? ""
-        return "\(val)\(unit)"
+        let mem = (arena?.value != nil ? arena : resident)
+        let rawUnit = (mem?.unit?.isEmpty == false ? mem!.unit! : "GiB")
+        let unit = padRight(rawUnit, to: 3)
+        return "\(formatFixedMemory(numericValue(of: mem))) \(unit)"
     }
 
-    private static func formatContextSegment(dashboard: QWDashboardViewModel) -> String? {
+    private static func formatContextSegment(dashboard: QWDashboardViewModel) -> String {
         let budget = dashboard.knobs["contextTokens"]?.intValue
         let activeCard = card("context.active_tokens", in: dashboard)
-        if let active = compactActiveTokens(activeCard) {
-            if let budget, budget > 0 {
-                return "\(active)/\(formatCompactBudget(budget))"
-            }
-            return "\(active) tok"
-        }
+        let activeNum = numericValue(of: activeCard).map { Int($0.rounded()) }
+        let activeSlot = formatFixedActiveTokens(activeNum)
         if let budget, budget > 0 {
-            return "\(formatCompactBudget(budget)) ctx"
+            return "\(activeSlot)/\(formatCompactBudget(budget))"
         }
-        return nil
-    }
-
-    private static func compactActiveTokens(_ card: QWDashboardCard?) -> String? {
-        guard let card, card.value != nil else { return nil }
-        if let n = card.number {
-            let rounded = Int(n.rounded())
-            return rounded >= 10_000 ? formatCompactBudget(rounded) : QWTokenCountFormatter.format(rounded)
-        }
-        return card.value
+        return "\(activeSlot) tok"
     }
 
     private static func card(_ id: String, in dashboard: QWDashboardViewModel) -> QWDashboardCard? {
         dashboard.cards.first { $0.id == id }
     }
 
-    private static func formatTemperatureSegment(dashboard: QWDashboardViewModel) -> String? {
-        guard let tempCard = card("hardware.gpu_temp_celsius", in: dashboard),
-              tempCard.value != nil,
-              let num = tempCard.number,
-              num > 0 else {
-            return nil
+    private static func formatTemperatureSegment(dashboard: QWDashboardViewModel) -> String {
+        formatFixedTemperature(numericValue(of: card("hardware.gpu_temp_celsius", in: dashboard)))
+    }
+
+    private static func formatFixedMemory(_ value: Double?) -> String {
+        guard let raw = value, raw.isFinite else {
+            return padLeft("—", to: memoryFieldWidth)
         }
-        return String(format: "%.0f°C", num.rounded())
+        let v = max(0.0, raw)
+        if v < 999.995 {
+            return padLeft(String(format: "%.2f", v), to: memoryFieldWidth)
+        }
+        if v < 9999.95 {
+            return padLeft(String(format: "%.1f", v), to: memoryFieldWidth)
+        }
+        let rounded = Int(min(999_999.0, v.rounded()))
+        return padLeft("\(rounded)", to: memoryFieldWidth)
+    }
+
+    private static func formatFixedTemperature(_ value: Double?) -> String {
+        guard let raw = value, raw.isFinite, raw > 0 else {
+            return padLeft("—", to: temperatureDigitsWidth) + "°C"
+        }
+        let rounded = min(999, max(0, Int(min(999.0, raw.rounded()))))
+        return padLeft("\(rounded)", to: temperatureDigitsWidth) + "°C"
+    }
+
+    private static func numericValue(of card: QWDashboardCard?) -> Double? {
+        guard let card, let val = card.value else { return nil }
+        return card.number ?? Double(val.replacingOccurrences(of: ",", with: ""))
+    }
+
+    private static func padLeft(_ text: String, to width: Int) -> String {
+        text.count >= width ? text : String(repeating: " ", count: width - text.count) + text
+    }
+
+    private static func padRight(_ text: String, to width: Int) -> String {
+        text.count >= width ? text : text + String(repeating: " ", count: width - text.count)
     }
 }

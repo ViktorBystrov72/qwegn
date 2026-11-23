@@ -136,7 +136,7 @@ extension QWEngineDriver {
             for b in ew.residentBuffers { appendUnique(b) }
         }
         switch headStorage {
-        case .f16(let t): appendUnique(t.region.buffer)
+        case .f16(let t), .bf16(let t): appendUnique(t.region.buffer)
         case .q4g(let w): appendUnique(w.view.blocks.region.buffer)
         }
         if let emb = mtpDeviceEmbedding {
@@ -156,6 +156,8 @@ extension QWEngineDriver {
             if let a = lw.attn {
                 appendUnique(a.qkvProj.blocks.region.buffer)
                 appendUnique(a.o.blocks.region.buffer)
+                if let qb = a.qkvBias { appendUnique(qb.region.buffer) }
+                if let ob = a.oBias { appendUnique(ob.region.buffer) }
                 if let q = a.mbsa?.qkvIdxProj { appendUnique(q.blocks.region.buffer) }
             }
             if let hc = lw.hca {
@@ -177,6 +179,8 @@ extension QWEngineDriver {
                       mw.gu.view.blocks.region.buffer, mw.down.blocks.region.buffer] {
                 appendUnique(b)
             }
+            if let qb = mw.qkvBias { appendUnique(qb.region.buffer) }
+            if let ob = mw.oBias { appendUnique(ob.region.buffer) }
         }
         return resident
     }
@@ -218,7 +222,7 @@ extension QWEngineDriver {
             for b in ew.residentBuffers { useUnique(b, usage: .read) }
         }
         switch headStorage {
-        case .f16(let t): useUnique(t.region.buffer, usage: .read)
+        case .f16(let t), .bf16(let t): useUnique(t.region.buffer, usage: .read)
         case .q4g(let w): useUnique(w.view.blocks.region.buffer, usage: .read)
         }
         if let emb = mtpDeviceEmbedding {
@@ -238,6 +242,8 @@ extension QWEngineDriver {
             if let a = lw.attn {
                 useUnique(a.qkvProj.blocks.region.buffer, usage: .read)
                 useUnique(a.o.blocks.region.buffer, usage: .read)
+                if let qb = a.qkvBias { useUnique(qb.region.buffer, usage: .read) }
+                if let ob = a.oBias { useUnique(ob.region.buffer, usage: .read) }
                 if let q = a.mbsa?.qkvIdxProj { useUnique(q.blocks.region.buffer, usage: .read) }
             }
             if let hc = lw.hca {
@@ -259,6 +265,8 @@ extension QWEngineDriver {
                       mw.gu.view.blocks.region.buffer, mw.down.blocks.region.buffer] {
                 useUnique(b, usage: .read)
             }
+            if let qb = mw.qkvBias { useUnique(qb.region.buffer, usage: .read) }
+            if let ob = mw.oBias { useUnique(ob.region.buffer, usage: .read) }
         }
     }
 }

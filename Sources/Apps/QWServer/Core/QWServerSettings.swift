@@ -47,7 +47,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
 
     // MARK: - Compute & Speculation
     public var speculativeDecodingEnabled: Bool
-    public var mtpDrafts: Int // 0...7
+    public var mtpDrafts: Int // 0...15
     public var mtpBackend: String
     public var mtpRelaxedMargin: Double
     /// Variational acceptance probability floor (`0` disables it).
@@ -66,6 +66,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
     public var lsaBudget: Int
     public var lsaClusterBlock: Int
     public var lsaSidecarPath: String
+    public var lsaCrossLoopReuse: Bool = false
     public var engineTuning: [String: QWKnobValue] = [:]  // QWEngineTuning knobs; absent = default
 
     // MARK: - Two-Tier KV Cache
@@ -82,6 +83,9 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
     // MARK: - Thermal & Cooling
     public var coolingPolicy: String // "auto", "proactive", "max"
 
+    // MARK: - Software Updates
+    public var updateCheckSchedule: String // "onLaunchAndDaily", "daily", "onLaunch", "manual"
+
     public struct DiscoveredModel: Identifiable, Hashable, Codable, Sendable {
         public var id: String { name }
         public let name: String
@@ -97,7 +101,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
 
         public init(name: String, packPath: String, family: String? = nil, nativeWindow: Int? = nil,
                     supported: Bool = true, reason: String? = nil,
-                    capabilities: [String] = [], maxSpeculativeDrafts: Int = 7,
+                    capabilities: [String] = [], maxSpeculativeDrafts: Int = 15,
                     hasLSASidecar: Bool = false, lsaSidecarPath: String? = nil) {
             self.name = name
             self.packPath = packPath
@@ -161,6 +165,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         lsaBudget: Int = QWLSAConfig.defaultBudget,
         lsaClusterBlock: Int = QWLSAConfig.defaultClusterBlock,
         lsaSidecarPath: String = "",
+        lsaCrossLoopReuse: Bool = false,
         warmRAMLimitGB: Double = 4.0,
         ssdCacheEnabled: Bool = false,
         ssdCacheLimitGB: Double = 10.0,
@@ -168,7 +173,8 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         logDir: String = "~/.qwg/logs",
         logFileName: String = "qwg.log",
         logLevel: String = "info",
-        coolingPolicy: String = "auto"
+        coolingPolicy: String = "auto",
+        updateCheckSchedule: String = QWUpdateCheckSchedule.onLaunchAndDaily.rawValue
     ) {
         self.runAtStartup = runAtStartup
         self.autoStartServer = autoStartServer
@@ -223,6 +229,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.lsaBudget = lsaBudget
         self.lsaClusterBlock = lsaClusterBlock
         self.lsaSidecarPath = lsaSidecarPath
+        self.lsaCrossLoopReuse = lsaCrossLoopReuse
         self.warmRAMLimitGB = warmRAMLimitGB
         self.ssdCacheEnabled = ssdCacheEnabled
         self.ssdCacheLimitGB = ssdCacheLimitGB
@@ -231,6 +238,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.logFileName = logFileName
         self.logLevel = logLevel
         self.coolingPolicy = QWCoolingPolicy(rawValue: coolingPolicy)?.rawValue ?? "auto"
+        self.updateCheckSchedule = QWUpdateCheckSchedule.resolve(updateCheckSchedule).rawValue
     }
 
     public init(from decoder: Decoder) throws {
@@ -295,6 +303,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.lsaBudget = try c.decodeIfPresent(Int.self, forKey: .lsaBudget) ?? QWLSAConfig.defaultBudget
         self.lsaClusterBlock = try c.decodeIfPresent(Int.self, forKey: .lsaClusterBlock) ?? QWLSAConfig.defaultClusterBlock
         self.lsaSidecarPath = try c.decodeIfPresent(String.self, forKey: .lsaSidecarPath) ?? ""
+        self.lsaCrossLoopReuse = try c.decodeIfPresent(Bool.self, forKey: .lsaCrossLoopReuse) ?? false
         self.engineTuning = try c.decodeIfPresent([String: QWKnobValue].self, forKey: .engineTuning) ?? [:]
         self.warmRAMLimitGB = try decodeDouble(forKey: .warmRAMLimitGB, defaultVal: 4.0)
         self.ssdCacheEnabled = try c.decodeIfPresent(Bool.self, forKey: .ssdCacheEnabled) ?? false
@@ -305,6 +314,8 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.logLevel = try c.decodeIfPresent(String.self, forKey: .logLevel) ?? "info"
         let rawCooling = try c.decodeIfPresent(String.self, forKey: .coolingPolicy) ?? "auto"
         self.coolingPolicy = QWCoolingPolicy(rawValue: rawCooling)?.rawValue ?? "auto"
+        let rawSchedule = try c.decodeIfPresent(String.self, forKey: .updateCheckSchedule)
+        self.updateCheckSchedule = QWUpdateCheckSchedule.resolve(rawSchedule).rawValue
     }
 
     /// Full expanded path to the log file
@@ -374,7 +385,8 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
                 mode: QWLSAMode.resolve(lsaMode) ?? .off,
                 budget: lsaBudget,
                 clusterBlock: lsaClusterBlock,
-                sidecarPath: lsaSidecarPath
+                sidecarPath: lsaSidecarPath,
+                crossLoopReuse: lsaCrossLoopReuse
             )
         }
         set {
@@ -382,6 +394,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
             lsaBudget = newValue.budget
             lsaClusterBlock = newValue.clusterBlock
             lsaSidecarPath = newValue.sidecarPath
+            lsaCrossLoopReuse = newValue.crossLoopReuse
         }
     }
 
@@ -392,7 +405,6 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
     ) -> Int {
         guard let descriptor else { return QWPrefillLimits.chunkRows }
         let isMoE = (descriptor.numExperts ?? 0) > 0
-            || descriptor.family == .qwen38FlashNext
             || descriptor.capabilities.contains(.moe)
         let ramGB = Double(physicalMemory) / 1_000_000_000.0
         if isMoE && ramGB > 36.5 {
@@ -428,6 +440,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         lsaBudget = QWLSAConfig.defaultBudget
         lsaClusterBlock = QWLSAConfig.defaultClusterBlock
         lsaSidecarPath = ""
+        lsaCrossLoopReuse = false
         engineTuning = [:]
         prefillChunkSize = Self.recommendedPrefillChunkSize(for: resolvedDescriptor)
         maxConcurrentSessions = QWCacheConfig.defaultMaxConcurrentSessions

@@ -31,29 +31,18 @@ final class QWMTPBackendTests: XCTestCase {
         XCTAssertEqual(try QWMTPBackend.resolveSelection(nil, drafts: 3), .standard)
         // Explicit backend with positive drafts: honored exactly.
         for backend in QWMTPBackend.allCases {
-            XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 1), backend)
-            XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 2), backend)
-            XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 3), backend)
-            XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 5), backend)
-            XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 6), backend)
-            XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 7), backend)
-            if backend == .dflash2 {
-                XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 11), backend)
-                XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: 15), backend)
+            for drafts in [1, 2, 3, 5, 6, 7, 11, 15] {
+                XCTAssertEqual(try QWMTPBackend.resolveSelection(backend, drafts: drafts), backend)
             }
             // Explicit backend without drafts is a refusal, not a downgrade.
             XCTAssertThrowsError(try QWMTPBackend.resolveSelection(backend, drafts: 0)) { error in
                 XCTAssertTrue(String(describing: error).contains(backend.rawValue))
             }
         }
-        // Invalid drafts are rejected with the historical error.
-        for drafts in [-1, 8, Int.max] {
-            for backend in [nil, QWMTPBackend.standard, QWMTPBackend.variational] {
+        for drafts in [-1, 16, Int.max] {
+            for backend in [nil, QWMTPBackend.standard, QWMTPBackend.variational, QWMTPBackend.dflash2] {
                 XCTAssertThrowsError(try QWMTPBackend.resolveSelection(backend, drafts: drafts))
             }
-        }
-        for drafts in [-1, 16, Int.max] {
-            XCTAssertThrowsError(try QWMTPBackend.resolveSelection(.dflash2, drafts: drafts))
         }
     }
 

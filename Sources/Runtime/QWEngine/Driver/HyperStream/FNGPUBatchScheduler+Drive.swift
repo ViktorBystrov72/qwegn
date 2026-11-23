@@ -1,0 +1,289 @@
+// FNGPUBatchScheduler+Drive.swift — Multi-slot decode scheduler loop for QWHyperStreamRuntime.
+
+import Foundation
+import QWAlloc
+import QWCore
+import QWHAL
+import QWHead
+
+extension FNGPUBatchScheduler {
+    func driveLoop() {
+        while true {
+            if coordinator.activeSlotIndices().isEmpty {
+                QWBatchAdmissionCounter.coalescePreparingBurst(maxSlots: Self.maxSlots) {
+                    coordinator.queuedCount
+                }
+            }
+
+            let sCap4 = slotCapacity(totalSlots: Self.maxSlots)
+            let newlyAdmitted = admitWaitingJobs(sCap4: sCap4)
+
+            if !newlyAdmitted.isEmpty {
+                let allActiveSlots = coordinator.activeSlotIndices()
+                let useMultiSlot = allActiveSlots.count > 1
+                    || allActiveSlots.contains(where: { $0 > 0 })
+                    || (coordinator.job(at: allActiveSlots[0])?.inBatchMode == true)
+                if useMultiSlot {
+                    do {
+                        try ensureBatchResources()
+                    } catch {
+                        for s in newlyAdmitted {
+                            if let j = coordinator.job(at: s) { finishJob(slot: s, job: j, error: error) }
+                        }
+                        continue
+                    }
+                    for s in allActiveSlots { coordinator.job(at: s)?.inBatchMode = true }
+                }
+
+                for s in newlyAdmitted {
+                    guard let job = coordinator.job(at: s) else { continue }
+                    do {
+                        try prefillAdmittedJob(slot: s, job: job, sCap4: sCap4)
+                    } catch {
+                        finishJob(slot: s, job: job, error: error)
+                    }
+                }
+                if coordinator.hasPending && coordinator.hasFreeSlot {
+                    continue
+                }
+            }
+
+            let activeSlots = coordinator.activeSlotIndices()
+            if activeSlots.isEmpty {
+                let parked = coordinator.tryParkDriverIfIdle {
+                    cleanupExtraSlotsBeforeSingleMode()
+                    activateSlot(0, totalSlots: 1)
+                }
+                if parked { return }
+                continue
+            }
+
+            // Recover Slot 0 to full-capacity single-stream mode once other batch slots drain.
+            if activeSlots.count == 1 && activeSlots[0] == 0,
+               let job0 = coordinator.job(at: 0), job0.inBatchMode,
+               !coordinator.hasPending && QWBatchAdmissionCounter.preparingCount == 0 {
+                cleanupExtraSlotsBeforeSingleMode()
+                job0.inBatchMode = false
+                if job0.generatedTokens.count <= 1 {
+                    job0.session.useSpec = job0.useSpec
+                }
+            }
+
+            // Single-stream fast path on Slot 0 (full capacity + speculative decoding).
+            if activeSlots.count == 1 && activeSlots[0] == 0,
+               let job = coordinator.job(at: 0), !job.inBatchMode {
+                stepSingleStreamJob(job)
+                continue
+            }
+
+            stepMultiSlotBatch(activeSlots: activeSlots, sCap4: sCap4)
+        }
+    }
+
+    private func admitWaitingJobs(sCap4: Int) -> [Int] {
+        coordinator.withPendingAndSlots { pendingQueue, activeJobs in
+            guard !pendingQueue.isEmpty else { return [] }
+            let slot0Fits: Bool
+            if let j0 = activeJobs[0] {
+                slot0Fits = QWBatchPartitionSelection.fitsSlotCapacity(
+                    usedTokens: j0.session.history.count,
+                    remainingTokens: j0.maxNew - j0.generatedTokens.count,
+                    slotCapacity: sCap4
+                )
+            } else {
+                slot0Fits = true
+            }
+            let demands = pendingQueue.map {
+                QWBatchPartitionSelection.SlotAdmissionDemand(promptCount: $0.prompt.count, maxNew: $0.maxNew)
+            }
+            let plan = QWBatchPartitionSelection.planAdmissions(
+                maxSlots: Self.maxSlots,
+                slotCapacity: sCap4,
+                slot0ActiveInBatchMode: activeJobs[0]?.inBatchMode == true,
+                slot0FitsInBatch: slot0Fits,
+                occupiedSlots: activeJobs.map { $0 != nil },
+                pendingDemands: demands
+            )
+            var newlyAdmitted: [Int] = []
+            for item in plan {
+                let job = pendingQueue.removeFirst()
+                job.inBatchMode = item.inBatchMode
+                activeJobs[item.slot] = job
+                newlyAdmitted.append(item.slot)
+            }
+            return newlyAdmitted
+        }
+    }
+
+    private func stepSingleStreamJob(_ job: FNBatchJob) {
+        activateSlot(0, totalSlots: 1)
+        let activeCap = engine.activeCapacity
+        let capLimit = max(0, activeCap - job.prompt.count)
+        if (job.session.pendingTokens.isEmpty && job.session.history.count + 1 >= activeCap)
+            || job.generatedTokens.count >= capLimit {
+            finishJob(slot: 0, job: job)
+            return
+        }
+        do {
+            let prevRounds = job.session.roundTokenCounts.count
+            let started = Date()
+            let nextTok = try engine.encodeDecodeToken(&job.session, token: job.lastToken, position: job.position)
+            job.position += 1
+            let measured = Date().timeIntervalSince(started) * 1000.0
+            let reported = job.session.stepMs > 0 ? job.session.stepMs : measured
+            let gpuMs = job.session.lastStepGPUMillis
+            if gpuMs > 0 && reported > 0 {
+                onStepTiming?(gpuMs, reported)
+            }
+            job.stepMs.append(reported)
+            if job.session.roundTokenCounts.count > prevRounds || !job.session.roundTokenCounts.isEmpty {
+                job.stepTokenCounts = job.session.roundTokenCounts
+            } else {
+                job.stepTokenCounts.append(1)
+            }
+            syncSlotFromEngine(0)
+            let done = emitAndCheckDone(token: nextTok, slot: 0, job: job)
+            if !done && job.generatedTokens.count >= capLimit {
+                finishJob(slot: 0, job: job)
+            }
+        } catch {
+            finishJob(slot: 0, job: job, error: error)
+        }
+    }
+
+    private func stepMultiSlotBatch(activeSlots: [Int], sCap4: Int) {
+        var validSlots: [Int] = []
+        var histories: [[Int64]] = []
+        let slotCap = min(sCap4, engine.activeCapacity)
+        for s in activeSlots {
+            guard let job = coordinator.job(at: s) else { continue }
+            if job.session.history.count + 1 >= slotCap
+                || job.generatedTokens.count >= max(0, slotCap - job.prompt.count) {
+                finishJob(slot: s, job: job)
+                continue
+            }
+            let prevCount = job.session.history.count
+            let tok = job.lastToken
+            job.session.history.append(Int64(tok))
+            if engine.residentKVHistoryBySlot[s]?.count == prevCount {
+                engine.residentKVHistoryBySlot[s]?.append(Int64(tok))
+            }
+            slotStates[s].highWaterPos = max(slotStates[s].highWaterPos, job.session.history.count)
+            validSlots.append(s)
+            histories.append(job.session.history)
+        }
+        guard !validSlots.isEmpty, let bStack = batchStack else { return }
+
+        let rawArgmaxes: [Int]
+        let wallMs: Double
+        do {
+            let started = Date()
+            rawArgmaxes = try bStack.forwardBatch(
+                histories: histories,
+                activeSlots: validSlots,
+                totalSlots: Self.maxSlots,
+                slotStates: &slotStates,
+                embedTable: engine.embedTable,
+                head: engine.head
+            )
+            wallMs = Date().timeIntervalSince(started) * 1000.0
+            let gpuMs = bStack.lastGPUMillis
+            if gpuMs > 0 && wallMs > 0 {
+                onStepTiming?(gpuMs, wallMs)
+            }
+        } catch {
+            for s in validSlots {
+                if let job = coordinator.job(at: s) { finishJob(slot: s, job: job, error: error) }
+            }
+            return
+        }
+
+        for (b, s) in validSlots.enumerated() {
+            guard let job = coordinator.job(at: s) else { continue }
+            do {
+                let nextTok = try engine.sampleFromHead(
+                    argmaxToken: rawArgmaxes[b],
+                    seenTokens: job.session.seenTokens,
+                    seenTokenList: job.session.seenTokenList,
+                    sampler: job.session.sampler,
+                    row: b,
+                    constraint: job.session.constraint
+                )
+                if job.session.sampler.config.repetitionPenalty != 1.0 {
+                    job.session.recordSeenToken(nextTok, vocab: engine.vocab)
+                }
+                if job.session.collectLogprobs {
+                    engine.recordTokenLogprob(&job.session, token: nextTok, row: b)
+                }
+                job.position += 1
+                job.stepMs.append(wallMs)
+                job.stepTokenCounts.append(1)
+                let done = emitAndCheckDone(token: nextTok, slot: s, job: job)
+                if !done && (job.session.history.count + 1 >= slotCap
+                             || job.generatedTokens.count >= max(0, slotCap - job.prompt.count)) {
+                    finishJob(slot: s, job: job)
+                }
+            } catch {
+                finishJob(slot: s, job: job, error: error)
+            }
+        }
+    }
+
+    /// Validates prompt fit, prefills an admitted job on its slot, and clamps output to remaining capacity.
+    private func prefillAdmittedJob(slot s: Int, job: FNBatchJob, sCap4: Int) throws {
+        if job.inBatchMode {
+            activateSlot(s, totalSlots: Self.maxSlots)
+            job.session.useSpec = (s == 0) ? job.useSpec : false
+        } else {
+            cleanupExtraSlotsBeforeSingleMode()
+            activateSlot(0, totalSlots: 1)
+        }
+        let activeCap = job.inBatchMode ? min(sCap4, engine.activeCapacity) : engine.activeCapacity
+        guard job.prompt.count < activeCap else {
+            throw FNGPUError.contextDoesNotFit(requested: job.prompt.count + 1,
+                                                maxFitting: max(0, activeCap - 1))
+        }
+        let effectiveMaxNew = QWBatchPartitionSelection.clampedMaxNew(
+            requested: job.maxNew, promptCount: job.prompt.count, activeCapacity: activeCap
+        )
+        if !engine.hasPrefixCacheTier {
+            try engine.preparePrefill(forTokenCount: job.prompt.count)
+        }
+        engine.beginSession(&job.session, maxNew: effectiveMaxNew)
+        let prefillStart = Date()
+        var chunkStart = 0
+        var firstTok = 0
+        let chunkRows = engine.dynamicPrefillChunkRows(forTotalTokens: job.prompt.count)
+        while chunkStart < job.prompt.count {
+            let end = min(chunkStart + chunkRows, job.prompt.count)
+            let isFirst = chunkStart == 0
+            firstTok = try engine.encodePrefillChunk(&job.session, chunk: chunkStart..<end,
+                                                     runsHead: end == job.prompt.count)
+            if isFirst {
+                onCacheEvaluated?(job.session)
+                if s == 0 {
+                    onSlot0CacheEvaluated?(job.session)
+                }
+            }
+            chunkStart = end
+        }
+        job.prefillSeconds = Date().timeIntervalSince(prefillStart)
+        if job.inBatchMode { job.session.useSpec = false }
+        let syncSlot = job.inBatchMode ? s : 0
+        syncSlotFromEngine(syncSlot)
+        slotStates[syncSlot].highWaterPos = engine.highWaterPos
+        job.position = job.prompt.count
+        if effectiveMaxNew <= 0 {
+            engine.flushPendingPrefixCache(&job.session)
+            job.decodeStart = Date()
+            finishJob(slot: syncSlot, job: job)
+        } else {
+            let done = emitAndCheckDone(token: firstTok, slot: syncSlot, job: job)
+            engine.flushPendingPrefixCache(&job.session)
+            job.decodeStart = Date()
+            if !done && job.generatedTokens.count >= effectiveMaxNew {
+                finishJob(slot: syncSlot, job: job)
+            }
+        }
+    }
+}

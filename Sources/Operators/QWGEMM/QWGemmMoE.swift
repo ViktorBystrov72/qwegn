@@ -51,8 +51,8 @@ extension QWGemm {
             self.experts = experts
             self.pairs = pairs
             let m = QWGemm.moeMaxTiles(experts: experts, pairs: pairs)
-            let guCol = gateUpRows / 64
-            let dnCol = downRows / 64
+            let guCol = (gateUpRows + 63) / 64
+            let dnCol = (downRows + 63) / 64
             self.maxTiles = m
             self.guColTiles = guCol
             self.dnColTiles = dnCol
@@ -123,19 +123,22 @@ extension QWGemm {
                                             fuseSiluFwht: Bool = false,
                                             coldBank: QWWeightView? = nil,
                                             tileFilter: MoETileFilter = .all,
-                                            reuseExpertsAcrossTokens: Bool = true) throws {
+                                            reuseExpertsAcrossTokens: Bool = true,
+                                            gateSoftcap: Float = 0, upSoftcap: Float = 0) throws {
         let intermediate = rowsPerExpert / 2
         let useFused = fuseSiluFwht && intermediate > 0 && (intermediate % 32 == 0)
         let residentE = coldBank != nil ? (bank.n / max(1, rowsPerExpert)) : 0
         let filterBits = Int(tileFilter.rawValue) << 8
-        let dedupToks = (useFused && reuseExpertsAcrossTokens && (2...4).contains(tokens)) ? ((tokens & 0x7) << 10) : 0
+        let dedupToks = (useFused && reuseExpertsAcrossTokens && (2...16).contains(tokens)) ? (((tokens - 1) & 0xF) << 10) : 0
         let eBase = (routes & 0x3FF) | dedupToks | filterBits | ((residentE & 0x7FFF) << 16)
         let ePacked = useFused ? (eBase | 0x8000_0000) : eBase
+        let hasSoftcap = (gateSoftcap > 0 || upSoftcap > 0)
         if bank.isIncumbentContainer {
-            enc.setComputePipelineState(try hal.pipeline("qwg_moe_gateup_q4g_f32_r1"))
+            enc.setComputePipelineState(try hal.pipeline(
+                hasSoftcap ? "qwg_moe_gateup_q4g_f32_r1_sc" : "qwg_moe_gateup_q4g_f32_r1"))
         } else {
             guard let aqName = QWGemmAQ.moeGateUpF32R1KernelName(bits: bank.bits, group: bank.groupSize,
-                                                                 isSHVQ: bank.isSHVQ) else {
+                                                                 isSHVQ: bank.isSHVQ, hasSoftcap: hasSoftcap) else {
                 throw QWGemmError.badWeights("no affine-quantised moe gateup r1 kernel for \(bank.bits)-bit group \(bank.groupSize)")
             }
             enc.setComputePipelineState(try hal.pipeline(aqName))
@@ -143,6 +146,10 @@ extension QWGemm {
         enc.bindTensors(bank.blocks, x, ids, out, startIndex: 0)
         enc.setUInt32s(rowsPerExpert, bank.k, ePacked, startIndex: 4)
         (coldBank ?? bank).blocks.bind(enc, index: 7)
+        if hasSoftcap {
+            var softcaps = SIMD2<Float>(gateSoftcap, upSoftcap)
+            enc.setBytes(&softcaps, length: MemoryLayout<SIMD2<Float>>.stride, index: 8)
+        }
         if useFused {
             enc.dispatchThreadgroups(MTLSize(width: intermediate / 32, height: routes, depth: tokens),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
@@ -190,7 +197,8 @@ extension QWGemm {
         enc.setUInt32s(rowsPerRoute, bank.k, ePacked, startIndex: 6)
         ids.bind(enc, index: 9)
         (out16 ?? out).bind(enc, index: 10)
-        let combineFlags = (out16 != nil ? 1 : 0) | (routeOutput ? 2 : 0) | (skipShared ? 4 : 0) | (tokenIndexedX ? 8 : 0)
+        let combineFlags = (out16 != nil ? 1 : 0) | (routeOutput ? 2 : 0) | (skipShared ? 4 : 0)
+            | (tokenIndexedX ? 8 : 0) | (out16?.shape.dtype == .bf16 ? 16 : 0)
         enc.setUInt32s(combineFlags, startIndex: 11)
         (coldBank ?? bank).blocks.bind(enc, index: 12)
         let tgRows = numGroups > 0 ? (tokens * numGroups) : (dedupToks != 0 ? 1 : tokens)
@@ -307,8 +315,10 @@ extension QWGemm {
                                                      ids: QWTensorValue? = nil,
                                                      numGroups: Int = 0,
                                                      scatterPerRoute: Bool = false,
-                                                     skipOut32: Bool = false) throws {
-        enc.setComputePipelineState(try hal.pipeline("qwg_moe_down_reduce_combine_f32"))
+                                                     skipOut32: Bool = false,
+                                                     nofmaShared: Bool = false) throws {
+        enc.setComputePipelineState(try hal.pipeline(
+            nofmaShared ? "qwg_moe_down_reduce_combine_f32_nofma" : "qwg_moe_down_reduce_combine_f32"))
         dnAcc.bind(enc, index: 0)
         (invPerm ?? weights).bind(enc, index: 1)
         enc.bindTensors(weights, shared, gate, out, startIndex: 2)
@@ -323,6 +333,8 @@ extension QWGemm {
             | (scatterPerRoute ? 64 : 0)
             | (skipOut32 ? 128 : 0)
             | ((numGroups & 0xFF) << 8)
+            | (out16?.shape.dtype == .bf16 ? 0x10000 : 0)
+            | (out16?.shape.dtype == .f32 ? 0x20000 : 0)
         enc.setUInt32s(flags, startIndex: 10)
         (ids ?? weights).bind(enc, index: 11)
         let cols4 = (hidden + 3) / 4
@@ -374,5 +386,369 @@ extension QWGemm {
         let blocks = rows == 1 ? hidden / 256 : 1
         enc.dispatchThreadgroups(MTLSize(width: blocks, height: rows, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    }
+
+    /// Unified NAX grouped gate+up prefill dispatch across legacy `QWWeightView` and FP expert banks.
+    public static func encodeMoEBankGateUpNax(
+        _ enc: any MTLComputeCommandEncoder, hal: QWHal,
+        xe: QWFPBufferSlice, bank: QWMoEExpertBank, upBank: QWMoEExpertBank? = nil,
+        expertOff: QWTensorValue, tileE: QWTensorValue, tileR: QWTensorValue,
+        tileCount: QWTensorValue, guOut: QWFPBufferSlice,
+        intermediate: Int, tilePlan: MoETilePlan,
+        sortedTok: QWTensorValue? = nil, coldBank: QWWeightView? = nil,
+        inDtype: QWFPElemDtype = .f16, outDtype: QWFPElemDtype = .f16
+    ) throws {
+        switch (bank, upBank) {
+        case (.weightView(let v), nil):
+            let xeT = QWTensorValue(region: QWMRegion(buffer: xe.buffer, base: xe.offset, length: max(xe.bytes, 1)),
+                                    offset: 0, shape: QWTensorShape([max(1, xe.bytes / 2)], .f16))
+            let guT = QWTensorValue(region: QWMRegion(buffer: guOut.buffer, base: guOut.offset, length: max(guOut.bytes, 1)),
+                                    offset: 0, shape: QWTensorShape([max(1, guOut.bytes / 2)], .f16))
+            try encodeMoEGateUpNax(
+                enc, hal: hal, xe: xeT, bank: v, expertOff: expertOff,
+                tileE: tileE, tileR: tileR, tileCount: tileCount, gu16: guT,
+                rowsPerExpert: 2 * intermediate, tilePlan: tilePlan,
+                sortedTok: sortedTok, coldBank: coldBank)
+        case (.nvfp4(let g), nil):
+            try QWGemmFP.encodeMoENaxNVFP4(
+                enc, hal: hal, bank: g, x: xe, y: guOut,
+                expertOff: expertOff, tileE: tileE, tileR: tileR, tileCount: tileCount,
+                tilePlan: tilePlan, inDtype: inDtype, outDtype: outDtype,
+                nOverride: 2 * intermediate, yStride: 2 * intermediate, yColOff: 0,
+                sortedTok: sortedTok)
+        case (.nvfp4(let g), .nvfp4(let u)):
+            try QWGemmFP.encodeMoENaxNVFP4(
+                enc, hal: hal, bank: g, x: xe, y: guOut,
+                expertOff: expertOff, tileE: tileE, tileR: tileR, tileCount: tileCount,
+                tilePlan: tilePlan, inDtype: inDtype, outDtype: outDtype,
+                nOverride: intermediate, yStride: 2 * intermediate, yColOff: 0,
+                sortedTok: sortedTok)
+            try QWGemmFP.encodeMoENaxNVFP4(
+                enc, hal: hal, bank: u, x: xe, y: guOut,
+                expertOff: expertOff, tileE: tileE, tileR: tileR, tileCount: tileCount,
+                tilePlan: tilePlan, inDtype: inDtype, outDtype: outDtype,
+                nOverride: intermediate, yStride: 2 * intermediate, yColOff: intermediate,
+                sortedTok: sortedTok)
+        case (.mxfp8(let g), nil):
+            try QWGemmFP.encodeMoENaxMXFP8(
+                enc, hal: hal, bank: g, x: xe, y: guOut,
+                expertOff: expertOff, tileE: tileE, tileR: tileR, tileCount: tileCount,
+                tilePlan: tilePlan, inDtype: inDtype, outDtype: outDtype,
+                nOverride: 2 * intermediate, yStride: 2 * intermediate, yColOff: 0,
+                sortedTok: sortedTok)
+        case (.mxfp8(let g), .mxfp8(let u)):
+            try QWGemmFP.encodeMoENaxMXFP8(
+                enc, hal: hal, bank: g, x: xe, y: guOut,
+                expertOff: expertOff, tileE: tileE, tileR: tileR, tileCount: tileCount,
+                tilePlan: tilePlan, inDtype: inDtype, outDtype: outDtype,
+                nOverride: intermediate, yStride: 2 * intermediate, yColOff: 0,
+                sortedTok: sortedTok)
+            try QWGemmFP.encodeMoENaxMXFP8(
+                enc, hal: hal, bank: u, x: xe, y: guOut,
+                expertOff: expertOff, tileE: tileE, tileR: tileR, tileCount: tileCount,
+                tilePlan: tilePlan, inDtype: inDtype, outDtype: outDtype,
+                nOverride: intermediate, yStride: 2 * intermediate, yColOff: intermediate,
+                sortedTok: sortedTok)
+        default:
+            throw QWGemmError.badWeights("mismatched MoE gate/up expert bank container types")
+        }
+    }
+
+    /// Unified NAX grouped down prefill dispatch across legacy `QWWeightView` and FP expert banks.
+    public static func encodeMoEBankDownNax(
+        _ enc: any MTLComputeCommandEncoder, hal: QWHal,
+        act: QWFPBufferSlice, bank: QWMoEExpertBank,
+        expertOff: QWTensorValue, tileE: QWTensorValue, tileR: QWTensorValue,
+        tileCount: QWTensorValue, yOut: QWFPBufferSlice,
+        hidden: Int, tilePlan: MoETilePlan, coldBank: QWWeightView? = nil,
+        inDtype: QWFPElemDtype = .f16, outDtype: QWFPElemDtype = .f16
+    ) throws {
+        switch bank {
+        case .weightView(let v):
+            let actT = QWTensorValue(region: QWMRegion(buffer: act.buffer, base: act.offset, length: max(act.bytes, 1)),
+                                     offset: 0, shape: QWTensorShape([max(1, act.bytes / 2)], .f16))
+            let yDtype: QWDType = (outDtype == .f32) ? .f32 : .f16
+            let yT = QWTensorValue(region: QWMRegion(buffer: yOut.buffer, base: yOut.offset, length: max(yOut.bytes, 1)),
+                                   offset: 0, shape: QWTensorShape([max(1, yOut.bytes / (yDtype == .f32 ? 4 : 2))], yDtype))
+            try encodeMoENaxSplitF32(
+                enc, hal: hal, xHi: actT, xLo: actT, bank: v,
+                expertOff: expertOff, tileE: tileE, tileR: tileR, tileCount: tileCount,
+                y32: yT, rowsPerExpert: hidden, tilePlan: tilePlan, coldBank: coldBank)
+        case .nvfp4(let b):
+            try QWGemmFP.encodeMoENaxNVFP4(
+                enc, hal: hal, bank: b, x: act, y: yOut,
+                expertOff: expertOff, tileE: tileE, tileR: tileR, tileCount: tileCount,
+                tilePlan: tilePlan, inDtype: inDtype, outDtype: outDtype,
+                nOverride: hidden, yStride: hidden, yColOff: 0,
+                sortedTok: nil, isDownIndirect: true)
+        case .mxfp8(let b):
+            try QWGemmFP.encodeMoENaxMXFP8(
+                enc, hal: hal, bank: b, x: act, y: yOut,
+                expertOff: expertOff, tileE: tileE, tileR: tileR, tileCount: tileCount,
+                tilePlan: tilePlan, inDtype: inDtype, outDtype: outDtype,
+                nOverride: hidden, yStride: hidden, yColOff: 0,
+                sortedTok: nil, isDownIndirect: true)
+        }
+    }
+
+    /// Dispatches active-bucket compact gate+up+SwiGLU for FP MoE expert banks.
+    public static func encodeMoEBankCompactGateUpSwiGLU(
+        _ enc: any MTLComputeCommandEncoder, hal: QWHal,
+        x: QWFPBufferSlice, gate: QWMoEExpertBank, up: QWMoEExpertBank? = nil,
+        expertOff: QWFPBufferSlice, activeExperts: QWFPBufferSlice,
+        activeArgs: QWFPBufferSlice, sortedTok: QWFPBufferSlice,
+        sortedPairIdx: QWFPBufferSlice, actOut: QWFPBufferSlice,
+        intermediate: Int, topK: Int,
+        inDtype: QWFPElemDtype, outDtype: QWFPElemDtype,
+        gateCap: Float = 0, upCap: Float = 0,
+        sortedOrder: Bool = true, useIndirectDispatch: Bool = true,
+        maxActiveExperts: Int? = nil, directT1: Bool = false
+    ) throws {
+        switch (gate, up) {
+        case (.nvfp4(let g), nil):
+            try QWGemmFP.encodeMoECompactNVFP4GateUpSwiGLU(
+                enc, hal: hal, x: x, gate: g, up: nil, expertOff: expertOff,
+                activeExperts: activeExperts, activeArgs: activeArgs,
+                sortedTok: sortedTok, sortedPairIdx: sortedPairIdx, actOut: actOut,
+                intermediate: intermediate, topK: topK,
+                inDtype: inDtype, outDtype: outDtype,
+                gateCap: gateCap, upCap: upCap, sortedOrder: sortedOrder,
+                useIndirectDispatch: useIndirectDispatch, maxActiveExperts: maxActiveExperts,
+                directT1: directT1)
+        case (.nvfp4(let g), .nvfp4(let u)):
+            try QWGemmFP.encodeMoECompactNVFP4GateUpSwiGLU(
+                enc, hal: hal, x: x, gate: g, up: u, expertOff: expertOff,
+                activeExperts: activeExperts, activeArgs: activeArgs,
+                sortedTok: sortedTok, sortedPairIdx: sortedPairIdx, actOut: actOut,
+                intermediate: intermediate, topK: topK,
+                inDtype: inDtype, outDtype: outDtype,
+                gateCap: gateCap, upCap: upCap, sortedOrder: sortedOrder,
+                useIndirectDispatch: useIndirectDispatch, maxActiveExperts: maxActiveExperts,
+                directT1: directT1)
+        case (.mxfp8(let g), nil):
+            try QWGemmFP.encodeMoECompactMXFP8GateUpSwiGLU(
+                enc, hal: hal, x: x, gate: g, up: nil, expertOff: expertOff,
+                activeExperts: activeExperts, activeArgs: activeArgs,
+                sortedTok: sortedTok, sortedPairIdx: sortedPairIdx, actOut: actOut,
+                intermediate: intermediate, topK: topK,
+                inDtype: inDtype, outDtype: outDtype,
+                gateCap: gateCap, upCap: upCap, sortedOrder: sortedOrder,
+                useIndirectDispatch: useIndirectDispatch, maxActiveExperts: maxActiveExperts,
+                directT1: directT1)
+        case (.mxfp8(let g), .mxfp8(let u)):
+            try QWGemmFP.encodeMoECompactMXFP8GateUpSwiGLU(
+                enc, hal: hal, x: x, gate: g, up: u, expertOff: expertOff,
+                activeExperts: activeExperts, activeArgs: activeArgs,
+                sortedTok: sortedTok, sortedPairIdx: sortedPairIdx, actOut: actOut,
+                intermediate: intermediate, topK: topK,
+                inDtype: inDtype, outDtype: outDtype,
+                gateCap: gateCap, upCap: upCap, sortedOrder: sortedOrder,
+                useIndirectDispatch: useIndirectDispatch, maxActiveExperts: maxActiveExperts,
+                directT1: directT1)
+        default:
+            throw QWGemmError.badWeights("compact FP gate_up requires matching NVFP4 or MXFP8 banks")
+        }
+    }
+
+    /// Dispatches active-bucket compact down projection for FP MoE expert banks.
+    public static func encodeMoEBankCompactDown(
+        _ enc: any MTLComputeCommandEncoder, hal: QWHal,
+        actIn: QWFPBufferSlice, down: QWMoEExpertBank,
+        expertOff: QWFPBufferSlice, activeExperts: QWFPBufferSlice,
+        activeArgs: QWFPBufferSlice, sortedPairIdx: QWFPBufferSlice,
+        slotOut: QWFPBufferSlice, topK: Int,
+        inDtype: QWFPElemDtype, outDtype: QWFPElemDtype,
+        sortedOrder: Bool = true, useIndirectDispatch: Bool = true,
+        maxActiveExperts: Int? = nil, directT1: Bool = false
+    ) throws {
+        switch down {
+        case .nvfp4(let d):
+            try QWGemmFP.encodeMoECompactNVFP4Down(
+                enc, hal: hal, actIn: actIn, down: d, expertOff: expertOff,
+                activeExperts: activeExperts, activeArgs: activeArgs,
+                sortedPairIdx: sortedPairIdx, slotOut: slotOut,
+                topK: topK, inDtype: inDtype, outDtype: outDtype,
+                sortedOrder: sortedOrder, useIndirectDispatch: useIndirectDispatch,
+                maxActiveExperts: maxActiveExperts, directT1: directT1)
+        case .mxfp8(let d):
+            try QWGemmFP.encodeMoECompactMXFP8Down(
+                enc, hal: hal, actIn: actIn, down: d, expertOff: expertOff,
+                activeExperts: activeExperts, activeArgs: activeArgs,
+                sortedPairIdx: sortedPairIdx, slotOut: slotOut,
+                topK: topK, inDtype: inDtype, outDtype: outDtype,
+                sortedOrder: sortedOrder, useIndirectDispatch: useIndirectDispatch,
+                maxActiveExperts: maxActiveExperts, directT1: directT1)
+        case .weightView:
+            throw QWGemmError.badWeights("compact FP down requires NVFP4 or MXFP8 bank")
+        }
+    }
+
+    /// Runs grouped-NAX prefill (`T > 8`) or active-bucket compact decode (`T <= 8`) across FP MoE banks, then combines routes + shared output.
+    public static func encodeMoEBankRoutedCombine(
+        _ enc: inout any MTLComputeCommandEncoder, hal: QWHal,
+        x: QWFPBufferSlice, xDtype: QWFPElemDtype, interDtype: QWFPElemDtype,
+        gateUp: QWMoEExpertBank, up: QWMoEExpertBank?, down: QWMoEExpertBank,
+        idx: QWTensorValue, wts: QWTensorValue,
+        shared: QWFPBufferSlice?, sharedDtype: QWFPElemDtype, gate: QWFPBufferSlice?,
+        out: QWFPBufferSlice, outDtype: QWFPElemDtype,
+        expOff: QWTensorValue, sortedPair: QWTensorValue,
+        sortedTok: QWTensorValue, invPerm: QWTensorValue,
+        tileE: QWTensorValue?, tileR: QWTensorValue?, tileCount: QWTensorValue?,
+        activeExperts: QWTensorValue?, activeIndirect: QWTensorValue?,
+        guBuf: QWTensorValue, actBuf: QWTensorValue, dnAccBuf: QWTensorValue,
+        hidden H: Int, experts E: Int, topK K: Int, intermediate I: Int, rows T: Int,
+        gateSoftcap: Float, upSoftcap: Float,
+        supportsGroupedNaxPrefill: Bool, concurrentBarriers: Bool,
+        rotateEncoder: ((inout any MTLComputeCommandEncoder) throws -> Void)?,
+        minNaxRows: Int = 9
+    ) throws {
+        @inline(__always) func barrier() {
+            if concurrentBarriers { enc.memoryBarrier(scope: .buffers) }
+        }
+        let useNax = T >= minNaxRows && supportsGroupedNaxPrefill && hal.caps.isMetal4TensorCapable
+            && (xDtype == .f16 || xDtype == .bf16) && tileE != nil && tileR != nil && tileCount != nil
+        if useNax, let te = tileE, let tr = tileR, let tc = tileCount {
+            guard let rotateEncoder else {
+                throw QWGemmError.badShape("FP grouped NAX prefill requires rotateEncoder for indirect slices")
+            }
+            let downIsRotated: Bool = {
+                if case .weightView(let d) = down { return d.isRotated }
+                return false
+            }()
+            let isNVFP4GU: Bool = {
+                if case .nvfp4 = gateUp { return true }
+                return false
+            }()
+            let useFusedFPGateUpSwiGLU: Bool = {
+                guard up == nil, I % 32 == 0, !downIsRotated else { return false }
+                switch gateUp {
+                case .nvfp4, .mxfp8: return true
+                case .weightView: return false
+                }
+            }()
+            let guProjRows = useFusedFPGateUpSwiGLU ? (2 * I) : ((up != nil) ? I : (2 * I))
+            let tilePlan = MoETilePlan(experts: E, pairs: T * K, gateUpRows: guProjRows, downRows: H)
+            try encodeMoEGroupPairsF32(
+                enc, hal: hal, ids: idx, expertOff: expOff,
+                sortedPairIdx: sortedPair, sortedTok: sortedTok,
+                experts: E, totalPairs: T * K, routes: K,
+                invPerm: invPerm, tileE: te, tileR: tr, tileCount: tc, tilePlan: tilePlan)
+            let guSlice = QWFPBufferSlice(guBuf), actSlice = QWFPBufferSlice(actBuf)
+            let canPreGather = useFusedFPGateUpSwiGLU && guBuf.bytes >= T * K * H * 2
+            let gatherDtype: QWFPElemDtype = isNVFP4GU ? .f16 : xDtype
+            let naxInterDtype: QWFPElemDtype = (canPreGather && isNVFP4GU) ? .f16 : interDtype
+            if canPreGather {
+                barrier()
+                try QWGemmFP.encodeMoEGatherX(
+                    enc, hal: hal, x: x, sortedTok: sortedTok, xSorted: guSlice,
+                    totalPairs: T * K, k: H, inDtype: xDtype, outDtype: gatherDtype)
+            }
+            try rotateEncoder(&enc)
+            let naxX: QWFPBufferSlice = canPreGather ? guSlice : x
+            let naxXDtype: QWFPElemDtype = canPreGather ? gatherDtype : xDtype
+            let naxSortedTok: QWTensorValue? = canPreGather ? nil : sortedTok
+            switch gateUp {
+            case .nvfp4(let g) where useFusedFPGateUpSwiGLU:
+                try QWGemmFP.encodeMoENaxNVFP4SwiGLU(
+                    enc, hal: hal, bank: g, x: naxX, actOut: actSlice,
+                    expertOff: expOff, tileE: te, tileR: tr, tileCount: tc,
+                    tilePlan: tilePlan, intermediate: I, inDtype: naxXDtype, outDtype: naxInterDtype,
+                    gateCap: gateSoftcap, upCap: upSoftcap, sortedTok: naxSortedTok)
+            case .mxfp8(let g) where useFusedFPGateUpSwiGLU:
+                try QWGemmFP.encodeMoENaxMXFP8SwiGLU(
+                    enc, hal: hal, bank: g, x: naxX, actOut: actSlice,
+                    expertOff: expOff, tileE: te, tileR: tr, tileCount: tc,
+                    tilePlan: tilePlan, intermediate: I, inDtype: naxXDtype, outDtype: naxInterDtype,
+                    gateCap: gateSoftcap, upCap: upSoftcap, sortedTok: naxSortedTok)
+            default:
+                try encodeMoEBankGateUpNax(
+                    enc, hal: hal, xe: x, bank: gateUp, upBank: up,
+                    expertOff: expOff, tileE: te, tileR: tr, tileCount: tc,
+                    guOut: guSlice, intermediate: I, tilePlan: tilePlan,
+                    sortedTok: sortedTok, inDtype: xDtype, outDtype: interDtype)
+                barrier()
+                try QWGemmFP.encodeSwiGLUSoftcap(
+                    enc, hal: hal, gu: guSlice, act: actSlice,
+                    rows: T * K, intermediate: I, gateCap: gateSoftcap, upCap: upSoftcap,
+                    inDtype: interDtype, outDtype: interDtype, rotateFwht32: downIsRotated)
+            }
+            barrier()
+            try encodeMoEBankDownNax(
+                enc, hal: hal, act: actSlice, bank: down,
+                expertOff: expOff, tileE: te, tileR: tr, tileCount: tc,
+                yOut: QWFPBufferSlice(dnAccBuf), hidden: H, tilePlan: tilePlan,
+                inDtype: naxInterDtype, outDtype: naxInterDtype)
+            barrier()
+            try QWGemmFP.encodeMoEDownReduceCombineBF16(
+                enc, hal: hal, dnAcc: QWFPBufferSlice(dnAccBuf), invPerm: QWFPBufferSlice(invPerm),
+                weights: QWFPBufferSlice(wts), shared: shared, gate: gate, out: out,
+                hidden: H, topK: K, tokens: T,
+                inDtype: naxInterDtype, outDtype: outDtype, sharedDtype: sharedDtype)
+            return
+        } else if T == 1 {
+            let idxSlice = QWFPBufferSlice(idx)
+            try encodeMoEBankCompactGateUpSwiGLU(
+                enc, hal: hal, x: x, gate: gateUp, up: up,
+                expertOff: QWFPBufferSlice(expOff), activeExperts: idxSlice,
+                activeArgs: QWFPBufferSlice(activeIndirect ?? expOff),
+                sortedTok: QWFPBufferSlice(sortedTok), sortedPairIdx: QWFPBufferSlice(sortedPair),
+                actOut: QWFPBufferSlice(actBuf), intermediate: I, topK: K,
+                inDtype: xDtype, outDtype: interDtype, gateCap: gateSoftcap, upCap: upSoftcap,
+                sortedOrder: false, useIndirectDispatch: false, maxActiveExperts: K, directT1: true)
+            barrier()
+            try encodeMoEBankCompactDown(
+                enc, hal: hal, actIn: QWFPBufferSlice(actBuf), down: down,
+                expertOff: QWFPBufferSlice(expOff), activeExperts: idxSlice,
+                activeArgs: QWFPBufferSlice(activeIndirect ?? expOff),
+                sortedPairIdx: QWFPBufferSlice(sortedPair), slotOut: QWFPBufferSlice(dnAccBuf),
+                topK: K, inDtype: interDtype, outDtype: interDtype,
+                sortedOrder: false, useIndirectDispatch: false, maxActiveExperts: K, directT1: true)
+            barrier()
+            try QWGemmFP.encodeMoEDownReduceCombineBF16(
+                enc, hal: hal, dnAcc: QWFPBufferSlice(dnAccBuf), invPerm: nil,
+                weights: QWFPBufferSlice(wts), shared: shared, gate: gate, out: out,
+                hidden: H, topK: K, tokens: T,
+                inDtype: interDtype, outDtype: outDtype, sharedDtype: sharedDtype, ids: idxSlice)
+            return
+        } else {
+            guard let actExp = activeExperts, let actInd = activeIndirect,
+                  actInd.bytes >= QWGemmFP.MoEActiveBucketPlan.indirectBufferBytes,
+                  actExp.bytes >= E * 4 else {
+                throw QWGemmError.badShape("FP compact MoE requires activeExperts (>= E*4 B) and activeIndirect (>= 48 B)")
+            }
+            let bucketPlan = QWGemmFP.MoEActiveBucketPlan(experts: E, intermediate: I, hidden: H)
+            let expOffS = QWFPBufferSlice(expOff), actExpS = QWFPBufferSlice(actExp), actIndS = QWFPBufferSlice(actInd)
+            try encodeMoEGroupAndActiveBuckets(
+                enc, hal: hal, ids: idx, expertOff: expOff,
+                activeExperts: actExp, activeIndirect: actInd,
+                sortedPairIdx: sortedPair, sortedTok: sortedTok,
+                experts: E, totalPairs: T * K, routes: K,
+                plan: bucketPlan, invPerm: invPerm,
+                concurrentBarriers: concurrentBarriers)
+            let maxAct = min(E, T * K)
+            let directBatch = (T <= 16 && maxAct <= 128)
+            let indirectDispatch = !directBatch && (rotateEncoder != nil)
+            if indirectDispatch, let rot = rotateEncoder { try rot(&enc) } else { barrier() }
+            try encodeMoEBankCompactGateUpSwiGLU(
+                enc, hal: hal, x: x, gate: gateUp, up: up,
+                expertOff: expOffS, activeExperts: actExpS, activeArgs: actIndS,
+                sortedTok: QWFPBufferSlice(sortedTok), sortedPairIdx: QWFPBufferSlice(sortedPair),
+                actOut: QWFPBufferSlice(actBuf), intermediate: I, topK: K,
+                inDtype: xDtype, outDtype: interDtype, gateCap: gateSoftcap, upCap: upSoftcap,
+                sortedOrder: true, useIndirectDispatch: indirectDispatch, maxActiveExperts: maxAct)
+            barrier()
+            try encodeMoEBankCompactDown(
+                enc, hal: hal, actIn: QWFPBufferSlice(actBuf), down: down,
+                expertOff: expOffS, activeExperts: actExpS, activeArgs: actIndS,
+                sortedPairIdx: QWFPBufferSlice(sortedPair), slotOut: QWFPBufferSlice(dnAccBuf),
+                topK: K, inDtype: interDtype, outDtype: interDtype,
+                sortedOrder: true, useIndirectDispatch: indirectDispatch, maxActiveExperts: maxAct)
+            barrier()
+        }
+        try QWGemmFP.encodeMoEDownReduceCombineBF16(
+            enc, hal: hal, dnAcc: QWFPBufferSlice(dnAccBuf), invPerm: QWFPBufferSlice(invPerm),
+            weights: QWFPBufferSlice(wts), shared: shared, gate: gate, out: out,
+            hidden: H, topK: K, tokens: T,
+            inDtype: interDtype, outDtype: outDtype, sharedDtype: sharedDtype)
     }
 }

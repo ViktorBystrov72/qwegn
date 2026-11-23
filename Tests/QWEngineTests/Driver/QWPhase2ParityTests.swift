@@ -119,22 +119,17 @@ final class QWPhase2ParityTests: XCTestCase {
     }
 
     func testTheSparseStandardModuleDeclaresTheRouterDoor() {
-        // The router is the sparse path's own door. This is about the
-        // **standard** path: the hybrid dense module carries the router
-        // door for the 27B's own MoE layers, and that is not in question.
-        XCTAssertTrue(Qwen3MoEModule.requiredDoors.contains("qwg_router_gemm"))
-        XCTAssertFalse(Qwen3DenseModule.requiredDoors.contains("qwg_router_gemm"))
-        XCTAssertFalse(StandardModule.requiredDoors.contains("qwg_router_gemm"))
+        // Unified DenseModule serves both dense and sparse MoE families and carries
+        // the router GEMM door alongside the per-pair MoE chain.
+        XCTAssertTrue(DenseModule.requiredDoors.contains("qwg_router_gemm"))
     }
 
-    func testTheStandardDecoderRefusesTheFiveNamedFeatures() throws {
-        // A key that changes what the engine runs is refused by name, and
-        // honoured when it asks for what the engine does.
+    func testTheStandardDecoderRefusesTheUnsupportedFeaturesAndHonoursQKNorm() throws {
+        // Unsupported keys fail closed by name; `use_qk_norm` controls `hasQKNorm`.
         let refused: [(String, Any, String)] = [
             ("architectures", ["Qwen3ForGuardModel"], "Qwen3ForGuardModel"),
             ("auto_map", "modeling_qwen3.MyModel", "auto_map"),
-            ("use_qk_norm", false, "use_qk_norm"),
-            ("qkv_bias", true, "qkv_bias"),
+            ("mlp_bias", true, "mlp_bias"),
             ("output_router_logits", true, "output_router_logits"),
         ]
         for (key, value, named) in refused {
@@ -146,7 +141,16 @@ final class QWPhase2ParityTests: XCTestCase {
         }
         // The same keys, asked for in the way the engine serves them.
         XCTAssertNoThrow(try QWStandardConfigDecoder.decode(config([:])))
-        XCTAssertNoThrow(try QWStandardConfigDecoder.decode(config(["use_qk_norm": true])))
+        XCTAssertTrue(try QWStandardConfigDecoder.decode(config(["use_qk_norm": true])).hasQKNorm)
+        XCTAssertFalse(try QWStandardConfigDecoder.decode(config(["use_qk_norm": false])).hasQKNorm)
         XCTAssertNoThrow(try QWStandardConfigDecoder.decode(config(["qkv_bias": false])))
+        XCTAssertNoThrow(try QWStandardConfigDecoder.decode(config(["qkv_bias": true])))
+        XCTAssertNoThrow(try QWStandardConfigDecoder.decode(config(["attention_bias": true])))
+        let qkvBiased = try QWModelDescriptor.decode(configJSON: config(["qkv_bias": true]))
+        XCTAssertTrue(qkvBiased.hasQKVBias)
+        XCTAssertFalse(qkvBiased.hasAttnOutputBias)
+        let attnBiased = try QWModelDescriptor.decode(configJSON: config(["attention_bias": true]))
+        XCTAssertTrue(attnBiased.hasQKVBias)
+        XCTAssertTrue(attnBiased.hasAttnOutputBias)
     }
 }

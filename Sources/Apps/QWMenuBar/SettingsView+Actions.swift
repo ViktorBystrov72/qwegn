@@ -252,7 +252,7 @@ extension SettingsView {
         if let disc = discoveredModels.first(where: { $0.name == draftSettings.modelName }), disc.maxSpeculativeDrafts > 0 {
             return disc.maxSpeculativeDrafts
         }
-        return 7
+        return 15
     }
 
     private func resolvedLSASidecarPaths() -> (packPath: String, explicitPath: String) {
@@ -455,9 +455,14 @@ extension SettingsView {
                 drafters: discoveredDrafterModels,
                 targetModelName: draftSettings.modelName
             ) ?? draftSettings.dflashDraftPackPath
-            let maxD = isExternalDrafterSelected
-                ? (telemetry.cachedMaxDrafts(forDrafterPackPath: effPath) ?? 7)
-                : max(1, desc.maxSpeculativeDrafts)
+            let maxD: Int
+            if isExternalDrafterSelected {
+                let fallbackExt = draftSettings.mtpBackend.lowercased() == "dspine" ? 15 : 7
+                let cached = telemetry.cachedMaxDrafts(forDrafterPackPath: effPath) ?? fallbackExt
+                maxD = draftSettings.mtpBackend.lowercased() == "dspine" ? max(15, cached) : cached
+            } else {
+                maxD = max(1, desc.maxSpeculativeDrafts)
+            }
             if draftSettings.mtpDrafts > maxD {
                 draftSettings.mtpDrafts = maxD
             }

@@ -1,0 +1,149 @@
+// qw_router_union.metalh — Single-TG (256-thread) union-aware MoE-Spec pruning (M <= 16, K <= 16).
+#pragma once
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+struct QWRUnionScratch {
+    uint32_t freeMask[16];
+    float origRowSums[16];
+    float sgBestW[8];
+    uint sgBestTid[8];
+    uint tgUnique;
+    uint tgWinTid;
+    int tgWinExp;
+};
+
+// Keeps root row t=0 lossless, marks draft hits free, admits top novel draft experts, renormalizes.
+METAL_FUNC void qwg_router_union_prune_tg(device int32_t* idx0,
+                                          device float* wts0,
+                                          uint M,
+                                          uint K,
+                                          uint budget,
+                                          bool doNorm,
+                                          uint tid,
+                                          uint sgi,
+                                          uint lane,
+                                          threadgroup QWRUnionScratch& sc) {
+    if (M <= 1u || M > 16u || K == 0u || K > 16u || M * K > 256u) return;
+    const uint effBudget = max(K, budget);
+    const uint totalPairs = M * K;
+
+    if (tid < 16u) sc.freeMask[tid] = 0u;
+    if (doNorm && tid < M) {
+        float s = 0.0f;
+        for (uint k = 0u; k < K; ++k) {
+            const float w = wts0[tid * K + k];
+            if (w > 0.0f) s += w;
+        }
+        sc.origRowSums[tid] = s;
+    }
+
+    const bool validSlot = (tid < totalPairs);
+    const int rawId = validSlot ? idx0[tid] : -1;
+    const int expId = (rawId >= 0) ? int(uint(rawId) & 0xFFFFu) : -1;
+    const float wVal = (validSlot && expId >= 0) ? wts0[tid] : -3.4e38f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        uint u = 0u;
+        for (uint s = 0u; s < K; ++s) {
+            const int r0 = idx0[s];
+            if (r0 < 0) continue;
+            const uint e = uint(r0) & 0xFFFFu;
+            if (e < 512u) {
+                const uint word = e >> 5u;
+                const uint bit = 1u << (e & 31u);
+                if ((sc.freeMask[word] & bit) == 0u) {
+                    sc.freeMask[word] |= bit;
+                    u += 1u;
+                }
+            } else {
+                bool dup = false;
+                for (uint p = 0u; p < s; ++p) {
+                    const int rp = idx0[p];
+                    if (rp >= 0 && (uint(rp) & 0xFFFFu) == e) { dup = true; break; }
+                }
+                if (!dup) u += 1u;
+            }
+        }
+        sc.tgUnique = u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bool keep = (tid < K);
+    if (validSlot && !keep && expId >= 0) {
+        if (uint(expId) < 512u) {
+            if ((sc.freeMask[uint(expId) >> 5u] & (1u << (uint(expId) & 31u))) != 0u) keep = true;
+        } else {
+            for (uint s = 0u; s < K; ++s) {
+                const int r0 = idx0[s];
+                if (r0 >= 0 && int(uint(r0) & 0xFFFFu) == expId) { keep = true; break; }
+            }
+        }
+    }
+
+    uint uniqueCount = sc.tgUnique;
+    while (uniqueCount < effBudget) {
+        const bool isCand = validSlot && !keep && expId >= 0 && (wVal == wVal);
+        const bool sgAny = simd_any(isCand);
+        const float sgMaxW = simd_max(isCand ? wVal : -3.4e38f);
+        const uint sgMinTid = sgAny ? simd_min((isCand && wVal == sgMaxW) ? tid : 0xFFFFFFFFu) : 0xFFFFFFFFu;
+        if (lane == 0u && sgi < 8u) {
+            sc.sgBestW[sgi] = sgAny ? sgMaxW : -3.4e38f;
+            sc.sgBestTid[sgi] = sgMinTid;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgi == 0u) {
+            const uint cTid = (lane < 8u) ? sc.sgBestTid[lane] : 0xFFFFFFFFu;
+            const bool cOk = (cTid != 0xFFFFFFFFu);
+            const float cW = cOk ? sc.sgBestW[lane] : -3.4e38f;
+            const bool anyCand = simd_any(cOk);
+            const float bestW = simd_max(cW);
+            const uint winTid = anyCand ? simd_min((cOk && cW == bestW) ? cTid : 0xFFFFFFFFu) : 0xFFFFFFFFu;
+            if (lane == 0u) {
+                sc.tgWinTid = winTid;
+                if (winTid < totalPairs) {
+                    const int winRaw = idx0[winTid];
+                    const int winE = (winRaw >= 0) ? int(uint(winRaw) & 0xFFFFu) : -1;
+                    sc.tgWinExp = winE;
+                    if (winE >= 0 && uint(winE) < 512u) {
+                        sc.freeMask[uint(winE) >> 5u] |= (1u << (uint(winE) & 31u));
+                    }
+                } else {
+                    sc.tgWinExp = -1;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint winTid = sc.tgWinTid;
+        const int winExp = sc.tgWinExp;
+        if (winTid >= totalPairs || winExp < 0) break;
+        if (expId == winExp) keep = true;
+        uniqueCount += 1u;
+    }
+
+    if (validSlot && !keep) {
+        idx0[tid] = -1;
+        wts0[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (doNorm && sgi == 0u && lane >= 1u && lane < M) {
+        const uint r = lane;
+        float newSum = 0.0f;
+        for (uint k = 0u; k < K; ++k) {
+            const float w = wts0[r * K + k];
+            if (w > 0.0f) newSum += w;
+        }
+        const float origSum = sc.origRowSums[r];
+        if (newSum > 0.0f && newSum < origSum) {
+            const float scale = origSum / newSum;
+            for (uint k = 0u; k < K; ++k) {
+                wts0[r * K + k] *= scale;
+            }
+        }
+    }
+}

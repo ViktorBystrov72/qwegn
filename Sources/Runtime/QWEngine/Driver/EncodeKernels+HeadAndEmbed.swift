@@ -160,6 +160,12 @@ extension QWEngineDriver {
                                      threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             enc.memoryBarrier(scope: .buffers)
             encodeFwht32Fast(enc, x: x)
+        case .bf16(let weight):
+            encodeFwht32Fast(enc, x: x)
+            enc.memoryBarrier(scope: .buffers)
+            try head.encodeBF16(enc, w: weight, x: x, y: sc.logits)
+            enc.memoryBarrier(scope: .buffers)
+            encodeFwht32Fast(enc, x: x)
         case .q4g:
             try head.encode(enc, storage: headStorage, x: x, gs: sc.gs, y: sc.logits)
         }

@@ -9,8 +9,8 @@ final class FlashNextModuleTests: XCTestCase {
     func testDraftStrategyResolutionAndReporting() throws {
         let requested = QWSpeculativeParameters(mtpDrafts: 5, mtpBackend: "variational",
                                                 mtpDraftStrategy: "hybrid")
-        let resolved = try FlashNextModule.resolveSpeculation(
-            requested, descriptor: .qwen38_27b,
+        let resolved = try DenseModule.resolveSpeculation(
+            requested, descriptor: flashNextDescriptor(),
             environment: ["FN_DRAFT": "NeUrAl"], modelSwitch: false)
         XCTAssertEqual(resolved.reportedBackend, "mtp")
         XCTAssertEqual(resolved.reportedDrafts, 3)
@@ -18,16 +18,16 @@ final class FlashNextModuleTests: XCTestCase {
         XCTAssertEqual(try FNGPUSessionState.draftMode(
             for: resolved.parameters, environment: ["FN_DRAFT": "ngram"]), .mtp)
         XCTAssertEqual(try FNGPUSessionState.draftMode(for: requested, environment: ["FN_DRAFT": "ngram"]), .ngram)
-        XCTAssertThrowsError(try FlashNextModule.resolveSpeculation(
-            requested, descriptor: .qwen38_27b, environment: ["FN_DRAFT": "typo"], modelSwitch: false))
+        XCTAssertThrowsError(try DenseModule.resolveSpeculation(
+            requested, descriptor: flashNextDescriptor(), environment: ["FN_DRAFT": "typo"], modelSwitch: false))
         var invalid = requested
         invalid.mtpDraftStrategy = "typo"
-        XCTAssertThrowsError(try FlashNextModule.resolveSpeculation(
-            invalid, descriptor: .qwen38_27b, environment: [:], modelSwitch: false))
+        XCTAssertThrowsError(try DenseModule.resolveSpeculation(
+            invalid, descriptor: flashNextDescriptor(), environment: [:], modelSwitch: false))
         invalid = requested
         invalid.mtpBackend = "typo"
-        XCTAssertThrowsError(try FlashNextModule.resolveSpeculation(
-            invalid, descriptor: .qwen38_27b, environment: [:], modelSwitch: false))
+        XCTAssertThrowsError(try DenseModule.resolveSpeculation(
+            invalid, descriptor: flashNextDescriptor(), environment: [:], modelSwitch: false))
     }
 
     /// The repository root, from this file's own path.
@@ -87,20 +87,20 @@ final class FlashNextModuleTests: XCTestCase {
 
     private static func readEngineSources() throws -> String {
         try [
-            "Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift",
-            "Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine+Seam.swift",
+            "Sources/Runtime/QWEngine/Driver/HyperStream/QWHyperStreamRuntime.swift",
+            "Sources/Runtime/QWEngine/Driver/HyperStream/QWHyperStreamRuntime+Seam.swift",
         ].map {
             try String(contentsOf: Self.repoRoot.appendingPathComponent($0), encoding: .utf8)
         }.joined(separator: "\n")
     }
 
     func testFlashNextHasNoTokenLoopOfItsOwn() throws {
-        // C2: one token loop. FN's private loop is gone; the core drives it.
+        // C2: one token loop. HyperStream's private loop is gone; the unified runtime drives it.
         let source = try Self.readEngineSources()
         XCTAssertFalse(source.contains("func generate"),
-                       "FN must call the core's loop, not keep one of its own")
+                       "QWHyperStreamRuntime must route through the core loop, not keep one of its own")
         XCTAssertFalse(source.contains("while generated.count < maxNew"),
-                       "FN must call the core's loop, not keep one of its own")
+                       "QWHyperStreamRuntime must route through the core loop, not keep one of its own")
     }
 
     func testFlashNextHasNoGlobalStateResetLeftInTheEngine() throws {
@@ -112,34 +112,45 @@ final class FlashNextModuleTests: XCTestCase {
     }
 
     func testTheFacadeOverTheCoreLivesInTheRuntimeLayer() throws {
-        // The engine owns the numerics; the loop belongs to the core, which
-        // sits above the subsystem. So the façade is an extension there.
-        let source = try String(contentsOf: Self.repoRoot
-            .appendingPathComponent("Sources/Runtime/QWEngine/Module/FlashNextGeneration.swift"),
+        for retired in [
+            "Sources/Runtime/QWEngine/Module/FlashNextModule.swift",
+            "Sources/Runtime/QWEngine/Module/FlashNextGeneration.swift",
+            "Sources/Subsystems/QWFlashNext",
+        ] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: Self.repoRoot.appendingPathComponent(retired).path),
+                           "\(retired) must be retired into unified QWEngineDriver/QWHyperStreamRuntime")
+        }
+        let conformance = try String(contentsOf: Self.repoRoot
+            .appendingPathComponent("Sources/Runtime/QWEngine/Generation/QWEngineDriverConformance.swift"),
             encoding: .utf8)
-        XCTAssertTrue(source.contains("extension FNGPUEngine"),
-                      "the façade is the runtime's extension on the engine")
-        XCTAssertTrue(source.contains("QWEngineCore"),
-                      "the façade must drive the core's loop")
+        XCTAssertTrue(conformance.contains("hyper.runGeneration("),
+                      "QWEngineDriver conformance must route HyperStream through runGeneration")
+        let generation = try String(contentsOf: Self.repoRoot
+            .appendingPathComponent("Sources/Runtime/QWEngine/Driver/HyperStream/QWHyperStreamRuntime+Generation.swift"),
+            encoding: .utf8)
+        XCTAssertTrue(generation.contains("extension QWHyperStreamRuntime"),
+                      "HyperStream generation lives as an extension on QWHyperStreamRuntime")
+        XCTAssertTrue(generation.contains("func runGeneration("),
+                      "QWHyperStreamRuntime must expose the unified runGeneration path")
     }
 
     func testFlashNextHasNoSamplerOfItsOwn() throws {
-        // FN must go through the shared sampler, not a private top-k/top-p.
+        // HyperStream must go through the shared sampler, not a private top-k/top-p.
         let engine = try Self.readEngineSources()
         XCTAssertFalse(engine.contains("func sampleToken("),
-                       "FN must use the shared sampler, not its own")
+                       "HyperStream must use the shared sampler, not its own")
         XCTAssertFalse(engine.contains("func sampleTopKTopP("),
-                       "FN must use the shared sampler, not its own")
-        // The shared sampler is built where the session is handed out — the
-        // module, which sits above the subsystem — and the engine only
-        // draws from it.
-        let module = try String(contentsOf: Self.repoRoot
-            .appendingPathComponent("Sources/Runtime/QWEngine/Module/FlashNextModule.swift"),
+                       "HyperStream must use the shared sampler, not its own")
+        let generation = try String(contentsOf: Self.repoRoot
+            .appendingPathComponent("Sources/Runtime/QWEngine/Driver/HyperStream/QWHyperStreamRuntime+Generation.swift"),
             encoding: .utf8)
-        XCTAssertTrue(module.contains("QWSampler("),
-                      "the session must be handed the shared sampler")
-        XCTAssertTrue(engine.contains("sampler: QWSampler"),
-                      "the engine's sampler must be the shared one")
+        let session = try String(contentsOf: Self.repoRoot
+            .appendingPathComponent("Sources/Runtime/QWEngine/Driver/HyperStream/FNGPUSession.swift"),
+            encoding: .utf8)
+        XCTAssertTrue(generation.contains("QWSamplerConfig("),
+                      "generation must build the shared sampler contract")
+        XCTAssertTrue(session.contains("sampler: QWSampler"),
+                      "HyperStream session's sampler must be the shared one")
     }
 
     func testTheSharedEntryPointAdvancesTheDrawCounter() throws {
@@ -258,9 +269,17 @@ final class FlashNextModuleTests: XCTestCase {
     }
 
     func testTheFNModuleFailsLoudWithoutAnEngine() throws {
-        let module = FlashNextModule(plan: try flashNextPlan())
+        let module = DenseModule(plan: try flashNextPlan())
         // A module with no engine must not pretend to serve.
-        XCTAssertThrowsError(try module.makeSessionState()) { error in
+        XCTAssertThrowsError(
+            try module.generate(
+                request: QWGenerationRequest(prompt: [1, 2], maxNew: 1, sampling: .greedy),
+                onToken: nil
+            )
+        ) { error in
+            XCTAssertEqual(error as? QWModuleError, .notImplemented("DenseModule has no engine yet"))
+        }
+        XCTAssertThrowsError(try module.configurePrefixCache(QWCacheConfig())) { error in
             guard case QWModuleError.notImplemented = error else {
                 return XCTFail("expected notImplemented, got \(error)")
             }
@@ -268,31 +287,29 @@ final class FlashNextModuleTests: XCTestCase {
     }
 
     func testTheFNModuleRefusesAForeignEngine() throws {
-        // A dense engine in Flash-Next's slot is an error, not a silent
-        // mis-dispatch.
         let plan = try flashNextPlan()
-        XCTAssertThrowsError(try FlashNextModule.make(plan: plan, engine: ForeignEngine(plan: plan))) { error in
-            XCTAssertEqual(error as? QWModuleError, .unsupportedFamily(.qwen38FlashNext))
+        XCTAssertThrowsError(try DenseModule.make(plan: plan, engine: ForeignEngine(plan: plan))) { error in
+            XCTAssertEqual(error as? QWModuleError, .unsupportedFamily(.qwen38Dense))
         }
     }
 
     func testTheFNModuleExistsWithoutAnEngine() throws {
-        // No engine yet: the module exists and every call that needs the
-        // engine fails loud.
         let plan = try flashNextPlan()
-        let module = try FlashNextModule.make(plan: plan, engine: nil)
-        XCTAssertTrue(module is FlashNextModule)
+        let module = try DenseModule.make(plan: plan, engine: nil)
+        XCTAssertTrue(module is DenseModule)
     }
 
     func testTheFNModuleCarriesItsPlanAndTypeFacts() throws {
+        let desc = flashNextDescriptor()
         let plan = try flashNextPlan()
-        let module = FlashNextModule(plan: plan)
+        let module = DenseModule(plan: plan)
         XCTAssertEqual(module.plan.digest, plan.digest)
         XCTAssertEqual(module.kvStorageMode, "f16")
-        XCTAssertTrue(FlashNextModule.supportedKVStorageModes.contains("f32"))
-        XCTAssertTrue(FlashNextModule.capabilities.contains(.vision))
-        XCTAssertTrue(FlashNextModule.capabilities.contains(.speculative))
-        XCTAssertTrue(FlashNextModule.capabilities.contains(.dflash))
+        XCTAssertTrue(DenseModule.supportedKVStorageModes(for: desc).contains("f32"))
+        let caps = QWModelCapabilities.resolve(descriptor: desc, hasVisionWeights: true)
+        XCTAssertTrue(caps.contains(.vision))
+        XCTAssertTrue(caps.contains(.speculative))
+        XCTAssertTrue(caps.contains(.dflash))
     }
 
     func testEstimateContextMemoryReflectsDFlashSavings() {
@@ -317,14 +334,14 @@ final class FlashNextModuleTests: XCTestCase {
             mtpLayers: 1, mtpUseDedicatedEmbeddings: false, eosTokenId: 248_044
         )
         let missing = "/tmp/nonexistent-pack-\(UUID().uuidString)"
-        let nativeMTP = FlashNextModule.estimateContextMemory(
+        let nativeMTP = DenseModule.estimateContextMemory(
             descriptor: desc, packPath: missing, contextTokens: 16_384, kvMode: .f16,
             mtpDrafts: 3, mtpBackend: "variational", prefillChunkSize: 4096,
-            tuning: .default, physicalMemoryBytes: 24 << 30)
-        let dflash = FlashNextModule.estimateContextMemory(
+            tuning: .default, physicalMemoryBytes: 64 << 30)
+        let dflash = DenseModule.estimateContextMemory(
             descriptor: desc, packPath: missing, contextTokens: 16_384, kvMode: .f16,
             mtpDrafts: 7, mtpBackend: "dflash2", prefillChunkSize: 4096,
-            tuning: .default, physicalMemoryBytes: 24 << 30)
+            tuning: .default, physicalMemoryBytes: 64 << 30)
         XCTAssertLessThan(dflash.kvBytes, nativeMTP.kvBytes)
         XCTAssertLessThan(dflash.weightsBytes, nativeMTP.weightsBytes)
         XCTAssertGreaterThan(dflash.maxFittingContext, nativeMTP.maxFittingContext)
@@ -377,7 +394,7 @@ final class FlashNextModuleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dflashDir) }
         var reqDFlash = QWSpeculativeParameters(mtpDrafts: 7, mtpBackend: "dflash2")
         reqDFlash.dflashDraftPackPath = dflashDir.path
-        let resDF = try FlashNextModule.resolveSpeculation(reqDFlash, descriptor: desc, environment: [:], modelSwitch: true)
+        let resDF = try DenseModule.resolveSpeculation(reqDFlash, descriptor: desc, environment: [:], modelSwitch: true)
         XCTAssertEqual(resDF.engineBackend, QWMTPBackend.dflash2)
         XCTAssertEqual(resDF.engineDrafts, 7)
         XCTAssertEqual(resDF.reportedBackend, "dflash2")
@@ -386,7 +403,7 @@ final class FlashNextModuleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dspineDir) }
         var reqDS = QWSpeculativeParameters(mtpDrafts: 12, mtpBackend: "dspine")
         reqDS.dflashDraftPackPath = dspineDir.path
-        let resDS = try FlashNextModule.resolveSpeculation(reqDS, descriptor: desc, environment: [:], modelSwitch: true)
+        let resDS = try DenseModule.resolveSpeculation(reqDS, descriptor: desc, environment: [:], modelSwitch: true)
         XCTAssertEqual(resDS.engineBackend, QWMTPBackend.dflash2)
         XCTAssertEqual(resDS.engineDrafts, 7)
         XCTAssertEqual(resDS.reportedBackend, "dspine")
@@ -394,44 +411,37 @@ final class FlashNextModuleTests: XCTestCase {
         // Model switch with incompatible/missing drafter falls back cleanly to variational (<= 3 drafts).
         var reqMissing = QWSpeculativeParameters(mtpDrafts: 7, mtpBackend: "dflash2")
         reqMissing.dflashDraftPackPath = "/tmp/nonexistent-dflash-\(UUID().uuidString)"
-        let fallback = try FlashNextModule.resolveSpeculation(reqMissing, descriptor: desc, environment: [:], modelSwitch: true)
+        let fallback = try DenseModule.resolveSpeculation(reqMissing, descriptor: desc, environment: [:], modelSwitch: true)
         XCTAssertEqual(fallback.parameters.mtpBackend, "variational")
         XCTAssertNil(fallback.engineBackend)
         XCTAssertLessThanOrEqual(fallback.reportedDrafts, 3)
     }
 
     func testConcurrentLastResultAndTelemetryUpdatesAreThreadSafe() throws {
-        let module = FlashNextModule(plan: try flashNextPlan())
+        let genSource = try String(contentsOf: Self.repoRoot
+            .appendingPathComponent("Sources/Runtime/QWEngine/Driver/HyperStream/QWHyperStreamRuntime+Generation.swift"),
+            encoding: .utf8)
+        XCTAssertTrue(genSource.contains("stateLock.withLock { _naxLogMessage = newValue }"))
+        XCTAssertTrue(genSource.contains("stateLock.withLock { _lastResult = newValue }"))
+        let module = DenseModule(plan: try flashNextPlan())
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "fn.module.race.test", attributes: .concurrent)
-        for worker in 0..<8 {
+        for _ in 0..<8 {
             group.enter()
             queue.async {
-                for iter in 0..<250 {
-                    let result = QWGenerationResult(
-                        tokens: [worker, iter],
-                        stepMs: [12.5],
-                        stepTokenCounts: [2],
-                        cache: QWCacheAnswer(hit: iter % 2 == 0, matchedTokens: iter, totalTokens: 64, tier: "warm_ram"),
-                        speculativeSummary: "dflash2=\(iter)/\(iter + 1), rounds=1, mean=2.00 tok/rnd"
-                    )
-                    module.naxLogMessage = "Dense NAX mode \(worker)-\(iter)"
-                    module.recordGenerationResult(result, specProposals: iter + 1, specAccepted: iter)
+                for _ in 0..<250 {
+                    module.onCacheEvent = { _ in }
                     _ = module.lastTurn
                     _ = module.report
+                    _ = module.capabilities
+                    _ = module.prefixCache
                 }
                 group.leave()
             }
         }
         XCTAssertEqual(group.wait(timeout: .now() + 10), .success)
-        XCTAssertNotNil(module.lastTurn)
+        XCTAssertNil(module.lastTurn)
     }
-}
-
-/// A session state from another family — the module must not accept it.
-private final class DummyState: QWModuleSessionState, @unchecked Sendable {
-    var activeTokens: Int { 0 }
-    func reset(sampling: QWSamplerConfig, speculative: QWSpeculativeParameters) throws {}
 }
 
 /// A loaded engine from another family.

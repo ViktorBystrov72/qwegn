@@ -31,6 +31,7 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_f16_body(
     device half*        outp,
     constant uint&      pos,
     constant uint&      T,
+    uint                slidingWindow,
     uint tid,
     uint sgi,
     uint3 tg,
@@ -81,8 +82,11 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_f16_body(
 
     const uint kLoadVec8 = 4u * QW_HEAD_DIM;
     const uint kStageStride = QW_NAX_HDIM;
+    const uint kStartRaw = (slidingWindow > 0u && (pos + tile0 + 1u) > slidingWindow)
+        ? ((pos + tile0 + 1u) - slidingWindow) : 0u;
+    const uint nStart = kStartRaw & ~(QW_BK - 1u);
 
-    for (uint n0 = 0u; n0 < kEnd; n0 += QW_BK) {
+    for (uint n0 = nStart; n0 < kEnd; n0 += QW_BK) {
         NAXTile<half, 1, 2> Pt;
 
         for (uint e = tid; e < kLoadVec8; e += kThreads) {
@@ -135,7 +139,9 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_f16_body(
             }
         }
 
-        const bool isUnmasked = (n0 + QW_BK <= pos + rowBase);
+        const uint maxRowPlus1 = pos + rowBase + 16u;
+        const bool isUnmasked = (n0 + QW_BK <= pos + rowBase)
+            && (slidingWindow == 0u || maxRowPlus1 <= n0 + slidingWindow);
         if (isUnmasked) {
             STEEL_PRAGMA_UNROLL
             for (short ik = 0; ik < 2; ik++) {
@@ -155,7 +161,8 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_f16_body(
                     const uint i = (uint)(loc >> 2), j = (uint)(loc & 3);
                     const uint abs_cc = col0 + j;
                     const uint abs_rr = pos + rowBase + (uint)sm + i * 8u;
-                    fg[loc] = (abs_cc <= abs_rr && abs_cc < (pos + T)) ? (fg[loc] * scale2) : (-1e30f);
+                    const bool inWin = (slidingWindow == 0u || (abs_rr - abs_cc) < slidingWindow);
+                    fg[loc] = (abs_cc <= abs_rr && abs_cc < (pos + T) && inWin) ? (fg[loc] * scale2) : (-1e30f);
                 }
             }
         }
@@ -323,6 +330,7 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_i8_body(
     device half*        outp,
     constant uint&      pos,
     constant uint&      T,
+    uint                slidingWindow,
     uint tid,
     uint sgi,
     uint3 tg,
@@ -419,8 +427,11 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_i8_body(
     const uint kLoadVec8 = 4u * QW_HEAD_DIM;
     constexpr uint kStageStrideI8 = QW_NAX_HDIM + 16u;
     constexpr uint kStageStrideV  = QW_NAX_HDIM;
+    const uint kStartRaw = (slidingWindow > 0u && (pos + tile0 + 1u) > slidingWindow)
+        ? ((pos + tile0 + 1u) - slidingWindow) : 0u;
+    const uint nStart = kStartRaw & ~(QW_BK - 1u);
 
-    for (uint n0 = 0u; n0 < kEnd; n0 += QW_BK) {
+    for (uint n0 = nStart; n0 < kEnd; n0 += QW_BK) {
         NAXTile<half, 1, 2> Pt;
 
         for (uint e = tid; e < kLoadVec8; e += kThreads) {
@@ -511,7 +522,9 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_i8_body(
         }
 
         NAXTile<float, 1, 2> Stile;
-        const bool isUnmasked = (n0 + QW_BK <= pos + rowBase);
+        const uint maxRowPlus1 = pos + rowBase + 16u;
+        const bool isUnmasked = (n0 + QW_BK <= pos + rowBase)
+            && (slidingWindow == 0u || maxRowPlus1 <= n0 + slidingWindow);
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < 2; ik++) {
             const uint kColBase = uint(ik * kU) + uint(sn);
@@ -535,7 +548,8 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_i8_body(
                     const uint i = (uint)(loc >> 2), j = (uint)(loc & 3);
                     const uint abs_cc = col0 + j;
                     const uint abs_rr = pos + rowBase + (uint)sm + i * 8u;
-                    fg[loc] = (abs_cc <= abs_rr && abs_cc < (pos + T))
+                    const bool inWin = (slidingWindow == 0u || (abs_rr - abs_cc) < slidingWindow);
+                    fg[loc] = (abs_cc <= abs_rr && abs_cc < (pos + T) && inWin)
                         ? (float(ifg[loc]) * (qScale2[i] * ksv[j]))
                         : (-1e30f);
                 }
@@ -705,6 +719,7 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_body(
     device half*        outp,
     constant uint&      pos,
     constant uint&      T,
+    uint                slidingWindow,
     uint tid,
     uint sgi,
     uint3 tg,
@@ -713,9 +728,9 @@ METAL_FUNC void qwg_attn_prefill_paged_nax_pair_body(
     if (MODE != 0u && (QW_HEAD_DIM & (QW_HEAD_DIM - 1u)) == 0u) {
         threadgroup int8_t* kvblk_i8 = (threadgroup int8_t*)kvblk;
         threadgroup float* kScale = (threadgroup float*)(kvblk_i8 + QW_BK * (QW_NAX_HDIM + 16u));
-        qwg_attn_prefill_paged_nax_pair_i8_body<MODE>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, tid, sgi, tg, kvblk_i8, kScale, vblk, kvblk);
+        qwg_attn_prefill_paged_nax_pair_i8_body<MODE>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, slidingWindow, tid, sgi, tg, kvblk_i8, kScale, vblk, kvblk);
     } else {
-        qwg_attn_prefill_paged_nax_pair_f16_body<MODE>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, tid, sgi, tg, kvblk, vblk);
+        qwg_attn_prefill_paged_nax_pair_f16_body<MODE>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, slidingWindow, tid, sgi, tg, kvblk, vblk);
     }
 }
 
@@ -729,12 +744,13 @@ kernel void qwg_attn_prefill_paged_nax_pair##SFX( \
     device half*        outp    [[buffer(5)]], \
     constant uint&      pos     [[buffer(6)]], \
     constant uint&      T       [[buffer(7)]], \
+    constant uint&      slidingWindow [[buffer(8)]], \
     uint tid   [[thread_index_in_threadgroup]], \
     uint sgi   [[simdgroup_index_in_threadgroup]], \
     uint3 tg   [[threadgroup_position_in_grid]]) { \
     threadgroup half kvblk[QW_BK * QW_NAX_HDIM]; \
     threadgroup half vblk[QW_BK * QW_NAX_HDIM]; \
-    qwg_attn_prefill_paged_nax_pair_body<MODE>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, tid, sgi, tg, kvblk, vblk); \
+    qwg_attn_prefill_paged_nax_pair_body<MODE>(qgate, kpool, vpool, ktab, vtab, outp, pos, T, slidingWindow, tid, sgi, tg, kvblk, vblk); \
 }
 QW_PAGED_PREFILL_ENTRY(, 0)
 QW_PAGED_PREFILL_ENTRY(_q8, 1)

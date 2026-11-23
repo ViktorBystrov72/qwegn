@@ -244,27 +244,17 @@ def dispatched_in(dirs: list[str], skip: tuple[str, ...] = ()) -> set[str]:
     return out
 
 
-DENSE_ENGINE_DIRS = ["Sources/Runtime/QWEngine"]
-NON_STANDARD_KERNEL_PREFIXES = (
-    "qwg_dflash_", "qwg_dspine_", "qwg_echo_", "qwg_mtp_",
-    "qwg_gdn_", "qwg_kda_", "qwg_hca_", "qwg_mla_",
-    "qwg_mbsa_",
-    "qwg_emeans_mla_", "qwg_mhc_", "qwg_moe_",
-    "qwg_cold_event_", "qwg_router_gemm",
-)
-FLASH_NEXT_ENGINE_DIRS = ["Sources/Subsystems/QWFlashNext"]
-SHARED_OPERATOR_DIRS = ["Sources/Operators/QWAttn", "Sources/Operators/QWGDN",
-                        "Sources/Operators/QWGEMM", "Sources/Operators/QWHead",
-                        "Sources/Operators/QWKV", "Sources/Subsystems/QWMTP",
-                        "Sources/Operators/QWNorm", "Sources/Operators/QWRope",
-                        "Sources/Foundation/QWQuant", "Sources/Subsystems/QWVision"]
-FLASH_NEXT_OPERATOR_DIRS = ["Sources/Operators/QWGDN", "Sources/Operators/QWGEMM",
-                            "Sources/Subsystems/QWMTP",
-                            "Sources/Foundation/QWQuant", "Sources/Subsystems/QWVision"]
+ENGINE_DIRS = ["Sources/Runtime/QWEngine"]
+OPERATOR_DIRS = ["Sources/Operators/QWAttn", "Sources/Operators/QWGDN",
+                 "Sources/Operators/QWGEMM", "Sources/Operators/QWHead",
+                 "Sources/Operators/QWKV", "Sources/Operators/QWMLP",
+                 "Sources/Subsystems/QWMTP", "Sources/Operators/QWNorm",
+                 "Sources/Operators/QWRope", "Sources/Operators/QWHyperPLE",
+                 "Sources/Foundation/QWQuant", "Sources/Subsystems/QWVision"]
 
 
 def door_problems(available: set[str], dynamic: set[str] | None = None) -> list[str]:
-    """Doors a module's engine dispatches but its module does not declare."""
+    """Doors the unified engine dispatches but DenseModule does not declare."""
     problems: list[str] = []
     if dynamic is None:
         _, dynamic = swift_refs()
@@ -275,44 +265,24 @@ def door_problems(available: set[str], dynamic: set[str] | None = None) -> list[
     generated = gen_kernel_inventory.render(inventory)
     if not gen_kernel_inventory.OUTPUT.exists() or gen_kernel_inventory.OUTPUT.read_text(encoding="utf-8") != generated:
         problems.append("STALE KERNEL INVENTORY: run python3 Scripts/gen_kernel_inventory.py")
-    common = set(inventory["common"])
-    declared_standard = common | set(inventory["standard_only"])
-    doors = {
-        "DenseModule": declared_standard | set(inventory["dense_only"]),
-        "FlashNextModule": common | set(inventory["flash_only"]),
-        "StandardModule": declared_standard,
-        "Qwen3MoEModule": declared_standard | set(inventory["moe_only"]),
-    }
-    for missing in sorted(set().union(*doors.values()) - available):
+    all_doors = (set(inventory["common"])
+                 | set(inventory["dense_only"])
+                 | set(inventory["hyper_only"])
+                 | set(inventory["inkling2_only"]))
+    for missing in sorted(all_doors - available):
         problems.append(f"MISSING INVENTORY KERNEL: {missing!r} is not in the metallib")
-    dense = (dispatched_in(DENSE_ENGINE_DIRS, ("Module", "Core"))
-             | dispatched_in(SHARED_OPERATOR_DIRS))
-    flash = (dispatched_in(FLASH_NEXT_ENGINE_DIRS)
-             | dispatched_in(FLASH_NEXT_OPERATOR_DIRS))
-    standard = {k for k in dense if not k.startswith(NON_STANDARD_KERNEL_PREFIXES)}
-    # The sparse family adds the chain's own kernels to the standard set.
-    chain = chain_kernels()
-    expected = {
-        "DenseModule": dense,
-        "FlashNextModule": flash,
-        "StandardModule": standard,
-        "Qwen3MoEModule": standard | chain,
-    }
-    for name, want in expected.items():
-        have = doors[name]
-        for missing in sorted(want - have):
-            problems.append(f"UNDECLARED DOOR: {name} dispatches {missing!r} "
-                            f"but does not declare it")
-    all_dispatched = dense | flash | chain | dispatched_in(["Sources/Foundation/QWLoad"])
-    for extra in sorted(set().union(*doors.values()) - all_dispatched):
+    dispatched = (dispatched_in(ENGINE_DIRS, ("Module", "Core"))
+                  | dispatched_in(OPERATOR_DIRS)
+                  | chain_kernels())
+    for missing in sorted(dispatched - all_doors):
+        problems.append(f"UNDECLARED DOOR: DenseModule dispatches {missing!r} "
+                        f"but does not declare it")
+    all_dispatched = dispatched | dispatched_in(["Sources/Foundation/QWLoad"])
+    for extra in sorted(all_doors - all_dispatched):
         if any(extra.startswith(d) for d in dynamic):
             continue
         problems.append(f"STALE INVENTORY DOOR: inventory declares {extra!r} "
                         f"but no engine or operator dispatches it")
-    # A door the sparse family adds must be one its chain dispatches.
-    for extra in sorted(set(inventory["moe_only"]) - chain):
-        problems.append(f"UNDECLARED DOOR: Qwen3MoEModule declares {extra!r} "
-                        f"but its chain does not dispatch it")
     return problems
 
 

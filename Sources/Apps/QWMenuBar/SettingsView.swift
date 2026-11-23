@@ -2,6 +2,7 @@
 
 import AppKit
 import QWCore
+import QWSMCHelper
 import QWServer
 import ServiceManagement
 import SwiftUI
@@ -22,7 +23,11 @@ public struct SettingsView: View {
     @State var isGeneratingLSASidecar: Bool = false
     @State var lsaSidecarTask: Task<Void, Never>?
     @State var isSaving: Bool = false
+    @State var fanHelperStatus: QWSMCHelperStatus = .notInstalled
+    @State var isUpdatingFanHelper: Bool = false
+    @State var fanHelperMessage: String?
     public var onClose: () -> Void
+    public var onOpenUpdates: (Bool) -> Void
 
     public enum SettingsTab: String, CaseIterable, Identifiable {
         case general = "General"
@@ -51,13 +56,15 @@ public struct SettingsView: View {
     public init(
         telemetry: TelemetryObservable,
         initialTab: SettingsTab = .general,
-        onClose: @escaping () -> Void = {}
+        onClose: @escaping () -> Void = {},
+        onOpenUpdates: @escaping (Bool) -> Void = { _ in }
     ) {
         self.telemetry = telemetry
         self._draftSettings = State(initialValue: telemetry.settings)
         self._baselineSettings = State(initialValue: telemetry.settings)
         self._activeTab = State(initialValue: initialTab)
         self.onClose = onClose
+        self.onOpenUpdates = onOpenUpdates
     }
 
     var isDirty: Bool {
@@ -275,6 +282,8 @@ public struct SettingsView: View {
                     .font(TelemetryTheme.ui(11))
                     .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
             }
+
+            softwareUpdatesGroup
 
             settingsGroup(title: "Network & Endpoints", icon: "network") {
                 formRow(label: "Listen Host:", key: "host") {

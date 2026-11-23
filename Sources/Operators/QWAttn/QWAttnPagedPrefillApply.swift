@@ -45,7 +45,8 @@ public final class QWAttnPagedPrefill: Sendable {
                        qgate: QWTensorValue,
                        kv: (k: QWKVLayerView, v: QWKVLayerView),
                        out: QWTensorValue,
-                       pos: Int, T: Int) throws {
+                       pos: Int, T: Int,
+                       slidingWindow: Int? = nil) throws {
         let sp = (T + 31) / 32 * 32
         let wantQGate = sp * geometry.qProjOut
         let wantOut = T * geometry.qHeads * geometry.headDim
@@ -83,8 +84,10 @@ public final class QWAttnPagedPrefill: Sendable {
         out.bind(enc, index: 5)
         var posU = UInt32(pos)
         var tU = UInt32(T)
+        var swU = UInt32(max(0, slidingWindow ?? geometry.descriptor.slidingWindow ?? 0))
         enc.setBytes(&posU, length: 4, index: 6)
         enc.setBytes(&tU, length: 4, index: 7)
+        enc.setBytes(&swU, length: 4, index: 8)
 
         let numTiles = (T + 31) / 32
         let gqaRatio = max(1, geometry.qHeads / max(1, geometry.kvHeads))

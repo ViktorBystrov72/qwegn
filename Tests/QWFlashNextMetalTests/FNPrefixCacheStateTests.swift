@@ -5,7 +5,7 @@
 
 import XCTest
 import Foundation
-@testable import QWFlashNext
+@testable import QWEngine
 
 final class FNPrefixCacheStateTests: XCTestCase {
     private func makeDirectory() throws -> URL {
@@ -27,7 +27,7 @@ final class FNPrefixCacheStateTests: XCTestCase {
         try Data(repeating: 2, count: 256)
             .write(to: dir.appendingPathComponent("fn_entry_0000000000000000_4.qwcache"))
 
-        let state = try XCTUnwrap(FNGPUEngine.diskState(in: dir))
+        let state = try XCTUnwrap(QWHyperStreamRuntime.diskState(in: dir))
         XCTAssertEqual(state.entries, 2, "only the saved prefixes are cache entries")
         XCTAssertEqual(state.bytes, 1024 + 256, "the bytes are the prefixes' own")
     }
@@ -35,7 +35,7 @@ final class FNPrefixCacheStateTests: XCTestCase {
     func testADirectoryThatCannotBeReadIsAbsentNotZero() {
         let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent("fncache-missing-\(UUID().uuidString)")
-        XCTAssertNil(FNGPUEngine.diskState(in: missing),
+        XCTAssertNil(QWHyperStreamRuntime.diskState(in: missing),
                      "a cache that was not measured is absent, not an empty one")
     }
 }

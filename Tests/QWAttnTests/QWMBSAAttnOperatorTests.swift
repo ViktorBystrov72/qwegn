@@ -79,6 +79,28 @@ final class QWMBSAAttnOperatorTests: XCTestCase {
         return QWMBSAAttnOperator.LayerWeights(qkvIdxProj: view, wqIdx: wqT, wkIdx: wkT)
     }
 
+    func testTargetSplitsWaveAlignment() {
+        let s1 = QWMBSAAttnOperator.targetSplits(rows: 1, kvHeads: 4, maxKeys: 4096)
+        XCTAssertEqual(s1, 20)
+        XCTAssertEqual((4 * s1) % 40, 0)
+
+        for rows in 1...8 {
+            let splits = QWMBSAAttnOperator.targetSplits(rows: rows, kvHeads: 4, maxKeys: 4096)
+            let cap = rows == 1 ? 64 : 32
+            XCTAssertGreaterThanOrEqual(splits, 1)
+            XCTAssertLessThanOrEqual(splits, cap)
+            XCTAssertEqual((rows * 4 * splits) % 40, 0, "rows=\(rows) splits=\(splits) not 40-core wave aligned")
+            let per = ((4096 + splits - 1) / splits + 15) & ~15
+            XCTAssertLessThan((splits - 1) * per, 4096, "rows=\(rows) splits=\(splits) wastes an empty split")
+        }
+
+        XCTAssertEqual(QWMBSAAttnOperator.targetSplits(rows: 1, kvHeads: 8, maxKeys: 4096), 20)
+        XCTAssertEqual(QWMBSAAttnOperator.targetSplits(rows: 1, kvHeads: 2, maxKeys: 4096), 20)
+        XCTAssertEqual(QWMBSAAttnOperator.targetSplits(rows: 1, kvHeads: 4, maxKeys: 8192), 40)
+        XCTAssertEqual(QWMBSAAttnOperator.targetSplits(rows: 1, kvHeads: 4, maxKeys: 256), 8)
+        XCTAssertEqual(QWMBSAAttnOperator.targetSplits(rows: 1, kvHeads: 4, maxKeys: 4096, gpuCores: 0), 22)
+    }
+
     func testIndexStateCaptureRestoreRoundTrip() throws {
         try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == "true", "GPU MBSA test skipped on CI")
         let geo = try Self.makeGeometry()
@@ -385,5 +407,95 @@ final class QWMBSAAttnOperatorTests: XCTestCase {
                 XCTAssertLessThan(d, tol, "NAX prefill r=\(r) h=\(h) mode=\(mode) maxDiff=\(d)")
             }
         }
+    }
+
+    func testRotatedBasisSingleSplitMatchesSplitK() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == "true", "GPU MBSA test skipped on CI")
+        let geo = try Self.makeGeometry()
+        let hal = try QWHal(geometry: geo, weightBasis: .rotated)
+        let maxCtx = 4608
+        let pos = 4400
+        let totalKeys = pos + 1
+        let headDim = geo.headDim
+        let kvElems = geo.kvChannels
+        let pages = (totalKeys + 255) / 256 + 1
+        let pageBytes = QWKVCache.pageBytes(mode: .f16, geometry: geo)
+        let tables = QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs
+        let kvBytes = pageBytes * (pages * 2 + 4) + tables + (1 << 20)
+        let arena = try QWArena(hal: hal, weights: 4 << 20, activations: 0, kv: kvBytes, gdnStates: 4096)
+        let cache = try QWKVCache(hal: hal, arena: arena, layers: [0], mode: .f16, geometry: geo)
+        let seq = try cache.allocate(promptTokens: maxCtx)
+        let views = try cache.layerViews(seq, layer: 0)
+        let op = try QWMBSAAttnOperator(
+            hal: hal, geometry: geo, config: geo.blockSparseGQAConfig!,
+            kvMode: .f16, layerCount: 1, maxContext: maxCtx, maxPrefillChunk: 64)
+
+        let kInBuf = try XCTUnwrap(hal.device.makeBuffer(length: totalKeys * kvElems * 2, options: .storageModeShared))
+        let vInBuf = try XCTUnwrap(hal.device.makeBuffer(length: totalKeys * kvElems * 2, options: .storageModeShared))
+        for t in 0..<totalKeys {
+            let kr = (0..<kvElems).map { sin(Float((t &* 13 &+ $0) % 197) * 0.031) * 0.4 }
+            let vr = (0..<kvElems).map { cos(Float((t &* 7 &+ $0) % 211) * 0.029) * 0.4 }
+            writeF16(kInBuf, byteOffset: t * kvElems * 2, values: kr)
+            writeF16(vInBuf, byteOffset: t * kvElems * 2, values: vr)
+        }
+        let psoWriter = try hal.pipeline("qwg_kv_paged_write_general")
+        guard let (cbW, encW) = hal.begin() else { throw NSError(domain: "hal", code: 10) }
+        encW.setComputePipelineState(psoWriter)
+        views.k.pool.bindTo(encW, index: 0)
+        views.v.pool.bindTo(encW, index: 1)
+        views.k.table.bind(encW, index: 2)
+        views.v.table.bind(encW, index: 3)
+        encW.setBuffer(kInBuf, offset: 0, index: 4)
+        encW.setBuffer(vInBuf, offset: 0, index: 5)
+        encW.setUInt32s(0, totalKeys, startIndex: 6)
+        var modeVal: UInt32 = 0
+        encW.setBytes(&modeVal, length: 4, index: 8)
+        encW.dispatchThreadgroups(MTLSize(width: geo.kvHeads, height: totalKeys, depth: 1),
+                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        encW.endEncoding(); cbW.commit(); cbW.waitUntilCompleted()
+        XCTAssertEqual(cbW.status, .completed)
+
+        let idxBase = op.idxKCaches[0].region.base + op.idxKCaches[0].offset
+        for t in 0..<totalKeys {
+            let blk = t / 128
+            let amp: Float = (blk == 15) ? 4.0 : 0.05 * Float((blk % 7) + 1)
+            let row = (0..<headDim).map { Float(sin(Double($0) * 0.1 + Double(blk))) * amp }
+            writeF16(op.idxKCaches[0].region.buffer, byteOffset: idxBase + t * headDim * 2, values: row)
+        }
+        let targetK = (0..<headDim).map { Float(sin(Double($0) * 0.1 + Double(15))) }
+        for h in 0..<geo.kvHeads {
+            writeF16(op.idxQScratch.region.buffer,
+                     byteOffset: op.idxQScratch.region.base + op.idxQScratch.offset + h * headDim * 2,
+                     values: targetK)
+        }
+
+        let qBuf = try XCTUnwrap(hal.device.makeBuffer(length: geo.qProjOut * 2, options: .storageModeShared))
+        let outSingleBuf = try XCTUnwrap(hal.device.makeBuffer(length: geo.qChannels * 2, options: .storageModeShared))
+        let outSplitBuf = try XCTUnwrap(hal.device.makeBuffer(length: geo.qChannels * 2, options: .storageModeShared))
+        writeF16(qBuf, byteOffset: 0, values: (0..<geo.qProjOut).map { sin(Float($0 % 97) * 0.07) * 0.5 })
+        let qT = QWTensorValue(region: QWMRegion(buffer: qBuf, base: 0, length: qBuf.length),
+                               offset: 0, shape: QWTensorShape([geo.qProjOut], .f16))
+        let outSingleT = QWTensorValue(region: QWMRegion(buffer: outSingleBuf, base: 0, length: outSingleBuf.length),
+                                       offset: 0, shape: QWTensorShape([geo.qChannels], .f16))
+        let outSplitT = QWTensorValue(region: QWMRegion(buffer: outSplitBuf, base: 0, length: outSplitBuf.length),
+                                      offset: 0, shape: QWTensorShape([geo.qChannels], .f16))
+        let partialsBytes = geo.qHeads * 64 * (headDim + 2) * 4
+        let pBuf = try XCTUnwrap(hal.device.makeBuffer(length: partialsBytes, options: .storageModeShared))
+        let partialsReg = QWMRegion(buffer: pBuf, base: 0, length: partialsBytes)
+
+        guard let (cb1, enc1) = hal.begin() else { throw NSError(domain: "hal", code: 11) }
+        op.encodeSelectAndAttend(enc1, qgate: qT, kv: views, out: outSingleT, layerIndex: 0, pos0: pos, rows: 1, partials: nil)
+        enc1.endEncoding(); cb1.commit(); cb1.waitUntilCompleted()
+        XCTAssertEqual(cb1.status, .completed)
+
+        guard let (cb2, enc2) = hal.begin() else { throw NSError(domain: "hal", code: 12) }
+        op.encodeSelectAndAttend(enc2, qgate: qT, kv: views, out: outSplitT, layerIndex: 0, pos0: pos, rows: 1, partials: partialsReg)
+        enc2.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
+        XCTAssertEqual(cb2.status, .completed)
+
+        let gotSingle = readF16(outSingleBuf, byteOffset: 0, count: geo.qChannels)
+        let gotSplit = readF16(outSplitBuf, byteOffset: 0, count: geo.qChannels)
+        let maxDiff = zip(gotSingle, gotSplit).map { abs($0 - $1) }.max() ?? 0
+        XCTAssertLessThan(maxDiff, 2e-3, "rotated splits=1 vs split-K maxDiff=\(maxDiff)")
     }
 }

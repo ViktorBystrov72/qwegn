@@ -67,7 +67,8 @@ enum QWMoEChain {
                 tileE: s.tileE, tileR: s.tileR, tileCount: s.tileCount,
                 gu16: s.gu16, dnHi: s.dnHi, dnAcc: s.dnAcc,
                 naxX16: s.naxX16, latent: s.latent,
-                maxTileWidth: max(geometry.hidden, geometry.sharedExpertIntermediate)
+                maxTileWidth: max(geometry.hidden, geometry.sharedExpertIntermediate),
+                activeExperts: s.activeExperts, activeIndirect: s.activeIndirect
             )
             let rotateFn: ((inout any MTLComputeCommandEncoder) throws -> Void)?
             if let driver {

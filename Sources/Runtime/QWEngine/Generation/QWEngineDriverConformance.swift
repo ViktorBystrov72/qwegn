@@ -10,6 +10,7 @@ import Metal
 import QWCore
 import QWHAL
 import QWHead
+import QWVision
 
 extension QWEngineDriver {
     func withDriverGenerateLock<T>(_ body: () throws -> T) rethrows -> T {
@@ -17,7 +18,8 @@ extension QWEngineDriver {
     }
 
     var maxBatchSlots: Int {
-        Self.gdnSlotCount()
+        if let ink = inkling2Runtime { return ink.maxBatchSlots }
+        return Self.gdnSlotCount()
     }
 }
 
@@ -26,20 +28,48 @@ extension QWEngineDriver: QWSessionInferenceEngine {
     public var prefixCacheEntries: Int { prefixStore?.count ?? 0 }
     public var ssdCacheChargedBytes: Int { cacheDiskManager?.chargedBytes ?? 0 }
     public var ssdCacheEntries: Int { cacheDiskManager?.entryCount ?? 0 }
-    public var hasPrefixCache: Bool { prefixStore != nil }
-    public var arenaBytes: Int { arena.committedBytes }
-    public var weightReservedBytes: Int { arena.regionSizes.weights }
-    public var weightUsedBytes: Int { arena.weightsSub.usedBytes }
-    public var freeKVPages: Int { kvCache.freePageCount }
-    /// The dense family offers every capability its module offers, and expert streaming when the model is MoE.
+    public var hasPrefixCache: Bool {
+        if let hyper = hyperRuntime { return hyper.hasPrefixCacheTier }
+        if let ink = inkling2Runtime { return ink.hasPrefixCacheTier }
+        return prefixStore != nil
+    }
+    public var arenaBytes: Int {
+        if let hyper = hyperRuntime { return hyper.arenaBytes }
+        if let ink = inkling2Runtime { return ink.arenaBytes }
+        return arena.committedBytes
+    }
+    public var weightReservedBytes: Int {
+        if let hyper = hyperRuntime { return hyper.weightReservedBytes }
+        if let ink = inkling2Runtime { return ink.weightReservedBytes }
+        return arena.regionSizes.weights
+    }
+    public var weightUsedBytes: Int {
+        if let hyper = hyperRuntime { return hyper.weightUsedBytes }
+        if let ink = inkling2Runtime { return ink.weightUsedBytes }
+        return arena.weightsSub.usedBytes
+    }
+    public var freeKVPages: Int {
+        if let hyper = hyperRuntime { return hyper.activeCapacity }
+        if let ink = inkling2Runtime { return ink.activeCapacity }
+        return kvCache.freePageCount
+    }
+    /// Derives engine capabilities from geometry, weight format, and attached vision weights.
     public var capabilities: Set<QWKnobCapability> {
-        geometry.numExperts > 0 ? DenseModule.capabilities.union([.expertStreaming]) : DenseModule.capabilities
+        if let hyper = hyperRuntime { return hyper.buildCapabilities() }
+        if let ink = inkling2Runtime { return ink.buildCapabilities() }
+        return QWModelCapabilities.resolve(
+            descriptor: geometry.descriptor,
+            weightFormat: weightFormat,
+            hasVisionWeights: hasVisionWeights
+        )
     }
     public var supportsTokenConstraints: Bool { true }
 
     /// The cache the engine holds. The bytes are what the cache says it
     /// charged; an engine with no cache reports no cache at all.
     public var prefixCache: QWPrefixCacheState {
+        if let hyper = hyperRuntime { return hyper.prefixCacheState }
+        if let ink = inkling2Runtime { return ink.prefixCacheState }
         guard hasPrefixCache else { return QWPrefixCacheState(isConfigured: false) }
         return QWPrefixCacheState(
             isConfigured: true,
@@ -53,6 +83,8 @@ extension QWEngineDriver: QWSessionInferenceEngine {
 
     /// The last turn's measurements, in the shape every family reports.
     public var lastTurn: QWGenerationResult? {
+        if let hyper = hyperRuntime { return hyper.lastResult }
+        if let ink = inkling2Runtime { return ink.lastResult }
         // The cache's answer belongs to the turn: the consumer that
         // asks afterwards gets the answer this turn got.
         let cache = lastPrefixCacheStats.map { stats in
@@ -80,12 +112,15 @@ extension QWEngineDriver: QWSessionInferenceEngine {
     /// A multi-turn conversation over this engine. The dense engine
     /// drives its own steps, so it has one.
     public func makeConversation() -> QWConversation? {
-        QWConversation(engine: self)
+        if hyperRuntime != nil || inkling2Runtime != nil { return nil }
+        return QWConversation(engine: self)
     }
 
-    /// What the dense engine says about itself. The frame belongs to the
-    /// consumer; these lines are the dense engine's own story.
+    /// What the engine says about itself. The frame belongs to the
+    /// consumer; these lines are the engine's own story.
     public var report: QWEngineReport {
+        if let hyper = hyperRuntime { return hyper.buildReport() }
+        if let ink = inkling2Runtime { return ink.buildReport() }
         var lines = ""
         if lastExperimentalGeneration != nil {
             let isDSpine = dflashDrafter?.config.isDSpine == true
@@ -135,7 +170,19 @@ extension QWEngineDriver: QWSessionInferenceEngine {
         request: QWGenerationRequest,
         onToken: ((Int) -> Bool)?
     ) throws -> QWGenerationResult {
-        try withDriverGenerateLock {
+        if let hyper = hyperRuntime {
+            if request.usePrefixCache && !hyper.hasPrefixCacheTier {
+                throw QWEngineDriverError.state("the request wants a prefix cache this engine does not have")
+            }
+            return try hyper.runGeneration(request: request, onToken: onToken, onStopToken: nil)
+        }
+        if let ink = inkling2Runtime {
+            if request.usePrefixCache && !ink.hasPrefixCacheTier {
+                throw QWEngineDriverError.state("the request wants a prefix cache this engine does not have")
+            }
+            return try ink.runGeneration(request: request, onToken: onToken, onStopToken: nil)
+        }
+        return try withDriverGenerateLock {
             if request.usePrefixCache && !hasPrefixCache {
                 throw QWEngineDriverError.state("the request wants a prefix cache this engine does not have")
             }

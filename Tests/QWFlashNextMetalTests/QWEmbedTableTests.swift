@@ -5,7 +5,7 @@
 import XCTest
 import Foundation
 import Metal
-@testable import QWFlashNext
+@testable import QWEngine
 import QWCore
 import QWHAL
 import QWAlloc

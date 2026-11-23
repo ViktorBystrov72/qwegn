@@ -6,13 +6,14 @@ import re, sys
 ROOT = Path(__file__).resolve().parent.parent
 LAYERS = {
     "QWCore": 0.0, "QWMetalCounterSupport": 0.0,
+    "QWSMCHelper": 0.5,
     "QWHAL": 1.0, "QWQuant": 1.0, "QWToken": 1.0,
     "QWAlloc": 2.0, "QWLoad": 2.5, "QWRope": 2.5,
     "QWGEMM": 3.0, "QWKV": 3.0,
-    "QWNorm": 4.0, "QWAttn": 4.0, "QWGDN": 4.0, "QWMLP": 4.0, "QWVision": 4.0,
-    "QWHead": 5.0, "QWMTP": 6.0, "QWMM": 6.0, "QWFlashNext": 6.5,
+    "QWNorm": 4.0, "QWAttn": 4.0, "QWGDN": 4.0, "QWMLP": 4.0, "QWHyperPLE": 4.0, "QWVision": 4.0,
+    "QWHead": 5.0, "QWMTP": 6.0, "QWMM": 6.0,
     "QWEngine": 7.0, "QWCli": 7.5, "QWServer": 7.8,
-    "qwg": 8.0, "qwg-bench-kernels": 8.0, "golden_pre_p3": 8.0,
+    "qwg": 8.0, "qwg-smc-helper": 8.0, "qwg-bench-kernels": 8.0, "golden_pre_p3": 8.0,
     "m1": 8.0, "QWMenuBarUI": 8.5, "qwg-menu": 9.0,
 }
 TEST_MAX_LAYER = {

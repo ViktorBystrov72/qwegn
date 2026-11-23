@@ -365,4 +365,76 @@ final class QWTokenTests: XCTestCase {
         XCTAssertTrue(resolved.defaultStopTokenIds.contains(3))
         XCTAssertTrue(resolved.defaultStopTokenIds.contains(5))
     }
+
+    func testIgnoreMergesAndInkling2SpecialTokens() throws {
+        var addedTokens: [[String: Any]] = []
+        var vocab: [String: Int] = [:]
+        var nextId = 0
+        for s in ["<|endoftext|>", "<|content_model_end_sampling|>", "<|end_message|>", "<|message_model|>"] {
+            addedTokens.append(["id": nextId, "content": s, "special": true])
+            nextId += 1
+        }
+        var n = 0
+        for b in 0..<256 {
+            let idc = Unicode.Scalar(UInt8(b))
+            let printable = (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF)
+            let sc: Unicode.Scalar = printable ? idc : Unicode.Scalar(0x100 + n)!
+            if !printable { n += 1 }
+            if b == 0xC0 || b == 0xC1 || b >= 0xF5 { continue }
+            vocab[String(sc)] = nextId
+            nextId += 1
+        }
+        // Intentionally add a direct multi-byte word `"abc"` in vocab WITH NO merge rule `"a" + "b" -> "ab"`
+        // so `ignore_merges: true` emits the direct token whereas BPE merges alone could never form `"abc"`.
+        let abcId = nextId
+        vocab["abc"] = abcId
+        nextId += 1
+        let pretokenizers: [[String: Any]] = [
+            ["type": "Split", "pattern": ["Regex": "[A-Za-z]+|\\s+"], "behavior": "Isolated", "invert": false],
+            ["type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false]
+        ]
+        let root: [String: Any] = [
+            "added_tokens": addedTokens,
+            "model": ["type": "BPE", "ignore_merges": true, "vocab": vocab, "merges": []],
+            "pre_tokenizer": ["type": "Sequence", "pretokenizers": pretokenizers]
+        ]
+        let tok = try QWTokenizer(json: try JSONSerialization.data(withJSONObject: root))
+        XCTAssertEqual(try tok.encode("abc xyz").first, abcId)
+        XCTAssertEqual(try tok.decode([abcId]), "abc")
+
+        let resolved = tok.resolveSpecialTokens(
+            fallback: QWModelSpecialTokens(eosTokenId: 1, usesChatTemplateIds: false)
+        )
+        XCTAssertEqual(resolved.eosTokenId, 1)
+        XCTAssertTrue(resolved.defaultStopTokenIds.contains(1))
+        XCTAssertFalse(resolved.defaultStopTokenIds.contains(2), "<|end_message|> must NOT be a stop token")
+    }
+
+    func testInkling2RealTokenizerOracleParity() throws {
+        let tokURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".qwg/models/Inkling-2-Mini-MLX-4-8bit/tokenizer.json")
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: tokURL.path), "Inkling-2 tokenizer.json not installed")
+        let tok = try QWTokenizer(json: Data(contentsOf: tokURL))
+        let cases: [(String, [Int])] = [
+            ("Hello, world!", [32269, 11, 150770, 0]),
+            ("I'm testing don't you're we've she'll he'd.", [40, 6, 76, 152831, 150388, 6, 83, 149941, 6, 261, 149961, 6, 290, 150295, 6, 359, 150026, 6, 67, 13]),
+            ("def fib(n):\n    return n if n < 2 else fib(n-1) + fib(n-2)\n", [1719, 172281, 7, 77, 8, 25, 198, 149862, 150583, 149934, 150003, 149934, 196982, 220, 17, 150506, 172281, 7, 77, 12, 16, 8, 196986, 172281, 7, 77, 12, 17, 8, 198]),
+            ("Numbers: 0, 123, 9876543210, 3.14159, -42e-6.", [98677, 25, 220, 15, 11, 220, 70904, 11, 220, 100057, 98613, 81271, 15, 11, 220, 18, 13, 73388, 69022, 11, 196973, 68872, 68, 12, 21, 13]),
+            ("UTF-8 emoji 🚀 and accents café résumé naïve.", [146531, 12, 23, 220, 40688, 220, 108185, 149880, 176593, 82, 162389, 150182, 118188, 149946, 5169, 290, 13]),
+            ("日本語と中文テスト：量子化と推論エンジンの比較。", [90626, 22912, 6080, 114903, 2804, 3527, 3529, 6647, 18659, 17417, 23906, 6080, 13630, 16217, 5902, 5951, 2063, 5951, 6084, 118522, 6434]),
+            ("<|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>", [200000, 200004, 1775, 149884, 220, 68107, 196987, 220, 68169, 30, 200010, 200001]),
+            ("<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|>", [200002, 200004, 34182, 279, 154554, 150628, 25, 220, 15, 13, 22, 200010]),
+            ("supercalifragilisticexpialidocious antidisestablishmentarianism", [2165, 1426, 336, 4532, 291, 71003, 4841, 888, 313, 38305, 992, 150864, 313, 1227, 265, 3210, 361, 35031, 2005]),
+            ("    indented\n\t\ttabbed   multiple   spaces\n\n\nend", [149862, 181070, 302, 198, 197, 197, 4338, 2537, 149859, 151389, 149859, 156465, 68019, 406]),
+        ]
+        for (idx, (text, want)) in cases.enumerated() {
+            XCTAssertEqual(try tok.encode(text), want, "encode mismatch on case \(idx)")
+            XCTAssertEqual(try tok.decode(want, skipSpecialTokens: false), text, "decode mismatch on case \(idx)")
+        }
+        let resolved = tok.resolveSpecialTokens(
+            fallback: QWModelSpecialTokens(eosTokenId: 200006, usesChatTemplateIds: false)
+        )
+        XCTAssertTrue(resolved.defaultStopTokenIds.contains(200006))
+        XCTAssertFalse(resolved.defaultStopTokenIds.contains(200010))
+    }
 }

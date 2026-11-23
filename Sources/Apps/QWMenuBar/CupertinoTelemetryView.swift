@@ -11,6 +11,7 @@ public struct CupertinoTelemetryView: View {
     public var onOpenLogs: () -> Void
     public var onOpenSettings: () -> Void
     public var onQuit: () -> Void
+    public var onOpenUpdates: (Bool) -> Void
 
     @State var switcherAnchor: NSView?
 
@@ -23,13 +24,15 @@ public struct CupertinoTelemetryView: View {
         onOpenWebUI: (() -> Void)? = nil,
         onOpenLogs: @escaping () -> Void = {},
         onOpenSettings: @escaping () -> Void = {},
-        onQuit: @escaping () -> Void = { NSApplication.shared.terminate(nil) }
+        onQuit: @escaping () -> Void = { NSApplication.shared.terminate(nil) },
+        onOpenUpdates: @escaping (Bool) -> Void = { _ in }
     ) {
         self.telemetry = telemetry
         self.onOpenWebUI = onOpenWebUI ?? { telemetry.openWebDashboard() }
         self.onOpenLogs = onOpenLogs
         self.onOpenSettings = onOpenSettings
         self.onQuit = onQuit
+        self.onOpenUpdates = onOpenUpdates
     }
 
     public var body: some View {

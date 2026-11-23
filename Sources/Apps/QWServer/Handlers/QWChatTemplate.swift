@@ -28,6 +28,7 @@ public struct QWChatTemplate: Sendable {
     private let template: Template
     private let tokenizerContext: [String: QWJson]
     public let rawSource: String
+    public let isInkling2Template: Bool
     public let supportsThinkingTags: Bool
 
     public init(source: String, tokenizerContext: [String: QWJson] = [:]) throws {
@@ -35,7 +36,10 @@ public struct QWChatTemplate: Sendable {
         self.template = try Template(normalizedSource)
         self.tokenizerContext = tokenizerContext
         self.rawSource = source
-        self.supportsThinkingTags = normalizedSource.contains("<think>") || normalizedSource.contains("<ernie:think>")
+        self.isInkling2Template = source.contains("<|content_thinking|>") && source.contains("<|message_model|>")
+        self.supportsThinkingTags = normalizedSource.contains("<think>")
+            || normalizedSource.contains("<ernie:think>")
+            || self.isInkling2Template
     }
 
     public func tokenizerTokenString(_ key: String) -> String? {
@@ -139,6 +143,9 @@ public struct QWChatTemplate: Sendable {
                        options: QWChatTemplateOptions = QWChatTemplateOptions()) throws -> String {
         guard !messages.isEmpty else {
             throw QWChatTemplateError.emptyConversation
+        }
+        if isInkling2Template {
+            return try renderInkling2(messages: messages, options: options)
         }
         var context = tokenizerContext.mapValues(Self.value(from:))
         context["messages"] = .array(messages.map(Self.value(from:)))

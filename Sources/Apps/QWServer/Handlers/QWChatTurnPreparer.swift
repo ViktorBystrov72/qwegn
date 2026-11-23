@@ -105,7 +105,13 @@ public enum QWChatTurnPreparer {
             }
         }
         if hasActiveTools, let forcedTool = request.forcedToolChoiceName {
-            if forcedTool.isEmpty {
+            if chatTemplate.isInkling2Template {
+                if forcedTool.isEmpty {
+                    extraSystemLines.append("You MUST call at least one of the provided tools in this response.")
+                } else {
+                    extraSystemLines.append("You MUST call the tool '\(forcedTool)' in this response.")
+                }
+            } else if forcedTool.isEmpty {
                 extraSystemLines.append("You MUST call at least one of the provided tools in this response using <tool_call>.")
             } else {
                 extraSystemLines.append("You MUST call the tool '\(forcedTool)' in this response using <tool_call>.")
@@ -166,9 +172,15 @@ public enum QWChatTurnPreparer {
         if isAssistantPrefill, let lastMsg = request.messages.last {
             let prefixMsgs = Array(msgs.dropLast())
             wire = try chatTemplate.render(messages: prefixMsgs, options: tplOpts)
+            if chatTemplate.isInkling2Template {
+                wire += "<|message_model|><|content_text|>"
+            }
             wire += lastMsg.extractTextContent()
         } else {
             wire = try chatTemplate.render(messages: msgs, options: tplOpts)
+            if chatTemplate.isInkling2Template && !shouldThink && (enforceJson || isConstrainedJson) {
+                wire += "<|message_model|><|content_text|>"
+            }
             if isConstrainedJson {
                 wire += "{"
             }
@@ -186,9 +198,15 @@ public enum QWChatTurnPreparer {
         var builtConstraint: QWStructuredOutputConstraint?
         if enforceJson, let grammar {
             let table = QWStructuredOutput.tokenTable(for: tok, vocabulary: vocabularySize)
+            var constraintStops = specialTokens.defaultStopTokenIds
+            if chatTemplate.isInkling2Template, let endMsgId = tok.tokenId(for: "<|end_message|>") {
+                constraintStops.insert(endMsgId)
+            }
+            let constraintEndThink = (chatTemplate.isInkling2Template ? tok.tokenId(for: "<|content_text|>") : nil)
+                ?? endThinkTokenId
             let constraint = QWStructuredOutputConstraint(
-                grammar: grammar, table: table, stopTokens: specialTokens.defaultStopTokenIds,
-                startsInThinking: shouldThink, endThinkToken: endThinkTokenId, toolCallToken: toolCallTokenId)
+                grammar: grammar, table: table, stopTokens: constraintStops,
+                startsInThinking: shouldThink, endThinkToken: constraintEndThink, toolCallToken: toolCallTokenId)
             if isAssistantPrefill, let lastMsg = request.messages.last {
                 try constraint.consumePrefix(lastMsg.extractTextContent())
             }

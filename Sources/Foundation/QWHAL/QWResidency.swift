@@ -90,19 +90,41 @@ extension QWHal {
         }
     }
 
+    private func ensureNopPSOLocked(_ state: inout MutableResidencyState) -> (any MTLComputePipelineState)? {
+        if let existing = state.nopPSO { return existing }
+        guard let lib = try? device.makeLibrary(source: "kernel void qw_keepalive_nop() {}", options: nil),
+              let fn = lib.makeFunction(name: "qw_keepalive_nop"),
+              let pso = try? device.makeComputePipelineState(function: fn) else { return nil }
+        state.nopPSO = pso
+        return pso
+    }
+
     private func startKeepAliveHeartbeatLocked(_ state: inout MutableResidencyState) {
         guard keepAliveEnabled, keepAliveIdleMs > 0, state.heartbeat == nil else { return }
         // An encoder with no dispatch is dropped before it reaches the GPU, so the heartbeat runs a no-op kernel.
-        guard let lib = try? device.makeLibrary(source: "kernel void qw_keepalive_nop() {}", options: nil),
-              let fn = lib.makeFunction(name: "qw_keepalive_nop"),
-              let pso = try? device.makeComputePipelineState(function: fn) else { return }
-        state.nopPSO = pso
+        guard ensureNopPSOLocked(&state) != nil else { return }
         let period = DispatchTimeInterval.milliseconds(keepAliveIdleMs)
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + period, repeating: period, leeway: .milliseconds(keepAliveIdleMs / 4))
         timer.setEventHandler { [weak self] in self?.keepAliveIdleTick() }
         state.heartbeat = timer
         timer.resume()
+    }
+
+    /// Executes a 1-thread no-op dispatch referencing every resident allocation so iogpu wires them before inference.
+    public func primeResidency() {
+        guard keepAliveEnabled,
+              let snap = acquireResidencySnapshot(), !snap.resources.isEmpty,
+              let pso = residencyState.withLock({ ensureNopPSOLocked(&$0) }),
+              let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.useResources(snap.resources, usage: .read)
+        enc.setComputePipelineState(pso)
+        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        keepAliveLastTouchNs.store(Self.monotonicNowNs(), ordering: .releasing)
     }
 
     private func keepAliveIdleTick() {

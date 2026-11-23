@@ -28,7 +28,7 @@ extension QWLSAOperator {
         let pendingBytes = (position % 4) * rowBytes
         let numUnits = position / clusterUnitTokens
         let unitBytes = 64 * rowBytes + clusterMemBytesPerUnit + clusterSizeBytesPerUnit
-        return layers.count * (pooledBytes + pendingBytes + numUnits * unitBytes)
+        return loopReusePlan.uniqueLeaderIndices.count * (pooledBytes + pendingBytes + numUnits * unitBytes)
     }
 
     /// Compact delta bytes required to snapshot `(basePos512 ..< position)` above a chunk-aligned pinned base.
@@ -39,7 +39,7 @@ extension QWLSAOperator {
         let pendingBytes = (position % 4) * rowBytes
         let deltaUnits = max(0, (position / unitTok) - (basePos512 / unitTok))
         let unitBytes = 64 * rowBytes + clusterMemBytesPerUnit + clusterSizeBytesPerUnit
-        return 16 + layers.count * (deltaPooledBytes + pendingBytes + deltaUnits * unitBytes)
+        return 16 + loopReusePlan.uniqueLeaderIndices.count * (deltaPooledBytes + pendingBytes + deltaUnits * unitBytes)
     }
 
     /// Bytes required to snapshot LSA state at `position` (uses delta encoding when extending a pinned base).
@@ -92,7 +92,8 @@ extension QWLSAOperator {
             withUnsafeBytes(of: &magic) { (raw: UnsafeRawBufferPointer) in out.append(contentsOf: raw) }
             withUnsafeBytes(of: &baseU) { (raw: UnsafeRawBufferPointer) in out.append(contentsOf: raw) }
             withUnsafeBytes(of: &posU) { (raw: UnsafeRawBufferPointer) in out.append(contentsOf: raw) }
-            for ls in layers {
+            for idx in loopReusePlan.uniqueLeaderIndices {
+                let ls = layers[idx]
                 if deltaPooledBytes > 0 {
                     out.append(base.advanced(by: ls.pooledKeys.offset + startPooledOff).assumingMemoryBound(to: UInt8.self),
                                count: deltaPooledBytes)
@@ -119,7 +120,8 @@ extension QWLSAOperator {
         let memBytes = numUnits * memPerUnit
         let sizeBytes = numUnits * sizePerUnit
         var out = Data(capacity: fullIndexerStateBytes(position: position))
-        for ls in layers {
+        for idx in loopReusePlan.uniqueLeaderIndices {
+                let ls = layers[idx]
             if pooledBytes > 0 {
                 out.append(base.advanced(by: ls.pooledKeys.offset).assumingMemoryBound(to: UInt8.self),
                            count: pooledBytes)
@@ -157,7 +159,8 @@ extension QWLSAOperator {
         let base = region.pointer
         baseData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             var src = 0
-            for ls in layers {
+            for idx in loopReusePlan.uniqueLeaderIndices {
+                let ls = layers[idx]
                 if copyPooledBytes > 0 {
                     base.advanced(by: ls.pooledKeys.offset)
                         .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: copyPooledBytes)
@@ -214,7 +217,8 @@ extension QWLSAOperator {
                 let deltaSizeBytes = deltaUnits * sizePerUnit
                 data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                     var src = 16
-                    for ls in layers {
+                    for idx in loopReusePlan.uniqueLeaderIndices {
+                let ls = layers[idx]
                         if deltaPooledBytes > 0 {
                             base.advanced(by: ls.pooledKeys.offset + startPooledOff)
                                 .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: deltaPooledBytes)
@@ -254,7 +258,8 @@ extension QWLSAOperator {
             guard tailCopyNeeded else { return true }
             data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 var src = 0
-                for ls in layers {
+                for idx in loopReusePlan.uniqueLeaderIndices {
+                let ls = layers[idx]
                     if tailPooledBytes > 0 {
                         base.advanced(by: ls.pooledKeys.offset + startPooledOff)
                             .copyMemory(from: raw.baseAddress!.advanced(by: src + startPooledOff), byteCount: tailPooledBytes)
@@ -278,7 +283,8 @@ extension QWLSAOperator {
         let sizeBytes = numUnits * sizePerUnit
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             var src = 0
-            for ls in layers {
+            for idx in loopReusePlan.uniqueLeaderIndices {
+                let ls = layers[idx]
                 if pooledBytes > 0 {
                     base.advanced(by: ls.pooledKeys.offset)
                         .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: pooledBytes)

@@ -195,13 +195,35 @@ final class MenuBarRendererParityTests: XCTestCase {
         }
     }
 
-    /// The app bundle must ship a signed sibling `qwg` executable beside `qwg-menu`.
+    /// The app bundle must ship signed `qwg` and `qwg-smc-helper` sibling executables plus LaunchDaemon plist.
     func testAppBundleShipsAndSignsQWGSiblingExecutable() throws {
         let script = try Self.read("Scripts/build_app.sh")
         XCTAssertTrue(script.contains("$APP/Contents/MacOS/qwg\""),
                       "build_app.sh must copy qwg into Contents/MacOS/qwg")
         XCTAssertTrue(script.contains("codesign") && script.contains("Contents/MacOS/qwg"),
                       "build_app.sh must sign Contents/MacOS/qwg")
+        XCTAssertTrue(script.contains("$APP/Contents/MacOS/qwg-smc-helper\""),
+                      "build_app.sh must copy qwg-smc-helper into Contents/MacOS/qwg-smc-helper")
+        XCTAssertTrue(script.contains("Contents/Library/LaunchDaemons/ai.qwegn.smc-helper.plist"),
+                      "build_app.sh must bundle LaunchDaemons/ai.qwegn.smc-helper.plist")
+        XCTAssertTrue(script.contains("codesign") && script.contains("Contents/MacOS/qwg-smc-helper"),
+                      "build_app.sh must sign Contents/MacOS/qwg-smc-helper")
+        let uninstall = try Self.read("Scripts/uninstall.sh")
+        XCTAssertTrue(uninstall.contains("ai.qwegn.smc-helper"),
+                      "uninstall.sh must unload and remove ai.qwegn.smc-helper")
+    }
+
+    /// QWMenuBarApp must use pure AppKit startup without a SwiftUI Settings scene so ⌘, never opens a blank second window.
+    func testMenuBarAppDoesNotDeclareEmptySwiftUISettingsScene() throws {
+        let appSource = try Self.read("Sources/Apps/QWMenuBar/QWMenuBarApp.swift")
+        XCTAssertFalse(appSource.contains("Settings {"),
+                       "QWMenuBarApp.swift must not declare a SwiftUI Settings scene")
+        XCTAssertFalse(appSource.contains("EmptyView()"),
+                       "QWMenuBarApp.swift must not host an EmptyView() scene")
+        XCTAssertTrue(appSource.contains("QWMenuBarShortcutRouter"),
+                      "QWMenuBarApp.swift must route hotkeys through QWMenuBarShortcutRouter")
+        XCTAssertTrue(appSource.contains("buildMainMenu()"),
+                      "QWMenuBarApp.swift must install an AppKit mainMenu for standard shortcuts")
     }
 
     func testWeightsCardUsesRunningTextMarqueeNotMiddleTruncation() throws {
@@ -316,32 +338,32 @@ final class MenuBarRendererParityTests: XCTestCase {
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: [], hideSpeedsWhenIdle: false
         ))
 
-        // Individual metrics and combined formatting.
+        // Individual metrics and combined fixed-width formatting.
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.decodeSpeed], hideSpeedsWhenIdle: false
-        ), "91.9 tok/s")
+        ), " 91.9 tok/s")
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.prefillSpeed], hideSpeedsWhenIdle: false
-        ), "↑93.3 tok/s")
+        ), "↑  93.3 tok/s")
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.engineMemory], hideSpeedsWhenIdle: false
-        ), "25.01 GiB")
+        ), " 25.01 GiB")
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.contextSize], hideSpeedsWhenIdle: false
-        ), "38/256k")
+        ), "   38/256k")
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: [.gpuTemperature], hideSpeedsWhenIdle: false
-        ), "54°C")
+        ), " 54°C")
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: Set(QWMenuBarMetric.allCases),
             hideSpeedsWhenIdle: false
-        ), "↓91.9 · ↑93.3 tok/s · 25.01 GiB · 38/256k · 54°C")
+        ), "↓ 91.9 t/s · ↑  93.3 t/s ·  25.01 GiB ·    38/256k ·  54°C")
 
         // Idle speed hiding keeps non-speed metrics and resumes speeds on decode/prefill.
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: loadedDashboard, isConnected: true, enabledMetrics: Set(QWMenuBarMetric.allCases),
             hideSpeedsWhenIdle: true
-        ), "25.01 GiB · 38/256k · 54°C")
+        ), " 25.01 GiB ·    38/256k ·  54°C")
 
         let activeDecode = QWDashboardViewModel(
             sampledAt: Date(), lifecycle: loadedDashboard.lifecycle, modelId: "m",
@@ -351,9 +373,9 @@ final class MenuBarRendererParityTests: XCTestCase {
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: activeDecode, isConnected: true, enabledMetrics: Set(QWMenuBarMetric.allCases),
             hideSpeedsWhenIdle: true
-        ), "↓91.9 · ↑93.3 tok/s · 25.01 GiB · 38/256k · 54°C")
+        ), "↓ 91.9 t/s · ↑  93.3 t/s ·  25.01 GiB ·    38/256k ·  54°C")
 
-        // Cached prefill + missing active_tokens + absent memory honesty checks.
+        // Cached prefill + missing active_tokens + absent memory preserve slot widths & honesty.
         let unmeasured = QWDashboardViewModel(
             sampledAt: Date(), lifecycle: loadedDashboard.lifecycle, modelId: "m",
             capabilities: [], generation: .idle, facts: nil,
@@ -367,13 +389,120 @@ final class MenuBarRendererParityTests: XCTestCase {
         )
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: unmeasured, isConnected: true, enabledMetrics: [.prefillSpeed], hideSpeedsWhenIdle: false
-        ), "↑cache")
-        XCTAssertNil(QWMenuBarStatusFormatter.statusTitle(
+        ), "↑  from cache")
+        XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: unmeasured, isConnected: true, enabledMetrics: [.engineMemory], hideSpeedsWhenIdle: false
-        ))
+        ), "     — GiB")
         XCTAssertEqual(QWMenuBarStatusFormatter.statusTitle(
             dashboard: unmeasured, isConnected: true, enabledMetrics: [.contextSize], hideSpeedsWhenIdle: false
-        ), "256k ctx")
+        ), "    —/256k")
+        XCTAssertEqual(QWMenuBarStatusFormatter.samplePreviewTitle(
+            enabledMetrics: [.decodeSpeed], hideSpeedsWhenIdle: true
+        ), " 91.9 tok/s (active)")
+        XCTAssertEqual(QWMenuBarStatusFormatter.samplePreviewTitle(
+            enabledMetrics: [.prefillSpeed], hideSpeedsWhenIdle: true
+        ), "↑  93.3 tok/s (active)")
+        XCTAssertEqual(QWMenuBarStatusFormatter.samplePreviewTitle(
+            enabledMetrics: [.decodeSpeed, .prefillSpeed], hideSpeedsWhenIdle: true
+        ), "↓ 91.9 t/s · ↑  93.3 t/s (active)")
+    }
+
+    func testMenuBarStatusFormatterKeepsConstantWidthAcrossDigitRegimes() throws {
+        func makeCard(_ id: String, value: String?, unit: String?, number: Double? = nil) -> QWDashboardCard {
+            QWDashboardCard(
+                id: id, title: id, value: value, unit: unit, number: number,
+                provenance: value == nil ? .unavailable : .measured,
+                sampledAt: value == nil ? nil : Date(),
+                age: value == nil ? nil : 0.1,
+                isStale: false, reason: value == nil ? "not measured" : nil, series: []
+            )
+        }
+        func makeDashboard(
+            decode: Double?,
+            prefill: Double?,
+            prefillText: String? = nil,
+            arena: Double?,
+            ctx: Double?,
+            temp: Double?
+        ) -> QWDashboardViewModel {
+            let prefillVal = prefillText ?? prefill.map { String(format: "%.1f", $0) }
+            let prefillUnit: String? = prefillText == nil ? "tok/s" : nil
+            return QWDashboardViewModel(
+                sampledAt: Date(),
+                lifecycle: .init(phase: .loaded, since: Date(), model: "m", detail: nil),
+                modelId: "m",
+                capabilities: [],
+                generation: .decode,
+                facts: nil,
+                cards: [
+                    makeCard("throughput.display_decode_tokens_per_sec", value: decode.map { String(format: "%.1f", $0) }, unit: "tok/s", number: decode),
+                    makeCard("throughput.display_prefill_tokens_per_sec", value: prefillVal, unit: prefillUnit, number: prefill),
+                    makeCard("memory.arena_reserved_bytes", value: arena.map { String(format: "%.2f", $0) }, unit: "GiB", number: arena),
+                    makeCard("context.active_tokens", value: ctx.map { String(Int($0)) }, unit: "tok", number: ctx),
+                    makeCard("hardware.gpu_temp_celsius", value: temp.map { String(format: "%.1f", $0) }, unit: "°C", number: temp),
+                ],
+                actions: [],
+                knobs: ["contextTokens": .int(262_144)],
+                knobSources: [:]
+            )
+        }
+        func occurrences(of needle: String, in haystack: String) -> [Int] {
+            var indices: [Int] = []
+            var start = haystack.startIndex
+            while let range = haystack.range(of: needle, range: start..<haystack.endIndex) {
+                indices.append(haystack.distance(from: haystack.startIndex, to: range.lowerBound))
+                start = range.upperBound
+            }
+            return indices
+        }
+
+        let regimes: [QWDashboardViewModel] = [
+            makeDashboard(decode: 9.5, prefill: 9.5, arena: 8.40, ctx: 38, temp: 48.2),
+            makeDashboard(decode: 91.9, prefill: 93.3, arena: 25.01, ctx: 512, temp: 54.2),
+            makeDashboard(decode: 248.3, prefill: 2450.0, arena: 108.42, ctx: 4096, temp: 102.0),
+            makeDashboard(decode: 1240.0, prefill: 12500.0, arena: 1024.0, ctx: 128_000, temp: 115.0),
+            makeDashboard(decode: 84.0, prefill: nil, prefillText: "from cache", arena: 25.01, ctx: 10_240, temp: 64.0),
+            makeDashboard(decode: nil, prefill: nil, arena: nil, ctx: nil, temp: nil),
+        ]
+
+        let metricSets: [Set<QWMenuBarMetric>] = [
+            [.decodeSpeed],
+            [.prefillSpeed],
+            [.decodeSpeed, .prefillSpeed],
+            [.engineMemory],
+            [.contextSize],
+            [.gpuTemperature],
+            Set(QWMenuBarMetric.allCases),
+        ]
+        for metrics in metricSets {
+            let titles = try regimes.map {
+                try XCTUnwrap(QWMenuBarStatusFormatter.statusTitle(
+                    dashboard: $0, isConnected: true, enabledMetrics: metrics, hideSpeedsWhenIdle: false
+                ))
+            }
+            let expectedLength = titles[0].count
+            for title in titles {
+                XCTAssertEqual(title.count, expectedLength, "Width drift in '\(title)' for \(metrics)")
+            }
+        }
+
+        let allMetrics = Set(QWMenuBarMetric.allCases)
+        let fullTitles = try regimes.map {
+            try XCTUnwrap(QWMenuBarStatusFormatter.statusTitle(
+                dashboard: $0, isConnected: true, enabledMetrics: allMetrics, hideSpeedsWhenIdle: false
+            ))
+        }
+        for landmark in ["↓", " t/s · ↑", " · ", "GiB", "/256k", "°C"] {
+            let expectedOffsets = occurrences(of: landmark, in: fullTitles[0])
+            XCTAssertFalse(expectedOffsets.isEmpty, "Missing landmark '\(landmark)' in '\(fullTitles[0])'")
+            for title in fullTitles.dropFirst() {
+                XCTAssertEqual(
+                    occurrences(of: landmark, in: title),
+                    expectedOffsets,
+                    "Landmark '\(landmark)' shifted in '\(title)' vs '\(fullTitles[0])'"
+                )
+            }
+        }
     }
 
     func testMenuBarRendersPrefillProgressCards() throws {

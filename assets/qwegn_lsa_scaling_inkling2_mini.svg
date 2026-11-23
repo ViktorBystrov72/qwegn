@@ -1,0 +1,206 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 828" width="1000" height="828">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070a12"/><stop offset="0.5" stop-color="#0d1323"/><stop offset="1" stop-color="#090d18"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#131c31" stop-opacity="0.96"/><stop offset="1" stop-color="#0b1120" stop-opacity="0.98"/>
+    </linearGradient>
+    <linearGradient id="aEm" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#10b981" stop-opacity="0.25"/><stop offset="1" stop-color="#10b981" stop-opacity="0.02"/>
+    </linearGradient>
+    <linearGradient id="aCy" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#38bdf8" stop-opacity="0.25"/><stop offset="1" stop-color="#38bdf8" stop-opacity="0.02"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+  </defs>
+  <style>
+    svg { text-rendering: geometricPrecision; -webkit-font-smoothing: antialiased; }
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", system-ui, sans-serif; }
+    .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; font-weight: 600; }
+  </style>
+
+  <rect width="1000" height="828" rx="20" fill="url(#bg)" stroke="#1e293b" stroke-width="2"/>
+  <rect x="0" y="0" width="1000" height="5" fill="#10b981" opacity="0.92"/>
+
+  <g transform="translate(28, 22)">
+    <rect x="0" y="0" width="330" height="28" rx="14" fill="#062e22" stroke="#10b981" stroke-width="1.2"/>
+    <text x="165.0" y="18.6" text-anchor="middle" class="mono" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.3">LOOPED-MOE 64-BIT LSA SCALING</text>
+    <text x="0" y="64" class="sans" font-size="28" font-weight="800" fill="#f8fafc">Inkling-2-Mini (SHVQ4 + SHVQ2/3 · 10.20 GiB)</text>
+    <text x="0" y="90" class="mono" font-size="13" fill="#cbd5e1">48 Effective Visits (24 Physical, Loop [6..18] ×3) · 128 Experts (8/tok) · DSpark MTP</text>
+  </g>
+  <g transform="translate(772, 20)">
+    <rect width="200" height="58" rx="13" fill="#0b1222" stroke="#334155" stroke-width="1.3"/>
+    <rect x="11" y="11" width="36" height="36" rx="9" fill="url(#mark)"/>
+    <text x="29" y="36" text-anchor="middle" class="sans" font-size="21" font-weight="900" fill="#04110c">Q</text>
+    <text x="57" y="29" class="sans" font-size="21" font-weight="800" fill="#f8fafc">Qwegn</text>
+    <text x="57" y="46" class="mono" font-size="11.5" font-weight="700" fill="#94a3b8">SWIFT 6.2 · METAL 4</text>
+  </g>
+
+  <g transform="translate(28, 142)">
+    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#10b981" stroke-opacity="0.52" stroke-width="1.2"/>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#6ee7b7">3,638 tok/s</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">peak NAX prefill @ 8K</text>
+  </g>
+  <g transform="translate(268, 142)">
+    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#10b981" stroke-opacity="0.52" stroke-width="1.2"/>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#6ee7b7">3,200 / 71.9</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">tok/s pre / dec @ 128K</text>
+  </g>
+  <g transform="translate(508, 142)">
+    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#10b981" stroke-opacity="0.52" stroke-width="1.2"/>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#6ee7b7">78.0 tok/s</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">1M q4 LSA decode</text>
+  </g>
+  <g transform="translate(748, 142)">
+    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#10b981" stroke-opacity="0.52" stroke-width="1.2"/>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#6ee7b7">20.7 GiB · 3/3</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">1M RSS &amp; 16K–128K needles</text>
+  </g>
+
+  <g transform="translate(28, 230)">
+    <rect width="460" height="384" rx="14" fill="url(#card)" stroke="#1e293b" stroke-width="1.4"/>
+    <text x="20" y="32" class="sans" font-size="15" font-weight="800" fill="#f8fafc" letter-spacing="0.2">PREFILL PERFORMANCE PROFILE</text>
+    <rect x="372" y="15" width="68" height="22" rx="6" fill="#0b1324" stroke="#334155" stroke-width="1"/>
+    <text x="406" y="30" text-anchor="middle" class="mono" font-size="11.5" fill="#94a3b8">tok/s</text>
+    <line x1="68.0" y1="322.0" x2="424.0" y2="322.0" stroke="#475569" stroke-width="1.4"/>
+    <line x1="68.0" y1="82.0" x2="68.0" y2="322.0" stroke="#475569" stroke-width="1.4"/>
+    <text x="58.0" y="326.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">0</text>
+    <line x1="68.0" y1="262.0" x2="424.0" y2="262.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="266.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">1k</text>
+    <line x1="68.0" y1="202.0" x2="424.0" y2="202.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="206.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">2k</text>
+    <line x1="68.0" y1="142.0" x2="424.0" y2="142.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="146.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">3k</text>
+    <line x1="68.0" y1="82.0" x2="424.0" y2="82.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="86.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">4k</text>
+    <line x1="68.0" y1="322.0" x2="68.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="68.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">2K</text>
+    <line x1="157.0" y1="322.0" x2="157.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="157.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">8K</text>
+    <line x1="246.0" y1="322.0" x2="246.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="246.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">16K</text>
+    <line x1="335.0" y1="322.0" x2="335.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="335.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">32K</text>
+    <line x1="424.0" y1="322.0" x2="424.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="424.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">128K</text>
+    <text x="246.0" y="370.0" text-anchor="middle" class="mono" font-size="11" fill="#64748b">PROMPT CONTEXT TOKENS</text>
+    <polygon points="68.0,111.6 157.0,103.7 246.0,116.2 335.0,128.9 424.0,130.0 424.0,322.0 68.0,322.0" fill="url(#aEm)"/>
+    <polyline points="68.0,120.1 157.0,111.8 246.0,132.6 335.0,151.7" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6 4"/>
+    <circle cx="68.0" cy="120.1" r="4.5" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="157.0" cy="111.8" r="4.5" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="246.0" cy="132.6" r="4.5" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="335.0" cy="151.7" r="4.5" fill="#38bdf8" stroke="#0b1220" stroke-width="1.2"/>
+    <polyline points="68.0,111.6 157.0,103.7 246.0,116.2 335.0,128.9 424.0,130.0" fill="none" stroke="#10b981" stroke-width="3.4" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="68.0" cy="111.6" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="157.0" cy="103.7" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="246.0" cy="116.2" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="335.0" cy="128.9" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="424.0" cy="130.0" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+
+    <text x="72.0" y="96.6" text-anchor="start" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">3,507</text>
+    <text x="72.0" y="96.6" text-anchor="start" class="mono" font-size="11.5" font-weight="800" fill="#34d399">3,507</text>
+    <text x="157.0" y="88.7" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">3,638</text>
+    <text x="157.0" y="88.7" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="#34d399">3,638</text>
+    <text x="246.0" y="101.2" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">3,430</text>
+    <text x="246.0" y="101.2" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="#34d399">3,430</text>
+    <text x="335.0" y="113.9" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">3,218</text>
+    <text x="335.0" y="113.9" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="#34d399">3,218</text>
+    <text x="438.0" y="115.0" text-anchor="end" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">3,200</text>
+    <text x="438.0" y="115.0" text-anchor="end" class="mono" font-size="11.5" font-weight="800" fill="#34d399">3,200</text>
+
+    <text x="72.0" y="142.1" text-anchor="start" class="mono" font-size="11.5" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">3,365</text>
+    <text x="72.0" y="142.1" text-anchor="start" class="mono" font-size="11.5" font-weight="700" fill="#7dd3fc">3,365</text>
+    <text x="157.0" y="133.8" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">3,504</text>
+    <text x="157.0" y="133.8" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="#7dd3fc">3,504</text>
+    <text x="246.0" y="154.6" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">3,156</text>
+    <text x="246.0" y="154.6" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="#7dd3fc">3,156</text>
+    <text x="335.0" y="173.7" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">2,838</text>
+    <text x="335.0" y="173.7" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="#7dd3fc">2,838</text>
+  </g>
+
+  <g transform="translate(512, 230)">
+    <rect width="460" height="384" rx="14" fill="url(#card)" stroke="#1e293b" stroke-width="1.4"/>
+    <text x="20" y="32" class="sans" font-size="15" font-weight="800" fill="#f8fafc" letter-spacing="0.2">DECODE &amp; LSA THROUGHPUT PROFILE</text>
+    <rect x="372" y="15" width="68" height="22" rx="6" fill="#0b1324" stroke="#334155" stroke-width="1"/>
+    <text x="406" y="30" text-anchor="middle" class="mono" font-size="11.5" fill="#94a3b8">tok/s</text>
+    <line x1="68.0" y1="322.0" x2="424.0" y2="322.0" stroke="#475569" stroke-width="1.4"/>
+    <line x1="68.0" y1="82.0" x2="68.0" y2="322.0" stroke="#475569" stroke-width="1.4"/>
+    <text x="58.0" y="326.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">0</text>
+    <line x1="68.0" y1="262.0" x2="424.0" y2="262.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="266.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">30</text>
+    <line x1="68.0" y1="202.0" x2="424.0" y2="202.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="206.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">60</text>
+    <line x1="68.0" y1="142.0" x2="424.0" y2="142.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="146.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">90</text>
+    <line x1="68.0" y1="82.0" x2="424.0" y2="82.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="58.0" y="86.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">120</text>
+    <line x1="68.0" y1="322.0" x2="68.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="68.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">≤2K*</text>
+    <line x1="157.0" y1="322.0" x2="157.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="157.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">16K</text>
+    <line x1="246.0" y1="322.0" x2="246.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="246.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">32K</text>
+    <line x1="335.0" y1="322.0" x2="335.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="335.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">128K</text>
+    <line x1="424.0" y1="322.0" x2="424.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
+    <text x="424.0" y="345.0" text-anchor="middle" class="mono" font-size="12" fill="#cbd5e1">1M</text>
+    <text x="246.0" y="370.0" text-anchor="middle" class="mono" font-size="11" fill="#64748b">PROMPT CONTEXT TOKENS</text>
+    <polygon points="68.0,122.2 157.0,128.8 246.0,198.4 335.0,178.2 424.0,166.0 424.0,322.0 68.0,322.0" fill="url(#aEm)"/>
+    <polyline points="68.0,201.4 157.0,165.8 246.0,208.8 335.0,180.2" fill="none" stroke="#c084fc" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6 4"/>
+    <circle cx="68.0" cy="201.4" r="4.5" fill="#c084fc" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="157.0" cy="165.8" r="4.5" fill="#c084fc" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="246.0" cy="208.8" r="4.5" fill="#c084fc" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="335.0" cy="180.2" r="4.5" fill="#c084fc" stroke="#0b1220" stroke-width="1.2"/>
+    <polyline points="68.0,122.2 157.0,128.8 246.0,198.4 335.0,178.2 424.0,166.0" fill="none" stroke="#10b981" stroke-width="3.4" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="68.0" cy="122.2" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="157.0" cy="128.8" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="246.0" cy="198.4" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="335.0" cy="178.2" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="424.0" cy="166.0" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+
+    <text x="72.0" y="107.2" text-anchor="start" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">99.9</text>
+    <text x="72.0" y="107.2" text-anchor="start" class="mono" font-size="11.5" font-weight="800" fill="#34d399">99.9</text>
+    <text x="157.0" y="113.8" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">96.6</text>
+    <text x="157.0" y="113.8" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="#34d399">96.6</text>
+    <text x="246.0" y="183.4" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">61.8</text>
+    <text x="246.0" y="183.4" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="#34d399">61.8</text>
+    <text x="335.0" y="163.2" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">71.9</text>
+    <text x="335.0" y="163.2" text-anchor="middle" class="mono" font-size="11.5" font-weight="800" fill="#34d399">71.9</text>
+    <text x="438.0" y="151.0" text-anchor="end" class="mono" font-size="11.5" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">78.0</text>
+    <text x="438.0" y="151.0" text-anchor="end" class="mono" font-size="11.5" font-weight="800" fill="#34d399">78.0</text>
+
+    <text x="72.0" y="222.4" text-anchor="start" class="mono" font-size="11.5" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">60.3</text>
+    <text x="72.0" y="222.4" text-anchor="start" class="mono" font-size="11.5" font-weight="700" fill="#d8b4fe">60.3</text>
+    <text x="157.0" y="186.8" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">78.1</text>
+    <text x="157.0" y="186.8" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="#d8b4fe">78.1</text>
+    <text x="246.0" y="229.8" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">56.6</text>
+    <text x="246.0" y="229.8" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="#d8b4fe">56.6</text>
+    <text x="335.0" y="201.2" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">70.9</text>
+    <text x="335.0" y="201.2" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="#d8b4fe">70.9</text>
+  </g>
+
+  <g transform="translate(28, 628)">
+    <rect width="944" height="54" rx="11" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
+    <line x1="20" y1="27" x2="50" y2="27" stroke="#10b981" stroke-width="3.2"/>
+    <circle cx="35" cy="27" r="5" fill="#10b981"/>
+    <text x="60" y="23" class="sans" font-size="13" font-weight="700" fill="#34d399">QWP-Fast Accelerated (DSpark d=3 · B=12 / loop-reuse)</text>
+    <text x="60" y="40" class="mono" font-size="11" fill="#94a3b8">*≤2K peak 99.9 (86.2 code B=12) · 3/3 needles 16K–128K · 1M q4</text>
+    <line x1="510" y1="27" x2="540" y2="27" stroke="#c084fc" stroke-width="3.2" stroke-dasharray="6 4"/>
+    <circle cx="525" cy="27" r="5" fill="#c084fc"/>
+    <text x="550" y="23" class="sans" font-size="13" font-weight="700" fill="#e9d5ff">Lossless Mode (B=0) &amp; QWP-Cand5 (Cyan Prefill)</text>
+    <text x="550" y="40" class="mono" font-size="11" fill="#94a3b8">Exact 0-ULP decode (2K: 60.3 B=0) · Cand5 prefill 2,838–3,504</text>
+  </g>
+  <g transform="translate(28, 696)">
+    <rect width="944" height="62" rx="11" fill="#0a101f" stroke="#334155" stroke-width="1.2"/>
+    <rect x="14" y="13" width="96" height="36" rx="8" fill="#111c33" stroke="#38bdf8" stroke-opacity="0.45" stroke-width="1"/>
+    <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
+    <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
+    <text x="124" y="27" class="mono" font-size="12" font-weight="700" fill="#e2e8f0">INFERENCE MACHINE · Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
+    <text x="124" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26.2+ · Qwegn v0.34.0 (Swift 6.2 &amp; Metal 4) · q4 KV · Temp 0 · 0 Steady Allocs</text>
+  </g>
+  <text x="500" y="782" text-anchor="middle" class="mono" font-size="12" fill="#94a3b8">24 physical layers execute 48 effective visits (4 trunk + 12×3 loop + 4 coda) with 64-bit 1M LSA indexing &amp; DSpark MTP.</text>
+  <text x="500" y="802" text-anchor="middle" class="mono" font-size="12" fill="#64748b">100% (3/3) 3-needle passkey recall @16K–128K · 19.72 GiB 1M q4 admission (20.69 GiB RSS) with 0 steady-state allocations.</text>
+</svg>

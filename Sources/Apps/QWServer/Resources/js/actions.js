@@ -395,7 +395,7 @@ function nativeMaxDraftsForModel(modelName) {
   const match = (Array.isArray(discoveredModelsList) ? discoveredModelsList : []).find((m) => m.name === modelName);
   return (match && typeof match.maxSpeculativeDrafts === "number" && match.maxSpeculativeDrafts > 0)
     ? match.maxSpeculativeDrafts
-    : 7;
+    : 15;
 }
 
 function updateMtpDraftsHint() {
@@ -645,9 +645,22 @@ function renderSettingsForm(s) {
       </div>
       <div class="form-field"><label>Log Directory <span class="restart-tag">[restart]</span></label><input class="input mono" data-setting="logDir" value="${escapeHtml(s.logDir)}" /></div>
       <div class="form-field"><label>Log File Name <span class="restart-tag">[restart]</span></label><input class="input mono" data-setting="logFileName" value="${escapeHtml(s.logFileName)}" /></div>
+    </div>
+    <div class="metric-cell" style="padding:14px;">
+      <h3 style="margin:0 0 10px;font-size:13px;">Software Updates</h3>
+      <div class="form-field"><label>Check Automatically</label>
+        <select class="select" data-setting="updateCheckSchedule">
+          <option value="onLaunchAndDaily" ${(s.updateCheckSchedule || "onLaunchAndDaily") === "onLaunchAndDaily" ? "selected" : ""}>On launch &amp; daily</option>
+          <option value="daily" ${s.updateCheckSchedule === "daily" ? "selected" : ""}>Daily (every 24h)</option>
+          <option value="onLaunch" ${s.updateCheckSchedule === "onLaunch" ? "selected" : ""}>On launch only</option>
+          <option value="manual" ${s.updateCheckSchedule === "manual" ? "selected" : ""}>Manual only</option>
+        </select>
+      </div>
+      <div id="settings-updates-host" class="update-settings-status"></div>
     </div>`;
   host.oninput = updateSettingsDirtyState;
   host.onchange = updateSettingsDirtyState;
+  if (typeof renderWebUpdateSettingsCard === "function") renderWebUpdateSettingsCard();
 }
 
 async function saveLiveSettings() {
@@ -671,6 +684,7 @@ async function saveLiveSettings() {
     if (status) status.textContent = "Saved";
     showToast("Settings saved to ~/.qwg/settings.json.");
     if (typeof syncChatWithServerSettings === "function") syncChatWithServerSettings(loadedSettingsObj);
+    if (typeof fetchUpdateStatus === "function") fetchUpdateStatus();
     fetchDashboard();
   } catch (err) {
     if (status) status.textContent = "Save failed";
@@ -763,6 +777,7 @@ if (typeof window !== "undefined") {
     fetchDashboard();
     initMetricsStream();
     fetchEngineInfo();
+    if (typeof initWebUpdates === "function") initWebUpdates();
     setInterval(fetchEngineInfo, 3000);
     window.addEventListener("beforeunload", closeLogStream);
   });

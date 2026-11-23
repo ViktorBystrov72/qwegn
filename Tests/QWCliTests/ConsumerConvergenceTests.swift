@@ -93,7 +93,8 @@ final class ConsumerConvergenceTests: XCTestCase {
     func testTheCLINamesNoEngineType() throws {
         for file in try cliSourceFiles() {
             let text = try source(file)
-            XCTAssertFalse(text.contains("FNGPUEngine"), "\(file) names the Flash-Next engine")
+            XCTAssertFalse(text.contains("FNGPUEngine"), "\(file) names the retired Flash-Next engine")
+            XCTAssertFalse(text.contains("QWHyperStreamRuntime"), "\(file) names the HyperStream runtime")
             XCTAssertFalse(text.contains("QWEngineDriver"), "\(file) names the dense engine")
             XCTAssertFalse(text.contains(".qwen38Dense"), "\(file) switches on the family")
             XCTAssertFalse(text.contains(".qwen38FlashNext"), "\(file) switches on the family")

@@ -290,7 +290,7 @@ kernel void qwg_emeans_cluster_1024(device const half* pooledKeys   [[buffer(0)]
         for (uint j = 0u; j < K_ALL; j++) {
             tgOff[j] = run;
             const ushort cnt = ushort(atomic_load_explicit(&tgCnt[j], memory_order_relaxed));
-            clusterSpans[macroIdx * K_ALL + j] = ushort2(run, cnt);
+            clusterSpans[uint64_t(macroIdx) * K_ALL + j] = ushort2(run, cnt);
             run += cnt;
         }
         tgOff[K_ALL] = run;

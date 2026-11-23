@@ -239,6 +239,7 @@ extension QWModelDescriptor {
     /// Resolves the RoPE-free key projection tensor slice for training-free Weight-SVD LSA synthesis.
     public func lsaKeyProjectionSpec(layer l: Int) -> LSAKeyProjectionSpec? {
         guard (0..<numLayers).contains(l) else { return nil }
+        if let ink2 = inkling2Config, ink2.isSlidingLayer(l) { return nil }
         if isCompressedAttention(l), let hca = hcaConfig, hca.qkNopeHeadDim > 0 {
             return LSAKeyProjectionSpec(
                 kind: .hcaCompressWKV,

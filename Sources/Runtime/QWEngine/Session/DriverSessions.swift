@@ -18,6 +18,9 @@ import QWQuant
 
 extension QWEngineDriver {
     public func makeSession(promptTokens: Int) throws -> QWEngineSession {
+        if hyperRuntime != nil || inkling2Runtime != nil {
+            throw QWEngineDriverError.state("runtime manages sessions via generate(request:)")
+        }
         guard flight.try() else { throw QWEngineDriverError.busy }
         defer { flight.unlock() }
         try requestGate.validate()
@@ -25,6 +28,9 @@ extension QWEngineDriver {
     }
 
     public func makeStochasticSession(promptTokens: Int, config: QWSamplerConfig) throws -> QWEngineSession {
+        if hyperRuntime != nil || inkling2Runtime != nil {
+            throw QWEngineDriverError.state("runtime manages sessions via generate(request:)")
+        }
         let owner = try QWStochasticSession(geometry: geometry, config: config)
         guard flight.try() else { throw QWEngineDriverError.busy }
         defer { flight.unlock() }

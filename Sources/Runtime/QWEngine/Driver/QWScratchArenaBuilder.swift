@@ -29,6 +29,8 @@ enum QWScratchArenaBuilder {
         let latentDim: Int
         let sharedIntermediate: Int
         let routerCols: Int
+        let needsActiveBuckets: Bool
+        let needsPairGrouping: Bool
 
         init(rows: Int, geometry: QWModelGeometry, useGroupedNAX: Bool) {
             self.rows = rows
@@ -51,6 +53,8 @@ enum QWScratchArenaBuilder {
             self.latentDim = geometry.moeLatentSize ?? 0
             self.sharedIntermediate = geometry.sharedExpertIntermediate
             self.routerCols = geometry.moeSplitFeatureRouting ? (2 * geometry.numExperts) : geometry.numExperts
+            self.needsActiveBuckets = rows >= 2 && geometry.numExperts > 0
+            self.needsPairGrouping = self.isPrefill || self.needsActiveBuckets
         }
 
         private static func alignedBytes(_ count: Int, _ dt: QWDType) -> Int {
@@ -88,6 +92,12 @@ enum QWScratchArenaBuilder {
                     + (aliasGuDnAcc ? max(guBytes, dnBytes) : guBytes)
                     + Self.alignedBytes(rows * K * I, .f16)
                     + Self.alignedBytes(rows * (H + ISh), .f16)
+            } else if needsPairGrouping {
+                total += Self.alignedBytes(E + 1, .i32) + 2 * Self.alignedBytes(rows * K, .i32)
+            }
+            if needsActiveBuckets {
+                let indInts = QWGemmFP.MoEActiveBucketPlan.indirectBufferBytes / 4
+                total += Self.alignedBytes(E, .i32) + Self.alignedBytes(indInts, .i32)
             }
             return total
         }
@@ -118,13 +128,16 @@ enum QWScratchArenaBuilder {
             let actSh32 = ISh > 0 ? try alloc(rows * ISh, .f32) : nil
             let shared = try pAlloc(rows * H, .f32)
             let gate = try pAlloc(rows, .f32)
-            let expOff = isPrefill ? try alloc(E + 1, .i32) : nil
-            let sortedPair = isPrefill ? try alloc(rows * K, .i32) : nil
-            let sortedTok = isPrefill ? try alloc(rows * K, .i32) : nil
+            let expOff = needsPairGrouping ? try alloc(E + 1, .i32) : nil
+            let sortedPair = needsPairGrouping ? try alloc(rows * K, .i32) : nil
+            let sortedTok = needsPairGrouping ? try alloc(rows * K, .i32) : nil
             let invPerm = isPrefill ? try alloc(rows * K, .i32) : nil
             let tileE = isPrefill ? try alloc(rows * K, .i32) : nil
             let tileR = isPrefill ? try alloc(rows * K, .i32) : nil
             let tileCount = isPrefill ? try alloc(tcInts, .i32) : nil
+            let indInts = QWGemmFP.MoEActiveBucketPlan.indirectBufferBytes / 4
+            let activeExperts = needsActiveBuckets ? try alloc(E, .i32) : nil
+            let activeIndirect = needsActiveBuckets ? try alloc(indInts, .i32) : nil
             let gu16Value: QWTensorValue?
             let dnAccValue: QWTensorValue
             if aliasGuDnAcc {
@@ -149,7 +162,9 @@ enum QWScratchArenaBuilder {
                 dnHi: isPrefill ? try alloc(rows * K * I, .f16) : nil,
                 dnAcc: dnAccValue,
                 naxX16: isPrefill ? try alloc(rows * (H + ISh), .f16) : nil,
-                latent: latentSc
+                latent: latentSc,
+                activeExperts: activeExperts,
+                activeIndirect: activeIndirect
             )
             memset(s.shared.region.pointer.advanced(by: s.shared.offset), 0, s.shared.bytes)
             if ISh > 0 && !geometry.sharedExpertHasGate {
@@ -325,6 +340,7 @@ enum QWScratchArenaBuilder {
         headQ4g: Bool,
         maxMTP: Int,
         format: QWWeightFormat,
+        headFormat: QWWeightFormat? = nil,
         dflashWeights: Int,
         safeWeightCap: Int
     ) -> Int {
@@ -334,7 +350,7 @@ enum QWScratchArenaBuilder {
             let candGeo = raw.withResidentExperts(cand)
             if let p = try? QWWeightAllocationPlan(
                 geometry: candGeo, ropeRows: ropeRows, mtpDrafts: mtpWeightDrafts,
-                headQ4g: headQ4g, maxMTPDrafts: maxMTP, format: format),
+                headQ4g: headQ4g, maxMTPDrafts: maxMTP, format: format, headFormat: headFormat),
                p.bytes + dflashWeights <= safeWeightCap {
                 return cand
             }
@@ -349,7 +365,7 @@ enum QWScratchArenaBuilder {
         ropeRows: Int, mtpDrafts: Int, mtpWeightDrafts: Int, kvMode: QWKVMode,
         allowExpertReduction: Bool = true
     ) throws -> (geometry: QWModelGeometry, prefillChunkSize: Int) {
-        let maxMTP0 = cfg.mtpBackend == .dflash2 ? 15 : 7
+        let maxMTP0 = 15
         let arenaCap0 = max(0, hal.caps.maxWorkingSetBytes - (64 << 20))
         let isMoE0 = raw.numExperts > 0
         let avail0 = QWEngineDriver.residencyBudgetBytes(
@@ -374,7 +390,8 @@ enum QWScratchArenaBuilder {
         )
         let fullWPlan = try QWWeightAllocationPlan(
             geometry: raw, ropeRows: max(ropeRows, maxTokens),
-            mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP0, format: format)
+            mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP0,
+            format: format, headFormat: cfg.headFormat)
         let fullBytes0 = fullWPlan.bytes + dflash0.weights
         let embedBytes0 = raw.vocab * raw.hidden * 2
         let devEmbedEnv = cfg.environment["QW_MTP_DEVICE_EMBEDDING"] ?? cfg.environment["QW_MTP_DEVICE_EMBED"]
@@ -392,7 +409,8 @@ enum QWScratchArenaBuilder {
                 dflashFootprint: dflash0, tuning: tuning,
                 physicalMemoryBytes: QWAdmission.physicalMemoryBytes())
             let kv0 = QWEngineDriver.kvBudgetBytes(
-                maxTokens: minFitTokens0, mtpDrafts: needsMTPCache ? mtpDrafts : 0, kvMode: kvMode, geometry: raw)
+                maxTokens: minFitTokens0, mtpDrafts: needsMTPCache ? mtpDrafts : 0,
+                kvMode: kvMode, geometry: raw, prefillChunk: chunkRows)
                 + (fixed.hcaPerTokBytes + fixed.mbsaPerTokBytes) * minFitTokens0
             let baseReserve = act + fixed.gdnBytes + fixed.extraFixedBytes + kv0 + (256 << 20)
             let safeCapWithoutEmbed = max(0, avail0 - baseReserve)
@@ -416,7 +434,7 @@ enum QWScratchArenaBuilder {
         }
         let chosenE = stepDownResidentExperts(
             raw: raw, ropeRows: max(ropeRows, maxTokens), mtpWeightDrafts: mtpWeightDrafts,
-            headQ4g: cfg.headIsQ4g, maxMTP: maxMTP0, format: format,
+            headQ4g: cfg.headIsQ4g, maxMTP: maxMTP0, format: format, headFormat: cfg.headFormat,
             dflashWeights: dflash0.weights, safeWeightCap: safeWeightCap(forChunk: fallbackChunk))
         return (raw.withResidentExperts(chosenE), fallbackChunk)
     }
@@ -449,13 +467,17 @@ enum QWScratchArenaBuilder {
             physicalMemoryBytes: QWAdmission.physicalMemoryBytes())
         let needsMTPCache = mtpWeightDrafts > 0 && mtpDrafts > 0
         let extraFixedBytes = fixed.extraFixedBytes + dflashFootprint.weights
-        let perTokBytes = 2 * fixed.activeAttnLayers
+        let kvSplit = swaLinearAndFixedKV(
+            geometry: geometry, activeAttnLayers: fixed.activeAttnLayers, needsMTPCache: needsMTPCache,
+            maxTokens: maxTokens, prefillChunk: prefillChunkSize, kvMode: kvMode)
+        let perTokBytes = 2 * kvSplit.linearLayers
             * (QWKVCache.pageBytes(mode: kvMode, geometry: geometry) / QWKVCache.pageTokens)
             + fixed.perTokenBytes
-        let maxMTP = cfg.mtpBackend == .dflash2 ? 15 : 7
+        let maxMTP = 15
         let prelimPlan = try QWWeightAllocationPlan(
             geometry: geometry, ropeRows: max(ropeRows, maxTokens),
-            mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP, format: weightFormat)
+            mtpDrafts: mtpWeightDrafts, headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP,
+            format: weightFormat, headFormat: cfg.headFormat)
         let arenaCap = max(0, hal.caps.maxWorkingSetBytes - (64 << 20))
         let isMoE = geometry.numExperts > 0
         let isColdStreamingMoE = isMoE && geometry.effectiveResidentExperts < geometry.numExperts
@@ -472,7 +494,7 @@ enum QWScratchArenaBuilder {
         let prelimCap = try QWCapacityPlan.plan(
             nativeWindow: geometry.maxPositionEmbeddings, requested: requestedMaxTokens,
             perTokenBytes: perTokBytes,
-            fixedBytes: prelimPlan.bytes + actBytes + fixed.gdnBytes + extraFixedBytes,
+            fixedBytes: prelimPlan.bytes + actBytes + fixed.gdnBytes + extraFixedBytes + kvSplit.swaFixedKVBytes,
             availableBytes: availBytes, yarnAllowed: true)
         let effectiveMaxTokens = (!prelimCap.fits && requestedMaxTokens == geometry.maxPositionEmbeddings
             && prelimCap.maxFittingContext >= QWCapacityPlan.kvStepTokens)
@@ -481,20 +503,27 @@ enum QWScratchArenaBuilder {
         let effectiveRopeRows = max(ropeRows, effectiveMaxTokens)
         let weightPlan = try QWWeightAllocationPlan(
             geometry: geometry, ropeRows: effectiveRopeRows, mtpDrafts: mtpWeightDrafts,
-            headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP, format: weightFormat)
+            headQ4g: cfg.headIsQ4g, maxMTPDrafts: maxMTP,
+            format: weightFormat, headFormat: cfg.headFormat)
         let weightsBytes = weightPlan.bytes
         let trunkKVBytes = QWEngineDriver.kvBudgetBytes(
-            maxTokens: effectiveMaxTokens, mtpDrafts: 0, kvMode: kvMode, geometry: geometry)
+            maxTokens: effectiveMaxTokens, mtpDrafts: 0, kvMode: kvMode,
+            geometry: geometry, prefillChunk: prefillChunkSize)
         let mtpKVBytes = needsMTPCache
             ? (QWEngineDriver.kvBudgetBytes(
-                maxTokens: effectiveMaxTokens, mtpDrafts: mtpDrafts, kvMode: kvMode, geometry: geometry)
+                maxTokens: effectiveMaxTokens, mtpDrafts: mtpDrafts, kvMode: kvMode,
+                geometry: geometry, prefillChunk: prefillChunkSize)
                 - trunkKVBytes)
             : 0
         let kvBytes = trunkKVBytes + mtpKVBytes
         let fixedBytes = weightsBytes + actBytes + fixed.gdnBytes + extraFixedBytes
+        let effectiveSwaKV = swaLinearAndFixedKV(
+            geometry: geometry, activeAttnLayers: fixed.activeAttnLayers, needsMTPCache: needsMTPCache,
+            maxTokens: effectiveMaxTokens, prefillChunk: prefillChunkSize, kvMode: kvMode).swaFixedKVBytes
         let capPlan = try QWCapacityPlan.plan(
             nativeWindow: geometry.maxPositionEmbeddings, requested: effectiveMaxTokens,
-            perTokenBytes: perTokBytes, fixedBytes: fixedBytes, availableBytes: availBytes, yarnAllowed: true)
+            perTokenBytes: perTokBytes, fixedBytes: fixedBytes + effectiveSwaKV,
+            availableBytes: availBytes, yarnAllowed: true)
         let formatSuffix = " weights_format=\(weightFormat.name) weights_bpw="
             + String(format: "%.2f", weightFormat.effectiveBitsPerWeight(geometry: geometry))
             + (weightFormatDeclineReason.map { " weights_declined=\($0)" } ?? "")
@@ -525,7 +554,7 @@ enum QWScratchArenaBuilder {
         prefillChunkSize: Int,
         tuning: QWEngineTuning,
         physicalMemoryBytes: Int?,
-        resolveFormat: (String?, QWModelDescriptor, QWModelGeometry, Int) -> (QWWeightFormat, Bool)
+        resolveFormat: (String?, QWModelDescriptor, QWModelGeometry, Int) -> (QWWeightFormat, Bool, QWWeightFormat?)
     ) -> QWContextMemoryEstimate {
         let clampedContext = max(64, min(1_048_576, contextTokens))
         let baseGeometry = QWModelGeometry(descriptor: descriptor)
@@ -534,11 +563,11 @@ enum QWScratchArenaBuilder {
         let effDrafts = max(0, mtpDrafts)
         let lowerBackend = mtpBackend.lowercased()
         let isDFlash = ["dflash2", "dflash", "dspine"].contains(lowerBackend)
-        let maxMTP = isDFlash ? 15 : 7
+        let maxMTP = 15
         let mtpWeightDrafts = (descriptor.mtpLayers > 0 && !isDFlash) ? min(effDrafts, maxMTP) : 0
         let needsMTPCache = mtpWeightDrafts > 0 && effDrafts > 0
         let hasMTPDrafter = (mtpWeightDrafts > 0 || isDFlash) && effDrafts > 0
-        let (format, headQ4g) = resolveFormat(packPath, descriptor, rawGeometry, mtpWeightDrafts)
+        let (format, headQ4g, headFormat) = resolveFormat(packPath, descriptor, rawGeometry, mtpWeightDrafts)
         let chunkRows = max(32, min(QWPrefillLimits.maxRows, (prefillChunkSize / 32) * 32))
         let maxBufferCap = MTLCreateSystemDefaultDevice().map { Int($0.maxBufferLength) }
         let actBytes = activationBytes(
@@ -565,7 +594,8 @@ enum QWScratchArenaBuilder {
                 ? min(clampedContext, rawGeometry.maxPositionEmbeddings) : clampedContext
             let minFitTokens = min(modelCap, max(16_384, min(clampedContext, 32_768)))
             let minFitKV = QWEngineDriver.kvBudgetBytes(
-                maxTokens: minFitTokens, mtpDrafts: needsMTPCache ? effDrafts : 0, kvMode: kvMode, geometry: rawGeometry)
+                maxTokens: minFitTokens, mtpDrafts: needsMTPCache ? effDrafts : 0,
+                kvMode: kvMode, geometry: rawGeometry, prefillChunk: chunkRows)
                 + (rawFixed.hcaPerTokBytes + rawFixed.mbsaPerTokBytes) * minFitTokens
             let safeCap = max(0, availBytes - (actBytes + rawFixed.gdnBytes + rawFixed.extraFixedBytes
                 + minFitKV + (256 << 20)))
@@ -573,7 +603,7 @@ enum QWScratchArenaBuilder {
             do {
                 fullBytes = try QWWeightAllocationPlan(
                     geometry: rawGeometry, ropeRows: ropeRows, mtpDrafts: mtpWeightDrafts,
-                    headQ4g: headQ4g, maxMTPDrafts: maxMTP, format: format).bytes + dflashBytes.weights
+                    headQ4g: headQ4g, maxMTPDrafts: maxMTP, format: format, headFormat: headFormat).bytes + dflashBytes.weights
             } catch {
                 planningFailed = true
                 return rawGeometry
@@ -581,7 +611,7 @@ enum QWScratchArenaBuilder {
             guard fullBytes > safeCap else { return rawGeometry }
             let chosenE = stepDownResidentExperts(
                 raw: rawGeometry, ropeRows: ropeRows, mtpWeightDrafts: mtpWeightDrafts,
-                headQ4g: headQ4g, maxMTP: maxMTP, format: format,
+                headQ4g: headQ4g, maxMTP: maxMTP, format: format, headFormat: headFormat,
                 dflashWeights: dflashBytes.weights, safeWeightCap: safeCap)
             return rawGeometry.withResidentExperts(chosenE)
         }()
@@ -589,7 +619,7 @@ enum QWScratchArenaBuilder {
         do {
             weightsBytes = try QWWeightAllocationPlan(
                 geometry: geometry, ropeRows: ropeRows, mtpDrafts: mtpWeightDrafts,
-                headQ4g: headQ4g, maxMTPDrafts: maxMTP, format: format).bytes + dflashBytes.weights
+                headQ4g: headQ4g, maxMTPDrafts: maxMTP, format: format, headFormat: headFormat).bytes + dflashBytes.weights
         } catch {
             planningFailed = true
             weightsBytes = 0
@@ -600,11 +630,15 @@ enum QWScratchArenaBuilder {
                 geometry: geometry, prefillChunkSize: chunkRows, maxTokens: clampedContext,
                 mtpDrafts: effDrafts, mtpWeightDrafts: mtpWeightDrafts,
                 dflashFootprint: dflashBytes, tuning: tuning, physicalMemoryBytes: physicalMemoryBytes)
-        let perTokBytes = 2 * fixed.activeAttnLayers
+        let kvSplit = swaLinearAndFixedKV(
+            geometry: geometry, activeAttnLayers: fixed.activeAttnLayers, needsMTPCache: needsMTPCache,
+            maxTokens: clampedContext, prefillChunk: chunkRows, kvMode: kvMode)
+        let perTokBytes = 2 * kvSplit.linearLayers
             * (QWKVCache.pageBytes(mode: kvMode, geometry: geometry) / QWKVCache.pageTokens)
             + fixed.perTokenBytes
         let kvBytes = QWEngineDriver.kvBudgetBytes(
-            maxTokens: clampedContext, mtpDrafts: needsMTPCache ? effDrafts : 0, kvMode: kvMode, geometry: geometry)
+            maxTokens: clampedContext, mtpDrafts: needsMTPCache ? effDrafts : 0,
+            kvMode: kvMode, geometry: geometry, prefillChunk: chunkRows)
             + fixed.perTokenBytes * clampedContext
         let baseScratchBytes = actBytes + fixed.gdnBytes + fixed.extraFixedBytes
         let embedBytes = geometry.vocab * geometry.hidden * 2
@@ -620,11 +654,36 @@ enum QWScratchArenaBuilder {
         }
         let fixedBytes = weightsBytes + scratchBytes
         let requiredBytes = fixedBytes + kvBytes
-        let maxFitting = availBytes > fixedBytes ? min(1_048_576, (availBytes - fixedBytes) / max(1, perTokBytes)) : 0
+        let effectiveFixedForMax = fixedBytes + kvSplit.swaFixedKVBytes
+        let maxFitting = availBytes > effectiveFixedForMax
+            ? min(1_048_576, (availBytes - effectiveFixedForMax) / max(1, perTokBytes)) : 0
         return QWContextMemoryEstimate(
             contextTokens: clampedContext, weightsBytes: weightsBytes, kvBytes: kvBytes,
             scratchAndStateBytes: scratchBytes, requiredBytes: requiredBytes,
             availableBytes: availBytes, maxFittingContext: maxFitting,
             fits: availBytes == 0 || requiredBytes <= availBytes)
+    }
+
+    private static func swaLinearAndFixedKV(
+        geometry: QWModelGeometry, activeAttnLayers: Int, needsMTPCache: Bool,
+        maxTokens: Int, prefillChunk: Int, kvMode: QWKVMode
+    ) -> (linearLayers: Int, swaFixedKVBytes: Int) {
+        guard geometry.hasAnySlidingWindow, !geometry.usesLatentOrCompressedAttention else {
+            return (activeAttnLayers, 0)
+        }
+        let pageBytes = QWKVCache.pageBytes(mode: kvMode, geometry: geometry)
+        var fullCount = 0
+        var swaBytes = 0
+        for v in 0..<geometry.numVirtualLayers where geometry.isVirtualLayerFullAttention(v) {
+            let w = geometry.virtualLayerSlidingWindow(v)
+            if w > 0 {
+                let cap = min(maxTokens, w + prefillChunk + 512)
+                swaBytes += QWEngineDriver.kvPagesPerPool(maxTokens: cap) * 2 * pageBytes
+                    + QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs
+            } else {
+                fullCount += 1
+            }
+        }
+        return (fullCount + (needsMTPCache ? 1 : 0), swaBytes)
     }
 }

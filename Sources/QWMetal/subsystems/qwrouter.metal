@@ -5,6 +5,7 @@
 using namespace metal;
 #include "include/qw_weight_basis.metalh"
 #include "include/qw_fastmath_safe.metalh"
+#include "include/qw_router_union.metalh"
 
 // 32-point normalized WHT in f32 (8 elements per thread across 4 threads).
 inline void qwg_route_fwht32_f32(thread float (&f)[8], uint lane_id) {
@@ -190,83 +191,11 @@ kernel void qwg_moe_route_decode(device const float* logits0    [[buffer(0)]],
                                  uint lane [[thread_index_in_simdgroup]]) {
     // tgp.y = row (verify batches): each row is an independent T = 1 route on its own slices.
     const uint tg = tgp.x, row = tgp.y, tid = tpt.x;
+    threadgroup QWRUnionScratch unionSc;
     if ((normTopK & 4u) != 0u) {
-        // MoE-Spec (arXiv:2602.16052) expert budgeting across verify window:
-        // E holds verify rows M (2..4), K holds topK (<= 16), IS holds expertBudget B (< M * K).
-        if (sgi > 0u) return;
-        const uint M = E;
-        const uint B = IS;
-        const uint totalPairs = M * K;
-        const bool doNorm = (normTopK & 1u) != 0u;
-        float origRowSums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if (doNorm && lane == 0u) {
-            for (uint r = 0u; r < M && r < 4u; ++r) {
-                float s = 0.0f;
-                for (uint k = 0u; k < K; ++k) s += wts0[r * K + k];
-                origRowSums[r] = s;
-            }
-        }
-        int id0 = (lane < totalPairs) ? idx0[lane] : -1;
-        int id1 = (lane + 32u < totalPairs) ? idx0[lane + 32u] : -1;
-        float w0 = (lane < totalPairs) ? wts0[lane] : -1.0f;
-        float w1 = (lane + 32u < totalPairs) ? wts0[lane + 32u] : -1.0f;
-        simdgroup_barrier(mem_flags::mem_device);
-        bool keep0 = (lane < K);
-        bool keep1 = (lane + 32u < K);
-        uint uniqueCount = 0u;
-        for (uint s = 0u; s < K; ++s) {
-            const int e = idx0[s];
-            if (e < 0) continue;
-            bool dup = false;
-            for (uint prev = 0u; prev < s; ++prev) {
-                if (idx0[prev] == e) { dup = true; break; }
-            }
-            if (!dup) {
-                uniqueCount += 1u;
-                if (id0 == e) keep0 = true;
-                if (id1 == e) keep1 = true;
-            }
-        }
-        while (uniqueCount < B) {
-            const float cand0 = (!keep0 && id0 >= 0) ? w0 : -1.0f;
-            const float cand1 = (!keep1 && id1 >= 0) ? w1 : -1.0f;
-            const float bestW = simd_max(max(cand0, cand1));
-            if (bestW < 0.0f) break;
-            uint candP = 0xFFFFFFFFu;
-            if (cand0 == bestW) candP = lane;
-            else if (cand1 == bestW) candP = lane + 32u;
-            const uint winP = simd_min(candP);
-            if (winP >= totalPairs) break;
-            const int winE = idx0[winP];
-            if (id0 == winE) keep0 = true;
-            if (id1 == winE) keep1 = true;
-            uniqueCount += 1u;
-        }
-        if (lane < totalPairs && !keep0) {
-            idx0[lane] = -1;
-            wts0[lane] = 0.0f;
-        }
-        if (lane + 32u < totalPairs && !keep1) {
-            idx0[lane + 32u] = -1;
-            wts0[lane + 32u] = 0.0f;
-        }
-        simdgroup_barrier(mem_flags::mem_device);
-        if (doNorm && lane == 0u) {
-            for (uint r = 1u; r < M && r < 4u; ++r) {
-                float newSum = 0.0f;
-                for (uint k = 0u; k < K; ++k) {
-                    const float w = wts0[r * K + k];
-                    if (w > 0.0f) newSum += w;
-                }
-                const float origSum = origRowSums[r];
-                if (newSum > 0.0f && newSum < origSum * 0.9999f) {
-                    const float scale = origSum / newSum;
-                    for (uint k = 0u; k < K; ++k) {
-                        wts0[r * K + k] *= scale;
-                    }
-                }
-            }
-        }
+        // MoE-Spec (arXiv:2602.16052) union-aware budgeting across verify window (256-thread 1-TG):
+        // E holds verify rows M (2..16), K holds topK (<= 16, M*K <= 256), IS holds expertBudget B.
+        qwg_router_union_prune_tg(idx0, wts0, E, K, IS, (normTopK & 1u) != 0u, tid, sgi, lane, unionSc);
         return;
     }
     const bool splitFeature = (normTopK & 8u) != 0u;

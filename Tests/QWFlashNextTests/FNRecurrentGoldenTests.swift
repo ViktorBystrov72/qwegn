@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 // Goldens for the recurrent blocks: GatedDeltaNet and the PLE layer (HF qwen4_exp, Scripts/flashnext/gen_goldens.py).
 final class FNRecurrentGoldenTests: XCTestCase {

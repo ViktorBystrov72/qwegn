@@ -20,6 +20,14 @@ typealias QWAsyncColdWriteController = QWCore.QWAsyncColdWriteController
 
 extension QWEngineDriver {
     public func configurePrefixCache(config: QWCacheConfig) throws {
+        if let hyper = hyperRuntime {
+            try hyper.configurePrefixCache(config)
+            return
+        }
+        if let ink = inkling2Runtime {
+            try ink.configurePrefixCache(config)
+            return
+        }
         try withFlightPermit { try configurePrefixCacheLocked(config: config) }
     }
 
@@ -258,11 +266,16 @@ extension QWEngineDriver {
                 activeSparseIndexerStateBytes(position: session.position) +
                 (session.dflashSlot.map { $0.kSlab.bytes + $0.vSlab.bytes } ?? 0)
             let sharedBaseHit = isSharedBase ? nil : store.sharedBasePrefix(matching: cacheTokens, mode: policyKey)
-            let (charge, sharedKVBytes) = QWPrefixCacheCoordinator.computeRetainCharge(
-                stateBytes: stateBytes, trunkWritten: kvCache.written(session.kv), attnLayerCount: attnLayers.count,
-                kvBytesPerPage: kvCache.bytesPerPage, mtpWritten: session.mtpKV.flatMap { mtpCache?.written($0) } ?? 0,
-                mtpBytesPerPage: mtpCache?.bytesPerPage ?? 0, logitsBytes: sc.logits.bytes, sharedBaseHit: sharedBaseHit?.value
+            let trunkWritten = kvCache.written(session.kv)
+            let mtpWritten = session.mtpKV.flatMap { mtpCache?.written($0) } ?? 0
+            let trunkKVBytes = kvCache.sharedPrefixBytes(tokenCount: trunkWritten)
+            let mtpKVBytes = mtpCache?.sharedPrefixBytes(tokenCount: mtpWritten) ?? 0
+            let sharedKVBytes = (sharedBaseHit?.value.prefix.trunk.memoryBytes ?? 0)
+                + (sharedBaseHit?.value.prefix.mtp?.memoryBytes ?? 0)
+            let incrementalKVBytes = QWTwoTierPrefixCache.incrementalCharge(
+                fullBytes: trunkKVBytes + mtpKVBytes, sharedBaseBytes: sharedKVBytes
             )
+            let charge = stateBytes + incrementalKVBytes + sc.logits.bytes
             guard keyBytes <= store.byteLimit, charge <= (store.byteLimit - keyBytes) else {
                 onCacheEvent?(.skippedOversize(tokens: cacheTokens.count, charge: charge + keyBytes, warmLimitBytes: store.byteLimit))
                 return false
@@ -531,7 +544,23 @@ extension QWEngineDriver {
         pinAsSharedBase: Bool = true,
         onPrefillProgress: (@Sendable (Int, Int) -> Void)?
     ) throws -> Int {
-        try requestGate.withRequest(flight: flight) { permit in
+        if let hyper = hyperRuntime {
+            return try hyper.buildStandalonePrefixCache(
+                tokens: tokens,
+                outputURL: outputURL,
+                pinAsSharedBase: pinAsSharedBase,
+                onPrefillProgress: onPrefillProgress
+            )
+        }
+        if let ink = inkling2Runtime {
+            return try ink.buildStandalonePrefixCache(
+                tokens: tokens,
+                outputURL: outputURL,
+                pinAsSharedBase: pinAsSharedBase,
+                onPrefillProgress: onPrefillProgress
+            )
+        }
+        return try requestGate.withRequest(flight: flight) { permit in
             guard !tokens.isEmpty, tokens.count <= ropeRows,
                   tokens.allSatisfy({ (0..<geometry.vocab).contains($0) }) else {
                 throw QWEngineDriverError.state("invalid standalone prefix tokens")
@@ -578,7 +607,13 @@ extension QWEngineDriver {
 
     /// Mounts a standalone `.qwcache` file from `fileURL` into warm RAM as a pinned shared base prefix.
     public func mountStandalonePrefixCache(from fileURL: URL) throws -> (tokens: [Int], byteCount: Int) {
-        try withFlightPermit {
+        if let hyper = hyperRuntime {
+            return try hyper.mountStandalonePrefixCache(from: fileURL)
+        }
+        if let ink = inkling2Runtime {
+            return try ink.mountStandalonePrefixCache(from: fileURL)
+        }
+        return try withFlightPermit {
             if prefixStore == nil {
                 try configurePrefixCacheLocked(config: QWCacheConfig(warmByteLimit: 512 << 20, ssdByteLimit: 0, entryLimit: 32))
             }
@@ -606,6 +641,14 @@ extension QWEngineDriver {
 
     /// Unmounts all pinned shared-base prefixes from the warm prefix store.
     public func unmountSharedBasePrefixes() {
+        if let hyper = hyperRuntime {
+            hyper.unmountSharedBasePrefixes()
+            return
+        }
+        if let ink = inkling2Runtime {
+            ink.unmountSharedBasePrefixes()
+            return
+        }
         guard flight.try() else { return }
         defer { flight.unlock() }
         lsaOperator?.setPinnedBaseState(nil, position: 0)

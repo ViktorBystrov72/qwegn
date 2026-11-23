@@ -13,7 +13,8 @@ struct QWWeightAllocationPlan {
     let bytes: Int
 
     init(geometry: QWModelGeometry, ropeRows: Int, mtpDrafts: Int = 0, headQ4g: Bool = false,
-         maxMTPDrafts: Int = 7, format: QWWeightFormat = .hq4G32) throws {
+         maxMTPDrafts: Int = 15, format: QWWeightFormat = .hq4G32,
+         headFormat: QWWeightFormat? = nil) throws {
         guard ropeRows > 0, ropeRows <= Int.max / 256 - 1 else {
             throw QWEngineDriverError.state("invalid RoPE row count: \(ropeRows)")
         }
@@ -38,7 +39,8 @@ struct QWWeightAllocationPlan {
         let h = geometry.hidden, i = geometry.intermediate
         let kv = geometry.kvHeads * geometry.headDim
         if headQ4g {
-            q4(geometry.vocab, h)
+            let hf = headFormat ?? format
+            tensor(geometry.vocab * (hf.rowBytes(k: h) / 2), .f16)
         } else {
             tensor(geometry.vocab * h, .f16)
         }
@@ -79,6 +81,12 @@ struct QWWeightAllocationPlan {
             let hasMBSA = includeMBSA && geometry.blockSparseGQAConfig != nil
             q4(hasMBSA ? geometry.attnProjTotalN : (geometry.qProjOut + 2 * kv), h)
             q4(h, geometry.qHeads * geometry.headDim)
+            if geometry.descriptor.hasQKVBias {
+                tensor(geometry.qProjOut + 2 * kv, .f16)
+            }
+            if geometry.descriptor.hasAttnOutputBias {
+                tensor(h, .f16)
+            }
             // The q/k norms only exist when the model has them.
             if geometry.descriptor.hasQKNorm {
                 tensor(geometry.headDim, .f16)
@@ -276,6 +284,12 @@ struct QWWeightAllocationPlan {
             } else {
                 q4(geometry.qProjOut + 2 * kv, h)
                 q4(h, geometry.qHeads * geometry.headDim)
+                if geometry.descriptor.hasQKVBias {
+                    tensor(geometry.qProjOut + 2 * kv, .f16)
+                }
+                if geometry.descriptor.hasAttnOutputBias {
+                    tensor(h, .f16)
+                }
                 tensor(geometry.headDim, .f16)
                 tensor(kv, .f16)
             }

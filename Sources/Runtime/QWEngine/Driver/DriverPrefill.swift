@@ -239,6 +239,12 @@ extension QWEngineDriver {
         // ALL 16 attn layers live under this one token-count cursor — the
         // same single-cursor law as append()/markWritten from decodeStep).
         kvCache.markWritten(session.kv, upTo: pos + T)
+        if geometry.hasAnySlidingWindow {
+            try kvCache.recycleExpiredWindowPages(
+                session.kv,
+                currentPosition: pos + T,
+                safetyMargin: geometry.descriptor.maxSpeculativeDrafts + QWKVCache.pageTokens)
+        }
         commitMTPSeeding(session, position: pos, count: T, cacheRows: mtpRows)
         session.roundRecord.outputCount = session.generated
         if runsHead {

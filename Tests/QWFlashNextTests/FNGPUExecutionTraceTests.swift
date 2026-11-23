@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import QWFlashNext
+@testable import QWEngine
 
 final class FNGPUExecutionTraceTests: XCTestCase {
     func testOverlappingHostAndGPUIntervalsAreNotAddedTogether() throws {

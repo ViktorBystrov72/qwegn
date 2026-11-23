@@ -19,6 +19,8 @@ extension QWServerConfigurationResolver {
         let lsaBudget: Int
         let lsaClusterBlock: Int
         let lsaSidecarPath: String
+        let lsaCrossLoopReuse: Bool
+        let lsaLoopShareStride: Int
         let warmRAM: Double
         let ssdCacheEnabled: Bool
         let ssdCache: Double
@@ -49,6 +51,7 @@ extension QWServerConfigurationResolver {
         cliPrefillChunkSize: Int?, cliMaxConcurrentSessions: Int?,
         cliLSAMode: String?, cliLSABudget: Int?,
         cliLSAClusterBlock: Int?, cliLSASidecarPath: String?,
+        cliLSACrossLoopReuse: Bool? = nil,
         cliWarmRAMLimitGB: Double?, cliSSDCacheLimitGB: Double?,
         cliCacheDir: String?, cliLogDir: String?, cliLogFileName: String?,
         cliLogLevel: String?, cliLazy: Bool?,
@@ -176,6 +179,20 @@ extension QWServerConfigurationResolver {
                 sources["lsaSidecarPath"] = "env"; return sp
             }
             sources["lsaSidecarPath"] = "config-file"; return fileSettings.lsaSidecarPath
+        }()
+
+        let resolvedLSALoopShare: (enabled: Bool, stride: Int) = {
+            let envShare = QWLSAConfig.parseLoopShareEnv(environment[QWLSAConfig.loopShareEnvKey])
+            if let cli = cliLSACrossLoopReuse {
+                sources["lsaCrossLoopReuse"] = "cli"
+                return (cli, cli ? (envShare?.stride ?? 0) : 0)
+            }
+            if let envShare {
+                sources["lsaCrossLoopReuse"] = "env"
+                return envShare
+            }
+            sources["lsaCrossLoopReuse"] = "config-file"
+            return (fileSettings.lsaCrossLoopReuse, 0)
         }()
 
         // 12. Cache
@@ -347,6 +364,8 @@ extension QWServerConfigurationResolver {
             lsaBudget: resolvedLSABudget,
             lsaClusterBlock: resolvedLSAClusterBlock,
             lsaSidecarPath: resolvedLSASidecarPath,
+            lsaCrossLoopReuse: resolvedLSALoopShare.enabled,
+            lsaLoopShareStride: resolvedLSALoopShare.stride,
             warmRAM: resolvedWarmRAM,
             ssdCacheEnabled: resolvedSSDCacheEnabled,
             ssdCache: resolvedSSDCache,

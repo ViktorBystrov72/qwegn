@@ -21,7 +21,9 @@ Variational MTP relaxes only MTP-sourced draft rows, and only when the verifier 
 | `Qwen3.8-27B-hq4g32` + `DSpine-b16` | 64L dense + 5L block-causal drafter (`B=2..16`) | 1,043 tok/s @4K (801 serve · 914 @64K) | 94 ms | **29.3 ms** @65.5K (`2.23M` med / `2.33M` pk) | 32.1–32.9 tok/s | **148.0 tok/s** (`144.1` pred serve · `69.2` CLI, `4.19×`) | — | **9/10 Code-10 · 9/10 Core-10 · 3/3 needle** |
 | `Qwen3.8-27B-hq4g32` + `DFlash2` | 64L dense + 5L diffusion drafter | 832 tok/s (869 peak) | 94 ms | 7 ms (266×) | 31.2 tok/s | **154.2 tok/s** pred serve (`87.7` CLI `256`-tok) | — | **9/10 Code-10 · 9/10 Core-10 · 3/3 needle (100%)** |
 | `SenseNova-Loop-9B-hq4g32` | 56L looped (32L, 2× loop, F32 mHC, 524K YaRN, `7.38 GiB`) | **2,045 tok/s** @4K (`1,944` @16K, `1,763` @64K, `1,650` @10.4K srv) | 108 ms | **18 ms (`46.1×`)** | **58.4 tok/s** srv (`153.0` 4-srv `3.02×`) | **165.7 tok/s** pred serve (`98.1` CLI code · `72.3` @512) | `49.3 / 49.4 tok/s` dec @524K / @1M (`14.3 / 22.4 GiB`) | **92% HE (`36/50` Code-50) · 10/12 Core-12 · 211/211 API · 3/3 needle (`16K`–`64K`)** |
-| `SenseNova-Loop-9B-Preview` | 56L looped (32L, 2× loop, mHC) | 1,759 tok/s serve (`1,749` @64K) | 64 ms | 7 ms (164×) | 48.9 tok/s | **149.2 tok/s** pred serve (`91.4` CLI `d=1` · `76.9` serve) | 1,476 / 46.5 tok/s | **10/10 Core-10 · 8/10 Code-10 · 3/3 needle (100%)** | 
+| `SenseNova-Loop-9B-Preview` | 56L looped (32L, 2× loop, mHC) | 1,759 tok/s serve (`1,749` @64K) | 64 ms | 7 ms (164×) | 48.9 tok/s | **149.2 tok/s** pred serve (`91.4` CLI `d=1` · `76.9` serve) | 1,476 / 46.5 tok/s | **10/10 Core-10 · 8/10 Code-10 · 3/3 needle (100%)** |
+| `Inkling-2-Mini-shvq4g32-shvq2g64-shvq3g64` | 48-visit looped MoE (24L, `[6..18]×3`, `128` exp `8/tok`, `10.20 GiB` + `DSpark` + ViT) | **3,638 tok/s** @8K (`3,507` @2K, `3,430` @16K, `3,218` @32K, **`3,200`** @128K) | — | `147/184` cached (`S1`) | **72.7–73.2 tok/s** (`100.6` `B=4` wavefront) | **99.9 tok/s** `d=3` (**`86.2`** `code256 B=12` · `96.6` `@16K` `B=12` · `79.9` `Cand5 var5`) | **`3,200 / 71.9`** @128K (`61.8` `@32K` reuse · **`78.0` @1M** `19.72 GiB` plan / `20.69` RSS) | **89/89 (100%) API · 21/25 Code-25 (`12/13` HE) · 3/3 needle (`16K`–`128K`) · 9/9 `S1..S9`** |
+| `Inkling-2-Mini-shvq4g32-nvfp4` | 48-visit looped MoE (`SHVQ4_G32` trunk + lossless `NVFP4` MoE, `15.15 GiB` + `DSpark`) | **3,504 tok/s** @8K (`3,365` @2K, `3,156` @16K, `2,838` @32K) | — | — | **61.2–66.4 tok/s** | **80.1 tok/s** `d=3` (`79.9` `var5` · `59.4` `2K B=12`) | — | **89/89 (100%) API · 20/25 Code-25 (`13/13` HE) · `0.0132` KL / `97.9%` Top-1 · 3/3 needle (`16K`)** | 
 
 All models execute with **0 heap and 0 Metal buffer allocations** in steady state across 64K–1M tokens.
 
@@ -93,6 +95,9 @@ Quiet-GPU (`0% / 0%` baseline utilization) long-context scaling and 3-needle pas
 </p>
 <p align="center">
   <img src="../assets/qwegn_lsa_scaling_sensenova_loop_9b.svg" alt="SenseNova-Loop-9B-Preview 64K-1M Prefill Profile and Decode Scaling" width="100%">
+</p>
+<p align="center">
+  <img src="../assets/qwegn_lsa_scaling_inkling2_mini.svg" alt="Inkling-2-Mini 2K-1M Prefill Profile and Decode Scaling" width="100%">
 </p>
 
 ### Regime Summary: When to Use `Ward-512` vs `e-means-4096`

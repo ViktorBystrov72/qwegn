@@ -29,11 +29,11 @@ final class QWMTPRandomStreamTests: XCTestCase {
         XCTAssertFalse(stream.isRoundActive)
         XCTAssertThrowsError(try stream.resolveGumbelRound(proposals: proposals, targetDistributions: targets))
 
-        try stream.beginGumbelRound(drafts: 7, vocabulary: 3)
+        try stream.beginGumbelRound(drafts: 15, vocabulary: 3)
         let partial = try stream.sampleGumbelProposal(rows[0])
         stream.cancelActiveRound()
         XCTAssertEqual(stream.drawsConsumed, 23, "successfully sampled row counters stay burned on cancellation")
-        XCTAssertThrowsError(try stream.beginGumbelRound(drafts: 8, vocabulary: 3))
+        XCTAssertThrowsError(try stream.beginGumbelRound(drafts: 16, vocabulary: 3))
         XCTAssertThrowsError(try stream.beginGumbelRound(drafts: 1, vocabulary: 0))
         XCTAssertEqual(partial.token, try QWMTP.checkedGumbelWinner(
             distribution: rows[0], seed: 137, offset: 20))

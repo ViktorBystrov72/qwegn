@@ -2,7 +2,8 @@
 
 import XCTest
 import Foundation
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 @testable import QWQuant
 
 final class FNNgramMLXRowsTests: XCTestCase {

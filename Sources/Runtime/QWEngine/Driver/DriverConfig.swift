@@ -26,7 +26,7 @@ struct QWWeightFormatChoice {
 }
 
 extension QWEngineDriver {
-    static func resolveMTPFlag(name: String, value: String?, drafts: Int, defaultValue: Bool = false, maxDrafts: Int = 7) throws -> Bool {
+    static func resolveMTPFlag(name: String, value: String?, drafts: Int, defaultValue: Bool = false, maxDrafts: Int = 15) throws -> Bool {
         guard (0...maxDrafts).contains(drafts) else { throw QWEngineDriverError.badMTPDrafts(drafts) }
         switch value {
         case nil: return drafts > 0 && defaultValue
@@ -214,18 +214,27 @@ extension QWEngineDriver {
     /// The KV arena budget law, sized from the model's **own** geometry: the
     /// pool holds the model's full-attention layers, not the 27B's 16.
     static func kvBudgetBytes(maxTokens: Int, mtpDrafts: Int, kvMode: QWKVMode = .f16,
-                              geometry: QWModelGeometry) -> Int {
-        let attnLayers = (0..<geometry.numVirtualLayers).filter { geometry.isVirtualLayerFullAttention($0) }.count
-        func cache(_ layers: Int) -> Int {
-            // Exact inverse of QWKVCache.init's pool arithmetic:
-            // poolBytes = (region − tables) / (2 × layers), floored to
-            // whole pages. This layout yields exactly kvPagesPerPool per
-            // pool with no leftover slack.
-            kvPagesPerPool(maxTokens: maxTokens) * 2 * layers
-                * QWKVCache.pageBytes(mode: kvMode, geometry: geometry)
-                + QWKVCache.tableSlotBytes * 2 * layers * QWKVCache.maxSeqs
+                              geometry: QWModelGeometry,
+                              prefillChunk: Int = 4096) -> Int {
+        let attnLayers = (0..<geometry.numVirtualLayers).filter { geometry.isVirtualLayerFullAttention($0) }
+        let pageBytes = QWKVCache.pageBytes(mode: kvMode, geometry: geometry)
+        let trunkTables = QWKVCache.tableSlotBytes * 2 * attnLayers.count * QWKVCache.maxSeqs
+        let trunkPoolBytes: Int
+        if geometry.hasAnySlidingWindow {
+            let pagesSum = attnLayers.reduce(0) { acc, v in
+                let w = geometry.virtualLayerSlidingWindow(v)
+                let cap = w > 0 ? min(maxTokens, w + prefillChunk + 512) : maxTokens
+                return acc + kvPagesPerPool(maxTokens: cap)
+            }
+            trunkPoolBytes = pagesSum * 2 * pageBytes
+        } else {
+            trunkPoolBytes = kvPagesPerPool(maxTokens: maxTokens) * 2 * attnLayers.count * pageBytes
         }
-        return cache(attnLayers) + (mtpDrafts > 0 ? cache(1) : 0)
+        let trunk = trunkPoolBytes + trunkTables
+        let mtp = mtpDrafts > 0
+            ? (kvPagesPerPool(maxTokens: maxTokens) * 2 * pageBytes + QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs)
+            : 0
+        return trunk + mtp
     }
 
     /// Modes whose DECODE KERNELS actually read the pool (4c lane shipped):
@@ -266,6 +275,13 @@ extension QWEngineDriver {
                                     pack: QWQuant.Pack? = nil) throws -> QWWeightFormatChoice {
         switch root.kind {
         case .safetensorsSingle, .safetensorsSharded:
+            if geometry.descriptor.family == .inkling2Loop {
+                let counts = geometry.descriptor.inkling2Config?.expertModesCount(numLayers: geometry.numLayers)
+                    ?? (nvfp4: 0, mxfp8: 0, bf16: geometry.numLayers)
+                return QWWeightFormatChoice(
+                    format: .nativeMixedFP(denseBits: 16, nvfp4Layers: counts.nvfp4, mxfp8Layers: counts.mxfp8),
+                    declineReason: nil)
+            }
             guard let q = quantization else {
                 return QWWeightFormatChoice(
                     format: .hq4G32,
@@ -370,11 +386,11 @@ extension QWEngineDriver {
         }
     }
 
-    /// Why the family cannot serve this model, when it cannot. Each reason
-    /// is a path whose weights the family has no twin for, so the incumbent's
-    /// kernel would read the family's blocks with the wrong layout.
+    /// Why the family cannot serve this model, when it cannot.
+    /// Both standard and MTP paths have native affine twins; supported
+    /// MTP configurations return `nil`.
     static func familyDeclineReason(geometry: QWModelGeometry, mtpDrafts: Int) -> String? {
-        if mtpDrafts != 0 { return "the family has no twin for the MTP draft path" }
+        _ = (geometry, mtpDrafts)
         return nil
     }
 
@@ -382,9 +398,10 @@ extension QWEngineDriver {
     /// pre-flight and the driver's check read one predicate, so the two
     /// cannot disagree about what the standard path can serve (C110, C112).
     static func validateServing(headDim: Int, kvHeads: Int, qHeads: Int,
-                                 kvMode: String) throws {
+                                 kvMode: String, allowF32: Bool = false) throws {
         let lowerMode = kvMode.lowercased()
-        guard lowerMode == "f16" || lowerMode == "q8" || lowerMode == "q4" else {
+        let allowed = allowF32 ? ["f32", "f16", "q8", "q4"] : ["f16", "q8", "q4"]
+        guard allowed.contains(lowerMode) else {
             throw QWEngineDriverError.unsupportedKVMode(kvMode)
         }
         guard headDim % 32 == 0 else {

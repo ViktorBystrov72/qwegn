@@ -280,11 +280,13 @@ extension QWEngineDriver {
             attnY: prefixRows(mtpBatchedTrunk.attentionProjection, rows: activeRows, cols: qkvCols, dt: .f16),
             qOut: qgate, kOut: keys, vOut: values,
             wq: weights.attn!.wq, wk: weights.attn!.wkTiled,
+            qkvBias: weights.attn!.qkvBias,
             positionStart: session.position, count: activeRows,
             inRowCols: qkvCols)
         enc.memoryBarrier(scope: .buffers)
+        let layerSW = geometry.virtualLayerSlidingWindow(layer)
         let mtpSparseThreshold = lsaConfig.denseBypassThreshold
-        if let lsa = lsaOperator {
+        if layerSW == 0, let lsa = lsaOperator {
             let isSparse = session.position >= mtpSparseThreshold
             lsa.encodeIndexAndCluster(enc, qgate: qgate, kIn: keys,
                                       fullAttnLayer: fullAttnIdx,
@@ -317,22 +319,28 @@ extension QWEngineDriver {
                 layerIndex: fullAttnIdx, pos0: session.position, rows: activeRows,
                 partials: partials)
             enc.memoryBarrier(scope: .buffers)
-        } else if let lsa = lsaOperator, session.position >= mtpSparseThreshold {
+        } else if layerSW == 0, let lsa = lsaOperator, session.position >= mtpSparseThreshold {
             lsa.encodeSelectBlocks(enc, fullAttnLayer: fullAttnIdx,
                                    pos0: session.position, rows: activeRows)
             let budgetCap = lsaConfig.alignedBudget + 640
             let outCols = geometry.qHeads * geometry.headDim
             var r0 = 0
             while r0 < activeRows {
-                let runSplits = QWAttnDecode.splits(forKeys: min(session.position + r0 + 1, budgetCap))
+                let runSplits = QWAttnDecode.splits(
+                    forKeys: min(session.position + r0 + 1, budgetCap),
+                    kvHeads: geometry.kvHeads)
                 var r1 = r0 + 1
                 while r1 < activeRows,
                       r1 - r0 < 8,
-                      QWAttnDecode.splits(forKeys: min(session.position + r1 + 1, budgetCap)) == runSplits {
+                      QWAttnDecode.splits(
+                          forKeys: min(session.position + r1 + 1, budgetCap),
+                          kvHeads: geometry.kvHeads) == runSplits {
                     r1 += 1
                 }
                 let chunk = r1 - r0
                 let fullWindow = (r0 == 0 && chunk == activeRows)
+                let blockListTV = lsa.blockList(forFullAttnLayer: fullAttnIdx)
+                let blockCountTV = lsa.blockCount(forFullAttnLayer: fullAttnIdx)
                 try attnDecode.encodeSparseBatched(
                     enc,
                     qgate: fullWindow ? qgate : qgate.slice(byteOffset: r0 * geometry.qProjOut * 2, count: chunk * geometry.qProjOut),
@@ -341,13 +349,13 @@ extension QWEngineDriver {
                     vnew: fullWindow ? values : values.slice(byteOffset: r0 * geometry.kvChannels * 2, count: chunk * geometry.kvChannels),
                     partials: partials,
                     out: fullWindow ? attnOut : attnOut.slice(byteOffset: r0 * outCols * 2, count: chunk * outCols),
-                    blockList: fullWindow ? lsa.blockListScratch : QWTensorValue(
-                        region: lsa.blockListScratch.region,
-                        offset: lsa.blockListScratch.offset + r0 * lsa.listStride * 4,
+                    blockList: fullWindow ? blockListTV : QWTensorValue(
+                        region: blockListTV.region,
+                        offset: blockListTV.offset + r0 * lsa.listStride * 4,
                         shape: QWTensorShape([chunk * lsa.listStride], .i32)),
-                    blockCount: fullWindow ? lsa.blockCountScratch : QWTensorValue(
-                        region: lsa.blockCountScratch.region,
-                        offset: lsa.blockCountScratch.offset + r0 * 4,
+                    blockCount: fullWindow ? blockCountTV : QWTensorValue(
+                        region: blockCountTV.region,
+                        offset: blockCountTV.offset + r0 * 4,
                         shape: QWTensorShape([chunk], .i32)),
                     cBase: session.position + r0, T: chunk, splits: runSplits,
                     listStride: lsa.listStride, writeKV: false)
@@ -356,13 +364,17 @@ extension QWEngineDriver {
             }
         } else {
             let outCols = geometry.qHeads * geometry.headDim
+            func keysForRow(_ rowOffset: Int) -> Int {
+                let total = session.position + rowOffset + 1
+                return layerSW > 0 ? min(total, layerSW) : total
+            }
             var r0 = 0
             while r0 < activeRows {
-                let runSplits = QWAttnDecode.splits(forKeys: session.position + r0 + 1)
+                let runSplits = QWAttnDecode.splits(forKeys: keysForRow(r0), kvHeads: geometry.kvHeads)
                 var r1 = r0 + 1
                 while r1 < activeRows,
                       r1 - r0 < 8,
-                      QWAttnDecode.splits(forKeys: session.position + r1 + 1) == runSplits {
+                      QWAttnDecode.splits(forKeys: keysForRow(r1), kvHeads: geometry.kvHeads) == runSplits {
                     r1 += 1
                 }
                 let chunk = r1 - r0
@@ -375,13 +387,14 @@ extension QWEngineDriver {
                     try attnDecode.encode(
                         enc, qgate: qChunk, kv: views, knew: kChunk, vnew: vChunk,
                         partials: partials, out: oChunk,
-                        C: session.position + r0, splits: runSplits)
+                        C: session.position + r0, splits: runSplits,
+                        slidingWindow: layerSW)
                 } else {
                     try attnDecode.encodeBatched(
                         enc, qgate: qChunk, kv: views, knew: kChunk, vnew: vChunk,
                         partials: partials, out: oChunk,
                         cBase: session.position + r0, T: chunk, splits: runSplits,
-                        sharedPrefix: true)
+                        sharedPrefix: true, slidingWindow: layerSW)
                 }
                 enc.memoryBarrier(scope: .buffers)
                 r0 = r1

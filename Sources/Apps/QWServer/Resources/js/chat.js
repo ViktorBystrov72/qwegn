@@ -7,15 +7,15 @@ const CHAT_PARAM_INPUT_BINDINGS = [
   ["chat-param-temp", "temperature"], ["chat-param-top-p", "topP"], ["chat-param-top-k", "topK"],
   ["chat-param-max-tokens", "maxTokens"], ["chat-param-rep-pen", "repetitionPenalty"], ["chat-param-seed", "seed"]
 ];
-const CHAT_NUMERIC_API_MAP = [
-  ["temperature", "temperature"], ["topP", "top_p"], ["topK", "top_k"],
-  ["maxTokens", "max_tokens"], ["repetitionPenalty", "repetition_penalty"], ["seed", "seed"]
-];
 const chatState = {
   initialized: false, sessions: [], activeSessionId: null, customPresets: [],
   sidebarCollapsed: false, openDrawer: null, pendingImages: [], editingMsgId: null,
-  clearAllArmedUntil: 0, isGenerating: false, activeAbortController: null, activeStatusLabel: "Ready"
+  clearAllArmedUntil: 0, isGenerating: false, activeAbortController: null, activeStatusLabel: "Ready",
+  autoFollowScroll: true, lastTranscriptScrollTop: 0, ignoreScrollUntil: 0,
+  transcriptListenersBound: false, reasoningOpenById: {},
+  reasoningQuip: { msgId: null, index: -1, text: "", timerId: null }
 };
+const CHAT_REASONING_QUIP_INTERVAL_MS = 3500;
 
 function chatEl(id) { return typeof document !== "undefined" ? document.getElementById(id) : null; }
 function generateChatId(prefix) { return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`; }
@@ -79,7 +79,7 @@ function commitChatWorkspace(session) {
   persistChatSessions();
   renderChatWorkspace();
 }
-function initChatWorkspace() { if (!chatState.initialized) { loadChatPersistence(); chatState.initialized = true; } renderChatWorkspace(); }
+function initChatWorkspace() { if (!chatState.initialized) { loadChatPersistence(); chatState.initialized = true; } bindChatTranscriptListeners(); renderChatWorkspace(); }
 function onChatTabActivated() {
   initChatWorkspace();
   if (typeof loadedSettingsObj !== "undefined" && !loadedSettingsObj && typeof loadLiveSettings === "function") loadLiveSettings();
@@ -132,7 +132,8 @@ function renderChatSessionList() {
   }).join("");
 }
 function activateFreshSessionState(session) {
-  chatState.activeSessionId = session.id; chatState.pendingImages = []; chatState.editingMsgId = null; commitChatWorkspace(null);
+  chatState.activeSessionId = session.id; chatState.pendingImages = []; chatState.editingMsgId = null;
+  chatState.autoFollowScroll = true; chatState.lastTranscriptScrollTop = 0; commitChatWorkspace(null);
 }
 function createNewChatSession() {
   const a = getActiveChatSession();
@@ -336,111 +337,64 @@ function resetChatParamsToDefault() {
 }
 function loadSampleChatTool() { const s = getActiveChatSession(); s.params.toolsJson = SAMPLE_CHAT_TOOLS_JSON; s.updatedAt = Date.now(); persistChatSessions(); renderChatParamsDrawer(); }
 function clearChatToolsJson() { const s = getActiveChatSession(); s.params.toolsJson = ""; s.updatedAt = Date.now(); persistChatSessions(); renderChatParamsDrawer(); }
-function serializeChatTurnForApi(msg) {
-  if (msg.role === "user") {
-    if (Array.isArray(msg.images) && msg.images.length > 0) {
-      const parts = [{ type: "text", text: msg.content || "" }];
-      msg.images.forEach((img) => { if (img && img.dataUrl) parts.push({ type: "image_url", image_url: { url: img.dataUrl } }); });
-      return { role: "user", content: parts };
-    }
-    return { role: "user", content: msg.content || "" };
-  }
-  if (msg.role === "tool") return { role: "tool", tool_call_id: msg.toolCallId || "", name: msg.toolName || "", content: msg.content || "" };
-  const out = { role: "assistant", content: msg.content || "" };
-  if (Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0) {
-    out.tool_calls = msg.toolCalls.map((tc) => ({
-      id: tc.id || "call_0", type: tc.type || "function",
-      function: { name: tc.function && tc.function.name ? tc.function.name : "", arguments: tc.function && typeof tc.function.arguments === "string" ? tc.function.arguments : "{}" }
-    }));
-  }
-  return out;
+function isChatMsgActivelyReasoning(msg) {
+  return Boolean(msg && msg.isStreaming && msg.reasoning && !msg.content && !(Array.isArray(msg.toolCalls) && msg.toolCalls.length));
 }
-function buildChatCompletionPayload(session, options) {
-  const opts = options || {}; const p = session.params || createDefaultChatParams(); const messages = [];
-  const sysText = typeof buildHarnessedSystemPrompt === "function" ? buildHarnessedSystemPrompt(session) : (session.systemPrompt || "").trim();
-  if (sysText) messages.push({ role: "system", content: sysText });
-  (Array.isArray(opts.messages) ? opts.messages : (session.messages || [])).forEach((m) => messages.push(serializeChatTurnForApi(m)));
-  const modelObj = typeof publishedModel !== "undefined" ? publishedModel : null;
-  const payload = { model: modelObj && modelObj.modelId ? modelObj.modelId : "resident", messages, stream: opts.forceStream !== undefined ? opts.forceStream : p.stream !== false };
-  CHAT_NUMERIC_API_MAP.forEach(([localKey, apiKey]) => { if (typeof p[localKey] === "number" && Number.isFinite(p[localKey])) payload[apiKey] = p[localKey]; });
-  if (p.enableThinking === "true") payload.enable_thinking = true;
-  else if (p.enableThinking === "false") payload.enable_thinking = false;
-  if (p.reasoningEffort && p.reasoningEffort !== "inherit") payload.reasoning_effort = p.reasoningEffort;
-  if (typeof p.stop === "string" && p.stop.trim()) { const stops = p.stop.split(",").map((s) => s.trim()).filter(Boolean); if (stops.length > 0) payload.stop = stops; }
-  if (p.responseFormat === "json_object") payload.response_format = { type: "json_object" };
-  else if (p.responseFormat === "json_schema") {
-    const schemaText = (p.jsonSchema || "").trim();
-    if (!schemaText) throw new Error("JSON Schema response_format requires a schema JSON object.");
-    payload.response_format = { type: "json_schema", json_schema: JSON.parse(schemaText) };
-  }
-  if (typeof p.toolsJson === "string" && p.toolsJson.trim()) {
-    const parsedTools = JSON.parse(p.toolsJson.trim());
-    if (!Array.isArray(parsedTools)) throw new Error("Tools definition must be a JSON array.");
-    payload.tools = parsedTools;
-  }
-  if (opts.continueLastAssistant === true) payload.continue_final_message = true;
-  if (typeof applyChatRequestMetadataToPayload === "function") applyChatRequestMetadataToPayload(payload, session);
-  return payload;
+function isChatReasoningOpen(msgId) { return Boolean(msgId && chatState.reasoningOpenById[msgId] === true); }
+function handleChatThinkingToggle(e) {
+  const el = e && e.target;
+  if (!el || el.tagName !== "DETAILS") return;
+  const msgId = typeof el.getAttribute === "function" ? el.getAttribute("data-thinking-msg-id") : "";
+  if (msgId) chatState.reasoningOpenById[msgId] = Boolean(el.open);
 }
-function parseChatSSELine(rawLine) {
-  const line = (rawLine || "").trim();
-  if (!line || line.startsWith(":") || !line.startsWith("data:")) return null;
-  const payload = line.slice(5).trim();
-  if (!payload) return null;
-  if (payload === "[DONE]") return { done: true };
-  const parsed = JSON.parse(payload);
-  if (parsed && (parsed.type === "server_error" || parsed.error)) {
-    const errObj = parsed.error || parsed; return { done: false, error: errObj.message || JSON.stringify(errObj) };
-  }
-  return { done: false, data: parsed };
+function stopChatReasoningQuip() {
+  if (chatState.reasoningQuip.timerId && typeof clearInterval === "function") clearInterval(chatState.reasoningQuip.timerId);
+  chatState.reasoningQuip.msgId = null; chatState.reasoningQuip.text = ""; chatState.reasoningQuip.timerId = null;
 }
-function mergeToolCallChunks(existingCalls, deltaCalls) {
-  const out = Array.isArray(existingCalls) ? existingCalls.map((c) => Object.assign({}, c, { function: Object.assign({}, c.function || {}) })) : [];
-  if (!Array.isArray(deltaCalls)) return out;
-  deltaCalls.forEach((dc) => {
-    if (!dc) return;
-    const idx = typeof dc.index === "number" ? dc.index : out.length;
-    while (out.length <= idx) out.push({ id: "", type: "function", function: { name: "", arguments: "" } });
-    const target = out[idx];
-    if (dc.id) target.id = dc.id; if (dc.type) target.type = dc.type;
-    if (dc.function) {
-      if (dc.function.name) target.function.name += dc.function.name;
-      if (dc.function.arguments) target.function.arguments += dc.function.arguments;
-    }
-  });
-  return out;
-}
-function splitInlineThinkTags(content, explicitReasoning, _) {
-  const text = typeof content === "string" ? content : "";
-  let extracted = typeof explicitReasoning === "string" ? explicitReasoning : "";
-  let cleaned = ""; let cursor = 0;
-  while (cursor < text.length) {
-    const openIdx = text.indexOf("<think>", cursor);
-    if (openIdx === -1) { cleaned += text.slice(cursor); break; }
-    cleaned += text.slice(cursor, openIdx);
-    const bodyStart = openIdx + 7; const closeIdx = text.indexOf("</think>", bodyStart);
-    if (closeIdx === -1) { extracted += text.slice(bodyStart); break; }
-    extracted += text.slice(bodyStart, closeIdx); cursor = closeIdx + 8;
+function ensureChatReasoningQuip(msgId) {
+  const q = chatState.reasoningQuip;
+  if (q.msgId !== msgId || !q.text) {
+    const pick = pickRandomReasoningQuip(q.index);
+    q.msgId = msgId; q.index = pick.index; q.text = pick.text;
   }
-  return { reasoning: extracted.trim(), answer: cleaned.replace(/^\n+/, "") };
-}
-function formatChatTurnMetrics(msg) {
-  const parts = [];
-  if (typeof msg.elapsedMs === "number") parts.push(`browser round trip: ${msg.elapsedMs} ms`);
-  if (msg.requestId) parts.push(`req: ${msg.requestId}`);
-  if (msg.usage) {
-    if (typeof msg.usage.prompt_tokens === "number") parts.push(`prompt: ${formatTokenCount(msg.usage.prompt_tokens)}`);
-    if (typeof msg.usage.completion_tokens === "number") parts.push(`gen: ${formatTokenCount(msg.usage.completion_tokens)}`);
-    const cached = msg.usage.prompt_tokens_details && msg.usage.prompt_tokens_details.cached_tokens;
-    if (typeof cached === "number") parts.push(`cached: ${formatTokenCount(cached)}`);
-    const rToks = msg.usage.completion_tokens_details && msg.usage.completion_tokens_details.reasoning_tokens;
-    if (typeof rToks === "number" && rToks > 0) parts.push(`reasoning: ${formatTokenCount(rToks)}`);
+  if (!q.timerId && typeof setInterval === "function") {
+    q.timerId = setInterval(() => {
+      const art = chatEl(`chat-turn-${q.msgId}`);
+      const det = art && typeof art.querySelector === "function" ? art.querySelector("details.md-thinking") : null;
+      if (!det || !det.classList || !det.classList.contains("is-reasoning")) { stopChatReasoningQuip(); return; }
+      const pick = pickRandomReasoningQuip(q.index);
+      q.index = pick.index; q.text = pick.text;
+      const quipEl = det.querySelector(".md-thinking-quip");
+      if (quipEl) quipEl.textContent = ` · ${q.text}`;
+    }, CHAT_REASONING_QUIP_INTERVAL_MS);
   }
-  return parts.length ? `<span class="chat-turn-metrics mono">${escapeHtml(parts.join(" · "))}</span>` : "";
+  return q.text;
+}
+function buildAnsweredToolCallIdSet(msgs) {
+  const answeredIds = new Set();
+  (msgs || []).forEach((m) => { if (m.role === "tool" && m.toolCallId) answeredIds.add(m.toolCallId); });
+  return answeredIds;
+}
+function buildChatThinkingHtml(msg) {
+  const active = isChatMsgActivelyReasoning(msg);
+  const openAttr = isChatReasoningOpen(msg.id) ? " open" : "";
+  const quipText = active ? ensureChatReasoningQuip(msg.id) : "";
+  const quipHtml = quipText ? `<span class="md-thinking-quip"> · ${escapeHtml(quipText)}</span>` : "";
+  return `<details class="md-thinking${active ? " is-reasoning" : ""}" data-thinking-msg-id="${escapeHtml(msg.id)}"${openAttr}><summary class="md-thinking-summary"><span class="md-thinking-title">${active ? "Reasoning" : "Reasoning trace"}</span> <span class="md-thinking-meta mono">(${msg.reasoning.length} chars)</span>${quipHtml}</summary><pre class="md-thinking-pre">${escapeHtml(msg.reasoning)}</pre></details>`;
+}
+function buildAssistantAnswerHtml(msg) {
+  if (msg.isRaw) return `<pre class="probe-raw mono">${escapeHtml(msg.content || "")}</pre>`;
+  if (msg.content) return `<div class="probe-markdown">${renderSmokeProbeMarkdown(msg.content)}</div>`;
+  if (!(msg.toolCalls && msg.toolCalls.length)) {
+    if (msg.isStreaming && !msg.reasoning) return `<div class="panel-sub mono">Streaming…</div>`;
+    if (!msg.isStreaming) return `<div class="panel-sub mono">—</div>`;
+  }
+  return "";
 }
 function renderChatTranscript() {
   const host = chatEl("chat-transcript");
   if (!host) return;
+  const keepTop = !chatState.autoFollowScroll ? (host.scrollTop || 0) : 0;
   const msgs = getActiveChatSession().messages;
   if (!msgs.length) {
     host.innerHTML = `<div class="chat-empty-state"><h3>Local Agent &amp; Chat Workbench</h3>
@@ -450,11 +404,17 @@ function renderChatTranscript() {
         <button type="button" class="btn btn-sm" onclick="applyChatStarterPrompt('Write a clean Swift function with unit tests to parse NDJSON safely.')">Swift NDJSON helper</button>
         <button type="button" class="btn btn-sm" onclick="toggleChatDrawer('system')">Choose System Prompt</button>
       </div></div>`;
+    updateChatScrollToBottomButton();
     return;
   }
-  const answeredIds = new Set();
-  msgs.forEach((m) => { if (m.role === "tool" && m.toolCallId) answeredIds.add(m.toolCallId); });
+  const answeredIds = buildAnsweredToolCallIdSet(msgs);
   host.innerHTML = msgs.map((m, idx) => renderSingleChatTurnHtml(m, idx, msgs.length, answeredIds)).join("");
+  if (!chatState.autoFollowScroll && keepTop > 0) {
+    chatState.ignoreScrollUntil = Date.now() + 80;
+    host.scrollTop = keepTop;
+    chatState.lastTranscriptScrollTop = keepTop;
+  }
+  updateChatScrollToBottomButton();
 }
 function safeChatImageDataUrl(rawUrl) {
   const s = String(rawUrl ?? "").trim();
@@ -488,18 +448,15 @@ function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
       <div class="chat-edit-actions"><button type="button" class="btn btn-primary btn-sm" data-chat-action="save-edit-turn" data-msg-id="${escapeHtml(msg.id)}">Save &amp; Resend</button>
       <button type="button" class="btn btn-sm" data-chat-action="cancel-edit-turn">Cancel</button></div></div>`;
   } else {
-    if (isAssistant && msg.reasoning) {
-      bodyHtml += `<details class="md-thinking"${msg.isStreaming && !msg.content ? " open" : ""}><summary>Reasoning trace (${msg.reasoning.length} chars)</summary><pre>${escapeHtml(msg.reasoning)}</pre></details>`;
-    }
-    if (isAssistant) {
-      if (msg.isRaw) bodyHtml += `<pre class="probe-raw mono">${escapeHtml(msg.content || "")}</pre>`;
-      else if (msg.content) bodyHtml += `<div class="probe-markdown">${renderSmokeProbeMarkdown(msg.content)}</div>`;
-      else if (!msg.toolCalls || !msg.toolCalls.length) bodyHtml += `<div class="panel-sub mono">${msg.isStreaming ? "Streaming…" : "—"}</div>`;
-    } else bodyHtml += `<div class="chat-user-text">${escapeHtml(msg.content || "")}</div>`;
+    if (isAssistant && msg.reasoning) bodyHtml += buildChatThinkingHtml(msg);
+    if (isAssistant) bodyHtml += `<div class="chat-turn-answer">${buildAssistantAnswerHtml(msg)}</div>`;
+    else bodyHtml += `<div class="chat-user-text">${escapeHtml(msg.content || "")}</div>`;
     if (Array.isArray(msg.images) && msg.images.length > 0) {
       bodyHtml += `<div class="chat-turn-images">${msg.images.map((img) => `<img class="chat-turn-thumb" src="${escapeHtml(safeChatImageDataUrl(img.dataUrl))}" alt="${escapeHtml(img.name || "Attached image")}" />`).join("")}</div>`;
     }
-    if (Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0) bodyHtml += msg.toolCalls.map((tc) => renderToolCallCardHtml(msg.id, tc, answeredToolCallIds)).join("");
+    if (Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0) {
+      bodyHtml += `<div class="chat-turn-tools">${msg.toolCalls.map((tc) => renderToolCallCardHtml(msg.id, tc, answeredToolCallIds)).join("")}</div>`;
+    }
     if (msg.error) bodyHtml += `<div class="chat-turn-error">${escapeHtml(msg.error)}</div>`;
   }
   const roleClass = isUser ? "chat-turn-user" : (isTool ? "chat-turn-tool" : "chat-turn-assistant");
@@ -507,22 +464,114 @@ function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
     <div class="chat-turn-head"><div class="chat-turn-role"><span>${escapeHtml(roleLabel)}</span>${jsonBadgeHtml}${formatChatTurnMetrics(msg)}</div><div class="chat-turn-actions">${btns.join("")}</div></div>
     <div class="chat-turn-body">${bodyHtml}</div></article>`;
 }
-function renderToolCallCardHtml(msgId, tc, answeredToolCallIds) {
-  const fnName = tc.function && tc.function.name ? tc.function.name : "tool";
-  let formattedArgs = tc.function && tc.function.arguments ? tc.function.arguments : "{}";
-  try { formattedArgs = JSON.stringify(JSON.parse(formattedArgs), null, 2); } catch (_) {}
-  const callId = tc.id || "call_0";
-  const replyForm = answeredToolCallIds.has(callId)
-    ? `<div class="panel-sub mono">Tool result recorded for ${escapeHtml(callId)}.</div>`
-    : `<div class="chat-tool-reply-form"><label for="tool-out-${escapeHtml(callId)}" class="chat-field-label">Submit Tool Output (<code>role: "tool"</code>)</label>
-        <textarea id="tool-out-${escapeHtml(callId)}" rows="2" class="input chat-textarea mono" placeholder='{"status":"ok"}…'></textarea>
-        <div class="chat-tool-reply-actions">
-          <button type="button" class="btn btn-primary btn-sm" data-chat-action="submit-tool-result" data-msg-id="${escapeHtml(msgId)}" data-call-id="${escapeHtml(callId)}" data-tool-name="${escapeHtml(fnName)}" data-run-continue="true">Send Tool Output &amp; Continue</button>
-          <button type="button" class="btn btn-sm" data-chat-action="submit-tool-result" data-msg-id="${escapeHtml(msgId)}" data-call-id="${escapeHtml(callId)}" data-tool-name="${escapeHtml(fnName)}" data-run-continue="false">Append Only</button>
-        </div></div>`;
-  return `<div class="chat-tool-call-card"><div class="chat-tool-call-head"><strong class="mono">tool_call: ${escapeHtml(fnName)}</strong><span class="knob-pill mono">${escapeHtml(callId)}</span></div><pre class="chat-tool-args mono">${escapeHtml(formattedArgs)}</pre>${replyForm}</div>`;
+function updateStreamingChatTurn(msg, answeredToolCallIds) {
+  const article = msg ? chatEl(`chat-turn-${msg.id}`) : null;
+  if (!article || typeof article.querySelector !== "function" || typeof document === "undefined" || typeof document.createElement !== "function") {
+    renderChatTranscript();
+    return;
+  }
+  const roleRow = article.querySelector(".chat-turn-role");
+  if (roleRow) {
+    const metricsEl = roleRow.querySelector(".chat-turn-metrics");
+    const nextMetricsHtml = formatChatTurnMetrics(msg);
+    if (nextMetricsHtml) {
+      const wrap = document.createElement("div"); wrap.innerHTML = nextMetricsHtml;
+      const fresh = wrap.firstElementChild;
+      if (metricsEl && fresh) metricsEl.textContent = fresh.textContent;
+      else if (fresh) roleRow.appendChild(fresh);
+    } else if (metricsEl) {
+      metricsEl.remove();
+    }
+  }
+  const body = article.querySelector(".chat-turn-body");
+  if (!body) { renderChatTranscript(); return; }
+  const active = isChatMsgActivelyReasoning(msg);
+  let det = body.querySelector("details.md-thinking");
+  if (msg.reasoning) {
+    if (!det) {
+      const wrap = document.createElement("div"); wrap.innerHTML = buildChatThinkingHtml(msg);
+      det = wrap.firstElementChild; if (det) body.insertBefore(det, body.firstChild);
+    } else {
+      det.classList.toggle("is-reasoning", active);
+      const titleEl = det.querySelector(".md-thinking-title"); if (titleEl) titleEl.textContent = active ? "Reasoning" : "Reasoning trace";
+      const metaEl = det.querySelector(".md-thinking-meta"); if (metaEl) metaEl.textContent = `(${msg.reasoning.length} chars)`;
+      const summaryEl = det.querySelector(".md-thinking-summary");
+      let quipEl = det.querySelector(".md-thinking-quip");
+      if (active) {
+        const quipText = ` · ${ensureChatReasoningQuip(msg.id)}`;
+        if (!quipEl && summaryEl) { quipEl = document.createElement("span"); quipEl.className = "md-thinking-quip"; summaryEl.appendChild(quipEl); }
+        if (quipEl) { quipEl.hidden = false; quipEl.textContent = quipText; }
+      } else {
+        stopChatReasoningQuip();
+        if (quipEl) quipEl.remove();
+      }
+      const preEl = det.querySelector(".md-thinking-pre"); if (preEl) preEl.textContent = msg.reasoning;
+    }
+  } else if (!active && chatState.reasoningQuip.msgId === msg.id) {
+    stopChatReasoningQuip();
+  }
+  const answerEl = body.querySelector(".chat-turn-answer");
+  const nextAnswerHtml = buildAssistantAnswerHtml(msg);
+  if (answerEl) { if (answerEl.innerHTML !== nextAnswerHtml) answerEl.innerHTML = nextAnswerHtml; }
+  else { renderChatTranscript(); return; }
+  const answeredIds = answeredToolCallIds || buildAnsweredToolCallIdSet(getActiveChatSession().messages);
+  let toolsEl = body.querySelector(".chat-turn-tools");
+  if (Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0) {
+    const nextToolsHtml = msg.toolCalls.map((tc) => renderToolCallCardHtml(msg.id, tc, answeredIds)).join("");
+    if (!toolsEl) { toolsEl = document.createElement("div"); toolsEl.className = "chat-turn-tools"; body.insertBefore(toolsEl, body.querySelector(".chat-turn-error") || null); }
+    toolsEl.innerHTML = nextToolsHtml;
+  } else if (toolsEl) {
+    toolsEl.remove();
+  }
 }
-function scrollChatTranscriptToBottom() { const h = chatEl("chat-transcript"); if (h) h.scrollTop = h.scrollHeight; }
+function isChatTranscriptNearBottom(el, thresholdPx) { return isTranscriptNearBottom(el, thresholdPx); }
+function updateChatScrollToBottomButton() {
+  const btn = chatEl("chat-scroll-bottom-btn");
+  const h = chatEl("chat-transcript");
+  if (!btn) return;
+  const canScroll = Boolean(h && h.scrollHeight > (h.clientHeight || 0) + 4);
+  const nearBottom = h ? isChatTranscriptNearBottom(h, 48) : true;
+  btn.hidden = !canScroll || chatState.autoFollowScroll || nearBottom;
+}
+function handleChatTranscriptWheel(e) {
+  if (e && typeof e.deltaY === "number" && e.deltaY < 0) {
+    chatState.autoFollowScroll = false;
+    updateChatScrollToBottomButton();
+  }
+}
+function handleChatTranscriptScroll() {
+  const h = chatEl("chat-transcript");
+  if (!h) return;
+  const curTop = h.scrollTop;
+  const nearBottom = isChatTranscriptNearBottom(h, 48);
+  if (!nearBottom && (curTop < chatState.lastTranscriptScrollTop - 0.5 || Date.now() >= chatState.ignoreScrollUntil)) {
+    chatState.autoFollowScroll = false;
+  } else if (nearBottom && Date.now() >= chatState.ignoreScrollUntil) {
+    chatState.autoFollowScroll = true;
+  }
+  chatState.lastTranscriptScrollTop = curTop;
+  updateChatScrollToBottomButton();
+}
+function scrollChatTranscriptToBottom(force) {
+  if (force === true) chatState.autoFollowScroll = true;
+  const h = chatEl("chat-transcript");
+  if (!chatState.autoFollowScroll || !h) { updateChatScrollToBottomButton(); return; }
+  chatState.ignoreScrollUntil = Date.now() + 80;
+  h.scrollTop = h.scrollHeight;
+  chatState.lastTranscriptScrollTop = h.scrollTop;
+  updateChatScrollToBottomButton();
+}
+function bindChatTranscriptListeners() {
+  if (chatState.transcriptListenersBound || typeof document === "undefined") return;
+  const host = chatEl("chat-transcript");
+  if (!host) return;
+  chatState.transcriptListenersBound = true;
+  if (typeof document.addEventListener === "function") document.addEventListener("toggle", handleChatThinkingToggle, true);
+  if (typeof host.addEventListener === "function") {
+    host.addEventListener("scroll", handleChatTranscriptScroll, { passive: true });
+    host.addEventListener("wheel", handleChatTranscriptWheel, { passive: true });
+  }
+}
 function applyChatStarterPrompt(text) { const i = chatEl("chat-input"); if (i) { i.value = text; autoResizeChatInput(i); i.focus(); } }
 function autoResizeChatInput(el) { if (el) { el.style.height = "auto"; el.style.height = `${Math.min(Math.max(el.scrollHeight, 68), 220)}px`; } }
 function handleChatInputKeyDown(e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!chatState.isGenerating) sendChatTurn(); } }
@@ -572,7 +621,10 @@ function renderChatComposerState() {
   if (chatEl("chat-stop-btn")) chatEl("chat-stop-btn").hidden = !chatState.isGenerating;
   if (chatEl("chat-composer-status")) chatEl("chat-composer-status").textContent = chatState.activeStatusLabel || "Ready";
 }
-function stopActiveChatGeneration() { if (chatState.activeAbortController) { chatState.activeAbortController.abort(); chatState.activeAbortController = null; } }
+function stopActiveChatGeneration() {
+  stopChatReasoningQuip();
+  if (chatState.activeAbortController) { chatState.activeAbortController.abort(); chatState.activeAbortController = null; }
+}
 async function sendChatTurn() {
   if (chatState.isGenerating) return;
   const inputEl = chatEl("chat-input"); const text = inputEl ? inputEl.value.trim() : ""; const images = chatState.pendingImages.slice();
@@ -581,7 +633,7 @@ async function sendChatTurn() {
   if (session.messages.length === 0 && (session.title === "New Chat" || session.title === "Untitled Chat") && text) session.title = text.replace(/\s+/g, " ").slice(0, 42);
   session.messages.push({ id: generateChatId("msg"), role: "user", content: text, images, createdAt: Date.now() });
   if (inputEl) { inputEl.value = ""; autoResizeChatInput(inputEl); }
-  chatState.pendingImages = []; commitChatWorkspace(session); scrollChatTranscriptToBottom(); await executeChatCompletion(session, {});
+  chatState.pendingImages = []; commitChatWorkspace(session); scrollChatTranscriptToBottom(true); await executeChatCompletion(session, {});
 }
 function beginEditChatTurn(msgId) {
   if (chatState.isGenerating) return;
@@ -595,7 +647,7 @@ async function saveAndResendChatTurn(msgId) {
   const area = chatEl(`chat-edit-textarea-${msgId}`); const nextText = area ? area.value.trim() : "";
   if (!nextText && (!session.messages[idx].images || !session.messages[idx].images.length)) { notifyChat("Message text cannot be empty.", true); return; }
   session.messages[idx].content = nextText; session.messages = session.messages.slice(0, idx + 1); chatState.editingMsgId = null;
-  commitChatWorkspace(session); scrollChatTranscriptToBottom(); await executeChatCompletion(session, {});
+  commitChatWorkspace(session); scrollChatTranscriptToBottom(true); await executeChatCompletion(session, {});
 }
 async function regenerateChatTurn(msgId) {
   if (chatState.isGenerating) return;
@@ -631,7 +683,7 @@ async function submitToolResultForCall(msgId, toolCallId, toolName, runContinue)
   const idx = session.messages.findIndex((m) => m.id === msgId);
   const toolMsg = { id: generateChatId("msg"), role: "tool", toolCallId, toolName, content: (input ? input.value : "") || "{}", createdAt: Date.now() };
   if (idx !== -1) session.messages.splice(idx + 1, 0, toolMsg); else session.messages.push(toolMsg);
-  commitChatWorkspace(session); scrollChatTranscriptToBottom(); if (runContinue) await executeChatCompletion(session, {});
+  commitChatWorkspace(session); scrollChatTranscriptToBottom(true); if (runContinue) await executeChatCompletion(session, {});
 }
 async function readChatSSEStream(res, assistantMsg, startedAt, acc) {
   const reader = res.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let sawDone = false;
@@ -653,7 +705,7 @@ async function readChatSSEStream(res, assistantMsg, startedAt, acc) {
     const split = splitInlineThinkTags(acc.content, acc.reasoning, true);
     assistantMsg.content = split.answer; assistantMsg.reasoning = split.reasoning; assistantMsg.toolCalls = acc.toolCalls;
     assistantMsg.elapsedMs = Math.round(performance.now() - startedAt);
-    renderChatTranscript(); scrollChatTranscriptToBottom();
+    updateStreamingChatTurn(assistantMsg); scrollChatTranscriptToBottom(false);
   }
   const finalSplit = splitInlineThinkTags(acc.content, acc.reasoning, false);
   assistantMsg.content = finalSplit.answer; assistantMsg.reasoning = finalSplit.reasoning;
@@ -670,7 +722,7 @@ async function executeChatCompletion(session, opts) {
     id: generateChatId("msg"), role: "assistant", content: "", reasoning: "", toolCalls: [], usage: null, isStreaming: true, isRaw: false, createdAt: Date.now()
   };
   if (!isContinue) session.messages.push(assistantMsg); else { assistantMsg.isStreaming = true; assistantMsg.error = ""; }
-  renderChatTranscript(); renderChatComposerState(); scrollChatTranscriptToBottom();
+  renderChatTranscript(); renderChatComposerState(); scrollChatTranscriptToBottom(true);
   const startedAt = performance.now();
   const acc = { content: basePrefix, reasoning: isContinue ? (assistantMsg.reasoning || "") : "", toolCalls: isContinue ? (assistantMsg.toolCalls || []) : [] };
   const reqId = generateChatId("req");
@@ -699,48 +751,10 @@ async function executeChatCompletion(session, opts) {
     if (err && err.name === "AbortError") chatState.activeStatusLabel = "Cancelled by user";
     else { assistantMsg.error = err ? err.message : "Request failed"; chatState.activeStatusLabel = "browser round trip: failed"; notifyChat("Chat request failed: " + assistantMsg.error, true); }
   } finally {
+    stopChatReasoningQuip();
     assistantMsg.isStreaming = false; chatState.isGenerating = false; chatState.activeAbortController = null;
-    commitChatWorkspace(session); scrollChatTranscriptToBottom();
+    commitChatWorkspace(session); scrollChatTranscriptToBottom(false);
   }
-}
-function exportChatSessionMarkdown(session) {
-  const s = session || getActiveChatSession(); const lines = [`# ${s.title || "Untitled Chat"}`];
-  if ((s.systemPrompt || "").trim()) lines.push("", "## System Prompt", "", "```text", s.systemPrompt.trim(), "```");
-  s.messages.forEach((m) => {
-    const label = m.role === "user" ? "User" : (m.role === "tool" ? `Tool (${m.toolName || m.toolCallId || "output"})` : "Assistant");
-    lines.push("", `## ${label}`);
-    if (m.reasoning) lines.push("", "<details><summary>Reasoning</summary>", "", "```text", m.reasoning, "```", "", "</details>");
-    if (m.content) lines.push("", m.content);
-    if (Array.isArray(m.toolCalls) && m.toolCalls.length > 0) lines.push("", "```json", JSON.stringify(m.toolCalls, null, 2), "```");
-  });
-  return lines.join("\n") + "\n";
-}
-function exportActiveChat(format) {
-  const s = getActiveChatSession(); const slug = (s.title || "chat").toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40) || "chat";
-  const isMd = format === "md";
-  const blob = new Blob([isMd ? exportChatSessionMarkdown(s) : JSON.stringify(s, null, 2)], { type: isMd ? "text/markdown" : "application/json" });
-  const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `qwegn-${slug}.${isMd ? "md" : "json"}`; a.click(); URL.revokeObjectURL(url);
-}
-function exportActiveChatJson() { exportActiveChat("json"); }
-function exportActiveChatMarkdown() { exportActiveChat("md"); }
-function openSmokeProbeInChat() {
-  initChatWorkspace();
-  const promptEl = chatEl("probe-prompt"); const maxTokEl = chatEl("probe-max-tokens");
-  const promptText = promptEl ? promptEl.value.trim() : ""; const maxTokVal = maxTokEl ? parseInt(maxTokEl.value, 10) : NaN;
-  const probeRaw = typeof smokeProbeState !== "undefined" && smokeProbeState ? smokeProbeState.rawText || "" : "";
-  const active = getActiveChatSession();
-  const s = createBlankChatSession(promptText ? promptText.replace(/\s+/g, " ").slice(0, 42) : "Smoke Probe Chat", active ? active.presetId : "server-default", active ? active.systemPrompt : "", active ? active.workspacePath : "");
-  if (typeof applyPresetHarnessToSession === "function") applyPresetHarnessToSession(s, s.presetId);
-  if (Number.isFinite(maxTokVal) && maxTokVal > 0) s.params.maxTokens = maxTokVal;
-  if (promptText && probeRaw && !probeRaw.startsWith("Error:")) {
-    const parts = typeof extractSmokeProbeParts === "function" ? extractSmokeProbeParts(probeRaw) : { reasoning: "", answer: probeRaw };
-    s.messages.push({ id: generateChatId("msg"), role: "user", content: promptText, images: [], createdAt: Date.now() });
-    s.messages.push({ id: generateChatId("msg"), role: "assistant", content: parts.answer || probeRaw, reasoning: parts.reasoning || "", toolCalls: [], usage: null, isRaw: false, createdAt: Date.now() });
-  }
-  chatState.sessions.unshift(s); chatState.activeSessionId = s.id; persistChatSessions(); renderChatWorkspace();
-  if (!probeRaw && promptText && chatEl("chat-input")) { chatEl("chat-input").value = promptText; autoResizeChatInput(chatEl("chat-input")); }
-  if (typeof switchTab === "function") switchTab("chat");
-  notifyChat("Opened Smoke Probe conversation in Chat.");
 }
 
 function handleChatActionClick(e) {

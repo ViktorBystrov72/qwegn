@@ -52,6 +52,25 @@ public enum QWPaths {
         rootDirectoryURL.appendingPathComponent("qwg-menu.lock", isDirectory: false).path
     }
 
+    /// Persisted update checker state (`~/.qwg/update-state.json`).
+    public static var updateStateFileURL: URL {
+        let env = ProcessInfo.processInfo.environment
+        if let override = env["QWEGN_UPDATE_STATE_PATH"], !override.isEmpty {
+            return URL(fileURLWithPath: override.expandingTildePath, isDirectory: false)
+        }
+        return rootDirectoryURL.appendingPathComponent("update-state.json", isDirectory: false)
+    }
+
+    /// Staging cache for downloaded & SHA-256 verified `.pkg` installers.
+    public static var updatesCacheDirectoryURL: URL {
+        let env = ProcessInfo.processInfo.environment
+        if let override = env["QWEGN_UPDATES_CACHE_DIR"], !override.isEmpty {
+            return URL(fileURLWithPath: override.expandingTildePath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Caches/Qwegn/updates", isDirectory: true)
+    }
+
     /// Per-user Application Support folder (`~/Library/Application Support/Qwegn`).
     public static var applicationSupportDirectoryURL: URL {
         if let env = ProcessInfo.processInfo.environment["QWEGN_APP_SUPPORT_DIR"], !env.isEmpty {

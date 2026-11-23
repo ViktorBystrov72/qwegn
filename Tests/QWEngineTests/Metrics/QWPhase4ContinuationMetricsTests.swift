@@ -24,7 +24,7 @@ struct QWPhase4ContinuationSample: Codable {
             }
             for (index, pair) in zip(roundProfiles, stepTokenCounts).enumerated() {
                 let (profile, count) = pair
-                guard (1...7).contains(profile.drafts), profile.retainedRows == count,
+                guard (1...15).contains(profile.drafts), profile.retainedRows == count,
                       let accepted = profile.acceptedDrafts, (0...profile.drafts).contains(accepted),
                       count <= accepted + 1,
                       (index == roundProfiles.count - 1 || count == accepted + 1),

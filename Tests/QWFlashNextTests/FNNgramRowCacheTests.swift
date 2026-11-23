@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 final class FNNgramRowCacheTests: XCTestCase {
     /// A row source that counts reads, so a cache hit is observable.

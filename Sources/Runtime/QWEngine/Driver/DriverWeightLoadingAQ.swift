@@ -21,9 +21,11 @@ extension QWEngineDriver.WeightLoader {
     /// The plane for one weight: the incumbent's container, or the family's.
     mutating func planeView(_ name: String, n: Int, k: Int,
                              key: KeyPath<QWQTensorEntry, Int?>,
-                             residentExperts: Int? = nil) throws -> QWTensorValue {
-        if format.isNativeAffine {
-            return try aqPlaneView(name, n: n, k: k)
+                             residentExperts: Int? = nil,
+                             formatOverride: QWWeightFormat? = nil) throws -> QWTensorValue {
+        let effectiveFormat = formatOverride ?? format
+        if effectiveFormat.isNativeAffine {
+            return try aqPlaneView(name, n: n, k: k, formatOverride: effectiveFormat)
         }
         let name = resolveName(name)
         let elems: Int
@@ -34,7 +36,7 @@ extension QWEngineDriver.WeightLoader {
                                                n: n, k: k, residentExperts: residentExperts)
             } else {
                 let rowBytes = residentExperts != nil
-                    ? format.expertDownRowBytes(k: k) : format.rowBytes(k: k)
+                    ? effectiveFormat.expertDownRowBytes(k: k) : effectiveFormat.rowBytes(k: k)
                 elems = (n * rowBytes) / 2
             }
         default:
@@ -108,14 +110,17 @@ extension QWEngineDriver.WeightLoader {
     }
 
     /// The bank's view, carrying the container's own pair and the model's basis.
-    mutating func q4(_ name: String, n: Int, k: Int) throws -> QWWeightView {
-        let blocks = try planeView(name, n: n, k: k, key: \QWQTensorEntry.hq4Off)
+    mutating func q4(_ name: String, n: Int, k: Int,
+                     formatOverride: QWWeightFormat? = nil) throws -> QWWeightView {
+        let effectiveFormat = formatOverride ?? format
+        let blocks = try planeView(name, n: n, k: k, key: \QWQTensorEntry.hq4Off,
+                                   formatOverride: formatOverride)
         let resolved = resolveName(name)
         let entry = try? pk?.entry(resolved)
-        let bits = entry?.hqBits ?? format.bits
-        let groupSize = entry?.hqGroup ?? format.groupSize
-        let isIncumbent = entry?.isIncumbentHQ4 ?? format.denseIsIncumbentContainer
-        let isSHVQ = entry?.isSHVQ ?? format.denseIsSHVQ
+        let bits = entry?.hqBits ?? effectiveFormat.bits
+        let groupSize = entry?.hqGroup ?? effectiveFormat.groupSize
+        let isIncumbent = entry?.isIncumbentHQ4 ?? effectiveFormat.denseIsIncumbentContainer
+        let isSHVQ = entry?.isSHVQ ?? effectiveFormat.denseIsSHVQ
         guard let v = QWWeightView(blocks: blocks, n: n, k: k,
                                     bits: bits, groupSize: groupSize,
                                     isRotated: hl.weightBasis.rotatesActivations,
@@ -137,10 +142,13 @@ extension QWEngineDriver.WeightLoader {
     // MARK: - the family's repack
 
     /// The family's plane: the checkpoint's own bytes, repacked on the GPU.
-    mutating func aqPlaneView(_ name: String, n: Int, k: Int) throws -> QWTensorValue {
-        let elems = (n * format.rowBytes(k: k)) / 2
+    mutating func aqPlaneView(_ name: String, n: Int, k: Int,
+                              formatOverride: QWWeightFormat? = nil) throws -> QWTensorValue {
+        let effectiveFormat = formatOverride ?? format
+        let elems = (n * effectiveFormat.rowBytes(k: k)) / 2
         let t = try allocateWeight(QWTensorShape([elems], .f16))
         try repackSafetensorsToAQ(name, n: n, k: k,
+                                  bits: effectiveFormat.bits, group: effectiveFormat.groupSize,
                                   into: t.region.buffer, dstByteOffset: t.region.base + t.offset)
         return t
     }
@@ -170,6 +178,7 @@ extension QWEngineDriver.WeightLoader {
     /// The repack itself is QWLoad's door — the one both engines use — and
     /// this is the driver's name resolution and the model's own pair.
     func repackSafetensorsToAQ(_ name: String, n: Int, k: Int,
+                                bits: Int? = nil, group: Int? = nil,
                                 into dstBuffer: any MTLBuffer, dstByteOffset: Int) throws {
         guard let st else {
             throw QWEngineDriverError.weightMissing(name, "the family is a safetensors route only")
@@ -178,7 +187,7 @@ extension QWEngineDriver.WeightLoader {
         do {
             try QWAQRepacker.repackMLXAffine(hal: hl, container: st, name: resolved,
                                              rows: n, cols: k,
-                                             bits: format.bits, group: format.groupSize,
+                                             bits: bits ?? format.bits, group: group ?? format.groupSize,
                                              into: dstBuffer, dstByteOffset: dstByteOffset)
         } catch let e as QWAQRepacker.RepackError {
             throw QWEngineDriverError.weightMissing(name, e.description)

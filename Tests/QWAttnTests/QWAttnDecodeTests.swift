@@ -298,4 +298,29 @@ final class QWAttnDecodeTests: XCTestCase {
             XCTAssertEqual(v.violations, 0, "splits=\(sp): parity (worst \(v.worstAbs) @\(v.worstIdx))")
         }
     }
+
+    func testOccupancyAwareSplits() {
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 262_144), 64)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 524_288), 128)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 1_048_576), 256)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 128), 8)
+
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 0, kvHeads: 4, gpuCores: 40), 8)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 1, kvHeads: 4, gpuCores: 40), 8)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 256, kvHeads: 2, gpuCores: 40), 8)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 257, kvHeads: 4, gpuCores: 40), 8)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 512, kvHeads: 2, gpuCores: 40), 8)
+
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 6102, kvHeads: 2, gpuCores: 40), 20)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 6102, kvHeads: 4, gpuCores: 40), 20)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 2048, kvHeads: 4, gpuCores: 40), 10)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 2048, kvHeads: 2, gpuCores: 40), 20)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 6400, kvHeads: 4, gpuCores: 40), 20)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 6656, kvHeads: 4, gpuCores: 40), 30)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 16_384, kvHeads: 2, gpuCores: 40), 60)
+
+        XCTAssertLessThanOrEqual(QWAttnDecode.splits(forKeys: 262_144, kvHeads: 4, gpuCores: 40), QWAttnDecode.maxSplits)
+        XCTAssertLessThanOrEqual(QWAttnDecode.splits(forKeys: 1_048_576, kvHeads: 4, gpuCores: 40), QWAttnDecode.maxLongContextSplits)
+        XCTAssertEqual(QWAttnDecode.splits(forKeys: 6102, kvHeads: 4, gpuCores: 32), 24)
+    }
 }

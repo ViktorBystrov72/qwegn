@@ -22,9 +22,9 @@ let targetPaths: [String: String] = [
     "QWAttn": "Sources/Operators/QWAttn",
     "QWGDN": "Sources/Operators/QWGDN",
     "QWMLP": "Sources/Operators/QWMLP",
+    "QWHyperPLE": "Sources/Operators/QWHyperPLE",
     "QWHead": "Sources/Operators/QWHead",
     // Subsystems (L4–L6)
-    "QWFlashNext": "Sources/Subsystems/QWFlashNext",
     "QWMTP": "Sources/Subsystems/QWMTP",
     "QWToken": "Sources/Subsystems/QWToken",
     "QWVision": "Sources/Subsystems/QWVision",
@@ -32,6 +32,8 @@ let targetPaths: [String: String] = [
     // Runtime (L7)
     "QWEngine": "Sources/Runtime/QWEngine",
     // Apps (L7.5–L8.5)
+    "QWSMCHelper": "Sources/Apps/QWSMCHelper",
+    "qwg-smc-helper": "Sources/Apps/QWSMCHelperEntry",
     "QWCli": "Sources/Apps/QWCli",
     "QWServer": "Sources/Apps/QWServer",
     "qwg": "Sources/Apps/qwg",
@@ -65,8 +67,6 @@ let components: [(String, String)] = [
     ("QWCli", "QWCliTests"),
     ("QWServer", "QWServerTests"),
     ("QWMenuBarUI", "QWMenuBarTests"),
-    // FlashNext (qwen4_exp_text) CPU reference + goldens; depends on QWCore only.
-    ("QWFlashNext", "QWFlashNextTests"),
 ]
 
 var targets: [Target] = [
@@ -91,6 +91,7 @@ var targets: [Target] = [
     T("QWAttn", ["QWCore", "QWHAL", "QWAlloc", "QWQuant", "QWGEMM", "QWKV", "QWRope"]),
     T("QWGDN", ["QWCore", "QWHAL", "QWAlloc", "QWGEMM"]),
     T("QWMLP", ["QWCore", "QWAlloc", "QWGEMM"]),
+    T("QWHyperPLE", ["QWCore", "QWQuant", "QWHAL", "QWAlloc", "QWLoad", "QWGEMM"]),
     T("QWVision", ["QWCore", "QWHAL", "QWAlloc", "QWGEMM", "QWQuant"]),
     // Layer 5
     T("QWHead", ["QWCore", "QWHAL", "QWAlloc", "QWGEMM"]),
@@ -101,19 +102,18 @@ var targets: [Target] = [
     T("QWMTP", ["QWCore", "QWQuant", "QWHAL", "QWAlloc", "QWGEMM", "QWNorm", "QWRope", "QWKV", "QWAttn", "QWMLP", "QWHead", "QWLoad"]),
     T("QWMM", ["QWCore", "QWHAL", "QWAlloc", "QWToken", "QWVision"]),
     // Layer 7
-    // The module registry maps a family to the module that serves it, so the
-    // runtime sees Flash-Next's adapter. Acyclic: QWFlashNext depends on
-    // QWLoad, which depends only on QWCore/QWHAL/QWQuant.
     T("QWEngine", ["QWCore", "QWHAL", "QWAlloc", "QWGEMM", "QWNorm", "QWRope",
-                   "QWKV", "QWAttn", "QWGDN", "QWMLP", "QWHead", "QWMTP",
+                   "QWKV", "QWAttn", "QWGDN", "QWMLP", "QWHyperPLE", "QWHead", "QWMTP",
                    "QWQuant", "QWVision", "QWMM", "QWMetalCounterSupport",
-                   "QWLoad", "QWFlashNext"]),
+                   "QWLoad"]),
+    // Layer 0.5 — Shared AppleSMC IOKit client & LaunchDaemon helper protocol (zero engine deps).
+    T("QWSMCHelper"),
     // Layer 7.5 — C22 CLI logic (library; needs pack format, KV types, geometry).
     T("QWCli", ["QWCore", "QWQuant", "QWKV"]),
     // Layer 7.8 — Server logic (library; HTTP 1.1 + SSE + OpenAI/Ollama schemas + lifecycle actor).
     .target(name: "QWServer",
             dependencies: ["QWCore", "QWHAL", "QWQuant", "QWKV", "QWToken", "QWVision", "QWMM",
-                           "QWMTP", "QWEngine", "QWCli", "QWHead",
+                           "QWMTP", "QWEngine", "QWCli", "QWHead", "QWSMCHelper",
                            .product(name: "Jinja", package: "swift-jinja")],
             path: targetPaths["QWServer"],
             resources: [
@@ -123,14 +123,18 @@ var targets: [Target] = [
                 .copy("Resources/js"),
             ],
             swiftSettings: swiftWarningsAsErrors),
-    // Layer 8 — CLI.
+    // Layer 8 — CLI & minimal privileged SMC fan helper daemon.
     .executableTarget(name: "qwg",
-                      dependencies: ["QWCore", "QWMTP", "QWEngine", "QWToken", "QWCli", "QWKV", "QWServer",
+                      dependencies: ["QWCore", "QWMTP", "QWEngine", "QWToken", "QWCli", "QWKV", "QWServer", "QWSMCHelper",
                                      .product(name: "ArgumentParser", package: "swift-argument-parser")],
                       path: targetPaths["qwg"],
                       swiftSettings: swiftWarningsAsErrors),
+    .executableTarget(name: "qwg-smc-helper",
+                      dependencies: ["QWSMCHelper"],
+                      path: targetPaths["qwg-smc-helper"],
+                      swiftSettings: swiftWarningsAsErrors),
     // Layer 8.5 — Native macOS Menu Bar Controller library + thin entrypoint.
-    T("QWMenuBarUI", ["QWCore", "QWHAL", "QWQuant", "QWKV", "QWToken", "QWServer"]),
+    T("QWMenuBarUI", ["QWCore", "QWHAL", "QWQuant", "QWKV", "QWToken", "QWServer", "QWSMCHelper"]),
     .executableTarget(name: "qwg-menu",
                       dependencies: ["QWMenuBarUI"],
                       path: targetPaths["qwg-menu"],
@@ -151,7 +155,6 @@ var targets: [Target] = [
     // soak and the CPU-only reference soak. One schema, one producer.
     .executableTarget(name: "m1", dependencies: ["QWCore", "QWEngine", "QWToken", "QWQuant", "QWCli"],
                       path: "Scripts/m1", swiftSettings: swiftWarningsAsErrors),
-    T("QWFlashNext", ["QWCore", "QWQuant", "QWHAL", "QWAlloc", "QWGEMM", "QWGDN", "QWHead", "QWMTP", "QWLoad", "QWRope"]),
     .target(name: "QWMetalCounterSupport", path: targetPaths["QWMetalCounterSupport"],
             publicHeadersPath: "include"),
 ]
@@ -164,7 +167,7 @@ for (mod, test) in components {
     // QWMMTests parses golden JSON via the C17 value model.
     if mod == "QWMM" { deps.append(contentsOf: [.byName(name: "QWToken"), .byName(name: "QWVision")]) }
     // QWEngineTests binds planning laws and C19 plans without upward app edges.
-    if mod == "QWEngine" { deps.append(contentsOf: [.byName(name: "QWMM"), .byName(name: "QWToken"), .byName(name: "QWGEMM"), .byName(name: "QWFlashNext"), .byName(name: "QWVision")]) }
+    if mod == "QWEngine" { deps.append(contentsOf: [.byName(name: "QWMM"), .byName(name: "QWToken"), .byName(name: "QWGEMM"), .byName(name: "QWHyperPLE"), .byName(name: "QWVision")]) }
     if mod == "QWKV" { deps.append(contentsOf: [.byName(name: "QWCore"), .byName(name: "QWHAL"), .byName(name: "QWAlloc")]) }
     // QWLoadTests race the mover against legacy bytes using lower-layer helpers only.
     if mod == "QWLoad" { deps.append(contentsOf: [.byName(name: "QWQuant"), .byName(name: "QWHAL")]) }
@@ -183,12 +186,12 @@ for (mod, test) in components {
         deps.append(.byName(name: "QWServer"))
         deps.append(.product(name: "ArgumentParser", package: "swift-argument-parser"))
     }
-    if mod == "QWServer" { deps.append(contentsOf: [.byName(name: "QWEngine"), .byName(name: "QWToken"), .byName(name: "QWMM"), .byName(name: "QWVision"), .byName(name: "QWCli")]) }
+    if mod == "QWServer" { deps.append(contentsOf: [.byName(name: "QWEngine"), .byName(name: "QWToken"), .byName(name: "QWMM"), .byName(name: "QWVision"), .byName(name: "QWCli"), .byName(name: "QWSMCHelper")]) }
     if mod == "QWMenuBarUI" { deps.append(.byName(name: "QWServer")) }
     // Fixture dirs are read from the SOURCE tree via #filePath — declaring
     // them as resources would copy (and duplicate) big golden blobs, so
     // exclude them explicitly (silences the unhandled-file warnings).
-    let excl: [String] = (mod == "QWQuant" || mod == "QWCli" || mod == "QWFlashNext") ? ["fixtures"]
+    let excl: [String] = (mod == "QWQuant" || mod == "QWCli") ? ["fixtures"]
         : (mod == "QWEngine" || mod == "QWCore" ? ["Fixtures"] : [])
     targets.append(.testTarget(name: test, dependencies: deps, exclude: excl, swiftSettings: swiftWarningsAsErrors))
 }
@@ -200,12 +203,20 @@ targets.append(.testTarget(
     path: "Tests/QWStateTests",
     swiftSettings: swiftWarningsAsErrors))
 
+// FlashNext CPU reference + goldens; reads fixtures from source tree via #filePath.
+targets.append(.testTarget(
+    name: "QWFlashNextTests",
+    dependencies: ["QWHyperPLE", "QWAttn", "QWEngine", "QWMTP", "QWCore", "QWQuant",
+                   "QWHAL", "QWAlloc", "QWGEMM", "QWGDN", "QWRope"],
+    path: "Tests/QWFlashNextTests",
+    exclude: ["fixtures"],
+    swiftSettings: swiftWarningsAsErrors))
+
 // FlashNext Metal (GPU) goldens: the dense HQ4 kernels driven on FlashNext expert weights.
 targets.append(.testTarget(
     name: "QWFlashNextMetalTests",
-    dependencies: [.byName(name: "QWFlashNext"), .byName(name: "QWMTP"), .byName(name: "QWCore"), .byName(name: "QWQuant"),
-                   .byName(name: "QWHAL"), .byName(name: "QWAlloc"), .byName(name: "QWGEMM"),
-                   .byName(name: "QWGDN"), .byName(name: "QWRope")],
+    dependencies: ["QWHyperPLE", "QWAttn", "QWEngine", "QWMTP", "QWCore", "QWQuant",
+                   "QWHAL", "QWAlloc", "QWGEMM", "QWGDN", "QWRope"],
     path: "Tests/QWFlashNextMetalTests",
     swiftSettings: swiftWarningsAsErrors))
 

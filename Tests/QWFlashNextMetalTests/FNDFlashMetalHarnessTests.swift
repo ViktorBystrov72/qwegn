@@ -9,7 +9,7 @@ import QWGEMM
 import QWHAL
 import QWMTP
 import QWQuant
-@testable import QWFlashNext
+@testable import QWEngine
 
 final class FNDFlashMetalHarnessTests: XCTestCase {
     private static func makeDescriptor(hidden: Int = 256, numLayers: Int = 4) -> QWModelDescriptor {

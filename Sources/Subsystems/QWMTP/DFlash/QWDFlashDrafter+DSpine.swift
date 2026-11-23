@@ -268,7 +268,7 @@ extension QWDFlashDrafter {
         bw: DSpineBridgeWeights,
         bs: DSpineBridgeScratch,
         stochastic: Bool
-    ) {
+    ) throws {
         let H = config.hiddenSize
         let C = config.bridgeCodeSize
         let R = config.bridgeRank
@@ -320,6 +320,8 @@ extension QWDFlashDrafter {
             enc.setComputePipelineState(dspinePSO.psoRefineScores)
             hTensor.bind(enc, index: 0)
             bs.refineNorm.bind(enc, index: 1)
+        case .bf16:
+            throw QWDFlashError.state("DSpine refine scores do not support raw .bf16 headStorage")
         case .q4g(let hw):
             if hw.view.isSHVQ {
                 headMode = 0x8000_0000 | UInt32(hw.view.bits) | (UInt32(hw.view.groupSize) << 8)

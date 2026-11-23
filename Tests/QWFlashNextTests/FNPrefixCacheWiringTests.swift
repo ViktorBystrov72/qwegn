@@ -1,20 +1,21 @@
 import XCTest
-@testable import QWFlashNext
+@testable import QWEngine
 
-/// The Flash-Next prefix cache's wiring: the RAM answers while it has
+/// The HyperStream prefix cache's wiring: the RAM answers while it has
 /// room, the disk answers the rest, and neither tier is advertised
 /// without the plumbing that feeds it.
 final class FNPrefixCacheWiringTests: XCTestCase {
     private static let cacheSources = [
-        "Sources/Subsystems/QWFlashNext/GPU/FNPrefixCache.swift",
-        "Sources/Subsystems/QWFlashNext/GPU/FNPrefixCache+Save.swift",
+        "Sources/Runtime/QWEngine/Driver/HyperStream/FNPrefixCache.swift",
+        "Sources/Runtime/QWEngine/Driver/HyperStream/FNPrefixCache+Save.swift",
     ]
     private static let engineSources = [
-        "Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift",
-        "Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine+Seam.swift",
+        "Sources/Runtime/QWEngine/Driver/HyperStream/QWHyperStreamRuntime.swift",
+        "Sources/Runtime/QWEngine/Driver/HyperStream/QWHyperStreamRuntime+Seam.swift",
     ]
-    private static let moduleSource = "Sources/Runtime/QWEngine/Module/FlashNextModule.swift"
-    private static let generationSource = "Sources/Runtime/QWEngine/Module/FlashNextGeneration.swift"
+    private static let moduleSource = "Sources/Runtime/QWEngine/Module/DenseModule.swift"
+    private static let generationSource = "Sources/Runtime/QWEngine/Driver/HyperStream/QWHyperStreamRuntime+Generation.swift"
+    private static let conformanceSource = "Sources/Runtime/QWEngine/Generation/QWEngineDriverConformance.swift"
 
     /// The source of a file (or split family of files), read from the package root.
     private static func read(_ relativePaths: [String]) throws -> String {
@@ -69,7 +70,7 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     /// The tier is the one that served the prefix. The name is not
     /// written down where the engine can be.
     func testTheTierIsNotAWrittenDownName() throws {
-        for path in [Self.moduleSource, Self.generationSource] {
+        for path in [Self.moduleSource, Self.generationSource, Self.conformanceSource] {
             let source = try Self.read(path)
             XCTAssertFalse(source.contains("\"cold_ssd\""),
                            "\(path) writes the tier down instead of reporting the one that served it")
@@ -124,11 +125,14 @@ final class FNPrefixCacheWiringTests: XCTestCase {
     }
 
     func testSerialMountCanReuseDFlashPrefixCacheWhileDFlashRequiresBlob() throws {
-        let restoreSource = try Self.read("Sources/Subsystems/QWFlashNext/GPU/FNPrefixCache.swift")
+        XCTAssertEqual(QWHyperStreamRuntime.FNPrefixHeader.version, 2,
+                       "FNPrefixHeader.version must be bumped to 2 for unified HyperStream runtime")
+
+        let restoreSource = try Self.read("Sources/Runtime/QWEngine/Driver/HyperStream/FNPrefixCache.swift")
         XCTAssertTrue(restoreSource.contains("(!wantDFlash || fileHasDFlash)"),
                       "serial mounts (wantDFlash == false) must accept DFlash-enabled .qwcache")
 
-        let mountSource = try Self.read("Sources/Subsystems/QWFlashNext/GPU/FNPrefixCache+Save.swift")
+        let mountSource = try Self.read("Sources/Runtime/QWEngine/Driver/HyperStream/FNPrefixCache+Save.swift")
         XCTAssertTrue(mountSource.contains("rebuild with qwg index --mtp-backend dflash2"),
                       "DFlash mount failure should direct users to qwg index --mtp-backend dflash2")
         XCTAssertTrue(mountSource.contains("if fileHasDFlash, let dflash = self.dflash"),

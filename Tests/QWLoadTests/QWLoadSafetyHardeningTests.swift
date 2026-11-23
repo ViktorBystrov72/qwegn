@@ -83,4 +83,11 @@ final class QWLoadSafetyHardeningTests: XCTestCase {
         XCTAssertThrowsError(try QWAQRepacker.layout(container: st, name: "w.weight", rows: 2, cols: 0))
         XCTAssertThrowsError(try QWAQRepacker.layout(container: st, name: "w.weight", rows: 0, cols: 32))
     }
+
+    func testNormGammaShiftLaw() {
+        XCTAssertEqual(QWCheckpointTensorLoader.normGammaShift(normGammaIsPlusOne: true, isMLXCheckpoint: false), 0.0)
+        XCTAssertEqual(QWCheckpointTensorLoader.normGammaShift(normGammaIsPlusOne: true, isMLXCheckpoint: true), 1.0)
+        XCTAssertEqual(QWCheckpointTensorLoader.normGammaShift(normGammaIsPlusOne: false, isMLXCheckpoint: false), 1.0)
+        XCTAssertEqual(QWCheckpointTensorLoader.normGammaShift(normGammaIsPlusOne: false, isMLXCheckpoint: true), 1.0)
+    }
 }

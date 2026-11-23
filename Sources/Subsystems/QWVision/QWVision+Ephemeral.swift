@@ -67,6 +67,7 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     private var resolvedConfig: QWVisionConfig
     private var metalBackend: QWVisionMetalBackend?
     private var residentWeights: QWVisionWeights?
+    private var inkling2Weights: QWInkling2VisionWeights?
     private var keepResidentFlag: Bool = false
     private var allowOnDemandFlag: Bool = true
 
@@ -75,7 +76,7 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     }
 
     public var isLoaded: Bool {
-        lock.withLock { metalBackend != nil || residentWeights != nil }
+        lock.withLock { metalBackend != nil || residentWeights != nil || inkling2Weights != nil }
     }
 
     public var keepResident: Bool {
@@ -87,11 +88,17 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     }
 
     public var isVisionEnabled: Bool {
-        lock.withLock { keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil }
+        lock.withLock {
+            keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil || inkling2Weights != nil
+        }
     }
 
     public var residentBytes: Int {
-        lock.withLock { (metalBackend?.residentBytes ?? 0) + (residentWeights?.residentBytes ?? 0) }
+        lock.withLock {
+            (metalBackend?.residentBytes ?? 0)
+                + (residentWeights?.residentBytes ?? 0)
+                + (inkling2Weights?.residentBytes ?? 0)
+        }
     }
 
     public init(
@@ -171,6 +178,19 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
               cfg.numPosEmbeds > 0, cfg.posSide * cfg.posSide == cfg.numPosEmbeds else {
             throw QWVisionError.badLayout("vision config incomplete or invalid")
         }
+        if cfg.architecture == .inkling2 {
+            guard ck.has("embeddings.patch_embedding.weight"),
+                  ck.has("embeddings.position_embedding"),
+                  ck.has("embeddings.class_embedding"),
+                  ck.has("embeddings.cls_position_embedding"),
+                  ck.has("pre_layernorm.weight"),
+                  ck.has("layers.0.layernorm_before.weight"),
+                  ck.has("proj_in.weight"),
+                  ck.has("proj_out.weight") else {
+                throw QWVisionError.missingTensor("inkling2 vision tensors missing")
+            }
+            return
+        }
         guard ck.shape("pos_embed.weight") == [cfg.numPosEmbeds, cfg.dim] else {
             throw QWVisionError.missingTensor("pos_embed.weight")
         }
@@ -189,6 +209,17 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         }
     }
 
+    private func makeInkling2WeightsLocked() throws -> QWInkling2VisionWeights {
+        switch source {
+        case .pack(let packPath):
+            return try QWInkling2VisionWeights(checkpoint: try QWVisionCheckpoint(pack: packPath))
+        case .directory(let dir):
+            return try QWInkling2VisionWeights(checkpoint: try QWVisionCheckpoint(dir: dir))
+        case .custom:
+            throw QWVisionError.badLayout("custom builder unsupported for inkling2 vision")
+        }
+    }
+
     private func loadCPUWeightsFromSource() throws -> QWVisionWeights {
         switch source {
         case .pack(let packPath):
@@ -201,7 +232,13 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     }
 
     private func loadResidentLocked() throws {
-        if metalBackend != nil || residentWeights != nil {
+        if metalBackend != nil || residentWeights != nil || inkling2Weights != nil {
+            return
+        }
+        if resolvedConfig.architecture == .inkling2 {
+            let loaded = try makeInkling2WeightsLocked()
+            resolvedConfig = loaded.config
+            inkling2Weights = loaded
             return
         }
         let forceCPU = ProcessInfo.processInfo.environment["QWG_VISION_CPU"] == "1"
@@ -248,6 +285,7 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     private func unloadLocked() {
         metalBackend = nil
         residentWeights = nil
+        inkling2Weights = nil
     }
 
     public func setVisionLoaded(_ loaded: Bool) throws {
@@ -264,7 +302,7 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     public func prepareForPrompt(hasImages: Bool) throws {
         try lock.withLock {
             if hasImages {
-                guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil else {
+                guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil || inkling2Weights != nil else {
                     throw QWVisionError.badLayout(
                         "Vision tower is disabled in Model Settings (enable 'Load Vision Tower' in Settings → Model)"
                     )
@@ -295,12 +333,22 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         enum EngineSelection {
             case metal(QWVisionMetalBackend)
             case cpu(QWVisionWeights)
+            case inkling2(QWInkling2VisionWeights)
         }
         let selection: EngineSelection = try lock.withLock {
-            guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil else {
+            guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil || inkling2Weights != nil else {
                 throw QWVisionError.badLayout(
                     "Vision tower is disabled in Model Settings (enable 'Load Vision Tower' in Settings → Model)"
                 )
+            }
+            if resolvedConfig.architecture == .inkling2 {
+                if inkling2Weights == nil {
+                    inkling2Weights = try makeInkling2WeightsLocked()
+                }
+                guard let iw = inkling2Weights else {
+                    throw QWVisionError.badLayout("Inkling-2 vision weights failed to load")
+                }
+                return .inkling2(iw)
             }
             if forceCPU {
                 if let existing = residentWeights {
@@ -327,6 +375,8 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
             return try metal.encodeSync(patches: patches, grid: grid, bins: bins, posIds: posIds)
         case .cpu(let weights):
             return QWVisionRef(weights: weights).encode(patches: patches, plan: grid, bins: bins, posIds: posIds)
+        case .inkling2(let iw):
+            return QWInkling2VisionRef(weights: iw).encode(patches: patches, plan: grid, bins: bins, posIds: posIds)
         }
     }
 

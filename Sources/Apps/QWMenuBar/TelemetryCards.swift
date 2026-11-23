@@ -31,12 +31,38 @@ extension CupertinoTelemetryView {
                     Text("Qwegn")
                         .font(TelemetryTheme.ui(13, .semibold))
                         .foregroundStyle(TelemetryTheme.primary(increasedContrast: contrast == .increased))
-                    Text("v\(telemetry.engineVersion)")
-                        .font(TelemetryTheme.numeric(11, .medium))
-                        .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+                    Button {
+                        onOpenUpdates(false)
+                    } label: {
+                        Text("v\(telemetry.engineVersion)")
+                            .font(TelemetryTheme.numeric(11, .medium))
+                            .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Check for updates")
                     Text(":\(telemetry.serverPortString)")
                         .font(TelemetryTheme.numeric(11))
                         .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                    if telemetry.updater.shouldShowBadge {
+                        Button {
+                            onOpenUpdates(false)
+                        } label: {
+                            Text(telemetry.updater.badgeText)
+                                .font(TelemetryTheme.numeric(9.5, .semibold))
+                                .foregroundStyle(TelemetryTheme.accent)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1.5)
+                                .background(TelemetryTheme.accent.opacity(0.14))
+                                .clipShape(Capsule())
+                                .overlay(
+                                    Capsule()
+                                        .stroke(TelemetryTheme.accent.opacity(0.35), lineWidth: 0.6)
+                                )
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open Software Update window")
+                    }
                 }
 
                 HStack(spacing: 5) {
@@ -295,9 +321,9 @@ extension CupertinoTelemetryView {
 
         return VStack(spacing: 0) {
             HStack(spacing: 0) {
-                heroMetricColumn(title: "Decode", card: decodeCard, tint: TelemetryTheme.accent)
+                heroMetricColumn(title: "Decode", card: decodeCard, tint: TelemetryTheme.accent, valueTemplate: "999.9")
                 verticalHairline
-                heroMetricColumn(title: "Prefill", card: prefillCard, tint: TelemetryTheme.prefill)
+                heroMetricColumn(title: "Prefill", card: prefillCard, tint: TelemetryTheme.prefill, valueTemplate: "9999.9")
             }
             .padding(.vertical, 10)
 
@@ -316,7 +342,7 @@ extension CupertinoTelemetryView {
             HStack(spacing: 0) {
                 inlineMetricCell(
                     label: "TTFT",
-                    valueText: formattedCardValue(ttftCard),
+                    valueText: formattedCardValue(ttftCard, minValueWidth: 4),
                     isAvailable: ttftCard?.value != nil,
                     tint: TelemetryTheme.cool,
                     help: ttftCard?.reason
@@ -332,7 +358,7 @@ extension CupertinoTelemetryView {
                 verticalHairline
                 inlineMetricCell(
                     label: "Eng GPU",
-                    valueText: formattedCardValue(engGpuCard),
+                    valueText: formattedCardValue(engGpuCard, minValueWidth: 5),
                     isAvailable: engGpuCard?.value != nil,
                     tint: TelemetryTheme.accent,
                     help: engGpuCard?.reason
@@ -392,7 +418,7 @@ extension CupertinoTelemetryView {
             HStack(spacing: 0) {
                 inlineMetricCell(
                     label: "Engine RAM",
-                    valueText: formattedCardValue(engineMemCard),
+                    valueText: formattedCardValue(engineMemCard, minValueWidth: 6),
                     isAvailable: engineMemCard?.value != nil,
                     tint: TelemetryTheme.highlight,
                     help: engineMemoryHelp(arena: arenaCard, resident: residentCard)
@@ -402,7 +428,7 @@ extension CupertinoTelemetryView {
                     verticalHairline
                     inlineMetricCell(
                         label: "Warm RAM",
-                        valueText: formattedCardValue(warmCard),
+                        valueText: formattedCardValue(warmCard, minValueWidth: 5),
                         isAvailable: warmCard?.value != nil,
                         tint: TelemetryTheme.cool,
                         help: warmCard?.reason
@@ -410,7 +436,7 @@ extension CupertinoTelemetryView {
                     verticalHairline
                     inlineMetricCell(
                         label: "SSD Cache",
-                        valueText: formattedCardValue(ssdCard),
+                        valueText: formattedCardValue(ssdCard, minValueWidth: 5),
                         isAvailable: ssdCard?.value != nil,
                         tint: TelemetryTheme.highlight,
                         help: ssdCard?.reason
@@ -427,7 +453,7 @@ extension CupertinoTelemetryView {
                     verticalHairline
                     inlineMetricCell(
                         label: "Weights",
-                        valueText: formattedCardValue(residentCard),
+                        valueText: formattedCardValue(residentCard, minValueWidth: 6),
                         isAvailable: residentCard?.value != nil,
                         tint: TelemetryTheme.cool,
                         help: residentCard?.reason
@@ -457,7 +483,7 @@ extension CupertinoTelemetryView {
             HStack(spacing: 0) {
                 inlineMetricCell(
                     label: "GPU Temp",
-                    valueText: formattedCardValue(gpuTempCard),
+                    valueText: formattedCardValue(gpuTempCard, minValueWidth: 5),
                     isAvailable: gpuTempCard?.value != nil,
                     tint: tempTint(gpuTempCard),
                     help: gpuTempCard?.reason ?? "AppleSMC GPU hotspot temperature"
@@ -465,7 +491,7 @@ extension CupertinoTelemetryView {
                 verticalHairline
                 inlineMetricCell(
                     label: "Fans",
-                    valueText: formattedCardValue(fanCard),
+                    valueText: formattedCardValue(fanCard, minValueWidth: 4),
                     isAvailable: fanCard?.value != nil,
                     tint: TelemetryTheme.cool,
                     help: fanCard?.reason ?? telemetry.dashboard?.facts?.fanControlStatus ?? "Cooling fan speed"
@@ -473,7 +499,7 @@ extension CupertinoTelemetryView {
                 verticalHairline
                 inlineMetricCell(
                     label: "Power",
-                    valueText: formattedCardValue(powerCard),
+                    valueText: formattedCardValue(powerCard, minValueWidth: 5),
                     isAvailable: powerCard?.value != nil,
                     tint: TelemetryTheme.secondary(increasedContrast: contrast == .increased),
                     help: powerCard?.reason ?? "AppleSMC system power draw"
@@ -548,7 +574,7 @@ extension CupertinoTelemetryView {
                     .tracking(0.4)
                     .foregroundStyle(TelemetryTheme.prefill)
                 Spacer(minLength: 4)
-                Text("\(progValue) / \(totalText) · \(pct)%")
+                Text("\(progValue) / \(totalText) · \(String(format: "%3d%%", pct))")
                     .font(TelemetryTheme.numeric(11, .medium))
                     .foregroundStyle(TelemetryTheme.secondary(increasedContrast: contrast == .increased))
                     .lineLimit(1)

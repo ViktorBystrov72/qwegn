@@ -148,11 +148,11 @@ extension QWCacheDiskManager {
         onBeforeWrite: ((Int) -> Void)? = nil
     ) throws -> (metadata: StoredMetadata, totalBytes: Int)? {
         func collectPlaneSizes(_ cache: QWKVCache, _ prefix: QWKVSharedPrefix) throws -> [Int] {
-            var counts: [Int: Int] = [:]
+            var counts = [Int](repeating: 0, count: cache.layerSlidingWindows.count * 2)
             try cache.withSharedPrefixPagePointers(prefix) { planeIdx, _, _, byteCount in
-                counts[planeIdx, default: 0] += byteCount
+                if planeIdx < counts.count { counts[planeIdx] += byteCount }
             }
-            return (0..<counts.count).map { counts[$0] ?? 0 }
+            return counts
         }
         let trunkPlaneSizes = try collectPlaneSizes(kvCache, trunk)
         let mtpPlaneSizes = try (mtp.flatMap { p in try mtpCache.map { try collectPlaneSizes($0, p) } }) ?? []
@@ -256,6 +256,13 @@ extension QWCacheDiskManager {
         var offset = decoded.kvOffset
 
         let tokenCount = meta.position
+        let expectedTrunkPlanes = (0..<kvCache.layerSlidingWindows.count).flatMap { li -> [Int] in
+            let size = kvCache.serializedPlaneBytes(layerIndex: li, tokenCount: tokenCount)
+            return [size, size]
+        }
+        guard meta.trunkPlaneSizes.isEmpty || meta.trunkPlaneSizes == expectedTrunkPlanes else {
+            throw ReadError.invalidHeader
+        }
         let tempH = try kvCache.allocate(promptTokens: tokenCount)
         defer { kvCache.finish(tempH) }
         try kvCache.populatePrivatePagesDirectly(into: tempH, tokenCount: tokenCount) { _, _, ptr, byteCount in

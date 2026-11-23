@@ -1,0 +1,149 @@
+// qw_ink2_common.metalh — Shared math helpers and parameter structs for Inkling-2 kernels.
+#pragma once
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+inline bfloat qw_ink2_bf16(float v) {
+    uint u = as_type<uint>(v);
+    if ((u & 0x7F800000u) == 0x7F800000u) return bfloat(v);
+    u = u + 0x7FFFu + ((u >> 16u) & 1u);
+    return bfloat(as_type<float>(u & 0xFFFF0000u));
+}
+
+inline float qw_ink2_fp8_e8m0(uchar b) {
+    if (b == 0xFFu) return as_type<float>(0x7FC00000u);
+    if (b == 0u) return as_type<float>(0x00400000u);
+    return as_type<float>(uint(b) << 23u);
+}
+
+inline float qw_ink2_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+inline float qw_ink2_tanh_safe(float x) {
+    return tanh(clamp(x, -15.0f, 15.0f));
+}
+
+inline float qw_ink2_softcap_swiglu(float gate, float up, float gateCap, float upCap) {
+    float g = qw_ink2_tanh_safe(gate / gateCap) * gateCap * qw_ink2_sigmoid(gate);
+    float u = qw_ink2_tanh_safe(up / upCap) * upCap;
+    return float(qw_ink2_bf16(g * u));
+}
+
+struct QWInk2EmbedParams {
+    uint T;
+    uint H;
+    uint V;
+    float eps;
+};
+
+struct QWInk2NormParams {
+    uint rows;
+    uint dim;
+    uint inIsF32;
+    float eps;
+};
+
+struct QWInk2DenseGemmParams {
+    uint M;
+    uint N;
+    uint K;
+    uint strideX;
+    uint strideY;
+    uint inIsF32;
+    uint outIsF32;
+    uint addResidual;
+    float softcap;
+};
+
+struct QWInk2RouterParams {
+    uint T;
+    uint H;
+    uint numExperts;
+    uint topK;
+    float routeScale;
+    uint moeSpecBudget;
+};
+
+struct QWInk2MoEParams {
+    uint T;
+    uint N;
+    uint K;
+    uint topK;
+    uint numExperts;
+    uint hidden;
+    float gateCap;
+    float upCap;
+};
+
+struct QWInk2AttnResParams {
+    uint T;
+    uint H;
+    uint nBlocks;
+    uint numQ;
+    uint blockStride;
+    uint partialIsF32;
+    uint normalizeValues;
+    float eps;
+    uint slotIds[8];
+};
+
+struct QWInk2BankAttendParams {
+    uint T;
+    uint H;
+    uint nStates;
+    uint numQ;
+    uint stateStride;
+    float eps;
+    uint slotIds[8];
+};
+
+struct QWInk2CtrlParams {
+    uint T;
+    uint H;
+    uint rank;
+    float eps;
+};
+
+struct QWInk2SConvParams {
+    uint T;
+    uint C;
+    uint nKV;
+    uint kernelSize;
+    uint updateState;
+    uint resMode;
+    float invSqrtDenom;
+};
+
+struct QWInk2QKVRParams {
+    uint T;
+    uint nH;
+    uint nKV;
+    uint headDim;
+    uint dRel;
+    uint isSliding;
+    uint posOffset;
+    uint ringCap;
+    uint kvMode;
+    uint nFloor;
+    float qkClip;
+    float relClip;
+    float logAlpha;
+    float rmsEps;
+};
+
+struct QWInk2AttnParams {
+    uint T;
+    uint nH;
+    uint nKV;
+    uint headDim;
+    uint dRel;
+    uint sliding;
+    uint relExtent;
+    uint posOffset;
+    uint ringCap;
+    uint kvMode;
+    uint kvLen;
+    uint splits;
+};

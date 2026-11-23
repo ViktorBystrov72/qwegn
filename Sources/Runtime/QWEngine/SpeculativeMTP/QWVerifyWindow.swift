@@ -171,6 +171,21 @@ struct QWVerifyWindow {
                     enc.memoryBarrier(scope: .buffers)
                     try QWGemm.encodeFwht32(enc, hal: hal, x: input)
                 }
+            case .bf16(let weight):
+                let input = QWTensorValue(region: hidden.region, offset: hidden.offset,
+                                          shape: QWTensorShape([count * geometry.hidden], .f16))
+                let output = QWTensorValue(region: logits.region, offset: logits.offset,
+                                           shape: QWTensorShape([count * vocabulary], .f32))
+                if unrotateForF16Head {
+                    try QWGemm.encodeFwht32(enc, hal: hal, x: input)
+                    enc.memoryBarrier(scope: .buffers)
+                }
+                try QWHead.encodeBF16(enc, hal: hal, w: weight, x: input, y: output,
+                                      geometry: geometry, M: count, N: vocabulary)
+                if unrotateForF16Head {
+                    enc.memoryBarrier(scope: .buffers)
+                    try QWGemm.encodeFwht32(enc, hal: hal, x: input)
+                }
             case .q4g(let weight):
                 // Phase 3 Step 3.0: ONE batched plane pass feeds all rows.
                 // The per-row GEMV loop this replaces re-read the full 606

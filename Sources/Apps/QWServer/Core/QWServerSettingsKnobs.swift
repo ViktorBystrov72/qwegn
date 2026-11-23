@@ -41,6 +41,7 @@ extension QWServerSettings {
         out["lsaBudget"] = .int(lsaBudget)
         out["lsaClusterBlock"] = .int(lsaClusterBlock)
         out["lsaSidecarPath"] = .string(lsaSidecarPath)
+        out["lsaCrossLoopReuse"] = .bool(lsaCrossLoopReuse)
         out["lazyLoad"] = .bool(lazyLoad)
         out["loadVision"] = .bool(loadVision)
         out["logLevel"] = .string(logLevel)
@@ -70,7 +71,7 @@ extension QWServerSettings {
         "mtpAdaptiveDepth", "mtpEntropyThreshold",
         "dflashDraftPackPath", "dflashSelectorTopK",
         "gdnPrefill", "evictPrefillScratch", "prefillChunkSize", "maxConcurrentSessions",
-        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "engineTuning"
+        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "engineTuning"
     ]
 
     /// Maps knob IDs from `QWKnobProfile` to `QWServerSettings` CodingKey names.
@@ -108,6 +109,7 @@ extension QWServerSettings {
             case "lsaBudget": keys.insert("lsaBudget")
             case "lsaClusterBlock": keys.insert("lsaClusterBlock")
             case "lsaSidecarPath": keys.insert("lsaSidecarPath")
+            case "lsaCrossLoopReuse": keys.insert("lsaCrossLoopReuse")
             case "lazyLoad": keys.insert("lazyLoad")
             case "loadVision": keys.insert("loadVision")
             case "logLevel": keys.insert("logLevel")
@@ -181,6 +183,7 @@ extension QWServerSettings {
         if let v = values["lsaBudget"]?.intValue { lsaBudget = v }
         if let v = values["lsaClusterBlock"]?.intValue { lsaClusterBlock = v }
         if let v = values["lsaSidecarPath"]?.stringValue { lsaSidecarPath = v }
+        if let v = values["lsaCrossLoopReuse"]?.boolValue { lsaCrossLoopReuse = v }
         if let v = values["lazyLoad"]?.boolValue { lazyLoad = v }
         if let v = values["loadVision"]?.boolValue { loadVision = v }
         if let v = values["logLevel"]?.stringValue { logLevel = v }
@@ -242,6 +245,7 @@ extension QWServerSettings {
         lsaBudget = defaults.lsaBudget
         lsaClusterBlock = defaults.lsaClusterBlock
         lsaSidecarPath = defaults.lsaSidecarPath
+        lsaCrossLoopReuse = defaults.lsaCrossLoopReuse
         engineTuning = [:]
         prefillChunkSize = Self.recommendedPrefillChunkSize(for: descriptor)
         maxConcurrentSessions = defaults.maxConcurrentSessions

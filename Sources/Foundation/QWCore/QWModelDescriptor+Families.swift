@@ -49,6 +49,11 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
     public let defaultExpertGateType: String?
     public let usesPlusOneRMSNorm: Bool
     public let usesQwenChatTemplateIds: Bool
+    public let defaultHasQKNorm: Bool
+    public let defaultAllFullAttention: Bool
+    public let defaultNormTopKProb: Bool
+    public let requiresSparseMoEConfig: Bool
+    public let disallowsMoEConfig: Bool
     public let maxSpeculativeDrafts: Int
     public let supportsExpertStreaming: Bool
     public let isOfficialSupported: Bool
@@ -60,6 +65,11 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
         defaultExpertGateType: String? = nil,
         usesPlusOneRMSNorm: Bool? = nil,
         usesQwenChatTemplateIds: Bool? = nil,
+        defaultHasQKNorm: Bool? = nil,
+        defaultAllFullAttention: Bool? = nil,
+        defaultNormTopKProb: Bool? = nil,
+        requiresSparseMoEConfig: Bool? = nil,
+        disallowsMoEConfig: Bool? = nil,
         maxSpeculativeDrafts: Int? = nil,
         supportsExpertStreaming: Bool? = nil,
         isOfficialSupported: Bool = true
@@ -71,8 +81,16 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
         self.usesPlusOneRMSNorm = usesPlusOneRMSNorm ?? [.qwen38Dense, .qwen38MoE, .senseNovaLoop].contains(family)
         self.usesQwenChatTemplateIds = usesQwenChatTemplateIds
             ?? [.qwen38Dense, .qwen38MoE, .qwen38FlashNext, .senseNovaLoop].contains(family)
-        self.maxSpeculativeDrafts = maxSpeculativeDrafts ?? (family == .qwen38FlashNext ? 3 : 7)
-        self.supportsExpertStreaming = supportsExpertStreaming ?? (family != .qwen38FlashNext)
+        self.defaultHasQKNorm = defaultHasQKNorm ?? ![.qwen2Dense, .llamaDense, .mistralDense].contains(family)
+        self.defaultAllFullAttention = defaultAllFullAttention
+            ?? [.qwen3Dense, .qwen3MoE, .qwen2Dense, .llamaDense, .mistralDense].contains(family)
+        self.defaultNormTopKProb = defaultNormTopKProb
+            ?? [.qwen38MoE, .qwen38FlashNext, .glm5Next, .ernie55MoE, .maxwellMoE].contains(family)
+        self.requiresSparseMoEConfig = requiresSparseMoEConfig ?? (family == .qwen3MoE)
+        self.disallowsMoEConfig = disallowsMoEConfig
+            ?? [.qwen3Dense, .qwen2Dense, .llamaDense, .mistralDense, .qwen38Dense, .senseNovaLoop].contains(family)
+        self.maxSpeculativeDrafts = maxSpeculativeDrafts ?? 15
+        self.supportsExpertStreaming = supportsExpertStreaming ?? true
         self.isOfficialSupported = isOfficialSupported
     }
 }
@@ -144,23 +162,69 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
             family: .qwen38FlashNext,
             defaultAttnOutputGate: true,
             defaultExpertGateType: "sigmoid",
-            maxSpeculativeDrafts: 3
+            maxSpeculativeDrafts: 3,
+            supportsExpertStreaming: false
         ),
         QWModelFamilySpec(
             modelType: "qwen4_exp_text",
             family: .qwen38FlashNext,
             defaultAttnOutputGate: true,
             defaultExpertGateType: "sigmoid",
-            maxSpeculativeDrafts: 3
+            maxSpeculativeDrafts: 3,
+            supportsExpertStreaming: false
+        ),
+        QWModelFamilySpec(
+            modelType: "inkling2_loop",
+            family: .inkling2Loop,
+            defaultAttnOutputGate: true,
+            defaultExpertGateType: "sigmoid",
+            usesPlusOneRMSNorm: false,
+            usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false,
+            defaultAllFullAttention: false,
+            defaultNormTopKProb: false,
+            maxSpeculativeDrafts: 15,
+            supportsExpertStreaming: false,
+            isOfficialSupported: true
+        ),
+        QWModelFamilySpec(
+            modelType: "inkling2_loop_text",
+            family: .inkling2Loop,
+            defaultAttnOutputGate: true,
+            defaultExpertGateType: "sigmoid",
+            usesPlusOneRMSNorm: false,
+            usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false,
+            defaultAllFullAttention: false,
+            defaultNormTopKProb: false,
+            maxSpeculativeDrafts: 15,
+            supportsExpertStreaming: false,
+            isOfficialSupported: true
         ),
         // The standard HF/MLX families. None packs an attention output gate.
-        // `qwen2`, `llama` and the `qwen3` families are officially supported;
-        // `mistral` waits for the sliding window (C116).
-        QWModelFamilySpec(modelType: "qwen3", family: .qwen3Dense, defaultAttnOutputGate: false, isOfficialSupported: true),
-        QWModelFamilySpec(modelType: "qwen3_moe", family: .qwen3MoE, defaultAttnOutputGate: false, isOfficialSupported: true),
-        QWModelFamilySpec(modelType: "qwen2", family: .qwen2Dense, defaultAttnOutputGate: false),
-        QWModelFamilySpec(modelType: "llama", family: .llamaDense, defaultAttnOutputGate: false),
-        QWModelFamilySpec(modelType: "mistral", family: .mistralDense, defaultAttnOutputGate: false, isOfficialSupported: false),
+        QWModelFamilySpec(
+            modelType: "qwen3", family: .qwen3Dense, defaultAttnOutputGate: false,
+            defaultHasQKNorm: true, defaultAllFullAttention: true,
+            defaultNormTopKProb: false, isOfficialSupported: true
+        ),
+        QWModelFamilySpec(
+            modelType: "qwen3_moe", family: .qwen3MoE, defaultAttnOutputGate: false,
+            defaultHasQKNorm: true, defaultAllFullAttention: true,
+            defaultNormTopKProb: false, requiresSparseMoEConfig: true, isOfficialSupported: true
+        ),
+        QWModelFamilySpec(
+            modelType: "qwen2", family: .qwen2Dense, defaultAttnOutputGate: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: true, defaultNormTopKProb: false
+        ),
+        QWModelFamilySpec(
+            modelType: "llama", family: .llamaDense, defaultAttnOutputGate: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: true, defaultNormTopKProb: false
+        ),
+        QWModelFamilySpec(
+            modelType: "mistral", family: .mistralDense, defaultAttnOutputGate: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: true, defaultNormTopKProb: false,
+            isOfficialSupported: false
+        ),
     ]
 
     public func register(_ spec: QWModelFamilySpec) {
@@ -191,4 +255,3 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
         spec(forModelType: modelType)?.isOfficialSupported == true
     }
 }
-

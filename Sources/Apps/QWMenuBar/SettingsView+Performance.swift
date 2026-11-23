@@ -4,6 +4,7 @@
 
 import SwiftUI
 import QWCore
+import QWSMCHelper
 import QWServer
 
 extension SettingsView {
@@ -71,7 +72,7 @@ extension SettingsView {
                                  readout: { $0 == 0 ? "Auto (memory policy)" : "\($0) of \(selectedModelExpertCount)" },
                                  value: tuningInt("residentExpertsPerLayer"))
                     intSliderRow(label: "MoE-Spec Verify Budget:", key: "engineTuning",
-                                 range: 0...8, step: 1,
+                                 range: 0...64, step: 1,
                                  readout: { $0 == 0 ? "0 (Lossless)" : "\($0) experts / layer" },
                                  value: tuningInt("moeSpecBudget"))
                     tuningToggle("Cross-Token Expert Cache", id: "expertCache")
@@ -115,7 +116,53 @@ extension SettingsView {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                Text("Auto defers to macOS SMC. Pre-Spin ramps fans on prefill/decode; Max Blast targets 100% RPM. Direct SMC fan writes require root or /var/run/qwg-smc.sock.")
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(fanHelperDotColor)
+                        .frame(width: 7, height: 7)
+                    Text(fanHelperStatusLabel)
+                        .font(TelemetryTheme.numeric(11))
+                        .foregroundStyle(fanHelperStatus == .active
+                            ? TelemetryTheme.active
+                            : TelemetryTheme.secondary(increasedContrast: contrast == .increased))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 6)
+                    if isUpdatingFanHelper {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else if fanHelperStatus == .active {
+                        Button("Remove") {
+                            disableFanHelper()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("Stop and remove the privileged Fan Helper LaunchDaemon")
+                    } else if fanHelperStatus == .requiresApproval {
+                        Button("Open Login Items") {
+                            openLoginItemsSettings()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    } else {
+                        Button("Enable Fan Control…") {
+                            enableFanHelper()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("Install the minimal privileged Fan Helper daemon for non-root SMC fan writes")
+                    }
+                }
+                .onAppear {
+                    refreshFanHelperStatus()
+                }
+                if let fanHelperMessage, !fanHelperMessage.isEmpty {
+                    Text(fanHelperMessage)
+                        .font(TelemetryTheme.ui(10.5))
+                        .foregroundStyle(TelemetryTheme.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("Auto defers to macOS SMC. Pre-Spin ramps fans on prefill/decode; Max Blast targets 100% RPM. Enabling the privileged Fan Helper allows non-root SMC fan writes with a 15 s auto-restore safety watchdog.")
                     .font(TelemetryTheme.ui(11))
                     .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                     .fixedSize(horizontal: false, vertical: true)

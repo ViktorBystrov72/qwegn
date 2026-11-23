@@ -2,7 +2,8 @@ import XCTest
 import Foundation
 import CryptoKit
 @testable import QWQuant
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 /// The n-gram row reader, against the tables the **Python** writer wrote.
 /// The golden bytes and the expected rows are both the writer's own, so the

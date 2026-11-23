@@ -34,6 +34,14 @@ public enum QWLayerKernelRegistry {
         case QWEnginePlan.LayerKernelKey(attention: .gdn, mlp: .moe, ple: false),
              QWEnginePlan.LayerKernelKey(attention: .kda, mlp: .moe, ple: false):
             return GDNMoELayerKernel.self
+        case QWEnginePlan.LayerKernelKey(attention: .gdn, mlp: .dense, ple: true):
+            return GDNPLELayerKernel.self
+        case QWEnginePlan.LayerKernelKey(attention: .kda, mlp: .dense, ple: true):
+            return KDAPLELayerKernel.self
+        case QWEnginePlan.LayerKernelKey(attention: .gdn, mlp: .moe, ple: true):
+            return GDNPLEMoELayerKernel.self
+        case QWEnginePlan.LayerKernelKey(attention: .kda, mlp: .moe, ple: true):
+            return KDAPLEMoELayerKernel.self
         case QWEnginePlan.LayerKernelKey(attention: .fullAttention, mlp: .dense, ple: false),
              QWEnginePlan.LayerKernelKey(attention: .qsaSparse, mlp: .dense, ple: false),
              QWEnginePlan.LayerKernelKey(attention: .mlaCompressed, mlp: .dense, ple: false):
@@ -42,6 +50,14 @@ public enum QWLayerKernelRegistry {
              QWEnginePlan.LayerKernelKey(attention: .qsaSparse, mlp: .moe, ple: false),
              QWEnginePlan.LayerKernelKey(attention: .mlaCompressed, mlp: .moe, ple: false):
             return MoELayerKernel.self
+        case QWEnginePlan.LayerKernelKey(attention: .qsaSparse, mlp: .dense, ple: true):
+            return QSAPLELayerKernel.self
+        case QWEnginePlan.LayerKernelKey(attention: .qsaSparse, mlp: .moe, ple: true):
+            return QSAPLEMoELayerKernel.self
+        case QWEnginePlan.LayerKernelKey(attention: .fullAttention, mlp: .dense, ple: true):
+            return FullAttentionPLELayerKernel.self
+        case QWEnginePlan.LayerKernelKey(attention: .fullAttention, mlp: .moe, ple: true):
+            return MoEPLELayerKernel.self
         case QWEnginePlan.LayerKernelKey(attention: .hcaCompressed, mlp: .dense, ple: false):
             return HCALayerKernel.self
         case QWEnginePlan.LayerKernelKey(attention: .hcaCompressed, mlp: .moe, ple: false):

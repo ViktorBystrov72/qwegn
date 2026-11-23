@@ -7,7 +7,6 @@ import XCTest
 import QWCore
 import QWHAL
 import QWHead
-import QWFlashNext
 @testable import QWEngine
 
 private final class MockBatchEngine: QWInferenceEngine, @unchecked Sendable {
@@ -259,7 +258,7 @@ final class QWDriverBatchSchedulerTests: XCTestCase {
         let burstOutputs = LockedBox<[Int: QWGenerationResult]>([:])
         let burstGroup = DispatchGroup()
         let maxNewPerReq = [0, 2, 4, 6]
-        FNBatchAdmissionTracker.beginPreparing()
+        QWBatchAdmissionTracker.beginPreparing()
         for idx in 0..<4 {
             burstGroup.enter()
             DispatchQueue.global().async {
@@ -277,7 +276,7 @@ final class QWDriverBatchSchedulerTests: XCTestCase {
             }
         }
         usleep(2000)
-        FNBatchAdmissionTracker.endPreparing()
+        QWBatchAdmissionTracker.endPreparing()
         burstGroup.wait()
 
         XCTAssertGreaterThanOrEqual(scheduler.peakCoalescedWaveSize, 2)
@@ -304,7 +303,7 @@ final class QWDriverBatchSchedulerTests: XCTestCase {
         let mixedOutputs = LockedBox<[Int: QWGenerationResult]>([:])
         let mixedGroup = DispatchGroup()
         let cancelledCount = LockedBox<Int>(0)
-        FNBatchAdmissionTracker.beginPreparing()
+        QWBatchAdmissionTracker.beginPreparing()
         for idx in 0..<3 {
             mixedGroup.enter()
             DispatchQueue.global().async {
@@ -330,7 +329,7 @@ final class QWDriverBatchSchedulerTests: XCTestCase {
             }
         }
         usleep(2000)
-        FNBatchAdmissionTracker.endPreparing()
+        QWBatchAdmissionTracker.endPreparing()
         mixedGroup.wait()
 
         XCTAssertEqual(driver.freeSlots.count, expectedSlots)
@@ -358,7 +357,7 @@ final class QWDriverBatchSchedulerTests: XCTestCase {
         let oversizedGroup = DispatchGroup()
         let oversizedErr = LockedBox<Error?>(nil)
         let validAfter = LockedBox<QWGenerationResult?>(nil)
-        FNBatchAdmissionTracker.beginPreparing()
+        QWBatchAdmissionTracker.beginPreparing()
         oversizedGroup.enter()
         DispatchQueue.global().async {
             defer { oversizedGroup.leave() }
@@ -375,7 +374,7 @@ final class QWDriverBatchSchedulerTests: XCTestCase {
             validAfter.mutate { $0 = try? scheduler.generate(request: QWGenerationRequest(prompt: prompts[1], maxNew: 3, sampling: .greedy)) }
         }
         usleep(2000)
-        FNBatchAdmissionTracker.endPreparing()
+        QWBatchAdmissionTracker.endPreparing()
         oversizedGroup.wait()
         XCTAssertEqual(oversizedErr.value as? QWEngineDriverError, .posBeyondTable(driver.ropeRows))
         XCTAssertEqual(validAfter.value?.tokens, Array(serialOutputs[1].prefix(3)))

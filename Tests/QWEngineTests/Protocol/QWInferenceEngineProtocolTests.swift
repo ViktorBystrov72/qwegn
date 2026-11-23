@@ -20,7 +20,7 @@ final class QWInferenceEngineProtocolTests: XCTestCase {
     /// is the bare type name, so a leak in any signature is caught.
     func testTheProtocolNamesNoConcreteEngine() throws {
         let source = try Self.read("Sources/Runtime/QWEngine/Generation/QWInferenceEngine.swift")
-        for concrete in ["QWEngineDriver", "FNGPUEngine"] {
+        for concrete in ["QWEngineDriver", "QWHyperStreamRuntime", "FNGPUEngine"] {
             XCTAssertFalse(source.contains(concrete),
                            "the public protocol must not name \(concrete)")
         }
@@ -35,19 +35,36 @@ final class QWInferenceEngineProtocolTests: XCTestCase {
             let source = try String(contentsOf: path, encoding: .utf8)
             XCTAssertFalse(source.contains("QWEngineDriver"),
                            "\(path.lastPathComponent) names the dense engine")
+            XCTAssertFalse(source.contains("QWHyperStreamRuntime"),
+                           "\(path.lastPathComponent) names the HyperStream runtime")
         }
     }
 
-    /// Both modules conform: the protocol is the engine-neutral surface
+    /// Unified engine and module conform: the protocol is the engine-neutral surface
     /// every family offers. The proof is compile-time — the call site
     /// does not compile unless the conformance exists.
     func testBothModulesConformToTheProtocol() throws {
         requireConformance(QWEngineDriver.self)
-        requireConformance(FlashNextModule.self)
+        requireConformance(DenseModule.self)
         let dense: Any.Type = QWEngineDriver.self
-        let flash: Any.Type = FlashNextModule.self
+        let module: Any.Type = DenseModule.self
         XCTAssertTrue(dense is any QWInferenceEngine.Type)
-        XCTAssertTrue(flash is any QWInferenceEngine.Type)
+        XCTAssertTrue(module is any QWInferenceEngine.Type)
+        let root = try Self.packageRoot()
+        let packageSwift = try Self.read("Package.swift")
+        XCTAssertFalse(packageSwift.contains("\"QWFlashNext\""),
+                       "QWFlashNext target must be retired from Package.swift")
+        for path in try Self.swiftFiles(under: root.appendingPathComponent("Sources")) {
+            let source = try String(contentsOf: path, encoding: .utf8)
+            XCTAssertFalse(source.contains("FlashNextModule"),
+                           "\(path.lastPathComponent) must not retain retired FlashNextModule")
+            XCTAssertFalse(source.contains("FNGPUEngine"),
+                           "\(path.lastPathComponent) must not retain retired FNGPUEngine")
+        }
+        let batchSched = try Self.read("Sources/Runtime/QWEngine/Core/QWBatchScheduler.swift")
+        XCTAssertTrue(batchSched.contains("public final class QWBatchScheduler"),
+                      "single unified QWBatchScheduler must live in Core/QWBatchScheduler.swift")
+        XCTAssertFalse(batchSched.contains("import QWFlashNext"))
     }
 
     func testModulePolicyIsDispatchedThroughTheProtocol() throws {
@@ -114,7 +131,7 @@ final class QWInferenceEngineProtocolTests: XCTestCase {
                        "per-family server backend adapter must be unified")
 
         let denseLoader = try Self.read("Sources/Runtime/QWEngine/Driver/DriverWeightLoading.swift")
-        let flashLoader = try Self.read("Sources/Subsystems/QWFlashNext/GPU/FNGPUWeights.swift")
+        let flashLoader = try Self.read("Sources/Runtime/QWEngine/Driver/HyperStream/FNGPUWeights.swift")
         XCTAssertTrue(denseLoader.contains("QWHQ4Quantizer."),
                       "QWEngineDriver must delegate online HQ4 quantization to QWHQ4Quantizer")
         XCTAssertTrue(flashLoader.contains("QWHQ4Quantizer."),

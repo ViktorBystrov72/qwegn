@@ -103,6 +103,12 @@ struct QWQuantHQ4 {
         return qwg_dot_hq4_block_f32_reg2(gp[0], a0.lo, a0.hi, a1.lo, a1.hi);
     }
 
+    METAL_FUNC static float2 slice_dot2_acc(WeightPtr gp, uint byteInGroup, thread const ActSlice& a0,
+                                            thread const ActSlice& a1, threadgroup const TgLut& tgLut,
+                                            float2 acc) {
+        return acc + slice_dot2(gp, byteInGroup, a0, a1, tgLut);
+    }
+
     METAL_FUNC static void unpack_lane4_f32(WeightPtr wrow, uint g, uint dl,
                                             thread float2& w01, thread float2& w23) {
         qwg_unpack_hq4_lane4_f32(wrow[g], dl, w01, w23);
@@ -185,6 +191,12 @@ struct QWQuantAQ {
                                         thread const ActSlice& a1, threadgroup const TgLut&) {
         return qwg_aq_slice_dot2<BITS>(gp, byteInGroup, a0.lo, a0.hi, a1.lo, a1.hi,
                                        float2(a0.sumX, a1.sumX));
+    }
+
+    METAL_FUNC static float2 slice_dot2_acc(WeightPtr gp, uint byteInGroup, thread const ActSlice& a0,
+                                            thread const ActSlice& a1, threadgroup const TgLut& tgLut,
+                                            float2 acc) {
+        return acc + slice_dot2(gp, byteInGroup, a0, a1, tgLut);
     }
 
     METAL_FUNC static void unpack_lane4_f32(WeightPtr wrow, uint g, uint dl,

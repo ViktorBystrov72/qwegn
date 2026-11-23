@@ -84,7 +84,7 @@ struct QWStochasticRoundWitness {
 
 extension QWGreedyRoundDecision {
     static func sampled(geometry: QWModelGeometry, proposals: [QWMTPGumbelProposal], result: QWMTP.GumbelRoundResult,
-                        maxNew: Int, stopIDs: Set<Int>, maxDrafts: Int = 7) throws -> QWGreedyRoundDecision {
+                        maxNew: Int, stopIDs: Set<Int>, maxDrafts: Int = 15) throws -> QWGreedyRoundDecision {
         guard maxDrafts >= 1, (1...maxDrafts).contains(proposals.count), (0...proposals.count).contains(result.accepted),
               (0..<geometry.vocab).contains(result.finalToken), maxNew > 0,
               result.draftTokens == proposals.prefix(min(result.accepted + 1, proposals.count)).map(\.token),

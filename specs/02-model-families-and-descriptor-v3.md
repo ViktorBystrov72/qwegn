@@ -18,7 +18,7 @@ Every HuggingFace `model_type` maps 1:1 through `QWModelFamilyRegistry` to an ex
 | `.qwen3MoE` | `qwen3_moe` | Standard HF/MLX sparse MoE (`defaultAttnOutputGate: false`) |
 | `.qwen2Dense` | `qwen2` | Standard dense Qwen2 (`defaultAttnOutputGate: false`) |
 | `.llamaDense` | `llama` | Standard dense Llama (`defaultAttnOutputGate: false`) |
-| `.mistralDense` | `mistral` | Registered descriptor (`isOfficialSupported: false` pending sliding window) |
+| `.mistralDense` | `mistral` | Registered descriptor (`isOfficialSupported: false`; trait-decoded `slidingWindow` routed through `QWAttnDecodeApply` general decode) |
 
 ## 2. Explicit Execution Roles (`QWModelRole`)
 `QWModelDescriptor.role` (`typealias Role = QWModelRole`) separates execution semantics:
@@ -29,7 +29,8 @@ Every HuggingFace `model_type` maps 1:1 through `QWModelFamilyRegistry` to an ex
 ## 3. Config-Sourced Geometry & Linter Gate
 - Geometry, layer cadence, RoPE/YaRN parameters, MoE/Latent/HCA/MLA fields, and `QWVisionConfig` come strictly from the model's `assets/config.json` (and companion pack files under `~/.qwg/models`), never hardcoded or synthesized when absent (`Scripts/lint_geometry_defaults.py` enforces zero hidden geometry fallbacks across `Sources/`).
 - `QWModelDescriptor.verifyInternalConsistency()` re-derives `qProjOut`, `rotaryDims`, MRoPE sums, `gdnQKVChannels`, `gdnZChannels`, full-attention cadence, and PLE linear-layer IDs prior to runtime plan construction.
-- Each family resolves explicitly via `QWModuleRegistry` (`DenseModule`, `FlashNextModule`, and dedicated hybrid modules in `QWHybridFamilyModules.swift`).
+- `QWModelDescriptor.decode` uses unified trait-based decoding via `QWModelFamilyRegistry.shared` (`QWStandardConfigDecoder`), propagating `slidingWindow` (served via `QWAttnDecodeApply` general decode without fast-path shared-prefix assumptions), `tieWordEmbeddings`, and `normGammaShift`.
+- All families resolve through `QWModuleRegistry` onto the unified `DenseModule` / `QWEngineDriver` (routing `hcCount > 1` / `.qwen38FlashNext` execution to `QWHyperStreamRuntime`, with `DriverWeightKernels.resolveHeadSpec` and `QWWeightAllocationPlan` supporting tied embeddings and `.nativeAffine` heads/MTP).
 
 ## 4. `geometryDigestV2` vs `geometryDigestV3`
 - **`geometryDigestV2` (`qwg-geo-v2:...`)**: Preserved **byte-identical** for on-disk `.qwp` pack headers and `.qlsa` sidecar trailers so existing packs validate without re-packing.

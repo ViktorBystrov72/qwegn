@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 import QWRope
-@testable import QWFlashNext
+@testable import QWEngine
 
 // Goldens for full attention + QSA indexer (HF qwen4_exp, eager path, float causal mask).
 final class FNAttentionGoldenTests: XCTestCase {

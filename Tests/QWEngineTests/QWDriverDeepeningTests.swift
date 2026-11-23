@@ -54,14 +54,23 @@ final class QWDriverDeepeningTests: XCTestCase {
             XCTAssertNotNil(QWModuleRegistry.familySpec(for: family), family.rawValue)
             XCTAssertEqual(QWModuleRegistry.capabilities(for: family),
                            QWModuleRegistry.moduleType(for: family)?.capabilities ?? [])
+            let expectedModule: any QWInferenceModule.Type = DenseModule.self
+            XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: family))),
+                           ObjectIdentifier(expectedModule), family.rawValue)
         }
         for modelType in ["qwen3_5_moe", "glm5_next", "ernie5_5_moe", "maxwell_moe"] {
             let fam = try XCTUnwrap(QWModuleRegistry.family(forPackModelId: modelType))
             let mod = try XCTUnwrap(QWModuleRegistry.moduleType(for: fam))
-            XCTAssertTrue(mod is HybridMoEModule.Type, modelType)
-            XCTAssertTrue(mod.capabilities.contains(.expertStreaming), modelType)
+            XCTAssertEqual(ObjectIdentifier(mod), ObjectIdentifier(DenseModule.self), modelType)
+            let moeDesc = Self.makeDescriptor(
+                family: fam, modelType: modelType,
+                numExperts: 32, expertsPerTok: 4, residentExperts: 32)
+            XCTAssertTrue(QWModelCapabilities.resolve(descriptor: moeDesc).contains(.expertStreaming), modelType)
         }
-        XCTAssertFalse(SenseNovaLoopModule.capabilities.contains(.expertStreaming))
+        let loopDesc = Self.makeDescriptor(
+            family: .senseNovaLoop, modelType: "sensenova_loop",
+            numExperts: nil, expertsPerTok: nil, residentExperts: nil)
+        XCTAssertFalse(QWModelCapabilities.resolve(descriptor: loopDesc).contains(.expertStreaming))
         XCTAssertFalse(DenseModule.capabilities.contains(.expertStreaming))
         XCTAssertEqual(QWModuleRegistry.family(forPackModelId: "qwen3_moe"), .qwen3MoE)
         XCTAssertEqual(QWModuleRegistry.family(forPackModelId: "sensenova_loop"), .senseNovaLoop)

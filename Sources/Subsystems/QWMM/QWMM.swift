@@ -17,6 +17,7 @@ public struct QWMMSpec: Sendable, Equatable, Hashable {
     public let videoToken: Int
     public let minPixels: Int
     public let maxPixels: Int
+    public let isInkling2: Bool
 
     public var factor: Int { patch * merge }
     public var patchArea: Int { patch * patch }
@@ -31,7 +32,8 @@ public struct QWMMSpec: Sendable, Equatable, Hashable {
         imageToken: Int,
         videoToken: Int,
         minPixels: Int = 65_536,
-        maxPixels: Int = 16_777_216
+        maxPixels: Int = 16_777_216,
+        isInkling2: Bool = false
     ) {
         self.patch = patch
         self.temporal = temporal
@@ -41,6 +43,7 @@ public struct QWMMSpec: Sendable, Equatable, Hashable {
         self.videoToken = videoToken
         self.minPixels = minPixels
         self.maxPixels = maxPixels
+        self.isInkling2 = isInkling2
     }
 
     public init(
@@ -56,7 +59,8 @@ public struct QWMMSpec: Sendable, Equatable, Hashable {
             imageToken: visionConfig.imageTokenId,
             videoToken: visionConfig.videoTokenId,
             minPixels: minPixels,
-            maxPixels: maxPixels
+            maxPixels: maxPixels,
+            isInkling2: visionConfig.architecture == .inkling2
         )
     }
 
@@ -205,6 +209,7 @@ func axisTaps(_ index: Int, size: Int, side: Int) -> (taps: [Int], weights: [Flo
 
 /// Golden-law interpolation table in merge-block order into `side x side` pos_embed.
 public func qwInterpTaps(grid: QWVisionGrid) -> (indices: [Int32], weights: [Float]) {
+    if grid.spec.isInkling2 { return qwInkling2InterpTaps(grid: grid) }
     let m = grid.spec.merge
     let side = grid.spec.posSide
     let blocksW = grid.w / m
@@ -233,6 +238,7 @@ public func qwInterpTaps(grid: QWVisionGrid) -> (indices: [Int32], weights: [Flo
 
 /// 2-axis (h,w) rope coords in merge-block patch order, repeated t times.
 public func qwVisionRopePositions(grid: QWVisionGrid) -> [Int32] {
+    if grid.spec.isInkling2 { return qwInkling2RopePositions(grid: grid) }
     let m = grid.spec.merge
     var hw = [Int32](); hw.reserveCapacity(grid.h * grid.w * 2)
     for hb in 0..<(grid.h / m) { for wb in 0..<(grid.w / m) {
@@ -383,6 +389,9 @@ private func scatterPlanarPatches(
 
 /// Construct the patch-slab layout from normalized Float RGB pixels [-1, 1].
 public func qwBuildPatchSlab(normalizedRGB: [Float], height: Int, width: Int, grid: QWVisionGrid) throws -> [Float] {
+    if grid.spec.isInkling2 {
+        return try qwBuildInkling2PatchSlab(normalizedPaddedRGB: normalizedRGB, paddedH: height, paddedW: width, grid: grid)
+    }
     try validatePatchSlabInputs(grid: grid, height: height, width: width, sampleCount: normalizedRGB.count)
     let pixelCount = height * width
     guard pixelCount > 0 else { return [] }
@@ -401,6 +410,12 @@ public func qwBuildPatchSlab(normalizedRGB: [Float], height: Int, width: Int, gr
 
 /// Construct the patch-slab layout from raw UInt8 RGB pixels [0, 255], normalizing to [-1, 1].
 public func qwBuildPatchSlab(imageRGB: [UInt8], height: Int, width: Int, grid: QWVisionGrid) throws -> [Float] {
+    if grid.spec.isInkling2 {
+        var norm = [Float](repeating: 0, count: imageRGB.count)
+        let scale: Float = 1.0 / 255.0
+        for i in 0..<imageRGB.count { norm[i] = (Float(imageRGB[i]) * scale - 0.5) / 0.5 }
+        return try qwBuildInkling2PatchSlab(normalizedPaddedRGB: norm, paddedH: height, paddedW: width, grid: grid)
+    }
     try validatePatchSlabInputs(grid: grid, height: height, width: width, sampleCount: imageRGB.count)
     let pixelCount = height * width
     guard pixelCount > 0 else { return [] }

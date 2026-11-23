@@ -26,7 +26,7 @@ final class QWBatchHeadScratch {
 
     init(hal: QWHal, vocab: Int) throws {
         func align256(_ bytes: Int) -> Int { (bytes + 255) / 256 * 256 }
-        let slots = max(1, QWHead.argmaxSlots(vocab))
+        let slots = max(1, max(QWHead.argmaxSlots(vocab), QWHead.batchedArgmaxSlots(vocab)))
         let rows = Self.maxBatchRows
         let logitsBytes = align256(rows * max(1, vocab) * 4)
         let keysBytes = align256(rows * slots * 4)
@@ -47,8 +47,11 @@ final class QWBatchHeadScratch {
 
     func logitsView(rows: Int) -> QWTensorValue { rowTensor(logitsOffset, stride: 0, 0, rows * vocab, .f32) }
     func logitRow(_ row: Int) -> QWTensorValue { rowTensor(logitsOffset, stride: vocab * 4, row, vocab, .f32) }
+    func keysHiView(rows: Int) -> QWTensorValue { rowTensor(keysHiOffset, stride: 0, 0, rows * argmaxSlots, .i32) }
     func keysHiRow(_ row: Int) -> QWTensorValue { rowTensor(keysHiOffset, stride: argmaxSlots * 4, row, argmaxSlots, .i32) }
+    func keysLoView(rows: Int) -> QWTensorValue { rowTensor(keysLoOffset, stride: 0, 0, rows * argmaxSlots, .i32) }
     func keysLoRow(_ row: Int) -> QWTensorValue { rowTensor(keysLoOffset, stride: argmaxSlots * 4, row, argmaxSlots, .i32) }
+    func tokensView(rows: Int) -> QWTensorValue { rowTensor(tokensOffset, stride: 0, 0, rows, .i32) }
     func tokenRow(_ row: Int) -> QWTensorValue { rowTensor(tokensOffset, stride: 4, row, 1, .i32) }
 
     func readToken(_ row: Int) -> Int {
@@ -135,7 +138,8 @@ extension QWEngineDriver {
     /// Executes one batched trunk + LM head step across B=2...4 active sessions in one command buffer.
     func forwardBatchStep(
         _ sessions: [QWEngineSession], tokens: [Int],
-        permit: QWGenerationPermit? = nil, headScratch: QWBatchHeadScratch? = nil
+        permit: QWGenerationPermit? = nil, headScratch: QWBatchHeadScratch? = nil,
+        greedyOnly: Bool = false
     ) throws -> (rawIds: [Int], stepMs: Double, scratch: QWBatchHeadScratch) {
         let B = sessions.count
         guard (2...QWBatchHeadScratch.maxBatchRows).contains(B), tokens.count == B else {
@@ -145,12 +149,12 @@ extension QWEngineDriver {
             throw QWEngineDriverError.state("model geometry/operators require quantum-interleaved batching")
         }
         return try withFlightPermit(permit) {
-            try forwardBatchStepLocked(sessions, tokens: tokens, headScratch: headScratch)
+            try forwardBatchStepLocked(sessions, tokens: tokens, headScratch: headScratch, greedyOnly: greedyOnly)
         }
     }
 
     private func forwardBatchStepLocked(
-        _ sessions: [QWEngineSession], tokens: [Int], headScratch: QWBatchHeadScratch?
+        _ sessions: [QWEngineSession], tokens: [Int], headScratch: QWBatchHeadScratch?, greedyOnly: Bool
     ) throws -> (rawIds: [Int], stepMs: Double, scratch: QWBatchHeadScratch) {
         let B = sessions.count
         guard verifiedSession == nil else {
@@ -204,7 +208,7 @@ extension QWEngineDriver {
             try denseKernel.encodeBatchDecode(activeEnc ?? enc, driver: self, sessions: sessions, layer: v, weights: layersW[p])
         }
         cb = activeCB ?? cb; enc = activeEnc ?? enc
-        try encodeBatchedHead(enc, scratch: scratch, count: B)
+        try encodeBatchedHead(enc, scratch: scratch, count: B, greedyOnly: greedyOnly)
         encoderEnded = true
         hal.end(cb, enc)
         committedFinalCB = true
@@ -218,6 +222,12 @@ extension QWEngineDriver {
             sessions[b].position += 1; sessions[b].generated += 1
             sessions[b].batchedDecodeTouched = true; sessions[b].mlaIndexerStash = nil
             kvCache.markWritten(sessions[b].kv, upTo: pos + 1)
+            if geometry.hasAnySlidingWindow {
+                try kvCache.recycleExpiredWindowPages(
+                    sessions[b].kv,
+                    currentPosition: pos + 1,
+                    safetyMargin: geometry.descriptor.maxSpeculativeDrafts + QWKVCache.pageTokens)
+            }
             rawIds.append(scratch.readToken(b))
         }
         return (rawIds, Date().timeIntervalSince(tStep0) * 1000, scratch)
@@ -246,15 +256,31 @@ extension QWEngineDriver {
     private func encodeBatchedHead(
         _ enc: any MTLComputeCommandEncoder,
         scratch: QWBatchHeadScratch,
-        count B: Int
+        count B: Int,
+        greedyOnly: Bool = false
     ) throws {
         enc.useResource(scratch.buffer, usage: [.read, .write])
         let xBatch = prefixRows(psc.ln1, rows: B, cols: geometry.hidden, dt: .f16)
-        let logitsBatch = scratch.logitsView(rows: B)
-        if case .f16 = headStorage {
+        let needsHeadFwht: Bool = switch headStorage {
+        case .f16: true
+        case .bf16: hal.weightBasis.rotatesActivations
+        case .q4g: false
+        }
+        if needsHeadFwht {
             encodeFwht32Fast(enc, x: xBatch)
             enc.memoryBarrier(scope: .buffers)
         }
+        if greedyOnly && multimaxParams == nil {
+            try head.encodeBatchedGreedyArgmax(
+                enc, storage: headStorage, x: xBatch,
+                keysHi: scratch.keysHiView(rows: B),
+                keysLo: scratch.keysLoView(rows: B),
+                tokens: scratch.tokensView(rows: B),
+                M: B, N: geometry.vocab
+            )
+            return
+        }
+        let logitsBatch = scratch.logitsView(rows: B)
         try head.encode(enc, storage: headStorage, x: xBatch, gs: nil, y: logitsBatch, M: B)
         if let mm = multimaxParams {
             enc.memoryBarrier(scope: .buffers)
@@ -348,11 +374,15 @@ extension QWEngineDriver {
                 hasSpeculative: stepIndices.contains { canSpeculateSlot(active[$0]) },
                 allowsSpeculativeBatch: geometry.numExperts == 0)
             if useBatched {
+                let greedyOnly = multimaxParams == nil && stepIndices.allSatisfy { idx in
+                    let slot = active[idx]
+                    return slot.lpSampler == nil && slot.constraint == nil && slot.session.stochastic == nil
+                }
                 let stepResult: (rawIds: [Int], stepMs: Double, scratch: QWBatchHeadScratch)
                 do {
                     stepResult = try forwardBatchStep(
                         stepIndices.map { active[$0].session }, tokens: stepIndices.map { active[$0].pendingToken },
-                        permit: permit, headScratch: scratch)
+                        permit: permit, headScratch: scratch, greedyOnly: greedyOnly)
                 } catch {
                     for slotIdx in stepIndices.sorted(by: >) { failSlot(at: slotIdx, error: error) }
                     continue
@@ -396,6 +426,14 @@ extension QWEngineDriver {
         pollPending: (_ freeSlots: Int) -> [QWBatchScheduledJob],
         requeueDelayed: ([QWBatchScheduledJob]) -> Void
     ) {
+        if let ink = inkling2Runtime {
+            ink.runScheduledBatch(
+                initialJobs: initialJobs,
+                pollPending: pollPending,
+                requeueDelayed: requeueDelayed
+            )
+            return
+        }
         withDriverGenerateLock {
             let permit: QWGenerationPermit
             do { permit = try acquireRequest() } catch {

@@ -2,8 +2,8 @@
 import Foundation
 
 extension QWModelDescriptor {
-    internal struct ConfigEnvelope: Decodable {
-        struct RopeParameters: Decodable {
+    internal final class ConfigEnvelope: Decodable {
+        final class RopeParameters: Decodable {
             let mrope_section: [Int]?
             let mrope_interleaved: Bool?
             let rope_theta: Double?
@@ -17,7 +17,7 @@ extension QWModelDescriptor {
             let mscale: Double?
             let mscale_all_dim: Double?
         }
-        struct RopeScaling: Decodable {
+        final class RopeScaling: Decodable {
             let type: String?
             let rope_type: String?
             let factor: Double?
@@ -27,7 +27,7 @@ extension QWModelDescriptor {
             let mscale: Double?
             let mscale_all_dim: Double?
         }
-        struct VisionConfig: Decodable {
+        final class VisionConfig: Decodable {
             let depth: Int?
             let hidden_size: Int?
             let num_heads: Int?
@@ -40,6 +40,11 @@ extension QWModelDescriptor {
             let image_size: Int?
             let rms_norm_eps: Double?
             let hidden_act: String?
+            let model_type: String?
+        }
+        struct GenerationConfig: Decodable {
+            let eos_token_id: JSONIntOrList?
+            let pad_token_id: Int?
         }
         struct RawLoopSettings: Decodable {
             let start: Int?
@@ -77,7 +82,7 @@ extension QWModelDescriptor {
             let gate_lower_bound: Float?
             let low_rank_dim: Int?
         }
-        struct Text: Decodable {
+        final class Text: Decodable {
             let model_type: String
             let hidden_size: Int
             let vocab_size: Int
@@ -86,9 +91,11 @@ extension QWModelDescriptor {
             var compress_ratios: [Int]? = nil
             var full_attention_interval: Int? = nil
             let rms_norm_eps: Double
-            let max_position_embeddings: Int
+            var max_position_embeddings: Int? = nil
+            var model_max_length: Int? = nil
             let num_attention_heads: Int
-            let num_key_value_heads: Int
+            var num_key_value_heads: Int? = nil
+            var architectures: [String]? = nil
             var head_dim: Int? = nil
             var attention_head_size: Int? = nil
             var qk_head_dim: Int? = nil
@@ -100,6 +107,12 @@ extension QWModelDescriptor {
             var block_sparse_gqa_local_window_size: Int? = nil
             var block_sparse_gqa_num_remote_blocks: Int? = nil
             var qk_layernorm: Bool? = nil
+            var use_qk_norm: Bool? = nil
+            var qk_norm: Bool? = nil
+            var attention_bias: Bool? = nil
+            var qkv_bias: Bool? = nil
+            var mlp_bias: Bool? = nil
+            var output_router_logits: Bool? = nil
             var qk_nope_head_dim: Int? = nil
             var qk_rope_head_dim: Int? = nil
             var v_head_dim: Int? = nil
@@ -108,6 +121,10 @@ extension QWModelDescriptor {
             var o_groups: Int? = nil
             var o_lora_rank: Int? = nil
             var sliding_window: Int? = nil
+            var use_sliding_window: Bool? = nil
+            var max_window_layers: Int? = nil
+            var sliding_window_pattern: Int? = nil
+            var original_max_position_embeddings: Int? = nil
             var mla_use_nope: Bool? = nil
             var use_mla: Bool? = nil
             var partial_rotary_factor: Double? = nil
@@ -155,6 +172,7 @@ extension QWModelDescriptor {
             var moe_router_enable_expert_bias: Bool? = nil
             var first_k_dense_replace: Int? = nil
             var mlp_only_layers: [Int]? = nil
+            var decoder_sparse_step: Int? = nil
             var moe_layer_freq: Int? = nil
             var routed_scaling_factor: Float? = nil
             var routed_scaling_factor_learnable: Bool? = nil
@@ -204,7 +222,7 @@ extension QWModelDescriptor {
             var mtp_shared_last_layer: Bool? = nil
             var multimax: String? = nil
             var tie_word_embeddings: Bool? = nil
-            let eos_token_id: JSONIntOrList
+            var eos_token_id: JSONIntOrList? = nil
             let intermediate_size: Int?           // dense models / first_k_dense_replace
             var quantization: QWQuantizationSpec? = nil
             var quantization_config: QWQuantizationSpec? = nil
@@ -213,6 +231,10 @@ extension QWModelDescriptor {
         }
         let text_config: Text?
         let vision_config: VisionConfig?
+        let generation_config: GenerationConfig?
+        let eos_token_id: JSONIntOrList?
+        let max_position_embeddings: Int?
+        let model_max_length: Int?
         let quantization: QWQuantizationSpec?
         let quantization_config: QWQuantizationSpec?
         let image_token_id: Int?
@@ -220,6 +242,9 @@ extension QWModelDescriptor {
         let vision_start_token_id: Int?
         let vision_end_token_id: Int?
         let model_type: String?
+        let architectures: [String]?
+        let tie_word_embeddings: Bool?
+        let original_max_position_embeddings: Int?
         let loop_settings: RawLoopSettings?
         let mhc: MHCValue?
     }

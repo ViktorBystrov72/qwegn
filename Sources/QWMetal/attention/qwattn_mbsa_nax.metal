@@ -36,8 +36,11 @@ static inline void mbsa_prefill_paged_nax_body(
         threadgroup half* kvblk, threadgroup half* vblk) {
     const uint kThreads   = 64u * QW_GQA_RATIO;
     const uint num_groups = QW_KV_HEADS;
+    const uint numTiles   = (T + 31u) >> 5u;
+    if (T == 0u || tg.x >= numTiles * num_groups) return;
     const uint kvh        = tg.x % num_groups;
-    const uint tileIdx    = tg.x / num_groups;
+    // LPT tile ordering: schedule longest causal tiles (highest tileIdx) first.
+    const uint tileIdx    = numTiles - 1u - (tg.x / num_groups);
     const uint tile0      = tileIdx * 32u;
     const uint headBase   = kvh * QW_GQA_RATIO;
     const uint kEnd       = pos + min(tile0 + 32u, T);
@@ -105,11 +108,23 @@ static inline void mbsa_prefill_paged_nax_body(
                 const uint dim0 = (QW_HEAD_DIM == 128u) ? ((e & 15u) << 3u) : ((e % VecPerRow) << 3u);
                 const uint absKey = n0 + kr;
                 const uint ob = kr * kStageStride + dim0;
-                if (kr < subValid) {
+                uint pk = 0u, pv = 0u;
+                if (QW_HEAD_DIM == 128u) {
+                    const ushort leader = ushort(tid & 16u);
+                    if ((tid & 15u) == 0u && kr < subValid) {
+                        const uint page = absKey >> 8u;
+                        pk = (uint)ktab[page];
+                        pv = (uint)vtab[page];
+                    }
+                    pk = simd_shuffle(pk, leader);
+                    pv = simd_shuffle(pv, leader);
+                } else if (kr < subValid) {
                     const uint page = absKey >> 8u;
+                    pk = (uint)ktab[page];
+                    pv = (uint)vtab[page];
+                }
+                if (kr < subValid) {
                     const uint slot = absKey & 255u;
-                    const uint pk = (uint)ktab[page];
-                    const uint pv = (uint)vtab[page];
                     if (MODE == 0u) {
                         const uint64_t rowOff = (uint64_t)slot * QW_ROW + (uint64_t)kvh * QW_HEAD_DIM + dim0;
                         device const half* sk = kpool + (uint64_t)pk * QW_PGEL + rowOff;
@@ -389,27 +404,62 @@ QW_MBSA_NAX_PREFILL_ENTRY(_q4,  2u)
 #undef QW_MBSA_NAX_PREFILL_ENTRY
 
 // 2. Split-K GQA-fused MBSA Sparse Decode & Verify (rows = 1..8) over paged KV pools.
-template <uint MODE>
-static inline void mbsa_decode_sparse_body(
+// Register-only 32-point normalized FWHT across 8 lanes (4 halves/lane); identity in STANDARD basis.
+METAL_FUNC void mbsa_fwht32_h4(thread half (&v)[4], uint lane) {
+    if (!QW_FWHT_ROTATED) return;
+    float f[4];
+    #pragma unroll
+    for (uint i = 0u; i < 4u; i++) f[i] = float(v[i]);
+    const float a0 = f[0] + f[1], a1 = f[0] - f[1];
+    const float a2 = f[2] + f[3], a3 = f[2] - f[3];
+    f[0] = a0 + a2; f[2] = a0 - a2;
+    f[1] = a1 + a3; f[3] = a1 - a3;
+    const bool neg1 = (lane & 1u) != 0u;
+    const bool neg2 = (lane & 2u) != 0u;
+    const bool neg4 = (lane & 4u) != 0u;
+    #pragma unroll
+    for (uint i = 0u; i < 4u; i++) {
+        const float p1 = simd_shuffle_xor(f[i], ushort(1));
+        f[i] = neg1 ? (p1 - f[i]) : (f[i] + p1);
+    }
+    #pragma unroll
+    for (uint i = 0u; i < 4u; i++) {
+        const float p2 = simd_shuffle_xor(f[i], ushort(2));
+        f[i] = neg2 ? (p2 - f[i]) : (f[i] + p2);
+    }
+    constexpr float inv_sqrt32 = 0.17677669529663689f;
+    #pragma unroll
+    for (uint i = 0u; i < 4u; i++) {
+        const float p4 = simd_shuffle_xor(f[i], ushort(4));
+        f[i] = (neg4 ? (p4 - f[i]) : (f[i] + p4)) * inv_sqrt32;
+    }
+    #pragma unroll
+    for (uint i = 0u; i < 4u; i++) v[i] = half(f[i]);
+}
+
+template <uint MODE, uint ELEMS>
+static inline void mbsa_decode_sparse_impl(
         const device half* qgate, device half* kpool, device half* vpool,
         const device int* ktab, const device int* vtab,
         const device int* blockList, const device int* blockCount,
         device float* partials, device half* outp, uint4 params,
         uint tid, uint3 tg,
-        threadgroup half* stageK, threadgroup half* stageV, threadgroup uchar* sKeyOk) {
+        threadgroup half* stageK, threadgroup half* stageV,
+        threadgroup uint* sAbsKey, threadgroup uint* sPk, threadgroup uint* sPv) {
+    constexpr uint stageStride = (ELEMS == 4u) ? 128u : QW_MBSA_DEC_HDIM;
     const uint kvh = tg.x, qi = tg.z;
     const uint sg = tid >> 5u, lane = tid & 31u;
     const uint head = kvh * QW_GQA_RATIO + sg;
-    const uint d0 = lane * 8u;
+    const uint d0 = lane * ELEMS;
     const bool live = d0 < QW_HEAD_DIM;
     const uint pos = params.x + qi, blockSize = params.y, listStride = params.z, splits = params.w;
 
     const device half* qrow = qgate + (uint64_t)qi * QW_QPROJ_OUT + (uint64_t)head * QW_Q_STRIDE * QW_HEAD_DIM;
-    float q8[8];
+    float qv[ELEMS];
     if (live) {
-        for (uint i = 0u; i < 8u; i++) q8[i] = float(qrow[d0 + i]);
+        for (uint i = 0u; i < ELEMS; i++) qv[i] = float(qrow[d0 + i]);
     } else {
-        for (uint i = 0u; i < 8u; i++) q8[i] = 0.0f;
+        for (uint i = 0u; i < ELEMS; i++) qv[i] = 0.0f;
     }
 
     const size_t slotBase = ((size_t)qi * QW_KV_HEADS + kvh) * listStride;
@@ -420,20 +470,20 @@ static inline void mbsa_decode_sparse_body(
     const uint s1 = min(s0 + per, totalSlots);
 
     float m = -1e30f, lsum = 0.0f;
-    float oacc[8];
-    for (uint i = 0u; i < 8u; i++) oacc[i] = 0.0f;
+    float oacc[ELEMS];
+    for (uint i = 0u; i < ELEMS; i++) oacc[i] = 0.0f;
 
     #define MBSA_MERGE(s, vv) { \
         const float _mn = max(m, s); \
         const float _c  = (m > -1e29f) ? ((s > m) ? metal::exp(m - s) : 1.0f) : 0.0f; \
         const float _p  = metal::exp(s - _mn); \
         lsum = lsum * _c + _p; \
-        for (uint _i = 0u; _i < 8u; _i++) oacc[_i] = oacc[_i] * _c + _p * float(vv[_i]); \
+        for (uint _i = 0u; _i < ELEMS; _i++) oacc[_i] = oacc[_i] * _c + _p * float(vv[_i]); \
         m = _mn; \
     }
     #define MBSA_DOT(kk) ({ \
         float _pd = 0.0f; \
-        for (uint _i = 0u; _i < 8u; _i++) _pd += q8[_i] * float(kk[_i]); \
+        for (uint _i = 0u; _i < ELEMS; _i++) _pd += qv[_i] * float(kk[_i]); \
         simd_sum(_pd) * QW_ATTN_SCALE; })
 
     const uint kThreads = QW_GQA_RATIO * 32u;
@@ -442,19 +492,29 @@ static inline void mbsa_decode_sparse_body(
 
     uint r = s0;
     for (; r + 16u <= s1; r += 16u) {
-        for (uint e = tid; e < totalVecs; e += kThreads) {
-            const uint keyIdx = e / vecPerRow;
-            const uint col = (e % vecPerRow) << 3u;
-            const uint slotIdx = r + keyIdx;
+        if (tid < 16u) {
+            const uint slotIdx = r + tid;
             const int rawBlk = blockList[slotBase + (slotIdx / blockSize)];
             const uint absKey = (rawBlk >= 0) ? (uint(rawBlk) * blockSize + (slotIdx % blockSize)) : 0xFFFFFFFFu;
             const bool ok = (rawBlk >= 0) && (absKey <= pos);
-            if (col == 0u) sKeyOk[keyIdx] = ok ? 1 : 0;
-            threadgroup half* dk = &stageK[keyIdx * QW_MBSA_DEC_HDIM + col];
-            threadgroup half* dv = &stageV[keyIdx * QW_MBSA_DEC_HDIM + col];
+            sAbsKey[tid] = ok ? absKey : 0xFFFFFFFFu;
             if (ok) {
-                const uint page = absKey >> 8u, slot = absKey & 255u;
-                const uint pk = (uint)ktab[page], pv = (uint)vtab[page];
+                const uint page = absKey >> 8u;
+                sPk[tid] = (uint)ktab[page];
+                sPv[tid] = (uint)vtab[page];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint e = tid; e < totalVecs; e += kThreads) {
+            const uint keyIdx = (QW_HEAD_DIM == 128u) ? (e >> 4u) : (e / vecPerRow);
+            const uint col = (QW_HEAD_DIM == 128u) ? ((e & 15u) << 3u) : ((e % vecPerRow) << 3u);
+            const uint absKey = sAbsKey[keyIdx];
+            threadgroup half* dk = &stageK[keyIdx * stageStride + col];
+            threadgroup half* dv = &stageV[keyIdx * stageStride + col];
+            if (absKey != 0xFFFFFFFFu) {
+                const uint slot = absKey & 255u;
+                const uint pk = sPk[keyIdx], pv = sPv[keyIdx];
                 if (MODE == 0u) {
                     const uint64_t off = (uint64_t)slot * QW_ROW + (uint64_t)kvh * QW_HEAD_DIM + col;
                     *(threadgroup uint4*)dk = *(const device uint4*)(kpool + (uint64_t)pk * QW_PGEL + off);
@@ -463,40 +523,55 @@ static inline void mbsa_decode_sparse_body(
                     half ka[8], va[8];
                     QW_KV_LOAD8(ka, kpool, pk, slot, kvh, col, MODE)
                     QW_KV_LOAD8(va, vpool, pv, slot, kvh, col, MODE)
-                    for (uint i = 0u; i < 8u; i++) { dk[i] = ka[i]; dv[i] = va[i]; }
+                    *(threadgroup half4*)dk        = half4(ka[0], ka[1], ka[2], ka[3]);
+                    *(threadgroup half4*)(dk + 4u) = half4(ka[4], ka[5], ka[6], ka[7]);
+                    *(threadgroup half4*)dv        = half4(va[0], va[1], va[2], va[3]);
+                    *(threadgroup half4*)(dv + 4u) = half4(va[4], va[5], va[6], va[7]);
                 }
             } else {
-                for (uint i = 0u; i < 8u; i++) { dk[i] = half(0.0h); dv[i] = half(0.0h); }
+                *(threadgroup uint4*)dk = uint4(0u);
+                *(threadgroup uint4*)dv = uint4(0u);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float s16[16];
         for (uint j = 0u; j < 16u; j++) {
-            half kk[8];
-            if (live) *(thread uint4*)kk = *(threadgroup const uint4*)&stageK[j * QW_MBSA_DEC_HDIM + d0];
-            else for (uint i = 0u; i < 8u; i++) kk[i] = half(0.0h);
+            alignas(16) half kk[ELEMS];
+            if (live) {
+                if constexpr (ELEMS == 4u) {
+                    *(thread half4*)kk = *(threadgroup const half4*)&stageK[j * stageStride + d0];
+                } else {
+                    *(thread uint4*)kk = *(threadgroup const uint4*)&stageK[j * stageStride + d0];
+                }
+            } else {
+                for (uint i = 0u; i < ELEMS; i++) kk[i] = half(0.0h);
+            }
             const float sc = MBSA_DOT(kk);
-            s16[j] = (sKeyOk[j] != 0) ? sc : -1e30f;
+            s16[j] = (sAbsKey[j] != 0xFFFFFFFFu) ? sc : -1e30f;
         }
         float bm = s16[0];
         for (uint j = 1u; j < 16u; j++) bm = max(bm, s16[j]);
         if (bm > -1e29f) {
             const float Mb = max(m, bm);
-            float lp = 0.0f, op[8];
-            for (uint i = 0u; i < 8u; i++) op[i] = 0.0f;
+            float lp = 0.0f, op[ELEMS];
+            for (uint i = 0u; i < ELEMS; i++) op[i] = 0.0f;
             for (uint j = 0u; j < 16u; j++) {
                 const float pj = (s16[j] > -1e29f) ? metal::exp(s16[j] - Mb) : 0.0f;
                 lp += pj;
                 if (pj > 0.0f && live) {
-                    half vv[8];
-                    *(thread uint4*)vv = *(threadgroup const uint4*)&stageV[j * QW_MBSA_DEC_HDIM + d0];
-                    for (uint i = 0u; i < 8u; i++) op[i] += pj * float(vv[i]);
+                    alignas(16) half vv[ELEMS];
+                    if constexpr (ELEMS == 4u) {
+                        *(thread half4*)vv = *(threadgroup const half4*)&stageV[j * stageStride + d0];
+                    } else {
+                        *(thread uint4*)vv = *(threadgroup const uint4*)&stageV[j * stageStride + d0];
+                    }
+                    for (uint i = 0u; i < ELEMS; i++) op[i] += pj * float(vv[i]);
                 }
             }
             const float cb = (m > -1e29f) ? metal::exp(m - Mb) : 0.0f;
             lsum = lsum * cb + lp;
-            for (uint i = 0u; i < 8u; i++) oacc[i] = oacc[i] * cb + op[i];
+            for (uint i = 0u; i < ELEMS; i++) oacc[i] = oacc[i] * cb + op[i];
             m = Mb;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -509,18 +584,30 @@ static inline void mbsa_decode_sparse_body(
         if (j > pos) continue;
         const uint page = j >> 8u, slot = j & 255u;
         const uint pk = (uint)ktab[page], pv = (uint)vtab[page];
-        half kk[8], vv[8];
+        alignas(16) half kk[ELEMS], vv[ELEMS];
         if (live) {
             if (MODE == 0u) {
                 const uint64_t rowOff = (uint64_t)slot * QW_ROW + (uint64_t)kvh * QW_HEAD_DIM + d0;
-                *(thread uint4*)kk = *(const device uint4*)(kpool + (uint64_t)pk * QW_PGEL + rowOff);
-                *(thread uint4*)vv = *(const device uint4*)(vpool + (uint64_t)pv * QW_PGEL + rowOff);
+                if constexpr (ELEMS == 4u) {
+                    *(thread half4*)kk = *(const device half4*)(kpool + (uint64_t)pk * QW_PGEL + rowOff);
+                    *(thread half4*)vv = *(const device half4*)(vpool + (uint64_t)pv * QW_PGEL + rowOff);
+                } else {
+                    *(thread uint4*)kk = *(const device uint4*)(kpool + (uint64_t)pk * QW_PGEL + rowOff);
+                    *(thread uint4*)vv = *(const device uint4*)(vpool + (uint64_t)pv * QW_PGEL + rowOff);
+                }
+            } else if constexpr (ELEMS == 4u) {
+                half k8[8], v8[8];
+                const uint d8 = d0 & ~7u;
+                const uint sub = (lane & 1u) * 4u;
+                QW_KV_LOAD8(k8, kpool, pk, slot, kvh, d8, MODE)
+                QW_KV_LOAD8(v8, vpool, pv, slot, kvh, d8, MODE)
+                for (uint i = 0u; i < 4u; i++) { kk[i] = k8[sub + i]; vv[i] = v8[sub + i]; }
             } else {
                 QW_KV_LOAD8(kk, kpool, pk, slot, kvh, d0, MODE)
                 QW_KV_LOAD8(vv, vpool, pv, slot, kvh, d0, MODE)
             }
         } else {
-            for (uint i = 0u; i < 8u; i++) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
+            for (uint i = 0u; i < ELEMS; i++) { kk[i] = half(0.0h); vv[i] = half(0.0h); }
         }
         MBSA_MERGE(MBSA_DOT(kk), vv)
     }
@@ -534,11 +621,30 @@ static inline void mbsa_decode_sparse_body(
             + (uint64_t)qi * (QW_Q_HEADS * splitStride * (QW_HEAD_DIM + 2u))
             + (head * splitStride + tg.y) * (QW_HEAD_DIM + 2u);
         if (live) {
-            for (uint i = 0u; i < 8u; i++) pb[d0 + i] = oacc[i];
+            for (uint i = 0u; i < ELEMS; i++) pb[d0 + i] = oacc[i];
         }
         if (lane == 0u) {
             pb[QW_HEAD_DIM] = m;
             pb[QW_HEAD_DIM + 1u] = lsum;
+        }
+    } else if constexpr (ELEMS == 4u) {
+        alignas(16) half hv[4];
+        if (live) {
+            float gf[4];
+            for (uint i = 0u; i < 4u; i++) gf[i] = 1.0f;
+            if (QW_HAS_Q_GATE) {
+                const device half* g4 = qrow + QW_HEAD_DIM + d0;
+                for (uint i = 0u; i < 4u; i++) gf[i] = 1.0f / (1.0f + metal::exp(-float(g4[i])));
+            }
+            const float invL = (lsum > 0.0f) ? (1.0f / lsum) : 0.0f;
+            for (uint i = 0u; i < 4u; i++) hv[i] = half(oacc[i] * invL * gf[i]);
+        } else {
+            for (uint i = 0u; i < 4u; i++) hv[i] = half(0.0h);
+        }
+        mbsa_fwht32_h4(hv, lane);
+        if (live) {
+            device half* ov = outp + (uint64_t)qi * (QW_Q_HEADS * QW_HEAD_DIM) + head * QW_HEAD_DIM + d0;
+            *(device half4*)ov = *(thread const half4*)hv;
         }
     } else if (live) {
         float gf[8];
@@ -548,11 +654,33 @@ static inline void mbsa_decode_sparse_body(
             for (uint i = 0u; i < 8u; i++) gf[i] = 1.0f / (1.0f + metal::exp(-float(g4[i])));
         }
         const float invL = (lsum > 0.0f) ? (1.0f / lsum) : 0.0f;
-        half hv[8];
+        alignas(16) half hv[8];
         for (uint i = 0u; i < 8u; i++) hv[i] = half(oacc[i] * invL * gf[i]);
         fwht32_inplace(hv, lane);
         device half* ov = outp + (uint64_t)qi * (QW_Q_HEADS * QW_HEAD_DIM) + head * QW_HEAD_DIM + d0;
-        *(device uint4*)ov = *(thread uint4*)hv;
+        *(device uint4*)ov = *(thread const uint4*)hv;
+    }
+}
+
+template <uint MODE>
+static inline void mbsa_decode_sparse_body(
+        const device half* qgate, device half* kpool, device half* vpool,
+        const device int* ktab, const device int* vtab,
+        const device int* blockList, const device int* blockCount,
+        device float* partials, device half* outp, uint4 params,
+        uint tid, uint3 tg,
+        threadgroup half* stageKV,
+        threadgroup uint* sAbsKey, threadgroup uint* sPk, threadgroup uint* sPv) {
+    if (QW_HEAD_DIM <= 128u) {
+        mbsa_decode_sparse_impl<MODE, 4u>(
+            qgate, kpool, vpool, ktab, vtab, blockList, blockCount,
+            partials, outp, params, tid, tg,
+            stageKV, stageKV + 16u * 128u, sAbsKey, sPk, sPv);
+    } else {
+        mbsa_decode_sparse_impl<MODE, 8u>(
+            qgate, kpool, vpool, ktab, vtab, blockList, blockCount,
+            partials, outp, params, tid, tg,
+            stageKV, stageKV + 16u * QW_MBSA_DEC_HDIM, sAbsKey, sPk, sPv);
     }
 }
 
@@ -568,12 +696,12 @@ kernel void qwg_mbsa_decode_sparse##SFX( \
         device float*      partials   [[buffer(7)]], \
         device half*       outp       [[buffer(8)]], \
         constant uint4&    params     [[buffer(9)]], \
+        threadgroup half*  stageKV    [[threadgroup(0)]], \
         uint tid [[thread_index_in_threadgroup]], \
         uint3 tg [[threadgroup_position_in_grid]]) { \
-    threadgroup half stageK[16u * QW_MBSA_DEC_HDIM], stageV[16u * QW_MBSA_DEC_HDIM]; \
-    threadgroup uchar sKeyOk[16]; \
+    threadgroup uint sAbsKey[16], sPk[16], sPv[16]; \
     mbsa_decode_sparse_body<MODE>(qgate, kpool, vpool, ktab, vtab, blockList, blockCount, \
-                                  partials, outp, params, tid, tg, stageK, stageV, sKeyOk); \
+                                  partials, outp, params, tid, tg, stageKV, sAbsKey, sPk, sPv); \
 }
 QW_MBSA_DECODE_SPARSE_ENTRY(_f16, 0u)
 QW_MBSA_DECODE_SPARSE_ENTRY(_q8,  1u)

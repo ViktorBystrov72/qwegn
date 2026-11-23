@@ -18,6 +18,7 @@ import QWQuant
 
 extension QWEngineDriver {
     public func logitsStats() -> (nan: Int, argmax: Int, max: Float, min: Float) {
+        guard standardState != nil else { return (0, 0, -.infinity, .infinity) }
         let p = sc.logits.region.buffer.contents()
             .advanced(by: sc.logits.region.base + sc.logits.offset)
             .assumingMemoryBound(to: Float.self)
@@ -36,6 +37,7 @@ extension QWEngineDriver {
     /// the f32 bytes exactly as the GPU wrote them (bitPattern-preserved
     /// readback; the engine is deterministic under the pinned-FMA law, so
     public func logitVector() -> [Float] {
+        guard standardState != nil else { return [] }
         let p = sc.logits.region.buffer.contents()
             .advanced(by: sc.logits.region.base + sc.logits.offset)
             .assumingMemoryBound(to: Float.self)
@@ -44,7 +46,9 @@ extension QWEngineDriver {
 
     /// Steady-state allocator counters (the soak gate's data feed).
     public var steadyAllocs: Int {
-        arena.weightsRegion().steadyStateAllocs + arena.activationsRegion().steadyStateAllocs
+        if let hyper = hyperRuntime { return hyper.steadyStateAllocations }
+        if let ink = inkling2Runtime { return ink.steadyStateAllocations }
+        return arena.weightsRegion().steadyStateAllocs + arena.activationsRegion().steadyStateAllocs
             + arena.gdnRegion().steadyStateAllocs
     }
 
@@ -52,7 +56,7 @@ extension QWEngineDriver {
     /// Safe to call once prompt prefill completes. Single-token decode scratchpad (sc)
     /// is kept intact.
     public func evictPrefillScratch() {
-        guard pscByteLength > 0 else { return }
+        guard standardState != nil, pscByteLength > 0 else { return }
         let ptr = pscBuffer.contents().advanced(by: pscByteOffset)
         _ = madvise(ptr, pscByteLength, MADV_DONTNEED)
     }

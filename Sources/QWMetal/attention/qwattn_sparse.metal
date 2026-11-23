@@ -6,47 +6,47 @@
 using namespace metal;
 
 template <uint KV_MODE>
-inline float qwg_fn_kv_read(device const uchar* buf, device const half* meta, uint seg, uint d) {
+inline float qwg_fn_kv_read(device const uchar* buf, device const half* meta, size_t seg, uint d) {
     constexpr uint D = 256u;
     if constexpr (KV_MODE == 0u) {
-        return ((device const float*)buf)[(uint64_t)seg * D + d];
+        return ((device const float*)buf)[seg * D + d];
     } else if constexpr (KV_MODE == 1u) {
-        return float(((device const half*)buf)[(uint64_t)seg * D + d]);
+        return float(((device const half*)buf)[seg * D + d]);
     } else if constexpr (KV_MODE == 2u) {
         const float sc = float(meta[seg]);
-        const int8_t q = ((device const char*)buf)[(uint64_t)seg * D + d];
+        const int8_t q = ((device const char*)buf)[seg * D + d];
         return float(q) * sc;
     } else {
-        const uint mIdx = (seg * 2u + (d >> 7u)) * 2u;
+        const size_t mIdx = (seg * 2u + (d >> 7u)) * 2u;
         const float sc = float(meta[mIdx]);
         const float mn = float(meta[mIdx + 1u]);
-        const uchar byteVal = buf[(uint64_t)seg * (D / 2u) + (d >> 1u)];
+        const uchar byteVal = buf[seg * (D / 2u) + (d >> 1u)];
         const uint nib = ((d & 1u) == 0u) ? (byteVal & 0x0Fu) : (byteVal >> 4u);
         return float(nib) * sc + mn;
     }
 }
 
 template <uint KV_MODE>
-inline void qwg_fn_kv_read_row8(device const uchar* buf, device const half* meta, uint seg, uint lane, thread float (&kvOut)[8]) {
+inline void qwg_fn_kv_read_row8(device const uchar* buf, device const half* meta, size_t seg, uint lane, thread float (&kvOut)[8]) {
     constexpr uint D = 256u;
     if constexpr (KV_MODE == 0u) {
-        device const float* row = ((device const float*)buf) + (uint64_t)seg * D + lane;
+        device const float* row = ((device const float*)buf) + seg * D + lane;
         #pragma unroll
         for (uint c = 0u; c < 8u; c++) kvOut[c] = row[c * 32u];
     } else if constexpr (KV_MODE == 1u) {
-        device const half* row = ((device const half*)buf) + (uint64_t)seg * D + lane;
+        device const half* row = ((device const half*)buf) + seg * D + lane;
         #pragma unroll
         for (uint c = 0u; c < 8u; c++) kvOut[c] = float(row[c * 32u]);
     } else if constexpr (KV_MODE == 2u) {
         const float sc = float(meta[seg]);
-        device const char* row = ((device const char*)buf) + (uint64_t)seg * D + lane;
+        device const char* row = ((device const char*)buf) + seg * D + lane;
         #pragma unroll
         for (uint c = 0u; c < 8u; c++) kvOut[c] = float(row[c * 32u]) * sc;
     } else {
         const half4 m = ((device const half4*)meta)[seg];
         const float sc0 = float(m.x), mn0 = float(m.y);
         const float sc1 = float(m.z), mn1 = float(m.w);
-        device const uchar* row = buf + (uint64_t)seg * (D / 2u) + (lane >> 1u);
+        device const uchar* row = buf + seg * (D / 2u) + (lane >> 1u);
         const uint shift = (lane & 1u) << 2u;
         #pragma unroll
         for (uint c = 0u; c < 4u; c++) {
@@ -62,22 +62,22 @@ inline void qwg_fn_kv_read_row8(device const uchar* buf, device const half* meta
 }
 
 template <uint KV_MODE>
-inline float4 qwg_fn_kv_read_vec4(device const uchar* buf, device const half* meta, uint seg, uint vHalf, uint lane) {
+inline float4 qwg_fn_kv_read_vec4(device const uchar* buf, device const half* meta, size_t seg, uint vHalf, uint lane) {
     constexpr uint D = 256u;
     const uint dBase = vHalf * 128u + lane * 4u;
     if constexpr (KV_MODE == 0u) {
-        return *((device const float4*)(((device const float*)buf) + (uint64_t)seg * D + dBase));
+        return *((device const float4*)(((device const float*)buf) + seg * D + dBase));
     } else if constexpr (KV_MODE == 1u) {
-        const half4 h = *((device const half4*)(((device const half*)buf) + (uint64_t)seg * D + dBase));
+        const half4 h = *((device const half4*)(((device const half*)buf) + seg * D + dBase));
         return float4(h);
     } else if constexpr (KV_MODE == 2u) {
-        const char4 c = *((device const char4*)(((device const char*)buf) + (uint64_t)seg * D + dBase));
+        const char4 c = *((device const char4*)(((device const char*)buf) + seg * D + dBase));
         const float sc = float(meta[seg]);
         return float4(c) * sc;
     } else {
         const half2 m = ((device const half2*)meta)[seg * 2u + vHalf];
         const float sc = float(m.x), mn = float(m.y);
-        const uchar2 b2 = *((device const uchar2*)(buf + (uint64_t)seg * (D / 2u) + (dBase >> 1u)));
+        const uchar2 b2 = *((device const uchar2*)(buf + seg * (D / 2u) + (dBase >> 1u)));
         return float4(float(b2.x & 0x0Fu), float(b2.x >> 4u),
                       float(b2.y & 0x0Fu), float(b2.y >> 4u)) * sc + mn;
     }
@@ -116,12 +116,12 @@ inline void qwg_attn_sparse_gated_impl(device const float* q,
         if (d < cnt) blkIdx[d] = d * BLOCK;
         if (d + 256u < cnt) blkIdx[d + 256u] = (d + 256u) * BLOCK;
     } else {
-        if (d < cnt) blkIdx[d] = uint(list[t * TOPK + d]) * BLOCK;
-        if (d + 256u < cnt) blkIdx[d + 256u] = uint(list[t * TOPK + d + 256u]) * BLOCK;
+        if (d < cnt) blkIdx[d] = uint(list[size_t(t) * TOPK + d]) * BLOCK;
+        if (d + 256u < cnt) blkIdx[d + 256u] = uint(list[size_t(t) * TOPK + d + 256u]) * BLOCK;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device const float* qRow = q + (t * nh + h) * D;
+    device const float* qRow = q + (size_t(t) * nh + h) * D;
     float qReg[8];
     #pragma unroll
     for (uint c = 0u; c < 8u; c++) qReg[c] = qRow[c * 32u + lane];
@@ -129,7 +129,7 @@ inline void qwg_attn_sparse_gated_impl(device const float* q,
         const uint j = (slot < cnt * BLOCK)
             ? blkIdx[slot >> 2u] + (slot & 3u)
             : tailStart + (slot - cnt * BLOCK);
-        const uint seg = j * nkv + g;
+        const size_t seg = size_t(j) * nkv + g;
         float kv[8];
         qwg_fn_kv_read_row8<KV_MODE>(k, kMeta, seg, lane, kv);
         float s0 = 0.0f;
@@ -179,7 +179,7 @@ inline void qwg_attn_sparse_gated_impl(device const float* q,
 
     float acc = 0.0f;
     for (uint b = 0u; b < cnt; b++) {
-        const uint baseSeg = blkIdx[b] * nkv + g;
+        const size_t baseSeg = size_t(blkIdx[b]) * nkv + g;
         const uint s0 = b << 2u;
         const float v0 = qwg_fn_kv_read<KV_MODE>(v, vMeta, baseSeg, d);
         const float v1 = qwg_fn_kv_read<KV_MODE>(v, vMeta, baseSeg + nkv, d);
@@ -192,10 +192,10 @@ inline void qwg_attn_sparse_gated_impl(device const float* q,
     }
     for (uint slot = cnt * BLOCK; slot < slots; slot++) {
         const uint j = tailStart + (slot - cnt * BLOCK);
-        acc = fma(score[slot], qwg_fn_kv_read<KV_MODE>(v, vMeta, j * nkv + g, d), acc);
+        acc = fma(score[slot], qwg_fn_kv_read<KV_MODE>(v, vMeta, size_t(j) * nkv + g, d), acc);
     }
     const float o = acc * invL;
-    const uint outIdx = (t * nh + h) * D + d;
+    const size_t outIdx = (size_t(t) * nh + h) * D + d;
     float x = o / (1.0f + exp(-gate[outIdx]));
     const uint lane2 = d & 31u;
     x = qwg_fwht32_lane_f32(x, lane2);
@@ -243,12 +243,12 @@ inline void qwg_attn_sparse_gated_gqa3_impl(device const float* q,
         if (d < cnt) blkIdx[d] = d * BLOCK;
         if (d + 256u < cnt) blkIdx[d + 256u] = (d + 256u) * BLOCK;
     } else {
-        if (d < cnt) blkIdx[d] = uint(list[t * TOPK + d]) * BLOCK;
-        if (d + 256u < cnt) blkIdx[d + 256u] = uint(list[t * TOPK + d + 256u]) * BLOCK;
+        if (d < cnt) blkIdx[d] = uint(list[size_t(t) * TOPK + d]) * BLOCK;
+        if (d + 256u < cnt) blkIdx[d + 256u] = uint(list[size_t(t) * TOPK + d + 256u]) * BLOCK;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device const float* qRow0 = q + (t * nh + h0) * D;
+    device const float* qRow0 = q + (size_t(t) * nh + h0) * D;
     device const float* qRow1 = qRow0 + D;
     device const float* qRow2 = qRow0 + 2u * D;
     float qReg0[8], qReg1[8], qReg2[8];
@@ -263,7 +263,7 @@ inline void qwg_attn_sparse_gated_gqa3_impl(device const float* q,
         const uint j = (slot < cnt * BLOCK)
             ? blkIdx[slot >> 2u] + (slot & 3u)
             : tailStart + (slot - cnt * BLOCK);
-        const uint seg = j * nkv + g;
+        const size_t seg = size_t(j) * nkv + g;
         float kv[8];
         qwg_fn_kv_read_row8<KV_MODE>(k, kMeta, seg, lane, kv);
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
@@ -358,7 +358,7 @@ inline void qwg_attn_sparse_gated_gqa3_impl(device const float* q,
     const uint dBase = vHalf * 128u + lane * 4u;
     float4 vAcc0 = 0.0f, vAcc1 = 0.0f, vAcc2 = 0.0f;
     for (uint b = vGrp; b < cnt; b += 4u) {
-        const uint baseSeg = blkIdx[b] * nkv + g;
+        const size_t baseSeg = size_t(blkIdx[b]) * nkv + g;
         const uint s0 = b << 2u;
         const float4 sc0 = *((threadgroup const float4*)(score + s0));
         const float4 sc1 = *((threadgroup const float4*)(score + STRIDE + s0));
@@ -383,7 +383,7 @@ inline void qwg_attn_sparse_gated_gqa3_impl(device const float* q,
     if (vGrp == 0u) {
         for (uint slot = cnt * BLOCK; slot < slots; slot++) {
             const uint j = tailStart + (slot - cnt * BLOCK);
-            const float4 vv = qwg_fn_kv_read_vec4<KV_MODE>(v, vMeta, j * nkv + g, vHalf, lane);
+            const float4 vv = qwg_fn_kv_read_vec4<KV_MODE>(v, vMeta, size_t(j) * nkv + g, vHalf, lane);
             vAcc0 = fma(score[slot],               vv, vAcc0);
             vAcc1 = fma(score[STRIDE + slot],      vv, vAcc1);
             vAcc2 = fma(score[2u * STRIDE + slot], vv, vAcc2);
@@ -401,7 +401,7 @@ inline void qwg_attn_sparse_gated_gqa3_impl(device const float* q,
     const uint lane2 = d & 31u;
     #pragma unroll
     for (uint u = 0u; u < 3u; u++) {
-        const uint idx = (t * nh + h0 + u) * D + d;
+        const size_t idx = (size_t(t) * nh + h0 + u) * D + d;
         float x = oArr[u] / (1.0f + exp(-gate[idx]));
         x = qwg_fwht32_lane_f32(x, lane2);
         const float rotVal = x;

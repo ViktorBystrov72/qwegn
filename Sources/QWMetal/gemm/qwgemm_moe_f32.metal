@@ -19,7 +19,28 @@ kernel void qwg_moe_gateup_q4g_f32_r1(device const Block_HQ4_G32* blocks     [[b
     threadgroup float tgAct[128];
     threadgroup QWEmptyTgLut tgLut;
     const QWMoEGateUpF32Params p = { N, K, E };
-    qwg_moe_gateup_f32_r1_body<QWQuantHQ4>(blocks, x, ids, out, p, coldBlocks, tg, tid, sgi, lane, tgAct, tgLut);
+    qwg_moe_gateup_f32_r1_body<QWQuantHQ4, false>(
+        blocks, x, ids, out, p, coldBlocks, float2(0.0f), tg, tid, sgi, lane, tgAct, tgLut);
+}
+
+kernel void qwg_moe_gateup_q4g_f32_r1_sc(device const Block_HQ4_G32* blocks     [[buffer(0)]],
+                                          device const float*         x          [[buffer(1)]],
+                                          device const int*           ids        [[buffer(2)]],
+                                          device float*               out        [[buffer(3)]],
+                                          constant uint&              N          [[buffer(4)]],
+                                          constant uint&              K          [[buffer(5)]],
+                                          constant uint&              E          [[buffer(6)]],
+                                          device const Block_HQ4_G32* coldBlocks [[buffer(7)]],
+                                          constant float2&            softcaps   [[buffer(8)]],
+                                          uint3 tg   [[threadgroup_position_in_grid]],
+                                          uint  tid  [[thread_index_in_threadgroup]],
+                                          uint  sgi  [[simdgroup_index_in_threadgroup]],
+                                          uint  lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tgAct[128];
+    threadgroup QWEmptyTgLut tgLut;
+    const QWMoEGateUpF32Params p = { N, K, E };
+    qwg_moe_gateup_f32_r1_body<QWQuantHQ4, true>(
+        blocks, x, ids, out, p, coldBlocks, softcaps, tg, tid, sgi, lane, tgAct, tgLut);
 }
 
 kernel void qwg_moe_down_shared_combine_q4g_f32(device const Block_HQ4_G32* blocks     [[buffer(0)]],

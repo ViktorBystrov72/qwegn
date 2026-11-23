@@ -8,7 +8,6 @@ import Metal
 import XCTest
 import QWAlloc
 import QWCore
-import QWFlashNext
 import QWHAL
 import QWQuant
 @testable import QWEngine
@@ -617,7 +616,7 @@ final class QWErnie55HybridE2ETests: XCTestCase {
         }
         let box = Box()
         let group = DispatchGroup()
-        FNBatchAdmissionTracker.beginPreparing()
+        QWBatchAdmissionTracker.beginPreparing()
         for idx in 0..<prompts.count {
             group.enter()
             DispatchQueue.global().async {
@@ -628,7 +627,7 @@ final class QWErnie55HybridE2ETests: XCTestCase {
             }
         }
         usleep(2000)
-        FNBatchAdmissionTracker.endPreparing()
+        QWBatchAdmissionTracker.endPreparing()
         group.wait()
 
         for idx in 0..<prompts.count {

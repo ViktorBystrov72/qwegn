@@ -4,7 +4,8 @@ import QWCore
 import QWHAL
 import QWAlloc
 import QWGEMM
-import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 /// Route kernel alone: 48 dispatches (one per layer) in one command buffer, GPU time per dispatch.
 final class FNMetalRouteBenchTests: XCTestCase {

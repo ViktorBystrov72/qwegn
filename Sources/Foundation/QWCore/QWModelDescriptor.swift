@@ -24,6 +24,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
         case qwen2Dense = "qwen2-dense"
         case llamaDense = "llama-dense"
         case mistralDense = "mistral-dense"
+        case inkling2Loop = "inkling2_loop"
     }
 
     public enum Capability: String, Sendable, Hashable, CaseIterable, Codable {
@@ -70,6 +71,13 @@ public struct QWModelDescriptor: Sendable, Hashable {
         }
     }
 
+    /// RoPE context-scaling specification decoded from HF `rope_scaling` / `rope_parameters`.
+    public enum RoPEScaling: Sendable, Hashable, Codable, Equatable {
+        case yarn(YarnRopeConfig)
+        case linear(factor: Double)
+        case dynamic(factor: Double, originalMaxPositionEmbeddings: Int?)
+    }
+
     public let family: Family
     public let role: QWModelRole
     public let modelType: String                  // HF `model_type`
@@ -81,6 +89,9 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let hybridMLAConfig: HybridMLAConfig?
     public let blockSparseGQAConfig: BlockSparseGQAConfig?
     public let yarnRopeConfig: YarnRopeConfig?
+    public let ropeScaling: RoPEScaling?
+    public let slidingWindow: Int?
+    public let layerSlidingWindows: [Int]?
     public let activationKind: ActivationKind
     public let moeLatentSize: Int?
     public let latentMoeUseNorm: Bool
@@ -89,6 +100,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let routedScalingFactorLearnable: Bool
     public let multimaxHead: Bool
     public let mtpSharedLastLayer: Bool
+    public let inkling2Config: Inkling2Config?
 
     // Text stack
     public let hidden: Int
@@ -135,6 +147,8 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let sharedExpertHasGate: Bool
     public let expertGateType: String?            // "sigmoid" on FN / GLM-5.3
     public let firstKDenseReplace: Int
+    public let mlpOnlyLayers: Set<Int>
+    public let decoderSparseStep: Int
     public let moeLayerFreq: Int
     public let routedScalingFactor: Float
     public let swigluLimit: Float?
@@ -177,6 +191,8 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let mropeH: Int
     public let mropeT: Int
     public let hasQKNorm: Bool
+    public let hasQKVBias: Bool
+    public let hasAttnOutputBias: Bool
     public let usesPlusOneRMSNorm: Bool
     public let quantization: QWQuantizationSpec?
     public let hasMropeSection: Bool
@@ -218,6 +234,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 usesChatTemplateIds: true
             )
         }
+        if family == .inkling2Loop { return inkling2SpecialTokens(stops: stops) }
         return QWModelSpecialTokens(eosTokenId: eosTokenId,
                                      extraStopTokenIds: stops,
                                      usesChatTemplateIds: usesChatTemplateIds)
@@ -254,6 +271,8 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 imageTokenId: Int = 248056, videoTokenId: Int = 248057,
                 visionStartTokenId: Int = 248053, visionEndTokenId: Int = 248054,
                 hasQKNorm: Bool = false,
+                hasQKVBias: Bool = false,
+                hasAttnOutputBias: Bool = false,
                 usesPlusOneRMSNorm: Bool? = nil,
                 quantization: QWQuantizationSpec? = nil,
                 hasMropeSection: Bool = true,
@@ -264,6 +283,8 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 loopSettings: LoopSettings? = nil,
                 mhcConfig: MHCConfig? = nil,
                 firstKDenseReplace: Int = 0,
+                mlpOnlyLayers: Set<Int> = [],
+                decoderSparseStep: Int = 1,
                 moeLayerFreq: Int = 1,
                 routedScalingFactor: Float = 1.0,
                 swigluLimit: Float? = nil,
@@ -288,6 +309,9 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 hybridMLAConfig: HybridMLAConfig? = nil,
                 blockSparseGQAConfig: BlockSparseGQAConfig? = nil,
                 yarnRopeConfig: YarnRopeConfig? = nil,
+                ropeScaling: RoPEScaling? = nil,
+                slidingWindow: Int? = nil,
+                layerSlidingWindows: [Int]? = nil,
                 activationKind: ActivationKind = .silu,
                 moeLatentSize: Int? = nil,
                 latentMoeUseNorm: Bool = false,
@@ -296,9 +320,11 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 routedScalingFactorLearnable: Bool = false,
                 multimaxHead: Bool = false,
                 mtpSharedLastLayer: Bool = false,
+                inkling2Config: Inkling2Config? = nil,
                 role: QWModelRole? = nil) {
         self.family = family; self.modelType = modelType
         self.role = role ?? (capabilities.contains(.vision) ? .multimodalConditionalLM : .causalLM)
+        self.inkling2Config = inkling2Config
         self.envelopeModelType = envelopeModelType
         self.capabilities = capabilities
         self.loopSettings = loopSettings
@@ -306,7 +332,16 @@ public struct QWModelDescriptor: Sendable, Hashable {
         self.hcaConfig = hcaConfig
         self.hybridMLAConfig = hybridMLAConfig
         self.blockSparseGQAConfig = blockSparseGQAConfig
-        self.yarnRopeConfig = yarnRopeConfig
+        if let yarnRopeConfig {
+            self.yarnRopeConfig = yarnRopeConfig
+        } else if hybridMLAConfig == nil, hcaConfig == nil, case .yarn(let y) = ropeScaling {
+            self.yarnRopeConfig = y
+        } else {
+            self.yarnRopeConfig = nil
+        }
+        self.ropeScaling = ropeScaling ?? yarnRopeConfig.map { .yarn($0) }
+        self.slidingWindow = slidingWindow.flatMap { $0 > 0 ? $0 : nil }
+        self.layerSlidingWindows = layerSlidingWindows
         self.activationKind = activationKind
         self.moeLatentSize = moeLatentSize
         self.latentMoeUseNorm = latentMoeUseNorm
@@ -333,7 +368,10 @@ public struct QWModelDescriptor: Sendable, Hashable {
         self.numExperts = numExperts; self.expertsPerTok = expertsPerTok; self.moeIntermediate = moeIntermediate
         self.sharedExpertIntermediate = sharedExpertIntermediate; self.sharedExpertHasGate = sharedExpertHasGate
         self.expertGateType = expertGateType
-        self.firstKDenseReplace = firstKDenseReplace; self.moeLayerFreq = moeLayerFreq
+        self.firstKDenseReplace = firstKDenseReplace
+        self.mlpOnlyLayers = mlpOnlyLayers
+        self.decoderSparseStep = max(1, decoderSparseStep)
+        self.moeLayerFreq = moeLayerFreq
         self.routedScalingFactor = routedScalingFactor; self.swigluLimit = swigluLimit
         self.topkMethod = topkMethod; self.residentExpertsPerLayer = residentExpertsPerLayer
         self.hcCount = hcCount; self.hcLowrank = hcLowrank
@@ -352,6 +390,8 @@ public struct QWModelDescriptor: Sendable, Hashable {
         self.imageTokenId = imageTokenId; self.videoTokenId = videoTokenId
         self.visionStartTokenId = visionStartTokenId; self.visionEndTokenId = visionEndTokenId
         self.hasQKNorm = hasQKNorm
+        self.hasQKVBias = hasQKVBias
+        self.hasAttnOutputBias = hasAttnOutputBias
         let defaultPlusOne = QWModelFamilyRegistry.shared.spec(forModelType: modelType)?.usesPlusOneRMSNorm
             ?? [.qwen38Dense, .qwen38MoE, .senseNovaLoop].contains(family)
         self.usesPlusOneRMSNorm = usesPlusOneRMSNorm ?? defaultPlusOne
@@ -362,33 +402,44 @@ public struct QWModelDescriptor: Sendable, Hashable {
 
     // MARK: - Derived views
 
+    /// True when 4-lane gated hyper-connections are active (`hc_count > 0`).
+    public var usesMultiStreamHC: Bool { (hcCount ?? 0) > 0 }
+
+    /// True when per-layer embeddings (PLE / n-gram table) are configured.
+    public var hasPLE: Bool { !(pleLayerIds?.isEmpty ?? true) || capabilities.contains(.ple) }
+
     /// True when the model carries native MTP prediction layers or capability.
     public var supportsNativeMTP: Bool {
         mtpLayers > 0 || capabilities.contains(.mtp)
     }
 
+    /// True when the model supports native speculative decoding (MTP layers/capability).
+    public var usesNativeSpeculative: Bool { supportsNativeMTP }
+
     /// True when routed experts can be streamed via DenseModule's cold-expert streamer.
     public var supportsExpertStreaming: Bool {
-        guard (numExperts ?? 0) > 0 else { return false }
+        guard (numExperts ?? 0) > 0, !usesMultiStreamHC, !hasPLE else { return false }
         if let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelType) {
             return spec.supportsExpertStreaming
         }
-        return family != .qwen38FlashNext
+        return true
     }
 
     /// Maximum supported speculative draft depth for this model architecture.
     public var maxSpeculativeDrafts: Int {
         if role == .speculativeDrafter { return 0 }
+        if usesMultiStreamHC || hasPLE { return 3 }
         if let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelType) {
             return spec.maxSpeculativeDrafts
         }
-        return family == .qwen38FlashNext ? 3 : 7
+        return 15
     }
 
     /// True when physical layer `l` uses a sparse MoE block rather than a dense MLP.
     public func isMoELayer(_ l: Int) -> Bool {
         guard let n = numExperts, n > 0, (0..<numLayers).contains(l) else { return false }
-        guard l >= firstKDenseReplace else { return false }
+        guard !mlpOnlyLayers.contains(l), l >= firstKDenseReplace else { return false }
+        if decoderSparseStep > 1, (l + 1) % decoderSparseStep != 0 { return false }
         let freq = max(1, moeLayerFreq)
         return (l - firstKDenseReplace) % freq == 0
     }
@@ -431,12 +482,16 @@ public struct QWModelDescriptor: Sendable, Hashable {
             visMerge: visMerge, visPosEmbeds: visPosEmbeds, visOut: visOut,
             imageTokenId: imageTokenId, videoTokenId: videoTokenId,
             visionStartTokenId: visionStartTokenId, visionEndTokenId: visionEndTokenId,
-            hasQKNorm: hasQKNorm, usesPlusOneRMSNorm: usesPlusOneRMSNorm,
+            hasQKNorm: hasQKNorm, hasQKVBias: hasQKVBias, hasAttnOutputBias: hasAttnOutputBias,
+            usesPlusOneRMSNorm: usesPlusOneRMSNorm,
             quantization: quantization, hasMropeSection: hasMropeSection,
             tieWordEmbeddings: tieWordEmbeddings, normTopKProb: normTopKProb,
             eosTokenIds: eosTokenIds, envelopeModelType: envelopeModelType,
             loopSettings: loopSettings, mhcConfig: mhcConfig,
-            firstKDenseReplace: firstKDenseReplace, moeLayerFreq: moeLayerFreq,
+            firstKDenseReplace: firstKDenseReplace,
+            mlpOnlyLayers: mlpOnlyLayers,
+            decoderSparseStep: decoderSparseStep,
+            moeLayerFreq: moeLayerFreq,
             routedScalingFactor: routedScalingFactor, swigluLimit: swigluLimit,
             topkMethod: topkMethod, residentExpertsPerLayer: count,
             sharedExpertHasGate: sharedExpertHasGate,
@@ -449,21 +504,31 @@ public struct QWModelDescriptor: Sendable, Hashable {
             hcaConfig: hcaConfig, hybridMLAConfig: hybridMLAConfig,
             blockSparseGQAConfig: blockSparseGQAConfig,
             yarnRopeConfig: yarnRopeConfig,
+            ropeScaling: ropeScaling,
+            slidingWindow: slidingWindow,
+            layerSlidingWindows: layerSlidingWindows,
             activationKind: activationKind, moeLatentSize: moeLatentSize,
             latentMoeUseNorm: latentMoeUseNorm,
             moeSplitFeatureRouting: moeSplitFeatureRouting,
             moeRouterEnableExpertBias: moeRouterEnableExpertBias,
             routedScalingFactorLearnable: routedScalingFactorLearnable,
             multimaxHead: multimaxHead, mtpSharedLastLayer: mtpSharedLastLayer,
-            role: role
+            inkling2Config: inkling2Config, role: role
         )
     }
 
-    /// 0-based module indices of full-attention layers, from the authoritative list.
-    public var fullAttentionLayers: [Int] { layerTypes.indices.filter { layerTypes[$0] == "full_attention" } }
+    /// 0-based module indices of paged-KV GQA attention layers (`full_attention` or `sliding_attention`).
+    public var fullAttentionLayers: [Int] { layerTypes.indices.filter { Self.isGQALayerKind(layerTypes[$0]) } }
     /// 0-based module indices carrying a PLE injection (ids are one-indexed).
     public var pleModuleIndices: [Int] { (pleLayerIds ?? []).map { $0 - 1 }.sorted() }
-    public func isFullAttention(_ l: Int) -> Bool { (0..<numLayers).contains(l) && layerTypes[l] == "full_attention" }
+    public func isFullAttention(_ l: Int) -> Bool { (0..<numLayers).contains(l) && Self.isGQALayerKind(layerTypes[l]) }
+    public func layerSlidingWindow(_ l: Int) -> Int {
+        guard isFullAttention(l) else { return 0 }
+        if let perLayer = layerSlidingWindows, l < perLayer.count { return max(0, perLayer[l]) }
+        return max(0, slidingWindow ?? 0)
+    }
+    public var hasAnySlidingWindow: Bool { layerTypes.indices.contains { layerSlidingWindow($0) > 0 } }
+    private static func isGQALayerKind(_ kind: String) -> Bool { kind == "full_attention" || kind == "sliding_attention" }
     /// q_proj output channels: Q‖gate when the attention carries an output gate.
     public var qProjOut: Int { (attnOutputGate ? 2 : 1) * qHeads * headDim }
     public var rotaryDims: Int { Int(Double(headDim) * partialRotaryFactor) }
@@ -565,6 +630,8 @@ public struct QWModelDescriptor: Sendable, Hashable {
         f.append("norm_topk=\(d.normTopKProb ? 1 : 0)")
         f.append("tie_emb=\(d.tieWordEmbeddings ? 1 : 0)")
         f.append("qk_norm=\(d.hasQKNorm ? 1 : 0)")
+        if d.hasQKVBias { f.append("qkv_bias=1") }
+        if d.hasAttnOutputBias { f.append("o_bias=1") }
         f.append("plus1_rms=\(d.usesPlusOneRMSNorm ? 1 : 0)")
         if let bsa = d.blockSparseGQAConfig {
             f.append("bsa=\(bsa.blockSize),\(bsa.prefixBlocks),\(bsa.localBlocks),\(bsa.remoteBlocks)")
@@ -579,11 +646,29 @@ public struct QWModelDescriptor: Sendable, Hashable {
         appendYarn("yarn", d.yarnRopeConfig)
         appendYarn("hca_yarn", d.hcaConfig?.yarn)
         appendYarn("mla_yarn", d.hybridMLAConfig?.yarn)
+        if case .linear(let factor) = d.ropeScaling {
+            f.append("rope_scale=linear,0x\(String(factor.bitPattern, radix: 16, uppercase: false))")
+        } else if case .dynamic(let factor, let orig) = d.ropeScaling {
+            f.append("rope_scale=dynamic,0x\(String(factor.bitPattern, radix: 16, uppercase: false)),\(orig ?? 0)")
+        }
+        if let sw = d.slidingWindow, sw > 0 {
+            f.append("sw=\(sw)")
+        }
+        if let swL = d.layerSlidingWindows {
+            f.append("sw_layers=\(swL.map(String.init).joined(separator: ","))")
+        }
+        if !d.mlpOnlyLayers.isEmpty {
+            f.append("mlp_only=\(d.mlpOnlyLayers.sorted().map(String.init).joined(separator: ","))")
+        }
+        if d.decoderSparseStep > 1 {
+            f.append("sparse_step=\(d.decoderSparseStep)")
+        }
         if d.capabilities.contains(.vision) {
             f.append("vis=\(d.visDepth),\(d.visHidden),\(d.visHeads),\(d.visIntermediate),\(d.visPatch),\(d.visMerge),\(d.visPosEmbeds),\(d.visOut),\(d.imageTokenId),\(d.videoTokenId)")
         } else {
             f.append("vis=-")
         }
+        appendInkling2DigestFields(d, into: &f)
         return f
     }
 
@@ -591,6 +676,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
         let kinds = d.layerTypes.map { kind -> String in
             if kind == "full_attention" { return "F" }
             if kind == "compressed_attention" { return "C" }
+            if kind == "sliding_attention" { return "S" }
             return "L"
         }.joined()
         var f: [String] = [
@@ -670,17 +756,20 @@ public struct QWModelDescriptor: Sendable, Hashable {
             if n <= 0 { bad.append("numExperts") }
             if let k = expertsPerTok, k <= 0 || k > n { bad.append("expertsPerTok") }
         }
-        var validKinds: Set<String> = ["full_attention", "linear_attention", "compressed_attention"]
-        if role == .speculativeDrafter { validKinds.insert("sliding_attention") }
+        let validKinds: Set<String> = ["full_attention", "linear_attention", "compressed_attention", "sliding_attention"]
         if layerTypes.count != numLayers { bad.append("layerTypes.count") }
         if !layerTypes.allSatisfy({ validKinds.contains($0) }) { bad.append("layerTypes") }
+        if let swL = layerSlidingWindows, (swL.count != numLayers || swL.contains(where: { $0 < 0 })) {
+            bad.append("layerSlidingWindows")
+        }
         if hasMropeSection, mropeW + mropeH + mropeT != rotaryDims / 2 { bad.append("mropeSection") }
         if !linearAttentionLayers.isEmpty, (gdnQKHeads <= 0 || gdnVHeads <= 0 || gdnHeadDim <= 0) {
             bad.append("gdnDims")
         }
         if gdnQKVChannels != (2 * gdnQKHeads + gdnVHeads) * gdnHeadDim { bad.append("gdnQKVChannels") }
         if gdnZChannels != gdnVHeads * gdnHeadDim { bad.append("gdnZChannels") }
-        if fullAttentionInterval > 0, layerTypes.count == numLayers {
+        if fullAttentionInterval > 0, layerTypes.count == numLayers,
+           layerTypes.contains("linear_attention") || layerTypes.contains("compressed_attention") {
             let every = fullAttentionLayers.allSatisfy { ($0 + 1) % fullAttentionInterval == 0 }
             if !every { bad.append("full-layer cadence vs interval") }
         }

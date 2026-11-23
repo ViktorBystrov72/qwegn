@@ -234,6 +234,30 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
             return s.shape(prefix + key)
         }
         let posShape = lookupShape("pos_embed.weight")
+        if index["embeddings.patch_embedding.weight"] != nil {
+            let inkPos = lookupShape("embeddings.position_embedding")
+            let inkPE = lookupShape("embeddings.patch_embedding.weight")
+            let dim = inkPos?.dropFirst().first ?? inkPE?.first ?? 1024
+            let numPos = inkPos?.first ?? 1024
+            let patchChan = inkPE?.dropFirst().first ?? 1200
+            let patch = max(1, Int(Double(patchChan / 3).squareRoot().rounded()))
+            let mlpInner = lookupShape("layers.0.mlp.fc1.weight")?.first ?? (dim * 4)
+            let projInW = lookupShape("proj_in.weight")
+            let merged = projInW?.last ?? (dim * 4)
+            let projHidden = projInW?.first ?? merged
+            let merge = dim > 0 ? max(1, Int(Double(merged / dim).squareRoot().rounded())) : 2
+            let outDim = lookupShape("proj_out.weight")?.first ?? 2304
+            var depth = 0
+            while lookupShape("layers.\(depth).layernorm_before.weight") != nil { depth += 1 }
+            let heads = max(1, dim / 64)
+            return QWVisionConfig(
+                dim: dim, heads: heads, headDim: dim / heads, depth: max(1, depth),
+                mlpInner: mlpInner, patch: patch, temporal: 1, merge: merge,
+                numPosEmbeds: numPos, outDim: outDim, imageTokenId: 200054, videoTokenId: -1,
+                ropeTheta: 10_000.0, eps: 1e-5, architecture: .inkling2,
+                projectionHiddenDim: projHidden, projectorBias: lookupShape("proj_in.bias") != nil
+            )
+        }
         let pwShape = lookupShape("patch_embed.proj.weight")
         let ref = QWVisionConfig.qwen3VLReference
         let dim = posShape?.dropFirst().first ?? pwShape?.first ?? ref.dim

@@ -32,6 +32,7 @@ public final class QWAttnDecode {
     public let threadsPerGroup: Int
     private let hal: QWHal
     private let isGeneral: Bool
+    private let hasSlidingWindow: Bool
     private let psoDecode: any MTLComputePipelineState
     private let psoDecodeSparse: any MTLComputePipelineState
     private let psoCombine: any MTLComputePipelineState
@@ -78,6 +79,34 @@ public final class QWAttnDecode {
         case .q4:  return "qwg_attn_decode_shared_m\(b)_q4"
         }
     }
+    static func generalDecodeKernelName(_ mode: QWKVMode, headDim: Int) -> String {
+        if headDim <= 128 {
+            switch mode {
+            case .f16: return "qwg_attn_decode_general_hd128"
+            case .q8:  return "qwg_attn_decode_general_hd128_q8"
+            case .q4:  return "qwg_attn_decode_general_hd128_q4"
+            }
+        }
+        switch mode {
+        case .f16: return "qwg_attn_decode_general"
+        case .q8:  return "qwg_attn_decode_general_q8"
+        case .q4:  return "qwg_attn_decode_general_q4"
+        }
+    }
+    static func generalSharedKernelName(_ mode: QWKVMode, _ b: Int, headDim: Int) -> String {
+        if headDim <= 128 {
+            switch mode {
+            case .f16: return "qwg_attn_decode_general_shared_hd128_m\(b)"
+            case .q8:  return "qwg_attn_decode_general_shared_hd128_m\(b)_q8"
+            case .q4:  return "qwg_attn_decode_general_shared_hd128_m\(b)_q4"
+            }
+        }
+        switch mode {
+        case .f16: return "qwg_attn_decode_general_shared_m\(b)"
+        case .q8:  return "qwg_attn_decode_general_shared_m\(b)_q8"
+        case .q4:  return "qwg_attn_decode_general_shared_m\(b)_q4"
+        }
+    }
     /// EXP-9 sub-item 3 (opt-in, NOT default): batched-dispatch variants of
     /// the two kernels above. Lazily resolved so callers that never use the
     /// batched path pay no extra pipeline-build cost.
@@ -120,40 +149,43 @@ public final class QWAttnDecode {
         self.threadsPerGroup = max(1, geometry.qHeads / max(1, geometry.kvHeads)) * 32
         self.hal = hal
         self.kvMode = kvMode
-        // The frozen decode serves the 27B's shape and nothing else (C108);
-        // every other geometry takes the general pair, whose lanes past the
-        // head's data carry zeros (C102).
+        // The specialized decode serves 4×256 GQA-6 gated attention without sliding window;
+        // other geometries use the general kernels supporting headDim in 32...256, gqa <= 16.
         let gqa = geometry.gqaRatio
-        let general = forceGeneral || !geometry.is27BShape
+        let hasSlidingWindow = geometry.hasAnySlidingWindow
+        let general = forceGeneral || !geometry.matchesHead256GQA6Kernel
+            || !geometry.attnOutputGate || hasSlidingWindow
         self.isGeneral = general
+        self.hasSlidingWindow = hasSlidingWindow
         if general {
-            // The general kernel stages 2 × the GQA ratio keys per phase,
-            // and its staging holds at most 16.
-            guard gqa <= 8 else {
+            guard geometry.headDim >= 32, geometry.headDim <= 256, geometry.headDim % 32 == 0 else {
                 throw QWAttnDecodeError.badShape(
-                    "the general decode stages 2×\(gqa) keys per phase (max 16)")
+                    "general decode requires headDim in 32...256 multiple of 32, got \(geometry.headDim)")
+            }
+            // The general kernel stages min(16, 2 × gqaRatio) keys across gqaRatio × 32 threads.
+            guard gqa <= 16 else {
+                throw QWAttnDecodeError.badShape(
+                    "general decode supports gqaRatio <= 16, got \(gqa)")
             }
             guard kvMode == .f16 || kvMode == .q8 || kvMode == .q4 else {
                 throw QWAttnDecodeError.badShape(
                     "a \(geometry.headDim)-half head supports f16, q8, or q4 KV only")
             }
         }
-        let generalDecodeName: String
-        switch kvMode {
-        case .f16: generalDecodeName = "qwg_attn_decode_general"
-        case .q8:  generalDecodeName = "qwg_attn_decode_general_q8"
-        case .q4:  generalDecodeName = "qwg_attn_decode_general_q4"
-        }
+        let generalDecodeName = Self.generalDecodeKernelName(kvMode, headDim: geometry.headDim)
         self.psoDecode = try hal.pipeline(general ? generalDecodeName
                                                    : Self.decodeKernelName(kvMode))
         self.psoDecodeSparse = try hal.pipeline(Self.sparseDecodeKernelName(kvMode))
         self.psoCombine = try hal.pipeline(general ? "qwg_attn_decode_combine_general"
                                                      : "qwg_attn_decode_combine")
         self.sharedPrefixRows = sharedPrefixRows
-        if !general, let sharedPrefixRows {
+        if let sharedPrefixRows, general || !hasSlidingWindow {
             var map: [Int: any MTLComputePipelineState] = [:]
             for r in 2...sharedPrefixRows {
-                map[r] = try hal.pipeline(Self.sharedKernelName(kvMode, r))
+                let name = general
+                    ? Self.generalSharedKernelName(kvMode, r, headDim: geometry.headDim)
+                    : Self.sharedKernelName(kvMode, r)
+                map[r] = try hal.pipeline(name)
             }
             psoSharedPrefixByRows = map
             psoSharedCombine = try hal.pipeline(general ? "qwg_attn_decode_combine_batched_general"
@@ -188,6 +220,55 @@ public final class QWAttnDecode {
         return max(8, min(64, (keys + tokensPerSplit - 1) / tokensPerSplit))
     }
 
+    /// Wave-aligned split plan for `gpuCores` GPU cores across `kvHeads` threadgroups per split.
+    public static func splits(
+        forKeys keys: Int,
+        kvHeads: Int,
+        gpuCores: Int = 40,
+        tokensPerSplit: Int = 256
+    ) -> Int {
+        guard keys > 0 else { return 8 }
+        let tps = max(1, tokensPerSplit)
+        let heads = max(1, kvHeads)
+        let cores = max(1, gpuCores)
+        let cap = keys > 262_144 ? maxLongContextSplits : maxSplits
+        let raw = keys > 262_144
+            ? min(cap, max(64, (keys + 4095) / 4096))
+            : max(8, min(cap, (keys + tps - 1) / tps))
+        let tgs = heads * raw
+        let wFloor = tgs / cores
+        let rem = tgs % cores
+        if rem == 0 { return raw }
+
+        func waveEfficiency(_ s: Int) -> Double {
+            let totalTGs = heads * s
+            let waves = (totalTGs + cores - 1) / cores
+            return Double(totalTGs) / Double(waves * cores)
+        }
+
+        if wFloor == 0 {
+            let sWave = min(cap, cores / heads)
+            if sWave > raw && keys >= sWave * 64 && waveEfficiency(sWave) > waveEfficiency(raw) {
+                return sWave
+            }
+            return raw
+        }
+
+        let sDown = max(1, (wFloor * cores) / heads)
+        let sUp = min(cap, ((wFloor + 1) * cores) / heads)
+        let minDown = max(1, (raw * 3 + 3) / 4)
+        if rem * 2 <= cores && sDown >= minDown && waveEfficiency(sDown) > waveEfficiency(raw) {
+            return sDown
+        }
+        if sUp > raw && waveEfficiency(sUp) > waveEfficiency(raw) {
+            return sUp
+        }
+        if sDown >= minDown && waveEfficiency(sDown) > waveEfficiency(raw) {
+            return sDown
+        }
+        return raw
+    }
+
     /// Encode one decode step: qgate [12288] f16 (q̂‖gate interleaved,
     /// rope/norm applied by C06.4/C07 upstream), the C10 (layer, kind) views
     /// for this sequence, the new token's k̂/v̂ [1024] f16 rows, out [6144]
@@ -197,7 +278,8 @@ public final class QWAttnDecode {
                        knew: QWTensorValue, vnew: QWTensorValue,
                        partials: QWMRegion,
                        out: QWTensorValue,
-                       C: Int, splits: Int) throws {
+                       C: Int, splits: Int,
+                       slidingWindow: Int? = nil) throws {
         guard C >= 0, splits >= 1, splits <= Self.maxLongContextSplits,
               qgate.shape.elementCount == geometry.qProjOut,
               knew.shape.elementCount == geometry.kvHeads * geometry.headDim,
@@ -214,7 +296,11 @@ public final class QWAttnDecode {
               kv.v.table.shape.elementCount >= pages
         else { throw QWAttnDecodeError.badShape("page table too short for C=\(C)") }
 
-        var cU = UInt32(C), sU = UInt32(splits)
+        let resolvedSW = max(0, slidingWindow ?? geometry.descriptor.slidingWindow ?? 0)
+        if resolvedSW > 0 && !isGeneral {
+            throw QWAttnDecodeError.badShape("slidingWindow \(resolvedSW) requires general decode pipeline")
+        }
+        var cU = UInt32(C), sU = UInt32(splits), swU = UInt32(resolvedSW)
         // 4c: the kernel's pool addressing mode comes from the VIEW, never
         // a caller flag. q8 pages address in bytes (payload 262144 + f16
         // scale array 2048); f16 pages address in QW_PGEL halves. Any other
@@ -237,6 +323,7 @@ public final class QWAttnDecode {
         enc.setBytes(&sU, length: 4, index: 9)
         if isGeneral {
             out.bind(enc, index: 10)
+            enc.setBytes(&swU, length: 4, index: 11)
         }
         // v3 shape: one workgroup = ONE kv-head's six q-heads (192 lanes =
         // 6 simdgroups) — the spec's head fusion. Grid = 4 × splits.
@@ -384,7 +471,8 @@ public final class QWAttnDecode {
                               knew: QWTensorValue, vnew: QWTensorValue,
                               partials: QWMRegion,
                               out: QWTensorValue,
-                              cBase: Int, T: Int, splits: Int, sharedPrefix: Bool = false) throws {
+                              cBase: Int, T: Int, splits: Int, sharedPrefix: Bool = false,
+                              slidingWindow: Int? = nil) throws {
         if sharedPrefix {
             func valid(_ value: QWTensorValue, dtype: QWDType = .f16) -> Bool {
                 let region = value.region
@@ -439,9 +527,19 @@ public final class QWAttnDecode {
               kv.v.table.shape.elementCount >= pages
         else { throw QWAttnDecodeError.badShape("page table too short for cBase=\(cBase) T=\(T)") }
 
-        // A common split stride preserves the reference's 12-key fold boundaries.
-        // At a stride transition, use the scalar reference instead of reordering.
-        if isGeneral || (sharedPrefix && (cBase + splits) / splits != (cBase + T + splits - 1) / splits) {
+        // General non-shared batched (`sharedPrefix == false`), specialized sliding-window,
+        // and split-stride transitions fall back to sequential `encode` for exactness.
+        let resolvedSW = max(0, slidingWindow ?? geometry.descriptor.slidingWindow ?? 0)
+        if resolvedSW > 0 && !isGeneral {
+            throw QWAttnDecodeError.badShape("slidingWindow \(resolvedSW) requires general decode pipeline")
+        }
+        let active0 = resolvedSW > 0 ? min(cBase + 1, resolvedSW) : (cBase + 1)
+        let activeLast = resolvedSW > 0 ? min(cBase + T, resolvedSW) : (cBase + T)
+        let strideMismatch = sharedPrefix && ((active0 + splits - 1) / splits != (activeLast + splits - 1) / splits)
+        let useSequentialFallback = sharedPrefix
+            ? ((!isGeneral && (resolvedSW > 0 || hasSlidingWindow)) || strideMismatch)
+            : (isGeneral || resolvedSW > 0)
+        if useSequentialFallback {
             func row(_ tensor: QWTensorValue, _ index: Int, _ columns: Int) -> QWTensorValue {
                 QWTensorValue(region: tensor.region, offset: tensor.offset + index * columns * 2,
                               shape: QWTensorShape([columns], .f16))
@@ -451,12 +549,12 @@ public final class QWAttnDecode {
                     knew: row(knew, query, geometry.kvHeads * geometry.headDim),
                     vnew: row(vnew, query, geometry.kvHeads * geometry.headDim),
                     partials: partials, out: row(out, query, geometry.qHeads * geometry.headDim),
-                    C: cBase + query, splits: splits)
+                    C: cBase + query, splits: splits, slidingWindow: resolvedSW)
                 enc.memoryBarrier(scope: .buffers)
             }
             return
         }
-        var cU = UInt32(cBase), sU = UInt32(splits)
+        var cU = UInt32(cBase), sU = UInt32(splits), swU = UInt32(resolvedSW)
         guard kv.k.mode == kvMode else {
             throw QWAttnDecodeError.badShape("view mode \(kv.k.mode) != pipeline mode \(kvMode)")
         }
@@ -479,6 +577,9 @@ public final class QWAttnDecode {
         enc.setBuffer(partials.buffer, offset: partials.base, index: 7)
         enc.setBytes(&cU, length: 4, index: 8)
         enc.setBytes(&sU, length: 4, index: 9)
+        if sharedPrefix && isGeneral {
+            enc.setBytes(&swU, length: 4, index: 10)
+        }
         enc.dispatchThreadgroups(
             MTLSize(width: geometry.kvHeads, height: splits, depth: sharedPrefix ? 1 : T),
             threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1))

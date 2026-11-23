@@ -50,7 +50,7 @@ public final class QWMTPRandomStream {
         return token
     }
 
-    public func beginGumbelRound(drafts: Int, vocabulary: Int, maxDrafts: Int = 7) throws {
+    public func beginGumbelRound(drafts: Int, vocabulary: Int, maxDrafts: Int = 15) throws {
         guard !isRoundActive, maxDrafts >= 1, (1...maxDrafts).contains(drafts), vocabulary > 0 else {
             throw QWMTP.ProtocolError.invalid("Gumbel round draft count or vocabulary is invalid")
         }
@@ -94,7 +94,7 @@ public final class QWMTPRandomStream {
         }
         let result = try QWMTP.checkedGumbelCouplingRound(
             draftDistributions: proposals.map(\.distribution), targetDistributions: targetDistributions,
-            seed: seed, offset: round.start, maxDrafts: max(7, expectedDrafts))
+            seed: seed, offset: round.start, maxDrafts: max(15, expectedDrafts))
         drawsConsumed = round.start + UInt64(expectedDrafts + 1) * UInt64(round.vocabulary)
         expectedDrafts = 0
         sampled = 0
@@ -124,7 +124,7 @@ public final class QWMTPRandomStream {
             seed: seed,
             offset: round.start,
             margin: margin,
-            maxDrafts: max(7, expectedDrafts)
+            maxDrafts: max(15, expectedDrafts)
         )
         drawsConsumed = round.start + UInt64(expectedDrafts + 1) * UInt64(round.vocabulary)
         expectedDrafts = 0

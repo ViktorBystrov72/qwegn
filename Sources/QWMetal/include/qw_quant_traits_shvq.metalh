@@ -47,6 +47,12 @@ struct QWQuantSHVQ {
         return qwg_shvq_slice_dot2_tg<BITS>(gp, byteInGroup, a0.lo, a0.hi, a1.lo, a1.hi, tgLut);
     }
 
+    METAL_FUNC static float2 slice_dot2_acc(WeightPtr gp, uint byteInGroup, thread const ActSlice& a0,
+                                            thread const ActSlice& a1, threadgroup const TgLut& tgLut,
+                                            float2 acc) {
+        return qwg_shvq_slice_dot2_acc_tg<BITS>(gp, byteInGroup, a0.lo, a0.hi, a1.lo, a1.hi, tgLut, acc);
+    }
+
     METAL_FUNC static void unpack_lane4_f32(WeightPtr wrow, uint g, uint dl,
                                             thread float2& w01, thread float2& w23) {
         qwg_unpack_shvq_lane4_f32<BITS, GROUP>(wrow, g, dl, w01, w23);

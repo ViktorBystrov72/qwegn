@@ -4,6 +4,11 @@ import QWCore
 
 /// Vision tower architecture parameters derived from a model's `config.json`.
 public struct QWVisionConfig: Sendable, Equatable, Hashable {
+    public enum Architecture: String, Sendable, Equatable, Hashable {
+        case qwen3VL
+        case inkling2
+    }
+
     public let dim: Int
     public let heads: Int
     public let headDim: Int
@@ -18,6 +23,9 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
     public let videoTokenId: Int
     public let ropeTheta: Double
     public let eps: Float
+    public let architecture: Architecture
+    public let projectionHiddenDim: Int
+    public let projectorBias: Bool
 
     public var spatial: Int { headDim / 2 }
     public var invFreqCount: Int { spatial / 2 }
@@ -44,7 +52,10 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
         imageTokenId: Int,
         videoTokenId: Int,
         ropeTheta: Double = 10_000,
-        eps: Float = 1e-6
+        eps: Float = 1e-6,
+        architecture: Architecture = .qwen3VL,
+        projectionHiddenDim: Int = 0,
+        projectorBias: Bool = true
     ) {
         self.dim = dim
         self.heads = heads
@@ -60,26 +71,53 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
         self.videoTokenId = videoTokenId
         self.ropeTheta = ropeTheta
         self.eps = eps
+        self.architecture = architecture
+        self.projectionHiddenDim = projectionHiddenDim
+        self.projectorBias = projectorBias
     }
 
     public init(descriptor: QWModelDescriptor) {
         let computedHeadDim = descriptor.visHeads > 0
             ? descriptor.visHidden / descriptor.visHeads
             : 0
-        self.init(
-            dim: descriptor.visHidden,
-            heads: descriptor.visHeads,
-            headDim: computedHeadDim,
-            depth: descriptor.visDepth,
-            mlpInner: descriptor.visIntermediate,
-            patch: descriptor.visPatch,
-            temporal: descriptor.visTemporal,
-            merge: descriptor.visMerge,
-            numPosEmbeds: descriptor.visPosEmbeds,
-            outDim: descriptor.visOut,
-            imageTokenId: descriptor.imageTokenId,
-            videoTokenId: descriptor.videoTokenId
-        )
+        if descriptor.family == .inkling2Loop {
+            let vCfg = descriptor.inkling2Config?.vision
+            let projH = vCfg?.projectionHiddenDim ?? (descriptor.visMerge * descriptor.visMerge * descriptor.visHidden)
+            self.init(
+                dim: descriptor.visHidden,
+                heads: descriptor.visHeads,
+                headDim: computedHeadDim,
+                depth: descriptor.visDepth,
+                mlpInner: descriptor.visIntermediate,
+                patch: descriptor.visPatch,
+                temporal: 1,
+                merge: descriptor.visMerge,
+                numPosEmbeds: descriptor.visPosEmbeds,
+                outDim: descriptor.visOut,
+                imageTokenId: descriptor.imageTokenId,
+                videoTokenId: descriptor.videoTokenId,
+                ropeTheta: 10_000.0,
+                eps: Float(vCfg?.layerNormEps ?? 1e-5),
+                architecture: .inkling2,
+                projectionHiddenDim: projH,
+                projectorBias: vCfg?.projectorBias ?? false
+            )
+        } else {
+            self.init(
+                dim: descriptor.visHidden,
+                heads: descriptor.visHeads,
+                headDim: computedHeadDim,
+                depth: descriptor.visDepth,
+                mlpInner: descriptor.visIntermediate,
+                patch: descriptor.visPatch,
+                temporal: descriptor.visTemporal,
+                merge: descriptor.visMerge,
+                numPosEmbeds: descriptor.visPosEmbeds,
+                outDim: descriptor.visOut,
+                imageTokenId: descriptor.imageTokenId,
+                videoTokenId: descriptor.videoTokenId
+            )
+        }
     }
 
     /// Reference Qwen3-VL vision tower geometry for synthetic fixtures without config.json.

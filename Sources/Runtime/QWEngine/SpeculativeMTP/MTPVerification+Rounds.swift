@@ -165,6 +165,7 @@ extension QWEngineDriver {
         )
         let needsTrunkCacheWait = session.position + verifyWindow.rows > session.kv.tokenCapacity
             || kvCache.hasSharedPages(session.kv, positions: session.position..<(session.position + verifyWindow.rows))
+            || kvCache.hasUnallocatedPages(session.kv, positions: session.position..<(session.position + verifyWindow.rows))
         if needsSparseClaim || needsTrunkCacheWait || needsMTPCacheWait {
             try drainPendingCommitIfNeeded()
         }
@@ -392,7 +393,7 @@ extension QWEngineDriver {
                                                               targetDistributions: targets)
                     rawDecision = try QWGreedyRoundDecision.sampled(geometry: geometry,
                         proposals: proposals, result: result, maxNew: maxNew, stopIDs: stopIDs,
-                        maxDrafts: dflashDrafter != nil ? 15 : 7)
+                        maxDrafts: 15)
                     preparedStochasticWitness = QWStochasticRoundWitness(owner: owner,
                         drawEnd: owner.stream.drawsConsumed)
                     evidence = QWStochasticRoundEvidence(proposals: proposals, targets: targets, result: result,
@@ -591,6 +592,12 @@ extension QWEngineDriver {
                 session.attnKVViews = try kvCache.layerViewsAll(session.kv, layers: attnLayers)
                 mlaOperator?.truncatePosition(session.position + retained)
                 hcaOperator?.truncatePosition(session.position + retained)
+            }
+            if geometry.hasAnySlidingWindow {
+                try kvCache.recycleExpiredWindowPages(
+                    session.kv,
+                    currentPosition: session.position + retained,
+                    safetyMargin: geometry.descriptor.maxSpeculativeDrafts + QWKVCache.pageTokens)
             }
             if let mtpCache, let mtpHandle = session.mtpKV {
                 if echoDrafter != nil || usesManagedPairs {

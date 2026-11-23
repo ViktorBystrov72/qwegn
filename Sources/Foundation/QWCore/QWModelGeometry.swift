@@ -96,6 +96,20 @@ public struct QWModelGeometry: Sendable, Equatable {
         descriptor.isLinearAttention(layer)
     }
 
+    public func layerSlidingWindow(_ layer: Int) -> Int {
+        descriptor.layerSlidingWindow(layer)
+    }
+
+    public func virtualLayerSlidingWindow(_ virtualLayer: Int) -> Int {
+        let plan = descriptor.executionPlan
+        guard (0..<plan.count).contains(virtualLayer) else { return 0 }
+        return descriptor.layerSlidingWindow(plan[virtualLayer])
+    }
+
+    public var hasAnySlidingWindow: Bool {
+        descriptor.hasAnySlidingWindow
+    }
+
     /// Authoritative per-virtual-layer kind along `executionPlan`.
     public func isVirtualLayerFullAttention(_ virtualLayer: Int) -> Bool {
         let plan = descriptor.executionPlan
@@ -203,27 +217,19 @@ public struct QWModelGeometry: Sendable, Equatable {
 
     public var gqaRatio: Int { max(1, qHeads / max(1, kvHeads)) }
 
-    /// The 27B's **KV shape**: four kv heads of 256 halves. The frozen KV
-    /// writer and the compressed (q8/q4) pool layouts hard-code it.
-    public var is27BKVShape: Bool {
-        kvHeads == QWModelGeometry.qwen38_27b.kvHeads
-            && headDim == QWModelGeometry.qwen38_27b.headDim
+    /// Matches the specialized KV writer/pool stride of 4 KV heads × 256 head dims (1024 halves).
+    public var matchesKVStride1024Kernel: Bool {
+        kvHeads == 4 && headDim == 256
     }
 
-    /// The 27B's **KV + attention shape**: the KV shape at a GQA ratio of 6.
-    /// The frozen decode pair hard-codes the ratio, so this is the ONE
-    /// predicate that says "the 27B's kernels may serve this geometry".
-    public var is27BShape: Bool {
-        QWModelGeometry.is27BShape(kvHeads: kvHeads, headDim: headDim, gqaRatio: gqaRatio)
+    /// Matches the specialized GQA decode/prefill kernels targeting 4 KV heads × 256 dims at GQA ratio 6.
+    public var matchesHead256GQA6Kernel: Bool {
+        QWModelGeometry.matchesHead256GQA6Kernel(kvHeads: kvHeads, headDim: headDim, gqaRatio: gqaRatio)
     }
 
-    /// The same predicate over the numbers a **plan** carries: the module's
-    /// pre-flight and the driver's check read one body, so they cannot
-    /// disagree about which geometry the 27B's kernels may serve (C110).
-    public static func is27BShape(kvHeads: Int, headDim: Int, gqaRatio: Int) -> Bool {
-        kvHeads == QWModelGeometry.qwen38_27b.kvHeads
-            && headDim == QWModelGeometry.qwen38_27b.headDim
-            && gqaRatio == QWModelGeometry.qwen38_27b.gqaRatio
+    /// Plan-level counterpart of `matchesHead256GQA6Kernel` so module pre-flight and driver agree.
+    public static func matchesHead256GQA6Kernel(kvHeads: Int, headDim: Int, gqaRatio: Int) -> Bool {
+        kvHeads == 4 && headDim == 256 && gqaRatio == 6
     }
 
     /// Whether this geometry can use the hardware NAX MMA paged FlashAttention prefill kernel.
@@ -252,5 +258,71 @@ public struct QWModelGeometry: Sendable, Equatable {
 
     public func verifyInternalConsistency() -> [String] {
         descriptor.verifyInternalConsistency()
+    }
+
+    /// Maps each full-attention visit to its LSA selection leader along `executionPlan`.
+    public func lsaLoopReusePlan(
+        attnLayers: [Int],
+        crossLoopReuse: Bool,
+        stride: Int = 0
+    ) -> QWLSALoopReusePlan {
+        let plan = executionPlan
+        let physLayers = attnLayers.map { v in
+            plan.indices.contains(v) ? plan[v] : v
+        }
+        return QWLSALoopReusePlan.build(physicalLayers: physLayers, enabled: crossLoopReuse, stride: stride)
+    }
+}
+
+/// Execution-plan-derived sharing schedule for recurrent global-attention visits.
+public struct QWLSALoopReusePlan: Sendable, Equatable {
+    public let physicalLayerForFullAttnLayer: [Int]
+    public let sourceForFullAttnLayer: [Int]
+    public let isFollower: [Bool]
+    public let uniqueLeaderIndices: [Int]
+    public let reuseCacheSlotForLeader: [Int: Int]
+    public let reuseSlotCount: Int
+
+    public var hasReuse: Bool { isFollower.contains(true) }
+
+    public static func build(physicalLayers: [Int], enabled: Bool, stride: Int = 0) -> QWLSALoopReusePlan {
+        let count = physicalLayers.count
+        var source = Array(0..<count)
+        if enabled && count > 1 {
+            let effectiveStride = stride >= 2 ? stride : 0
+            var visitsByPhys: [Int: [Int]] = [:]
+            for (idx, phys) in physicalLayers.enumerated() {
+                visitsByPhys[phys, default: []].append(idx)
+            }
+            for visits in visitsByPhys.values where visits.count > 1 {
+                var currentLeader = visits[0]
+                for (visitOffset, fullIdx) in visits.enumerated() {
+                    if visitOffset == 0 || (effectiveStride > 0 && visitOffset % effectiveStride == 0) {
+                        currentLeader = fullIdx
+                    }
+                    source[fullIdx] = currentLeader
+                }
+            }
+        }
+        let followerFlags = (0..<count).map { source[$0] != $0 }
+        var followerCountByLeader: [Int: Int] = [:]
+        for (idx, src) in source.enumerated() where src != idx {
+            followerCountByLeader[src, default: 0] += 1
+        }
+        let leaders = (0..<count).filter { source[$0] == $0 }
+        var cacheSlots: [Int: Int] = [:]
+        var nextSlot = 0
+        for leader in leaders where (followerCountByLeader[leader] ?? 0) > 0 {
+            cacheSlots[leader] = nextSlot
+            nextSlot += 1
+        }
+        return QWLSALoopReusePlan(
+            physicalLayerForFullAttnLayer: physicalLayers,
+            sourceForFullAttnLayer: source,
+            isFollower: followerFlags,
+            uniqueLeaderIndices: leaders,
+            reuseCacheSlotForLeader: cacheSlots,
+            reuseSlotCount: nextSlot
+        )
     }
 }

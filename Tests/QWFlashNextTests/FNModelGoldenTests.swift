@@ -1,7 +1,8 @@
 import XCTest
 import Foundation
 import QWRope
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 // Full-model golden: 4 layers (GDN, full attention, GDN+PLE, full attention), HF Qwen4ExpForCausalLM at small dims.
 final class FNModelGoldenTests: XCTestCase {

@@ -23,15 +23,15 @@ public final class QWRopeApply: @unchecked Sendable {
     private let psoGeneral: any MTLComputePipelineState
     private let psoExtractGeneral: any MTLComputePipelineState
 
-    enum Buffer: Int { case qIn = 0, kIn, qOut, kOut, wq, wk, table, normOut, headU4, eps }
+    enum Buffer: Int { case qIn = 0, kIn, qOut, kOut, wq, wk, table, normOut, headU4, eps, qkvBias }
 
     /// Floats per table row: the model's rotary dims.
     private var tableWidth: Int { geometry.rotaryDims }
 
     /// True when the frozen 27B kernels cannot serve this call: a 256-half
     /// head, q/k norm, and hardcoded `simd_shuffle_xor(lo, 4)` (`rotaryDims == 64`).
-    private func needsGeneralKernel(hasNorm: Bool) -> Bool {
-        geometry.headDim != 256 || !hasNorm || geometry.rotaryDims != 64
+    private func needsGeneralKernel(hasNorm: Bool, hasBias: Bool = false) -> Bool {
+        hasBias || geometry.headDim != 256 || !hasNorm || geometry.rotaryDims != 64
     }
 
     private static func validateGeometry(_ g: QWModelGeometry) throws {
@@ -83,12 +83,13 @@ public final class QWRopeApply: @unchecked Sendable {
 
     /// Encode the fused q‖k norm+rope (f16). q [S·qProjOut] (Q‖gate
     /// interleaved when the model has a gate), k [S·kvWidth], weights wq
-    /// [headDim] and wk [kvHeads·headDim] — both optional; normOut optional.
+    /// [headDim] and wk [kvHeads·headDim] — both optional; normOut/qkvBias optional.
     public func encodeQK(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
                          q: QWTensorValue, k: QWTensorValue,
                          wq: QWTensorValue?, wk: QWTensorValue?,
                          qOut: QWTensorValue, kOut: QWTensorValue,
                          normOut: QWTensorValue? = nil,
+                         qkvBias: QWTensorValue? = nil,
                          positions: [Int]) throws {
         try Self.validateGeometry(geometry)
         let S = positions.count
@@ -97,7 +98,7 @@ public final class QWRopeApply: @unchecked Sendable {
            (0..<nrows).contains(p), (0..<nrows).contains(q0),
            p - q0 + 1 == S, zip(positions, positions.dropFirst()).allSatisfy({ $1 == $0 + 1 }) {
             try encodeQKContiguous(enc, q: q, k: k, wq: wq, wk: wk,
-                                   qOut: qOut, kOut: kOut, normOut: normOut,
+                                   qOut: qOut, kOut: kOut, normOut: normOut, qkvBias: qkvBias,
                                    rowBase: q0, rows: S)
         } else if positions.count == S, Set(positions).count == S, S <= 4096 {
             // sparse positions (spec 07 allows; phase-0 engine path is
@@ -117,6 +118,7 @@ public final class QWRopeApply: @unchecked Sendable {
                          wq: QWTensorValue?, wk: QWTensorValue?,
                          qOut: QWTensorValue, kOut: QWTensorValue,
                          normOut: QWTensorValue? = nil,
+                         qkvBias: QWTensorValue? = nil,
                          positionStart: Int, count: Int) throws {
         try Self.validateGeometry(geometry)
         let nrows = tables?.rows ?? (tableTensor.shape.dims.first ?? 0)
@@ -125,7 +127,7 @@ public final class QWRopeApply: @unchecked Sendable {
             throw QWRopeError.posBeyondTable(positionStart + count - 1, nrows)
         }
         try encodeQKContiguous(enc, q: q, k: k, wq: wq, wk: wk,
-                               qOut: qOut, kOut: kOut, normOut: normOut,
+                               qOut: qOut, kOut: kOut, normOut: normOut, qkvBias: qkvBias,
                                rowBase: positionStart, rows: count)
     }
 
@@ -134,6 +136,7 @@ public final class QWRopeApply: @unchecked Sendable {
                                     wq: QWTensorValue?, wk: QWTensorValue?,
                                     qOut: QWTensorValue, kOut: QWTensorValue,
                                     normOut: QWTensorValue?,
+                                    qkvBias: QWTensorValue?,
                                     rowBase: Int, rows: Int) throws {
         let qSlot = geometry.qProjOut                             // Q‖gate or Q only
         let kAll = geometry.kvHeads * geometry.headDim
@@ -144,9 +147,13 @@ public final class QWRopeApply: @unchecked Sendable {
               wq.map({ $0.shape.elementCount == geometry.headDim }) ?? true,
               wk.map({ $0.shape.elementCount == geometry.kvHeads * geometry.headDim }) ?? true,
               (wq == nil) == (wk == nil),
-              normOut.map({ $0.shape.dtype == .f16 && $0.shape.elementCount == S * (qSlot + kAll) }) ?? true
+              normOut.map({ $0.shape.dtype == .f16 && $0.shape.elementCount == S * (qSlot + kAll) }) ?? true,
+              qkvBias.map({
+                  $0.shape.dtype == .f16 && $0.shape.elementCount == geometry.attnTotalN
+                      && ($0.region.base + $0.offset) % 16 == 0
+              }) ?? true
         else { throw QWRopeError.badShape("q/k/weights/positions mismatch: S=\(S)") }
-        let general = needsGeneralKernel(hasNorm: wq != nil)
+        let general = needsGeneralKernel(hasNorm: wq != nil, hasBias: qkvBias != nil)
         enc.setComputePipelineState(general ? psoGeneral : pso)
         q.bind(enc, index: Buffer.qIn.rawValue)
         k.bind(enc, index: Buffer.kIn.rawValue)
@@ -161,13 +168,19 @@ public final class QWRopeApply: @unchecked Sendable {
         } else {
             enc.setBuffer(nullSlab, offset: 0, index: Buffer.normOut.rawValue)
         }
+        if let b = qkvBias {
+            b.bind(enc, index: Buffer.qkvBias.rawValue)
+        } else {
+            enc.setBuffer(nullSlab, offset: 0, index: Buffer.qkvBias.rawValue)
+        }
         struct RopeFlags { var headU4, writeNorm, kNormBaseU4, normOn: UInt32 }   // metal uint4
         // staged-norm layout law (mirrored in tests): q heads at [0, S·qProjOut/8),
         // k heads at the tail [S·qProjOut/8, S·(qProjOut+kvWidth)/8). uint4 units.
+        let flagsW: UInt32 = (wq != nil ? 1 : 0) | (qkvBias != nil ? 2 : 0)
         var flags = RopeFlags(headU4: UInt32(geometry.headDim / 8),      // 32
                               writeNorm: normOut == nil ? 0 : 1,         // ptr never null → gate
                               kNormBaseU4: UInt32(S * qSlot / 8),
-                              normOn: wq == nil ? 0 : 1)                 // no q/k norm → no norm
+                              normOn: flagsW)
         var eps = geometry.rmsEps
         withUnsafeBytes(of: &flags) { (raw: UnsafeRawBufferPointer) in enc.setBytes(raw.baseAddress!, length: 16, index: Buffer.headU4.rawValue) }
         enc.setBytes(&eps, length: 4, index: Buffer.eps.rawValue)
@@ -186,6 +199,7 @@ public final class QWRopeApply: @unchecked Sendable {
                                 attnY: QWTensorValue,
                                 qOut: QWTensorValue, kOut: QWTensorValue, vOut: QWTensorValue,
                                 wq: QWTensorValue?, wk: QWTensorValue?,
+                                qkvBias: QWTensorValue? = nil,
                                 positionStart: Int, count: Int,
                                 inRowCols: Int? = nil) throws {
         try Self.validateGeometry(geometry)
@@ -209,10 +223,14 @@ public final class QWRopeApply: @unchecked Sendable {
               vOut.shape.elementCount == S * vAll,
               wq.map({ $0.shape.elementCount == geometry.headDim }) ?? true,
               wk.map({ $0.shape.elementCount == geometry.kvHeads * geometry.headDim }) ?? true,
-              (wq == nil) == (wk == nil)
+              (wq == nil) == (wk == nil),
+              qkvBias.map({
+                  $0.shape.dtype == .f16 && $0.shape.elementCount == totalN
+                      && ($0.region.base + $0.offset) % 16 == 0
+              }) ?? true
         else { throw QWRopeError.badShape("extractQK tensor shapes mismatch: S=\(S)") }
 
-        let general = needsGeneralKernel(hasNorm: wq != nil) || rowCols != totalN
+        let general = needsGeneralKernel(hasNorm: wq != nil, hasBias: qkvBias != nil) || rowCols != totalN
         enc.setComputePipelineState(general ? psoExtractGeneral : psoExtract)
         attnY.bind(enc, index: 0)
         qOut.bind(enc, index: 1)
@@ -228,11 +246,17 @@ public final class QWRopeApply: @unchecked Sendable {
         var eps = geometry.rmsEps
         enc.setBytes(&eps, length: 4, index: 7)
         struct RopeFlags { var headU4, inRowU4, kNormBaseU4, normOn: UInt32 }
+        let flagsW: UInt32 = (wq != nil ? 1 : 0) | (qkvBias != nil ? 2 : 0)
         var flags = RopeFlags(headU4: UInt32(geometry.headDim / 8),
                               inRowU4: rowCols == totalN ? 0 : UInt32(rowCols / 8),
                               kNormBaseU4: UInt32(S * (geometry.qHeads * geometry.headDim) / 8),
-                              normOn: wq == nil ? 0 : 1)
+                              normOn: flagsW)
         withUnsafeBytes(of: &flags) { (raw: UnsafeRawBufferPointer) in enc.setBytes(raw.baseAddress!, length: 16, index: 8) }
+        if let b = qkvBias {
+            b.bind(enc, index: 9)
+        } else {
+            enc.setBuffer(nullSlab, offset: 0, index: 9)
+        }
         enc.dispatchThreadgroups(MTLSize(width: S, height: geometry.qHeads + geometry.kvHeads, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }

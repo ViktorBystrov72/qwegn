@@ -1,11 +1,18 @@
-// qwattn_mbsa.metal — Maxwell Block-Sparse GQA indexer prep, top-k selector & scalar fallback attention.
+// qwattn_mbsa.metal — Maxwell Block-Sparse GQA indexer prep, NAX top-k selector & scalar fallback attention.
 #include <metal_stdlib>
 #include <metal_simdgroup>
-#include <metal_simdgroup_matrix>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#if !defined(__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__) || __ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ < 260200
+#error "NAX cooperative_tensor kernels require -mmacosx-version-min=26.2 or newer (Apple MPP operand_index ABI)."
+#endif
+#include "mlx/backend/metal/kernels/steel/defines.h"
+#include "mlx/backend/metal/kernels/steel/utils/integral_constant.h"
+#include "mlx/backend/metal/kernels/steel/gemm/nax.h"
 #include "include/qw_geometry_constants.metalh"
 #include "include/qw_dequant.metalh"
 #include "include/qw_kv_paged.metalh"
 using namespace metal;
+using namespace mlx::steel;
 
 struct MBSAH8 { half v[8]; } __attribute__((__packed__, __aligned__(16)));
 static inline MBSAH8 mbsa_asH8(uint4 w) { return *(thread MBSAH8*)&w; }
@@ -106,16 +113,16 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
 
     threadgroup float sharedQ[256];
     threadgroup float sgMax[8];
+    threadgroup float topScores[32];
+    threadgroup int   topIds[32];
+    const uint rKeep = min(remoteBlks, 32u);
+    if (tid < rKeep) { topScores[tid] = -1e30f; topIds[tid] = -1; }
     const float idxScale = rsqrt(float(headDim));
     const device half* qRow = idxQ + ((size_t)qi * kvHeads + kvh) * headDim;
     for (uint d = tid; d < headDim; d += 256u) sharedQ[d] = float(qRow[d]) * idxScale;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint sg = tid >> 5u, lane = tid & 31u;
-    const uint rKeep = min(remoteBlks, 32u);
-    float topScores[32];
-    int   topIds[32];
-    for (uint r = 0u; r < rKeep; r++) { topScores[r] = -1e30f; topIds[r] = -1; }
     uint worstSlot = 0u;
     float worstScore = -1e30f;
 
@@ -310,7 +317,7 @@ QW_MBSA_ATTN_ENTRY(_q8,  1u)
 QW_MBSA_ATTN_ENTRY(_q4,  2u)
 #undef QW_MBSA_ATTN_ENTRY
 
-// Prefill 32-query-tile MBSA block-max selector using simdgroup MMA + union bitmask compaction.
+// Prefill 32-query-tile MBSA block-max selector using NAX 16x16 MMA + union bitmask compaction (128T).
 kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[buffer(0)]],
                                            const device half* idxKCache      [[buffer(1)]],
                                            device int*        tileBlockList  [[buffer(2)]],
@@ -330,20 +337,17 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
     const uint prefixBlks = p1.x, localBlks = p1.y, remoteBlks = p1.z, tileListStride = p1.w;
     const uint rKeep = min(remoteBlks, 32u);
     const uint kDim = min(headDim, 128u);
-    const uint kPadded = min(128u, (kDim + 7u) & ~7u);
     const float idxScale = rsqrt(float(headDim));
 
-    threadgroup half sQ[32][136];
     threadgroup half sK[32][136];
-    threadgroup float sScores[32][34];
+    threadgroup float sHalfMax[2][32];
     threadgroup int sRowBlks[32 * 32];
-    threadgroup atomic_uint maskWin[512];
-    threadgroup float sBlkMax[32];
+    threadgroup atomic_uint maskWin[256];
     threadgroup uchar sIsDense[32];
     threadgroup uint sCurBlk[32];
     threadgroup uint sLocalStart[32];
-    threadgroup uint sSgCounts[8];
-    threadgroup uint sSgBases[8];
+    threadgroup uint sSgCounts[4];
+    threadgroup uint sSgBases[4];
     threadgroup uint sNextOutCount;
 
     const uint sg = tid >> 5u, lane = tid & 31u;
@@ -357,12 +361,6 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
         sIsDense[tid] = qDenseSelf ? 1 : 0;
         sCurBlk[tid] = qCurBlkSelf;
         sLocalStart[tid] = qLocalStartSelf;
-        sBlkMax[tid] = -1e30f;
-    }
-    for (uint e = tid; e < 32u * kPadded; e += 256u) {
-        const uint q = e / kPadded;
-        const uint k = e % kPadded;
-        sQ[q][k] = (q < R && k < kDim) ? idxQ[((size_t)(tile0 + q) * kvHeads + kvh) * headDim + k] : half(0.0h);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -372,31 +370,56 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
 
     float topScores[32];
     int   topIds[32];
-    for (uint r = 0u; r < rKeep; ++r) { topScores[r] = -1e30f; topIds[r] = -1; }
+    if (tid < R) {
+        for (uint r = 0u; r < rKeep; ++r) { topScores[r] = -1e30f; topIds[r] = -1; }
+    }
     uint worstSlot = 0u;
     float worstScore = -1e30f;
 
     if (anySparse && maxLocalStart > prefixBlks && rKeep > 0u) {
-        const uint sgRow = (sg >> 1u) * 8u;
+        const uint kPadded32 = min(128u, (kDim + 31u) & ~31u);
+        const short nq16 = short((kDim + 15u) >> 4u);
+        const short nk32 = short(kPadded32 >> 5u);
+        const uint sgRow = (sg >> 1u) * 16u;
         const uint sgCol = (sg & 1u) * 16u;
-        const uint redRow = tid >> 3u;
-        const uint lane8 = tid & 7u;
-        const bool fast128 = (headDim == 128u);
+        const short validRows = short(clamp(int(R) - int(sgRow), 0, 16));
+        const device half* qBase = idxQ + ((size_t)(tile0 + sgRow) * kvHeads + kvh) * headDim;
+        NAXTile<half, 1, 1> Qf[8];
+        STEEL_PRAGMA_UNROLL
+        for (short id = 0; id < 8; ++id) {
+            if (id < nq16 && validRows > 0) {
+                const short validCols = short(clamp(int(kDim) - int(id) * 16, 0, 16));
+                if (validRows == 16 && validCols == 16) {
+                    Qf[id].load(qBase + int(id) * 16, int(kvHeads * headDim));
+                } else {
+                    Qf[id].load_safe(qBase + int(id) * 16, int(kvHeads * headDim), short2(validCols, validRows));
+                }
+            } else {
+                Qf[id].clear();
+            }
+        }
 
+        const short2 sc = BaseNAXFrag::get_coord();
+        const bool fast128 = (headDim == 128u);
+        const uint kFillCols = max(32u, kPadded32);
         for (uint b = prefixBlks; b < maxLocalStart; ++b) {
             const uint tStart = b * blockSize;
+            float bScore = -1e30f;
             for (uint off = 0u; off < blockSize; off += 32u) {
                 const uint subLen = min(32u, blockSize - off);
                 if (fast128 && subLen == 32u) {
-                    const uint kr = tid >> 3u;
-                    const uint d16 = (tid & 7u) << 4u;
-                    const device uint4* src = (const device uint4*)(idxKCache + (size_t)(tStart + off + kr) * 128u + d16);
-                    *(threadgroup uint4*)(&sK[kr][d16])      = src[0];
-                    *(threadgroup uint4*)(&sK[kr][d16 + 8u]) = src[1];
+                    const uint kr = tid >> 2u;
+                    const uint d32 = (tid & 3u) << 5u;
+                    const device uint4* src = (const device uint4*)(idxKCache + (size_t)(tStart + off + kr) * 128u + d32);
+                    threadgroup uint4* dst = (threadgroup uint4*)(&sK[kr][d32]);
+                    dst[0] = src[0];
+                    dst[1] = src[1];
+                    dst[2] = src[2];
+                    dst[3] = src[3];
                 } else {
-                    for (uint e = tid; e < 32u * kPadded; e += 256u) {
-                        const uint kr = e / kPadded;
-                        const uint k = e % kPadded;
+                    for (uint e = tid; e < 32u * kFillCols; e += 128u) {
+                        const uint kr = e / kFillCols;
+                        const uint k = e % kFillCols;
                         sK[kr][k] = (kr < subLen && k < kDim)
                             ? idxKCache[(size_t)(tStart + off + kr) * headDim + k]
                             : half(0.0h);
@@ -404,37 +427,48 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                simdgroup_float8x8 acc0 = simdgroup_float8x8(0.0f);
-                simdgroup_float8x8 acc1 = simdgroup_float8x8(0.0f);
-                for (uint k = 0u; k < kPadded; k += 8u) {
-                    simdgroup_half8x8 a, b0, b1;
-                    simdgroup_load(a,  &sQ[sgRow][k],        136, ulong2(0, 0), false);
-                    simdgroup_load(b0, &sK[sgCol + 0u][k],   136, ulong2(0, 0), true);
-                    simdgroup_load(b1, &sK[sgCol + 8u][k],   136, ulong2(0, 0), true);
-                    simdgroup_multiply_accumulate(acc0, a, b0, acc0);
-                    simdgroup_multiply_accumulate(acc1, a, b1, acc1);
+                NAXTile<float, 1, 1> Stile;
+                Stile.clear();
+                STEEL_PRAGMA_UNROLL
+                for (short ik32 = 0; ik32 < 4; ++ik32) {
+                    if (ik32 < nk32) {
+                        const short id0 = ik32 * 2;
+                        const short id1 = id0 + 1;
+                        NAXTile<half, 1, 1> Kt0, Kt1;
+                        Kt0.template load<half, 136, 1>(&sK[sgCol][id0 * 16]);
+                        Kt1.template load<half, 136, 1>(&sK[sgCol][id1 * 16]);
+                        BaseNAXFrag::mma_k32(Stile.frag_at(0, 0),
+                                             Qf[id0].frag_at(0, 0), Qf[id1].frag_at(0, 0),
+                                             metal::false_type{},
+                                             Kt0.frag_at(0, 0), Kt1.frag_at(0, 0),
+                                             metal::true_type{});
+                    }
                 }
-                simdgroup_store(acc0, &sScores[sgRow][sgCol + 0u], 34, ulong2(0, 0), false);
-                simdgroup_store(acc1, &sScores[sgRow][sgCol + 8u], 34, ulong2(0, 0), false);
+
+                thread auto& fg = Stile.frag_at(0, 0);
+                float rowMax[2];
+                STEEL_PRAGMA_UNROLL
+                for (short i = 0; i < 2; ++i) {
+                    float m0 = -1e30f;
+                    STEEL_PRAGMA_UNROLL
+                    for (short j = 0; j < 4; ++j) {
+                        const uint col = sgCol + uint(sc.x) + uint(j);
+                        if (col < subLen) m0 = max(m0, fg[i * 4 + j] * idxScale);
+                    }
+                    m0 = max(m0, simd_shuffle_xor(m0, ushort(1)));
+                    m0 = max(m0, simd_shuffle_xor(m0, ushort(8)));
+                    rowMax[i] = m0;
+                }
+                if (sc.x == 0) {
+                    sHalfMax[sg & 1u][sgRow + uint(sc.y)] = rowMax[0];
+                    sHalfMax[sg & 1u][sgRow + uint(sc.y) + 8u] = rowMax[1];
+                }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                float subMax = -1e30f;
-                if (redRow < R) {
-                    const uint c0 = lane8 * 4u;
-                    for (uint c = 0u; c < 4u; ++c) {
-                        if (c0 + c < subLen) subMax = max(subMax, sScores[redRow][c0 + c] * idxScale);
-                    }
-                    subMax = max(subMax, simd_shuffle_xor(subMax, ushort(1)));
-                    subMax = max(subMax, simd_shuffle_xor(subMax, ushort(2)));
-                    subMax = max(subMax, simd_shuffle_xor(subMax, ushort(4)));
-                    if (lane8 == 0u) {
-                        sBlkMax[redRow] = (off == 0u) ? subMax : max(sBlkMax[redRow], subMax);
-                    }
-                }
-                if (off + 32u >= blockSize) {
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (tid < R && !qDenseSelf && b >= prefixBlks && b < qLocalStartSelf) {
-                        const float bScore = sBlkMax[tid];
+                if (tid < R) {
+                    const float subMax = max(sHalfMax[0][tid], sHalfMax[1][tid]);
+                    bScore = (off == 0u) ? subMax : max(bScore, subMax);
+                    if (off + 32u >= blockSize && !qDenseSelf && b >= prefixBlks && b < qLocalStartSelf) {
                         if (topIds[worstSlot] < 0 || bScore > worstScore) {
                             topScores[worstSlot] = bScore;
                             topIds[worstSlot] = int(b);
@@ -462,10 +496,10 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
 
     const size_t slotBase = ((size_t)tileIdx * kvHeads + kvh) * tileListStride;
     uint outCount = 0u;
-    for (uint winBase = 0u; winBase <= maxCurBlk; winBase += 512u) {
-        const uint winLen = min(512u, maxCurBlk + 1u - winBase);
+    for (uint winBase = 0u; winBase <= maxCurBlk; winBase += 256u) {
+        const uint winLen = min(256u, maxCurBlk + 1u - winBase);
         for (uint k = 0u; k < 2u; ++k) {
-            const uint idx = tid + k * 256u;
+            const uint idx = tid + k * 128u;
             uint detMask = 0u;
             if (idx < winLen) {
                 const uint b = winBase + idx;
@@ -482,7 +516,7 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
 
         if (anySparse && rKeep > 0u) {
             const uint totalRemoteSlots = R * rKeep;
-            for (uint e = tid; e < totalRemoteSlots; e += 256u) {
+            for (uint e = tid; e < totalRemoteSlots; e += 128u) {
                 const uint q = e / rKeep;
                 const uint j = e % rKeep;
                 if (sIsDense[q] == 0) {
@@ -508,7 +542,7 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0u) {
             uint run = outCount;
-            for (uint s = 0u; s < 8u; ++s) {
+            for (uint s = 0u; s < 4u; ++s) {
                 sSgBases[s] = run;
                 run += sSgCounts[s];
             }

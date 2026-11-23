@@ -20,6 +20,7 @@ kernel void qwg_rope_qk_general(device const uint4* qIn      [[buffer(0)]],
                                 device uint4* normOut        [[buffer(7)]],
                                 constant uint4& flags        [[buffer(8)]],
                                 constant float& eps          [[buffer(9)]],
+                                device const uint4* qkvBias  [[buffer(10)]],
                                 uint2 tg [[threadgroup_position_in_grid]],
                                 uint ti [[thread_index_in_threadgroup]]) {
     const uint s = tg.x;
@@ -35,19 +36,31 @@ kernel void qwg_rope_qk_general(device const uint4* qIn      [[buffer(0)]],
     device uint4* dst = (isQ ? qOut : kOut) + uOff;
     device const uint4* w = (isQ ? wq : (wk + (size_t)row * headU4));
     const bool active = ti < headU4;
+    const bool hasNorm = (flags.w & 1u) != 0u;
+    const bool hasBias = (flags.w & 2u) != 0u;
+    const size_t biasOff = isQ ? ((size_t)head * headU4)
+                               : ((size_t)(QW_QPROJ_OUT / 8u) + (size_t)row * headU4);
+    device const uint4* bPtr = qkvBias + biasOff;
 
     uint4 xw = active ? src[ti] : uint4(0u);
     H8 xv = asH8(xw);
+    float xf[8];
+    if (hasBias && active) {
+        H8 bv = asH8(bPtr[ti]);
+        for (int i = 0; i < 8; i++) xf[i] = float(xv.v[i]) + float(bv.v[i]);
+    } else {
+        for (int i = 0; i < 8; i++) xf[i] = float(xv.v[i]);
+    }
     float xn[8];
     float rstd = 1.0f;
-    if (flags.w) {                                        // per-head norm (Qwen3 class)
+    if (hasNorm) {                                        // per-head norm (Qwen3 class)
         H8 wv = active ? asH8(w[ti]) : asH8(uint4(0u));
         float acc = 0.0f;
-        for (int i = 0; i < 8; i++) { float v = float(xv.v[i]); acc += v * v; }
+        for (int i = 0; i < 8; i++) { float v = xf[i]; acc += v * v; }
         rstd = rsqrt(simd_sum(acc) / float(headU4 * 8u) + eps);
-        for (int i = 0; i < 8; i++) xn[i] = float(xv.v[i]) * rstd * (float(wv.v[i]) + 1.0f);
+        for (int i = 0; i < 8; i++) xn[i] = xf[i] * rstd * (float(wv.v[i]) + 1.0f);
     } else {
-        for (int i = 0; i < 8; i++) xn[i] = float(xv.v[i]);
+        for (int i = 0; i < 8; i++) xn[i] = xf[i];
     }
 
     if (flags.y && active) {
@@ -76,13 +89,16 @@ kernel void qwg_rope_qk_general(device const uint4* qIn      [[buffer(0)]],
         }
     } else if (ti < ropeSlots) {
         H8 xvP = asH8(active && partner < headU4 ? src[partner] : uint4(0u));
-        if (flags.w) {
+        H8 bvP = asH8(hasBias && active && partner < headU4 ? bPtr[partner] : uint4(0u));
+        float xfP[8];
+        for (int i = 0; i < 8; i++) xfP[i] = float(xvP.v[i]) + (hasBias ? float(bvP.v[i]) : 0.0f);
+        if (hasNorm) {
             H8 wvP = asH8(active && partner < headU4 ? w[partner] : uint4(0u));
             for (int i = 0; i < 8; i++) {
-                pf[i] = float(xvP.v[i]) * rstd * (float(wvP.v[i]) + 1.0f);
+                pf[i] = xfP[i] * rstd * (float(wvP.v[i]) + 1.0f);
             }
         } else {
-            for (int i = 0; i < 8; i++) pf[i] = float(xvP.v[i]);
+            for (int i = 0; i < 8; i++) pf[i] = xfP[i];
         }
     }
 
@@ -106,7 +122,17 @@ kernel void qwg_rope_qk_general(device const uint4* qIn      [[buffer(0)]],
     }
     if (active) dst[ti] = o;
     // The gate half of an interleaved [Q‖gate] row is never roped.
-    if (isQ && QW_HAS_Q_GATE && active) dst[headU4 + ti] = src[headU4 + ti];
+    if (isQ && QW_HAS_Q_GATE && active) {
+        if (hasBias) {
+            H8 gx = asH8(src[headU4 + ti]);
+            H8 gb = asH8(qkvBias[(size_t)(head + 1u) * headU4 + ti]);
+            H8 go;
+            for (int i = 0; i < 8; i++) go.v[i] = half(float(gx.v[i]) + float(gb.v[i]));
+            dst[headU4 + ti] = *(thread uint4*)&go;
+        } else {
+            dst[headU4 + ti] = src[headU4 + ti];
+        }
+    }
 }
 
 // ── General extract + RoPE (+ optional norm) + V copy ─────────────────────
@@ -120,6 +146,7 @@ kernel void qwg_extract_rope_qk_general(device const uint4* attnY   [[buffer(0)]
                                         device const float* table    [[buffer(6)]],
                                         constant uint4& flags        [[buffer(8)]],
                                         constant float& eps          [[buffer(7)]],
+                                        device const uint4* qkvBias  [[buffer(9)]],
                                         uint2 tg [[threadgroup_position_in_grid]],
                                         uint ti [[thread_index_in_threadgroup]]) {
     const uint s = tg.x;
@@ -139,19 +166,31 @@ kernel void qwg_extract_rope_qk_general(device const uint4* attnY   [[buffer(0)]
     device uint4* dst = (isQ ? qOut : kOut) + dstOff;
     device const uint4* w = (isQ ? wq : (wk + (size_t)row * headU4));
     const bool active = ti < headU4;
+    const bool hasNorm = (flags.w & 1u) != 0u;
+    const bool hasBias = (flags.w & 2u) != 0u;
+    const size_t biasOff = isQ ? ((size_t)head * headU4)
+                               : ((size_t)(QW_QPROJ_OUT / 8u) + (size_t)row * headU4);
+    device const uint4* bPtr = qkvBias + biasOff;
 
     uint4 xw = active ? src[ti] : uint4(0u);
     H8 xv = asH8(xw);
+    float xf[8];
+    if (hasBias && active) {
+        H8 bv = asH8(bPtr[ti]);
+        for (int i = 0; i < 8; i++) xf[i] = float(xv.v[i]) + float(bv.v[i]);
+    } else {
+        for (int i = 0; i < 8; i++) xf[i] = float(xv.v[i]);
+    }
     float xn[8];
     float rstd = 1.0f;
-    if (flags.w) {
+    if (hasNorm) {
         float acc = 0.0f;
-        for (int i = 0; i < 8; i++) { float v = float(xv.v[i]); acc += v * v; }
+        for (int i = 0; i < 8; i++) { float v = xf[i]; acc += v * v; }
         rstd = rsqrt(simd_sum(acc) / float(headU4 * 8u) + eps);
         H8 wv = active ? asH8(w[ti]) : asH8(uint4(0u));
-        for (int i = 0; i < 8; i++) xn[i] = float(xv.v[i]) * rstd * (float(wv.v[i]) + 1.0f);
+        for (int i = 0; i < 8; i++) xn[i] = xf[i] * rstd * (float(wv.v[i]) + 1.0f);
     } else {
-        for (int i = 0; i < 8; i++) xn[i] = float(xv.v[i]);
+        for (int i = 0; i < 8; i++) xn[i] = xf[i];
     }
 
     const uint ropeSlots = QW_ROPE_DIMS / 8u;
@@ -167,13 +206,16 @@ kernel void qwg_extract_rope_qk_general(device const uint4* attnY   [[buffer(0)]
         }
     } else if (ti < ropeSlots) {
         H8 xvP = asH8(active && partner < headU4 ? src[partner] : uint4(0u));
-        if (flags.w) {
+        H8 bvP = asH8(hasBias && active && partner < headU4 ? bPtr[partner] : uint4(0u));
+        float xfP[8];
+        for (int i = 0; i < 8; i++) xfP[i] = float(xvP.v[i]) + (hasBias ? float(bvP.v[i]) : 0.0f);
+        if (hasNorm) {
             H8 wvP = asH8(active && partner < headU4 ? w[partner] : uint4(0u));
             for (int i = 0; i < 8; i++) {
-                pf[i] = float(xvP.v[i]) * rstd * (float(wvP.v[i]) + 1.0f);
+                pf[i] = xfP[i] * rstd * (float(wvP.v[i]) + 1.0f);
             }
         } else {
-            for (int i = 0; i < 8; i++) pf[i] = float(xvP.v[i]);
+            for (int i = 0; i < 8; i++) pf[i] = xfP[i];
         }
     }
 
@@ -197,12 +239,31 @@ kernel void qwg_extract_rope_qk_general(device const uint4* attnY   [[buffer(0)]
     }
     if (active) dst[ti] = o;
     if (isQ) {
-        if (QW_HAS_Q_GATE && active) dst[headU4 + ti] = src[headU4 + ti];
+        if (QW_HAS_Q_GATE && active) {
+            if (hasBias) {
+                H8 gx = asH8(src[headU4 + ti]);
+                H8 gb = asH8(qkvBias[(size_t)(head + 1u) * headU4 + ti]);
+                H8 go;
+                for (int i = 0; i < 8; i++) go.v[i] = half(float(gx.v[i]) + float(gb.v[i]));
+                dst[headU4 + ti] = *(thread uint4*)&go;
+            } else {
+                dst[headU4 + ti] = src[headU4 + ti];
+            }
+        }
     } else {
         if (active) {
-            vOut[(size_t)s * QW_KV_HEADS * QW_HEAD_DIM / 8u + (size_t)row * headU4 + ti] =
-                attnY[inRow + (size_t)(QW_QPROJ_OUT + QW_KV_HEADS * QW_HEAD_DIM) / 8u
-                       + (size_t)row * headU4 + ti];
+            const size_t vOff = (size_t)row * headU4 + ti;
+            const size_t vSrcOff = inRow + (size_t)(QW_QPROJ_OUT + QW_KV_HEADS * QW_HEAD_DIM) / 8u + vOff;
+            const size_t vDstOff = (size_t)s * QW_KV_HEADS * QW_HEAD_DIM / 8u + vOff;
+            if (hasBias) {
+                H8 vx = asH8(attnY[vSrcOff]);
+                H8 vb = asH8(qkvBias[(size_t)(QW_QPROJ_OUT + QW_KV_HEADS * QW_HEAD_DIM) / 8u + vOff]);
+                H8 vo;
+                for (int i = 0; i < 8; i++) vo.v[i] = half(float(vx.v[i]) + float(vb.v[i]));
+                vOut[vDstOff] = *(thread uint4*)&vo;
+            } else {
+                vOut[vDstOff] = attnY[vSrcOff];
+            }
         }
     }
 }

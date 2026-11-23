@@ -124,7 +124,7 @@ extension QWEngineDriver {
                                     headStorage: headStorage,
                                     q4Head: mtpVerifyHeadQ4 ? mtpDraftHead : nil,
                                     activeRows: rowCount,
-                                    unrotateForF16Head: true,
+                                    unrotateForF16Head: hal.weightBasis.rotatesActivations,
                                     multimaxParams: multimaxParams,
                                     outOfPlaceGDN: gdnReplayCheckpoint.layers > 0,
                                     windowEncoder: {
@@ -349,6 +349,14 @@ extension QWEngineDriver {
                                   cols: outCols, dt: .f16),
                 weight: weight, output: mtpBatchedMLP.downRows,
                 activeRows: activeRows, preparedSums: isGDN)
+            if (weights.kind == .fullAttention || weights.kind == .moe),
+               let oBias = weights.attn?.oBias {
+                enc.memoryBarrier(scope: .buffers)
+                try QWNorm.encodeAddBiasF16(enc, hal: hal,
+                    x: prefixRows(mtpBatchedMLP.downRows, rows: activeRows, cols: h, dt: .f16),
+                    bias: oBias, rows: activeRows, cols: h)
+                enc.memoryBarrier(scope: .buffers)
+            }
             let moeBridge = canFusePreMoENorm(weights: weights, rows: activeRows) ? window.moeScratch.map {
                 (xRot32: prefixRows($0.xRot32, rows: activeRows, cols: h, dt: .f32),
                  xPlain32: prefixRows($0.xPlain32, rows: activeRows, cols: h, dt: .f32),
@@ -391,7 +399,8 @@ extension QWEngineDriver {
                 try beginStage(.mlpGateUp)
                 let activeMlpRows = prefixRows(mlpRows, rows: activeRows,
                                                cols: geometry.intermediate, dt: .f16)
-                let fuseFwht = weights.gu.view.containerKind != .incumbentHQ4G32
+                let fuseFwht = weights.gu.view.isRotated
+                    && weights.gu.view.containerKind != .incumbentHQ4G32
                     && geometry.intermediate > 0 && (geometry.intermediate % 32 == 0)
                 try mtpBatchedMLP.encodeGateUp(enc,
                     input: prefixRows(normalized, rows: activeRows, cols: h, dt: .f16),
@@ -399,7 +408,7 @@ extension QWEngineDriver {
                     output: activeMlpRows,
                     activeRows: activeRows,
                     fuseFwht32: fuseFwht)
-                if !fuseFwht {
+                if !fuseFwht && weights.down.isRotated {
                     encodeFwht32Fast(enc, x: activeMlpRows)
                     enc.memoryBarrier(scope: .buffers)
                 }

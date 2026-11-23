@@ -1,6 +1,6 @@
 import Foundation
 import QWRope
-@testable import QWFlashNext
+@testable import QWEngine
 
 // FlashNext QSA indexer (HF Qwen4ExpTextQSAIndexer). Per query token, keeps the top `budget/ratio`
 // complete key blocks by relu-scored, mean-pooled block keys, plus the incomplete tail.

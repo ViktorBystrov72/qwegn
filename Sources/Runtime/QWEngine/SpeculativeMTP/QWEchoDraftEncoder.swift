@@ -315,7 +315,8 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             try driver.ropeApply.encodeExtractQK(
                 enc, hal: driver.hal, attnY: qkvSlice,
                 qOut: qRSlice, kOut: kRSlice, vOut: vSlice,
-                wq: attn.wq, wk: attn.wkTiled, positionStart: cacheRows, count: rows)
+                wq: attn.wq, wk: attn.wkTiled, qkvBias: attn.qkvBias,
+                positionStart: cacheRows, count: rows)
             if writeSeedKVOnly {
                 enc.memoryBarrier(scope: .buffers)
                 driver.encodePagedKVWrite(enc, kv: kv, k: kRSlice, v: vSlice, startPos: cacheRows, t: rows)
@@ -388,13 +389,17 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             try aDec.encode(
                 enc, qgate: qR1, kv: kv, knew: kR1, vnew: v1,
                 partials: gPart, out: attOut, C: cacheRows,
-                splits: QWAttnDecode.splits(forKeys: cacheRows + 1))
+                splits: QWAttnDecode.splits(forKeys: cacheRows + 1, kvHeads: geometry.kvHeads))
         }
         enc.memoryBarrier(scope: .buffers)
 
         try driver.gemvH16T4(enc, n: h, k: attn.o.k, x: attOut, gs: driver.sc.gs48,
                              wQ4: attn.o, y16: oOut16)
         enc.memoryBarrier(scope: .buffers)
+        if let oBias = attn.oBias {
+            try QWNorm.encodeAddBiasF16(enc, hal: driver.hal, x: oOut16, bias: oBias, rows: 1, cols: h)
+            enc.memoryBarrier(scope: .buffers)
+        }
 
         try driver.encodeMHCRouterNorm(enc, stream: outStream, w: mhc.ffnW, b: mhc.ffnB,
                                        gamma: layer.ln2, controls: ctrl1, out: ln2,
@@ -413,7 +418,7 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
             }
         } else {
             try driver.mlpSiluPairH16(enc, x: ln2, gs: driver.sc.gs, wQ4: layer.gu.view,
-                                      h16: mlpInter, fuseFwht32: true)
+                                      h16: mlpInter, fuseFwht32: layer.gu.view.isRotated)
             enc.memoryBarrier(scope: .buffers)
             try driver.gemvH16T4(enc, n: h, k: layer.down.k, x: mlpInter, gs: driver.sc.gsI,
                                  wQ4: layer.down, y16: dn16)
@@ -458,10 +463,19 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         } else {
             switch driver.headStorage {
             case .f16(let w):
-                try QWGemm.encodeFwht32(enc, hal: driver.hal, x: postNorm)
-                enc.memoryBarrier(scope: .buffers)
+                if driver.hal.weightBasis.rotatesActivations {
+                    try QWGemm.encodeFwht32(enc, hal: driver.hal, x: postNorm)
+                    enc.memoryBarrier(scope: .buffers)
+                }
                 try QWHead.encodeF16(enc, hal: driver.hal, w: w, x: postNorm,
                                      y: draftLogits, geometry: geometry, N: vocab)
+            case .bf16(let w):
+                if driver.hal.weightBasis.rotatesActivations {
+                    try QWGemm.encodeFwht32(enc, hal: driver.hal, x: postNorm)
+                    enc.memoryBarrier(scope: .buffers)
+                }
+                try QWHead.encodeBF16(enc, hal: driver.hal, w: w, x: postNorm,
+                                      y: draftLogits, geometry: geometry, N: vocab)
             case .q4g(let w):
                 try QWHead.encodeQ4g(enc, hal: driver.hal, weight: w,
                                      x: postNorm, gs: gsHead, y: draftLogits)

@@ -459,6 +459,7 @@ struct Serve: AsyncParsableCommand {
             cliMaxConcurrentSessions: knobs.maxConcurrentSessions,
             cliLSAMode: knobs.lsaMode, cliLSABudget: knobs.lsaBudget,
             cliLSAClusterBlock: knobs.lsaClusterBlock, cliLSASidecarPath: knobs.lsaSidecarPath,
+            cliLSACrossLoopReuse: knobs.lsaCrossLoopReuse,
             cliWarmRAMLimitGB: knobs.warmCacheLimit,
             cliSSDCacheLimitGB: knobs.ssdCacheLimit, cliCacheDir: knobs.cacheDir,
             cliLogLevel: knobs.logLevel, cliLazy: knobs.lazy,
@@ -468,7 +469,7 @@ struct Serve: AsyncParsableCommand {
             cliIgnoreProfile: noProfile
         )
         let isDFlash2 = ["dflash2", "dflash", "dspine"].contains(resolved.mtpBackend?.lowercased() ?? "")
-        let maxDrafts = isDFlash2 ? 15 : 7
+        let maxDrafts = 15
         guard resolved.mtpDrafts >= 0 && resolved.mtpDrafts <= maxDrafts else {
             FileHandle.standardError.write("qwg serve: error: --mtp-drafts must be 0...\(maxDrafts) (got \(resolved.mtpDrafts))\n".data(using: .utf8)!)
             throw ExitCode(2)
@@ -588,7 +589,8 @@ struct Serve: AsyncParsableCommand {
             port: resolved.port,
             logger: logger,
             apiKey: resolved.apiKey,
-            corsAllowedOrigins: resolved.corsAllowedOrigins
+            corsAllowedOrigins: resolved.corsAllowedOrigins,
+            enableAutoUpdateChecks: !noProfile
         )
         do {
             try server.start()

@@ -252,6 +252,50 @@ extension QWEngineDriver.WeightLoader {
             return (gu, down, nil)
         }
 
+        mutating func loadGQABiasTripletIfNeeded(
+            _ attnPrefix: String, geometry: QWModelGeometry
+        ) throws -> QWTensorValue? {
+            let qName = attnPrefix + "q_proj.bias"
+            let kName = attnPrefix + "k_proj.bias"
+            let vName = attnPrefix + "v_proj.bias"
+            let hasAny = hasTensor(qName) || hasTensor(kName) || hasTensor(vName)
+            guard geometry.descriptor.hasQKVBias || geometry.descriptor.hasAttnOutputBias || hasAny else {
+                return nil
+            }
+            for name in [qName, kName, vName] where !hasTensor(name) {
+                throw QWEngineDriverError.weightMissing(name, "missing attention QKV bias")
+            }
+            let qCount = geometry.qProjOut
+            let kvCount = geometry.kvHeads * geometry.headDim
+            let qFloats = try rawFloats(qName, qCount)
+            let kFloats = try rawFloats(kName, kvCount)
+            let vFloats = try rawFloats(vName, kvCount)
+            let t = try allocateWeight(QWTensorShape([qCount + 2 * kvCount], .f16))
+            let dst = t.region.buffer.contents()
+                .advanced(by: t.region.base + t.offset)
+                .assumingMemoryBound(to: UInt16.self)
+            var cursor = 0
+            for floats in [qFloats, kFloats, vFloats] {
+                for f in floats {
+                    dst[cursor] = QWQuant.f32tof16Bits(f)
+                    cursor += 1
+                }
+            }
+            return t
+        }
+
+        mutating func loadGQAOutputBiasIfNeeded(
+            _ attnPrefix: String, geometry: QWModelGeometry
+        ) throws -> QWTensorValue? {
+            let oName = attnPrefix + "o_proj.bias"
+            let exists = hasTensor(oName)
+            guard geometry.descriptor.hasAttnOutputBias || exists else { return nil }
+            guard exists else {
+                throw QWEngineDriverError.weightMissing(oName, "missing attention output bias")
+            }
+            return try f16w(oName, geometry.hidden)
+        }
+
         mutating func loadGQAAttn(
             _ blk: String, geometry: QWModelGeometry, includeMBSA: Bool
         ) throws -> AttnW {
@@ -271,6 +315,8 @@ extension QWEngineDriver.WeightLoader {
             let (qkvProj, attnSub) = try concatQ4(attnSpecs, k: geometry.hidden)
             let o = try q4(blk + "self_attn.o_proj.weight",
                            n: geometry.hidden, k: geometry.qHeads * geometry.headDim)
+            let qkvBias = try loadGQABiasTripletIfNeeded(blk + "self_attn.", geometry: geometry)
+            let oBias = try loadGQAOutputBiasIfNeeded(blk + "self_attn.", geometry: geometry)
             let qNormName = hasTensor(blk + "self_attn.q_norm.weight")
                 ? (blk + "self_attn.q_norm.weight")
                 : (hasTensor(blk + "self_attn.q_layernorm.weight")
@@ -303,7 +349,7 @@ extension QWEngineDriver.WeightLoader {
                 mbsaW = nil
             }
             return AttnW(qkvProj: qkvProj, q: attnSub[0], k: attnSub[1], v: attnSub[2],
-                         o: o, wq: wq, wkTiled: wkT, mbsa: mbsaW)
+                         o: o, wq: wq, wkTiled: wkT, mbsa: mbsaW, qkvBias: qkvBias, oBias: oBias)
         }
 
         /// Every layer's weights, in the plan's order.

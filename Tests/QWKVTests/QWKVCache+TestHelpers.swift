@@ -25,24 +25,27 @@ extension QWKVCache {
                       st.layerPairs[li].v.pageCount >= required else {
                     throw QWKVError.badArgument("shared prefix destination page table is short")
                 }
+                let startPage = min(required, liveStartPage(layerIndex: li, tokenCount: prefix.tokenCount))
                 for (ki, kind) in QWKVKind.allCases.enumerated() {
                     let ids = prefix.pages[li * 2 + ki].prefix(required)
                     let limit = pool(at: li, kind).pages.pageCount
-                    guard ids.allSatisfy({ $0 >= 0 && Int($0) < limit }) else {
+                    guard ids.prefix(startPage).allSatisfy({ $0 < 0 }),
+                          startPage >= required || ids[startPage..<required].allSatisfy({ $0 >= 0 && Int($0) < limit }) else {
                         throw QWKVError.badArgument("shared prefix page ID is invalid")
                     }
                 }
             }
             for li in layers.indices {
+                let startPage = min(required, liveStartPage(layerIndex: li, tokenCount: prefix.tokenCount))
                 for (ki, kind) in QWKVKind.allCases.enumerated() {
-                    let newIDs = Array(prefix.pages[li * 2 + ki].prefix(required))
+                    let newIDs = (0..<required).map { idx in idx < startPage ? Int32(-1) : prefix.pages[li * 2 + ki][idx] }
                     let oldIDs = st.layerPairs[li][kind].ids
                     let oldShared = st.layerPairs[li][kind].shared
-                    for page in newIDs { retainSharedPage(li: li, kind: kind, page: page) }
+                    for page in newIDs where page >= 0 { retainSharedPage(li: li, kind: kind, page: page) }
                     st.layerPairs[li][kind].ids.replaceSubrange(0..<required, with: newIDs)
                     st.layerPairs[li][kind].shared.replaceSubrange(
-                        0..<required, with: repeatElement(true, count: required))
-                    for index in 0..<required {
+                        0..<required, with: (0..<required).map { $0 >= startPage })
+                    for index in 0..<required where oldIDs[index] >= 0 {
                         if oldShared[index] {
                             releaseSharedPage(li: li, kind: kind, page: oldIDs[index])
                         } else if !isPagePinned(li: li, kind: kind, page: oldIDs[index]) {
@@ -58,21 +61,24 @@ extension QWKVCache {
 
     func exportSharedPrefixPlanes(_ prefix: QWKVSharedPrefix) -> [Data] {
         lock.withLock {
-            let planeBytes = serializedPlaneBytes(tokenCount: prefix.tokenCount)
             var planes: [Data] = []
             planes.reserveCapacity(layers.count * 2)
             for li in layers.indices {
+                let planeBytes = serializedPlaneBytes(layerIndex: li, tokenCount: prefix.tokenCount)
+                let startPage = min(
+                    (prefix.tokenCount + Self.pageTokens - 1) / Self.pageTokens,
+                    liveStartPage(layerIndex: li, tokenCount: prefix.tokenCount))
                 for (ki, kind) in QWKVKind.allCases.enumerated() {
                     var data = Data(count: planeBytes)
                     let ids = prefix.pages[li * 2 + ki]
                     let region = pool(at: li, kind).pages.region
                     data.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
                         guard let dstBase = destination.baseAddress else { return }
-                        for page in 0..<ids.count {
+                        for page in startPage..<ids.count {
                             let bytes = mode == .f16
                                 ? min(Self.pageTokens, prefix.tokenCount - page * Self.pageTokens) * f16RowBytes
                                 : bytesPerPage
-                            dstBase.advanced(by: page * bytesPerPage)
+                            dstBase.advanced(by: (page - startPage) * bytesPerPage)
                                 .copyMemory(from: region.pointer.advanced(by: Int(ids[page]) * bytesPerPage),
                                             byteCount: bytes)
                         }

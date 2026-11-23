@@ -16,7 +16,7 @@ extension QWEngineDriver {
     /// Returns the active MoE-Spec (arXiv:2602.16052) unique-expert budget across `rows` verification tokens,
     /// or `0` when all routed experts should be evaluated losslessly.
     func activeMoESpecExpertBudget(rows: Int) -> Int {
-        guard rows > 1, rows <= 4, geometry.numExperts > 0, geometry.expertsPerTok > 0 else {
+        guard rows > 1, rows <= 16, geometry.numExperts > 0, geometry.expertsPerTok > 0 else {
             return 0
         }
         if let raw = Self.moeSpecExpertBudgetEnv {
@@ -128,7 +128,7 @@ extension QWEngineDriver {
             } else {
                 try head.encode(enc, storage: headStorage, x: xRot16, y: yLogits32, M: rows)
             }
-        case .f16:
+        case .f16, .bf16:
             try head.encode(enc, storage: headStorage, x: xNorm16, y: yLogits32, M: rows)
         }
     }

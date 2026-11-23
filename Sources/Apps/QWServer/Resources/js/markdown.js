@@ -350,8 +350,7 @@ function renderSmokeProbeOutput() {
   }
   const sections = [];
   if (smokeProbeState.reasoning) {
-    const openAttr = smokeProbeState.content ? "" : " open";
-    sections.push(`<details class="md-thinking"${openAttr}><summary>Reasoning</summary><div class="md-thinking-body">${renderSmokeProbeMarkdown(smokeProbeState.reasoning)}</div></details>`);
+    sections.push(`<details class="md-thinking"><summary>Reasoning</summary><div class="md-thinking-body">${renderSmokeProbeMarkdown(smokeProbeState.reasoning)}</div></details>`);
   }
   if (smokeProbeState.content) {
     sections.push(renderSmokeProbeMarkdown(smokeProbeState.content));

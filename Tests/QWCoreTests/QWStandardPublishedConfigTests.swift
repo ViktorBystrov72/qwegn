@@ -53,24 +53,17 @@ final class QWStandardPublishedConfigTests: XCTestCase {
                       + refused.map { "\($0.id): \($0.reason)" }.joined(separator: ", "))
     }
 
-    func testTheDenseFamilyRefusesOnlyItsTiedAndGuardCheckpoints() throws {
+    func testTheDenseFamilyRefusesOnlyItsGuardCheckpoints() throws {
         let verdicts = try audit().filter { $0.family == "qwen3" }
         let refused = verdicts.filter { !$0.accepted }
-        XCTAssertEqual(refused.count, 38)
-        XCTAssertEqual(verdicts.filter { $0.accepted }.count, 29)
-        // Every refusal names its feature: the tied head the engine cannot
-        // materialise, or a guard checkpoint, which is not a causal LM.
-        var tied = 0
+        XCTAssertEqual(refused.count, 3)
+        XCTAssertEqual(verdicts.filter { $0.accepted }.count, 64)
         var guardModels = 0
         for v in refused {
-            if v.reason.contains("tie_word_embeddings") { tied += 1 }
             if v.reason.contains("Qwen3ForGuardModel") { guardModels += 1 }
-        }
-        XCTAssertEqual(tied, 35, "the tied-head refusals")
-        XCTAssertEqual(guardModels, 3, "the guard-architecture refusals")
-        for v in refused {
             XCTAssertTrue(v.reason.contains("'"), "\(v.id): the refusal names nothing")
         }
+        XCTAssertEqual(guardModels, 3, "the guard-architecture refusals")
     }
 
     func testEveryRefusalNamesItsFeature() throws {

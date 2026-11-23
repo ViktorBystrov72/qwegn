@@ -43,7 +43,7 @@ public enum QWSettingsCoherence {
         "mtpAdaptiveDepth", "mtpEntropyThreshold",
         "dflashDraftPackPath", "dflashSelectorTopK",
         "gdnPrefill", "evictPrefillScratch", "prefillChunkSize", "maxConcurrentSessions",
-        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "engineTuning",
+        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "engineTuning",
         "warmRAMLimitGB", "ssdCacheEnabled", "ssdCacheLimitGB", "cacheDir",
         "logLevel",
         "keepServerRunningAfterQuit",
@@ -135,6 +135,7 @@ public enum QWSettingsCoherence {
         "lsaBudget": "LSA key budget",
         "lsaClusterBlock": "LSA cluster block size",
         "lsaSidecarPath": "LSA sidecar path",
+        "lsaCrossLoopReuse": "LSA cross-loop reuse",
         "engineTuning": "Engine performance & memory tuning",
         "warmRAMLimitGB": "Warm RAM limit",
         "ssdCacheEnabled": "Persist cache to SSD",
@@ -142,6 +143,7 @@ public enum QWSettingsCoherence {
         "cacheDir": "Cache directory",
         "logLevel": "Log level",
         "coolingPolicy": "Cooling & fan policy",
+        "updateCheckSchedule": "Update check schedule",
         "keepServerRunningAfterQuit": "Keep server running after quit",
     ]
 
@@ -156,6 +158,7 @@ public enum QWSettingsCoherence {
         "coolingPolicy": "Changes AppleSMC cooling policy immediately (System Auto, Proactive Pre-Spin during active inference, or Max Blast). Direct fan RPM override requires root SMC write privilege.",
         "logDir": "Where the app writes its log file.",
         "logFileName": "The app's log file name.",
+        "updateCheckSchedule": "Controls how often Qwegn checks GitHub Releases for newer versions (applied immediately).",
     ]
 
     /// One canonical text per setting key, so two revisions can be

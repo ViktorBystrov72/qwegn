@@ -573,23 +573,22 @@ final class QWStandardMoEKernelTests: XCTestCase {
         XCTAssertEqual(outPtr[0], 0.25)
     }
 
-    /// The sparse module's doors are the per-pair chain's six: the chain's
-    /// own kernels and the router's GEMM. The dense standard families route
-    /// nothing, so they declare none of them.
+    /// The sparse chain's ten MoE kernel doors belong to the unified dense
+    /// inventory and are declared by `DenseModule.requiredDoors`.
     func testTheSparseDoorsAreThePerPairChain() {
-        let sparse = Set(Qwen3MoEModule.requiredDoors)
-        let dense = Set(StandardModule.requiredDoors)
-        XCTAssertEqual(Set(QWKernelInventory.moe_only),
-                       ["qwg_router_gemm", "qwg_moe_bridge_f16_to_f32", "qwg_moe_route",
-                        "qwg_moe_route_decode", "qwg_moe_gateup_q4g_f32_r1",
-                        "qwg_moe_down_shared_combine_q4g_f32",
-                        "qwg_moe_group_pairs_f32", "qwg_moe_nax_gemm",
-                        "qwg_moe_nax_split_f32", "qwg_moe_down_reduce_combine_f32"])
-        for door in QWKernelInventory.moe_only {
-            XCTAssertTrue(sparse.contains(door), door)
-            XCTAssertFalse(dense.contains(door), door)
+        let moeChainDoors: Set<String> = [
+            "qwg_router_gemm", "qwg_moe_bridge_f16_to_f32", "qwg_moe_route",
+            "qwg_moe_route_decode", "qwg_moe_gateup_q4g_f32_r1",
+            "qwg_moe_down_shared_combine_q4g_f32",
+            "qwg_moe_group_pairs_f32", "qwg_moe_nax_gemm",
+            "qwg_moe_nax_split_f32", "qwg_moe_down_reduce_combine_f32",
+        ]
+        let denseDoors = Set(QWKernelInventory.dense)
+        let allDense = Set(DenseModule.requiredDoors)
+        for door in moeChainDoors {
+            XCTAssertTrue(denseDoors.contains(door), door)
+            XCTAssertTrue(allDense.contains(door), door)
         }
-        XCTAssertTrue(sparse.isSubset(of: Set(DenseModule.requiredDoors)))
     }
 
     /// The config laws: what the chain cannot serve is refused by name, and
@@ -645,12 +644,9 @@ final class QWStandardMoEKernelTests: XCTestCase {
         XCTAssertThrowsError(try decode(dense, ["moe_intermediate_size": 64])) { e in
             XCTAssertTrue("\(e)".contains("moe_intermediate_size"), "\(e)")
         }
-        // The shared expert: the standard path has none, so its term is
-        // zeroed — a checkpoint with one is refused by name. A width of zero
-        // IS "no shared expert", so it is honoured.
-        XCTAssertThrowsError(try decode(sparse, ["shared_expert_intermediate_size": 128])) { e in
-            XCTAssertTrue("\(e)".contains("shared_expert_intermediate_size"), "\(e)")
-        }
+        // Dense models still refuse `shared_expert_intermediate_size > 0`, while
+        // sparse MoE (`qwen3_moe`) honours both explicit shared experts and zero.
+        XCTAssertEqual(try decode(sparse, ["shared_expert_intermediate_size": 128]).sharedExpertIntermediate, 128)
         XCTAssertThrowsError(try decode(dense, ["shared_expert_intermediate_size": 128])) { e in
             XCTAssertTrue("\(e)".contains("shared_expert_intermediate_size"), "\(e)")
         }

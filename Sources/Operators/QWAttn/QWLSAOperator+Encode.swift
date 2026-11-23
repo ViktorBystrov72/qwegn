@@ -22,7 +22,8 @@ extension QWLSAOperator {
                                       pos0: Int,
                                       rows: Int,
                                       qMode: IndexPrepQMode = .allRows) {
-        guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0 else { return }
+        guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0,
+              !isSelectionFollower(fullAttnLayer: fullAttnLayer) else { return }
         let unitTok = clusterUnitTokens
         if pos0 < residentPos512 {
             residentPos512 = (pos0 / unitTok) * unitTok
@@ -64,6 +65,70 @@ extension QWLSAOperator {
         enc.dispatchThreadgroups(
             MTLSize(width: rows, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+
+        encodePoolAndCluster(enc, fullAttnLayer: fullAttnLayer, pos0: pos0, rows: rows)
+    }
+
+    /// BF16 variant accepting separate gate-free `qIn` (`[T, qRowStride]`, `qStride = 1`) and `kIn`.
+    public func encodeIndexAndClusterBF16(_ enc: any MTLComputeCommandEncoder,
+                                          qIn: QWTensorValue,
+                                          kIn: QWTensorValue,
+                                          fullAttnLayer: Int,
+                                          pos0: Int,
+                                          rows: Int,
+                                          qRowStride: Int? = nil,
+                                          qMode: IndexPrepQMode = .allRows) {
+        guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0,
+              !isSelectionFollower(fullAttnLayer: fullAttnLayer) else { return }
+        let unitTok = clusterUnitTokens
+        if pos0 < residentPos512 {
+            residentPos512 = (pos0 / unitTok) * unitTok
+        }
+        let ls = layers[fullAttnLayer]
+        var tU = UInt32(rows)
+        var pos0U = UInt32(pos0)
+        var qHeadsU = UInt32(geometry.qHeads)
+        var kvHeadsU = UInt32(geometry.kvHeads)
+        var headDimU = UInt32(geometry.headDim)
+        var qRowStrideU = UInt32(qRowStride ?? geometry.qChannels)
+        var sliceStartU = UInt32(sliceStart)
+        var sliceDimU = UInt32(sliceDim)
+        var idxDimU = UInt32(indexDim)
+        var ringMaskU = UInt32(ringCap - 1)
+        var qModeU = qMode.rawValue
+
+        enc.setComputePipelineState(psoIndexPrepBF16)
+        qIn.bind(enc, index: 0)
+        kIn.bind(enc, index: 1)
+        ls.wqIdx.bind(enc, index: 2)
+        ls.wkIdx.bind(enc, index: 3)
+        qIdxScratch.bind(enc, index: 4)
+        ls.kPending.bind(enc, index: 5)
+        enc.setBytes(&tU, length: 4, index: 6)
+        enc.setBytes(&pos0U, length: 4, index: 7)
+        enc.setBytes(&qHeadsU, length: 4, index: 8)
+        enc.setBytes(&kvHeadsU, length: 4, index: 9)
+        enc.setBytes(&headDimU, length: 4, index: 10)
+        enc.setBytes(&qRowStrideU, length: 4, index: 11)
+        enc.setBytes(&sliceStartU, length: 4, index: 12)
+        enc.setBytes(&sliceDimU, length: 4, index: 13)
+        enc.setBytes(&idxDimU, length: 4, index: 14)
+        enc.setBytes(&ringMaskU, length: 4, index: 15)
+        enc.setBytes(&qModeU, length: 4, index: 16)
+        enc.dispatchThreadgroups(
+            MTLSize(width: rows, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+
+        encodePoolAndCluster(enc, fullAttnLayer: fullAttnLayer, pos0: pos0, rows: rows)
+    }
+
+    private func encodePoolAndCluster(_ enc: any MTLComputeCommandEncoder,
+                                      fullAttnLayer: Int,
+                                      pos0: Int,
+                                      rows: Int) {
+        let ls = layers[fullAttnLayer]
+        var idxDimU = UInt32(indexDim)
+        var ringMaskU = UInt32(ringCap - 1)
 
         // 2. Pool any newly completed 4-token blocks in [pos0 / 4 ..< (pos0 + rows) / 4]
         let startBlock = pos0 / 4
@@ -124,7 +189,8 @@ extension QWLSAOperator {
                                    pos0: Int,
                                    rows: Int,
                                    tiled32: Bool = false) {
-        guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0 else { return }
+        guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0,
+              !isSelectionFollower(fullAttnLayer: fullAttnLayer) else { return }
         let ls = layers[fullAttnLayer]
         var idxDimU = UInt32(indexDim)
         var budgetBlkU = UInt32(config.budgetBlocks)
@@ -136,6 +202,8 @@ extension QWLSAOperator {
         let totalUnits = tiled32 ? ((rows + 31) / 32) : rows
 
         var u0 = 0
+        let targetList = blockList(forFullAttnLayer: fullAttnLayer)
+        let targetCount = blockCount(forFullAttnLayer: fullAttnLayer)
         while u0 < totalUnits {
             if u0 > 0 { enc.memoryBarrier(scope: .buffers) }
             let batchUnits = min(Self.maxSelectBatchRows, totalUnits - u0)
@@ -149,12 +217,12 @@ extension QWLSAOperator {
                 offset: qIdxScratch.offset + r0 * indexDim * 2,
                 shape: QWTensorShape([remRows, indexDim], .f16))
             let listSub = QWTensorValue(
-                region: blockListScratch.region,
-                offset: blockListScratch.offset + r0 * listStride * 4,
+                region: targetList.region,
+                offset: targetList.offset + r0 * listStride * 4,
                 shape: QWTensorShape([remRows, listStride], .i32))
             let countSub = QWTensorValue(
-                region: blockCountScratch.region,
-                offset: blockCountScratch.offset + r0 * 4,
+                region: targetCount.region,
+                offset: targetCount.offset + r0 * 4,
                 shape: QWTensorShape([remRows], .i32))
 
             if isEmeansCoarse, let coarsePipeline {
@@ -329,8 +397,9 @@ extension QWLSAOperator {
                 }
             }
         }
+        let resolvedConfig = lsaConfig.resolvingLoopShareEnvironment()
         return try QWLSAOperator(
-            hal: hal, geometry: geometry, config: lsaConfig,
+            hal: hal, geometry: geometry, config: resolvedConfig,
             indexDim: indexDim, layerWeights: layerWeights,
             maxContext: maxContext, maxPrefillChunk: maxPrefillChunk)
     }

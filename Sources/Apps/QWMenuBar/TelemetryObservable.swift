@@ -44,6 +44,7 @@ public final class TelemetryObservable {
     public var cachedContextEstimates: [String: QWContextMemoryEstimate] = [:]
     public var parentPidWatchdogArmed: Bool = false
     public var serverAppliedSettings: QWServerSettings?
+    public let updater: QWUpdateController
     public var enabledMenuBarMetrics: Set<QWMenuBarMetric> {
         didSet { persistMenuBarMetrics() }
     }
@@ -130,7 +131,12 @@ public final class TelemetryObservable {
     @ObservationIgnored private var scheduledEstimateKeys: Set<String> = []
     @ObservationIgnored private var metadataTasks: [String: Task<Void, Never>] = [:]
 
-    public init(startServices: Bool = true, enableAutoLifecycle: Bool = true, initialSettings: QWServerSettings? = nil) {
+    public init(
+        startServices: Bool = true,
+        enableAutoLifecycle: Bool = true,
+        initialSettings: QWServerSettings? = nil,
+        updateController: QWUpdateController? = nil
+    ) {
         let resolvedSettings = initialSettings ?? QWSettingsManager.shared.loadSettings()
         self.settings = resolvedSettings
         self.discoveredModels = []
@@ -138,6 +144,8 @@ public final class TelemetryObservable {
         self.engineState = .stopped
         self.enabledMenuBarMetrics = Self.loadEnabledMenuBarMetrics()
         self.hideMenuBarSpeedsWhenIdle = Self.loadHideMenuBarSpeedsWhenIdle()
+        self.updater = updateController
+            ?? QWUpdateController(schedule: QWUpdateCheckSchedule.resolve(resolvedSettings.updateCheckSchedule))
 
         guard startServices else { return }
         setupLocalLoggerSubscription()
@@ -145,11 +153,13 @@ public final class TelemetryObservable {
             refreshDiscoveredModelsAsync()
             startPolling()
             applyAutoStartDecision()
+            updater.startScheduler()
         }
     }
 
     isolated deinit {
         pollTimer?.invalidate()
+        updater.stopScheduler()
         modelDiscoveryTask?.cancel()
         for task in metadataTasks.values {
             task.cancel()
@@ -770,6 +780,7 @@ public final class TelemetryObservable {
         }
         startPolling()
         applyAutoStartDecision()
+        updater.updateSchedule(QWUpdateCheckSchedule.resolve(self.settings.updateCheckSchedule))
     }
 
     /// Saves settings and awaits live server validation before returning.
@@ -783,5 +794,6 @@ public final class TelemetryObservable {
         }
         startPolling()
         applyAutoStartDecision()
+        updater.updateSchedule(QWUpdateCheckSchedule.resolve(self.settings.updateCheckSchedule))
     }
 }

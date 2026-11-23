@@ -7,19 +7,11 @@ import Foundation
 @testable import QWRope
 
 final class QWStandardModuleTests: XCTestCase {
-    func testTheStandardFamiliesNowResolveToAModule() {
-        XCTAssertNotNil(QWModuleRegistry.moduleType(for: .llamaDense))
-        XCTAssertNotNil(QWModuleRegistry.moduleType(for: .mistralDense))
-        XCTAssertNotNil(QWModuleRegistry.moduleType(for: .qwen2Dense))
-    }
-
-    func testTheQwen3FamiliesNowResolveToTheirOwnModules() {
-        // Task 4.4 served the MoE path, Task 4.5a the dense one. A family
-        // with no module says so rather than running another path.
-        XCTAssertNotNil(QWModuleRegistry.moduleType(for: .qwen3Dense))
-        XCTAssertNotNil(QWModuleRegistry.moduleType(for: .qwen3MoE))
-        XCTAssertEqual(Qwen3DenseModule.family, .qwen3Dense)
-        XCTAssertEqual(Qwen3MoEModule.family, .qwen3MoE)
+    func testTheStandardFamiliesNowResolveToDenseModule() throws {
+        for family: QWModelDescriptor.Family in [.llamaDense, .mistralDense, .qwen2Dense, .qwen3Dense, .qwen3MoE] {
+            let mod = try XCTUnwrap(QWModuleRegistry.moduleType(for: family), family.rawValue)
+            XCTAssertEqual(ObjectIdentifier(mod), ObjectIdentifier(DenseModule.self), family.rawValue)
+        }
     }
 
     func testTheStandardFamiliesAreInTheRegistrysFamilyList() {
@@ -59,29 +51,20 @@ final class QWStandardModuleTests: XCTestCase {
         XCTAssertEqual(plan.qProjOut, 2 * plan.qHeads * plan.headDim)
     }
 
-    func testTheStandardModuleShipsNoneOfThe27BsExtras() {
-        let expected: Set<QWKnobCapability> = [.kvQuantQ8, .kvQuantQ4, .lsa]
-        XCTAssertEqual(StandardModule.capabilities, expected)
-        XCTAssertEqual(LlamaModule.capabilities, expected)
-        XCTAssertEqual(MistralModule.capabilities, expected)
-        XCTAssertEqual(Qwen2DenseModule.capabilities, expected)
+    func testGeometryDerivedCapabilitiesPreserveAllSupportedKnobsForStandardFamilies() throws {
+        let llamaCaps = QWModelCapabilities.resolve(descriptor: try QWModelGeometry.stubLlamaGeometry().descriptor)
+        let expected: Set<QWKnobCapability> = [
+            .prefixCache, .kvQuantQ8, .kvQuantQ4, .dflash, .ropeYaRN, .speculative, .mtpAdaptive, .lsa,
+        ]
+        XCTAssertEqual(llamaCaps, expected)
     }
 
-    func testEachStandardModuleNamesItsOwnFamily() {
-        XCTAssertEqual(LlamaModule.family, .llamaDense)
-        XCTAssertEqual(MistralModule.family, .mistralDense)
-        XCTAssertEqual(Qwen2DenseModule.family, .qwen2Dense)
-    }
-
-    func testTheStandardDoorsAreTheDenseOnesWithoutTheHybridFamilies() {
-        let doors = Set(StandardModule.requiredDoors)
+    func testDenseRequiredDoorsIncludeStandardAndHybridKernels() {
+        let doors = Set(DenseModule.requiredDoors)
         XCTAssertFalse(doors.isEmpty)
-        XCTAssertTrue(doors.isSubset(of: Set(DenseModule.requiredDoors)))
-        for door in doors {
-            XCTAssertFalse(door.hasPrefix("qwg_" + "gdn_"), door)
-            XCTAssertFalse(door.hasPrefix("qwg_" + "mtp_"), door)
-            XCTAssertFalse(door.hasPrefix("qwg_" + "dflash_"), door)
-        }
+        XCTAssertTrue(doors.contains("qwg_attn_decode"))
+        XCTAssertTrue(doors.contains("qwg_gdn_recurrent"))
+        XCTAssertTrue(doors.contains("qwg_router_gemm"))
     }
 
     /// The standard model's geometry: a 128-half head, no gate, no q/k norm.
@@ -127,7 +110,7 @@ final class QWStandardModuleTests: XCTestCase {
             let plan = try QWEnginePlan(geometry: geometry, modelId: "stub",
                                         geometryDigest: "stub", prefillChunkRows: 512,
                                         kvStorageMode: "f16")
-            XCTAssertNoThrow(try LlamaModule.make(plan: plan, engine: nil),
+            XCTAssertNoThrow(try DenseModule.make(plan: plan, engine: nil),
                              "\(geometry.headDim) halves")
         }
     }
@@ -171,29 +154,27 @@ final class QWStandardModuleTests: XCTestCase {
         }
     }
 
-    /// The plan-shaped predicate and the instance one are ONE body, and that
-    /// body names the 27B's shape: its own geometry satisfies it, and a shape
-    /// that differs in any of the three numbers does not.
+    /// The plan-shaped predicate and instance predicate share one geometric definition:
+    /// 4 KV heads, headDim 256, and GQA ratio 6.
     func testThePlanShapedPredicateAgreesWithTheInstance() throws {
-        XCTAssertTrue(QWModelGeometry.qwen38_27b.is27BShape, "the 27B is the 27B's shape")
+        XCTAssertTrue(QWModelGeometry.qwen38_27b.matchesHead256GQA6Kernel, "4×256 GQA-6 matches specialized kernel")
         for kvHeads in [2, 4, 8] {
             for headDim in [64, 128, 256] {
                 for qHeads in [kvHeads, kvHeads * 4, kvHeads * 6] {
                     let geometry = try QWModelGeometry.stubShape(
                         kvHeads: kvHeads, qHeads: qHeads, headDim: headDim)
                     XCTAssertEqual(
-                        QWModelGeometry.is27BShape(kvHeads: kvHeads, headDim: headDim,
-                                                  gqaRatio: geometry.gqaRatio),
-                        geometry.is27BShape, "\(kvHeads)×\(headDim) gqa\(geometry.gqaRatio)")
+                        QWModelGeometry.matchesHead256GQA6Kernel(kvHeads: kvHeads, headDim: headDim,
+                                                                 gqaRatio: geometry.gqaRatio),
+                        geometry.matchesHead256GQA6Kernel, "\(kvHeads)×\(headDim) gqa\(geometry.gqaRatio)")
                 }
             }
         }
-        // The 27B's shape at a different GQA, or with a different head count,
-        // is NOT the 27B's shape: the frozen kernels hard-code all three.
+        // Any change in kvHeads, headDim, or GQA ratio falls off the specialized kernel.
         for (kvHeads, headDim, qHeads) in [(4, 256, 8), (4, 128, 24), (8, 256, 48)] {
             let geometry = try QWModelGeometry.stubShape(
                 kvHeads: kvHeads, qHeads: qHeads, headDim: headDim)
-            XCTAssertFalse(geometry.is27BShape, "\(kvHeads)×\(headDim) gqa\(qHeads / kvHeads)")
+            XCTAssertFalse(geometry.matchesHead256GQA6Kernel, "\(kvHeads)×\(headDim) gqa\(qHeads / kvHeads)")
         }
     }
 

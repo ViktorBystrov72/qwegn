@@ -1,6 +1,6 @@
 import Foundation
 import QWRope
-@testable import QWFlashNext
+@testable import QWEngine
 
 // FlashNext full attention (HF Qwen4ExpTextAttention): q/k RMSNorm (1+w), partial RoPE, GQA,
 // attention restricted to QSA-selected keys, sigmoid output gate applied before o_proj.

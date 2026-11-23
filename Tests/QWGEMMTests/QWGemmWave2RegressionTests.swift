@@ -23,11 +23,13 @@ final class QWGemmWave2RegressionTests: XCTestCase {
             for r in 0..<n {
                 for g in 0..<groups {
                     let base = (r * groups + g) * 20
-                    let sc = Float16(0.02 * (1.0 + 0.1 * Float((r + g) % 7))).bitPattern
+                    let scF16 = Float16(0.02 * (1.0 + 0.1 * Float((r + g) % 7)))
+                    let sc = scF16.bitPattern
+                    let bi = Float16(-1031.5 * Float(scF16)).bitPattern
                     ptr[base] = UInt8(sc & 0xFF)
                     ptr[base + 1] = UInt8(sc >> 8)
-                    ptr[base + 2] = 0
-                    ptr[base + 3] = 0
+                    ptr[base + 2] = UInt8(bi & 0xFF)
+                    ptr[base + 3] = UInt8(bi >> 8)
                     for b in 0..<16 {
                         seed = seed &* 1664525 &+ 1013904223
                         ptr[base + 4 + b] = UInt8((seed >> 16) & 0xFF)
@@ -382,7 +384,7 @@ final class QWGemmWave2RegressionTests: XCTestCase {
         )
         let out32 = try act.allocate(QWTensorShape([rows * h], .f32))
         let out16 = try act.allocate(QWTensorShape([rows * h], .f16))
-        guard let (cb, rawEnc) = hal.begin() else { throw XCTSkip("no command buffer") }
+        guard let (cb, rawEnc) = hal.begin(.concurrent) else { throw XCTSkip("no command buffer") }
         var enc: any MTLComputeCommandEncoder = rawEnc
         var encEnded = false
         defer { if !encEnded { enc.endEncoding() } }
@@ -391,6 +393,7 @@ final class QWGemmWave2RegressionTests: XCTestCase {
             input: .f32PreRotated(plain: xPlain, rotated: xRot, prefillPrecast16: nil),
             out32: out32, out16: out16, rows: rows,
             supportsGroupedNaxPrefill: hal.caps.isMetal4TensorCapable,
+            concurrentBarriers: true,
             rotateEncoder: { current in
                 current.endEncoding()
                 guard let next = cb.makeComputeCommandEncoder(dispatchType: .concurrent) else {

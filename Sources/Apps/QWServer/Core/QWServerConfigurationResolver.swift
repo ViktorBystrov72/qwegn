@@ -40,6 +40,7 @@ public enum QWServerConfigurationResolver {
         cliDFlashTopK: Int? = nil, cliGDNPrefill: String? = nil, cliEvictScratch: String? = nil,
         cliPrefillChunkSize: Int? = nil, cliMaxConcurrentSessions: Int? = nil, cliLSAMode: String? = nil,
         cliLSABudget: Int? = nil, cliLSAClusterBlock: Int? = nil, cliLSASidecarPath: String? = nil,
+        cliLSACrossLoopReuse: Bool? = nil,
         cliWarmRAMLimitGB: Double? = nil, cliSSDCacheLimitGB: Double? = nil, cliCacheDir: String? = nil,
         cliLogDir: String? = nil, cliLogFileName: String? = nil, cliLogLevel: String? = nil, cliLazy: Bool? = nil,
         cliLoadVision: Bool? = nil, cliStreamNgrams: Bool? = nil,
@@ -209,6 +210,7 @@ public enum QWServerConfigurationResolver {
                         case "lsaBudget": effective.lsaBudget = rawFileSettings.lsaBudget
                         case "lsaClusterBlock": effective.lsaClusterBlock = rawFileSettings.lsaClusterBlock
                         case "lsaSidecarPath": effective.lsaSidecarPath = rawFileSettings.lsaSidecarPath
+                        case "lsaCrossLoopReuse": effective.lsaCrossLoopReuse = rawFileSettings.lsaCrossLoopReuse
                         default: break
                         }
                     }
@@ -457,6 +459,7 @@ public enum QWServerConfigurationResolver {
             cliPrefillChunkSize: cliPrefillChunkSize, cliMaxConcurrentSessions: cliMaxConcurrentSessions,
             cliLSAMode: cliLSAMode, cliLSABudget: cliLSABudget,
             cliLSAClusterBlock: cliLSAClusterBlock, cliLSASidecarPath: cliLSASidecarPath,
+            cliLSACrossLoopReuse: cliLSACrossLoopReuse,
             cliWarmRAMLimitGB: cliWarmRAMLimitGB, cliSSDCacheLimitGB: cliSSDCacheLimitGB,
             cliCacheDir: cliCacheDir, cliLogDir: cliLogDir, cliLogFileName: cliLogFileName,
             cliLogLevel: cliLogLevel, cliLazy: cliLazy,
@@ -488,6 +491,7 @@ public enum QWServerConfigurationResolver {
             maxConcurrentSessions: extra.maxConcurrentSessions,
             lsaMode: extra.lsaMode, lsaBudget: extra.lsaBudget,
             lsaClusterBlock: extra.lsaClusterBlock, lsaSidecarPath: extra.lsaSidecarPath,
+            lsaCrossLoopReuse: extra.lsaCrossLoopReuse, lsaLoopShareStride: extra.lsaLoopShareStride,
             warmRAMLimitGB: extra.warmRAM, ssdCacheEnabled: extra.ssdCacheEnabled,
             ssdCacheLimitGB: extra.ssdCache, cacheDir: extra.cacheDir,
             logDir: extra.logDir, logFileName: extra.logFile,

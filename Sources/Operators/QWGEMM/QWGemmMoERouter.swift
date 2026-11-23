@@ -57,7 +57,7 @@ extension QWGemm {
             enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         }
-        if expertBudget > 0 && rows > 1 && rows <= 4 && expertBudget < rows * topK && rows * topK <= 64 {
+        if expertBudget > 0 && rows > 1 && rows <= 16 && topK <= 16 && expertBudget < rows * topK && rows * topK <= 256 {
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(try hal.pipeline("qwg_moe_route_decode"))
             enc.bindTensors(logits, idx, wts, startIndex: 0)
@@ -70,7 +70,7 @@ extension QWGemm {
             (groupIds ?? idx).bind(enc, index: 12)
             enc.setUInt32s(0, startIndex: 13)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
     }
 

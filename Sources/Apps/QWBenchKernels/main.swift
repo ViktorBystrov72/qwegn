@@ -23,12 +23,13 @@ func die(_ message: String, _ code: Int32 = 2) -> Never {
 
 if optFlag("--help") || optFlag("-h") {
     print("""
-    usage: qwg-bench-kernels [--out DIR] [--samples N] [--cols N] [--only-shvq]
+    usage: qwg-bench-kernels [--out DIR] [--samples N] [--cols N] [--only-shvq] [--only-ink2-fp]
       --out DIR      where to write bench_kernels_report.json (default: .)
       --samples N    timed runs per candidate, median wins (default: 5)
       --repeats N    dispatches per timed run, to amortise the buffer (default: 1)
       --cols N       the activation width every candidate reads (default: 4096)
       --only-shvq    run only the cold-streaming SHVQ vs AQ live kernel suites
+      --only-ink2-fp run only Inkling-2 BF16/NVFP4/MXFP8/Sink-RelBias/Head suites
     """)
     exit(0)
 }
@@ -39,6 +40,7 @@ let cols = max(BenchRunner.verifyCols,
                Int(optVal("--cols") ?? String(BenchSuites.defaultCols)) ?? BenchSuites.defaultCols)
 let repeats = max(1, Int(optVal("--repeats") ?? "1") ?? 1)
 let onlySHVQ = optFlag("--only-shvq")
+let onlyInk2FP = optFlag("--only-ink2-fp")
 
 /// The candidates the bench races, in the order it reports them.
 var candidates: [BenchCandidate] = []
@@ -50,6 +52,27 @@ do {
     // The bench races the 27B's kernels, so the HAL carries the 27B's
     // function constants — named here, never defaulted.
     let hal = try QWHal(geometry: .qwen38_27b)
+
+    if onlyInk2FP {
+        let rounds = max(6, samples)
+        let reps = max(8, repeats)
+        print("suite ink2_fp (alternating min-of-2, \(rounds) rounds x \(reps) reps/CB)")
+        let inkRows = try Ink2FPSuites.run(hal: hal, samples: rounds, repeats: reps)
+        for r in inkRows {
+            let candDesc = r.candMs.map { ms in
+                String(format: "vs %@ %.4f ms (%.2fx)", r.candKernel, ms, r.baseMs / max(ms, 1e-9))
+            } ?? "(\(r.candKernel): \(r.note))"
+            print("  \(r.suite) [\(r.shape)]: \(r.baseKernel) "
+                  + String(format: "%.4f", r.baseMs) + " ms \(candDesc)")
+        }
+        let dir = URL(fileURLWithPath: outDir, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let md = Ink2FPSuites.renderMarkdown(inkRows, rounds: rounds, reps: reps)
+        let mdURL = dir.appendingPathComponent("bench_ink2_fp_report.md")
+        try md.write(to: mdURL, atomically: true, encoding: .utf8)
+        print("VERDICT: wrote \(mdURL.path) (\(inkRows.count) Inkling-2 FP benchmarks)")
+        exit(0)
+    }
 
     if onlySHVQ {
         print("suite shvq_vs_aq (cold 256 MiB flush, \(samples) alternating samples)")

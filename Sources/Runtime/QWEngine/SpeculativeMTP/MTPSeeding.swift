@@ -143,6 +143,7 @@ extension QWEngineDriver {
             try ropeApply.encodeExtractQK(enc, hal: hal, attnY: qkvBuf,
                                           qOut: qOutBuf, kOut: kOutBuf, vOut: vOutBuf,
                                           wq: wq, wk: wkTiled,
+                                          qkvBias: mtpWeights.qkvBias,
                                           positionStart: pos + tStart, count: pairs)
             encodePagedKVWrite(enc, kv: views, k: kOutBuf, v: vOutBuf, startPos: cacheRows, t: pairs)
         }

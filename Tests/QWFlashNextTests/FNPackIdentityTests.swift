@@ -2,7 +2,8 @@ import XCTest
 import Foundation
 @testable import QWCore
 @testable import QWQuant
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 // Synthetic Flash-Next descriptor and packed N-gram binary table (`FNNgramBinRows`) tests.
 // Uses only synthetic in-memory/temp-file fixtures (no real model packs).

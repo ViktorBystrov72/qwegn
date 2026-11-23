@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 import QWCore
-@testable import QWFlashNext
+@testable import QWEngine
 
 /// The decode stack's commit order is what keeps the GPU busy while the PLE
 /// rows are read from the SSD, so the order is pinned here rather than left

@@ -44,6 +44,7 @@ public struct QWHeadWeight: Sendable {
 
 public enum QWHeadStorage: Sendable {
     case f16(QWTensorValue)
+    case bf16(QWTensorValue)
     case q4g(QWHeadWeight)
 }
 
@@ -52,7 +53,7 @@ public final class QWHead {
     public static let rowsPerTG = 8
 
     public let geometry: QWModelGeometry
-    private let hal: QWHal
+    internal let hal: QWHal
     private let psoGemv: any MTLComputePipelineState
     private let psoGemvArgmax: any MTLComputePipelineState
     private let psoCombine: any MTLComputePipelineState
@@ -80,6 +81,18 @@ public final class QWHead {
     public static func gemvArgmaxSlots(_ N: Int) -> Int { bandFor(N) }
     public static func bandFor(_ N: Int) -> Int { (N + rowsPerTG - 1) / rowsPerTG }
 
+    internal static func validateTensor(_ tensor: QWTensorValue, alignment: Int,
+                                        label: String = "head buffer") throws {
+        guard tensor.offset >= 0, tensor.region.base >= 0,
+              tensor.offset <= tensor.region.length,
+              tensor.bytes <= tensor.region.length - tensor.offset,
+              tensor.region.base <= tensor.region.buffer.length,
+              tensor.region.length <= tensor.region.buffer.length - tensor.region.base,
+              (tensor.region.base + tensor.offset) % alignment == 0 else {
+            throw QWHeadError.badShape("\(label) extent or alignment is invalid")
+        }
+    }
+
     /// Small verify windows share each FP16 weight load across all input rows.
     /// The widths come from the model's **own** geometry — the 27B's used to
     /// stand in for them here.
@@ -95,19 +108,9 @@ public final class QWHead {
               y.shape.dtype == .f32, y.shape.elementCount == M * N else {
             throw QWHeadError.badShape("FP16 head requires M=1...16, W[N,H], X[M,H], Y[M,N]")
         }
-        func validate(_ tensor: QWTensorValue, alignment: Int) throws {
-            guard tensor.offset >= 0, tensor.region.base >= 0,
-                  tensor.offset <= tensor.region.length,
-                  tensor.bytes <= tensor.region.length - tensor.offset,
-                  tensor.region.base <= tensor.region.buffer.length,
-                  tensor.region.length <= tensor.region.buffer.length - tensor.region.base,
-                  (tensor.region.base + tensor.offset) % alignment == 0 else {
-                throw QWHeadError.badShape("FP16 head buffer extent or alignment is invalid")
-            }
-        }
-        try validate(w, alignment: 16)
-        try validate(x, alignment: 16)
-        try validate(y, alignment: 4)
+        try validateTensor(w, alignment: 16, label: "FP16 head weight")
+        try validateTensor(x, alignment: 16, label: "FP16 head input")
+        try validateTensor(y, alignment: 4, label: "FP16 head output")
         if M > 8 {
             let c0 = M / 2
             let c1 = M - c0
@@ -137,11 +140,20 @@ public final class QWHead {
 
     public func encode(_ enc: any MTLComputeCommandEncoder, storage: QWHeadStorage,
                        x: QWTensorValue, gs: QWTensorValue? = nil, y: QWTensorValue,
-                       M: Int = 1) throws {
+                       M: Int = 1, softcap: Float = 0.0) throws {
         switch storage {
         case .f16(let weight):
+            guard softcap == 0 else {
+                throw QWHeadError.badShape("softcap is only supported on .bf16 head projection or encodeBatchedGreedyArgmax")
+            }
             try Self.encodeF16(enc, hal: hal, w: weight, x: x, y: y, geometry: geometry, M: M)
+        case .bf16(let weight):
+            try Self.encodeBF16(enc, hal: hal, w: weight, x: x, y: y,
+                                geometry: geometry, M: M, softcap: softcap)
         case .q4g(let weight):
+            guard softcap == 0 else {
+                throw QWHeadError.badShape("softcap is only supported on .bf16 head projection or encodeBatchedGreedyArgmax")
+            }
             if M == 1 {
                 try encode(enc, x: x, gs: gs, w: weight, y: y)
             } else {

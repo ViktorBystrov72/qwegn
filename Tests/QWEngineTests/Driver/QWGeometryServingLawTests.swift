@@ -42,18 +42,18 @@ final class QWGeometryServingLawTests: XCTestCase {
     /// A 256-half head at another kv-head count is also supported across KV modes.
     func testA256HeadAtAnotherKvCountIsSupportedAcrossKVModes() throws {
         let g = try geometry(headDim: 256, qHeads: 16, kvHeads: 8)
-        XCTAssertFalse(g.is27BShape)
-        XCTAssertFalse(g.is27BKVShape)
+        XCTAssertFalse(g.matchesHead256GQA6Kernel)
+        XCTAssertFalse(g.matchesKVStride1024Kernel)
         XCTAssertNoThrow(try QWEngineDriver.validateGeometry(g, kvMode: .f16))
         XCTAssertNoThrow(try QWEngineDriver.validateGeometry(g, kvMode: .q8))
         XCTAssertNoThrow(try QWEngineDriver.validateGeometry(g, kvMode: .q4))
     }
 
-    /// The 27B itself keeps every mode: the compressed layouts are its own.
+    /// The specialized 4×256 GQA-6 shape keeps every mode.
     func testThe27BShapeKeepsEveryMode() throws {
         let g = QWModelGeometry.qwen38_27b
-        XCTAssertTrue(g.is27BShape)
-        XCTAssertTrue(g.is27BKVShape)
+        XCTAssertTrue(g.matchesHead256GQA6Kernel)
+        XCTAssertTrue(g.matchesKVStride1024Kernel)
         for mode in [QWKVMode.f16, .q8, .q4] {
             XCTAssertNoThrow(try QWEngineDriver.validateGeometry(g, kvMode: mode))
         }
@@ -73,8 +73,27 @@ final class QWGeometryServingLawTests: XCTestCase {
                                    "max_position_embeddings": 128,
                                    "rms_norm_eps": 1e-5, "rope_theta": 500000.0,
                                    "eos_token_id": 2, "vocab_size": 64])))
-        // A head wider than 256 halves would be half-written.
-        let wide = try geometry(headDim: 512, qHeads: 2, kvHeads: 1)
+        // Decode fails closed on head_dim > 256, and validateGeometry enforces the same > 256 guard.
+        XCTAssertThrowsError(try geometry(headDim: 512, qHeads: 2, kvHeads: 1))
+        let wideDescriptor = QWModelDescriptor(
+            family: .llamaDense, modelType: "llama", capabilities: [],
+            hidden: 1024, vocab: 64, denseIntermediate: 256, numLayers: 1,
+            layerTypes: ["full_attention"], fullAttentionInterval: 1, rmsEps: 1e-5,
+            maxPositionEmbeddings: 128, qHeads: 2, kvHeads: 1, headDim: 512,
+            attnOutputGate: false, partialRotaryFactor: 1.0, ropeTheta: 500000.0,
+            indexerHeads: nil, indexerKvHeads: nil, indexerHeadDim: nil,
+            indexerBudget: nil, indexerCompressRatio: nil,
+            numExperts: nil, expertsPerTok: nil, moeIntermediate: nil,
+            sharedExpertIntermediate: nil, expertGateType: nil,
+            hcCount: nil, hcLowrank: nil,
+            gdnQKHeads: 0, gdnVHeads: 0, gdnHeadDim: 0,
+            gdnQKVChannels: 0, gdnZChannels: 0, gdnConvKernel: 0,
+            pleLayerIds: nil, pleEmbedDim: nil, pleConvKernel: nil,
+            ngramSize: nil, headsPerNgram: nil, ngramVocabSizeBase: nil,
+            makeNgramVocabDivisibleBy: nil, splitNgramParts: nil,
+            mtpLayers: 0, mtpUseDedicatedEmbeddings: false, eosTokenId: 2
+        )
+        let wide = QWModelGeometry(descriptor: wideDescriptor)
         XCTAssertThrowsError(try QWEngineDriver.validateGeometry(wide, kvMode: .f16)) { e in
             guard case QWEngineDriverError.unsupportedModel = e else {
                 return XCTFail("expected unsupportedModel, got \(e)")

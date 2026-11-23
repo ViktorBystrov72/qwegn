@@ -406,4 +406,76 @@ final class QWStandardWeightLoadingTests: XCTestCase {
             XCTAssertTrue(slice.allSatisfy { $0 == guTags[e] })
         }
     }
+
+    func testQWPackBiasLoadingAndFailClosedMissingBias() throws {
+        let baseGeo = try QWModelGeometry.stubPureMoE().withResidentExperts(4)
+        let biasedDesc = baseGeo.descriptor.withAttentionBias(qkv: true, output: true)
+        let geometry = QWModelGeometry(descriptor: biasedDesc)
+        let h = geometry.hidden, inter = geometry.moeIntermediate, totalE = geometry.numExperts
+        let kv = geometry.kvHeads * geometry.headDim
+        let shvqBlockBytes = QWSHVQBlock.bytes(bits: 3, group: 64)
+        let shvqMeta: [String: Any] = ["bits": 3, "group": 64, "vq": "shvq1"]
+        let guTags = (0..<totalE).map { UInt8(0x80 + $0) }
+        let dnTags = (0..<totalE).map { UInt8(0xC0 + $0) }
+        let qBias = (0..<geometry.qProjOut).map { Float(($0 % 19) - 9) * 0.05 }
+        let kBias = (0..<kv).map { Float(($0 % 17) - 8) * 0.06 }
+        let vBias = (0..<kv).map { Float(($0 % 13) - 6) * 0.07 }
+        let oBias = (0..<h).map { Float(($0 % 23) - 11) * 0.04 }
+
+        var planes: [String: Plane] = [
+            Pack.ln1: .raw(gammaVector(h)),
+            Pack.ln2: .raw(gammaVector(h)),
+            Pack.q: .hq4(n: geometry.qProjOut, k: h, tag: Tag.q),
+            Pack.k: .hq4(n: kv, k: h, tag: Tag.k),
+            Pack.v: .hq4(n: kv, k: h, tag: Tag.v),
+            Pack.o: .hq4(n: h, k: geometry.qHeads * geometry.headDim, tag: Tag.o),
+            Pack.qNorm: .raw(gammaVector(geometry.headDim)),
+            Pack.kNorm: .raw(gammaVector(geometry.headDim)),
+            "model.layers.0.self_attn.q_proj.bias": .raw(qBias),
+            "model.layers.0.self_attn.k_proj.bias": .raw(kBias),
+            "model.layers.0.self_attn.v_proj.bias": .raw(vBias),
+            "model.layers.0.self_attn.o_proj.bias": .raw(oBias),
+            "model.layers.0.block_sparse_moe.gate.weight": .raw([Float](repeating: 0.5, count: totalE * h)),
+            "model.layers.0.block_sparse_moe.experts.gate_up_proj.weight": .fused3D(
+                experts: totalE, rows: 2 * inter, k: h,
+                perExpertBytes: 2 * inter * (h / 64) * shvqBlockBytes, hq: shvqMeta, tags: guTags),
+            "model.layers.0.block_sparse_moe.experts.down_proj.weight": .fused3D(
+                experts: totalE, rows: h, k: inter,
+                perExpertBytes: h * (inter / 64) * shvqBlockBytes, hq: shvqMeta, tags: dnTags),
+            Pack.finalNorm: .raw(gammaVector(h)),
+            Pack.head: .hq4(n: geometry.vocab, k: h, tag: Tag.head),
+        ]
+
+        var (L, plan, wsub) = try makeLoader(geometry: geometry, planes: planes, resolvePackFormat: true)
+        _ = try L.q4(Pack.head, n: geometry.vocab, k: h)
+        let (layers, _) = try L.loadDecoderWeights(geometry: geometry)
+        if let ropeShape = plan.shapes.last { _ = try L.allocateWeight(ropeShape) }
+        try plan.finish(requests: L.weightRequest, usedBytes: wsub.usedBytes)
+
+        let attn = try XCTUnwrap(layers[0].attn)
+        let loadedQKV = try XCTUnwrap(attn.qkvBias)
+        let loadedO = try XCTUnwrap(attn.oBias)
+        let qkvRaw = bytes(loadedQKV, count: geometry.attnTotalN * 2)
+        let wantQKV = qBias + kBias + vBias
+        for i in 0..<wantQKV.count {
+            let bits = UInt16(qkvRaw[2 * i]) | (UInt16(qkvRaw[2 * i + 1]) << 8)
+            let got = QWQuant.f16tof32Bits(bits)
+            let bf = UInt16(truncatingIfNeeded: wantQKV[i].bitPattern >> 16)
+            let want = Float(Float16(Float(bitPattern: UInt32(bf) << 16)))
+            XCTAssertLessThanOrEqual(abs(got - want), 1e-3, "qkvBias[\(i)]")
+        }
+        let oRaw = bytes(loadedO, count: h * 2)
+        for i in 0..<h {
+            let bits = UInt16(oRaw[2 * i]) | (UInt16(oRaw[2 * i + 1]) << 8)
+            let got = QWQuant.f16tof32Bits(bits)
+            let bf = UInt16(truncatingIfNeeded: oBias[i].bitPattern >> 16)
+            let want = Float(Float16(Float(bitPattern: UInt32(bf) << 16)))
+            XCTAssertLessThanOrEqual(abs(got - want), 1e-3, "oBias[\(i)]")
+        }
+
+        planes.removeValue(forKey: "model.layers.0.self_attn.k_proj.bias")
+        var (missingKLoader, _, _) = try makeLoader(geometry: geometry, planes: planes, resolvePackFormat: true)
+        _ = try missingKLoader.q4(Pack.head, n: geometry.vocab, k: h)
+        XCTAssertThrowsError(try missingKLoader.loadDecoderWeights(geometry: geometry))
+    }
 }

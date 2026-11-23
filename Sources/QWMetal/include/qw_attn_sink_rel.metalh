@@ -1,0 +1,58 @@
+// qw_attn_sink_rel.metalh — Shared params and KV read helper for sink + relBias + gated attention.
+#pragma once
+#include <metal_stdlib>
+using namespace metal;
+
+struct QWSinkRelAttnParams {
+    uint T;
+    uint nH;
+    uint nKV;
+    uint headDim;
+    uint dRel;
+    uint sliding;
+    uint relExtent;
+    uint posOffset;
+    uint ringCap;
+    uint kvMode;
+    uint kvLen;
+    uint splits;
+    uint hasSink;
+    uint hasRelBias;
+    uint hasOutGate;
+    uint splitSpan;
+};
+
+METAL_FUNC float qwg_sink_rel_dot4(float4 a, float4 b) {
+    #pragma clang fp contract(off) reassociate(off)
+    return fma(a.w, b.w, fma(a.z, b.z, fma(a.y, b.y, a.x * b.x)));
+}
+
+struct QWSinkRelTreeMeta {
+    uint isTree;
+    uint pad[3];
+    uint ancMask[16];
+    uint depths[16];
+};
+
+template <uint MODE>
+METAL_FUNC half4 qwg_sink_rel_read_kv4(
+    uint vecIdx, uint slot, uint kvh, uint nKV, uint D,
+    device const uchar* cacheBuf, device const uchar* metaBuf
+) {
+    const size_t rowHead = size_t(slot) * nKV + kvh;
+    if constexpr (MODE == 0u) {
+        return *(device const half4*)(((device const half*)cacheBuf) + rowHead * D + vecIdx * 4u);
+    } else if constexpr (MODE == 1u) {
+        const half sc = ((device const half*)metaBuf)[rowHead];
+        const char4 c = *(device const char4*)(((device const char*)cacheBuf) + rowHead * D + vecIdx * 4u);
+        return half4(half(c.x) * sc, half(c.y) * sc, half(c.z) * sc, half(c.w) * sc);
+    } else {
+        const half2 sm = ((device const half2*)metaBuf)[rowHead];
+        const uchar2 b = *(device const uchar2*)(cacheBuf + rowHead * (D >> 1u) + vecIdx * 2u);
+        const half sc = sm.x, mn = sm.y;
+        return half4(
+            fma(half(b.x & 0x0Fu), sc, mn), fma(half(b.x >> 4u), sc, mn),
+            fma(half(b.y & 0x0Fu), sc, mn), fma(half(b.y >> 4u), sc, mn)
+        );
+    }
+}

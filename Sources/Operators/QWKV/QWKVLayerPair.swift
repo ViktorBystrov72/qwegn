@@ -56,12 +56,13 @@ enum QWKVHostCodec {
         let base0 = positions.lowerBound
         switch mode {
         case .f16:
-            src.withUnsafeBufferPointer { s in
+            try src.withUnsafeBufferPointer { s in
                 guard let base = s.baseAddress else { return }
                 for tok in positions {
                     let pg = tok / QWKVCache.pageTokens
                     let off = tok % QWKVCache.pageTokens
                     let pageID = Int(table[pg])
+                    guard pageID >= 0 else { throw QWKVError.badArgument("unallocated KV page \(pg)") }
                     let dst = pageArena.region.buffer.contents()
                         .advanced(by: pageArena.region.base + pageID * bytesPerPage)
                         .assumingMemoryBound(to: UInt16.self) + off * rowElems
@@ -81,6 +82,7 @@ enum QWKVHostCodec {
                     let pg = tok / QWKVCache.pageTokens
                     let off = tok % QWKVCache.pageTokens
                     let pageID = Int(table[pg])
+                    guard pageID >= 0 else { throw QWKVError.badArgument("unallocated KV page \(pg)") }
                     let pageBase = pageArena.region.buffer.contents()
                         .advanced(by: pageArena.region.base + pageID * bytesPerPage)
                     let srcRow = base + (tok - base0) * rowElems
@@ -115,6 +117,7 @@ enum QWKVHostCodec {
                     let pg = tok / QWKVCache.pageTokens
                     let off = tok % QWKVCache.pageTokens
                     let pageID = Int(table[pg])
+                    guard pageID >= 0 else { throw QWKVError.badArgument("unallocated KV page \(pg)") }
                     let pageBase = pageArena.region.buffer.contents()
                         .advanced(by: pageArena.region.base + pageID * bytesPerPage)
                     let srcRow = base + (tok - base0) * rowElems
@@ -144,7 +147,8 @@ enum QWKVHostCodec {
         kvAux: QWSubAllocator?,
         layers: [Int],
         pageBytes: Int,
-        tablesTotal: Int
+        tablesTotal: Int,
+        layerPoolWeights: [Int]? = nil
     ) throws -> (poolPairs: [QWKVLayerPoolPair], tableBuffer: any MTLBuffer, tableBase: Int) {
         let layerCount = layers.count
         let kvAvail = kv.freeBytes
@@ -158,10 +162,10 @@ enum QWKVHostCodec {
         }
         let hasVSub = vSubAllocator != nil
         let hasAux = kvAux != nil
-        func canPlace(pagesPerPool: Int, requireTablesRoom: Bool) -> Bool {
-            let alignedPool = qwAlignUp(pagesPerPool * pageBytes, 256)
+        func canPlace(_ counts: [Int], requireTablesRoom: Bool) -> Bool {
             var remK = kvAvail, remV = vAvail, remAux = auxAvail
-            for _ in 0..<layerCount {
+            for li in 0..<layerCount {
+                let alignedPool = qwAlignUp(counts[li] * pageBytes, 256)
                 for kind in QWKVKind.allCases {
                     if kind == .k || !hasVSub {
                         if remK >= alignedPool { remK -= alignedPool }
@@ -176,29 +180,65 @@ enum QWKVHostCodec {
             }
             return !requireTablesRoom || remK >= tablesTotal || remV >= tablesTotal || remAux >= tablesTotal
         }
-        let maxCandidates = rawPoolBytes / pageBytes
-        func maxFeasiblePages(requireTablesRoom: Bool) -> Int {
-            var lo = 1, hi = maxCandidates, best = 0
-            while lo <= hi {
-                let mid = lo + (hi - lo) / 2
-                if canPlace(pagesPerPool: mid, requireTablesRoom: requireTablesRoom) {
-                    best = mid; lo = mid + 1
-                } else {
-                    hi = mid - 1
-                }
+
+        let useProportional: Bool = {
+            guard let w = layerPoolWeights, w.count == layerCount else { return false }
+            return Set(w.map { max(1, $0) }).count > 1
+        }()
+        let pagesPerLayer: [Int]
+        if useProportional, let rawWeights = layerPoolWeights {
+            let weights = rawWeights.map { max(1, $0) }
+            let maxWeight = weights.max() ?? 1
+            let maxTop = max(1, (avail - tablesTotal) / (2 * pageBytes))
+            func weightedCounts(_ top: Int) -> [Int] {
+                weights.map { max(1, (top * $0) / maxWeight) }
             }
-            return best
+            func maxFeasibleTop(requireTablesRoom: Bool) -> Int {
+                var lo = 1, hi = maxTop, best = 0
+                while lo <= hi {
+                    let mid = lo + (hi - lo) / 2
+                    if canPlace(weightedCounts(mid), requireTablesRoom: requireTablesRoom) {
+                        best = mid; lo = mid + 1
+                    } else {
+                        hi = mid - 1
+                    }
+                }
+                return best
+            }
+            var bestTop = maxFeasibleTop(requireTablesRoom: true)
+            if bestTop == 0 { bestTop = maxFeasibleTop(requireTablesRoom: false) }
+            guard bestTop >= 1 else {
+                throw QWKVError.outOfPages(asked: qwAlignUp(pageBytes, 256),
+                                           free: max(kvAvail, max(vAvail, auxAvail)))
+            }
+            pagesPerLayer = weightedCounts(bestTop)
+        } else {
+            let maxCandidates = rawPoolBytes / pageBytes
+            func maxFeasiblePages(requireTablesRoom: Bool) -> Int {
+                var lo = 1, hi = maxCandidates, best = 0
+                while lo <= hi {
+                    let mid = lo + (hi - lo) / 2
+                    if canPlace(Array(repeating: mid, count: layerCount), requireTablesRoom: requireTablesRoom) {
+                        best = mid; lo = mid + 1
+                    } else {
+                        hi = mid - 1
+                    }
+                }
+                return best
+            }
+            var pagesPerPool = maxFeasiblePages(requireTablesRoom: true)
+            if pagesPerPool == 0 { pagesPerPool = maxFeasiblePages(requireTablesRoom: false) }
+            guard pagesPerPool >= 1 else {
+                throw QWKVError.outOfPages(asked: qwAlignUp(pageBytes, 256),
+                                           free: max(kvAvail, max(vAvail, auxAvail)))
+            }
+            pagesPerLayer = Array(repeating: pagesPerPool, count: layerCount)
         }
-        var pagesPerPool = maxFeasiblePages(requireTablesRoom: true)
-        if pagesPerPool == 0 { pagesPerPool = maxFeasiblePages(requireTablesRoom: false) }
-        guard pagesPerPool >= 1 else {
-            throw QWKVError.outOfPages(asked: qwAlignUp(pageBytes, 256),
-                                       free: max(kvAvail, max(vAvail, auxAvail)))
-        }
-        let onePoolBytes = pagesPerPool * pageBytes
-        let alignedPoolBytes = qwAlignUp(onePoolBytes, 256)
+
         var remK = kvAvail, remV = vAvail, remAux = auxAvail
-        func allocatePool(_ kind: QWKVKind) throws -> QWKVLayerPoolPair.Pool {
+        func allocatePool(pages: Int, kind: QWKVKind) throws -> QWKVLayerPoolPair.Pool {
+            let onePoolBytes = pages * pageBytes
+            let alignedPoolBytes = qwAlignUp(onePoolBytes, 256)
             let targetSub: QWSubAllocator
             if let kvV = vSubAllocator, kind == .v {
                 if remV >= alignedPoolBytes { remV -= alignedPoolBytes; targetSub = kvV }
@@ -212,12 +252,14 @@ enum QWKVHostCodec {
             let off = try targetSub.allocate(bytes: onePoolBytes)
             let region = QWMRegion(buffer: targetSub.region.buffer,
                                    base: targetSub.region.base + off, length: onePoolBytes)
-            return QWKVLayerPoolPair.Pool(QWPageArena(region: region, pageSize: pageBytes, pageCount: pagesPerPool))
+            return QWKVLayerPoolPair.Pool(QWPageArena(region: region, pageSize: pageBytes, pageCount: pages))
         }
         var pairs: [QWKVLayerPoolPair] = []
         pairs.reserveCapacity(layers.count)
-        for _ in layers {
-            pairs.append(QWKVLayerPoolPair(k: try allocatePool(.k), v: try allocatePool(.v)))
+        for li in layers.indices {
+            let pages = pagesPerLayer[li]
+            pairs.append(QWKVLayerPoolPair(k: try allocatePool(pages: pages, kind: .k),
+                                           v: try allocatePool(pages: pages, kind: .v)))
         }
 
         // Table slots tail: zero-initialised so unwritten slots never expose stale page IDs.

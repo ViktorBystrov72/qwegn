@@ -41,6 +41,7 @@ public final class QWTokenizer: @unchecked Sendable {
     let mode: Mode
     let usesNFC: Bool
     let stripLeadingSpace: Bool
+    let ignoreMerges: Bool
     /// byte → ByteLevel symbol scalar (derived at load; law above).
     let byteMap: [Unicode.Scalar]
     /// vocab symbol (ByteLevel string) → token id.
@@ -150,6 +151,7 @@ public final class QWTokenizer: @unchecked Sendable {
         }
         self.mode = detectedMode
         self.usesNFC = (normType == "NFC")
+        self.ignoreMerges = (model["ignore_merges"] as? Bool) ?? false
         let decSubs = ((root["decoder"] as? [String: Any])?["decoders"] as? [[String: Any]]) ?? []
         self.stripLeadingSpace = decSubs.contains(where: {
             ($0["type"] as? String) == "Strip" && ($0["content"] as? String) == " " && (($0["start"] as? Int) ?? 0) > 0

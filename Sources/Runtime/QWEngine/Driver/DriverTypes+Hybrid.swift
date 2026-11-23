@@ -55,6 +55,8 @@ extension QWEngineDriver {
                 ])
                 if let a = dl.attn {
                     out.append(contentsOf: [a.qkvProj.blocks.region.buffer, a.o.blocks.region.buffer])
+                    if let qb = a.qkvBias { out.append(qb.region.buffer) }
+                    if let ob = a.oBias { out.append(ob.region.buffer) }
                 }
                 if let m = dl.moe {
                     out.append(m.router.region.buffer)

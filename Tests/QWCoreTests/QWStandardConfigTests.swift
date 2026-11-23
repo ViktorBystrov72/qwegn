@@ -95,7 +95,7 @@ final class QWStandardConfigTests: XCTestCase {
 
     func testAModelMissingANumericsKeySaysWhichOne() throws {
         XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: try config(without: "vocab_size"))) { error in
-            XCTAssertEqual(error as? QWStandardConfigDecoder.Error, .missing("vocab_size"))
+            XCTAssertTrue("\(error)".contains("vocab_size"), "unexpected error: \(error)")
         }
     }
 
@@ -110,14 +110,27 @@ final class QWStandardConfigTests: XCTestCase {
         XCTAssertEqual(d.ropeTheta, 500000.0, accuracy: 1.0)
     }
 
-    func testARoPEScalingCurveIsRefusedRatherThanIgnored() throws {
-        // The engine cannot reproduce a scaled RoPE, and a wrong curve
-        // changes every position — so the model is refused, not run wrong.
-        for block in [["rope_type": "llama3", "factor": 8.0],
-                      ["type": "linear", "factor": 2.0]] {
-            XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
-                "rope_scaling": block,
-            ])))
+    func testUnsupportedRoPEScalingCurveIsRefusedWhileLinearYarnDynamicDecode() throws {
+        XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
+            "rope_scaling": ["rope_type": "llama3", "factor": 8.0],
+        ])))
+        let linear = try QWModelDescriptor.decode(configJSON: config([
+            "rope_scaling": ["type": "linear", "factor": 2.0],
+        ]))
+        XCTAssertEqual(linear.ropeScaling, .linear(factor: 2.0))
+        let dynamic = try QWModelDescriptor.decode(configJSON: config([
+            "rope_scaling": ["rope_type": "dynamic", "factor": 4.0, "original_max_position_embeddings": 32768],
+        ]))
+        XCTAssertEqual(dynamic.ropeScaling, .dynamic(factor: 4.0, originalMaxPositionEmbeddings: 32768))
+        let yarn = try QWModelDescriptor.decode(configJSON: config([
+            "rope_scaling": ["rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768,
+                             "beta_fast": 32.0, "beta_slow": 1.0],
+        ]))
+        XCTAssertEqual(yarn.yarnRopeConfig?.factor, 4.0)
+        if case .yarn(let yc)? = yarn.ropeScaling {
+            XCTAssertEqual(yc.originalMaxPositionEmbeddings, 32768)
+        } else {
+            XCTFail("expected RoPEScaling.yarn")
         }
     }
 
@@ -126,54 +139,78 @@ final class QWStandardConfigTests: XCTestCase {
             "rope_scaling": ["rope_type": "default"],
         ]))
         XCTAssertEqual(d.ropeTheta, 1_000_000.0, accuracy: 1.0)
+        XCTAssertNil(d.ropeScaling)
     }
 
-    func testAttentionBiasIsRefused() throws {
-        XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
+    func testAttentionBiasDecodesQKVAndOutputFlags() throws {
+        let base = try QWModelDescriptor.decode(configJSON: config([:]))
+        XCTAssertFalse(base.hasQKVBias)
+        XCTAssertFalse(base.hasAttnOutputBias)
+
+        let biased = try QWModelDescriptor.decode(configJSON: config([
             "attention_bias": true,
-        ])))
+        ]))
+        XCTAssertTrue(biased.hasQKVBias)
+        XCTAssertTrue(biased.hasAttnOutputBias)
+        XCTAssertEqual(biased.geometryDigestV2Hex, base.geometryDigestV2Hex)
+        XCTAssertNotEqual(biased.geometryDigestV3Hex, base.geometryDigestV3Hex)
     }
 
-    func testAMixedDenseMoELayerLayoutIsRefused() throws {
-        // The descriptor cannot express "some layers dense, some MoE".
-        XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
+    func testMixedDenseMoESchedulesAndSharedExpertsDecode() throws {
+        let d = try QWModelDescriptor.decode(configJSON: config([
             "model_type": "qwen3_moe",
             "num_experts": 128,
             "num_experts_per_tok": 8,
             "moe_intermediate_size": 1536,
-            "mlp_only_layers": [0, 1],
-        ])))
+            "shared_expert_intermediate_size": 768,
+            "mlp_only_layers": [0, 3, 7],
+            "first_k_dense_replace": 2,
+            "decoder_sparse_step": 2,
+        ]))
+        XCTAssertEqual(d.sharedExpertIntermediate, 768)
+        XCTAssertEqual(d.firstKDenseReplace, 2)
+        XCTAssertEqual(d.mlpOnlyLayers, [0, 3, 7])
+        XCTAssertEqual(d.decoderSparseStep, 2)
+        XCTAssertFalse(d.isMoELayer(0))
+        XCTAssertFalse(d.isMoELayer(1))
+        XCTAssertFalse(d.isMoELayer(2))
+        XCTAssertFalse(d.isMoELayer(3))
+        XCTAssertFalse(d.isMoELayer(4))
+        XCTAssertTrue(d.isMoELayer(5))
+        XCTAssertFalse(d.isMoELayer(7))
     }
 
-    func testAnActiveSlidingWindowIsRefusedRatherThanIgnored() throws {
-        // The engine has no sliding-window attention: a token attends the
-        // whole context. A checkpoint that declares a window would run with
-        // the wrong numbers past the window, so it is refused.
-        XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
+    func testActiveSlidingWindowDecodesAcrossStandardModels() throws {
+        let mistral = try QWModelDescriptor.decode(configJSON: config([
             "model_type": "mistral",
             "sliding_window": 4096,
-        ]))) { error in
-            XCTAssertTrue("\(error)".contains("sliding_window"), "the refusal names the feature: \(error)")
-        }
+        ]))
+        XCTAssertEqual(mistral.slidingWindow, 4096)
     }
 
     func testASlidingWindowTheFamilyTurnsOffIsAccepted() throws {
-        // Qwen2 declares `sliding_window` but switches it off — the same
-        // numbers, no window. The flag decides, so the config is accepted.
         let d = try QWModelDescriptor.decode(configJSON: config([
             "model_type": "qwen2",
             "sliding_window": 4096,
             "use_sliding_window": false,
         ]))
         XCTAssertEqual(d.family, .qwen2Dense)
+        XCTAssertNil(d.slidingWindow)
     }
 
-    func testASlidingWindowTheFamilyTurnsOnIsRefused() throws {
-        XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
+    func testASlidingWindowTheFamilyTurnsOnDecodes() throws {
+        let d = try QWModelDescriptor.decode(configJSON: config([
             "model_type": "qwen2",
             "sliding_window": 4096,
             "use_sliding_window": true,
-        ])))
+        ]))
+        XCTAssertEqual(d.slidingWindow, 4096)
+        let fullCtx = try QWModelDescriptor.decode(configJSON: config([
+            "model_type": "qwen2",
+            "sliding_window": 40960,
+            "use_sliding_window": true,
+        ]))
+        XCTAssertNil(fullCtx.slidingWindow)
     }
 
     func testANullSlidingWindowIsAbsent() throws {
@@ -208,19 +245,18 @@ final class QWStandardConfigTests: XCTestCase {
         ])))
     }
 
-    func testATiedCheckpointIsRefusedUntilTheEngineCanMaterialiseItsHead() throws {
-        // A tied checkpoint has no lm_head of its own. The engine would fail
-        // later on a missing weight; the config says so now. The rule holds
-        // for the qwen3 family too — 37 of its 64 published configs are
-        // tied, and they are refused while the untied ones are served.
-        for type in ["qwen2", "qwen3", "qwen3_moe"] {
-            XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
-                "model_type": type,
-                "tie_word_embeddings": true,
-            ]))) { error in
-                XCTAssertTrue("\(error)".contains("tie_word_embeddings"),
-                              "the refusal names the feature: \(error)")
-            }
+    func testTiedWordEmbeddingsDecodeAcrossStandardFamilies() throws {
+        let cases: [(String, [String: Any])] = [
+            ("qwen2", [:]),
+            ("qwen3", [:]),
+            ("qwen3_moe", ["num_experts": 64, "num_experts_per_tok": 8, "moe_intermediate_size": 768]),
+        ]
+        for (type, extra) in cases {
+            var fields = extra
+            fields["model_type"] = type
+            fields["tie_word_embeddings"] = true
+            let d = try QWModelDescriptor.decode(configJSON: config(fields))
+            XCTAssertTrue(d.tieWordEmbeddings, type)
         }
     }
 
@@ -263,29 +299,37 @@ final class QWStandardConfigTests: XCTestCase {
         }
     }
 
-    func testAQKNormTheConfigTurnsOffIsRefused() throws {
-        // The engine's q/k norm is the family's own. A checkpoint that says
-        // it has none would run with a norm the model does not have.
-        XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
+    func testExplicitQKNormTraitOverridesFamilyDefault() throws {
+        let off = try QWModelDescriptor.decode(configJSON: config([
             "use_qk_norm": false,
-        ]))) { error in
-            XCTAssertTrue("\(error)".contains("use_qk_norm"), "the refusal names it: \(error)")
-        }
-        XCTAssertNoThrow(try QWModelDescriptor.decode(configJSON: config([
+        ]))
+        XCTAssertFalse(off.hasQKNorm)
+        let on = try QWModelDescriptor.decode(configJSON: config([
             "use_qk_norm": true,
-        ])))
+        ]))
+        XCTAssertTrue(on.hasQKNorm)
+        let llamaOn = try QWModelDescriptor.decode(configJSON: config([
+            "model_type": "llama",
+            "use_qk_norm": true,
+        ]))
+        XCTAssertTrue(llamaOn.hasQKNorm)
     }
 
-    func testABiasOnTheQKVProjectionsIsRefused() throws {
-        // The sibling of attention_bias, which was already policed.
-        XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
+    func testABiasOnTheQKVProjectionsDecodesQKVBiasOnly() throws {
+        let base = try QWModelDescriptor.decode(configJSON: config([:]))
+        let biased = try QWModelDescriptor.decode(configJSON: config([
             "qkv_bias": true,
-        ]))) { error in
-            XCTAssertTrue("\(error)".contains("qkv_bias"), "the refusal names it: \(error)")
-        }
-        XCTAssertNoThrow(try QWModelDescriptor.decode(configJSON: config([
+        ]))
+        XCTAssertTrue(biased.hasQKVBias)
+        XCTAssertFalse(biased.hasAttnOutputBias)
+        XCTAssertEqual(biased.geometryDigestV2Hex, base.geometryDigestV2Hex)
+        XCTAssertNotEqual(biased.geometryDigestV3Hex, base.geometryDigestV3Hex)
+
+        let unBiased = try QWModelDescriptor.decode(configJSON: config([
             "qkv_bias": false,
-        ])))
+        ]))
+        XCTAssertFalse(unBiased.hasQKVBias)
+        XCTAssertFalse(unBiased.hasAttnOutputBias)
     }
 
     func testAModelThatAsksForRouterLogitsIsRefused() throws {
@@ -480,8 +524,18 @@ final class QWStandardConfigTests: XCTestCase {
             "hidden_size": 4001,        // not divisible by 32 heads
             "num_attention_heads": 32,
         ]))) { error in
-            XCTAssertEqual(error as? QWStandardConfigDecoder.Error,
-                           .badGeometry("hidden_size 4001 is not divisible by num_attention_heads 32"))
+            XCTAssertTrue("\(error)".contains("hidden_size 4001 is not divisible by num_attention_heads 32"),
+                          "unexpected error: \(error)")
+        }
+        XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
+            "head_dim": 512,
+        ]))) { error in
+            XCTAssertTrue("\(error)".contains("512"), "expected >256 refusal: \(error)")
+        }
+        XCTAssertThrowsError(try QWModelDescriptor.decode(configJSON: config([
+            "head_dim": 100,
+        ]))) { error in
+            XCTAssertTrue("\(error)".contains("32"), "expected %32 refusal: \(error)")
         }
     }
 

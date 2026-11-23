@@ -19,6 +19,8 @@ public final class QWHttpServer: @unchecked Sendable {
     let maxConcurrentConnections: Int
     let requestReadTimeoutSeconds: TimeInterval
     let finderRevealRunner: (@Sendable ([String]) async throws -> Int32)?
+    let updateService: QWServerUpdateService
+    let enableAutoUpdateChecks: Bool
     let logger: QWServerLogger
     var listener: NWListener?
     let queue = DispatchQueue(label: "qwg.server.nw", qos: .userInitiated)
@@ -41,7 +43,9 @@ public final class QWHttpServer: @unchecked Sendable {
         allowUnauthenticatedPublicBind: Bool = false,
         allowedWorkspaceRoots: [String] = [],
         maxConcurrentConnections: Int = 64,
-        requestReadTimeoutSeconds: TimeInterval = 30.0
+        requestReadTimeoutSeconds: TimeInterval = 30.0,
+        enableAutoUpdateChecks: Bool = false,
+        updateService: QWServerUpdateService? = nil
     ) {
         self.init(
             actor: actor,
@@ -54,7 +58,9 @@ public final class QWHttpServer: @unchecked Sendable {
             allowedWorkspaceRoots: allowedWorkspaceRoots,
             maxConcurrentConnections: maxConcurrentConnections,
             requestReadTimeoutSeconds: requestReadTimeoutSeconds,
-            finderRevealRunner: nil
+            finderRevealRunner: nil,
+            enableAutoUpdateChecks: enableAutoUpdateChecks,
+            updateService: updateService
         )
     }
 
@@ -69,7 +75,9 @@ public final class QWHttpServer: @unchecked Sendable {
         allowedWorkspaceRoots: [String] = [],
         maxConcurrentConnections: Int = 64,
         requestReadTimeoutSeconds: TimeInterval = 30.0,
-        finderRevealRunner: (@Sendable ([String]) async throws -> Int32)?
+        finderRevealRunner: (@Sendable ([String]) async throws -> Int32)?,
+        enableAutoUpdateChecks: Bool = false,
+        updateService: QWServerUpdateService? = nil
     ) {
         self.actor = actor
         self.host = host
@@ -83,6 +91,8 @@ public final class QWHttpServer: @unchecked Sendable {
         self.maxConcurrentConnections = max(1, maxConcurrentConnections)
         self.requestReadTimeoutSeconds = max(0.05, requestReadTimeoutSeconds)
         self.finderRevealRunner = finderRevealRunner
+        self.enableAutoUpdateChecks = enableAutoUpdateChecks
+        self.updateService = updateService ?? QWServerUpdateService()
         if !allowedWorkspaceRoots.isEmpty {
             actor.configureAllowedWorkspaceRoots(allowedWorkspaceRoots)
         }
@@ -163,11 +173,17 @@ public final class QWHttpServer: @unchecked Sendable {
             self.listener = nil
             throw err
         }
+        if enableAutoUpdateChecks {
+            let svc = updateService
+            Task { await svc.startScheduler() }
+        }
     }
 
     public func stop() {
         listener?.cancel()
         listener = nil
+        let svc = updateService
+        Task { await svc.stopScheduler() }
     }
 
     private func handleConnection(_ connection: NWConnection) {
@@ -510,6 +526,24 @@ public final class QWHttpServer: @unchecked Sendable {
 
                 case ("GET", "/v1/engine/info"), ("GET", "/api/engine/info"):
                     self.handleEngineInfoRoute(connection: connection)
+
+                case ("GET", "/v1/update"), ("GET", "/api/update"):
+                    await self.handleUpdateStatusRoute(connection: connection)
+
+                case ("POST", "/v1/update/check"), ("POST", "/api/update/check"):
+                    await self.handleUpdateCheckRoute(connection: connection, body: body)
+
+                case ("POST", "/v1/update/skip"), ("POST", "/api/update/skip"):
+                    await self.handleUpdateSkipRoute(connection: connection, body: body)
+
+                case ("POST", "/v1/update/download"), ("POST", "/api/update/download"):
+                    await self.handleUpdateDownloadRoute(connection: connection)
+
+                case ("POST", "/v1/update/download/cancel"), ("POST", "/api/update/download/cancel"):
+                    await self.handleUpdateCancelDownloadRoute(connection: connection)
+
+                case ("POST", "/v1/update/install"), ("POST", "/api/update/install"):
+                    await self.handleUpdateInstallRoute(connection: connection, body: body)
 
                 case ("GET", "/v1/metrics/stream"):
                     self.handleMetricsStream(connection: connection)

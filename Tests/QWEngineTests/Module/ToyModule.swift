@@ -22,12 +22,12 @@ final class ToyModule: QWInferenceModule, @unchecked Sendable {
     static let requiredDoors: [String] = []
 
     /// The module's own session state.
-    final class State: QWModuleSessionState, @unchecked Sendable {
+    final class State: @unchecked Sendable {
         var activeTokens: Int = 0
         /// The tokens the module has been fed, in order.
         var history: [Int] = []
 
-        func reset(sampling: QWSamplerConfig, speculative: QWSpeculativeParameters) throws {
+        func reset() {
             activeTokens = 0
             history = []
         }
@@ -105,24 +105,11 @@ final class ToyModule: QWInferenceModule, @unchecked Sendable {
         throw QWModuleError.notImplemented("ToyModule.configurePrefixCache")
     }
 
-    func makeSessionState() throws -> any QWModuleSessionState {
+    func makeSessionState() -> State {
         State()
     }
 
-    func prepare(_ state: any QWModuleSessionState, prompt: [Int], maxNew: Int) throws {
-        // The toy has no stack to carve: the plan already says how much a
-        // request may generate.
-    }
-
-    func finish(_ state: any QWModuleSessionState) {
-        // The toy holds nothing across a request.
-    }
-
-    func encodePrefill(_ state: any QWModuleSessionState, tokens: [Int],
-                       chunk: Range<Int>, runsHead: Bool) throws -> Int {
-        guard let toy = state as? State else {
-            throw QWModuleError.invalidState("ToyModule got a foreign session state")
-        }
+    func encodePrefill(_ toy: State, tokens: [Int], chunk: Range<Int>, runsHead: Bool) -> Int {
         for token in tokens[chunk] {
             toy.history.append(token)
             toy.activeTokens += 1
@@ -131,11 +118,7 @@ final class ToyModule: QWInferenceModule, @unchecked Sendable {
         return step(toy, token: last)
     }
 
-    func encodeDecodeStep(_ state: any QWModuleSessionState, token: Int,
-                          position: Int) throws -> Int {
-        guard let toy = state as? State else {
-            throw QWModuleError.invalidState("ToyModule got a foreign session state")
-        }
+    func encodeDecodeStep(_ toy: State, token: Int, position: Int) -> Int {
         toy.history.append(token)
         toy.activeTokens += 1
         return step(toy, token: token)
@@ -152,8 +135,4 @@ final class ToyModule: QWInferenceModule, @unchecked Sendable {
         }
         return Int(abs(accumulator).rounded(.down)) % max(1, plan.vocab)
     }
-
-    func lastStepMilliseconds(_ state: any QWModuleSessionState) -> Double { 0 }
-
-    func prefillGPUSeconds(_ state: any QWModuleSessionState) -> Double { 0 }
 }

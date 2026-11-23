@@ -32,6 +32,9 @@ done
 
 APP_PATH="${ROOT_PREFIX}/Applications/Qwegn.app"
 CLI_PATH="${ROOT_PREFIX}/usr/local/bin/qwg"
+HELPER_BIN="${ROOT_PREFIX}/usr/local/libexec/qwg-smc-helper"
+HELPER_PLIST="${ROOT_PREFIX}/Library/LaunchDaemons/ai.qwegn.smc-helper.plist"
+HELPER_SOCK="${ROOT_PREFIX}/var/run/qwg-smc.sock"
 SHARE_PATH="${ROOT_PREFIX}/usr/local/share/qwegn"
 VENV_PATH="${HOME}/Library/Application Support/Qwegn"
 
@@ -59,6 +62,20 @@ if [[ -e "$CLI_PATH" || -L "$CLI_PATH" ]]; then
   fi
 fi
 
+if [[ -z "$ROOT_PREFIX" && ( -e "$HELPER_PLIST" || -e "$HELPER_BIN" ) ]]; then
+  run_priv /bin/launchctl bootout system/ai.qwegn.smc-helper >/dev/null 2>&1 || true
+fi
+
+for helper_item in "$HELPER_PLIST" "$HELPER_BIN" "$HELPER_SOCK"; do
+  if [[ -e "$helper_item" || -L "$helper_item" || -S "$helper_item" ]]; then
+    if [[ -w "$(dirname "$helper_item")" ]]; then
+      /bin/rm -f "$helper_item"
+    else
+      run_priv /bin/rm -f "$helper_item"
+    fi
+  fi
+done
+
 if [[ -d "$APP_PATH" || -L "$APP_PATH" ]]; then
   if [[ -w "$(dirname "$APP_PATH")" ]]; then
     /bin/rm -rf "$APP_PATH"
@@ -85,5 +102,5 @@ if [[ -d "$SHARE_PATH" || -L "$SHARE_PATH" ]]; then
   fi
 fi
 
-echo "Uninstalled Qwegn (removed $CLI_PATH, $APP_PATH, $SHARE_PATH)."
+echo "Uninstalled Qwegn (removed $CLI_PATH, $HELPER_BIN, $HELPER_PLIST, $APP_PATH, $SHARE_PATH)."
 echo "Models, settings, profiles, and caches in ~/.qwg were preserved."

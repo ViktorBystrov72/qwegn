@@ -11,6 +11,7 @@ Mixed raw BF16/FP16 and quantized weight tensors (including `DFlash` / `DSpine` 
 1. Check `entry.rawOff != nil` **before** checking quantized plane offsets (`hq4Off`).
 2. Compute `.raw` bytes via `shape.reduce(1, *) * rawElemBytes`; compute `.hq4` bytes from `experts * eHq4` (3D MoE banks) or `n * (k / hqGroup) * hqBlockBytes`.
 3. `QWCheckpointTensorLoader.mapCachedMoESlab` enforces explicit `sysconf(_SC_PAGESIZE)` modulus alignment checks before `mmap`/zero-copy projection.
+4. `DriverWeightKernels.resolveHeadSpec` and `QWWeightAllocationPlan` resolve tied embeddings (`tieWordEmbeddings` fallback to `model.embed_tokens.weight`) and `.nativeAffine` SafeTensors heads/MTP uniformly within the single `QWEngineDriver`.
 
 ## 3. Zero-Copy Buffer Lifetimes & Checked POSIX I/O
 - **Zero-copy retention (`PlaneIO.mapZeroCopyRange` & `DispatchData`):** Both `MTLBuffer(bytesNoCopy:)` and `DispatchData` mappings retain the backing `QWQuant.Pack` via `nonisolated(unsafe)` lifetime extension across deallocation (`withExtendedLifetime(...) {}`) without `@Sendable` capture warnings, preventing premature `munmap` under async consumers.
@@ -20,7 +21,7 @@ Mixed raw BF16/FP16 and quantized weight tensors (including `DFlash` / `DSpine` 
   - Retry `EINTR` and partial short reads until `count` or EOF; `preadExact` throws `QWPOSIXError.shortRead` on premature EOF.
 
 ## 4. Runtime Residency Toggles & Hermetic Mode
-All containers and model modules honor runtime residency controls without hidden overrides:
+All containers and the unified `DenseModule` / `QWEngineDriver` (including `QWHyperStreamRuntime`) honor runtime residency controls without hidden overrides:
 - `--load-vision` / `--no-load-vision`: Loads or omits the ViT encoder; image requests when disabled fail cleanly without lazy surprise allocations.
 - `--stream-ngrams` / `--no-stream-ngrams`: Streams HyperPLE / `QNGRAM` tables from NVMe via a bounded cache rather than pinning full tables in GPU/RAM.
 - `--no-profile`: Bypasses `~/.qwg/settings.json` and per-model profile overrides for deterministic, hermetic CLI/bench execution (enforced by `Scripts/paired_perf.py`).

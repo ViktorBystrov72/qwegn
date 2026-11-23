@@ -4,8 +4,28 @@
 
 import Foundation
 import QWCore
-import QWFlashNext
 import QWHead
+
+/// Tracks requests rendering chat templates or tokenizing so concurrent bursts coalesce cleanly.
+public enum QWBatchAdmissionTracker {
+    public static func beginPreparing() {
+        QWBatchAdmissionCounter.beginPreparing()
+    }
+
+    public static func endPreparing() {
+        QWBatchAdmissionCounter.endPreparing()
+    }
+
+    public static var preparingCount: Int {
+        QWBatchAdmissionCounter.preparingCount
+    }
+}
+
+/// Public entry point callers invoke around template rendering/tokenization to assist batch coalescing.
+public enum QWConcurrentBatchTracker {
+    public static func beginPreparing() { QWBatchAdmissionTracker.beginPreparing() }
+    public static func endPreparing() { QWBatchAdmissionTracker.endPreparing() }
+}
 
 /// Unified request scheduler over any `QWInferenceEngine`.
 public final class QWBatchScheduler: @unchecked Sendable {
@@ -13,7 +33,6 @@ public final class QWBatchScheduler: @unchecked Sendable {
 
     private let underlying: any QWInferenceEngine
     private let driver: QWEngineDriver?
-    private let fnEngine: FNGPUEngine?
     private let lock = NSLock()
     private let exclusiveCond = NSCondition()
     private let driverWorker = QWDriverWorkerThread()
@@ -27,7 +46,6 @@ public final class QWBatchScheduler: @unchecked Sendable {
     public init(engine: any QWInferenceEngine) {
         self.underlying = engine
         self.driver = Self.resolveDriver(engine)
-        self.fnEngine = Self.resolveFNEngine(engine)
     }
 
     deinit {
@@ -44,17 +62,6 @@ public final class QWBatchScheduler: @unchecked Sendable {
         }
         if let dense = current as? DenseModule {
             return dense.engine
-        }
-        return nil
-    }
-
-    static func resolveFNEngine(_ engine: any QWInferenceEngine) -> FNGPUEngine? {
-        var current: any QWInferenceEngine = engine
-        while let unified = current as? QWEngine {
-            current = unified.underlying
-        }
-        if let fnMod = current as? FlashNextModule {
-            return fnMod.engine
         }
         return nil
     }
@@ -128,16 +135,6 @@ public final class QWBatchScheduler: @unchecked Sendable {
                 )
             }
         }
-        if let fnEngine {
-            return try runExclusive {
-                try fnEngine.computeEchoPromptLogprobs(
-                    promptTokens: promptTokens,
-                    sampling: sampling,
-                    topLogprobsCount: topLogprobsCount,
-                    shouldStop: shouldStop
-                )
-            }
-        }
         return nil
     }
 
@@ -160,6 +157,20 @@ public final class QWBatchScheduler: @unchecked Sendable {
 
         guard let driver else {
             return try underlying.generate(request: request, onToken: onToken)
+        }
+        if let hyper = driver.hyperRuntime {
+            if request.usePrefixCache && !hyper.hasPrefixCacheTier {
+                throw QWEngineDriverError.state("the request wants a prefix cache this engine does not have")
+            }
+            return try hyper.runGeneration(request: request, onToken: onToken, onStopToken: nil)
+        }
+        if let ink = driver.inkling2Runtime {
+            if request.usePrefixCache && !ink.hasPrefixCacheTier {
+                throw QWEngineDriverError.state("the request wants a prefix cache this engine does not have")
+            }
+            if ink.maxBatchSlots <= 1 {
+                return try ink.runGeneration(request: request, onToken: onToken, onStopToken: nil)
+            }
         }
 
         let job = QWBatchScheduledJob(request: request, onToken: onToken)
@@ -214,12 +225,12 @@ public final class QWBatchScheduler: @unchecked Sendable {
     }
 
     private func coalescePreparingBurst(maxSlots: Int) {
-        guard FNBatchAdmissionTracker.preparingCount > 0 else { return }
+        guard QWBatchAdmissionTracker.preparingCount > 0 else { return }
         var waitedUs = 0
         while waitedUs < 10_000 {
             let queued = lock.withLock { pendingQueue.count }
             if queued >= maxSlots { break }
-            if FNBatchAdmissionTracker.preparingCount == 0 && waitedUs >= 1_000 { break }
+            if QWBatchAdmissionTracker.preparingCount == 0 && waitedUs >= 1_000 { break }
             usleep(250)
             waitedUs += 250
         }
@@ -228,7 +239,7 @@ public final class QWBatchScheduler: @unchecked Sendable {
     private func driveLoop() {
         while true {
             let maxWave = driver.map { min(Self.maxSlots, $0.maxBatchSlots) } ?? 1
-            if FNBatchAdmissionTracker.preparingCount > 0 {
+            if QWBatchAdmissionTracker.preparingCount > 0 {
                 coalescePreparingBurst(maxSlots: maxWave)
             }
             enum Wave {
@@ -305,6 +316,7 @@ public final class QWBatchScheduler: @unchecked Sendable {
     }
 
     private func ensureHeadScratch(for driver: QWEngineDriver) -> QWBatchHeadScratch? {
+        if driver.inkling2Runtime != nil { return nil }
         if let box = cachedHeadScratch { return box.scratch }
         guard let scratch = try? QWBatchHeadScratch(hal: driver.hal, vocab: driver.geometry.vocab) else {
             return nil
@@ -326,6 +338,22 @@ extension QWEngineDriver {
         topLogprobsCount: Int,
         shouldStop: (@Sendable () -> Bool)?
     ) throws -> [QWTokenLogprob] {
+        if let hyper = hyperRuntime {
+            return try hyper.computeEchoPromptLogprobs(
+                promptTokens: prompt,
+                sampling: sampling,
+                topLogprobsCount: topLogprobsCount,
+                shouldStop: shouldStop
+            )
+        }
+        if let ink = inkling2Runtime {
+            return try ink.computeEchoPromptLogprobs(
+                promptTokens: prompt,
+                sampling: sampling,
+                topLogprobsCount: topLogprobsCount,
+                shouldStop: shouldStop
+            )
+        }
         guard prompt.count >= 2 else { return [] }
         for t in prompt where t < 0 || t >= geometry.vocab {
             throw QWEngineDriverError.badToken(t)

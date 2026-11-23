@@ -4,9 +4,10 @@ import Metal
 import XCTest
 import QWAlloc
 import QWCore
-@testable import QWFlashNext
+@testable import QWEngine
 import QWGEMM
 import QWHAL
+import QWHyperPLE
 
 final class FNBatchRecurrentResetTests: XCTestCase {
     private static func fillBytes(_ ptr: UnsafeMutableRawPointer, count: Int, byte: UInt8) {
@@ -60,7 +61,7 @@ final class FNBatchRecurrentResetTests: XCTestCase {
         )
         ple.parity = 1
 
-        FNGPUEngine.wipeRecurrentLayer(gdn: gdn, ple: ple, arena: arena)
+        QWHyperStreamRuntime.wipeRecurrentLayer(gdn: gdn, ple: ple, arena: arena)
         XCTAssertTrue(Self.allZero(arena.cpuPointer(of: gState), count: gState.bytes))
         XCTAssertTrue(Self.allZero(arena.cpuPointer(of: gConv), count: gConv.bytes))
         XCTAssertTrue(Self.allZero(arena.cpuPointer(of: pHist), count: pHist.bytes))
@@ -103,15 +104,15 @@ final class FNBatchRecurrentResetTests: XCTestCase {
     }
 
     func testSessionAndSchedulerWiringDoNotGateRecurrentResetOnHighWaterPos() throws {
-        let sessionSrc = try Self.readSource("Sources/Subsystems/QWFlashNext/GPU/FNGPUSession.swift")
+        let sessionSrc = try Self.readSource("Sources/Runtime/QWEngine/Driver/HyperStream/FNGPUSession.swift")
         XCTAssertFalse(sessionSrc.contains("guard used > 0 else"))
         XCTAssertTrue(sessionSrc.contains("Self.wipeRecurrentLayer(gdn: rec.gdn, ple: rec.weights.ple, arena: arena)"))
 
-        let schedSrc = try Self.readSource("Sources/Subsystems/QWFlashNext/GPU/FNGPUBatchScheduler.swift")
+        let schedSrc = try Self.readSource("Sources/Runtime/QWEngine/Driver/HyperStream/FNGPUBatchScheduler.swift")
         XCTAssertFalse(schedSrc.contains("for s in 1..<slotStates.count where slotStates[s].highWaterPos > 0"))
         XCTAssertTrue(schedSrc.contains("Self.resetExtraSlotRecurrentStates("))
 
-        let driveSrc = try Self.readSource("Sources/Subsystems/QWFlashNext/GPU/FNGPUBatchScheduler+Drive.swift")
+        let driveSrc = try Self.readSource("Sources/Runtime/QWEngine/Driver/HyperStream/FNGPUBatchScheduler+Drive.swift")
         XCTAssertTrue(driveSrc.contains("slotStates[syncSlot].highWaterPos = engine.highWaterPos"))
     }
 }

@@ -1,8 +1,9 @@
 // FNContextHeadroomAndBoundsTests.swift — Tests < 32K KV headroom and LRU protected eviction.
 import Foundation
 import XCTest
+import QWAttn
 import QWCore
-@testable import QWFlashNext
+@testable import QWEngine
 
 final class FNContextHeadroomAndBoundsTests: XCTestCase {
     func testResolveKVCapacityAdds1024HeadroomFrom4KWhenRAMAllows() {
@@ -12,13 +13,13 @@ final class FNContextHeadroomAndBoundsTests: XCTestCase {
 
         // Contexts < 4096 keep exact aligned capacity.
         XCTAssertEqual(
-            FNGPUEngine.resolveKVCapacity(alignedCap: 2048, fixedBytes: fixed, perTokenBytes: perTok, availableBytes: roomy),
+            QWHyperStreamRuntime.resolveKVCapacity(alignedCap: 2048, fixedBytes: fixed, perTokenBytes: perTok, availableBytes: roomy),
             2048
         )
         // Contexts >= 4096 (including < 32K) gain +1024 decode headroom when RAM permits.
         for cap in [4096, 8192, 16384, 32768] {
             XCTAssertEqual(
-                FNGPUEngine.resolveKVCapacity(alignedCap: cap, fixedBytes: fixed, perTokenBytes: perTok, availableBytes: roomy),
+                QWHyperStreamRuntime.resolveKVCapacity(alignedCap: cap, fixedBytes: fixed, perTokenBytes: perTok, availableBytes: roomy),
                 cap + 1024
             )
         }
@@ -30,11 +31,11 @@ final class FNContextHeadroomAndBoundsTests: XCTestCase {
         for cap in [4096, 16384, 32768] {
             let exactAvail = fixed + cap * perTok
             XCTAssertEqual(
-                FNGPUEngine.resolveKVCapacity(alignedCap: cap, fixedBytes: fixed, perTokenBytes: perTok, availableBytes: exactAvail),
+                QWHyperStreamRuntime.resolveKVCapacity(alignedCap: cap, fixedBytes: fixed, perTokenBytes: perTok, availableBytes: exactAvail),
                 cap
             )
             XCTAssertEqual(
-                FNGPUEngine.resolveKVCapacity(alignedCap: cap, fixedBytes: fixed, perTokenBytes: perTok, availableBytes: exactAvail + 1024 * perTok),
+                QWHyperStreamRuntime.resolveKVCapacity(alignedCap: cap, fixedBytes: fixed, perTokenBytes: perTok, availableBytes: exactAvail + 1024 * perTok),
                 cap + 1024
             )
         }

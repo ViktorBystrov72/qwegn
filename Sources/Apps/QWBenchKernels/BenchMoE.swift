@@ -332,6 +332,7 @@ enum MoESuites {
             enc.setBytes(&n, length: 4, index: 4)
             enc.setBytes(&k, length: 4, index: 5)
             enc.setBytes(&e, length: 4, index: 6)
+            enc.setBuffer(bankBuf, offset: 0, index: 7)
             enc.dispatchThreadgroups(
                 MTLSize(width: (rowsPerExpert + 3) / 4, height: routes, depth: tokens),
                 threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))

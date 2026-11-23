@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 private struct SyntheticNgramRows: FNNgramRows {
     let headDim: Int

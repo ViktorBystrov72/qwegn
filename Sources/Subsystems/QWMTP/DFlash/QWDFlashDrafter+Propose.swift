@@ -575,7 +575,7 @@ extension QWDFlashDrafter {
             guard let headStorage else {
                 throw QWDFlashError.state("QWDFlashDrafter: DSpine refinement requires headStorage")
             }
-            encodeDSpineRefinementTail(
+            try encodeDSpineRefinementTail(
                 enc, draftCount: D, topK: topK, headStorage: headStorage,
                 bw: bw, bs: bs, stochastic: stochastic != nil
             )

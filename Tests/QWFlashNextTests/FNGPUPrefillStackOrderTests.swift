@@ -1,5 +1,5 @@
 import XCTest
-@testable import QWFlashNext
+@testable import QWEngine
 
 final class FNGPUPrefillStackOrderTests: XCTestCase {
     func testSplitOccursOnlyBeforeTheFirstConsumer() {

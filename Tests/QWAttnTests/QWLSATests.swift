@@ -631,4 +631,110 @@ final class QWLSATests: XCTestCase {
             cache.finish(seq)
         }
     }
+
+    func testMillionTokenLayoutStridesAndLiveGPUPoolSelect() throws {
+        let context1M = 1_048_576
+        for clusterBlk in [QWLSAConfig.defaultClusterBlock, QWLSAConfig.emeansClusterBlock] {
+            let cfg = QWLSAConfig(mode: .svd, budget: 2048, clusterBlock: clusterBlk)
+            let emeans = (cfg.alignedClusterBlock == QWLSAConfig.emeansClusterBlock)
+            let maxBlocks = (context1M + 3) / 4
+            let maxSB = emeans
+                ? ((context1M + QWLSAConfig.emeansClusterBlock - 1) / QWLSAConfig.emeansClusterBlock)
+                : ((context1M + 511) / 512)
+            let reusePlan = QWLSALoopReusePlan.build(physicalLayers: [0, 1], enabled: false)
+            let plan = QWLSAOperator.buildLayoutPlan(
+                inDim: Self.geometry.lsaInputDim, indexDim: 64, ringCap: 16_384,
+                maxBlocks: maxBlocks, maxSuperblocks: maxSB, maxBuckets: maxSB * 64,
+                listStride: max(512, cfg.maxTotalSelectedBlocks), maxPrefillChunk: 8192, emeans: emeans,
+                physicalLayers: [0, 1], reusePlan: reusePlan
+            )
+            XCTAssertGreaterThan(plan.totalBytes, 0)
+            for off in plan.layerOffsets {
+                XCTAssertEqual(off.pooledOff & 255, 0)
+                XCTAssertLessThan(off.pooledOff + maxBlocks * 64 * 2, plan.totalBytes)
+                XCTAssertNotEqual(off.wqOff, off.wkOff)
+            }
+            let est = QWLSAOperator.estimateRegionBytes(
+                geometry: Self.geometry, lsaConfig: cfg, attnLayers: [0, 1],
+                maxContext: context1M, maxPrefillChunk: 8192
+            )
+            XCTAssertGreaterThanOrEqual(est, plan.totalBytes)
+        }
+
+        try XCTSkipIf(MTLCreateSystemDefaultDevice() == nil, "Metal device required")
+        let inDim = Self.geometry.lsaInputDim
+        let wq = QWLSASidecar.synthesizeDeterministicOrthogonalBasis(inDim: inDim, indexDim: 64, seed: 301)
+        let wk = QWLSASidecar.synthesizeDeterministicOrthogonalBasis(inDim: inDim, indexDim: 64, seed: 302)
+        let op = try QWLSAOperator(
+            hal: Self.hal,
+            geometry: Self.geometry,
+            config: QWLSAConfig(mode: .svd, budget: 512, clusterBlock: 512),
+            layerWeights: [QWLSAOperator.LayerWeights(physicalLayer: 0, wqIdxF16: wq, wkIdxF16: wk)],
+            maxContext: context1M,
+            maxPrefillChunk: 32
+        )
+        XCTAssertEqual(op.maxBlocks, 262_144)
+        XCTAssertEqual(op.maxSuperblocks, 2048)
+        XCTAssertEqual(op.maxBuckets, 131_072)
+        XCTAssertNotEqual(op.layers[0].wqIdx.offset, op.layers[0].wkIdx.offset)
+        XCTAssertGreaterThan(op.fullIndexerStateBytes(position: context1M), 0)
+        XCTAssertGreaterThan(op.deltaIndexerStateBytes(basePos512: context1M - 512, position: context1M), 0)
+
+        let ls = op.layers[0]
+        // Seed middle-zone block 261_888 (superblock 2046) so top-k must index beyond 32-bit half offsets.
+        let targetBlk = 261_888
+        let targetBucket = 2046 * 64
+        let unitDim0 = Float16(1.0).bitPattern
+        let pooledPtr = ls.pooledKeys.region.pointer.advanced(by: ls.pooledKeys.offset).assumingMemoryBound(to: UInt16.self)
+        let centPtr = ls.centroids.region.pointer.advanced(by: ls.centroids.offset).assumingMemoryBound(to: UInt16.self)
+        let sizePtr = ls.bucketSizes.region.pointer.advanced(by: ls.bucketSizes.offset).assumingMemoryBound(to: UInt8.self)
+        pooledPtr[targetBlk * 64] = unitDim0
+        centPtr[targetBucket * 64] = unitDim0
+        sizePtr[targetBucket] = 1
+
+        let qElems = 4 * Self.geometry.qProjOut
+        let kElems = 4 * Self.geometry.kvChannels
+        var qArr = [UInt16](repeating: 0, count: qElems)
+        var kArr = [UInt16](repeating: 0, count: kElems)
+        for t in 0..<4 {
+            let kBase = t * Self.geometry.kvChannels + Self.geometry.lsaHeadSliceStart
+            for kv in 0..<Self.geometry.kvHeads {
+                kArr[kBase + kv * Self.geometry.headDim] = Float16(0.5).bitPattern
+            }
+            for h in 0..<Self.geometry.qHeads {
+                let qOff = t * Self.geometry.qProjOut + h * 2 * Self.geometry.headDim + Self.geometry.lsaHeadSliceStart
+                qArr[qOff] = Float16(0.5).bitPattern
+            }
+        }
+        let qBuf = Self.hal.device.makeBuffer(bytes: qArr, length: qArr.count * 2, options: .storageModeShared)!
+        let kBuf = Self.hal.device.makeBuffer(bytes: kArr, length: kArr.count * 2, options: .storageModeShared)!
+        let qTV = QWTensorValue(region: QWMRegion(buffer: qBuf, base: 0, length: qBuf.length),
+                                offset: 0, shape: QWTensorShape([4, Self.geometry.qProjOut], .f16))
+        let kTV = QWTensorValue(region: QWMRegion(buffer: kBuf, base: 0, length: kBuf.length),
+                                offset: 0, shape: QWTensorShape([4, Self.geometry.kvChannels], .f16))
+
+        let (cb, enc) = try XCTUnwrap(Self.hal.begin())
+        op.encodeIndexAndCluster(enc, qgate: qTV, kIn: kTV, fullAttnLayer: 0, pos0: context1M - 4, rows: 4, qMode: .none)
+        let qIdxPtr = op.qIdxScratch.region.pointer.advanced(by: op.qIdxScratch.offset).assumingMemoryBound(to: UInt16.self)
+        qIdxPtr[0] = unitDim0
+        op.encodeSelectBlocks(enc, fullAttnLayer: 0, pos0: context1M - 1, rows: 1)
+        Self.hal.end(cb, enc)
+        cb.waitUntilCompleted()
+        XCTAssertNil(cb.error)
+
+        var tailNorm = 0.0
+        for d in 0..<64 {
+            let v = Double(QWQuant.f16tof32Bits(pooledPtr[262_143 * 64 + d]))
+            tailNorm += v * v
+        }
+        XCTAssertEqual(tailNorm, 1.0, accuracy: 2e-2)
+        let cnt = op.blockCountScratch.region.pointer.advanced(by: op.blockCountScratch.offset)
+            .assumingMemoryBound(to: Int32.self)[0]
+        XCTAssertEqual(cnt, 257) // 1 sink + 128 budgetBlocks + 128 windowBlocks
+        let listPtr = op.blockListScratch.region.pointer.advanced(by: op.blockListScratch.offset)
+            .assumingMemoryBound(to: Int32.self)
+        let picked = (0..<Int(cnt)).map { Int(listPtr[$0]) }
+        XCTAssertTrue(picked.contains(targetBlk), "1M selector dropped high block \(targetBlk)")
+        XCTAssertTrue(picked.contains(262_143), "1M selector dropped final tail block 262143")
+    }
 }

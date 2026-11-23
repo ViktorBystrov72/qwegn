@@ -302,6 +302,7 @@ final class QWTelemetryHonestyTests: XCTestCase {
             "Sources/Apps/QWServer/Resources/js/chat-presets.js",
             "Sources/Apps/QWServer/Resources/js/chat.js",
             "Sources/Apps/QWServer/Resources/js/actions.js",
+            "Sources/Apps/QWServer/Resources/js/updates.js",
         ].map { try source($0) }.joined(separator: "\n")
         XCTAssertFalse(dashboard.contains("util.gpuUsagePercent || 0"),
                        "the dashboard must not turn a missing GPU reading into a zero")
@@ -434,11 +435,11 @@ final class QWTelemetryHonestyTests: XCTestCase {
     }
 
     func testFlashNextAndLayerStageTelemetryHonesty() throws {
-        let fnEngine = try source("Sources/Subsystems/QWFlashNext/GPU/FNGPUEngine.swift")
-        XCTAssertFalse(fnEngine.contains("if self.pack == nil {"),
-                       "Flash-Next zero-copy pack slabs must never be skipped from standalone weight telemetry")
-        XCTAssertTrue(fnEngine.contains("standaloneWeightBytes("),
-                      "FNGPUEngine must compute non-arena weights via standaloneWeightBytes")
+        let hyperRuntime = try source("Sources/Runtime/QWEngine/Driver/HyperStream/QWHyperStreamRuntime.swift")
+        XCTAssertFalse(hyperRuntime.contains("if self.pack == nil {"),
+                       "HyperStream zero-copy pack slabs must never be skipped from standalone weight telemetry")
+        XCTAssertTrue(hyperRuntime.contains("standaloneWeightBytes("),
+                      "QWHyperStreamRuntime must compute non-arena weights via standaloneWeightBytes")
 
         let denseKernel = try source("Sources/Runtime/QWEngine/Module/QWDenseLayerKernels.swift")
         let hybridKernel = try source("Sources/Runtime/QWEngine/Module/QWHybridLayerKernels.swift")

@@ -4,7 +4,7 @@ import Foundation
 import Metal
 import XCTest
 @testable import QWEngine
-@testable import QWFlashNext
+@testable import QWHyperPLE
 import QWAlloc
 import QWCore
 import QWGDN

@@ -474,8 +474,8 @@ struct BaseNAXFrag {
       metal::bool_constant<transpose_b>) {
     // Create Matmul descriptor
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-        16,
         32,
+        16,
         16,
         transpose_a,
         transpose_b,

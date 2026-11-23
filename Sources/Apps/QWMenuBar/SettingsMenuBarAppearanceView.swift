@@ -95,6 +95,7 @@ struct SettingsMenuBarAppearanceView: View {
                         .font(TelemetryTheme.numeric(11, .medium))
                         .foregroundStyle(TelemetryTheme.primary(increasedContrast: increasedContrast))
                         .lineLimit(1)
+                        .minimumScaleFactor(0.82)
                 } else {
                     Text("Icon only")
                         .font(TelemetryTheme.ui(10.5))

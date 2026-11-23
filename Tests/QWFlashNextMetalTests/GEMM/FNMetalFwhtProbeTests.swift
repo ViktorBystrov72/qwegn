@@ -4,7 +4,7 @@ import QWCore
 import QWHAL
 import QWAlloc
 import QWGEMM
-@testable import QWFlashNext
+@testable import QWEngine
 
 // Probe: qwg_fwht32_f16 via QWGemm.encodeFwht32 on a known f16 vector, against a CPU orthonormal FWHT.
 final class FNMetalFwhtProbeTests: XCTestCase {

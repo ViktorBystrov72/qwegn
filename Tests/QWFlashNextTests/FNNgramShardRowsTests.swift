@@ -1,7 +1,8 @@
 import XCTest
 import Foundation
 @testable import QWQuant
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 final class FNNgramShardRowsTests: XCTestCase {
     private var dir: URL!

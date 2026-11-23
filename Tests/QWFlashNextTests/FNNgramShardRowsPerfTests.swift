@@ -1,7 +1,8 @@
 import XCTest
 import Foundation
 @testable import QWQuant
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 /// Checks the two row paths against the **real** n-gram table: 320,001,536
 /// rows in 128 shards, in a machine-local Hugging Face snapshot, so these

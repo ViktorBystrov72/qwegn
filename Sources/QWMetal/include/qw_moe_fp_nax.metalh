@@ -1,0 +1,227 @@
+// qw_moe_fp_nax.metalh — Shared NAX A-tile, SRAM LUT & cooperative B-tile stagers for FP/BF16 NAX.
+#pragma once
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#if !defined(__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__) || __ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ < 260200
+#error "NAX cooperative_tensor kernels require -mmacosx-version-min=26.2 or newer (Apple MPP operand_index ABI)."
+#endif
+#include "mlx/backend/metal/kernels/steel/defines.h"
+#include "mlx/backend/metal/kernels/steel/utils/integral_constant.h"
+#include "mlx/backend/metal/kernels/steel/gemm/nax.h"
+#include "qw_dequant_fp.metalh"
+
+using namespace metal;
+using namespace mlx::steel;
+
+/// 1.5 KiB threadgroup LUT cache shared by all 4 simdgroups in FP MoE NAX kernels.
+struct QWGFPTgLut {
+    half2 fp4Pair[256];
+    half fp8H[256];
+
+    METAL_FUNC void load(uint lid) threadgroup {
+        if (lid < 128u) {
+            fp4Pair[lid] = kQWGFP4Pair_H2[lid];
+            fp4Pair[lid + 128u] = kQWGFP4Pair_H2[lid + 128u];
+            fp8H[lid] = kQWGFP8E4M3FN_H[lid];
+            fp8H[lid + 128u] = kQWGFP8E4M3FN_H[lid + 128u];
+        }
+    }
+};
+
+/// Cooperatively dequantizes a 64x32 B tile into padded `[64][36]` SRAM (stride 36) across 128 threads.
+template <bool IS_MXFP8, typename WT, bool IS_DUAL32>
+METAL_FUNC void qwg_moe_stage_b_k32(
+    threadgroup ushort4* bShU4,
+    threadgroup const QWGFPTgLut& tgLut,
+    device const uint32_t* wExp,
+    device const uchar* scExp,
+    size_t rowBaseA,
+    size_t rowBaseB,
+    uint k0,
+    uint k,
+    uint kGroups,
+    uint wWordsPerRow,
+    int tgp_bn,
+    bool alignedW,
+    uint lid) {
+    const uint row = lid >> 1u;
+    const uint colHalf = lid & 1u;
+    const uint localRow = IS_DUAL32 ? (row & 31u) : row;
+    const uint c0 = colHalf * 16u;
+    threadgroup ushort4* dst = bShU4 + size_t(row) * 9u + size_t(colHalf) * 4u;
+    if (int(localRow) >= tgp_bn || (k0 + c0) >= k) {
+        dst[0] = ushort4(0); dst[1] = ushort4(0);
+        dst[2] = ushort4(0); dst[3] = ushort4(0);
+        return;
+    }
+    const size_t rowIdx = (IS_DUAL32 && row >= 32u) ? (rowBaseB + localRow) : (rowBaseA + localRow);
+    const size_t rowWordBase = rowIdx * wWordsPerRow;
+    const size_t rowScBase = rowIdx * kGroups;
+    if constexpr (IS_MXFP8) {
+        const uint g = k0 >> 5u;
+        const float scF = qwg_ue8m0_to_float(scExp[rowScBase + g]);
+        const size_t wOff = rowWordBase + g * 8u + colHalf * 4u;
+        const uint4 w4 = alignedW
+            ? *(device const uint4*)(wExp + wOff)
+            : uint4(wExp[wOff], wExp[wOff + 1u], wExp[wOff + 2u], wExp[wOff + 3u]);
+        STEEL_PRAGMA_UNROLL
+        for (uint wi = 0u; wi < 4u; ++wi) {
+            const uchar4 u = as_type<uchar4>(w4[wi]);
+            const half4 h4 = half4(tgLut.fp8H[u.x], tgLut.fp8H[u.y], tgLut.fp8H[u.z], tgLut.fp8H[u.w]);
+            const float4 f4 = float4(h4) * scF;
+            dst[wi] = as_type<ushort4>(vec<WT, 4>(WT(f4.x), WT(f4.y), WT(f4.z), WT(f4.w)));
+        }
+    } else {
+        const uint g = (k0 >> 4u) + colHalf;
+        const half4 sc4 = half4(tgLut.fp8H[scExp[rowScBase + g]]);
+        const size_t wOff = rowWordBase + g * 2u;
+        const uint2 ww = alignedW
+            ? *(device const uint2*)(wExp + wOff)
+            : uint2(wExp[wOff], wExp[wOff + 1u]);
+        const uchar4 b0 = as_type<uchar4>(ww.x);
+        const uchar4 b1 = as_type<uchar4>(ww.y);
+        const half4 h0 = half4(tgLut.fp4Pair[b0.x], tgLut.fp4Pair[b0.y]) * sc4;
+        const half4 h1 = half4(tgLut.fp4Pair[b0.z], tgLut.fp4Pair[b0.w]) * sc4;
+        const half4 h2 = half4(tgLut.fp4Pair[b1.x], tgLut.fp4Pair[b1.y]) * sc4;
+        const half4 h3 = half4(tgLut.fp4Pair[b1.z], tgLut.fp4Pair[b1.w]) * sc4;
+        dst[0] = as_type<ushort4>(vec<WT, 4>(WT(h0.x), WT(h0.y), WT(h0.z), WT(h0.w)));
+        dst[1] = as_type<ushort4>(vec<WT, 4>(WT(h1.x), WT(h1.y), WT(h1.z), WT(h1.w)));
+        dst[2] = as_type<ushort4>(vec<WT, 4>(WT(h2.x), WT(h2.y), WT(h2.z), WT(h2.w)));
+        dst[3] = as_type<ushort4>(vec<WT, 4>(WT(h3.x), WT(h3.y), WT(h3.z), WT(h3.w)));
+    }
+}
+
+/// Fast cooperative-B BF16 BM=64 BK=32 NAX GEMM for M>=48 prefill when X is BF16 and K%32==0.
+METAL_FUNC void qwg_gemm_bf16_nax_bm64_fast(
+    device const bfloat* W, device const bfloat* xBF16,
+    device bfloat* yBF16, device float* yF32, constant QWGemmFPBF16Params& p,
+    threadgroup ushort4* bShU4, uint2 tg, uint lid, uint simd_gid) {
+    constexpr short BM = 64, BN = 64, SK = 32, WM = 2, WN = 2;
+    constexpr short SM = BM / WM, SN = BN / WN, TM = SM / 16, TN = SN / 16, TK = SK / 16;
+    const uint tgM0 = tg.y * uint(BM), tgN0 = tg.x * uint(BN);
+    if (tgM0 >= p.M || tgN0 >= p.N) return;
+
+    const short sgM = short(simd_gid / WN), sgN = short(simd_gid % WN);
+    const uint m0 = tgM0 + uint(sgM * SM), n0 = tgN0 + uint(sgN * SN);
+    const short sgp_sm = short(min(int(SM), max(0, int(p.M) - int(m0))));
+    const short sgp_sn = short(min(int(SN), max(0, int(p.N) - int(n0))));
+    const bool sgActive = (sgp_sm > 0 && sgp_sn > 0);
+    const bool alignedM = (sgp_sm == SM);
+    const bool vec16W = ((p.K & 7u) == 0u) && ((size_t(W) & 15u) == 0u);
+
+    NAXTile<float, TM, TN> Dtile;
+    Dtile.clear();
+    const device bfloat* xRowPtr = xBF16 + size_t(min(m0, p.M - 1u)) * p.strideX;
+    const uint bRow = tgN0 + (lid >> 1u);
+    const uint bColOff = (lid & 1u) * 16u;
+    const bool validBRow = (bRow < p.N);
+    const device bfloat* wStageRow = W + size_t(validBRow ? bRow : tgN0) * p.K;
+    threadgroup ushort4* dst = bShU4 + size_t(lid >> 1u) * 9u + size_t(lid & 1u) * 4u;
+
+    STEEL_PRAGMA_NO_UNROLL
+    for (uint k0 = 0u; k0 < p.K; k0 += uint(SK)) {
+        if (validBRow) {
+            if (vec16W) {
+                const uint4 u0 = *(device const uint4*)(wStageRow + k0 + bColOff);
+                const uint4 u1 = *(device const uint4*)(wStageRow + k0 + bColOff + 8u);
+                dst[0] = ushort4(ushort(u0.x), ushort(u0.x >> 16u), ushort(u0.y), ushort(u0.y >> 16u));
+                dst[1] = ushort4(ushort(u0.z), ushort(u0.z >> 16u), ushort(u0.w), ushort(u0.w >> 16u));
+                dst[2] = ushort4(ushort(u1.x), ushort(u1.x >> 16u), ushort(u1.y), ushort(u1.y >> 16u));
+                dst[3] = ushort4(ushort(u1.z), ushort(u1.z >> 16u), ushort(u1.w), ushort(u1.w >> 16u));
+            } else {
+                const device ushort4* wp = (device const ushort4*)(wStageRow + k0 + bColOff);
+                dst[0] = wp[0]; dst[1] = wp[1]; dst[2] = wp[2]; dst[3] = wp[3];
+            }
+        } else {
+            dst[0] = ushort4(0); dst[1] = ushort4(0); dst[2] = ushort4(0); dst[3] = ushort4(0);
+        }
+        NAXTile<bfloat, TM, TK> Atile;
+        if (sgActive) {
+            if (alignedM) Atile.load(xRowPtr + k0, int(p.strideX));
+            else Atile.load_rows(xRowPtr + k0, int(p.strideX), sgp_sm);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgActive) {
+            NAXTile<bfloat, TN, TK> Btile;
+            Btile.template load<bfloat, 36, 1>((threadgroup const bfloat*)(bShU4 + size_t(sgN * SN) * 9u));
+            tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (!sgActive) return;
+    const short2 sc = BaseNAXFrag::get_coord();
+    const bool fastStoreBF = (p.addResidual == 0u) && (p.softcap == 0.0f) && (p.outIsF32 == 0u)
+        && ((p.strideY & 3u) == 0u) && ((size_t(yBF16) & 7u) == 0u);
+    const_for_loop<0, TM, 1>([&](auto mm) {
+        const_for_loop<0, TN, 1>([&](auto nn) {
+            thread const auto& df = Dtile.template frag_at<mm.value, nn.value>();
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < 2; ++i) {
+                const uint gr = m0 + uint(mm.value * 16 + int(sc.y) + i * 8);
+                if (gr >= p.M) continue;
+                const uint gc0 = n0 + uint(nn.value * 16 + int(sc.x));
+                if (fastStoreBF && gc0 + 4u <= p.N) {
+                    *(device ushort4*)(yBF16 + size_t(gr) * p.strideY + gc0) = ushort4(
+                        as_type<ushort>(qwg_fp_bf16(df[i * 4 + 0])),
+                        as_type<ushort>(qwg_fp_bf16(df[i * 4 + 1])),
+                        as_type<ushort>(qwg_fp_bf16(df[i * 4 + 2])),
+                        as_type<ushort>(qwg_fp_bf16(df[i * 4 + 3])));
+                } else {
+                    STEEL_PRAGMA_UNROLL
+                    for (short j = 0; j < 4; ++j) {
+                        const uint gc = gc0 + uint(j);
+                        if (gc >= p.N) continue;
+                        float val = df[i * 4 + j];
+                        const size_t yIdx = size_t(gr) * p.strideY + gc;
+                        if (p.addResidual != 0u) {
+                            if (p.outIsF32 == 1u) val += yF32[yIdx];
+                            else if (p.outIsF32 == 2u) val += float(((device const half*)yBF16)[yIdx]);
+                            else val += float(yBF16[yIdx]);
+                        }
+                        if (p.softcap > 0.0f) val = precise::tanh(clamp(val / p.softcap, -15.0f, 15.0f)) * p.softcap;
+                        if (p.outIsF32 == 1u) yF32[yIdx] = val;
+                        else if (p.outIsF32 == 2u) ((device half*)yBF16)[yIdx] = half(val);
+                        else yBF16[yIdx] = qwg_fp_bf16(val);
+                    }
+                }
+            }
+        });
+    });
+}
+
+template <typename ActT, int TM, int TK, bool HAS_GATHER = true>
+METAL_FUNC void qwg_moe_nax_load_a_tile(
+    thread NAXTile<ActT, TM, TK>& Atile,
+    thread const device ActT* (&x_rows)[TM * 2],
+    const device ActT* xBase,
+    uint k0, uint k, int sgp_sm, bool alignedM) {
+    if constexpr (HAS_GATHER) {
+        const_for_loop<0, TM, 1>([&](auto idx_row) {
+            constexpr short m = idx_row.value;
+            thread auto& a0 = Atile.template frag_at<m, 0>();
+            thread auto& a1 = Atile.template frag_at<m, 1>();
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < 2; ++i) {
+                const device ActT* xr = x_rows[m * 2 + i];
+                if (xr != nullptr) {
+                    const vec<ActT, 4> v0 = *(const device vec<ActT, 4>*)(xr + k0);
+                    a0[i * 4 + 0] = v0.x; a0[i * 4 + 1] = v0.y; a0[i * 4 + 2] = v0.z; a0[i * 4 + 3] = v0.w;
+                    if (k0 + 16u < k) {
+                        const vec<ActT, 4> v1 = *(const device vec<ActT, 4>*)(xr + k0 + 16u);
+                        a1[i * 4 + 0] = v1.x; a1[i * 4 + 1] = v1.y; a1[i * 4 + 2] = v1.z; a1[i * 4 + 3] = v1.w;
+                    } else {
+                        a1[i * 4 + 0] = ActT(0); a1[i * 4 + 1] = ActT(0); a1[i * 4 + 2] = ActT(0); a1[i * 4 + 3] = ActT(0);
+                    }
+                } else {
+                    a0[i * 4 + 0] = ActT(0); a0[i * 4 + 1] = ActT(0); a0[i * 4 + 2] = ActT(0); a0[i * 4 + 3] = ActT(0);
+                    a1[i * 4 + 0] = ActT(0); a1[i * 4 + 1] = ActT(0); a1[i * 4 + 2] = ActT(0); a1[i * 4 + 3] = ActT(0);
+                }
+            }
+        });
+    } else if (alignedM && k0 + 32u <= k) {
+        Atile.load(xBase + k0, int(k));
+    } else {
+        Atile.load_safe(xBase + k0, int(k), short2(min(32, int(k - k0)), sgp_sm));
+    }
+}

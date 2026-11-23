@@ -173,7 +173,7 @@ enum QWMTPAdaptiveDepth {
         guard normalizedEntropy.isFinite, (0...1).contains(normalizedEntropy),
               threshold.isFinite, (0...1).contains(threshold),
               completedDrafts >= 1, completedDrafts <= maximumDrafts,
-              (1...7).contains(maximumDrafts) else {
+              (1...15).contains(maximumDrafts) else {
             throw QWEngineDriverError.state("adaptive draft-depth policy received invalid input")
         }
         return completedDrafts < maximumDrafts && normalizedEntropy >= threshold

@@ -55,11 +55,12 @@ goldens: ## Regenerate the synthetic golden fixtures the tests read (needs the v
 
 # ---------------------------------------------------------------- build --
 
-build: metallib ## Build the qwg CLI and Qwegn.app menu bar bundle (release)
+build: metallib ## Build the qwg CLI, fan helper, and Qwegn.app menu bar bundle (release)
 	@swift build -c release --product qwg
 	@swift build -c release --product qwg-menu
+	@swift build -c release --product qwg-smc-helper
 	@./Scripts/build_app.sh --skip-build >/dev/null
-	@echo "built: .build/release/qwg, .build/release/Qwegn.app"
+	@echo "built: .build/release/qwg, .build/release/qwg-smc-helper, .build/release/Qwegn.app"
 
 pkg: build ## Build the macOS .pkg installer in dist/
 	@./Scripts/build_pkg.sh --skip-build

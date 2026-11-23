@@ -5,7 +5,7 @@
 
 import XCTest
 import QWCore
-import QWFlashNext
+import QWHyperPLE
 import QWHead
 @testable import QWEngine
 
@@ -15,12 +15,20 @@ final class QWLayerKernelTests: XCTestCase {
     private static let served: Set<QWEnginePlan.LayerKernelKey> = [
         .init(attention: .gdn, mlp: .dense, ple: false),
         .init(attention: .gdn, mlp: .moe, ple: false),
+        .init(attention: .gdn, mlp: .dense, ple: true),
+        .init(attention: .gdn, mlp: .moe, ple: true),
         .init(attention: .kda, mlp: .dense, ple: false),
         .init(attention: .kda, mlp: .moe, ple: false),
+        .init(attention: .kda, mlp: .dense, ple: true),
+        .init(attention: .kda, mlp: .moe, ple: true),
         .init(attention: .fullAttention, mlp: .dense, ple: false),
         .init(attention: .fullAttention, mlp: .moe, ple: false),
+        .init(attention: .fullAttention, mlp: .dense, ple: true),
+        .init(attention: .fullAttention, mlp: .moe, ple: true),
         .init(attention: .qsaSparse, mlp: .dense, ple: false),
         .init(attention: .qsaSparse, mlp: .moe, ple: false),
+        .init(attention: .qsaSparse, mlp: .dense, ple: true),
+        .init(attention: .qsaSparse, mlp: .moe, ple: true),
         .init(attention: .mlaCompressed, mlp: .dense, ple: false),
         .init(attention: .mlaCompressed, mlp: .moe, ple: false),
         .init(attention: .hcaCompressed, mlp: .dense, ple: false),
@@ -64,9 +72,9 @@ final class QWLayerKernelTests: XCTestCase {
     func testThirdModuleWithNoGDNLoadsAndDecodes() throws {
         // A toy Llama-style config: 4 layers, all full attention.
         let module = try ToyModule.make(hidden: 64, layers: 4, kvStorageMode: "f32")
-        let state = try module.makeSessionState()
-        _ = try module.encodePrefill(state, tokens: [1, 2, 3], chunk: 0..<3, runsHead: true)
-        let token = try module.encodeDecodeStep(state, token: 3, position: 3)
+        let state = module.makeSessionState()
+        _ = module.encodePrefill(state, tokens: [1, 2, 3], chunk: 0..<3, runsHead: true)
+        let token = module.encodeDecodeStep(state, token: 3, position: 3)
         XCTAssertGreaterThanOrEqual(token, 0)
         XCTAssertLessThan(token, module.plan.vocab)
         XCTAssertEqual(ToyModule.supportedKVStorageModes, ["f32"],
@@ -92,12 +100,12 @@ final class QWLayerKernelTests: XCTestCase {
         // The plan drives the numerics: a deeper toy answers differently.
         let shallow = try ToyModule.make(hidden: 64, layers: 2, kvStorageMode: "f32")
         let deep = try ToyModule.make(hidden: 64, layers: 6, kvStorageMode: "f32")
-        let shallowState = try shallow.makeSessionState()
-        let deepState = try deep.makeSessionState()
-        _ = try shallow.encodePrefill(shallowState, tokens: [1, 2, 3], chunk: 0..<3, runsHead: true)
-        _ = try deep.encodePrefill(deepState, tokens: [1, 2, 3], chunk: 0..<3, runsHead: true)
-        let shallowToken = try shallow.encodeDecodeStep(shallowState, token: 3, position: 3)
-        let deepToken = try deep.encodeDecodeStep(deepState, token: 3, position: 3)
+        let shallowState = shallow.makeSessionState()
+        let deepState = deep.makeSessionState()
+        _ = shallow.encodePrefill(shallowState, tokens: [1, 2, 3], chunk: 0..<3, runsHead: true)
+        _ = deep.encodePrefill(deepState, tokens: [1, 2, 3], chunk: 0..<3, runsHead: true)
+        let shallowToken = shallow.encodeDecodeStep(shallowState, token: 3, position: 3)
+        let deepToken = deep.encodeDecodeStep(deepState, token: 3, position: 3)
         XCTAssertNotEqual(shallowToken, deepToken,
                           "the layer count must reach the module's output")
     }
@@ -113,55 +121,27 @@ final class QWLayerKernelTests: XCTestCase {
         XCTAssertEqual(kernels.count, QWModelGeometry.qwen38_27b.numLayers)
     }
 
-    func testTheDenseModuleRefusesARequestItCannotServe() throws {
-        // The engine-less module is enough to check the contract: a sampled
-        // request, a repetition penalty the greedy head cannot apply and a
-        // speculative round are all refused — never quietly downgraded.
-        let plan = try QWEnginePlan(geometry: QWModelGeometry.qwen38_27b, modelId: "toy",
-                                    geometryDigest: "d", prefillChunkRows: 512,
-                                    kvStorageMode: "f16")
-        let module = DenseModule(plan: plan)
-        XCTAssertNoThrow(try module.checkContract(sampling: .greedy,
-                                                   speculative: QWSpeculativeParameters(enabled: false,
-                                                                                      mtpDrafts: 0)))
-        XCTAssertThrowsError(try module.checkContract(
-            sampling: QWSamplerConfig(temperature: 0.8, topK: 40, topP: 0.9),
-            speculative: QWSpeculativeParameters(enabled: false, mtpDrafts: 0)))
-        XCTAssertThrowsError(try module.checkContract(
-            sampling: QWSamplerConfig(temperature: 1, topK: 1, topP: 1, repetitionPenalty: 1.1),
-            speculative: QWSpeculativeParameters(enabled: false, mtpDrafts: 0)))
-        XCTAssertThrowsError(try module.checkContract(
-            sampling: .greedy,
-            speculative: QWSpeculativeParameters(enabled: true, mtpDrafts: 1)))
-    }
-
-    func testTheDenseModuleRefusesToConfigureACacheItWouldNotUse() throws {
-        // The seam's prefill does not consult the prefix cache. Configuring
-        // one would promise a cache that never answers.
+    func testTheDenseModuleRefusesToGenerateOrConfigureCacheWithoutAnEngine() throws {
         let plan = try QWEnginePlan(geometry: QWModelGeometry.qwen38_27b, modelId: "toy",
                                     geometryDigest: "d", prefillChunkRows: 512,
                                     kvStorageMode: "f16")
         let module = DenseModule(plan: plan)
         XCTAssertFalse(module.hasPrefixCache)
+        XCTAssertThrowsError(
+            try module.generate(
+                request: QWGenerationRequest(prompt: [1, 2], maxNew: 1, sampling: .greedy),
+                onToken: nil
+            )
+        ) { error in
+            guard case QWModuleError.notImplemented = error else {
+                return XCTFail("expected notImplemented, got \(error)")
+            }
+        }
         XCTAssertThrowsError(try module.configurePrefixCache(QWCacheConfig())) { error in
             guard case QWModuleError.notImplemented = error else {
                 return XCTFail("expected notImplemented, got \(error)")
             }
         }
-    }
-
-    func testTheCoreCallsFinishWhenTheRequestIsOver() throws {
-        // The module must be able to give the engine back when the request
-        // ends — that is where the dense module releases its permit.
-        let plan = try QWEnginePlan(geometry: QWModelGeometry.qwen38_27b, modelId: "toy",
-                                    geometryDigest: "d", prefillChunkRows: 512,
-                                    kvStorageMode: "f16")
-        let module = LoopToyModule(plan: plan)
-        let core = try QWEngineCore(configuration: .init(plan: plan, module: module,
-                                                          sampling: .greedy, maxSessions: 1))
-        _ = try core.generate(prompt: [1, 2, 3], maxNew: 4, stopIDs: [],
-                              sampling: .greedy, onToken: nil)
-        XCTAssertEqual(module.finishedRequests, 1)
     }
 
     func testLayerStackScheduleAndRollbackRing() throws {

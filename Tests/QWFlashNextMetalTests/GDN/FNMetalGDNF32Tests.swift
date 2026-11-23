@@ -5,7 +5,7 @@ import QWHAL
 import QWAlloc
 import QWGEMM
 import QWGDN
-@testable import QWFlashNext
+@testable import QWEngine
 
 // f32 GDN kernels vs their fp16 originals on the same random inputs (conv, prologue, recurrence readout).
 final class FNMetalGDNF32Tests: XCTestCase {

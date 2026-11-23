@@ -45,13 +45,18 @@ extension QWEngineDriver {
         let wq: QWTensorValue?, wkTiled: QWTensorValue?
         let mla: QWMLAAttnOperator.LayerWeights?
         let mbsa: QWMBSAAttnOperator.LayerWeights?
+        let qkvBias: QWTensorValue?
+        let oBias: QWTensorValue?
 
         init(qkvProj: QWWeightView, q: QWWeightView, k: QWWeightView, v: QWWeightView, o: QWWeightView,
              wq: QWTensorValue?, wkTiled: QWTensorValue?,
              mla: QWMLAAttnOperator.LayerWeights? = nil,
-             mbsa: QWMBSAAttnOperator.LayerWeights? = nil) {
+             mbsa: QWMBSAAttnOperator.LayerWeights? = nil,
+             qkvBias: QWTensorValue? = nil,
+             oBias: QWTensorValue? = nil) {
             self.qkvProj = qkvProj; self.q = q; self.k = k; self.v = v; self.o = o
             self.wq = wq; self.wkTiled = wkTiled; self.mla = mla; self.mbsa = mbsa
+            self.qkvBias = qkvBias; self.oBias = oBias
         }
     }
     enum QWLayerPass: Equatable, Sendable { case fullAttention, gdn, hca, moe, gdnMoe, hcaMoe }
@@ -161,6 +166,32 @@ extension QWEngineDriver {
         let dnAcc: QWTensorValue       // [rows · K · outDim] f32 — route-ordered down contributions
         let naxX16: QWTensorValue?     // [rows · H] f16 — rotated hidden for NAX
         let latent: QWMoEOperator.LatentScratch?
+        let activeExperts: QWTensorValue?
+        let activeIndirect: QWTensorValue?
+
+        init(xRot32: QWTensorValue, xPlain32: QWTensorValue,
+             logits: QWTensorValue, idx: QWTensorValue, wts: QWTensorValue,
+             gu32: QWTensorValue, act32: QWTensorValue,
+             guSh32: QWTensorValue?, actSh32: QWTensorValue?,
+             shared: QWTensorValue, gate: QWTensorValue,
+             expOff: QWTensorValue?, sortedPair: QWTensorValue?,
+             sortedTok: QWTensorValue?, invPerm: QWTensorValue?,
+             tileE: QWTensorValue?, tileR: QWTensorValue?, tileCount: QWTensorValue?,
+             gu16: QWTensorValue?, dnHi: QWTensorValue?, dnAcc: QWTensorValue,
+             naxX16: QWTensorValue?, latent: QWMoEOperator.LatentScratch?,
+             activeExperts: QWTensorValue? = nil, activeIndirect: QWTensorValue? = nil) {
+            self.xRot32 = xRot32; self.xPlain32 = xPlain32
+            self.logits = logits; self.idx = idx; self.wts = wts
+            self.gu32 = gu32; self.act32 = act32
+            self.guSh32 = guSh32; self.actSh32 = actSh32
+            self.shared = shared; self.gate = gate
+            self.expOff = expOff; self.sortedPair = sortedPair
+            self.sortedTok = sortedTok; self.invPerm = invPerm
+            self.tileE = tileE; self.tileR = tileR; self.tileCount = tileCount
+            self.gu16 = gu16; self.dnHi = dnHi; self.dnAcc = dnAcc
+            self.naxX16 = naxX16; self.latent = latent
+            self.activeExperts = activeExperts; self.activeIndirect = activeIndirect
+        }
     }
     struct Scratch {
         let x: QWTensorValue                             // residual stream [H] f16 (in-place)

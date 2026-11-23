@@ -151,4 +151,28 @@ public enum QWNorm {
         enc.dispatchThreadgroups(MTLSize(width: pairs, height: 2, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }
+
+    /// In-place elementwise `x += bias` over `[rows, cols]` f16 with FP32 accumulation.
+    public static func encodeAddBiasF16(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
+                                        x: QWTensorValue, bias: QWTensorValue,
+                                        rows: Int, cols: Int) throws {
+        guard rows > 0, cols > 0, cols % 8 == 0 else {
+            throw QWNormError.badShape("addBiasF16 requires positive rows and cols % 8 == 0")
+        }
+        guard x.shape.dtype == .f16, bias.shape.dtype == .f16,
+              x.shape.elementCount == rows * cols, bias.shape.elementCount == cols,
+              (x.region.base + x.offset) % 16 == 0,
+              (bias.region.base + bias.offset) % 16 == 0 else {
+            throw QWNormError.badShape("addBiasF16 tensor shape or alignment mismatch")
+        }
+        let pso = try hal.pipeline("qwg_add_bias_f16")
+        let rowU4 = cols / 8
+        var rowU4Param = UInt32(rowU4)
+        enc.setComputePipelineState(pso)
+        x.bind(enc, index: 0)
+        bias.bind(enc, index: 1)
+        enc.setBytes(&rowU4Param, length: 4, index: 2)
+        enc.dispatchThreadgroups(MTLSize(width: (rowU4 + 31) / 32, height: rows, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    }
 }

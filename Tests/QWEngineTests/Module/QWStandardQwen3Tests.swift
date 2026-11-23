@@ -17,11 +17,11 @@ import QWRope
 final class QWStandardQwen3Tests: XCTestCase {
     /// The module serves the family. The registry is the only admission
     /// point, and a family with no module is refused loudly (Law L4).
-    func testTheQwen3FamiliesHaveAModule() {
-        XCTAssertNotNil(QWModuleRegistry.moduleType(for: .qwen3Dense))
-        XCTAssertNotNil(QWModuleRegistry.moduleType(for: .qwen3MoE))
-        XCTAssertEqual(Qwen3DenseModule.family, .qwen3Dense)
-        XCTAssertEqual(Qwen3MoEModule.family, .qwen3MoE)
+    func testTheQwen3FamiliesHaveAModule() throws {
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen3Dense))),
+                       ObjectIdentifier(DenseModule.self))
+        XCTAssertEqual(ObjectIdentifier(try XCTUnwrap(QWModuleRegistry.moduleType(for: .qwen3MoE))),
+                       ObjectIdentifier(DenseModule.self))
         XCTAssertTrue(QWModuleRegistry.supportedFamilies.contains(.qwen3Dense))
         XCTAssertTrue(QWModuleRegistry.supportedFamilies.contains(.qwen3MoE))
     }

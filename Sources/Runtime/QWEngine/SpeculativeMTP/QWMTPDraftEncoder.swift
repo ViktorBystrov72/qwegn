@@ -24,6 +24,8 @@ struct QWMTPDraftWeights {
     let norm: QWTensorValue
     var moe: QWEngineDriver.MoEW? = nil
     var mla: QWMLAAttnOperator.LayerWeights? = nil
+    var qkvBias: QWTensorValue? = nil
+    var oBias: QWTensorValue? = nil
 }
 
 struct QWMTPDraftScratch {
@@ -166,10 +168,30 @@ final class QWMTPDraftEncoder {
             }
         }
         if weights.mla == nil {
-            guard let wq = weights.wq, let wkTiled = weights.wkTiled,
-                  wq.shape.dtype == .f16, wq.shape.elementCount == geometry.headDim,
-                  wkTiled.shape.dtype == .f16, wkTiled.shape.elementCount == kv else {
-                throw QWEngineDriverError.state("MTP Q/K norm geometry is invalid")
+            if geometry.descriptor.hasQKNorm {
+                guard let wq = weights.wq, let wkTiled = weights.wkTiled,
+                      wq.shape.dtype == .f16, wq.shape.elementCount == geometry.headDim,
+                      wkTiled.shape.dtype == .f16, wkTiled.shape.elementCount == kv else {
+                    throw QWEngineDriverError.state("MTP Q/K norm geometry is invalid")
+                }
+            } else {
+                guard (weights.wq == nil) == (weights.wkTiled == nil),
+                      weights.wq.map({ $0.shape.dtype == .f16 && $0.shape.elementCount == geometry.headDim }) ?? true,
+                      weights.wkTiled.map({ $0.shape.dtype == .f16 && $0.shape.elementCount == kv }) ?? true else {
+                    throw QWEngineDriverError.state("MTP Q/K norm geometry is invalid")
+                }
+            }
+            if let qkvBias = weights.qkvBias {
+                guard qkvBias.shape.dtype == .f16, qkvBias.shape.elementCount == geometry.attnTotalN,
+                      (qkvBias.region.base + qkvBias.offset) % 16 == 0 else {
+                    throw QWEngineDriverError.state("MTP QKV bias geometry is invalid")
+                }
+            }
+            if let oBias = weights.oBias {
+                guard oBias.shape.dtype == .f16, oBias.shape.elementCount == h,
+                      (oBias.region.base + oBias.offset) % 16 == 0 else {
+                    throw QWEngineDriverError.state("MTP O bias geometry is invalid")
+                }
             }
         }
         self.hal = hal
@@ -191,7 +213,7 @@ final class QWMTPDraftEncoder {
         guPlan = QWGemm.plan(QWGemmShape(m: 1, n: 2 * i, k: h), dtype: .q4g, epi: .siluMulPair, outDtype: .f16)
         downPlan = QWGemm.plan(QWGemmShape(m: 1, n: h, k: i), dtype: .q4g, epi: .none, outDtype: .f16)
         for kernel in ["qwg_rmsnorm", "qwg_rmsnorm_residual", "qwg_rmsnorm_from_rot",
-                       "qwg_mtp_pre_fc_norm",
+                       "qwg_add_bias_f16", "qwg_mtp_pre_fc_norm",
                        "qwg_fwht32_f16", "qwg_gemv_q4g_v4", "qwg_gemv_q4g_v4_h16",
                        "qwg_gemv_q4g_silu_pair", "qwg_gemv_q4g_silu_pair_h16",
                        "qwg_cast_f32_to_f16", "qwg_gemv_f16_v4", "qwg_mtp_seed_kv",
@@ -200,15 +222,23 @@ final class QWMTPDraftEncoder {
                        "qwg_head_argmax_fin"] {
             _ = try hal.pipeline(kernel)
         }
-        if !weights.fc.isIncumbentContainer {
+        let draftViews: [QWWeightView] = [
+            weights.fc, weights.qkvProj, weights.o, weights.gu.view, weights.down
+        ] + (weights.mla.map { [$0.qBProj] } ?? [])
+        for v in draftViews where !v.isIncumbentContainer {
             for optionalKernel in [
-                QWGemmAQ.decodeKernelName(bits: weights.fc.bits, group: weights.fc.groupSize, isSHVQ: weights.fc.isSHVQ),
-                QWGemmAQ.siluPairKernelName(bits: weights.gu.view.bits, group: weights.gu.view.groupSize, isSHVQ: weights.gu.view.isSHVQ),
-                QWGemmAQ.headArgmaxKernelName(bits: weights.fc.bits, group: weights.fc.groupSize, isSHVQ: weights.fc.isSHVQ),
-                QWGemmAQ.kernelName(bits: weights.fc.bits, group: weights.fc.groupSize, isSHVQ: weights.fc.isSHVQ)
+                QWGemmAQ.decodeKernelName(bits: v.bits, group: v.groupSize, isSHVQ: v.isSHVQ),
+                QWGemmAQ.headArgmaxKernelName(bits: v.bits, group: v.groupSize, isSHVQ: v.isSHVQ),
+                QWGemmAQ.kernelName(bits: v.bits, group: v.groupSize, isSHVQ: v.isSHVQ)
             ].compactMap({ $0 }) {
                 _ = try hal.pipeline(optionalKernel)
             }
+        }
+        if !weights.gu.view.isIncumbentContainer,
+           let siluName = QWGemmAQ.siluPairKernelName(bits: weights.gu.view.bits,
+                                                      group: weights.gu.view.groupSize,
+                                                      isSHVQ: weights.gu.view.isSHVQ) {
+            _ = try hal.pipeline(siluName)
         }
     }
 
@@ -266,14 +296,18 @@ final class QWMTPDraftEncoder {
                                         pos0: cacheRows, rows: 1)
             return
         }
-        guard let wq = w.wq, let wkTiled = w.wkTiled else {
-            throw QWEngineDriverError.state("MTP Q/K norms are missing")
-        }
         try project(enc, x: s.ln1, gs: s.gsHidden, w: w.qkvProj,
                     plan: qkvPlan, y32: s.qkv32, y16: s.qkv16)
-        try rope.encodeQK(enc, hal: hal, q: s.q16, k: s.k16,
-                          wq: wq, wk: wkTiled, qOut: s.qRope, kOut: s.kRope,
-                          positionStart: absolutePosition, count: 1)
+        if let qkvBias = w.qkvBias {
+            try rope.encodeExtractQK(enc, hal: hal, attnY: s.qkv16,
+                                     qOut: s.qRope, kOut: s.kRope, vOut: s.v16,
+                                     wq: w.wq, wk: w.wkTiled, qkvBias: qkvBias,
+                                     positionStart: absolutePosition, count: 1)
+        } else {
+            try rope.encodeQK(enc, hal: hal, q: s.q16, k: s.k16,
+                              wq: w.wq, wk: w.wkTiled, qOut: s.qRope, kOut: s.kRope,
+                              positionStart: absolutePosition, count: 1)
+        }
     }
 
     /// Prompt pair rows depend only on supplied trunk hidden, not earlier MTP
@@ -293,7 +327,7 @@ final class QWMTPDraftEncoder {
         case .q4:  seedQ8 = 2
         @unknown default: throw QWEngineDriverError.state("MTP KV unknown mode")
         }
-        if !geometry.is27BKVShape {
+        if !geometry.matchesKVStride1024Kernel {
             enc.setComputePipelineState(try hal.pipeline("qwg_kv_paged_write_general"))
             enc.setBuffer(kv.k.pool.buffer, offset: kv.k.pool.base, index: 0)
             enc.setBuffer(kv.v.pool.buffer, offset: kv.v.pool.base, index: 1)
@@ -354,10 +388,14 @@ final class QWMTPDraftEncoder {
         } else {
             try attention.encode(enc, qgate: s.qRope, kv: kv, knew: s.kRope, vnew: s.v16,
                                  partials: s.partials, out: s.attOut,
-                                 C: cacheRows, splits: QWAttnDecode.splits(forKeys: cacheRows + 1))
+                                 C: cacheRows, splits: QWAttnDecode.splits(forKeys: cacheRows + 1, kvHeads: geometry.kvHeads))
         }
         try project(enc, x: s.attOut, gs: s.gsAttn, w: w.o,
                     plan: outPlan, y32: s.fcOut32, y16: s.oProjOut)
+        if let oBias = w.oBias {
+            try QWNorm.encodeAddBiasF16(enc, hal: hal, x: s.oProjOut, bias: oBias,
+                                        rows: 1, cols: geometry.hidden)
+        }
         try QWNorm.encode(enc, hal: hal, variant: .rmsnormResidual,
                           x: s.oProjOut, gamma: w.postAttnNorm, out: s.ln2, residual: s.fcOut16,
                           geometry: geometry)
@@ -378,7 +416,9 @@ final class QWMTPDraftEncoder {
         } else {
             try project(enc, x: s.ln2, gs: s.gsHidden, w: w.gu.view,
                         plan: guPlan, y32: s.mlp32, y16: s.mlpIntermediate)
-            try QWGemm.encodeFwht32(enc, hal: hal, x: s.mlpIntermediate)
+            if w.down.isRotated {
+                try QWGemm.encodeFwht32(enc, hal: hal, x: s.mlpIntermediate)
+            }
             try project(enc, x: s.mlpIntermediate, gs: s.gsMLP, w: w.down,
                         plan: downPlan, y32: s.fcOut32, y16: s.downOut)
         }
@@ -406,6 +446,10 @@ final class QWMTPDraftEncoder {
             try QWHead.encodeF16(enc, hal: hal, w: weight, x: scratch.postNorm,
                                  y: scratch.draftLogits, geometry: geometry,
                                  N: scratch.draftLogits.shape.elementCount)
+        case .bf16(let weight):
+            try QWHead.encodeBF16(enc, hal: hal, w: weight, x: scratch.postNorm,
+                                  y: scratch.draftLogits, geometry: geometry,
+                                  N: scratch.draftLogits.shape.elementCount)
         case .q4g(let weight):
             try QWHead.encodeQ4g(enc, hal: hal, weight: weight,
                 x: scratch.postNorm, gs: scratch.gsHead, y: scratch.draftLogits)
@@ -428,7 +472,7 @@ final class QWMTPDraftEncoder {
             q4View = draftHead.view
         } else {
             switch storage {
-            case .f16:
+            case .f16, .bf16:
                 q4View = nil
             case .q4g(let weight):
                 q4View = weight.view
@@ -436,6 +480,7 @@ final class QWMTPDraftEncoder {
         }
         guard let view = q4View else {
             try encodeHead(enc, storage: storage, draftHead: draftHead)
+            enc.memoryBarrier(scope: .buffers)
             try scratch.greedySelector.encode(enc, hal: hal, logits: scratch.draftLogits,
                                               ordering: .numericalDraft, destination: outToken)
             return

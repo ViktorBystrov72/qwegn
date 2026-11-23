@@ -546,11 +546,15 @@ public final class QWChatStreamParser: @unchecked Sendable {
     private static let toolOpen = "<tool_call>"
 
     private var mode: Mode
-    private let allowToolCalls: Bool
+    let allowToolCalls: Bool
     private var allowReasoningTags: Bool
-    private var buffer = ""
+    var buffer = ""
     private var leadingPending = true
     private var contentEmitted = false
+    var ink2Mode = false
+    var ink2State: Ink2ChannelState = .awaitingChannel
+    var ink2ToolPayloads: [String] = []
+    var ink2IncompleteToolPayload: String? = nil
 
     public private(set) var reasoning = ""
     public private(set) var content = ""
@@ -578,6 +582,10 @@ public final class QWChatStreamParser: @unchecked Sendable {
     }
 
     /// Longest suffix of `text` that is a proper prefix of one of `tags`.
+    func heldMarkerSuffixCount(_ text: String, tags: [String]) -> Int {
+        Self.heldSuffix(text, tags: tags)
+    }
+
     private static func heldSuffix(_ text: String, tags: [String]) -> Int {
         var best = 0
         for tag in tags {
@@ -590,6 +598,12 @@ public final class QWChatStreamParser: @unchecked Sendable {
         }
         return best
     }
+
+    func emitSubstring(_ text: Substring, as targetMode: DeltaTarget, into out: inout [Delta]) {
+        emit(text, as: targetMode == .reasoning ? .reasoning : .content, into: &out)
+    }
+
+    enum DeltaTarget { case reasoning, content }
 
     private func emit(_ text: Substring, as mode: Mode, into out: inout [Delta]) {
         guard !text.isEmpty else { return }
@@ -617,6 +631,20 @@ public final class QWChatStreamParser: @unchecked Sendable {
     private func drain(final: Bool) -> [Delta] {
         var out: [Delta] = []
         while true {
+            if ink2Mode {
+                _ = drainInk2(final: final, out: &out)
+                return out
+            }
+            if let inkMatch = Self.earliestTagMatch(in: buffer, tags: QWToolCallParser.ink2AllMarkers) {
+                if inkMatch.range.lowerBound > buffer.startIndex {
+                    let target: Mode = (mode == .reasoning) ? .reasoning : .content
+                    emit(buffer[..<inkMatch.range.lowerBound], as: target, into: &out)
+                }
+                buffer.removeSubrange(..<inkMatch.range.lowerBound)
+                ink2Mode = true
+                ink2State = .awaitingChannel
+                continue
+            }
             switch mode {
             case .toolCall:
                 if buffer.hasPrefix(Self.toolOpen) {
@@ -644,6 +672,7 @@ public final class QWChatStreamParser: @unchecked Sendable {
             case .reasoning:
                 if leadingPending {
                     buffer = String(buffer.drop(while: { $0.isWhitespace }))
+                    if !final && Self.heldSuffix(buffer, tags: QWToolCallParser.ink2AllMarkers) >= 2 { return out }
                     if let openTag = Self.thinkOpenTags.first(where: { buffer.hasPrefix($0) }) {
                         buffer.removeFirst(openTag.count)
                         continue
@@ -667,7 +696,7 @@ public final class QWChatStreamParser: @unchecked Sendable {
                     mode = .toolCall
                     continue
                 }
-                let activeTags = allowToolCalls ? (Self.thinkCloseTags + [Self.toolOpen]) : Self.thinkCloseTags
+                let activeTags = (allowToolCalls ? (Self.thinkCloseTags + [Self.toolOpen]) : Self.thinkCloseTags) + QWToolCallParser.ink2AllMarkers
                 let hold = final ? 0 : Self.heldSuffix(buffer, tags: activeTags)
                 let cut = buffer.index(buffer.endIndex, offsetBy: -hold)
                 emit(buffer[..<cut], as: .reasoning, into: &out)
@@ -685,7 +714,8 @@ public final class QWChatStreamParser: @unchecked Sendable {
                                 leadingPending = true
                                 continue
                             }
-                            if !final && Self.thinkOpenTags.contains(where: { $0.hasPrefix(afterWS) }) {
+                            if !final && (Self.thinkOpenTags.contains(where: { $0.hasPrefix(afterWS) })
+                                || Self.heldSuffix(String(afterWS), tags: QWToolCallParser.ink2AllMarkers) >= 2) {
                                 return out
                             }
                             leadingPending = false
@@ -704,7 +734,7 @@ public final class QWChatStreamParser: @unchecked Sendable {
                     mode = .toolCall
                     continue
                 }
-                let activeTags = allowToolCalls ? [Self.toolOpen] : []
+                let activeTags = (allowToolCalls ? [Self.toolOpen] : []) + QWToolCallParser.ink2AllMarkers
                 let hold = final ? 0 : Self.heldSuffix(buffer, tags: activeTags)
                 let cut = buffer.index(buffer.endIndex, offsetBy: -hold)
                 emit(buffer[..<cut], as: .content, into: &out)
@@ -716,9 +746,16 @@ public final class QWChatStreamParser: @unchecked Sendable {
 
     /// Final structured result. Call after `finish()`.
     public func result(tools: [QWJson]?, truncated: Bool) -> QWToolCallParser.ParseResult {
-        let (calls, _) = allowToolCalls
+        var (calls, _) = allowToolCalls
             ? QWToolCallParser.parseToolSegments(toolText, tools: tools, dropIncomplete: truncated)
             : ([], false)
+        if allowToolCalls {
+            let inkCalls = QWToolCallParser.parseInk2ToolPayloads(
+                ink2ToolPayloads, trailingIncomplete: ink2IncompleteToolPayload,
+                tools: tools, dropIncomplete: truncated
+            )
+            calls.append(contentsOf: inkCalls)
+        }
         let trimmedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedReasoning = reasoning.trimmingCharacters(in: .whitespacesAndNewlines)
         let finish: String

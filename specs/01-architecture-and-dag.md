@@ -14,11 +14,10 @@ Dependencies flow strictly **upward** along numeric layers (`LAYERS[dep] < LAYER
 | **L2.0** | `QWAlloc` | Buffer/arena allocator (`QWArena`), `QWWeightView` (`L0` contract) over GPU storage. |
 | **L2.5** | `QWLoad`, `QWRope` | Memory-mapped weight/slab loader (`PlaneIO`, `PlaneLayout`, `QWCheckpointTensorLoader` — no `QWGEMM` dependency), RoPE kernels. |
 | **L3.0** | `QWGEMM`, `QWKV` | Matrix multiply / dequant GEMM & GEMV dispatch (`QWDeviceEmbedTable.gather`), KV cache arenas. |
-| **L4.0** | `QWNorm`, `QWAttn`, `QWGDN`, `QWMLP`, `QWVision` | Transformer normalization, dense/paged/sparse/MLA/QSA attention, Gated DeltaNet recurrent/chunked operators, MLP/MoE FFN, vision encoder (`ViT`). |
+| **L4.0** | `QWNorm`, `QWAttn`, `QWGDN`, `QWMLP`, `QWHyperPLE`, `QWVision` | Transformer normalization, dense/paged/sparse/MLA/QSA attention (`QWQSACacheState`, `QWQSAEncoders`), Gated DeltaNet recurrent/chunked operators, MLP/MoE FFN, HyperPLE operators (CPU references in `Tests/QWFlashNextTests/Reference/`), vision encoder (`ViT`). |
 | **L5.0** | `QWHead` | LM-head projection & GPU sampling (`qwhead*`). |
 | **L6.0** | `QWMTP`, `QWMM` | Multi-token prediction (`MTP` / `DFlash` / `DSpine`) and multimodal vision-text fusion. |
-| **L6.5** | `QWFlashNext` | Dedicated Flash-Next / PLE (`HyperPLE`) subsystem & prefix cache (CPU references reside solely in `Tests/QWFlashNextTests/Reference/`). |
-| **L7.0** | `QWEngine` | Module registry (`QWModuleRegistry`), compiled layer graphs, `QWUnifiedEngine`, `QWEngineDriver`, `ColdExpertStreamer`, telemetry registry. |
+| **L7.0** | `QWEngine` | Module registry (`QWModuleRegistry`), unified `DenseModule`, compiled layer graphs (`QWLayerKernelRegistry` with `ple: true` via `QWQSALayerKernels`), single `QWEngineDriver` (routing `hcCount > 1` / `.qwen38FlashNext` through `QWHyperStreamRuntime`), `QWBatchScheduler` (`QWBatchAdmissionTracker`), `ColdExpertStreamer`, telemetry registry (retired `L6.5 QWFlashNext`, `FlashNextModule`, `StandardModule`, `QWEngineCore`). |
 | **L7.5** | `QWCli` | ArgumentParser CLI library (`pull`, `quantize`, `inspect`, `bench`, soak harnesses). |
 | **L7.8** | `QWServer` | `NWListener`-based HTTP/1.1 API server, lifecycle actor, `/ui` WebUI & dashboard view-model builder, security/SSRF/framing policy. |
 | **L8.0** | `qwg`, `qwg-bench-kernels`, `golden_pre_p3`, `m1` | Thin executable entry points. |
@@ -33,7 +32,7 @@ Dependencies flow strictly **upward** along numeric layers (`LAYERS[dep] < LAYER
   - `QWEngineTests` `<= L7.0`
 - **Compiler safety:** Every Swift target sets `.swiftLanguageMode(.v6)` and `-warnings-as-errors` in `Package.swift`.
 - **Style & size gates (`Scripts/lint_style.py`, `make lint`):**
-  - All production Swift files remain compact and single-responsibility (`0` files `> 650` LOC in `Sources/`, hard lint ceiling `<= 800` LOC).
+  - All production Swift files remain compact and single-responsibility (hard lint ceiling `<= 800` LOC across `Sources/`).
   - File headers `<= 7` lines; block/doc comment runs `<= 3` lines.
   - Zero `try!` / `as!` in production engine/server targets (`Sources/`, excluding `QWBenchKernels` harness).
 - **Kernel reachability (`Scripts/lint_kernels.py`, `Scripts/test_kernel_inventory.py`):** Every Metal kernel compiled into `kernel.metallib` / `kernel_std.metallib` is bidirectionally checked against production dispatch sites in `Sources/` (rejecting unreferenced or `Tests/`-only `.metal` kernels) and manifest-backed prewarm inventories.

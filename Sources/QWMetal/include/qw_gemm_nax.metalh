@@ -412,10 +412,13 @@ METAL_FUNC void qwg_gemm_nax_f32_dispatch(const device char* w, const device hal
                                           uint M, uint N, uint K, uint3 tg, uint simd_gid,
                                           threadgroup const ushort4* shvqLut16 = nullptr) {
     const uint mode = (M >> 29u) & 3u;
-    const int realM = int(M & 0x1FFFFFFFu);
+    const int realM = int(M & 0x0FFFFFFFu);
     if ((M & 0x80000000u) != 0u) {
         qwg_gemm_nax_split_mode_dispatch<AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_TG, half>(
             w, xh, xl, (device half*)y32, int(K), int(N), realM, mode, tg, simd_gid, shvqLut16);
+    } else if ((M & 0x10000000u) != 0u) {
+        qwg_gemm_nax_split_mode_dispatch<AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_TG, bfloat>(
+            w, xh, xl, (device bfloat*)y32, int(K), int(N), realM, mode, tg, simd_gid, shvqLut16);
     } else {
         qwg_gemm_nax_split_mode_dispatch<AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_TG, float>(
             w, xh, xl, y32, int(K), int(N), realM, mode, tg, simd_gid, shvqLut16);

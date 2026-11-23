@@ -203,6 +203,12 @@ extension QWEngineDriver {
         // rollback(by:)/snapshots price the true retained window. Monotonic,
         // zero GPU cost.
         kvCache.markWritten(session.kv, upTo: pos + 1)
+        if geometry.hasAnySlidingWindow {
+            try kvCache.recycleExpiredWindowPages(
+                session.kv,
+                currentPosition: pos + 1,
+                safetyMargin: geometry.descriptor.maxSpeculativeDrafts + QWKVCache.pageTokens)
+        }
         if seedMTP || (isWeightFreeSpeculation && !session.batchedDecodeTouched) {
             commitMTPSeeding(session, position: pos, count: 1, cacheRows: mtpRows)
         }

@@ -140,7 +140,7 @@ struct QWResolvedCliEngineConfig {
             FileHandle.standardError.write("\(verb): error: \(error)\n".data(using: .utf8)!)
             throw ExitCode(2)
         }
-        let maxDrafts = (resolvedBackend == .dflash2) ? 15 : 7
+        let maxDrafts = 15
         if resolvedBackend == .dflash2, knobs.mtpDrafts == nil, dflashWindow == nil {
             let inferred = QWDFlashConfig.inferBackendAndMaxDrafts(
                 packPath: knobs.dflashDraftPack
@@ -197,15 +197,32 @@ struct QWResolvedCliEngineConfig {
         )
         let minMemoryContext = memoryPack.map { max(4096, (($0.artifact.tokenCount + 16384 + 255) / 256) * 256) } ?? 0
         let defaultContext = max(runtimeAssets.descriptor.maxPositionEmbeddings, minMemoryContext)
+        let wDir = location.weights.hasDirectoryPath
+            ? location.weights
+            : location.weights.deletingLastPathComponent()
+        let hasDSparkFile = [
+            wDir.appendingPathComponent("dspark.qwp"),
+            location.assets.appendingPathComponent("dspark.qwp"),
+            wDir.appendingPathComponent("mtp.safetensors"),
+            location.assets.appendingPathComponent("mtp.safetensors")
+        ].contains { FileManager.default.fileExists(atPath: $0.path) }
         let defaultStrategy = knobs.mtpDraftStrategy ?? effectivePair.settings.mtpDraftStrategy
         let isWeightFreeLoopNgram = !runtimeAssets.descriptor.capabilities.contains(.mtp)
             && effectivePair.settings.speculativeDecodingEnabled
             && effectivePair.settings.mtpDrafts > 0
             && defaultStrategy.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "ngram"
         var effectiveMtpDrafts = initialMtpDrafts
-        if knobs.mtpDrafts == nil && dflashWindow == nil && resolvedBackend != .dflash2
-            && !runtimeAssets.descriptor.capabilities.contains(.mtp) {
-            effectiveMtpDrafts = isWeightFreeLoopNgram ? effectivePair.settings.mtpDrafts : 0
+        if knobs.mtpDrafts == nil && dflashWindow == nil && resolvedBackend != .dflash2 {
+            if let dsCfg = runtimeAssets.descriptor.inkling2Config?.dspark, hasDSparkFile {
+                if effectivePair.settings.speculativeDecodingEnabled {
+                    let profDrafts = effectivePair.profile?.values["mtpDrafts"]?.intValue ?? 3
+                    effectiveMtpDrafts = min(max(1, dsCfg.blockSize - 1), profDrafts)
+                } else {
+                    effectiveMtpDrafts = 0
+                }
+            } else if !runtimeAssets.descriptor.capabilities.contains(.mtp) {
+                effectiveMtpDrafts = isWeightFreeLoopNgram ? effectivePair.settings.mtpDrafts : 0
+            }
         }
         let resolvedBackendForConfig = resolvedBackend
             ?? (knobs.mtpDrafts == nil && isWeightFreeLoopNgram
@@ -235,11 +252,18 @@ struct QWResolvedCliEngineConfig {
             FileHandle.standardError.write("\(verb): error: invalid --lsa-mode '\(rawLSAMode)' (must be off, auto, sidecar, svd, or qsa-cluster)\n".data(using: .utf8)!)
             throw ExitCode(2)
         }
+        let envLoopShare = QWLSAConfig.parseLoopShareEnv(ProcessInfo.processInfo.environment[QWLSAConfig.loopShareEnvKey])
+        let resolvedCrossLoopReuse = knobs.lsaCrossLoopReuse
+            ?? envLoopShare?.enabled
+            ?? effectivePair.settings.lsaCrossLoopReuse
+        let resolvedLoopShareStride = resolvedCrossLoopReuse ? (envLoopShare?.stride ?? 0) : 0
         let lsaConfig = QWLSAConfig(
             mode: resolvedLSAMode,
             budget: knobs.lsaBudget ?? effectivePair.settings.lsaBudget,
             clusterBlock: knobs.lsaClusterBlock ?? memoryPack?.manifest.clusterBlockTokens ?? effectivePair.settings.lsaClusterBlock,
-            sidecarPath: knobs.lsaSidecarPath ?? effectivePair.settings.lsaSidecarPath
+            sidecarPath: knobs.lsaSidecarPath ?? effectivePair.settings.lsaSidecarPath,
+            crossLoopReuse: resolvedCrossLoopReuse,
+            loopShareStride: resolvedLoopShareStride
         )
         let tok = try QWTokenizer(json: runtimeAssets.tokenizerJSON)
         let specialTokens = tok.resolveSpecialTokens(fallback: runtimeAssets.descriptor.specialTokens)

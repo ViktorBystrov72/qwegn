@@ -132,6 +132,11 @@ public enum QWCheckpointTensorLoader {
         return st.tensors.keys.contains(where: { $0.hasSuffix(".scales") })
     }
 
+    /// Shift subtracted from raw RMSNorm weights so packed weights obey the engine's `1 + w` law.
+    public static func normGammaShift(normGammaIsPlusOne: Bool, isMLXCheckpoint: Bool) -> Float {
+        (normGammaIsPlusOne && !isMLXCheckpoint) ? 0.0 : 1.0
+    }
+
     /// Byte span of a 2-D or stacked HQ/SHVQ tensor inside a `.qwp` pack.
     public struct PackSpan: Sendable {
         public let off: Int, bytes: Int, rows: Int, cols: Int
@@ -247,7 +252,10 @@ public enum QWCheckpointTensorLoader {
            let layout = try? QWAQRepacker.layout(container: st, name: name, rows: n, cols: k),
            QWAQBlock.isSupported(bits: layout.bits, group: layout.group) {
             let rowBytes = QWAQBlock.rowBytes(bits: layout.bits, group: layout.group, k: k)
-            let totalBytes = n * rowBytes
+            let (totalBytes, ov) = n.multipliedReportingOverflow(by: rowBytes)
+            guard n > 0, !ov, totalBytes > 0, totalBytes % 2 == 0 else {
+                throw QWCheckpointLoaderError.notHQ4(name)
+            }
             let t = try arena.weightsRegion().allocate(QWTensorShape([totalBytes / 2], .f16))
             try QWAQRepacker.repackMLXAffine(
                 hal: arena.hal, container: st, name: name, rows: n, cols: k,
@@ -277,7 +285,14 @@ public enum QWCheckpointTensorLoader {
             return (try concatBank(arena, pack, spans, n: rows, k: k), rows)
         }
         guard let st else { throw QWCheckpointLoaderError.notHQ4(names.first ?? "") }
-        let counts = try names.map { try st.reader(of: $0).tensorInfo.shape[0] }
+        guard !names.isEmpty else { throw QWCheckpointLoaderError.notHQ4("concatHQBank empty") }
+        let counts = try names.map { name -> Int in
+            let shape = try st.reader(of: name).tensorInfo.shape
+            guard shape.count >= 2, shape[0] > 0 else {
+                throw QWCheckpointLoaderError.notHQ4(name)
+            }
+            return shape[0]
+        }
         let totalRows = counts.reduce(0, +)
         if !arena.hal.weightBasis.rotatesActivations {
             let layouts = zip(names, counts).compactMap { (name, rows) in
@@ -287,7 +302,10 @@ public enum QWCheckpointTensorLoader {
                QWAQBlock.isSupported(bits: first.bits, group: first.group),
                layouts.allSatisfy({ $0.bits == first.bits && $0.group == first.group }) {
                 let rowBytes = QWAQBlock.rowBytes(bits: first.bits, group: first.group, k: k)
-                let totalBytes = totalRows * rowBytes
+                let (totalBytes, ov) = totalRows.multipliedReportingOverflow(by: rowBytes)
+                guard !ov, totalBytes > 0, totalBytes % 2 == 0 else {
+                    throw QWCheckpointLoaderError.notHQ4(names.first ?? "")
+                }
                 let t = try arena.weightsRegion().allocate(QWTensorShape([totalBytes / 2], .f16))
                 var rowOff = 0
                 for (name, rows) in zip(names, counts) {
@@ -332,7 +350,7 @@ public enum QWCheckpointTensorLoader {
     ) throws -> R? {
         guard minBytes > 0 else { return nil }
         return try stageLock.withLock {
-            if let existing = sharedRepackStage, existing.length >= minBytes {
+            if let existing = sharedRepackStage, existing.device === device, existing.length >= minBytes {
                 return try body(existing)
             }
             sharedRepackStage = nil
@@ -365,7 +383,16 @@ public enum QWCheckpointTensorLoader {
         let attrs = try? fm.attributesOfItem(atPath: stPath)
         let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
         let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        let keyStr = "\(stPath)|\(size)|\(Int64(mtime))|\(st.tensors.count)|\(isRotated ? "rot" : "std")"
+        var keyStr = "\(stPath)|\(size)|\(Int64(mtime))|\(st.tensors.count)|\(isRotated ? "rot" : "std")"
+        if st.shards.count > 1 {
+            let shardMeta = st.shards.keys.sorted { $0.path < $1.path }.map { url -> String in
+                let a = try? fm.attributesOfItem(atPath: url.path)
+                let s = (a?[.size] as? NSNumber)?.uint64Value ?? 0
+                let m = Int64((a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+                return "\(url.lastPathComponent):\(s):\(m)"
+            }.joined(separator: ",")
+            keyStr += "|\(shardMeta)"
+        }
         var hash: UInt64 = 0xcbf29ce484222325
         for b in keyStr.utf8 {
             hash ^= UInt64(b)
@@ -451,31 +478,49 @@ public enum QWCheckpointTensorLoader {
             return (try bankFrom(arena, pack, gu.span, n: gu.n, k: gu.k),
                     try bankFrom(arena, pack, dn.span, n: dn.n, k: dn.k))
         }
-        guard let st else { throw QWCheckpointLoaderError.notHQ4(mp) }
-        let guRows = experts * 2 * inter
-        let dnRows = experts * hidden
+        guard let st, experts > 0, inter > 0, hidden > 0 else {
+            throw QWCheckpointLoaderError.notHQ4(mp)
+        }
+        let (expInter, ovEI) = experts.multipliedReportingOverflow(by: inter)
+        let (guRows, ovGU) = expInter.multipliedReportingOverflow(by: 2)
+        let (dnRows, ovDN) = experts.multipliedReportingOverflow(by: hidden)
+        guard !ovEI, !ovGU, !ovDN else { throw QWCheckpointLoaderError.notHQ4(mp) }
         let downName = st.tensor(mp + "experts.down_proj") != nil
             ? (mp + "experts.down_proj") : (mp + "switch_mlp.down_proj.weight")
         let pageSize = max(4096, Int(sysconf(_SC_PAGESIZE)))
 
         if !arena.hal.weightBasis.rotatesActivations {
-            let guLayout: QWAQRepacker.Layout? = st.tensor(mp + "experts.gate_up_proj") != nil
+            let isFusedGateUp = st.tensor(mp + "experts.gate_up_proj") != nil
+            let guLayout: QWAQRepacker.Layout? = isFusedGateUp
                 ? (try? QWAQRepacker.layout(container: st, name: mp + "experts.gate_up_proj", rows: guRows, cols: hidden))
-                : (try? QWAQRepacker.layout(container: st, name: mp + "switch_mlp.gate_proj.weight", rows: experts * inter, cols: hidden))
+                : (try? QWAQRepacker.layout(container: st, name: mp + "switch_mlp.gate_proj.weight", rows: expInter, cols: hidden))
+            let upLayout: QWAQRepacker.Layout? = isFusedGateUp
+                ? guLayout
+                : (try? QWAQRepacker.layout(container: st, name: mp + "switch_mlp.up_proj.weight", rows: expInter, cols: hidden))
             let dnLayout = try? QWAQRepacker.layout(container: st, name: downName, rows: dnRows, cols: inter)
+            if guLayout != nil && (upLayout != guLayout || dnLayout == nil) {
+                throw QWCheckpointLoaderError.notHQ4(mp + "switch_mlp")
+            }
             if let guLayout, let dnLayout,
                QWAQBlock.isSupported(bits: guLayout.bits, group: guLayout.group),
                QWAQBlock.isSupported(bits: dnLayout.bits, group: dnLayout.group) {
                 let guRowBytes = QWAQBlock.rowBytes(bits: guLayout.bits, group: guLayout.group, k: hidden)
-                let guBytes = guRows * guRowBytes
+                let (guBytes, ovGUB) = guRows.multipliedReportingOverflow(by: guRowBytes)
                 let dnRowBytes = QWAQBlock.rowBytes(bits: dnLayout.bits, group: dnLayout.group, k: inter)
-                let dnBytes = dnRows * dnRowBytes
-                let alignedGU = ((guBytes + pageSize - 1) / pageSize) * pageSize
-                let alignedDN = ((dnBytes + pageSize - 1) / pageSize) * pageSize
+                let (dnBytes, ovDNB) = dnRows.multipliedReportingOverflow(by: dnRowBytes)
+                let (guPad, ovGUP) = guBytes.addingReportingOverflow(pageSize - 1)
+                let (dnPad, ovDNP) = dnBytes.addingReportingOverflow(pageSize - 1)
+                let (totalAQBytes, ovTot) = guBytes.addingReportingOverflow(dnBytes)
+                guard !ovGUB, !ovDNB, !ovGUP, !ovDNP, !ovTot, guBytes > 0, dnBytes > 0,
+                      guBytes % 2 == 0, dnBytes % 2 == 0 else {
+                    throw QWCheckpointLoaderError.notHQ4(mp + "switch_mlp")
+                }
+                let alignedGU = (guPad / pageSize) * pageSize
+                let alignedDN = (dnPad / pageSize) * pageSize
 
-                if guBytes + dnBytes >= (16 << 20),
+                if totalAQBytes >= (16 << 20),
                    let cacheDir = moeSlabCacheDirectory(for: st, isRotated: false) {
-                    let sanitizedMP = mp.replacingOccurrences(of: ".", with: "_")
+                    let sanitizedMP = mp.replacingOccurrences(of: ".", with: "_").replacingOccurrences(of: "/", with: "_")
                     let slabName = "\(sanitizedMP)gu\(guLayout.bits)g\(guLayout.group)_dn\(dnLayout.bits)g\(dnLayout.group)_\(guRows)x\(hidden)_\(dnRows)x\(inter).slab"
                     let slabURL = cacheDir.appendingPathComponent(slabName)
                     if let mapped = mapCachedMoESlab(at: slabURL, alignedGU: alignedGU, alignedDN: alignedDN, device: arena.hal.device) {

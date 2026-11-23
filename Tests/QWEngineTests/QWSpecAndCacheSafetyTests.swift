@@ -40,27 +40,29 @@ final class QWSpecAndCacheSafetyTests: XCTestCase {
         XCTAssertThrowsError(try QWEngineDriver.resolveStartup(
             packPath: dir.path,
             kvMode: .q4,
-            mtpDrafts: 8,
+            mtpDrafts: 16,
             mtpBackend: .standard,
             prefillScratchEviction: .never,
             mtpAdaptiveDepth: nil,
             mtpAdaptiveEntropyThreshold: nil
         )) { error in
-            guard case QWEngineDriverError.badMTPDrafts(8) = error else {
-                return XCTFail("expected badMTPDrafts(8) for non-dflash2 backend, got \(error)")
+            guard case QWEngineDriverError.badMTPDrafts(16) = error else {
+                return XCTFail("expected badMTPDrafts(16) for out-of-range drafts, got \(error)")
             }
         }
-        XCTAssertThrowsError(try QWEngineDriver.resolveStartup(
-            packPath: dir.path,
-            kvMode: .q4,
-            mtpDrafts: 15,
-            mtpBackend: .dflash2,
-            prefillScratchEviction: .never,
-            mtpAdaptiveDepth: nil,
-            mtpAdaptiveEntropyThreshold: nil
-        )) { error in
-            if case QWEngineDriverError.badMTPDrafts = error {
-                XCTFail("dflash2 allows 15 drafts; should proceed past draft check to missing weights, got \(error)")
+        for backend in [QWMTPBackend.standard, .dflash2] {
+            XCTAssertThrowsError(try QWEngineDriver.resolveStartup(
+                packPath: dir.path,
+                kvMode: .q4,
+                mtpDrafts: 15,
+                mtpBackend: backend,
+                prefillScratchEviction: .never,
+                mtpAdaptiveDepth: nil,
+                mtpAdaptiveEntropyThreshold: nil
+            )) { error in
+                if case QWEngineDriverError.badMTPDrafts = error {
+                    XCTFail("\(backend.rawValue) allows 15 drafts; should proceed past draft check to missing weights, got \(error)")
+                }
             }
         }
     }

@@ -2,8 +2,9 @@
 // residency/KV footprint estimation, prefix header flags, and hybrid PLD/recycler bypass.
 import XCTest
 import Foundation
+import QWAttn
 import QWCore
-@testable import QWFlashNext
+@testable import QWEngine
 
 final class FNDFlashIntegrationTests: XCTestCase {
     private static func makeFlashNextDescriptor(hidden: Int = 2560, numLayers: Int = 48) -> QWModelDescriptor {
@@ -82,13 +83,14 @@ final class FNDFlashIntegrationTests: XCTestCase {
     }
 
     func testPrefixHeaderBitAndGeometryMarkerHashing() {
-        XCTAssertEqual(FNGPUEngine.FNPrefixHeader.dflashBit, 4)
+        XCTAssertEqual(QWHyperStreamRuntime.FNPrefixHeader.version, 2)
+        XCTAssertEqual(QWHyperStreamRuntime.FNPrefixHeader.dflashBit, 4)
         let tokens: [Int64] = Array(10..<160)
-        let baseHash = FNGPUEngine.fnPrefixHash(tokens: tokens[...], kvMode: .f16, hasMTP: false)
+        let baseHash = QWHyperStreamRuntime.fnPrefixHash(tokens: tokens[...], kvMode: .f16, hasMTP: false)
         let m1 = "df:2560:5:20:8:128:2047:0:5,15,25,35,45"
         let m2 = "df:2560:5:20:8:128:2047:0:1,12,23,34,45"
-        let h1 = FNGPUEngine.fnPrefixHash(tokens: tokens[...], kvMode: .f16, hasMTP: false, dflashMarker: m1)
-        let h2 = FNGPUEngine.fnPrefixHash(tokens: tokens[...], kvMode: .f16, hasMTP: false, dflashMarker: m2)
+        let h1 = QWHyperStreamRuntime.fnPrefixHash(tokens: tokens[...], kvMode: .f16, hasMTP: false, dflashMarker: m1)
+        let h2 = QWHyperStreamRuntime.fnPrefixHash(tokens: tokens[...], kvMode: .f16, hasMTP: false, dflashMarker: m2)
         XCTAssertNotEqual(baseHash, h1)
         XCTAssertNotEqual(h1, h2)
     }
@@ -165,7 +167,7 @@ final class FNDFlashIntegrationTests: XCTestCase {
         let otherMarker = "df:2560:5:20:8:128:2047:0:1,12,23,34,45"
         let n1 = FNPrefixWarmStore.rootPrefixTokenCount + 32
         let turn1: [Int64] = (10..<(10 + n1)).map { Int64($0) }
-        let h1 = FNGPUEngine.fnPrefixHash(tokens: turn1[...], kvMode: .f16, hasMTP: false, dflashMarker: marker)
+        let h1 = QWHyperStreamRuntime.fnPrefixHash(tokens: turn1[...], kvMode: .f16, hasMTP: false, dflashMarker: marker)
         let name1 = String(format: "fn_entry_%016llx_%d.qwcache", h1, n1)
         let r1 = FNPrefixWarmStore.rootHash(history: turn1, kvMode: .f16, hasMTP: false, dflashMarker: marker)
         let slot1 = store.resolveSlot(rootHash: r1, history: turn1, kvMode: .f16, hasMTP: false, dflashMarker: marker)
@@ -176,7 +178,7 @@ final class FNDFlashIntegrationTests: XCTestCase {
 
         // An unrelated prompt resolves to a distinct slot so slot reuse on extension is non-trivial.
         let otherPrompt: [Int64] = (5000..<(5000 + n1)).map { Int64($0) }
-        let hOther = FNGPUEngine.fnPrefixHash(
+        let hOther = QWHyperStreamRuntime.fnPrefixHash(
             tokens: otherPrompt[...], kvMode: .f16, hasMTP: false, dflashMarker: marker)
         let rOther = FNPrefixWarmStore.rootHash(
             history: otherPrompt, kvMode: .f16, hasMTP: false, dflashMarker: marker)
@@ -203,7 +205,7 @@ final class FNDFlashIntegrationTests: XCTestCase {
         XCTAssertEqual(slot2, slot1)
         store.prepareSlotForStore(slot: slot2, rootHash: r2, history: turn2, incomingBytes: 64,
                                   kvMode: .f16, hasMTP: false, dflashMarker: marker)
-        let h2 = FNGPUEngine.fnPrefixHash(tokens: turn2[...], kvMode: .f16, hasMTP: false, dflashMarker: marker)
+        let h2 = QWHyperStreamRuntime.fnPrefixHash(tokens: turn2[...], kvMode: .f16, hasMTP: false, dflashMarker: marker)
         let name2 = String(format: "fn_entry_%016llx_%d.qwcache", h2, turn2.count)
         store.store(name: name2, blob: Data(repeating: 3, count: 64),
                     slot: slot2, rootHash: r2, history: turn2, isSharedBase: false)
@@ -215,7 +217,7 @@ final class FNDFlashIntegrationTests: XCTestCase {
 
         // Shared-base matching also honors dflashMarker isolation.
         let baseHist: [Int64] = (8000..<8160).map { Int64($0) }
-        let hBase = FNGPUEngine.fnPrefixHash(tokens: baseHist[...], kvMode: .f16, hasMTP: false, dflashMarker: marker)
+        let hBase = QWHyperStreamRuntime.fnPrefixHash(tokens: baseHist[...], kvMode: .f16, hasMTP: false, dflashMarker: marker)
         let baseName = String(format: "fn_entry_%016llx_%d.qwcache", hBase, baseHist.count)
         store.store(name: baseName, blob: Data(repeating: 4, count: 64),
                     slot: nil, rootHash: nil, history: baseHist, isSharedBase: true)

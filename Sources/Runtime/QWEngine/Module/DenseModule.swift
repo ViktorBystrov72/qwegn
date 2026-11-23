@@ -1,81 +1,48 @@
-// DenseModule.swift — The dense (qwen3_5) family module.
-// The adapter: it owns no numerics, it drives the dense engine through the
-// seam the core loops over.
+// DenseModule.swift — Unified dense, MoE, and hybrid family module.
+// Drives `QWEngineDriver` directly behind `QWInferenceModule` / `QWInferenceEngine`.
 
 import Foundation
 import QWCore
 import QWHead
 import QWKV
 
-/// One dense request behind the seam.
-/// The engine owns the numerics; this owns the request: the session it
-/// admitted, the permit it holds, and the timing it attributes.
-final class DenseSessionState: QWModuleSessionState, @unchecked Sendable {
-    /// The engine the request belongs to.
-    let engine: QWEngineDriver
-    /// The engine session this request owns.
-    var engineSession: QWEngineSession?
-    /// The permit this request holds on the engine.
-    var permit: QWGenerationPermit?
-    /// The sampling contract the request runs under.
-    var sampling: QWSamplerConfig = .greedy
-    /// The speculation contract the request runs under.
-    var speculative: QWSpeculativeParameters = QWSpeculativeParameters()
-    /// The wall time of the last decode step, in milliseconds.
-    var stepMs: Double = 0
-    /// The GPU seconds this request's prefill spent.
-    var prefillGPUSec: Double = 0
-    /// Where the prefill ledger stood before this request's prefill.
-    var prefillMark: Int = 0
-    /// Whether the prefill ledger was on before this request asked for it.
-    var ledgerWasEnabled: Bool = false
+/// Unified engine module serving dense, MoE, and hybrid families via `QWEngineDriver`.
+public final class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendable {
+    public static let family: QWModelDescriptor.Family = .qwen38Dense
 
-    init(engine: QWEngineDriver) {
-        self.engine = engine
-    }
-
-    var activeTokens: Int { engineSession?.position ?? 0 }
-
-    func reset(sampling: QWSamplerConfig, speculative: QWSpeculativeParameters) throws {
-        // A request that ended without `finish` still holds the engine. Give
-        // the KV pages and the permit back before the next request starts.
-        release()
-        self.sampling = sampling
-        self.speculative = speculative
-        stepMs = 0
-        prefillGPUSec = 0
-        prefillMark = 0
-    }
-
-    /// Gives the engine back: the session's KV pages first, then the permit.
-    func release() {
-        if let engineSession { engine.finishSession(engineSession) }
-        engineSession = nil
-        if let permit { engine.releaseRequest(permit) }
-        permit = nil
-        // The prefill ledger goes back to how the engine had it.
-        engine.prefillTimingLedger.setEnabled(ledgerWasEnabled)
-    }
-}
-
-/// The dense 27B family, served by `QWEngineDriver`.
-/// Not final: the standard families share this lifecycle (see
-/// `QWStandardModule`), and only the contract differs.
-open class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendable {
-    open class var family: QWModelDescriptor.Family { .qwen38Dense }
-
-    /// The dense engine ships every capability the family can offer:
-    /// DFlash, rope-YaRN, a real GDN prefill choice, adaptive MTP, vision.
-    open class var capabilities: Set<QWKnobCapability> { [
+    /// Full capability set offered by the unified dense/hybrid driver.
+    public static let capabilities: Set<QWKnobCapability> = [
         .prefixCache, .kvQuantQ8, .kvQuantQ4, .gdnPrefill, .dflash, .ropeYaRN,
         .speculative, .mtpAdaptive, .vision, .lsa,
-    ] }
+    ]
 
-    /// `QWKVMode` has no f32 path in the dense engine.
-    open class var supportedKVStorageModes: Set<String> { ["f16", "q8", "q4"] }
+    /// `QWKVMode` supports f16, q8, and q4 storage modes.
+    public static let supportedKVStorageModes: Set<String> = ["f16", "q8", "q4"]
 
     /// Every kernel door the dense engine dispatches.
-    open class var requiredDoors: [String] { QWKernelInventory.dense }
+    public static let requiredDoors: [String] = QWKernelInventory.all
+
+    /// Kernel doors required for a specific model geometry.
+    public static func requiredDoors(for descriptor: QWModelDescriptor) -> [String] {
+        (descriptor.hcCount ?? 0) > 1 ? QWKernelInventory.flash : QWKernelInventory.dense
+    }
+
+    /// KV cache storage modes supported for a specific model geometry.
+    public static func supportedKVStorageModes(for descriptor: QWModelDescriptor) -> Set<String> {
+        QWModelCapabilities.supportedKVStorageModes(for: descriptor)
+    }
+
+    public static func resolveSpeculation(
+        _ requested: QWSpeculativeParameters, descriptor: QWModelDescriptor,
+        environment: [String: String], modelSwitch: Bool
+    ) throws -> QWResolvedSpeculation {
+        if (descriptor.hcCount ?? 0) > 1 {
+            return try QWHyperStreamRuntime.resolveSpeculation(
+                requested, descriptor: descriptor, environment: environment, modelSwitch: modelSwitch)
+        }
+        return try defaultResolveSpeculation(
+            requested, descriptor: descriptor, environment: environment, modelSwitch: modelSwitch)
+    }
 
     /// The dense engine. Nil before the engine is loaded.
     public let engine: QWEngineDriver?
@@ -93,27 +60,39 @@ open class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendabl
     /// The kernel each layer of the loaded model runs.
     private let kernels: [any QWLayerKernel]
 
-    public required init(engine: QWEngineDriver) {
+    public init(engine: QWEngineDriver) {
         self.engine = engine
         self.plan = engine.plan
         self.kernels = engine.layerKernels
     }
 
-    /// A module with no engine yet. Every call that needs the engine fails
-    /// loud — it never pretends to serve.
-    public required init(plan: QWEnginePlan) {
+    /// A module with no engine yet. Calls requiring a loaded engine fail loud.
+    public init(plan: QWEnginePlan) {
         self.engine = nil
         self.plan = plan
         self.kernels = []
     }
 
-    open class func make(plan: QWEnginePlan,
-                         engine: (any QWLoadedEngine)?) throws -> any QWInferenceModule {
-        guard let engine else { return Self(plan: plan) }
+    public static func make(plan: QWEnginePlan,
+                            engine: (any QWLoadedEngine)?) throws -> any QWInferenceModule {
+        let usesLatentOrCompressed = plan.usesAnyMLA
+            || plan.layers.contains { $0.attention == .hcaCompressed }
+        let isHyperStreamPlan = plan.modelCapabilities.contains(.ple)
+            || (plan.modelCapabilities.contains(.hyperConnections) && plan.modelCapabilities.contains(.qsaIndexer))
+        if !usesLatentOrCompressed {
+            try QWEngineDriver.validateServing(
+                headDim: plan.headDim,
+                kvHeads: plan.kvHeads,
+                qHeads: plan.qHeads,
+                kvMode: plan.kvStorageMode,
+                allowF32: isHyperStreamPlan
+            )
+        }
+        guard let engine else { return DenseModule(plan: plan) }
         guard let dense = engine as? QWEngineDriver else {
             throw QWModuleError.unsupportedFamily(family)
         }
-        return Self(engine: dense)
+        return DenseModule(engine: dense)
     }
 
     public var capabilities: Set<QWKnobCapability> {
@@ -186,160 +165,9 @@ open class DenseModule: QWInferenceModule, QWInferenceEngine, @unchecked Sendabl
     public func configurePrefixCache(_ config: QWCacheConfig) throws {
         guard let engine else {
             throw QWModuleError.notImplemented(
-                "DenseModule.configurePrefixCache — the seam prefill does not consult the cache yet")
+                "DenseModule.configurePrefixCache — engine not loaded")
         }
         try engine.configurePrefixCache(config: config)
-    }
-
-    public func makeSessionState() throws -> any QWModuleSessionState {
-        guard let engine else {
-            throw QWModuleError.notImplemented("DenseModule has no engine yet")
-        }
-        return DenseSessionState(engine: engine)
-    }
-
-    /// Prepares the engine for this request: the session is admitted for the
-    /// prompt plus the tokens the request may generate, and the request
-    /// holds the engine's admission permit until it finishes.
-    public func prepare(_ state: any QWModuleSessionState, prompt: [Int], maxNew: Int) throws {
-        let session = try unwrap(state)
-        // The module gets the request's contract: a request it cannot serve
-        // is refused here, not quietly downgraded later.
-        try checkContract(sampling: session.sampling, speculative: session.speculative)
-        guard let engine else {
-            throw QWModuleError.notImplemented("DenseModule has no engine yet")
-        }
-        // The whole prompt is checked before any chunk opens an encoder: a
-        // bad id must fail loud, not mid-stream.
-        for token in prompt where token < 0 || token >= engine.geometry.vocab {
-            throw QWModuleError.invalidToken(token)
-        }
-        // The seam's prefill is chunked. The engine's naive GDN mode decodes
-        // the prompt one token at a time, which the seam cannot express — the
-        // module refuses it rather than quietly running a different path.
-        guard engine.gdnPrefillMode != .naive else {
-            throw QWModuleError.notImplemented("DenseModule serves the chunked prefill only")
-        }
-        // The dense engine has one scratch and one KV cache: two requests
-        // must never interleave, so the request holds the permit from here
-        // until `finish` gives it back.
-        let permit = try engine.acquireRequest()
-        session.permit = permit
-        do {
-            session.engineSession = try engine.admitSession(promptTokens: prompt.count + maxNew)
-        } catch {
-            engine.releaseRequest(permit)
-            session.permit = nil
-            throw error
-        }
-        // The prefill's GPU time is measured by the engine's ledger. The
-        // module turns it on for this request and puts it back afterwards.
-        session.ledgerWasEnabled = engine.prefillTimingLedger.isEnabled
-        engine.prefillTimingLedger.setEnabled(true)
-        session.prefillMark = engine.prefillTimingLedger.values().count
-    }
-
-    /// Whether the module can serve a request's contract.
-    /// The dense module serves the greedy contract only: a sampled, penalised
-    /// or speculative request is refused, never quietly answered without it.
-    func checkContract(sampling: QWSamplerConfig,
-                       speculative: QWSpeculativeParameters) throws {
-        guard sampling.isGreedy, sampling.repetitionPenalty == 1.0 else {
-            throw QWModuleError.notImplemented(
-                "DenseModule serves greedy sampling without a repetition penalty")
-        }
-        guard speculative.effectiveDrafts == 0 else {
-            throw QWModuleError.notImplemented(
-                "DenseModule serves no speculative round — the request asked for \(speculative.effectiveDrafts) drafts")
-        }
-    }
-
-    /// The request is over: the KV pages and the permit go back to the engine.
-    public func finish(_ state: any QWModuleSessionState) {
-        guard let session = state as? DenseSessionState else { return }
-        session.release()
-    }
-
-    /// Runs one prefill chunk and returns the head's token for its last row.
-    public func encodePrefill(_ state: any QWModuleSessionState, tokens: [Int],
-                               chunk: Range<Int>, runsHead: Bool) throws -> Int {
-        guard let engine else {
-            throw QWModuleError.notImplemented("DenseModule has no engine yet")
-        }
-        let session = try unwrap(state)
-        guard let permit = session.permit, let engineSession = session.engineSession else {
-            throw QWModuleError.invalidState("the dense module has no live request")
-        }
-        // The prompt is fed exactly once: each chunk the seam names is fed
-        // once, and the head runs on the last one. The engine's own chunking
-        // is the same size, so one seam chunk is one engine chunk — a longer
-        // one is split, never dropped.
-        if chunk.lowerBound == 0 { engineSession.tokenRecycler.reset() }
-        engineSession.tokenRecycler.ingestSequence(
-            tokens[chunk], previousToken: chunk.lowerBound > 0 ? tokens[chunk.lowerBound - 1] : nil)
-        engineSession.tokenHistory = tokens
-        var offset = chunk.lowerBound
-        var token = 0
-        let prefillEndPos = engineSession.position + (tokens.count - chunk.lowerBound)
-        while offset < chunk.upperBound {
-            let stepCap = QWEngineDriver.adaptivePrefillChunkCap(
-                position: engineSession.position,
-                maxChunk: engine.prefillChunkSize,
-                isSubquadraticAttention: engine.usesSubquadraticLongPrefill)
-            let count = QWEngineDriver.nextBalancedChunkCount(
-                remaining: chunk.upperBound - offset, stepCap: stepCap)
-            let last = offset + count == chunk.upperBound
-            token = try engine.prefillChunk(engineSession, tokens: tokens,
-                                            start: offset, count: count,
-                                            runsHead: runsHead && last,
-                                            mode: engine.gdnPrefillMode, permit: permit,
-                                            dflashWindowEnd: prefillEndPos)
-            offset += count
-        }
-        if runsHead {
-            // The prefill's GPU time, as the engine's ledger measured it.
-            session.prefillGPUSec = engine.prefillGPUSecondsSince(mark: session.prefillMark)
-            if engine.prefillScratchEviction.shouldEvict(wiredEngineBytes: engine.arena.committedBytes) {
-                engine.evictPrefillScratch()
-            }
-        }
-        return token
-    }
-
-    /// Runs one decode step and returns the token the model produced.
-    public func encodeDecodeStep(_ state: any QWModuleSessionState, token: Int,
-                                 position: Int) throws -> Int {
-        guard let engine else {
-            throw QWModuleError.notImplemented("DenseModule has no engine yet")
-        }
-        let session = try unwrap(state)
-        guard let permit = session.permit, let engineSession = session.engineSession else {
-            throw QWModuleError.invalidState("the dense module has no live request")
-        }
-        let started = Date()
-        let next = try engine.decodeStep(engineSession, token: token, permit: permit)
-        // The module attributes the step's time to the token it produced.
-        session.stepMs = Date().timeIntervalSince(started) * 1000.0
-        return next
-    }
-
-    /// The step time the module attributes to the token it produced.
-    public func lastStepMilliseconds(_ state: any QWModuleSessionState) -> Double {
-        (state as? DenseSessionState)?.stepMs ?? 0
-    }
-
-    /// The GPU seconds the prefill of this session spent.
-    public func prefillGPUSeconds(_ state: any QWModuleSessionState) -> Double {
-        (state as? DenseSessionState)?.prefillGPUSec ?? 0
-    }
-
-    /// The concrete session behind the seam. A state this module did not make
-    /// is an error, never a silently mis-typed session.
-    private func unwrap(_ state: any QWModuleSessionState) throws -> DenseSessionState {
-        guard let session = state as? DenseSessionState else {
-            throw QWModuleError.unsupportedFamily(Self.family)
-        }
-        return session
     }
 }
 
@@ -372,12 +200,16 @@ extension DenseModule {
         lsaConfig: QWLSAConfig = QWLSAConfig(),
         residentExpertsPerLayer: Int? = nil,
         osReserveGiB: Double? = nil,
-        tuning: QWEngineTuning = .default
+        tuning: QWEngineTuning = .default,
+        rawKVMode: String? = nil,
+        prefixCacheDirectory: URL? = nil,
+        maxConcurrentSessions: Int? = nil
     ) throws -> QWEngineDriver {
         let engine = try QWEngineDriver(
             packPath: packPath,
             maxTokens: maxTokens,
             kvMode: kvMode,
+            rawKVMode: rawKVMode,
             mtpDrafts: mtpDrafts,
             mtpBackend: mtpBackend,
             prefillScratchEviction: prefillScratchEviction,
@@ -393,7 +225,10 @@ extension DenseModule {
             prefillChunkSize: prefillChunkSize,
             lsaConfig: lsaConfig,
             residentExpertsPerLayer: residentExpertsPerLayer,
-            tuning: tuning
+            tuning: tuning,
+            prefixCacheConfig: cacheConfig,
+            prefixCacheDirectory: prefixCacheDirectory,
+            maxConcurrentSessions: maxConcurrentSessions
         )
         engine.mtpRelaxedMinProb = min(1.0, max(0.0, mtpRelaxedMinProb))
         switch gdnPrefill.lowercased() {
@@ -402,20 +237,25 @@ extension DenseModule {
         case "regres": engine.gdnPrefillMode = GDNPrefillMode.regres
         default: break
         }
-        if cacheConfig.warmByteLimit > 0 {
+        if engine.hyperRuntime == nil && engine.inkling2Runtime == nil && cacheConfig.warmByteLimit > 0 {
             try engine.configurePrefixCache(config: cacheConfig)
         }
         return engine
     }
 
-    /// Builds the dense engine from what a consumer asked for. The
-    /// consumer fills the options it knows; this module reads the ones
-    /// the dense family understands.
+    /// Builds the unified engine from what a consumer asked for.
     public static func makeEngine(options: QWEngineBuildOptions) throws -> any QWInferenceEngine {
-        try makeEngine(
+        let rawMode = options.kvMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let parsedKVMode: QWKVMode = switch rawMode {
+        case "f16", "f32": .f16
+        case "q8": .q8
+        case "q4": .q4
+        default: throw QWModuleError.invalidState("unknown KV mode '\(options.kvMode)'")
+        }
+        return try makeEngine(
             packPath: options.packPath,
             maxTokens: options.maxTokens,
-            kvMode: try Self.kvMode(from: options.kvMode),
+            kvMode: parsedKVMode,
             mtpDrafts: options.mtpDrafts,
             mtpBackend: options.mtpBackend,
             prefillScratchEviction: options.prefillScratchEviction,
@@ -438,7 +278,10 @@ extension DenseModule {
             lsaConfig: options.lsaConfig,
             residentExpertsPerLayer: options.residentExpertsPerLayer,
             osReserveGiB: options.osReserveGiB,
-            tuning: options.tuning
+            tuning: options.tuning,
+            rawKVMode: rawMode,
+            prefixCacheDirectory: options.prefixCacheDirectory,
+            maxConcurrentSessions: options.maxConcurrentSessions
         )
     }
 

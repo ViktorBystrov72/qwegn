@@ -5,7 +5,7 @@ import QWCore
 import QWHAL
 import QWAlloc
 import QWGDN
-@testable import QWFlashNext
+@testable import QWEngine
 
 // Dense causal conv (qwg_gdn_conv, QWGDNConv.encode) GPU time per call, for comparison with the mlx-vlm / oMLX
 // formulations timed in scratch/conv_mlx_bench.py. Gated: QW_BENCH_CONV=1. Each command buffer holds 50 independent

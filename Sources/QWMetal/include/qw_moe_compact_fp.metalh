@@ -1,0 +1,506 @@
+// qw_moe_compact_fp.metalh — 32-row/TG (4 rows/simdgroup) active-bucket compact NVFP4/MXFP8 MoE helpers.
+#pragma once
+#include "qw_dequant_fp.metalh"
+
+inline void qwg_nvfp4_unpack16_tg(
+    uint2 w2, threadgroup const half2* tgFP4, thread float4 (&a)[4]) {
+    const uchar4 b0 = as_type<uchar4>(w2.x);
+    const uchar4 b1 = as_type<uchar4>(w2.y);
+    a[0] = float4(half4(tgFP4[b0.x], tgFP4[b0.y]));
+    a[1] = float4(half4(tgFP4[b0.z], tgFP4[b0.w]));
+    a[2] = float4(half4(tgFP4[b1.x], tgFP4[b1.y]));
+    a[3] = float4(half4(tgFP4[b1.z], tgFP4[b1.w]));
+}
+
+template <bool IS_MXFP8>
+inline void qwg_moe_compact_load_gu_rows(
+    device const uint32_t* gateW, device const uchar* gateSc,
+    device const uint32_t* upW, device const uchar* upSc,
+    uint e, uint row0, uint groups,
+    constant QWGemmFPCompactMoEParams& p,
+    thread device const uint32_t* (&gwR)[4], thread device const uchar* (&gsR)[4],
+    thread device const uint32_t* (&uwR)[4], thread device const uchar* (&usR)[4]) {
+    const uint wordsPerGroup = IS_MXFP8 ? 8u : 2u;
+    const uint eStride = (p.wExpertRows > 0u) ? p.wExpertRows : p.N;
+    #pragma unroll
+    for (uint r = 0u; r < 4u; ++r) {
+        const uint rr = (row0 + r < p.N) ? (row0 + r) : row0;
+        const size_t gRow = size_t(e) * eStride + rr;
+        const size_t uRow = size_t(e) * eStride + p.upRowBias + rr;
+        gwR[r] = gateW + gRow * (groups * wordsPerGroup);
+        gsR[r] = gateSc + gRow * groups;
+        uwR[r] = upW + uRow * (groups * wordsPerGroup);
+        usR[r] = upSc + uRow * groups;
+    }
+}
+
+template <bool IS_MXFP8>
+inline void qwg_moe_compact_load_dn_rows(
+    device const uint32_t* downW, device const uchar* downSc,
+    uint e, uint row0, uint groups,
+    constant QWGemmFPCompactMoEParams& p,
+    thread device const uint32_t* (&dwR)[4], thread device const uchar* (&dsR)[4]) {
+    const uint wordsPerGroup = IS_MXFP8 ? 8u : 2u;
+    #pragma unroll
+    for (uint r = 0u; r < 4u; ++r) {
+        const size_t dRow = size_t(e) * p.N + ((row0 + r < p.N) ? (row0 + r) : row0);
+        dwR[r] = downW + dRow * (groups * wordsPerGroup);
+        dsR[r] = downSc + dRow * groups;
+    }
+}
+
+template <bool IS_MXFP8>
+inline void qwg_moe_compact_gu_single(
+    device const char* x, device const uint32_t* const thread* gwR, device const uchar* const thread* gsR,
+    float gs2, device const uint32_t* const thread* uwR, device const uchar* const thread* usR,
+    float us2, uint tokId, uint outSlot, uint groups, size_t elemSz,
+    threadgroup const half2* tgFP4, threadgroup const float* tgFP8,
+    device char* actOut, uint row0, constant QWGemmFPCompactMoEParams& p, uint lane) {
+    device const char* xTok = x + size_t(tokId) * p.K * elemSz;
+    float4 gAcc = float4(0.0f), uAcc = float4(0.0f);
+    for (uint g = lane; g < groups; g += 32u) {
+        if constexpr (IS_MXFP8) {
+            const size_t kByte = size_t(g * 32u) * elemSz;
+            float4 xvL[4], xvH[4];
+            qwg_fp_load_x16(xTok + kByte, p.inDtype, xvL);
+            qwg_fp_load_x16(xTok + kByte + 16u * elemSz, p.inDtype, xvH);
+            #pragma unroll
+            for (uint r = 0u; r < 4u; ++r) {
+                if (row0 + r >= p.N) break;
+                const uint4 gwL = *(device const uint4*)(gwR[r] + g * 8u), gwH = *(device const uint4*)(gwR[r] + g * 8u + 4u);
+                const uint4 uwL = *(device const uint4*)(uwR[r] + g * 8u), uwH = *(device const uint4*)(uwR[r] + g * 8u + 4u);
+                const float gsc = qwg_ue8m0_to_float(gsR[r][g]), usc = qwg_ue8m0_to_float(usR[r][g]);
+                float gd = 0.0f, ud = 0.0f;
+                #pragma unroll
+                for (uint wi = 0u; wi < 4u; ++wi) {
+                    gd = qwg_fp_dot8_fma(float4(qwg_fp8_e4m3_to_half4(gwL[wi])),
+                                         float4(qwg_fp8_e4m3_to_half4(gwH[wi])),
+                                         xvL[wi], xvH[wi], gd);
+                    ud = qwg_fp_dot8_fma(float4(qwg_fp8_e4m3_to_half4(uwL[wi])),
+                                         float4(qwg_fp8_e4m3_to_half4(uwH[wi])),
+                                         xvL[wi], xvH[wi], ud);
+                }
+                gAcc[r] = fma(gd, gsc, gAcc[r]);
+                uAcc[r] = fma(ud, usc, uAcc[r]);
+            }
+        } else {
+            float4 xv[4];
+            qwg_fp_load_x16(xTok + size_t(g * 16u) * elemSz, p.inDtype, xv);
+            #pragma unroll
+            for (uint r = 0u; r < 4u; ++r) {
+                if (row0 + r >= p.N) break;
+                const uint2 gw2 = *(device const uint2*)(gwR[r] + g * 2u), uw2 = *(device const uint2*)(uwR[r] + g * 2u);
+                float4 ga[4], ua[4];
+                qwg_nvfp4_unpack16_tg(gw2, tgFP4, ga);
+                qwg_nvfp4_unpack16_tg(uw2, tgFP4, ua);
+                const float gd = qwg_fp_dot4_fma(ga[3], xv[3], qwg_fp_dot4_fma(ga[2], xv[2], qwg_fp_dot4_fma(ga[1], xv[1], qwg_fp_dot4_init(ga[0], xv[0]))));
+                const float ud = qwg_fp_dot4_fma(ua[3], xv[3], qwg_fp_dot4_fma(ua[2], xv[2], qwg_fp_dot4_fma(ua[1], xv[1], qwg_fp_dot4_init(ua[0], xv[0]))));
+                gAcc[r] = fma(gd, tgFP8[gsR[r][g]], gAcc[r]);
+                uAcc[r] = fma(ud, tgFP8[usR[r][g]], uAcc[r]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint r = 0u; r < 4u; ++r) {
+        const float gv = simd_sum(gAcc[r]) * gs2, uv = simd_sum(uAcc[r]) * us2;
+        if (lane == 0u && row0 + r < p.N) {
+            qwg_fp_write(actOut, size_t(outSlot) * p.N + row0 + r,
+                         qwg_fp_softcap_swiglu(gv, uv, p.gateCap, p.upCap), p.outDtype);
+        }
+    }
+}
+
+template <bool IS_MXFP8, uint MAX_M>
+inline void qwg_moe_compact_gu_batch4(
+    device const char* x, device const uint32_t* const thread* gwR, device const uchar* const thread* gsR,
+    float gs2, device const uint32_t* const thread* uwR, device const uchar* const thread* usR,
+    float us2, int off, uint cnt, uint groups, bool sortedOut, size_t elemSz,
+    threadgroup const half2* tgFP4, threadgroup const float* tgFP8,
+    device const int32_t* sortedTok, device const int32_t* sortedPairIdx,
+    device char* actOut, uint row0, constant QWGemmFPCompactMoEParams& p, uint lane) {
+    for (uint base = 0u; base < cnt; base += MAX_M) {
+        const uint batch = min(MAX_M, cnt - base);
+        uint tokIds[MAX_M], outSlots[MAX_M];
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) {
+            if (m >= batch) break;
+            const uint sIdx = uint(off) + base + m;
+            tokIds[m] = uint(sortedTok[sIdx]);
+            outSlots[m] = sortedOut ? sIdx : uint(sortedPairIdx[sIdx]);
+        }
+        float4 gAcc[MAX_M], uAcc[MAX_M];
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) { gAcc[m] = float4(0.0f); uAcc[m] = float4(0.0f); }
+        for (uint g = lane; g < groups; g += 32u) {
+            if constexpr (IS_MXFP8) {
+                const size_t kByte = size_t(g * 32u) * elemSz;
+                #pragma unroll
+                for (uint r = 0u; r < 4u; ++r) {
+                    if (row0 + r >= p.N) break;
+                    const uint4 gwL = *(device const uint4*)(gwR[r] + g * 8u), gwH = *(device const uint4*)(gwR[r] + g * 8u + 4u);
+                    const uint4 uwL = *(device const uint4*)(uwR[r] + g * 8u), uwH = *(device const uint4*)(uwR[r] + g * 8u + 4u);
+                    const float gsc = qwg_ue8m0_to_float(gsR[r][g]), usc = qwg_ue8m0_to_float(usR[r][g]);
+                    half4 gq[8], uq[8];
+                    #pragma unroll
+                    for (uint wi = 0u; wi < 4u; ++wi) {
+                        gq[wi] = qwg_fp8_e4m3_to_half4(gwL[wi]); gq[4u + wi] = qwg_fp8_e4m3_to_half4(gwH[wi]);
+                        uq[wi] = qwg_fp8_e4m3_to_half4(uwL[wi]); uq[4u + wi] = qwg_fp8_e4m3_to_half4(uwH[wi]);
+                    }
+                    #pragma unroll
+                    for (uint m = 0u; m < MAX_M; ++m) {
+                        if (m < batch) {
+                            device const char* xp = x + size_t(tokIds[m]) * p.K * elemSz + kByte;
+                            float4 xvL[4], xvH[4];
+                            qwg_fp_load_x16(xp, p.inDtype, xvL);
+                            qwg_fp_load_x16(xp + 16u * elemSz, p.inDtype, xvH);
+                            float gd = 0.0f, ud = 0.0f;
+                            #pragma unroll
+                            for (uint wi = 0u; wi < 4u; ++wi) {
+                                gd = qwg_fp_dot8_fma(float4(gq[wi]), float4(gq[4u + wi]), xvL[wi], xvH[wi], gd);
+                                ud = qwg_fp_dot8_fma(float4(uq[wi]), float4(uq[4u + wi]), xvL[wi], xvH[wi], ud);
+                            }
+                            gAcc[m][r] = fma(gd, gsc, gAcc[m][r]);
+                            uAcc[m][r] = fma(ud, usc, uAcc[m][r]);
+                        }
+                    }
+                }
+            } else {
+                const size_t kByte = size_t(g * 16u) * elemSz;
+                #pragma unroll
+                for (uint r = 0u; r < 4u; ++r) {
+                    if (row0 + r >= p.N) break;
+                    const uint2 gw2 = *(device const uint2*)(gwR[r] + g * 2u);
+                    const uint2 uw2 = *(device const uint2*)(uwR[r] + g * 2u);
+                    const float gsc = tgFP8[gsR[r][g]];
+                    const float usc = tgFP8[usR[r][g]];
+                    float4 ga[4], ua[4];
+                    qwg_nvfp4_unpack16_tg(gw2, tgFP4, ga);
+                    qwg_nvfp4_unpack16_tg(uw2, tgFP4, ua);
+                    #pragma unroll
+                    for (uint m = 0u; m < MAX_M; ++m) {
+                        if (m < batch) {
+                            float4 xv[4];
+                            qwg_fp_load_x16(x + size_t(tokIds[m]) * p.K * elemSz + kByte, p.inDtype, xv);
+                            const float gd = qwg_fp_dot4_fma(ga[3], xv[3], qwg_fp_dot4_fma(ga[2], xv[2], qwg_fp_dot4_fma(ga[1], xv[1], qwg_fp_dot4_init(ga[0], xv[0]))));
+                            const float ud = qwg_fp_dot4_fma(ua[3], xv[3], qwg_fp_dot4_fma(ua[2], xv[2], qwg_fp_dot4_fma(ua[1], xv[1], qwg_fp_dot4_init(ua[0], xv[0]))));
+                            gAcc[m][r] = fma(gd, gsc, gAcc[m][r]);
+                            uAcc[m][r] = fma(ud, usc, uAcc[m][r]);
+                        }
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) {
+            if (m < batch) {
+                #pragma unroll
+                for (uint r = 0u; r < 4u; ++r) {
+                    const float gv = simd_sum(gAcc[m][r]) * gs2, uv = simd_sum(uAcc[m][r]) * us2;
+                    if (lane == 0u && row0 + r < p.N) {
+                        qwg_fp_write(actOut, size_t(outSlots[m]) * p.N + row0 + r,
+                                     qwg_fp_softcap_swiglu(gv, uv, p.gateCap, p.upCap), p.outDtype);
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <bool IS_MXFP8>
+inline void qwg_moe_compact_gate_up_t1_body(
+    device const char* x, device const uint32_t* gateW, device const uchar* gateSc,
+    device const float* gateS2, device const uint32_t* upW, device const uchar* upSc,
+    device const float* upS2, device const int32_t* activeExperts,
+    device char* actOut, constant QWGemmFPCompactMoEParams& p,
+    threadgroup half2* tgFP4, threadgroup float* tgFP8,
+    uint2 tg, uint tid, uint simd_id, uint lane) {
+    if (tg.y >= p.topK) return;
+    const int eSigned = activeExperts[tg.y];
+    if (eSigned < 0) return;
+    const uint e = uint(eSigned);
+    if (e >= p.numExperts) return;
+    if constexpr (!IS_MXFP8) {
+        tgFP4[tid] = kQWGFP4Pair_H2[tid];
+        tgFP8[tid] = kQWGFP8E4M3FN[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        (void)tid;
+    }
+    const uint row0 = tg.x * 32u + simd_id * 4u;
+    if (row0 >= p.N) return;
+    const uint groups = IS_MXFP8 ? (p.K >> 5u) : (p.K >> 4u);
+    device const uint32_t* gwR[4];
+    device const uint32_t* uwR[4];
+    device const uchar* gsR[4];
+    device const uchar* usR[4];
+    qwg_moe_compact_load_gu_rows<IS_MXFP8>(gateW, gateSc, upW, upSc, e, row0, groups, p, gwR, gsR, uwR, usR);
+    const float gs2 = (!IS_MXFP8 && (p.flags & 1u) != 0u) ? gateS2[e] : 1.0f;
+    const float us2 = (!IS_MXFP8 && (p.flags & 1u) != 0u) ? upS2[e] : 1.0f;
+    const size_t elemSz = (p.inDtype == 2u) ? 4u : 2u;
+    qwg_moe_compact_gu_single<IS_MXFP8>(
+        x, gwR, gsR, gs2, uwR, usR, us2, 0u, tg.y, groups, elemSz, tgFP4, tgFP8, actOut, row0, p, lane);
+}
+
+template <bool IS_MXFP8>
+inline void qwg_moe_compact_gate_up_body(
+    device const char* x, device const uint32_t* gateW, device const uchar* gateSc,
+    device const float* gateS2, device const uint32_t* upW, device const uchar* upSc,
+    device const float* upS2, device const int32_t* expertOff,
+    device const int32_t* activeExperts, device const uint* activeArgs,
+    device const int32_t* sortedTok, device const int32_t* sortedPairIdx,
+    device char* actOut, constant QWGemmFPCompactMoEParams& p,
+    threadgroup half2* tgFP4, threadgroup float* tgFP8,
+    uint2 tg, uint tid, uint simd_id, uint lane) {
+    if ((p.flags & 4u) != 0u) {
+        qwg_moe_compact_gate_up_t1_body<IS_MXFP8>(
+            x, gateW, gateSc, gateS2, upW, upSc, upS2, activeExperts, actOut, p, tgFP4, tgFP8, tg, tid, simd_id, lane);
+        return;
+    }
+    if (tg.y >= activeArgs[0]) return;
+    const uint e = uint(activeExperts[tg.y]);
+    if (e >= p.numExperts) return;
+    const int off = expertOff[e];
+    const int cnt = expertOff[e + 1] - off;
+    if (cnt <= 0) return;
+    if constexpr (!IS_MXFP8) {
+        tgFP4[tid] = kQWGFP4Pair_H2[tid];
+        tgFP8[tid] = kQWGFP8E4M3FN[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        (void)tid;
+    }
+    const uint row0 = tg.x * 32u + simd_id * 4u;
+    if (row0 >= p.N) return;
+
+    const uint groups = IS_MXFP8 ? (p.K >> 5u) : (p.K >> 4u);
+    device const uint32_t* gwR[4];
+    device const uint32_t* uwR[4];
+    device const uchar* gsR[4];
+    device const uchar* usR[4];
+    qwg_moe_compact_load_gu_rows<IS_MXFP8>(gateW, gateSc, upW, upSc, e, row0, groups, p, gwR, gsR, uwR, usR);
+    const float gs2 = (!IS_MXFP8 && (p.flags & 1u) != 0u) ? gateS2[e] : 1.0f;
+    const float us2 = (!IS_MXFP8 && (p.flags & 1u) != 0u) ? upS2[e] : 1.0f;
+    const bool sortedOut = (p.flags & 2u) != 0u;
+    const size_t elemSz = (p.inDtype == 2u) ? 4u : 2u;
+
+    if (cnt == 1) {
+        const uint outSlot = sortedOut ? uint(off) : uint(sortedPairIdx[off]);
+        qwg_moe_compact_gu_single<IS_MXFP8>(
+            x, gwR, gsR, gs2, uwR, usR, us2, uint(sortedTok[off]), outSlot, groups, elemSz, tgFP4, tgFP8, actOut, row0, p, lane);
+        return;
+    }
+    qwg_moe_compact_gu_batch4<IS_MXFP8, 4u>(
+        x, gwR, gsR, gs2, uwR, usR, us2, off, uint(cnt), groups, sortedOut, elemSz, tgFP4, tgFP8,
+        sortedTok, sortedPairIdx, actOut, row0, p, lane);
+}
+
+template <bool IS_MXFP8>
+inline void qwg_moe_compact_dn_single(
+    device const char* actIn, device const uint32_t* const thread* dwR,
+    device const uchar* const thread* dsR, float ds2,
+    uint ioSlot, uint groups, size_t elemSz,
+    threadgroup const half2* tgFP4, threadgroup const float* tgFP8,
+    device char* slotOut, uint row0, constant QWGemmFPCompactMoEParams& p, uint lane) {
+    device const char* xSlot = actIn + size_t(ioSlot) * p.K * elemSz;
+    float4 acc = float4(0.0f);
+    for (uint g = lane; g < groups; g += 32u) {
+        if constexpr (IS_MXFP8) {
+            const size_t kByte = size_t(g * 32u) * elemSz;
+            float4 xvL[4], xvH[4];
+            qwg_fp_load_x16(xSlot + kByte, p.inDtype, xvL);
+            qwg_fp_load_x16(xSlot + kByte + 16u * elemSz, p.inDtype, xvH);
+            #pragma unroll
+            for (uint r = 0u; r < 4u; ++r) {
+                if (row0 + r >= p.N) break;
+                const uint4 dwL = *(device const uint4*)(dwR[r] + g * 8u), dwH = *(device const uint4*)(dwR[r] + g * 8u + 4u);
+                const float dsc = qwg_ue8m0_to_float(dsR[r][g]);
+                float dd = 0.0f;
+                #pragma unroll
+                for (uint wi = 0u; wi < 4u; ++wi) {
+                    dd = qwg_fp_dot8_fma(float4(qwg_fp8_e4m3_to_half4(dwL[wi])),
+                                         float4(qwg_fp8_e4m3_to_half4(dwH[wi])),
+                                         xvL[wi], xvH[wi], dd);
+                }
+                acc[r] = fma(dd, dsc, acc[r]);
+            }
+        } else {
+            float4 xv[4];
+            qwg_fp_load_x16(xSlot + size_t(g * 16u) * elemSz, p.inDtype, xv);
+            #pragma unroll
+            for (uint r = 0u; r < 4u; ++r) {
+                if (row0 + r >= p.N) break;
+                const uint2 dw2 = *(device const uint2*)(dwR[r] + g * 2u);
+                float4 da[4];
+                qwg_nvfp4_unpack16_tg(dw2, tgFP4, da);
+                const float dd = qwg_fp_dot4_fma(da[3], xv[3], qwg_fp_dot4_fma(da[2], xv[2], qwg_fp_dot4_fma(da[1], xv[1], qwg_fp_dot4_init(da[0], xv[0]))));
+                acc[r] = fma(dd, tgFP8[dsR[r][g]], acc[r]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint r = 0u; r < 4u; ++r) {
+        const float v = simd_sum(acc[r]) * ds2;
+        if (lane == 0u && row0 + r < p.N) qwg_fp_write(slotOut, size_t(ioSlot) * p.N + row0 + r, v, p.outDtype);
+    }
+}
+
+template <bool IS_MXFP8, uint MAX_M>
+inline void qwg_moe_compact_dn_batch4(
+    device const char* actIn, device const uint32_t* const thread* dwR,
+    device const uchar* const thread* dsR, float ds2,
+    int off, uint cnt, uint groups, bool sortedOut, size_t elemSz,
+    threadgroup const half2* tgFP4, threadgroup const float* tgFP8,
+    device const int32_t* sortedPairIdx, device char* slotOut,
+    uint row0, constant QWGemmFPCompactMoEParams& p, uint lane) {
+    for (uint base = 0u; base < cnt; base += MAX_M) {
+        const uint batch = min(MAX_M, cnt - base);
+        uint ioSlots[MAX_M];
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) {
+            if (m >= batch) break;
+            const uint sIdx = uint(off) + base + m;
+            ioSlots[m] = sortedOut ? sIdx : uint(sortedPairIdx[sIdx]);
+        }
+        float4 acc[MAX_M];
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) acc[m] = float4(0.0f);
+        for (uint g = lane; g < groups; g += 32u) {
+            if constexpr (IS_MXFP8) {
+                const size_t kByte = size_t(g * 32u) * elemSz;
+                #pragma unroll
+                for (uint r = 0u; r < 4u; ++r) {
+                    if (row0 + r >= p.N) break;
+                    const uint4 gwL = *(device const uint4*)(dwR[r] + g * 8u), gwH = *(device const uint4*)(dwR[r] + g * 8u + 4u);
+                    const float dsc = qwg_ue8m0_to_float(dsR[r][g]);
+                    half4 dq[8];
+                    #pragma unroll
+                    for (uint wi = 0u; wi < 4u; ++wi) {
+                        dq[wi] = qwg_fp8_e4m3_to_half4(gwL[wi]); dq[4u + wi] = qwg_fp8_e4m3_to_half4(gwH[wi]);
+                    }
+                    #pragma unroll
+                    for (uint m = 0u; m < MAX_M; ++m) {
+                        if (m < batch) {
+                            device const char* xp = actIn + size_t(ioSlots[m]) * p.K * elemSz + kByte;
+                            float4 xvL[4], xvH[4];
+                            qwg_fp_load_x16(xp, p.inDtype, xvL);
+                            qwg_fp_load_x16(xp + 16u * elemSz, p.inDtype, xvH);
+                            float dd = 0.0f;
+                            #pragma unroll
+                            for (uint wi = 0u; wi < 4u; ++wi) {
+                                dd = qwg_fp_dot8_fma(float4(dq[wi]), float4(dq[4u + wi]), xvL[wi], xvH[wi], dd);
+                            }
+                            acc[m][r] = fma(dd, dsc, acc[m][r]);
+                        }
+                    }
+                }
+            } else {
+                const size_t kByte = size_t(g * 16u) * elemSz;
+                #pragma unroll
+                for (uint r = 0u; r < 4u; ++r) {
+                    if (row0 + r >= p.N) break;
+                    const uint2 dw2 = *(device const uint2*)(dwR[r] + g * 2u);
+                    const float dsc = tgFP8[dsR[r][g]];
+                    float4 da[4];
+                    qwg_nvfp4_unpack16_tg(dw2, tgFP4, da);
+                    #pragma unroll
+                    for (uint m = 0u; m < MAX_M; ++m) {
+                        if (m < batch) {
+                            float4 xv[4];
+                            qwg_fp_load_x16(actIn + size_t(ioSlots[m]) * p.K * elemSz + kByte, p.inDtype, xv);
+                            const float dd = qwg_fp_dot4_fma(da[3], xv[3], qwg_fp_dot4_fma(da[2], xv[2], qwg_fp_dot4_fma(da[1], xv[1], qwg_fp_dot4_init(da[0], xv[0]))));
+                            acc[m][r] = fma(dd, dsc, acc[m][r]);
+                        }
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) {
+            if (m < batch) {
+                #pragma unroll
+                for (uint r = 0u; r < 4u; ++r) {
+                    const float v = simd_sum(acc[m][r]) * ds2;
+                    if (lane == 0u && row0 + r < p.N) qwg_fp_write(slotOut, size_t(ioSlots[m]) * p.N + row0 + r, v, p.outDtype);
+                }
+            }
+        }
+    }
+}
+
+template <bool IS_MXFP8>
+inline void qwg_moe_compact_down_t1_body(
+    device const char* actIn, device const uint32_t* downW, device const uchar* downSc,
+    device const float* downS2, device const int32_t* activeExperts,
+    device char* slotOut, constant QWGemmFPCompactMoEParams& p,
+    threadgroup half2* tgFP4, threadgroup float* tgFP8,
+    uint2 tg, uint tid, uint simd_id, uint lane) {
+    if (tg.y >= p.topK) return;
+    const int eSigned = activeExperts[tg.y];
+    if (eSigned < 0) return;
+    const uint e = uint(eSigned);
+    if (e >= p.numExperts) return;
+    if constexpr (!IS_MXFP8) {
+        tgFP4[tid] = kQWGFP4Pair_H2[tid];
+        tgFP8[tid] = kQWGFP8E4M3FN[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        (void)tid;
+    }
+    const uint row0 = tg.x * 32u + simd_id * 4u;
+    if (row0 >= p.N) return;
+    const uint groups = IS_MXFP8 ? (p.K >> 5u) : (p.K >> 4u);
+    device const uint32_t* dwR[4];
+    device const uchar* dsR[4];
+    qwg_moe_compact_load_dn_rows<IS_MXFP8>(downW, downSc, e, row0, groups, p, dwR, dsR);
+    const float ds2 = (!IS_MXFP8 && (p.flags & 1u) != 0u) ? downS2[e] : 1.0f;
+    const size_t elemSz = (p.inDtype == 2u) ? 4u : 2u;
+    qwg_moe_compact_dn_single<IS_MXFP8>(actIn, dwR, dsR, ds2, tg.y, groups, elemSz, tgFP4, tgFP8, slotOut, row0, p, lane);
+}
+
+template <bool IS_MXFP8>
+inline void qwg_moe_compact_down_body(
+    device const char* actIn, device const uint32_t* downW, device const uchar* downSc,
+    device const float* downS2, device const int32_t* expertOff,
+    device const int32_t* activeExperts, device const uint* activeArgs,
+    device const int32_t* sortedPairIdx, device char* slotOut,
+    constant QWGemmFPCompactMoEParams& p,
+    threadgroup half2* tgFP4, threadgroup float* tgFP8,
+    uint2 tg, uint tid, uint simd_id, uint lane) {
+    if ((p.flags & 4u) != 0u) {
+        qwg_moe_compact_down_t1_body<IS_MXFP8>(
+            actIn, downW, downSc, downS2, activeExperts, slotOut, p, tgFP4, tgFP8, tg, tid, simd_id, lane);
+        return;
+    }
+    if (tg.y >= activeArgs[0]) return;
+    const uint e = uint(activeExperts[tg.y]);
+    if (e >= p.numExperts) return;
+    const int off = expertOff[e];
+    const int cnt = expertOff[e + 1] - off;
+    if (cnt <= 0) return;
+    if constexpr (!IS_MXFP8) {
+        tgFP4[tid] = kQWGFP4Pair_H2[tid];
+        tgFP8[tid] = kQWGFP8E4M3FN[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        (void)tid;
+    }
+    const uint row0 = tg.x * 32u + simd_id * 4u;
+    if (row0 >= p.N) return;
+
+    const uint groups = IS_MXFP8 ? (p.K >> 5u) : (p.K >> 4u);
+    device const uint32_t* dwR[4];
+    device const uchar* dsR[4];
+    qwg_moe_compact_load_dn_rows<IS_MXFP8>(downW, downSc, e, row0, groups, p, dwR, dsR);
+    const float ds2 = (!IS_MXFP8 && (p.flags & 1u) != 0u) ? downS2[e] : 1.0f;
+    const bool sortedOut = (p.flags & 2u) != 0u;
+    const size_t elemSz = (p.inDtype == 2u) ? 4u : 2u;
+
+    if (cnt == 1) {
+        const uint ioSlot = sortedOut ? uint(off) : uint(sortedPairIdx[off]);
+        qwg_moe_compact_dn_single<IS_MXFP8>(actIn, dwR, dsR, ds2, ioSlot, groups, elemSz, tgFP4, tgFP8, slotOut, row0, p, lane);
+        return;
+    }
+    qwg_moe_compact_dn_batch4<IS_MXFP8, 4u>(
+        actIn, dwR, dsR, ds2, off, uint(cnt), groups, sortedOut, elemSz, tgFP4, tgFP8,
+        sortedPairIdx, slotOut, row0, p, lane);
+}

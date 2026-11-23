@@ -6,23 +6,13 @@ import QWKV
 
 /// Maps a model family and `QWModelFamilyRegistry` traits to the module that serves it.
 public enum QWModuleRegistry {
-    private static let registeredModules: [any QWInferenceModule.Type] = [
-        DenseModule.self,
-        Qwen38MoEModule.self,
-        FlashNextModule.self,
-        SenseNovaLoopModule.self,
-        Glm5NextModule.self,
-        Ernie55MoEModule.self,
-        MaxwellMoEModule.self,
-        Qwen2DenseModule.self,
-        LlamaModule.self,
-        MistralModule.self,
-        Qwen3DenseModule.self,
-        Qwen3MoEModule.self,
-    ]
-
-    private static let modulesByFamily: [QWModelDescriptor.Family: any QWInferenceModule.Type] =
-        Dictionary(uniqueKeysWithValues: registeredModules.map { ($0.family, $0) })
+    private static let modulesByFamily: [QWModelDescriptor.Family: any QWInferenceModule.Type] = {
+        var map: [QWModelDescriptor.Family: any QWInferenceModule.Type] = [:]
+        for family in QWModelDescriptor.Family.allCases {
+            map[family] = DenseModule.self
+        }
+        return map
+    }()
 
     /// The module type for a family, or nil when no module serves it.
     public static func moduleType(for family: QWModelDescriptor.Family) -> (any QWInferenceModule.Type)? {
@@ -59,6 +49,24 @@ public enum QWModuleRegistry {
     /// The capabilities the module that serves a family offers.
     public static func capabilities(for family: QWModelDescriptor.Family) -> Set<QWKnobCapability> {
         moduleType(for: family)?.capabilities ?? []
+    }
+
+    /// Geometry-derived capabilities for a concrete model descriptor and assets.
+    public static func capabilities(
+        for descriptor: QWModelDescriptor,
+        weightFormat: QWWeightFormat? = nil,
+        hasVisionWeights: Bool = false
+    ) -> Set<QWKnobCapability> {
+        QWModelCapabilities.resolve(
+            descriptor: descriptor,
+            weightFormat: weightFormat,
+            hasVisionWeights: hasVisionWeights
+        )
+    }
+
+    /// Supported KV cache storage mode strings for a concrete model descriptor.
+    public static func supportedKVStorageModes(for descriptor: QWModelDescriptor) -> Set<String> {
+        QWModelCapabilities.supportedKVStorageModes(for: descriptor)
     }
 
     /// Builds the engine that serves a family without naming a concrete engine type.

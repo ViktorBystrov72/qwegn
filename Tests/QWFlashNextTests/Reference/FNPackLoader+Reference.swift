@@ -4,7 +4,8 @@ import Foundation
 import QWCore
 import QWRope
 @testable import QWQuant
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 // mmap-backed and read-only, so concurrent reads are safe; a dequant failure here is a loader bug, not input.
 public final class FNPackExperts: FNLatentExpertSource, @unchecked Sendable {

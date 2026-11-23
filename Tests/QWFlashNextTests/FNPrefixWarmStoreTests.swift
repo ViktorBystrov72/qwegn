@@ -1,14 +1,15 @@
 import XCTest
-@testable import QWFlashNext
+import QWAttn
+@testable import QWEngine
 
-/// The warm tier of the Flash-Next prefix cache: the RAM holds the hot
+/// The warm tier of the HyperStream prefix cache: the RAM holds the hot
 /// prefixes, the disk answers the ones it does not, and both stay inside
 /// the limits the settings gave.
 final class FNPrefixWarmStoreTests: XCTestCase {
     /// The name the disk uses for a saved prefix.
     private func entryName(tokens: [Int64], kvMode: FNKVStorageMode = .q4,
                             hasMTP: Bool = false) -> String {
-        let hash = FNGPUEngine.fnPrefixHash(tokens: tokens[...], kvMode: kvMode, hasMTP: hasMTP)
+        let hash = QWHyperStreamRuntime.fnPrefixHash(tokens: tokens[...], kvMode: kvMode, hasMTP: hasMTP)
         return String(format: "fn_entry_%016llx_%d.qwcache", hash, tokens.count)
     }
 
@@ -128,7 +129,7 @@ final class FNPrefixWarmStoreTests: XCTestCase {
 
         // Three prefixes of 100 bytes and a new one of 100 bytes do not
         // fit under 250 bytes: the two oldest go, the newest stays.
-        FNGPUEngine.makeRoom(in: dir, for: 100, limit: 250)
+        QWHyperStreamRuntime.makeRoom(in: dir, for: 100, limit: 250)
 
         let left = try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted()
         XCTAssertEqual(left, ["fn_entry_0000000000000003_12.qwcache", "other.txt"])

@@ -87,6 +87,14 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
     public var budget: Int
     public var clusterBlock: Int
     public var sidecarPath: String
+    /// Opt-in cross-loop LSA selection sharing across recurrent visits to the same physical layer.
+    public var crossLoopReuse: Bool
+    /// Recompute interval across visits to the same physical layer (`0` = reuse first visit across all passes).
+    public var loopShareStride: Int
+    /// Whether `crossLoopReuse` was explicitly provided (`false` overrides `QW_LSA_LOOP_SHARE`).
+    public var hasExplicitLoopShareOverride: Bool
+
+    public static let loopShareEnvKey = "QW_LSA_LOOP_SHARE"
 
     public var isEnabled: Bool { mode != .off }
 
@@ -94,12 +102,74 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
         mode: QWLSAMode = .off,
         budget: Int = QWLSAConfig.defaultBudget,
         clusterBlock: Int = QWLSAConfig.defaultClusterBlock,
-        sidecarPath: String = ""
+        sidecarPath: String = "",
+        crossLoopReuse: Bool? = nil,
+        loopShareStride: Int = 0
     ) {
         self.mode = mode
         self.budget = budget
         self.clusterBlock = clusterBlock
         self.sidecarPath = sidecarPath
+        self.crossLoopReuse = crossLoopReuse ?? false
+        self.loopShareStride = max(0, loopShareStride)
+        self.hasExplicitLoopShareOverride = (crossLoopReuse != nil)
+    }
+
+    public static func == (lhs: QWLSAConfig, rhs: QWLSAConfig) -> Bool {
+        lhs.mode == rhs.mode && lhs.budget == rhs.budget
+            && lhs.clusterBlock == rhs.clusterBlock && lhs.sidecarPath == rhs.sidecarPath
+            && lhs.crossLoopReuse == rhs.crossLoopReuse && lhs.loopShareStride == rhs.loopShareStride
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(mode)
+        hasher.combine(budget)
+        hasher.combine(clusterBlock)
+        hasher.combine(sidecarPath)
+        hasher.combine(crossLoopReuse)
+        hasher.combine(loopShareStride)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case mode, budget, clusterBlock, sidecarPath, crossLoopReuse, loopShareStride
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.mode = try c.decodeIfPresent(QWLSAMode.self, forKey: .mode) ?? .off
+        self.budget = try c.decodeIfPresent(Int.self, forKey: .budget) ?? Self.defaultBudget
+        self.clusterBlock = try c.decodeIfPresent(Int.self, forKey: .clusterBlock) ?? Self.defaultClusterBlock
+        self.sidecarPath = try c.decodeIfPresent(String.self, forKey: .sidecarPath) ?? ""
+        let decodedReuse = try c.decodeIfPresent(Bool.self, forKey: .crossLoopReuse)
+        self.crossLoopReuse = decodedReuse ?? false
+        self.loopShareStride = max(0, try c.decodeIfPresent(Int.self, forKey: .loopShareStride) ?? 0)
+        self.hasExplicitLoopShareOverride = (decodedReuse != nil)
+    }
+
+    public static func parseLoopShareEnv(_ raw: String?) -> (enabled: Bool, stride: Int)? {
+        guard let raw else { return nil }
+        let norm = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !norm.isEmpty else { return nil }
+        if ["0", "false", "no", "off"].contains(norm) { return (false, 0) }
+        if ["1", "true", "yes", "on", "all"].contains(norm) { return (true, 0) }
+        let strideText = norm.hasPrefix("stride:") ? String(norm.dropFirst(7)) : norm
+        if let n = Int(strideText), n >= 1 {
+            return (true, n >= 2 ? n : 0)
+        }
+        return nil
+    }
+
+    public func resolvingLoopShareEnvironment(
+        _ env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> QWLSAConfig {
+        guard !hasExplicitLoopShareOverride, !crossLoopReuse,
+              let parsed = Self.parseLoopShareEnv(env[Self.loopShareEnvKey]) else {
+            return self
+        }
+        var copy = self
+        copy.crossLoopReuse = parsed.enabled
+        copy.loopShareStride = parsed.stride
+        return copy
     }
 
     /// Selected token budget $k$, clamped to `512...8192` and aligned to a 4-token block boundary.

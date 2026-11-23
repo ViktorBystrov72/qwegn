@@ -5,7 +5,8 @@ import QWHAL
 import QWAlloc
 import QWGEMM
 @testable import QWQuant
-@testable import QWFlashNext
+@testable import QWHyperPLE
+@testable import QWEngine
 
 final class FNMetalPLEBatchTests: XCTestCase {
     func testStridedKeyNormAndGateMatchPerSlot() throws {

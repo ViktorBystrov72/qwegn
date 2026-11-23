@@ -4,9 +4,10 @@ import QWCore
 import QWQuant
 import QWHAL
 import QWAlloc
+import QWAttn
 import QWGEMM
 import QWRope
-@testable import QWFlashNext
+@testable import QWEngine
 
 final class FNMetalMTPPrefillCacheTests: XCTestCase {
     func testCacheOnlyAttentionMatchesFullPrefill() throws {
@@ -53,18 +54,18 @@ final class FNMetalMTPPrefillCacheTests: XCTestCase {
             return s
         }
         let fullScratch = try scratch(), cacheScratch = try scratch(), lastScratch = try scratch()
-        let full = try FNGPUAttnDecodeState(arena: arena, mixer: attention, hidden: hidden,
-                                            capacity: capacity, kvMode: mode)
-        let cache = try FNGPUAttnDecodeState(arena: arena, mixer: attention, hidden: hidden,
-                                             capacity: capacity, kvMode: mode)
-        let lastOnly = try FNGPUAttnDecodeState(arena: arena, mixer: attention, hidden: hidden,
-                                                capacity: capacity, kvMode: mode)
+        let full = try QWQSACacheState(arena: arena, mixer: attention, hidden: hidden,
+                                       capacity: capacity, kvMode: mode)
+        let cache = try QWQSACacheState(arena: arena, mixer: attention, hidden: hidden,
+                                        capacity: capacity, kvMode: mode)
+        let lastOnly = try QWQSACacheState(arena: arena, mixer: attention, hidden: hidden,
+                                           capacity: capacity, kvMode: mode)
         for state in [full, cache, lastOnly] {
             for tensor in [state.k, state.v, state.kMeta, state.vMeta, state.indexK, state.pooled] {
                 memset(arena.cpuPointer(of: tensor), 0, tensor.bytes)
             }
         }
-        func run(_ state: FNGPUAttnDecodeState, _ scratch: FNGPUScratch,
+        func run(_ state: QWQSACacheState, _ scratch: FNGPUScratch,
                  position: Int, cacheOnly: Bool, lastRowOnly: Bool = false) throws -> Double {
             let pair = try XCTUnwrap(hal.begin(.concurrent))
             try FNGPULayerPasses.attentionPrefill(pair.1, ctx: ctx, a: attention, c: state,

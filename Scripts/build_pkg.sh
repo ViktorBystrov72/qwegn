@@ -71,10 +71,11 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
   ./Scripts/build_metallib.sh >/dev/null
   swift build -c release --product qwg
   swift build -c release --product qwg-menu
+  swift build -c release --product qwg-smc-helper
 fi
 
 BIN_DIR="$(swift build -c release --show-bin-path)"
-[[ -x "$BIN_DIR/qwg" && -x "$BIN_DIR/qwg-menu" ]] || { echo "build_pkg.sh: release binaries missing in $BIN_DIR" >&2; exit 1; }
+[[ -x "$BIN_DIR/qwg" && -x "$BIN_DIR/qwg-menu" && -x "$BIN_DIR/qwg-smc-helper" ]] || { echo "build_pkg.sh: release binaries missing in $BIN_DIR" >&2; exit 1; }
 
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd -P)"
@@ -86,6 +87,8 @@ SCRIPTS_DIR="$WORK/scripts"
 RES_DIR="$WORK/resources"
 mkdir -p \
   "$PKGROOT/usr/local/bin" \
+  "$PKGROOT/usr/local/libexec" \
+  "$PKGROOT/Library/LaunchDaemons" \
   "$PKGROOT/Applications" \
   "$PKGROOT/usr/local/share/qwegn/Scripts/quantize" \
   "$PKGROOT/usr/local/share/qwegn/Scripts/oracle" \
@@ -95,7 +98,7 @@ mkdir -p \
 # 1. /Applications/Qwegn.app (with Info.plist, AppIcon.icns, and kernel*.metallib)
 ./Scripts/build_app.sh --skip-build --version "$VERSION" --identity "$APP_IDENTITY" --output "$PKGROOT/Applications" >/dev/null
 
-# 2. /usr/local/bin/qwg
+# 2. /usr/local/bin/qwg and /usr/local/libexec/qwg-smc-helper + LaunchDaemon
 cp "$BIN_DIR/qwg" "$PKGROOT/usr/local/bin/qwg"
 chmod 755 "$PKGROOT/usr/local/bin/qwg"
 CLI_SIGN_FLAGS=(--force --sign "$APP_IDENTITY")
@@ -105,6 +108,33 @@ else
   CLI_SIGN_FLAGS+=(--options runtime --timestamp)
 fi
 /usr/bin/codesign "${CLI_SIGN_FLAGS[@]}" "$PKGROOT/usr/local/bin/qwg"
+
+cp "$BIN_DIR/qwg-smc-helper" "$PKGROOT/usr/local/libexec/qwg-smc-helper"
+chmod 755 "$PKGROOT/usr/local/libexec/qwg-smc-helper"
+/usr/bin/codesign "${CLI_SIGN_FLAGS[@]}" "$PKGROOT/usr/local/libexec/qwg-smc-helper"
+
+cat > "$PKGROOT/Library/LaunchDaemons/ai.qwegn.smc-helper.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.qwegn.smc-helper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/qwg-smc-helper</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/var/log/qwg-smc-helper.log</string>
+</dict>
+</plist>
+PLIST
+chmod 644 "$PKGROOT/Library/LaunchDaemons/ai.qwegn.smc-helper.plist"
+/usr/bin/plutil -lint "$PKGROOT/Library/LaunchDaemons/ai.qwegn.smc-helper.plist" >/dev/null
 
 # 3. /usr/local/share/qwegn/ support files
 cp "$ROOT/Scripts/uninstall.sh" "$PKGROOT/usr/local/share/qwegn/uninstall.sh"
@@ -128,13 +158,18 @@ fi
 cat > "$SCRIPTS_DIR/preinstall" <<'SH'
 #!/bin/sh
 pkill -TERM -f "/Applications/Qwegn.app/Contents/MacOS/qwg-menu" >/dev/null 2>&1 || true
+/bin/launchctl bootout system/ai.qwegn.smc-helper >/dev/null 2>&1 || true
 exit 0
 SH
 
 cat > "$SCRIPTS_DIR/postinstall" <<'SH'
 #!/bin/sh
-chmod 755 "/usr/local/bin/qwg" "/usr/local/share/qwegn/uninstall.sh" 2>/dev/null || true
-echo "Qwegn installed (/usr/local/bin/qwg, /Applications/Qwegn.app)."
+chmod 755 "/usr/local/bin/qwg" "/usr/local/libexec/qwg-smc-helper" "/usr/local/share/qwegn/uninstall.sh" 2>/dev/null || true
+chown root:wheel "/usr/local/libexec/qwg-smc-helper" "/Library/LaunchDaemons/ai.qwegn.smc-helper.plist" 2>/dev/null || true
+chmod 644 "/Library/LaunchDaemons/ai.qwegn.smc-helper.plist" 2>/dev/null || true
+/bin/launchctl bootstrap system "/Library/LaunchDaemons/ai.qwegn.smc-helper.plist" >/dev/null 2>&1 || true
+/bin/launchctl kickstart -k system/ai.qwegn.smc-helper >/dev/null 2>&1 || true
+echo "Qwegn installed (/usr/local/bin/qwg, /Applications/Qwegn.app, /usr/local/libexec/qwg-smc-helper)."
 echo "To remove Qwegn, run: /usr/local/share/qwegn/uninstall.sh"
 exit 0
 SH
@@ -169,6 +204,7 @@ cat > "$RES_DIR/welcome.html" <<HTML
 <ul>
   <li><code>/usr/local/bin/qwg</code>: command-line engine and server</li>
   <li><code>/Applications/Qwegn.app</code>: menu bar controller and bundled Metal 4 kernels</li>
+  <li><code>/usr/local/libexec/qwg-smc-helper</code> and <code>/Library/LaunchDaemons/ai.qwegn.smc-helper.plist</code>: bounded fan control helper</li>
   <li><code>/usr/local/share/qwegn/</code>: quantizer support files and uninstaller</li>
 </ul>
 </body>
@@ -187,6 +223,7 @@ cat > "$RES_DIR/conclusion.html" <<HTML
 <ul>
   <li>Menu bar app: <code>/Applications/Qwegn.app</code></li>
   <li>CLI: <code>/usr/local/bin/qwg</code></li>
+  <li>Fan control helper: <code>/usr/local/libexec/qwg-smc-helper</code></li>
   <li>Python quantizer environment is created automatically on first <code>qwg quantize</code> in <code>~/Library/Application Support/Qwegn/venv/</code> (rebuild anytime with <code>qwg init --python</code>).</li>
 </ul>
 <p><strong>Uninstall:</strong> run <code>/usr/local/share/qwegn/uninstall.sh</code></p>

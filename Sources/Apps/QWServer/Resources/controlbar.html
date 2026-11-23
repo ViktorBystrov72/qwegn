@@ -46,6 +46,7 @@
           <div class="brand-title">Qwegn Engine</div>
           <div class="brand-sub">
             <span id="header-version">—</span>
+            <button id="header-update-pill" type="button" class="update-pill mono" hidden onclick="openUpdateModal()" title="Software update available">↑ —</button>
             <span>·</span>
             <span id="header-port" class="mono">Port —</span>
             <span>·</span>
@@ -528,7 +529,10 @@
           </div>
 
           <!-- Transcript Area -->
-          <div id="chat-transcript" class="chat-transcript" aria-live="polite"></div>
+          <div class="chat-transcript-wrap">
+            <div id="chat-transcript" class="chat-transcript" aria-live="polite"></div>
+            <button id="chat-scroll-bottom-btn" type="button" class="btn btn-sm chat-scroll-bottom-btn" onclick="scrollChatTranscriptToBottom(true)" aria-label="Jump to latest messages" hidden>↓ Latest</button>
+          </div>
 
           <!-- Composer -->
           <div id="chat-composer" class="chat-composer" ondragover="handleChatDragOver(event)" ondragleave="handleChatDragLeave(event)" ondrop="handleChatDrop(event)">
@@ -703,6 +707,43 @@
     <div id="mempack-actions-bar" class="mempack-modal-actions"></div>
   </dialog>
 
+  <dialog id="modal-update" aria-labelledby="update-dialog-title">
+    <div class="mempack-modal-head">
+      <div class="mempack-modal-title-group">
+        <h3 id="update-dialog-title" class="mempack-modal-title">Software Update</h3>
+        <span id="update-status-badge" class="mempack-badge is-missing">Checking…</span>
+      </div>
+      <button id="update-close-btn" type="button" class="btn btn-sm" onclick="closeUpdateModal()">Close</button>
+    </div>
+
+    <div class="mempack-summary-card">
+      <div id="update-version-headline" class="update-headline">—</div>
+      <p id="update-status-summary" class="mempack-status-summary">Checking GitHub Releases via local QWServer…</p>
+      <div id="update-meta-row" class="panel-sub mono mempack-git-summary" hidden></div>
+    </div>
+
+    <div id="update-sha-badge" class="update-sha-badge mono" hidden></div>
+    <div id="update-busy-warn" class="update-busy-warn" hidden></div>
+
+    <div id="update-notes-section" class="update-notes-section" hidden>
+      <div class="mempack-section-label">Release Notes</div>
+      <div id="update-notes-body" class="update-notes-box"></div>
+    </div>
+
+    <div id="update-progress-box" class="mempack-progress-box" aria-live="polite" hidden>
+      <div class="mempack-progress-head">
+        <span id="update-progress-phase" class="mono">Downloading installer…</span>
+        <span id="update-progress-pct" class="mono num">0%</span>
+      </div>
+      <div class="bar-bg mempack-progress-track">
+        <div id="update-progress-fill" class="bar-fg" style="width:0%;background:var(--accent);"></div>
+      </div>
+      <div id="update-progress-bytes" class="panel-sub mono num">—</div>
+    </div>
+
+    <div id="update-actions-bar" class="mempack-modal-actions"></div>
+  </dialog>
+
   <div id="toast-region" aria-live="polite"></div>
 
   <script src="/ui/js/state.js" defer></script>
@@ -711,5 +752,6 @@
   <script src="/ui/js/chat-presets.js" defer></script>
   <script src="/ui/js/chat.js" defer></script>
   <script src="/ui/js/actions.js" defer></script>
+  <script src="/ui/js/updates.js" defer></script>
 </body>
 </html>

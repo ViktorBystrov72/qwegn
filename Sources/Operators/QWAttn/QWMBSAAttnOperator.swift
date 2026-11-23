@@ -79,6 +79,35 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
         return max(max(1, config.maxSelectedBlocks), ((raw + 31) / 32) * 32)
     }
 
+    private static func gcd(_ a: Int, _ b: Int) -> Int {
+        var x = abs(a), y = abs(b)
+        while y != 0 { (x, y) = (y, x % y) }
+        return max(1, x)
+    }
+
+    public static func targetSplits(
+        rows: Int,
+        kvHeads: Int,
+        maxKeys: Int,
+        gpuCores: Int = 40
+    ) -> Int {
+        let r = max(1, rows)
+        let kvh = max(1, kvHeads)
+        let cap = r == 1 ? 64 : 32
+        let raw = r == 1
+            ? min(cap, max(8, (maxKeys + 191) / 192))
+            : min(cap, max(4, 32 / r))
+        guard gpuCores > 0 else { return raw }
+        let activeGroups = r * kvh
+        let step = gpuCores / gcd(activeGroups, gpuCores)
+        guard step <= cap else { return raw }
+        let aligned = (raw / step) * step
+        if aligned >= 1 {
+            return min(cap, aligned)
+        }
+        return step * 64 <= maxKeys ? min(cap, step) : raw
+    }
+
     public init(
         hal: QWHal,
         geometry: QWModelGeometry,
@@ -232,7 +261,7 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
             enc.setBytes(&p1, length: 16, index: 6)
             enc.setBytes(&p2, length: 16, index: 7)
             enc.dispatchThreadgroups(MTLSize(width: kvHeads, height: numTiles, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
             enc.memoryBarrier(scope: .buffers)
 
             enc.setComputePipelineState(psoPrefillNAX)
@@ -279,9 +308,7 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
             let maxPartialRowBytes = qHeads * 64 * (headDim + 2) * 4
             let canSplit = partials.map { $0.length >= rows * maxPartialRowBytes } ?? false
             let maxKeys = config.maxSelectedBlocks * config.blockSize
-            let targetSplits = rows == 1
-                ? min(64, max(8, (maxKeys + 127) / 128))
-                : min(32, max(4, 32 / rows))
+            let targetSplits = Self.targetSplits(rows: rows, kvHeads: kvHeads, maxKeys: maxKeys)
             let splits = canSplit ? targetSplits : 1
             enc.setComputePipelineState(psoDecodeSparse)
             qgate.bind(enc, index: 0)
@@ -300,6 +327,8 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
             var params: (UInt32, UInt32, UInt32, UInt32) = (
                 UInt32(pos0), UInt32(config.blockSize), UInt32(listStride), UInt32(splits))
             enc.setBytes(&params, length: 16, index: 9)
+            let stageDim = headDim <= 128 ? 128 : 256
+            enc.setThreadgroupMemoryLength(2 * 16 * stageDim * 2, index: 0)
             let gqaRatio = max(1, qHeads / max(1, kvHeads))
             enc.dispatchThreadgroups(MTLSize(width: kvHeads, height: splits, depth: rows),
                                      threadsPerThreadgroup: MTLSize(width: gqaRatio * 32, height: 1, depth: 1))

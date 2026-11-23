@@ -265,11 +265,15 @@ struct Index: ParsableCommand {
             return
         }
 
+        let envLoopShare = QWLSAConfig.parseLoopShareEnv(ProcessInfo.processInfo.environment[QWLSAConfig.loopShareEnvKey])
+        let crossLoopReuse = envLoopShare?.enabled ?? effectivePair.settings.lsaCrossLoopReuse
         let lsaConfig = QWLSAConfig(
             mode: resolvedLSAMode,
             budget: effectivePair.settings.lsaBudget,
             clusterBlock: clusterBlock,
-            sidecarPath: sidecarURL?.path ?? effectivePair.settings.lsaSidecarPath
+            sidecarPath: sidecarURL?.path ?? effectivePair.settings.lsaSidecarPath,
+            crossLoopReuse: crossLoopReuse,
+            loopShareStride: crossLoopReuse ? (envLoopShare?.stride ?? 0) : 0
         )
 
         let modelSlug = QWMemoryPack.safeSlug(resolvedModelName)

@@ -54,13 +54,17 @@ public enum QWWeightFormat: Sendable, Hashable {
     /// kept in its own bytes is a model whose activations must NOT be
     /// rotated to match.
     case nativeAffine(bits: Int, groupSize: Int)
+    /// Inkling-2 mixed native FP container: BF16 dense trunk/controllers with
+    /// native NVFP4 (4-bit g16 E4M3FN) and MXFP8 (8-bit g32 E8M0) routed experts
+    /// in the STANDARD basis.
+    case nativeMixedFP(denseBits: Int, nvfp4Layers: Int, mxfp8Layers: Int)
 
     /// The basis the weights in this container are quantised in, and so the
     /// basis the activations must be in.
     public var basis: QWWeightBasis {
         switch self {
         case .hq4G32, .hqBlock: return .rotated
-        case .nativeAffine: return .standard
+        case .nativeAffine, .nativeMixedFP: return .standard
         }
     }
 
@@ -70,6 +74,7 @@ public enum QWWeightFormat: Sendable, Hashable {
         case .hq4G32: return 4
         case .hqBlock(let bits, _, _, _, _, _, _, _, _, _, _, _): return bits
         case .nativeAffine(let bits, _): return bits
+        case .nativeMixedFP(let denseBits, _, _): return denseBits
         }
     }
 
@@ -79,6 +84,7 @@ public enum QWWeightFormat: Sendable, Hashable {
         case .hq4G32: return 32
         case .hqBlock(_, let groupSize, _, _, _, _, _, _, _, _, _, _): return groupSize
         case .nativeAffine(_, let groupSize): return groupSize
+        case .nativeMixedFP(_, let nvfp4Layers, _): return nvfp4Layers > 0 ? 16 : 32
         }
     }
 
@@ -86,6 +92,7 @@ public enum QWWeightFormat: Sendable, Hashable {
     public var expertBits: Int {
         switch self {
         case .hqBlock(let bits, _, let eb, _, _, _, _, _, _, _, _, _): return eb ?? bits
+        case .nativeMixedFP(_, let nvfp4Layers, _): return nvfp4Layers > 0 ? 4 : 8
         default: return bits
         }
     }
@@ -119,7 +126,7 @@ public enum QWWeightFormat: Sendable, Hashable {
         switch self {
         case .hq4G32: return true
         case .hqBlock(_, _, _, _, let denseIncumbent, _, _, _, _, _, _, _): return denseIncumbent
-        case .nativeAffine: return false
+        case .nativeAffine, .nativeMixedFP: return false
         }
     }
 
@@ -128,7 +135,7 @@ public enum QWWeightFormat: Sendable, Hashable {
         switch self {
         case .hq4G32: return true
         case .hqBlock(_, _, _, _, _, let expertIncumbent, _, _, _, _, _, _): return expertIncumbent
-        case .nativeAffine: return false
+        case .nativeAffine, .nativeMixedFP: return false
         }
     }
 
@@ -137,7 +144,7 @@ public enum QWWeightFormat: Sendable, Hashable {
         switch self {
         case .hq4G32: return true
         case .hqBlock(_, _, _, _, _, let expertIncumbent, _, _, let edInc, _, _, _): return edInc ?? expertIncumbent
-        case .nativeAffine: return false
+        case .nativeAffine, .nativeMixedFP: return false
         }
     }
 
@@ -190,6 +197,11 @@ public enum QWWeightFormat: Sendable, Hashable {
             }
             return dTag
         case .nativeAffine(let bits, let groupSize): return "AQ\(bits)_G\(groupSize)"
+        case .nativeMixedFP(let denseBits, let nvfp4Layers, let mxfp8Layers):
+            if nvfp4Layers > 0 && mxfp8Layers > 0 { return "BF\(denseBits)+NVFP4/MXFP8" }
+            if nvfp4Layers > 0 { return "BF\(denseBits)+NVFP4" }
+            if mxfp8Layers > 0 { return "BF\(denseBits)+MXFP8" }
+            return "BF\(denseBits)"
         }
     }
 
@@ -207,11 +219,16 @@ public enum QWWeightFormat: Sendable, Hashable {
             return (k / groupSize) * (pay + (ds ? 2 : 4))
         case .nativeAffine(let bits, let groupSize):
             return (k / groupSize) * (groupSize * bits / 8 + 4)
+        case .nativeMixedFP(let denseBits, _, _):
+            return k * (denseBits / 8)
         }
     }
 
     /// The bytes one row of `k` routed expert gate/up weights takes in this container.
     public func expertRowBytes(k: Int) -> Int {
+        if case .nativeMixedFP(_, let nvfp4Layers, _) = self {
+            return nvfp4Layers > 0 ? (k / 2 + k / 16) : (k + k / 32)
+        }
         let b = expertBits
         let g = expertGroupSize
         let pay = expertIsSHVQ ? Self.shvqPayloadBytes(bits: b, group: g) : (g * b / 8)
@@ -220,6 +237,9 @@ public enum QWWeightFormat: Sendable, Hashable {
 
     /// The bytes one row of `k` routed expert down_proj weights takes in this container.
     public func expertDownRowBytes(k: Int) -> Int {
+        if case .nativeMixedFP(_, let nvfp4Layers, _) = self {
+            return nvfp4Layers > 0 ? (k / 2 + k / 16) : (k + k / 32)
+        }
         let b = expertDownBits
         let g = expertDownGroupSize
         let pay = expertDownIsSHVQ ? Self.shvqPayloadBytes(bits: b, group: g) : (g * b / 8)
@@ -234,6 +254,25 @@ public enum QWWeightFormat: Sendable, Hashable {
 
     /// Effective bits per weight across dense and routed expert planes.
     public func effectiveBitsPerWeight(geometry: QWModelGeometry? = nil) -> Double {
+        if case .nativeMixedFP(let denseBits, let nvfp4Layers, let mxfp8Layers) = self {
+            let denseBpw = Double(denseBits)
+            guard let g = geometry, g.numExperts > 0 else {
+                let totalL = max(1, nvfp4Layers + mxfp8Layers)
+                return (Double(nvfp4Layers) * 4.5 + Double(mxfp8Layers) * 8.25) / Double(totalL)
+            }
+            let numLayers = max(1, g.numLayers)
+            let moeW = Double(g.numExperts) * 3.0 * Double(g.moeIntermediate) * Double(g.hidden)
+            let nvWeights = Double(nvfp4Layers) * moeW
+            let mxWeights = Double(mxfp8Layers) * moeW
+            let denseLayers = max(0, numLayers - nvfp4Layers - mxfp8Layers)
+            let denseExpWeights = Double(denseLayers) * moeW
+            let qDim = g.qHeads * g.headDim
+            let kvDim = g.kvHeads * g.headDim
+            let attnWeightsPerLayer = Double(2 * qDim + 2 * kvDim + qDim) * Double(g.hidden)
+            let denseWeights = Double(2 * g.vocab * g.hidden) + Double(numLayers) * attnWeightsPerLayer + denseExpWeights
+            let total = max(1.0, denseWeights + nvWeights + mxWeights)
+            return (denseWeights * denseBpw + nvWeights * 4.5 + mxWeights * 8.25) / total
+        }
         let denseBpw = Self.containerBpw(bits: bits, group: groupSize, isSHVQ: denseIsSHVQ)
         let expGuBpw = Self.containerBpw(bits: expertBits, group: expertGroupSize, isSHVQ: expertIsSHVQ)
         let expDnBpw = Self.containerBpw(bits: expertDownBits, group: expertDownGroupSize, isSHVQ: expertDownIsSHVQ)

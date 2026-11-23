@@ -10,7 +10,8 @@ import QWHAL
 import QWKV
 import QWMTP
 import QWQuant
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 final class FNWave2KernelGuardsTests: XCTestCase {
     private static func makeGDNDescriptor(hidden: Int = 256) -> QWModelDescriptor {

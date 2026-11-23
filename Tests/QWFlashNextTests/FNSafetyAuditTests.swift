@@ -4,7 +4,8 @@
 import Darwin
 import Foundation
 import XCTest
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 @testable import QWQuant
 
 final class FNSafetyAuditTests: XCTestCase {

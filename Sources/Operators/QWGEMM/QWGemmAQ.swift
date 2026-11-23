@@ -30,6 +30,12 @@ public enum QWGemmAQ {
         return isSHVQ ? "qwg_gemv_shvq\(bits)_g\(group)_dx_h16_t4" : "qwg_gemv_aq\(bits)_g\(group)_dx_h16_t4"
     }
 
+    /// Low-register M<=4 SHVQ decode kernel specialization for `(bits, group)`.
+    public static func decodeM4KernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
+        guard isSHVQ, isSupported(bits: bits, group: group, isSHVQ: true) else { return nil }
+        return "qwg_gemv_shvq\(bits)_g\(group)_dx_h16_t4_m4"
+    }
+
     /// The threads one decode threadgroup runs, and the rows it owns.
     public static let decodeThreadsPerThreadgroup = 128
     public static let decodeRowsPerThreadgroup = 16
@@ -44,6 +50,18 @@ public enum QWGemmAQ {
     public static func headArgmaxKernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
         guard isSupported(bits: bits, group: group, isSHVQ: isSHVQ) else { return nil }
         return isSHVQ ? "qwg_head_gemv_shvq\(bits)_g\(group)_argmax" : "qwg_head_gemv_aq\(bits)_g\(group)_argmax"
+    }
+
+    /// Low-register M<=4 SHVQ fused GEMV-and-argmax kernel specialization for `(bits, group)`.
+    public static func headArgmaxM4KernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
+        guard isSHVQ, isSupported(bits: bits, group: group, isSHVQ: true) else { return nil }
+        return "qwg_head_gemv_shvq\(bits)_g\(group)_argmax_m4"
+    }
+
+    /// Single-pass M=9..16 SHVQ fused GEMV-and-argmax kernel specialization for `(bits, group)`.
+    public static func headArgmaxM16KernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
+        guard isSHVQ, isSupported(bits: bits, group: group, isSHVQ: true) else { return nil }
+        return "qwg_head_gemv_shvq\(bits)_g\(group)_argmax_m16"
     }
 
     /// The prefill GEMM for a `(bits, group)` pair.
@@ -95,9 +113,11 @@ public enum QWGemmAQ {
         return isSHVQ ? "qwg_gemm_shvq\(bits)_g\(group)_nax_f32" : "qwg_gemm_aq\(bits)_g\(group)_nax_f32"
     }
 
-    public static func moeGateUpF32R1KernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
+    public static func moeGateUpF32R1KernelName(bits: Int, group: Int, isSHVQ: Bool = false, hasSoftcap: Bool = false) -> String? {
         guard isSupported(bits: bits, group: group, isSHVQ: isSHVQ) else { return nil }
-        return isSHVQ ? "qwg_moe_gateup_shvq\(bits)_g\(group)_f32_r1" : "qwg_moe_gateup_aq\(bits)_g\(group)_f32_r1"
+        let suffix = hasSoftcap ? "_sc" : ""
+        return isSHVQ ? "qwg_moe_gateup_shvq\(bits)_g\(group)_f32_r1\(suffix)"
+            : "qwg_moe_gateup_aq\(bits)_g\(group)_f32_r1\(suffix)"
     }
 
     public static func moeDownSharedCombineF32KernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
@@ -301,6 +321,78 @@ public enum QWGemmAQ {
         enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: decodeThreadsPerThreadgroup,
                                                                height: 1, depth: 1))
+    }
+
+    /// Encodes 1..8-row SHVQ decode GEMV writing directly to `.bf16` output (`bfloat(float)` single rounding).
+    public static func encodeDecodeBF16(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
+                                        blocks: QWTensorValue, x: QWTensorValue,
+                                        yBF16: QWTensorValue,
+                                        n: Int, k: Int, bits: Int, group: Int,
+                                        rows: Int = 1, isSHVQ: Bool = false) throws {
+        guard isSHVQ else {
+            throw QWGemmError.badWeights("encodeDecodeBF16 requires SHVQ blocks")
+        }
+        guard let name = decodeKernelName(bits: bits, group: group, isSHVQ: true) else {
+            throw QWGemmError.badWeights("no SHVQ decode kernel for \(bits)-bit group \(group)")
+        }
+        guard k % group == 0, n > 0, rows > 0 else {
+            throw QWGemmError.badWeights("k must be a multiple of \(group), n and rows positive")
+        }
+        guard n < (1 << 24) else {
+            throw QWGemmError.badWeights("a bank of \(n) rows does not fit row-count flags")
+        }
+        guard let rowBytes = rowBytes(bits: bits, group: group, k: k, isSHVQ: true) else {
+            throw QWGemmError.badWeights("no SHVQ size for \(bits)-bit group \(group)")
+        }
+        guard blocks.bytes >= n * rowBytes else {
+            throw QWGemmError.badWeights("block bank holds \(blocks.bytes) bytes, \(n * rowBytes) needed")
+        }
+        guard x.shape.dtype == .f16, x.shape.elementCount >= rows * k else {
+            throw QWGemmError.badWeights("activations must be f16 with >= \(rows * k) elements")
+        }
+        guard yBF16.shape.dtype == .bf16, yBF16.shape.elementCount >= rows * n else {
+            throw QWGemmError.badWeights("output must be bf16 with >= \(rows * n) elements")
+        }
+        let pso = try hal.pipeline(name)
+        let psoM4 = (rows >= 2) ? decodeM4KernelName(bits: bits, group: group, isSHVQ: true)
+            .flatMap { try? hal.pipeline($0) } : nil
+        var activeIsM4: Bool? = nil
+        blocks.bind(enc, index: 0)
+        var k32 = UInt32(k)
+        enc.setBytes(&k32, length: 4, index: 5)
+        var rowOffset = 0
+        while rowOffset < rows {
+            let chunk = min(8, rows - rowOffset)
+            let useM4 = (chunk >= 2 && chunk <= 4) && (psoM4 != nil)
+            let useTwoRowsM1 = (chunk == 1 && n <= 8192)
+            if useM4 != activeIsM4 {
+                if let m4 = psoM4, useM4 {
+                    enc.setComputePipelineState(m4)
+                } else {
+                    enc.setComputePipelineState(pso)
+                }
+                activeIsM4 = useM4
+            }
+            let xChunk = (rowOffset == 0 && chunk == rows)
+                ? x
+                : x.slice(byteOffset: rowOffset * k * 2, count: chunk * k, dtype: .f16)
+            let yChunk = (rowOffset == 0 && chunk == rows)
+                ? yBF16
+                : yBF16.slice(byteOffset: rowOffset * n * 2, count: chunk * n, dtype: .bf16)
+            xChunk.bind(enc, index: 1)
+            yChunk.bind(enc, index: 3)
+            yChunk.bind(enc, index: 8)
+            var n32 = UInt32(n)
+                | (useTwoRowsM1 ? 0xE000_0000 : 0x6000_0000)
+                | (chunk >= 2 ? (UInt32(chunk) << 24) : 0)
+            enc.setBytes(&n32, length: 4, index: 4)
+            let rowsPerTG = useTwoRowsM1 ? (decodeRowsPerThreadgroup / 2) : decodeRowsPerThreadgroup
+            let groups = (n + rowsPerTG - 1) / rowsPerTG
+            enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: decodeThreadsPerThreadgroup,
+                                                                   height: 1, depth: 1))
+            rowOffset += chunk
+        }
     }
 
     /// Encodes the head's fused GEMV-and-argmax over the family's blocks:

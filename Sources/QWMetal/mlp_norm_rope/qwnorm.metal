@@ -448,3 +448,17 @@ kernel void qwg_mtp_pre_fc_norm(device const uint4* embeddings [[buffer(0)]],
     }
 }
 
+// Elementwise FP16 bias add in FP32 accumulation (used for optional o_proj.bias).
+kernel void qwg_add_bias_f16(device uint4* x           [[buffer(0)]],
+                             device const uint4* bias  [[buffer(1)]],
+                             constant uint& rowU4      [[buffer(2)]],
+                             uint2 tg [[threadgroup_position_in_grid]],
+                             uint ti [[thread_index_in_threadgroup]]) {
+    const uint u = tg.x * 32u + ti;
+    if (u >= rowU4) return;
+    device uint4* xr = x + (size_t)tg.y * rowU4;
+    H8 xv = asH8(xr[u]), bv = asH8(bias[u]), ov;
+    for (int i = 0; i < 8; i++) ov.v[i] = half(float(xv.v[i]) + float(bv.v[i]));
+    xr[u] = *(thread uint4*)&ov;
+}
+

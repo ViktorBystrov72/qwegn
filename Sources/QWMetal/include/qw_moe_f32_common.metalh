@@ -15,8 +15,15 @@ METAL_FUNC void qwg_moe_write_route4(device float* out, uint slot, uint N, uint 
     if (rowsLeft > 3u) out[base + 3u] = value.w;
 }
 
+METAL_FUNC bfloat qwg_moe_f32_to_bf16(float v) {
+    uint u = as_type<uint>(v);
+    if ((u & 0x7F800000u) == 0x7F800000u) return bfloat(v);
+    u = u + 0x7FFFu + ((u >> 16u) & 1u);
+    return bfloat(as_type<float>(u & 0xFFFF0000u));
+}
+
 METAL_FUNC void qwg_moe_combine_store4(device float* out, device half* out16, size_t base,
-                                       uint rowsLeft, bool effSkip, bool writeOut16,
+                                       uint rowsLeft, bool effSkip, bool writeOut16, bool writeOutBF16,
                                        uint filterMode, float g, device const float* shared,
                                        float4 acc) {
     const float a[4] = { acc.x, acc.y, acc.z, acc.w };
@@ -24,7 +31,10 @@ METAL_FUNC void qwg_moe_combine_store4(device float* out, device half* out16, si
         if (rowsLeft <= r) break;
         const float y = a[r] + ((filterMode == 2u) ? out[base + r] : (effSkip ? 0.0f : (g * shared[base + r])));
         out[base + r] = y;
-        if (writeOut16) out16[base + r] = half(y);
+        if (writeOut16) {
+            if (writeOutBF16) ((device bfloat*)out16)[base + r] = qwg_moe_f32_to_bf16(y);
+            else out16[base + r] = half(y);
+        }
     }
 }
 
@@ -53,7 +63,7 @@ METAL_FUNC float4 qwg_moe_rows4_f32_t(typename Traits::WeightPtr blocks,
     return qwg_simd_reduce_down<32u>(acc);
 }
 
-template <typename Traits>
+template <typename Traits, bool FMA_ACC = false>
 METAL_FUNC void qwg_moe_rows4_f32_2_t(typename Traits::WeightPtr blocks,
                                         device const float* x0,
                                         device const float* x1,
@@ -75,12 +85,21 @@ METAL_FUNC void qwg_moe_rows4_f32_2_t(typename Traits::WeightPtr blocks,
         Traits::load_act_f32(x0 + col, a0);
         Traits::load_act_f32(x1 + col, a1);
         const uint byteInGroup = Traits::byte_in_group(g);
-        const float2 d0 = Traits::slice_dot2(Traits::group_ptr(r0, g), byteInGroup, a0, a1, tgLut);
-        const float2 d1 = Traits::slice_dot2(Traits::group_ptr(r1, g), byteInGroup, a0, a1, tgLut);
-        const float2 d2 = Traits::slice_dot2(Traits::group_ptr(r2, g), byteInGroup, a0, a1, tgLut);
-        const float2 d3 = Traits::slice_dot2(Traits::group_ptr(r3, g), byteInGroup, a0, a1, tgLut);
-        acc0 += float4(d0.x, d1.x, d2.x, d3.x);
-        acc1 += float4(d0.y, d1.y, d2.y, d3.y);
+        if constexpr (FMA_ACC) {
+            const float2 d0 = Traits::slice_dot2_acc(Traits::group_ptr(r0, g), byteInGroup, a0, a1, tgLut, float2(acc0.x, acc1.x));
+            const float2 d1 = Traits::slice_dot2_acc(Traits::group_ptr(r1, g), byteInGroup, a0, a1, tgLut, float2(acc0.y, acc1.y));
+            const float2 d2 = Traits::slice_dot2_acc(Traits::group_ptr(r2, g), byteInGroup, a0, a1, tgLut, float2(acc0.z, acc1.z));
+            const float2 d3 = Traits::slice_dot2_acc(Traits::group_ptr(r3, g), byteInGroup, a0, a1, tgLut, float2(acc0.w, acc1.w));
+            acc0 = float4(d0.x, d1.x, d2.x, d3.x);
+            acc1 = float4(d0.y, d1.y, d2.y, d3.y);
+        } else {
+            const float2 d0 = Traits::slice_dot2(Traits::group_ptr(r0, g), byteInGroup, a0, a1, tgLut);
+            const float2 d1 = Traits::slice_dot2(Traits::group_ptr(r1, g), byteInGroup, a0, a1, tgLut);
+            const float2 d2 = Traits::slice_dot2(Traits::group_ptr(r2, g), byteInGroup, a0, a1, tgLut);
+            const float2 d3 = Traits::slice_dot2(Traits::group_ptr(r3, g), byteInGroup, a0, a1, tgLut);
+            acc0 += float4(d0.x, d1.x, d2.x, d3.x);
+            acc1 += float4(d0.y, d1.y, d2.y, d3.y);
+        }
     }
     acc0 = qwg_simd_reduce_down<32u>(acc0);
     acc1 = qwg_simd_reduce_down<32u>(acc1);
@@ -108,7 +127,7 @@ METAL_FUNC float4 qwg_moe_down_rows4_1x(typename Traits::WeightPtr wSrc,
         }
         return qwg_simd_reduce_down<32u>(vx);
     }
-    if ((nSlices & 15u) == 0u && rowsLeft >= 4u) {
+    if (nSlices > 32u && rowsLeft >= 4u) {
         const uint upHalf = lane >> 4u, hl = lane & 15u;
         typename Traits::WeightPtr r0p = Traits::row_ptr(
             wSrc, (size_t)wExp * N + r0 + upHalf * 2u, rowStride);
@@ -128,7 +147,7 @@ METAL_FUNC float4 qwg_moe_down_rows4_1x(typename Traits::WeightPtr wSrc,
     return qwg_moe_rows4_f32_t<Traits>(wSrc, xRow, (size_t)wExp * N + r0, rowsLeft, K, lane, tgLut);
 }
 
-template <typename Traits>
+template <typename Traits, bool FMA_ACC = false>
 METAL_FUNC void qwg_moe_down_rows4_2x(typename Traits::WeightPtr wSrc,
                                       device const float* xA, device const float* xB,
                                       uint wExp, uint r0, uint rowsLeft,
@@ -157,7 +176,7 @@ METAL_FUNC void qwg_moe_down_rows4_2x(typename Traits::WeightPtr wSrc,
         vx1 = qwg_simd_reduce_down<32u>(vx1);
         return;
     }
-    if ((nSlices & 15u) == 0u && rowsLeft >= 4u) {
+    if (nSlices > 32u && rowsLeft >= 4u) {
         const uint upHalf = lane >> 4u, hl = lane & 15u;
         typename Traits::WeightPtr r0p = Traits::row_ptr(
             wSrc, (size_t)wExp * N + r0 + upHalf * 2u, rowStride);
@@ -168,10 +187,17 @@ METAL_FUNC void qwg_moe_down_rows4_2x(typename Traits::WeightPtr wSrc,
             Traits::load_act_f32(xB + (s << 5u), a1);
             const uint byteInGroup = Traits::byte_in_group(s);
             typename Traits::WeightPtr gp = Traits::group_ptr(r0p, s);
-            const float2 d0 = Traits::slice_dot2(gp, byteInGroup, a0, a1, tgLut);
-            const float2 d1 = Traits::slice_dot2(gp + rowStride, byteInGroup, a0, a1, tgLut);
-            v0 += float2(d0.x, d1.x);
-            v1 += float2(d0.y, d1.y);
+            if constexpr (FMA_ACC) {
+                const float2 d0 = Traits::slice_dot2_acc(gp, byteInGroup, a0, a1, tgLut, float2(v0.x, v1.x));
+                const float2 d1 = Traits::slice_dot2_acc(gp + rowStride, byteInGroup, a0, a1, tgLut, float2(v0.y, v1.y));
+                v0 = float2(d0.x, d1.x);
+                v1 = float2(d0.y, d1.y);
+            } else {
+                const float2 d0 = Traits::slice_dot2(gp, byteInGroup, a0, a1, tgLut);
+                const float2 d1 = Traits::slice_dot2(gp + rowStride, byteInGroup, a0, a1, tgLut);
+                v0 += float2(d0.x, d1.x);
+                v1 += float2(d0.y, d1.y);
+            }
         }
         v0 = qwg_simd_reduce_down<16u>(v0);
         v1 = qwg_simd_reduce_down<16u>(v1);
@@ -181,23 +207,37 @@ METAL_FUNC void qwg_moe_down_rows4_2x(typename Traits::WeightPtr wSrc,
         vx1 = float4(v1.x, v1.y, v1Hi.x, v1Hi.y);
         return;
     }
-    qwg_moe_rows4_f32_2_t<Traits>(wSrc, xA, xB, (size_t)wExp * N + r0, rowsLeft, K, lane, vx0, vx1, tgLut);
+    qwg_moe_rows4_f32_2_t<Traits, FMA_ACC>(wSrc, xA, xB, (size_t)wExp * N + r0, rowsLeft, K, lane, vx0, vx1, tgLut);
 }
 
-template <typename Traits>
+METAL_FUNC float qwg_moe_softcap_swiglu_val(float g, float u, float2 softcaps) {
+    if (softcaps.x <= 0.0f && softcaps.y <= 0.0f) return qwg_swiglu_mul(g, u);
+    const float sig = 1.0f / (1.0f + exp(-g));
+    const float gs = (softcaps.x > 0.0f)
+        ? (precise::tanh(clamp(g / softcaps.x, -15.0f, 15.0f)) * softcaps.x * sig)
+        : (g * sig);
+    const float us = (softcaps.y > 0.0f)
+        ? (precise::tanh(clamp(u / softcaps.y, -15.0f, 15.0f)) * softcaps.y)
+        : u;
+    return gs * us;
+}
+
+template <typename Traits, bool HAS_SOFTCAP = false>
 METAL_FUNC void qwg_moe_gateup_f32_r1_body(typename Traits::WeightPtr w,
                                            device const float* x,
                                            device const int* ids,
                                            device float* out,
                                            QWMoEGateUpF32Params p,
                                            typename Traits::WeightPtr coldW,
+                                           float2 softcaps,
                                            uint3 tg, uint tid, uint sgi, uint lane,
                                            threadgroup float* tgAct,
                                            threadgroup typename Traits::TgLut& tgLut) {
     const bool fuseSiluFwht = (p.E & 0x80000000u) != 0u;
     const uint residentE = (p.E >> 16u) & 0x7FFFu;
     const uint realE = p.E & 0x3FFu;
-    const uint numToks = (p.E >> 10u) & 0x7u;
+    const uint dedupCode = (p.E >> 10u) & 0xFu;
+    const uint numToks = (dedupCode > 0u) ? (dedupCode + 1u) : 1u;
     const bool skipCold = (p.E & 0x4000u) != 0u;
     const bool onlyCold = (p.E & 0x8000u) != 0u;
     const uint k = tg.y, t = tg.z;
@@ -215,19 +255,27 @@ METAL_FUNC void qwg_moe_gateup_f32_r1_body(typename Traits::WeightPtr w,
         uint4 tokIds = uint4(t, 0u, 0u, 0u);
         uint4 pairSlots = uint4(t * realE + k, 0u, 0u, 0u);
         if (numToks >= 2u) {
+            uint prevHits = 0u;
             for (uint tPrev = 0u; tPrev <= t; ++tPrev) {
                 const uint kLim = (tPrev == t) ? k : realE;
                 for (uint kPrev = 0u; kPrev < kLim; ++kPrev) {
-                    if (ids[tPrev * realE + kPrev] == rawExpSigned) return;
+                    if (ids[tPrev * realE + kPrev] == rawExpSigned) ++prevHits;
+                }
+            }
+            if ((prevHits & 3u) != 0u) return;
+            for (uint kNext = k + 1u; kNext < realE && mCount < 4u; ++kNext) {
+                if (ids[t * realE + kNext] == rawExpSigned) {
+                    tokIds[mCount] = t;
+                    pairSlots[mCount] = t * realE + kNext;
+                    ++mCount;
                 }
             }
             for (uint tNext = t + 1u; tNext < numToks && mCount < 4u; ++tNext) {
-                for (uint kNext = 0u; kNext < realE; ++kNext) {
+                for (uint kNext = 0u; kNext < realE && mCount < 4u; ++kNext) {
                     if (ids[tNext * realE + kNext] == rawExpSigned) {
                         tokIds[mCount] = tNext;
                         pairSlots[mCount] = tNext * realE + kNext;
                         ++mCount;
-                        break;
                     }
                 }
             }
@@ -265,12 +313,21 @@ METAL_FUNC void qwg_moe_gateup_f32_r1_body(typename Traits::WeightPtr w,
                 typename Traits::ActSlice a0x, a1x;
                 Traits::load_act_f32(x + xr0 * p.K + col, a0x);
                 Traits::load_act_f32(x + xr1 * p.K + col, a1x);
-                const float2 d0 = Traits::slice_dot2(gp, byteInGroup, a0x, a1x, tgLut);
-                const float2 d1 = Traits::slice_dot2(gp + st1, byteInGroup, a0x, a1x, tgLut);
-                const float2 d2 = Traits::slice_dot2(gp + st2, byteInGroup, a0x, a1x, tgLut);
-                const float2 d3 = Traits::slice_dot2(gp + st3, byteInGroup, a0x, a1x, tgLut);
-                accM[0] += float4(d0.x, d1.x, d2.x, d3.x);
-                accM[1] += float4(d0.y, d1.y, d2.y, d3.y);
+                if constexpr (HAS_SOFTCAP) {
+                    const float2 d0 = Traits::slice_dot2_acc(gp, byteInGroup, a0x, a1x, tgLut, float2(accM[0].x, accM[1].x));
+                    const float2 d1 = Traits::slice_dot2_acc(gp + st1, byteInGroup, a0x, a1x, tgLut, float2(accM[0].y, accM[1].y));
+                    const float2 d2 = Traits::slice_dot2_acc(gp + st2, byteInGroup, a0x, a1x, tgLut, float2(accM[0].z, accM[1].z));
+                    const float2 d3 = Traits::slice_dot2_acc(gp + st3, byteInGroup, a0x, a1x, tgLut, float2(accM[0].w, accM[1].w));
+                    accM[0] = float4(d0.x, d1.x, d2.x, d3.x);
+                    accM[1] = float4(d0.y, d1.y, d2.y, d3.y);
+                } else {
+                    const float2 d0 = Traits::slice_dot2(gp, byteInGroup, a0x, a1x, tgLut);
+                    const float2 d1 = Traits::slice_dot2(gp + st1, byteInGroup, a0x, a1x, tgLut);
+                    const float2 d2 = Traits::slice_dot2(gp + st2, byteInGroup, a0x, a1x, tgLut);
+                    const float2 d3 = Traits::slice_dot2(gp + st3, byteInGroup, a0x, a1x, tgLut);
+                    accM[0] += float4(d0.x, d1.x, d2.x, d3.x);
+                    accM[1] += float4(d0.y, d1.y, d2.y, d3.y);
+                }
                 if (mCount == 3u) {
                     const size_t xr2 = (gStride > 0u) ? ((size_t)tokIds[2] * gStride + gIdx) : (size_t)tokIds[2];
                     Traits::load_act_f32(x + xr2 * p.K + col, a0x);
@@ -283,12 +340,21 @@ METAL_FUNC void qwg_moe_gateup_f32_r1_body(typename Traits::WeightPtr w,
                     const size_t xr3 = (gStride > 0u) ? ((size_t)tokIds[3] * gStride + gIdx) : (size_t)tokIds[3];
                     Traits::load_act_f32(x + xr2 * p.K + col, a0x);
                     Traits::load_act_f32(x + xr3 * p.K + col, a1x);
-                    const float2 e0 = Traits::slice_dot2(gp, byteInGroup, a0x, a1x, tgLut);
-                    const float2 e1 = Traits::slice_dot2(gp + st1, byteInGroup, a0x, a1x, tgLut);
-                    const float2 e2 = Traits::slice_dot2(gp + st2, byteInGroup, a0x, a1x, tgLut);
-                    const float2 e3 = Traits::slice_dot2(gp + st3, byteInGroup, a0x, a1x, tgLut);
-                    accM[2] += float4(e0.x, e1.x, e2.x, e3.x);
-                    accM[3] += float4(e0.y, e1.y, e2.y, e3.y);
+                    if constexpr (HAS_SOFTCAP) {
+                        const float2 e0 = Traits::slice_dot2_acc(gp, byteInGroup, a0x, a1x, tgLut, float2(accM[2].x, accM[3].x));
+                        const float2 e1 = Traits::slice_dot2_acc(gp + st1, byteInGroup, a0x, a1x, tgLut, float2(accM[2].y, accM[3].y));
+                        const float2 e2 = Traits::slice_dot2_acc(gp + st2, byteInGroup, a0x, a1x, tgLut, float2(accM[2].z, accM[3].z));
+                        const float2 e3 = Traits::slice_dot2_acc(gp + st3, byteInGroup, a0x, a1x, tgLut, float2(accM[2].w, accM[3].w));
+                        accM[2] = float4(e0.x, e1.x, e2.x, e3.x);
+                        accM[3] = float4(e0.y, e1.y, e2.y, e3.y);
+                    } else {
+                        const float2 e0 = Traits::slice_dot2(gp, byteInGroup, a0x, a1x, tgLut);
+                        const float2 e1 = Traits::slice_dot2(gp + st1, byteInGroup, a0x, a1x, tgLut);
+                        const float2 e2 = Traits::slice_dot2(gp + st2, byteInGroup, a0x, a1x, tgLut);
+                        const float2 e3 = Traits::slice_dot2(gp + st3, byteInGroup, a0x, a1x, tgLut);
+                        accM[2] += float4(e0.x, e1.x, e2.x, e3.x);
+                        accM[3] += float4(e0.y, e1.y, e2.y, e3.y);
+                    }
                 }
             }
         }
@@ -297,10 +363,18 @@ METAL_FUNC void qwg_moe_gateup_f32_r1_body(typename Traits::WeightPtr w,
             const float4 uAcc = simd_shuffle_down(accM[m], 16);
             if (lane == 0u) {
                 const uint c = m * 32u + sgi * 4u;
-                tgAct[c + 0u] = rows > 0u ? qwg_swiglu_mul(accM[m].x, uAcc.x) : 0.0f;
-                tgAct[c + 1u] = rows > 1u ? qwg_swiglu_mul(accM[m].y, uAcc.y) : 0.0f;
-                tgAct[c + 2u] = rows > 2u ? qwg_swiglu_mul(accM[m].z, uAcc.z) : 0.0f;
-                tgAct[c + 3u] = rows > 3u ? qwg_swiglu_mul(accM[m].w, uAcc.w) : 0.0f;
+                if constexpr (HAS_SOFTCAP) {
+                    tgAct[c + 0u] = rows > 0u ? qwg_moe_softcap_swiglu_val(accM[m].x, uAcc.x, softcaps) : 0.0f;
+                    tgAct[c + 1u] = rows > 1u ? qwg_moe_softcap_swiglu_val(accM[m].y, uAcc.y, softcaps) : 0.0f;
+                    tgAct[c + 2u] = rows > 2u ? qwg_moe_softcap_swiglu_val(accM[m].z, uAcc.z, softcaps) : 0.0f;
+                    tgAct[c + 3u] = rows > 3u ? qwg_moe_softcap_swiglu_val(accM[m].w, uAcc.w, softcaps) : 0.0f;
+                } else {
+                    (void)softcaps;
+                    tgAct[c + 0u] = rows > 0u ? qwg_swiglu_mul(accM[m].x, uAcc.x) : 0.0f;
+                    tgAct[c + 1u] = rows > 1u ? qwg_swiglu_mul(accM[m].y, uAcc.y) : 0.0f;
+                    tgAct[c + 2u] = rows > 2u ? qwg_swiglu_mul(accM[m].z, uAcc.z) : 0.0f;
+                    tgAct[c + 3u] = rows > 3u ? qwg_swiglu_mul(accM[m].w, uAcc.w) : 0.0f;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -348,6 +422,7 @@ METAL_FUNC void qwg_moe_down_shared_combine_f32_body(
     const uint numToks = (numGroups > 0u) ? 0u : ((p.E >> 8u) & 0x7u);
     const uint realE = p.E & 0xFFu;
     const bool writeOut16 = (p.hasOut16 & 1u) != 0u;
+    const bool writeOutBF16 = (p.hasOut16 & 16u) != 0u;
     const bool routeOutput = (p.hasOut16 & 2u) != 0u;
     const bool skipShared = (p.hasOut16 & 4u) != 0u;
     const bool tokenIndexedX = (p.hasOut16 & 8u) != 0u;
@@ -419,7 +494,7 @@ METAL_FUNC void qwg_moe_down_shared_combine_f32_body(
         if (routeOutput || lane != 0u) return;
         for (uint tm = 0u; tm < numToks; ++tm) {
             qwg_moe_combine_store4(out, out16, (size_t)tm * p.N + r0, rowsLeft, skipShared,
-                                   writeOut16, filterMode, skipShared ? 0.0f : gate[tm], shared, accM[tm]);
+                                   writeOut16, writeOutBF16, filterMode, skipShared ? 0.0f : gate[tm], shared, accM[tm]);
         }
         return;
     }
@@ -448,5 +523,5 @@ METAL_FUNC void qwg_moe_down_shared_combine_f32_body(
     const uint outRow = (numGroups > 0u) ? tg.y : t;
     const bool effSkip = skipShared || numGroups > 0u;
     qwg_moe_combine_store4(out, out16, (size_t)outRow * p.N + r0, rowsLeft, effSkip,
-                           writeOut16, filterMode, effSkip ? 0.0f : gate[t], shared, acc);
+                           writeOut16, writeOutBF16, filterMode, effSkip ? 0.0f : gate[t], shared, acc);
 }

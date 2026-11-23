@@ -601,5 +601,73 @@ final class QWAttnPagedPrefillTests: XCTestCase {
             XCTAssertLessThan(maxDiff, 1e-3, "gqaRatio=\(geo.gqaRatio) NAX prefill vs general maxDiff=\(maxDiff)")
         }
     }
+
+    func testPagedPrefillCrossPageMultiTileAndRaggedTailParity() throws {
+        let pos = 240
+        let T = 72
+        let sp = (T + 31) / 32 * 32
+        let ceiling = pos + T + 256
+        let qgateBits = Self.synthQGate(n: sp, seed: 0xBEEF)
+        let qgateBuf = Self.buf(qgateBits)
+        let qgateTV = Self.tv(qgateBuf, sp * QWModelGeometry.qwen38_27b.qProjOut)
+        let kPrefix = Self.synthKV(n: pos, seed: 0x1357)
+        let vPrefix = Self.synthV(n: pos, seed: 0x2468)
+        let kChunk = Self.synthKV(n: T, seed: 0x9BDF)
+        let vChunk = Self.synthV(n: T, seed: 0xACE0)
+        let pagedPrefill = try QWAttnPagedPrefill(hal: Self.hal, geometry: .qwen38_27b)
+        let rowElems = QWModelGeometry.qwen38_27b.kvHeads * QWModelGeometry.qwen38_27b.headDim
+
+        for mode in [QWKVMode.f16, .q8, .q4] {
+            let pageBytes = QWKVCache.pageBytes(mode: mode, geometry: .qwen38_27b)
+            let needPages = (ceiling + 255) / 256
+            let tables = QWKVCache.tableSlotBytes * 2 * QWKVCache.maxSeqs
+            let pBytes = QWAttnDecode.decodePartialsBytes(geometry: .qwen38_27b)
+            let arena = try QWArena(hal: Self.hal, weights: 0, activations: 0,
+                                    kv: pageBytes * needPages * 2 + tables, gdnStates: pBytes)
+            let cache = try QWKVCache(hal: Self.hal, arena: arena, layers: [Self.layer], mode: mode, geometry: .qwen38_27b)
+            let h = try cache.allocate(promptTokens: ceiling)
+            try cache.append(h, positions: 0..<pos, layer: Self.layer, kind: .k, src: kPrefix)
+            try cache.append(h, positions: 0..<pos, layer: Self.layer, kind: .v, src: vPrefix)
+            try cache.append(h, positions: pos..<(pos + T), layer: Self.layer, kind: .k, src: kChunk)
+            try cache.append(h, positions: pos..<(pos + T), layer: Self.layer, kind: .v, src: vChunk)
+
+            let views = try cache.layerViews(h, layer: Self.layer)
+            let outPagedBuf = Self.hal.device.makeBuffer(length: T * 6144 * 2, options: .storageModeShared)!
+            guard let (cbPaged, encPaged) = Self.hal.begin() else { XCTFail(); return }
+            try pagedPrefill.encode(encPaged, qgate: qgateTV, kv: views, out: Self.tv(outPagedBuf, T * 6144), pos: pos, T: T)
+            encPaged.endEncoding()
+            cbPaged.commit()
+            cbPaged.waitUntilCompleted()
+
+            let decode = try QWAttnDecode(hal: Self.hal, kvMode: mode, geometry: .qwen38_27b)
+            let partialsBuf = Self.hal.device.makeBuffer(length: pBytes, options: .storageModeShared)!
+            let partialsRegion = QWMRegion(buffer: partialsBuf, base: 0, length: pBytes)
+            let outRefBuf = Self.hal.device.makeBuffer(length: T * 6144 * 2, options: .storageModeShared)!
+            for t in 0..<T {
+                let tokPos = pos + t
+                let qRow = QWTensorValue(region: qgateTV.region, offset: t * QWModelGeometry.qwen38_27b.qProjOut * 2,
+                                         shape: QWTensorShape([QWModelGeometry.qwen38_27b.qProjOut], .f16))
+                let kRow = Self.tv(Self.buf(Array(kChunk[(t * rowElems)..<((t + 1) * rowElems)])), rowElems)
+                let vRow = Self.tv(Self.buf(Array(vChunk[(t * rowElems)..<((t + 1) * rowElems)])), rowElems)
+                let outRow = QWTensorValue(region: QWMRegion(buffer: outRefBuf, base: 0, length: T * 6144 * 2),
+                                           offset: t * 6144 * 2, shape: QWTensorShape([6144], .f16))
+                guard let (cbDec, encDec) = Self.hal.begin() else { XCTFail(); return }
+                try decode.encode(encDec, qgate: qRow, kv: views, knew: kRow, vnew: vRow,
+                                  partials: partialsRegion, out: outRow, C: tokPos,
+                                  splits: QWAttnDecode.splits(forKeys: tokPos + 1, kvHeads: QWModelGeometry.qwen38_27b.kvHeads))
+                encDec.endEncoding()
+                cbDec.commit()
+                cbDec.waitUntilCompleted()
+            }
+            let outPaged = Self.readOut(outPagedBuf, T * 6144)
+            let outRef = Self.readOut(outRefBuf, T * 6144)
+            var maxDiff: Float = 0
+            for i in 0..<outPaged.count {
+                XCTAssertTrue(outPaged[i].isFinite, "mode=\(mode) non-finite at \(i)")
+                maxDiff = max(maxDiff, abs(outPaged[i] - outRef[i]))
+            }
+            XCTAssertLessThan(maxDiff, 5e-3, "cross-page multi-tile mode=\(mode) maxDiff=\(maxDiff)")
+        }
+    }
 }
 

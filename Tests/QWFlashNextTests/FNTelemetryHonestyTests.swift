@@ -2,10 +2,12 @@
 
 import Metal
 import XCTest
-@testable import QWAlloc
+import QWAlloc
+import QWAttn
 @testable import QWCore
-@testable import QWFlashNext
+@testable import QWEngine
 import QWHAL
+import QWHyperPLE
 import QWQuant
 import QWRope
 
@@ -19,7 +21,7 @@ final class FNTelemetryHonestyTests: XCTestCase {
         let zeroCopySlab = try XCTUnwrap(device.makeBuffer(length: 16384, options: .storageModeShared))
         let pleBuffer = try XCTUnwrap(device.makeBuffer(length: 32768, options: .storageModeShared))
 
-        let total = FNGPUEngine.standaloneUniqueBufferBytes(
+        let total = QWHyperStreamRuntime.standaloneUniqueBufferBytes(
             arenaBuffers: [arenaBuf0, arenaBuf1],
             candidateBuffers: [arenaBuf0, arenaBuf1, zeroCopySlab, zeroCopySlab, pleBuffer]
         )
@@ -76,7 +78,7 @@ final class FNTelemetryHonestyTests: XCTestCase {
         let pleTable = FNGPUPLETable(buffer: pleBuf, headDim: 32, entryCount: 4,
                                      dataOffset: 0, rowsPerSector: 1, rowBytes: 32, dtype: .vq2g32)
 
-        let total = FNGPUEngine.standaloneWeightBytes(
+        let total = QWHyperStreamRuntime.standaloneWeightBytes(
             arenaBuffers: [arenaBuf] + arena.allBuffers,
             layers: [layer], head: head, embedTable: embed, gpuPLETable: pleTable, mtp: nil
         )

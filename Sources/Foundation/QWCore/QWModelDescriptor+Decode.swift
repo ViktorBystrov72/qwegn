@@ -37,17 +37,6 @@ extension QWModelDescriptor {
            isDrafterJSON(obj) {
             throw DescriptorError.drafterModel("DFlash2 drafter model (cannot be loaded as a primary model)")
         }
-        if QWStandardConfigDecoder.isStandardSchema(data) {
-            let desc = try decodeStandard(data)
-            let issues = desc.verifyInternalConsistency()
-            if !issues.isEmpty {
-                throw DescriptorError.invariant(issues.joined(separator: "; "))
-            }
-            return desc
-        }
-        if let feature = QWStandardConfigDecoder.standardFamilyRefusal(data) {
-            throw QWStandardConfigDecoder.Error.unsupported(feature)
-        }
         let rawRoot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         let rawText = (rawRoot?["text_config"] as? [String: Any]) ?? rawRoot ?? [:]
         let env = try JSONDecoder().decode(ConfigEnvelope.self, from: data)
@@ -58,25 +47,42 @@ extension QWModelDescriptor {
             do {
                 t = try JSONDecoder().decode(ConfigEnvelope.Text.self, from: data)
             } catch DecodingError.keyNotFound(let key, _) {
-                throw DescriptorError.invariant("flat config missing \(key.stringValue)")
+                throw DescriptorError.invariant("flat config missing '\(key.stringValue)'")
             } catch DecodingError.valueNotFound(_, let ctx) {
                 let name = ctx.codingPath.last?.stringValue ?? "required field"
-                throw DescriptorError.invariant("flat config missing \(name)")
+                throw DescriptorError.invariant("flat config missing '\(name)'")
             }
         }
         func inv(_ cond: Bool, _ msg: String) throws {
             if !cond { throw DescriptorError.invariant(msg) }
         }
+        guard let textFamilySpec = QWModelFamilyRegistry.shared.spec(forModelType: t.model_type) else {
+            throw QWModelDescriptorError.unsupportedModelType(t.model_type)
+        }
+        let envFamilySpec = env.model_type.flatMap { QWModelFamilyRegistry.shared.spec(forModelType: $0) }
+        let familySpec = envFamilySpec ?? textFamilySpec
+        let family = familySpec.family
+
+        try validateUnsupportedFeatures(text: t, env: env, familySpec: familySpec,
+                                        rawRoot: rawRoot, rawText: rawText, inv: inv)
+
         try inv(t.hidden_size > 0, "hidden_size \(t.hidden_size) <= 0")
         try inv(t.vocab_size > 0, "vocab_size \(t.vocab_size) <= 0")
         try inv(t.num_hidden_layers > 0, "num_hidden_layers \(t.num_hidden_layers) <= 0")
         try inv(t.num_attention_heads > 0, "num_attention_heads \(t.num_attention_heads) <= 0")
-        try inv(t.num_key_value_heads > 0 && t.num_attention_heads % t.num_key_value_heads == 0,
-                "num_attention_heads \(t.num_attention_heads) not divisible by num_key_value_heads \(t.num_key_value_heads)")
-        try inv(t.max_position_embeddings > 0, "max_position_embeddings \(t.max_position_embeddings) <= 0")
+        let resolvedKVHeads = t.num_key_value_heads ?? t.num_attention_heads
+        try inv(resolvedKVHeads > 0 && t.num_attention_heads % resolvedKVHeads == 0,
+                "num_attention_heads \(t.num_attention_heads) not divisible by num_key_value_heads \(resolvedKVHeads)")
+        let resolvedMaxPos = t.max_position_embeddings ?? t.model_max_length
+            ?? env.max_position_embeddings ?? env.model_max_length ?? 0
+        try inv(resolvedMaxPos > 0, "max_position_embeddings \(resolvedMaxPos) <= 0")
         try inv(t.rms_norm_eps > 0 && t.rms_norm_eps.isFinite, "rms_norm_eps \(t.rms_norm_eps) invalid")
         let rawLayerTypes: [String]
         if let explicitTypes = t.layer_types {
+            if familySpec.defaultAllFullAttention,
+               let odd = explicitTypes.first(where: { $0 != "full_attention" && $0 != "sliding_attention" }) {
+                throw DescriptorError.invariant("unsupported layer_types '\(odd)'")
+            }
             rawLayerTypes = explicitTypes
         } else if let ratios = t.compress_ratios {
             try inv(ratios.count >= t.num_hidden_layers,
@@ -84,27 +90,35 @@ extension QWModelDescriptor {
             rawLayerTypes = (0..<t.num_hidden_layers).map { l in
                 ratios[l] > 0 ? "compressed_attention" : "full_attention"
             }
-        } else if t.attention_variant == "block_sparse_gqa" || t.model_type == "maxwell_moe" {
+        } else if family == .inkling2Loop {
+            let localSet = Set((rawText["local_layer_ids"] as? [Int]) ?? [])
+            rawLayerTypes = (0..<t.num_hidden_layers).map { localSet.contains($0) ? "sliding_attention" : "full_attention" }
+        } else if t.attention_variant == "block_sparse_gqa" || t.model_type == "maxwell_moe"
+                    || familySpec.defaultAllFullAttention {
             rawLayerTypes = Array(repeating: "full_attention", count: t.num_hidden_layers)
         } else {
-            throw DescriptorError.invariant("flat config missing layer_types")
+            throw DescriptorError.invariant("flat config missing 'layer_types'")
         }
         let normalizedLayerTypes = rawLayerTypes.map { kind -> String in
             kind == "deepseek_sparse_attention" ? "full_attention" : kind
         }
         try inv(normalizedLayerTypes.count == t.num_hidden_layers,
                 "layer_types count \(normalizedLayerTypes.count) != num_hidden_layers \(t.num_hidden_layers)")
-        let kindsOK = normalizedLayerTypes.allSatisfy {
-            $0 == "full_attention" || $0 == "linear_attention" || $0 == "compressed_attention"
+        let isGQAKind: (String) -> Bool = { $0 == "full_attention" || $0 == "sliding_attention" }
+        if let badKind = normalizedLayerTypes.first(where: {
+            !isGQAKind($0) && $0 != "linear_attention" && $0 != "compressed_attention"
+        }) {
+            throw DescriptorError.invariant("layer_types contain unknown kind '\(badKind)'")
         }
-        try inv(kindsOK, "layer_types contain unknown kind")
 
+        let hasNonGQALayers = normalizedLayerTypes.contains("linear_attention")
+            || normalizedLayerTypes.contains("compressed_attention")
         let resolvedFAInterval: Int
-        if let explicitInterval = t.full_attention_interval {
+        if let explicitInterval = t.full_attention_interval ?? (family == .inkling2Loop ? dictInt(rawText, "n_layers_per_attn_res_block") : nil) {
             resolvedFAInterval = explicitInterval
-        } else if let firstFA = normalizedLayerTypes.firstIndex(of: "full_attention") {
+        } else if let firstFA = normalizedLayerTypes.firstIndex(where: isGQAKind) {
             let candidate = firstFA + 1
-            let fullIndices = normalizedLayerTypes.indices.filter { normalizedLayerTypes[$0] == "full_attention" }
+            let fullIndices = normalizedLayerTypes.indices.filter { isGQAKind(normalizedLayerTypes[$0]) }
             let uniformCadence = fullIndices.allSatisfy { ($0 + 1) % candidate == 0 }
             resolvedFAInterval = uniformCadence ? candidate : 0
         } else {
@@ -118,50 +132,71 @@ extension QWModelDescriptor {
             resolvedHeadDim = qkHd
         } else if let nope = t.qk_nope_head_dim, let rope = t.qk_rope_head_dim, nope + rope > 0 {
             resolvedHeadDim = nope + rope
+        } else if t.head_dim == nil && t.attention_head_size == nil && familySpec.defaultAllFullAttention {
+            try inv(t.hidden_size % t.num_attention_heads == 0,
+                    "hidden_size \(t.hidden_size) is not divisible by num_attention_heads \(t.num_attention_heads)")
+            resolvedHeadDim = t.hidden_size / t.num_attention_heads
+        } else if let badHd = t.head_dim ?? t.attention_head_size {
+            throw DescriptorError.invariant("head_dim \(badHd) <= 0")
         } else {
-            throw DescriptorError.invariant("flat config missing head_dim")
+            throw DescriptorError.invariant("flat config missing 'head_dim'")
         }
 
         let hasHybridMLA = t.hybrid_mla_kv_lora_rank != nil || t.hybrid_mla_attention != nil
         let isNoPEMLA = t.mla_use_nope ?? (t.kv_lora_rank != nil && t.use_mla != false && t.compress_ratios == nil && !hasHybridMLA)
+        if !isNoPEMLA && !hasHybridMLA && !normalizedLayerTypes.contains("compressed_attention") {
+            try inv(resolvedHeadDim % 32 == 0 && resolvedHeadDim <= 256,
+                    "head_dim \(resolvedHeadDim) must be a multiple of 32 in 32...256")
+        }
         let resolvedPartialRotary: Double
         if let prf = t.partial_rotary_factor ?? t.rope_parameters?.partial_rotary_factor {
             resolvedPartialRotary = prf
         } else if let rp = t.rotary_percent {
             resolvedPartialRotary = rp
         } else if isNoPEMLA || hasHybridMLA || t.compress_ratios != nil
-                    || t.attention_variant == "block_sparse_gqa" || t.model_type == "maxwell_moe" {
+                    || t.attention_variant == "block_sparse_gqa" || t.model_type == "maxwell_moe"
+                    || familySpec.defaultAllFullAttention || family == .inkling2Loop {
             resolvedPartialRotary = 1.0
         } else {
-            throw DescriptorError.invariant("flat config missing partial_rotary_factor")
+            throw DescriptorError.invariant("flat config missing 'partial_rotary_factor'")
         }
 
-        // Documented test fallback: minimal synthetic hybrid unit fixtures omit `rope_theta`.
-        let ropeTheta = t.rope_theta ?? t.rope_parameters?.rope_theta ?? 10000.0
+        // Minimal synthetic hybrid unit fixtures omit `rope_theta`; standard full-attention configs require it.
+        let ropeTheta: Double
+        if let explicitTheta = t.rope_theta ?? t.rope_parameters?.rope_theta ?? (family == .inkling2Loop ? dictDouble(rawRoot?["mtp_config"] as? [String: Any], "rope_theta") : nil) {
+            ropeTheta = explicitTheta
+        } else if !familySpec.defaultAllFullAttention {
+            ropeTheta = 10000.0
+        } else {
+            throw DescriptorError.invariant("flat config missing 'rope_theta'")
+        }
         try inv(resolvedPartialRotary > 0 && resolvedPartialRotary <= 1.0 && resolvedPartialRotary.isFinite,
                 "partial_rotary_factor \(resolvedPartialRotary) invalid")
         try inv(ropeTheta > 0 && ropeTheta.isFinite, "rope_theta \(ropeTheta) invalid")
+        if familySpec.defaultAllFullAttention && t.rope_parameters?.mrope_section != nil {
+            throw DescriptorError.invariant("unsupported 'mrope_section'")
+        }
         let mropeSec: (w: Int, h: Int, t: Int)
         let hasMrope: Bool
         if let sec = t.rope_parameters?.mrope_section {
             try inv(sec.count == 3, "mrope_section must have 3 elements")
             mropeSec = (sec[0], sec[1], sec[2])
             hasMrope = true
+        } else if familySpec.defaultAllFullAttention || family == .inkling2Loop {
+            mropeSec = (0, 0, 0)
+            hasMrope = false
         } else {
             mropeSec = (11, 11, 10)
             let rotHalf = Int(Double(resolvedHeadDim) * resolvedPartialRotary) / 2
             hasMrope = (rotHalf == 32)
         }
 
-        let rawNumExperts = t.num_experts ?? t.n_routed_experts
-        if let rawNumExperts {
-            try inv(rawNumExperts >= 0, "num_experts \(rawNumExperts) < 0")
-        }
-        let resolvedNumExperts = rawNumExperts.flatMap { $0 > 0 ? $0 : nil }
-        if resolvedNumExperts == nil && resolvedFAInterval > 0 {
+        let moeConfig = try validateAndResolveMoE(text: t, familySpec: familySpec, inv: inv)
+        let resolvedNumExperts = moeConfig.numExperts
+        if resolvedNumExperts == nil && resolvedFAInterval > 0 && hasNonGQALayers {
             for l in 0..<t.num_hidden_layers {
                 let want = (l + 1) % resolvedFAInterval == 0
-                try inv((normalizedLayerTypes[l] == "full_attention") == want, "layer \(l) cadence")
+                try inv(isGQAKind(normalizedLayerTypes[l]) == want, "layer \(l) cadence")
             }
         }
         let hasLinearLayers = normalizedLayerTypes.contains("linear_attention")
@@ -181,9 +216,6 @@ extension QWModelDescriptor {
         let isKDA = hasLinearLayers && (linType == "kda" || linCfg?.gate_lower_bound != nil)
         let gdnLowRank = linCfg?.low_rank_dim ?? (isKDA ? gHeadDim : nil)
 
-        if let n = rawNumExperts, let k = t.num_experts_per_tok {
-            try inv(n > 0 && k > 0 && k <= n, "MoE top-k \(k) > experts \(n)")
-        }
         let resolvedIdxHeads = t.indexer_n_heads ?? t.index_n_heads
         let resolvedIdxHeadDim = t.indexer_head_dim ?? t.index_head_dim
         let resolvedIdxBudget = t.indexer_budget ?? t.index_topk
@@ -209,8 +241,11 @@ extension QWModelDescriptor {
                         "PLE id \(id) must land on linear_attention (got \(normalizedLayerTypes[id-1]))")
             }
         }
-        let eos = t.eos_token_id.value
-        let eosList = t.eos_token_id.values
+        guard let eosVal = t.eos_token_id ?? env.eos_token_id ?? env.generation_config?.eos_token_id else {
+            throw DescriptorError.invariant("flat config missing 'eos_token_id'")
+        }
+        let eos = eosVal.value
+        let eosList = eosVal.values
 
         let resolvedSharedIntermediate: Int?
         if let explicitShared = t.shared_expert_intermediate_size {
@@ -249,28 +284,11 @@ extension QWModelDescriptor {
             parsedMHC = nil
         }
         if t.hc_count != nil || parsedMHC != nil { caps.insert(.hyperConnections) }
-        let resolvedMtpLayers = max(0, t.mtp_num_hidden_layers ?? t.num_nextn_predict_layers ?? t.mtp_num_layers ?? 0)
+        let mtpCfgLayers = family == .inkling2Loop ? dictInt(rawRoot?["mtp_config"] as? [String: Any], "num_hidden_layers") : nil
+        let resolvedMtpLayers = max(0, t.mtp_num_hidden_layers ?? t.num_nextn_predict_layers ?? t.mtp_num_layers ?? mtpCfgLayers ?? 0)
         if resolvedMtpLayers > 0 { caps.insert(.mtp) }
 
-        let parsedYarn: YarnRopeConfig? = {
-            if let rs = t.rope_scaling {
-                let kind = (rs.type ?? rs.rope_type ?? "").lowercased()
-                if kind == "yarn", let factor = rs.factor, let orig = rs.original_max_position_embeddings {
-                    return YarnRopeConfig(factor: factor, originalMaxPositionEmbeddings: orig,
-                                          betaFast: rs.beta_fast ?? 32.0, betaSlow: rs.beta_slow ?? 1.0,
-                                          mscale: rs.mscale ?? 0.0, mscaleAllDim: rs.mscale_all_dim ?? 0.0)
-                }
-            }
-            if let rp = t.rope_parameters {
-                let kind = (rp.type ?? rp.rope_type ?? "").lowercased()
-                if kind == "yarn", let factor = rp.factor, let orig = rp.original_max_position_embeddings {
-                    return YarnRopeConfig(factor: factor, originalMaxPositionEmbeddings: orig,
-                                          betaFast: rp.beta_fast ?? 32.0, betaSlow: rp.beta_slow ?? 1.0,
-                                          mscale: rp.mscale ?? 1.0, mscaleAllDim: rp.mscale_all_dim ?? 0.0)
-                }
-            }
-            return nil
-        }()
+        let (resolvedRopeScaling, parsedYarn) = try parseRoPEScaling(text: t, env: env)
 
         let parsedHCA: HCAConfig? = try {
             guard normalizedLayerTypes.contains("compressed_attention"),
@@ -299,7 +317,7 @@ extension QWModelDescriptor {
                 compressRatios: ratios,
                 defaultCompressRatio: defRatio,
                 qHeads: t.num_attention_heads,
-                kvHeads: t.num_key_value_heads,
+                kvHeads: resolvedKVHeads,
                 headDim: resolvedHeadDim,
                 qLoraRank: qLoraRank,
                 kvLoraRank: kvLoraRank,
@@ -355,28 +373,63 @@ extension QWModelDescriptor {
         }()
 
         let parsedAct: ActivationKind
-        if let act = t.hidden_act?.lowercased(), act == "situ" {
-            parsedAct = .situ(beta: t.activation_situ_beta ?? 4.0,
-                              linearBeta: t.activation_situ_linear_beta ?? 25.0)
+        if let rawAct = t.hidden_act {
+            let act = rawAct.lowercased()
+            if act == "situ" {
+                parsedAct = .situ(beta: t.activation_situ_beta ?? 4.0,
+                                  linearBeta: t.activation_situ_linear_beta ?? 25.0)
+            } else if act == "silu" {
+                parsedAct = .silu
+            } else {
+                throw DescriptorError.invariant("unsupported hidden_act '\(rawAct)'")
+            }
         } else {
             parsedAct = .silu
         }
 
         let rawLoop = t.loop_settings ?? env.loop_settings
-        let parsedLoop: LoopSettings? = (rawLoop.flatMap { rl in
+        let parsedLoop: LoopSettings? = rawLoop.flatMap { rl in
             guard let s = rl.start, let e = rl.end, s >= 0, e > s, e <= t.num_hidden_layers else { return nil }
             return LoopSettings(start: s, end: e, evalCount: max(1, rl.eval_count ?? rl.counts?.first ?? 1), counts: rl.counts)
-        })
+        } ?? (family == .inkling2Loop ? inkling2LoopSettings(rawText: rawText, numLayers: t.num_hidden_layers) : nil)
+        let parsedInk2 = family == .inkling2Loop
+            ? try decodeInkling2Config(text: t, env: env, rawRoot: rawRoot, rawText: rawText, inv: inv)
+            : nil
 
-        let resolvedFirstKDenseReplace: Int
-        if let fk = t.first_k_dense_replace {
-            resolvedFirstKDenseReplace = max(0, fk)
-        } else if let denseLayers = t.mlp_only_layers, !denseLayers.isEmpty {
-            try inv(Set(denseLayers) == Set(0..<denseLayers.count),
-                    "mlp_only_layers \(denseLayers) must be contiguous from 0")
-            resolvedFirstKDenseReplace = denseLayers.count
+        let resolvedSlidingWindow: Int?
+        let resolvedLayerSlidingWindows: [Int]?
+        let effectiveSW = t.sliding_window ?? dictInt(rawText, "sliding_window_size")
+        if !normalizedLayerTypes.contains("compressed_attention"), !hasHybridMLA {
+            if let sw = effectiveSW { try inv(sw >= 0, "sliding_window \(sw) < 0") }
+            if let mwl = t.max_window_layers { try inv(mwl >= 0, "max_window_layers \(mwl) < 0") }
+            if let pat = t.sliding_window_pattern { try inv(pat >= 1, "sliding_window_pattern \(pat) < 1") }
+            if normalizedLayerTypes.contains("sliding_attention") {
+                guard let sw = effectiveSW, sw > 0 else {
+                    throw DescriptorError.invariant("layer_types 'sliding_attention' requires positive sliding_window")
+                }
+                let effective = sw < resolvedMaxPos ? sw : 0
+                resolvedSlidingWindow = nil
+                resolvedLayerSlidingWindows = normalizedLayerTypes.map { $0 == "sliding_attention" ? effective : 0 }
+            } else if (t.use_sliding_window ?? true),
+                      let sw = effectiveSW, sw > 0, sw < resolvedMaxPos {
+                if let mwl = t.max_window_layers {
+                    resolvedSlidingWindow = nil
+                    resolvedLayerSlidingWindows = (0..<t.num_hidden_layers).map { $0 < mwl ? 0 : sw }
+                } else if let pat = t.sliding_window_pattern {
+                    resolvedSlidingWindow = nil
+                    resolvedLayerSlidingWindows = pat == 1 ? nil
+                        : (0..<t.num_hidden_layers).map { ($0 + 1) % pat == 0 ? 0 : sw }
+                } else {
+                    resolvedSlidingWindow = sw
+                    resolvedLayerSlidingWindows = nil
+                }
+            } else {
+                resolvedSlidingWindow = nil
+                resolvedLayerSlidingWindows = nil
+            }
         } else {
-            resolvedFirstKDenseReplace = 0
+            resolvedSlidingWindow = nil
+            resolvedLayerSlidingWindows = nil
         }
 
         let parsedBlockSparseGQA: BlockSparseGQAConfig?
@@ -389,7 +442,7 @@ extension QWModelDescriptor {
                   let idxHeads = t.block_sparse_gqa_indexer_n_heads,
                   blk > 0, pfxWin > 0, locWin > 0, remote > 0,
                   pfxWin % blk == 0, locWin % blk == 0,
-                  idxHeads == t.num_key_value_heads, idxDim == resolvedHeadDim else {
+                  idxHeads == resolvedKVHeads, idxDim == resolvedHeadDim else {
                 throw DescriptorError.invariant("block_sparse_gqa parameters missing or invalid")
             }
             parsedBlockSparseGQA = BlockSparseGQAConfig(
@@ -403,38 +456,24 @@ extension QWModelDescriptor {
             parsedBlockSparseGQA = nil
         }
 
-        guard let textFamilySpec = QWModelFamilyRegistry.shared.spec(forModelType: t.model_type) else {
-            throw QWModelDescriptorError.unsupportedModelType(t.model_type)
-        }
-        let envFamilySpec = env.model_type.flatMap { QWModelFamilyRegistry.shared.spec(forModelType: $0) }
-        let familySpec = envFamilySpec ?? textFamilySpec
-        let family = familySpec.family
         let gateDeclared: Bool = t.output_gate_type != nil
         let attnGate: Bool = t.attn_output_gate ?? t.use_gated_attn ?? (gateDeclared || familySpec.defaultAttnOutputGate)
         let resolvedGateType = t.scoring_func ?? t.router_score_function ?? familySpec.defaultExpertGateType
-        let vc = env.vision_config
-        // Documented test fallback: unit fixtures (e.g. glm5_next plan test) omit Qwen-VL patch/token fields.
-        let resolvedVisPatch = vc?.patch_size ?? (vc != nil ? 16 : 0)
-        let resolvedVisPosEmbeds: Int = try {
-            guard let vc else { return 0 }
-            if let explicit = vc.num_position_embeddings { return explicit }
-            if let img = vc.image_size, resolvedVisPatch > 0 {
-                let side = max(1, img / resolvedVisPatch)
-                return side * side
-            }
-            throw DescriptorError.invariant("vision_config missing num_position_embeddings and image_size")
-        }()
+        let vd = try resolveVisionDims(vc: env.vision_config, rawVision: rawRoot?["vision_config"] as? [String: Any], hidden: t.hidden_size, isInkling2: family == .inkling2Loop)
+        let hasVis = env.vision_config != nil
         let descriptor = QWModelDescriptor(
             family: family, modelType: t.model_type, capabilities: caps,
-            hidden: t.hidden_size, vocab: t.vocab_size, denseIntermediate: t.intermediate_size,
+            hidden: t.hidden_size, vocab: t.vocab_size,
+            denseIntermediate: family == .inkling2Loop ? nil : t.intermediate_size,
             numLayers: t.num_hidden_layers, layerTypes: normalizedLayerTypes, fullAttentionInterval: resolvedFAInterval,
-            rmsEps: Float(t.rms_norm_eps), maxPositionEmbeddings: t.max_position_embeddings,
-            qHeads: t.num_attention_heads, kvHeads: t.num_key_value_heads, headDim: resolvedHeadDim,
+            rmsEps: Float(t.rms_norm_eps), maxPositionEmbeddings: resolvedMaxPos,
+            qHeads: t.num_attention_heads, kvHeads: resolvedKVHeads, headDim: resolvedHeadDim,
             attnOutputGate: attnGate, partialRotaryFactor: resolvedPartialRotary, ropeTheta: ropeTheta,
             indexerHeads: resolvedIdxHeads, indexerKvHeads: resolvedIdxKvHeads,
             indexerHeadDim: resolvedIdxHeadDim, indexerBudget: resolvedIdxBudget,
             indexerCompressRatio: resolvedIdxCompress,
-            numExperts: resolvedNumExperts, expertsPerTok: t.num_experts_per_tok, moeIntermediate: t.moe_intermediate_size,
+            numExperts: resolvedNumExperts, expertsPerTok: t.num_experts_per_tok,
+            moeIntermediate: t.moe_intermediate_size ?? (family == .inkling2Loop && resolvedNumExperts != nil ? t.intermediate_size : nil),
             sharedExpertIntermediate: resolvedSharedIntermediate, expertGateType: resolvedGateType,
             hcCount: t.hc_count, hcLowrank: t.hc_lowrank,
             gdnQKHeads: qkHeads, gdnVHeads: vHeads, gdnHeadDim: gHeadDim,
@@ -444,28 +483,29 @@ extension QWModelDescriptor {
             makeNgramVocabDivisibleBy: t.make_ngram_vocab_size_divisible_by, splitNgramParts: t.split_ngram_parts,
             mtpLayers: resolvedMtpLayers, mtpUseDedicatedEmbeddings: t.mtp_use_dedicated_embeddings ?? false,
             eosTokenId: eos, mropeSection: mropeSec,
-            visDepth: vc?.depth ?? 0, visHidden: vc?.hidden_size ?? 0,
-            visHeads: vc?.num_heads ?? 0, visIntermediate: vc?.intermediate_size ?? 0,
-            visPatch: resolvedVisPatch, visTemporal: vc?.temporal_patch_size ?? (vc != nil ? 2 : 0),
-            visMerge: vc?.spatial_merge_size ?? (vc != nil ? 2 : 0), visPosEmbeds: resolvedVisPosEmbeds,
-            visOut: vc?.out_hidden_size ?? (vc != nil ? t.hidden_size : 0),
-            imageTokenId: env.image_token_id ?? (vc != nil ? 248056 : -1),
-            videoTokenId: env.video_token_id ?? (vc != nil ? 248057 : -1),
-            visionStartTokenId: env.vision_start_token_id ?? (vc != nil ? 248053 : -1),
-            visionEndTokenId: env.vision_end_token_id ?? (vc != nil ? 248054 : -1),
-            hasQKNorm: t.qk_layernorm ?? true,
+            visDepth: vd.depth, visHidden: vd.hidden, visHeads: vd.heads, visIntermediate: vd.inter,
+            visPatch: vd.patch, visTemporal: vd.temporal, visMerge: vd.merge, visPosEmbeds: vd.pos, visOut: vd.out,
+            imageTokenId: env.image_token_id ?? (hasVis ? (family == .inkling2Loop ? 200054 : 248056) : -1),
+            videoTokenId: env.video_token_id ?? (hasVis ? (family == .inkling2Loop ? -1 : 248057) : -1),
+            visionStartTokenId: env.vision_start_token_id ?? (hasVis ? 248053 : -1),
+            visionEndTokenId: env.vision_end_token_id ?? (hasVis ? 248054 : -1),
+            hasQKNorm: t.use_qk_norm ?? t.qk_layernorm ?? t.qk_norm ?? familySpec.defaultHasQKNorm,
+            hasQKVBias: (t.qkv_bias == true) || (t.attention_bias == true),
+            hasAttnOutputBias: (t.attention_bias == true),
             usesPlusOneRMSNorm: familySpec.usesPlusOneRMSNorm,
             quantization: t.quantization ?? t.quantization_config ?? env.quantization ?? env.quantization_config,
             hasMropeSection: hasMrope,
-            tieWordEmbeddings: t.tie_word_embeddings ?? false,
-            normTopKProb: t.norm_topk_prob ?? (resolvedNumExperts != nil),
+            tieWordEmbeddings: t.tie_word_embeddings ?? env.tie_word_embeddings ?? false,
+            normTopKProb: t.norm_topk_prob ?? (resolvedNumExperts != nil ? familySpec.defaultNormTopKProb : false),
             eosTokenIds: eosList,
             envelopeModelType: env.model_type,
             loopSettings: parsedLoop,
             mhcConfig: parsedMHC,
-            firstKDenseReplace: resolvedFirstKDenseReplace,
-            moeLayerFreq: max(1, t.moe_layer_freq ?? 1),
-            routedScalingFactor: t.routed_scaling_factor ?? 1.0,
+            firstKDenseReplace: moeConfig.firstKDenseReplace,
+            mlpOnlyLayers: moeConfig.mlpOnlyLayers,
+            decoderSparseStep: moeConfig.decoderSparseStep,
+            moeLayerFreq: moeConfig.moeLayerFreq,
+            routedScalingFactor: t.routed_scaling_factor ?? dictFloat(rawText, "route_scale") ?? 1.0,
             swigluLimit: (t.mlp_clamp == false) ? nil : (t.swiglu_limit ?? t.swiglu_limits),
             topkMethod: t.topk_method,
             sharedExpertHasGate: t.moe_shared_expert_gate ?? t.use_shared_expert_gate ?? (family == .maxwellMoE ? false : (t.n_shared_experts == nil)),
@@ -487,20 +527,265 @@ extension QWModelDescriptor {
             hybridMLAConfig: parsedHybridMLA,
             blockSparseGQAConfig: parsedBlockSparseGQA,
             yarnRopeConfig: (!hasHybridMLA && parsedHCA == nil) ? parsedYarn : nil,
+            ropeScaling: resolvedRopeScaling,
+            slidingWindow: resolvedSlidingWindow,
+            layerSlidingWindows: resolvedLayerSlidingWindows,
             activationKind: parsedAct,
             moeLatentSize: t.moe_latent_size,
             latentMoeUseNorm: t.latent_moe_use_norm ?? false,
             moeSplitFeatureRouting: t.moe_split_feature_routing ?? false,
-            moeRouterEnableExpertBias: t.moe_router_enable_expert_bias ?? false,
+            moeRouterEnableExpertBias: t.moe_router_enable_expert_bias ?? (dictBool(rawText, "use_gate_bias") ?? false),
             routedScalingFactorLearnable: t.routed_scaling_factor_learnable ?? false,
             multimaxHead: (t.multimax?.lowercased() == "lm_head"),
             mtpSharedLastLayer: t.mtp_shared_last_layer ?? false,
+            inkling2Config: parsedInk2,
             role: caps.contains(.vision) ? .multimodalConditionalLM : .causalLM)
         let issues = descriptor.verifyInternalConsistency()
         if !issues.isEmpty {
             throw DescriptorError.invariant(issues.joined(separator: "; "))
         }
         return descriptor
+    }
+
+    private struct ResolvedMoESchedule {
+        let numExperts: Int?
+        let firstKDenseReplace: Int
+        let mlpOnlyLayers: Set<Int>
+        let decoderSparseStep: Int
+        let moeLayerFreq: Int
+    }
+
+    private static func rawKeyPresent(_ dict: [String: Any]?, _ key: String) -> Bool {
+        guard let val = dict?[key] else { return false }
+        return !(val is NSNull)
+    }
+
+    private static func validateUnsupportedFeatures(
+        text t: ConfigEnvelope.Text,
+        env: ConfigEnvelope,
+        familySpec: QWModelFamilySpec,
+        rawRoot: [String: Any]?,
+        rawText: [String: Any],
+        inv: (Bool, String) throws -> Void
+    ) throws {
+        let archs = t.architectures ?? env.architectures
+        if let archs, !archs.isEmpty,
+           !archs.contains(where: { $0.hasSuffix("ForCausalLM") || $0.hasSuffix("ForConditionalGeneration") }) {
+            throw DescriptorError.invariant("unsupported architecture '\(archs[0])'")
+        }
+        if familySpec.defaultAllFullAttention,
+           rawKeyPresent(rawText, "auto_map") || rawKeyPresent(rawRoot, "auto_map") {
+            throw DescriptorError.invariant("unsupported 'auto_map'")
+        }
+        try inv(t.mlp_bias != true, "unsupported 'mlp_bias'")
+        try inv(t.output_router_logits != true, "unsupported 'output_router_logits'")
+    }
+
+    private static func validateAndResolveMoE(
+        text t: ConfigEnvelope.Text,
+        familySpec: QWModelFamilySpec,
+        inv: (Bool, String) throws -> Void
+    ) throws -> ResolvedMoESchedule {
+        let family = familySpec.family
+        let resolvedMLPOnly = Set(t.mlp_only_layers ?? [])
+        if let only = t.mlp_only_layers {
+            for idx in only {
+                try inv(idx >= 0 && idx < t.num_hidden_layers, "mlp_only_layers index \(idx) out of range")
+            }
+        }
+        let resolvedFirstKDenseReplace: Int
+        if let fk = t.first_k_dense_replace {
+            try inv(fk >= 0, "first_k_dense_replace \(fk) < 0")
+            resolvedFirstKDenseReplace = fk
+        } else if let denseLayers = t.mlp_only_layers, !denseLayers.isEmpty,
+                  Set(denseLayers) == Set(0..<denseLayers.count) {
+            resolvedFirstKDenseReplace = denseLayers.count
+        } else {
+            resolvedFirstKDenseReplace = 0
+        }
+        let resolvedDecoderSparseStep = t.decoder_sparse_step ?? 1
+        try inv(resolvedDecoderSparseStep >= 1, "decoder_sparse_step \(resolvedDecoderSparseStep) < 1")
+        let resolvedMoELayerFreq = t.moe_layer_freq ?? 1
+        try inv(resolvedMoELayerFreq >= 1, "moe_layer_freq \(resolvedMoELayerFreq) < 1")
+
+        let rawNumExperts = t.num_experts ?? t.n_routed_experts
+        if let rawNumExperts {
+            try inv(rawNumExperts >= 0, "num_experts \(rawNumExperts) < 0")
+        }
+        if familySpec.disallowsMoEConfig {
+            try inv(rawNumExperts == nil,
+                    "num_experts \(rawNumExperts ?? 0) on the dense family '\(family.rawValue)'")
+            if let moeW = t.moe_intermediate_size, moeW > 0 {
+                throw DescriptorError.invariant("moe_intermediate_size \(moeW) on the dense family '\(family.rawValue)'")
+            }
+            if let sharedW = t.shared_expert_intermediate_size, sharedW > 0 {
+                throw DescriptorError.invariant("shared_expert_intermediate_size \(sharedW) on the dense family '\(family.rawValue)'")
+            }
+        }
+        if familySpec.requiresSparseMoEConfig {
+            guard let experts = rawNumExperts else {
+                throw DescriptorError.invariant("flat config missing 'num_experts' on sparse family '\(family.rawValue)'")
+            }
+            try inv(experts >= 32 && experts % 32 == 0 && experts <= 512,
+                    "num_experts \(experts) must be a multiple of 32 in 32...512")
+            guard let topK = t.num_experts_per_tok else {
+                throw DescriptorError.invariant("flat config missing 'num_experts_per_tok'")
+            }
+            try inv(topK > 0 && topK <= 16 && topK <= experts,
+                    "num_experts_per_tok \(topK) must be in 1...min(16, \(experts))")
+            guard let moeW = t.moe_intermediate_size else {
+                throw DescriptorError.invariant("flat config missing 'moe_intermediate_size'")
+            }
+            try inv(moeW > 0, "moe_intermediate_size \(moeW) <= 0")
+        }
+        if let sw = t.shared_expert_intermediate_size {
+            try inv(sw >= 0, "shared_expert_intermediate_size \(sw) < 0")
+        }
+        let resolvedNumExperts = rawNumExperts.flatMap { $0 > 0 ? $0 : nil }
+        if let n = rawNumExperts, let k = t.num_experts_per_tok {
+            try inv(n > 0 && k > 0 && k <= n, "MoE top-k \(k) > experts \(n)")
+        }
+        let hasDenseLayer: Bool = {
+            guard resolvedNumExperts != nil else { return true }
+            return (0..<t.num_hidden_layers).contains { layer in
+                if resolvedMLPOnly.contains(layer) || layer < resolvedFirstKDenseReplace { return true }
+                if resolvedDecoderSparseStep > 1 && (layer + 1) % resolvedDecoderSparseStep != 0 { return true }
+                if resolvedMoELayerFreq > 1 && (layer - resolvedFirstKDenseReplace) % resolvedMoELayerFreq != 0 { return true }
+                return false
+            }
+        }()
+        if hasDenseLayer || familySpec.disallowsMoEConfig {
+            guard let inter = t.intermediate_size else {
+                throw DescriptorError.invariant("flat config missing 'intermediate_size'")
+            }
+            try inv(inter > 0, "intermediate_size \(inter) <= 0")
+        }
+        return ResolvedMoESchedule(
+            numExperts: resolvedNumExperts,
+            firstKDenseReplace: resolvedFirstKDenseReplace,
+            mlpOnlyLayers: resolvedMLPOnly,
+            decoderSparseStep: resolvedDecoderSparseStep,
+            moeLayerFreq: resolvedMoELayerFreq
+        )
+    }
+
+    private static func parseRoPEScaling(
+        text t: ConfigEnvelope.Text,
+        env: ConfigEnvelope
+    ) throws -> (RoPEScaling?, YarnRopeConfig?) {
+        let candidates: [(type: String?, ropeType: String?, factor: Double?, orig: Int?,
+                          betaFast: Double?, betaSlow: Double?, mscale: Double?, mscaleAllDim: Double?,
+                          defaultMscale: Double)] = [
+            t.rope_scaling.map {
+                ($0.type, $0.rope_type, $0.factor, $0.original_max_position_embeddings,
+                 $0.beta_fast, $0.beta_slow, $0.mscale, $0.mscale_all_dim, 0.0)
+            },
+            t.rope_parameters.map {
+                ($0.type, $0.rope_type, $0.factor, $0.original_max_position_embeddings,
+                 $0.beta_fast, $0.beta_slow, $0.mscale, $0.mscale_all_dim, 1.0)
+            },
+        ].compactMap { $0 }
+
+        for c in candidates {
+            let rawKind = c.ropeType ?? c.type
+            guard let kind = rawKind?.lowercased() else {
+                if c.factor != nil {
+                    throw DescriptorError.invariant("unsupported rope_scaling without a type")
+                }
+                continue
+            }
+            if kind == "default" { continue }
+            guard let factor = c.factor, factor > 0, factor.isFinite else {
+                throw DescriptorError.invariant("rope_scaling '\(kind)' missing positive factor")
+            }
+            let orig = c.orig ?? t.original_max_position_embeddings ?? env.original_max_position_embeddings
+            switch kind {
+            case "yarn":
+                guard let orig, orig > 0 else {
+                    throw DescriptorError.invariant("rope_scaling 'yarn' missing original_max_position_embeddings")
+                }
+                let yarn = YarnRopeConfig(
+                    factor: factor,
+                    originalMaxPositionEmbeddings: orig,
+                    betaFast: c.betaFast ?? 32.0,
+                    betaSlow: c.betaSlow ?? 1.0,
+                    mscale: c.mscale ?? c.defaultMscale,
+                    mscaleAllDim: c.mscaleAllDim ?? 0.0
+                )
+                return (.yarn(yarn), yarn)
+            case "linear":
+                return (.linear(factor: factor), nil)
+            case "dynamic":
+                return (.dynamic(factor: factor, originalMaxPositionEmbeddings: orig), nil)
+            default:
+                throw DescriptorError.invariant("unsupported rope_scaling '\(rawKind ?? kind)'")
+            }
+        }
+        return (nil, nil)
+    }
+
+    /// Return a copy of this descriptor with updated attention bias flags.
+    public func withAttentionBias(qkv: Bool? = nil, output: Bool? = nil) -> QWModelDescriptor {
+        let nextQKV = qkv ?? hasQKVBias
+        let nextOutput = output ?? hasAttnOutputBias
+        if nextQKV == hasQKVBias && nextOutput == hasAttnOutputBias { return self }
+        return QWModelDescriptor(
+            family: family, modelType: modelType, capabilities: capabilities,
+            hidden: hidden, vocab: vocab, denseIntermediate: denseIntermediate,
+            numLayers: numLayers, layerTypes: layerTypes, fullAttentionInterval: fullAttentionInterval,
+            rmsEps: rmsEps, maxPositionEmbeddings: maxPositionEmbeddings,
+            qHeads: qHeads, kvHeads: kvHeads, headDim: headDim,
+            attnOutputGate: attnOutputGate, partialRotaryFactor: partialRotaryFactor, ropeTheta: ropeTheta,
+            indexerHeads: indexerHeads, indexerKvHeads: indexerKvHeads, indexerHeadDim: indexerHeadDim,
+            indexerBudget: indexerBudget, indexerCompressRatio: indexerCompressRatio,
+            numExperts: numExperts, expertsPerTok: expertsPerTok, moeIntermediate: moeIntermediate,
+            sharedExpertIntermediate: sharedExpertIntermediate, expertGateType: expertGateType,
+            hcCount: hcCount, hcLowrank: hcLowrank,
+            gdnQKHeads: gdnQKHeads, gdnVHeads: gdnVHeads, gdnHeadDim: gdnHeadDim,
+            gdnQKVChannels: gdnQKVChannels, gdnZChannels: gdnZChannels, gdnConvKernel: gdnConvKernel,
+            pleLayerIds: pleLayerIds, pleEmbedDim: pleEmbedDim, pleConvKernel: pleConvKernel,
+            ngramSize: ngramSize, headsPerNgram: headsPerNgram, ngramVocabSizeBase: ngramVocabSizeBase,
+            makeNgramVocabDivisibleBy: makeNgramVocabDivisibleBy, splitNgramParts: splitNgramParts,
+            mtpLayers: mtpLayers, mtpUseDedicatedEmbeddings: mtpUseDedicatedEmbeddings, eosTokenId: eosTokenId,
+            mropeSection: mropeSection,
+            visDepth: visDepth, visHidden: visHidden, visHeads: visHeads,
+            visIntermediate: visIntermediate, visPatch: visPatch, visTemporal: visTemporal,
+            visMerge: visMerge, visPosEmbeds: visPosEmbeds, visOut: visOut,
+            imageTokenId: imageTokenId, videoTokenId: videoTokenId,
+            visionStartTokenId: visionStartTokenId, visionEndTokenId: visionEndTokenId,
+            hasQKNorm: hasQKNorm, hasQKVBias: nextQKV, hasAttnOutputBias: nextOutput,
+            usesPlusOneRMSNorm: usesPlusOneRMSNorm,
+            quantization: quantization, hasMropeSection: hasMropeSection,
+            tieWordEmbeddings: tieWordEmbeddings, normTopKProb: normTopKProb,
+            eosTokenIds: eosTokenIds, envelopeModelType: envelopeModelType,
+            loopSettings: loopSettings, mhcConfig: mhcConfig,
+            firstKDenseReplace: firstKDenseReplace,
+            mlpOnlyLayers: mlpOnlyLayers,
+            decoderSparseStep: decoderSparseStep,
+            moeLayerFreq: moeLayerFreq,
+            routedScalingFactor: routedScalingFactor, swigluLimit: swigluLimit,
+            topkMethod: topkMethod, residentExpertsPerLayer: residentExpertsPerLayer,
+            sharedExpertHasGate: sharedExpertHasGate,
+            mlaUseNoPE: mlaUseNoPE, kvLoraRank: kvLoraRank, qLoraRank: qLoraRank,
+            qkNopeHeadDim: qkNopeHeadDim, qkRopeHeadDim: qkRopeHeadDim, vHeadDim: vHeadDim,
+            indexKPoolCompress: indexKPoolCompress, indexKPoolAlwaysSelectTail: indexKPoolAlwaysSelectTail,
+            indexShareForMTP: indexShareForMTP, indexerRopeInterleave: indexerRopeInterleave,
+            gdnVectorDecay: gdnVectorDecay, gdnLowRankDim: gdnLowRankDim,
+            gdnGateLowerBound: gdnGateLowerBound, gdnSeparateConv: gdnSeparateConv,
+            hcaConfig: hcaConfig, hybridMLAConfig: hybridMLAConfig,
+            blockSparseGQAConfig: blockSparseGQAConfig,
+            yarnRopeConfig: yarnRopeConfig,
+            ropeScaling: ropeScaling,
+            slidingWindow: slidingWindow,
+            layerSlidingWindows: layerSlidingWindows,
+            activationKind: activationKind, moeLatentSize: moeLatentSize,
+            latentMoeUseNorm: latentMoeUseNorm,
+            moeSplitFeatureRouting: moeSplitFeatureRouting,
+            moeRouterEnableExpertBias: moeRouterEnableExpertBias,
+            routedScalingFactorLearnable: routedScalingFactorLearnable,
+            multimaxHead: multimaxHead, mtpSharedLastLayer: mtpSharedLastLayer,
+            inkling2Config: inkling2Config, role: role
+        )
     }
 
 }

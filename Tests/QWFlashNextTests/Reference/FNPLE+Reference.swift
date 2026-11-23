@@ -1,7 +1,8 @@
 // FNPLE+Reference.swift — CPU-only PLE & in-memory array rows for tests.
 
 import Foundation
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 
 public struct FNPLE: Sendable {

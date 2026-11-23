@@ -279,6 +279,9 @@ public enum QWChatPolicyResolver {
         supportsTokenConstraints: Bool,
         inner: (any QWTokenConstraint)?
     ) -> QWThinkingBudgetConstraint? {
+        if tokenizer.tokenId(for: "<|content_thinking|>") != nil {
+            return nil
+        }
         let hasKnownEndThink = tokenizer.tokenId(for: "</think>") != nil
             || tokenizer.tokenId(for: "</ernie:think>") != nil
         guard supportsTokenConstraints,

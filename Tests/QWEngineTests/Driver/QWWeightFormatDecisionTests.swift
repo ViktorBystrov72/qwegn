@@ -105,9 +105,8 @@ final class QWWeightFormatDecisionTests: XCTestCase {
         }
     }
 
-    /// A path without a twin keeps the incumbent's container. MTP drafts read
-    /// weights the family has no kernel for; experts and hybrid GDN layers have
-    /// twins, so they keep their native bytes.
+    /// Standard-path architectures (dense, MoE, hybrid GDN) including MTP draft/verify paths
+    /// have native affine twins, so supported quantization pairs keep their native bytes.
     func testAPathWithoutATwinKeepsTheIncumbent() throws {
         let dense = try QWModelGeometry.stubPureAttention()
         let moe = try QWModelGeometry.stubPureMoE()
@@ -115,11 +114,11 @@ final class QWWeightFormatDecisionTests: XCTestCase {
         XCTAssertTrue(QWEngineDriver.familyServes(geometry: dense, mtpDrafts: 0))
         XCTAssertTrue(QWEngineDriver.familyServes(geometry: moe, mtpDrafts: 0))
         XCTAssertTrue(QWEngineDriver.familyServes(geometry: hybrid, mtpDrafts: 0))
-        XCTAssertFalse(QWEngineDriver.familyServes(geometry: dense, mtpDrafts: 1))
+        XCTAssertTrue(QWEngineDriver.familyServes(geometry: dense, mtpDrafts: 1))
         let quantization = QWQuantizationSpec(bits: 3, groupSize: 64)
         XCTAssertEqual(try decide(quantization, geometry: moe), .nativeAffine(bits: 3, groupSize: 64))
         XCTAssertEqual(try decide(quantization, geometry: hybrid), .nativeAffine(bits: 3, groupSize: 64))
-        XCTAssertEqual(try decide(quantization, geometry: dense, mtpDrafts: 1), .hq4G32)
+        XCTAssertEqual(try decide(quantization, geometry: dense, mtpDrafts: 1), .nativeAffine(bits: 3, groupSize: 64))
     }
 
     // MARK: - the containers that never reach the family
@@ -173,10 +172,10 @@ final class QWWeightFormatDecisionTests: XCTestCase {
         XCTAssertTrue(try reason(nil, dense)!.contains("quantisation"))
         XCTAssertTrue(try reason(QWQuantizationSpec(bits: 5, groupSize: 64), dense)!.contains("5-bit"))
         XCTAssertNil(try reason(QWQuantizationSpec(bits: 4, groupSize: 32), dense))
-        // Both MoE and hybrid GDN have twins, so neither is declined.
+        // Both MoE, hybrid GDN, and MTP draft/verify paths have twins, so none is declined.
         XCTAssertNil(try reason(quantization, moe))
         XCTAssertNil(try reason(quantization, hybrid))
-        XCTAssertTrue(try reason(quantization, dense, drafts: 1)!.contains("MTP"))
+        XCTAssertNil(try reason(quantization, dense, drafts: 1))
         // The environment, and the engine's own pack.
         setenv("QW_WEIGHT_FORMAT", "incumbent", 1)
         defer { unsetenv("QW_WEIGHT_FORMAT") }

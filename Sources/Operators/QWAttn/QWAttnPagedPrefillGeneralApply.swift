@@ -41,7 +41,8 @@ public final class QWAttnPagedPrefillGeneral: Sendable {
                        qgate: QWTensorValue,
                        kv: (k: QWKVLayerView, v: QWKVLayerView),
                        out: QWTensorValue,
-                       pos: Int, T: Int) throws {
+                       pos: Int, T: Int,
+                       slidingWindow: Int? = nil) throws {
         let wantQGate = T * geometry.qProjOut
         let wantOut = T * geometry.qHeads * geometry.headDim
         guard pos >= 0, T > 0, T <= 65535,
@@ -80,8 +81,10 @@ public final class QWAttnPagedPrefillGeneral: Sendable {
         case .q8:  q8U = 1
         case .q4:  q8U = 2
         }
+        var swU = UInt32(max(0, slidingWindow ?? geometry.descriptor.slidingWindow ?? 0))
         enc.setBytes(&posU, length: 4, index: 6)
         enc.setBytes(&q8U, length: 4, index: 7)
+        enc.setBytes(&swU, length: 4, index: 8)
 
         // One threadgroup per (head, query); 32 lanes onto the head.
         enc.dispatchThreadgroups(MTLSize(width: geometry.qHeads, height: T, depth: 1),

@@ -37,7 +37,9 @@ extension QWEngineDriver {
                 gu: nextN.layer.gu, down: nextN.layer.down,
                 norm: nextN.sharedHeadNorm,
                 moe: nextN.layer.moe,
-                mla: attn.mla
+                mla: attn.mla,
+                qkvBias: attn.qkvBias,
+                oBias: attn.oBias
             )
         }
             let mPreFcNormEmb = try L.f16wNorm("mtp.pre_fc_norm_embedding.weight", geometry.hidden)
@@ -53,6 +55,8 @@ extension QWEngineDriver {
             let mQ = mAttnSub[0], mK = mAttnSub[1], mV = mAttnSub[2]
             let mO = try L.q4("mtp.layers.0.self_attn.o_proj.weight",
                             n: geometry.hidden, k: geometry.qHeads * geometry.headDim)
+            let mQkvBias = try L.loadGQABiasTripletIfNeeded("mtp.layers.0.self_attn.", geometry: geometry)
+            let mOBias = try L.loadGQAOutputBiasIfNeeded("mtp.layers.0.self_attn.", geometry: geometry)
             let mWq = try L.f16wNorm("mtp.layers.0.self_attn.q_norm.weight", geometry.headDim)
             let mKnBits = try L.normGammaBits("mtp.layers.0.self_attn.k_norm.weight", geometry.headDim)
             let mWkT = try L.allocateWeight(QWTensorShape([(geometry.kvHeads * geometry.headDim)], .f16))
@@ -101,7 +105,9 @@ extension QWEngineDriver {
                 postAttnNorm: mPostAttnNorm,
                 gu: mGu, down: mDown,
                 norm: mNorm,
-                moe: mMoE
+                moe: mMoE,
+                qkvBias: mQkvBias,
+                oBias: mOBias
             )
     }
 
@@ -121,34 +127,89 @@ extension QWEngineDriver {
         }
     }
 
+    private static func resolvedTrunkPoolWeights(
+        attnLayers: [Int], trunkKVBytes: Int, kvMode: QWKVMode, geometry: QWModelGeometry,
+        maxTokens: Int?, prefillChunk: Int
+    ) -> [Int]? {
+        guard geometry.hasAnySlidingWindow, attnLayers.count > 1 else { return nil }
+        let windows = attnLayers.map { geometry.virtualLayerSlidingWindow($0) }
+        guard windows.contains(where: { $0 > 0 }) else { return nil }
+        func weightsFor(_ tok: Int, chunk: Int) -> [Int] {
+            windows.map { w in
+                let cap = w > 0 ? min(tok, w + chunk + 512) : tok
+                return QWEngineDriver.kvPagesPerPool(maxTokens: cap)
+            }
+        }
+        if let maxTokens { return weightsFor(maxTokens, chunk: prefillChunk) }
+        let pageBytes = QWKVCache.pageBytes(mode: kvMode, geometry: geometry)
+        let tablesTotal = QWKVCache.tableSlotBytes * 2 * attnLayers.count * QWKVCache.maxSeqs
+        let targetPages = max(attnLayers.count, (trunkKVBytes - tablesTotal) / (2 * pageBytes))
+        func solveMaxTokens(chunk: Int) -> (tok: Int, total: Int) {
+            var lo = 1, hi = max(geometry.maxPositionEmbeddings, 1_048_576), best = 1
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2
+                let sum = weightsFor(mid, chunk: chunk).reduce(0, +)
+                if sum <= targetPages { best = mid; lo = mid + 1 } else { hi = mid - 1 }
+            }
+            return (best, weightsFor(best, chunk: chunk).reduce(0, +))
+        }
+        let candidates = [prefillChunk, QWPrefillLimits.chunkRows, 2048, 4096, 1024, 3584, 3072, 2560, 1536]
+        for chunk in candidates {
+            let solved = solveMaxTokens(chunk: chunk)
+            if solved.total == targetPages,
+               solved.tok == geometry.maxPositionEmbeddings || solved.tok % 4096 == 0 {
+                return weightsFor(solved.tok, chunk: chunk)
+            }
+        }
+        for chunk in candidates {
+            let solved = solveMaxTokens(chunk: chunk)
+            if solved.total == targetPages { return weightsFor(solved.tok, chunk: chunk) }
+        }
+        return weightsFor(solveMaxTokens(chunk: prefillChunk).tok, chunk: prefillChunk)
+    }
+
     static func makeKVCaches(
         hal: QWHal, arena: QWArena, attnLayers: [Int], kvMode: QWKVMode,
-        geometry: QWModelGeometry, mtpDrafts: Int, trunkKVBytes: Int, mtpKVBytes: Int
+        geometry: QWModelGeometry, mtpDrafts: Int, trunkKVBytes: Int, mtpKVBytes: Int,
+        maxTokens: Int? = nil, prefillChunk: Int = 4096
     ) throws -> (kvCache: QWKVCache, mtpCache: QWKVCache?) {
         func carveSub(_ parent: QWSubAllocator, bytes: Int) throws -> QWSubAllocator {
             let off = try parent.allocate(bytes: bytes)
             return QWSubAllocator(region: QWMRegion(buffer: parent.region.buffer,
                                                     base: parent.region.base + off, length: bytes))
         }
+        let trunkWindows = attnLayers.map { geometry.virtualLayerSlidingWindow($0) }
+        let effectiveTrunkBytes = trunkKVBytes > 0 ? trunkKVBytes
+            : arena.kvRegion().freeBytes + (arena.kvVSub?.freeBytes ?? 0) + (arena.kvAuxSub?.freeBytes ?? 0)
+        let trunkWeights = resolvedTrunkPoolWeights(
+            attnLayers: attnLayers, trunkKVBytes: effectiveTrunkBytes,
+            kvMode: kvMode, geometry: geometry, maxTokens: maxTokens, prefillChunk: prefillChunk)
         guard mtpDrafts > 0 else {
-            let kv = try QWKVCache(hal: hal, arena: arena, layers: attnLayers, mode: kvMode, geometry: geometry)
+            let kv = try QWKVCache(hal: hal, arena: arena, layers: attnLayers, mode: kvMode,
+                                   geometry: geometry, layerSlidingWindows: trunkWindows,
+                                   layerPoolWeights: trunkWeights)
             return (kv, nil)
         }
-        func makeSplitOrSingle(layers: [Int], totalBytes: Int) throws -> QWKVCache {
+        func makeSplitOrSingle(layers: [Int], totalBytes: Int,
+                               windows: [Int], weights: [Int]?) throws -> QWKVCache {
             if let kvV = arena.kvVSub {
                 let vLen = ((totalBytes / 2) / 256) * 256
                 let kLen = totalBytes - vLen
                 let kSub = try carveSub(arena.kvRegion(), bytes: kLen)
                 let vSub = try carveSub(kvV, bytes: vLen)
                 return try QWKVCache(hal: hal, subAllocator: kSub, vSubAllocator: vSub,
-                                     layers: layers, mode: kvMode, arena: arena, geometry: geometry)
+                                     layers: layers, mode: kvMode, arena: arena, geometry: geometry,
+                                     layerSlidingWindows: windows, layerPoolWeights: weights)
             }
             let sub = try carveSub(arena.kvRegion(), bytes: totalBytes)
             return try QWKVCache(hal: hal, subAllocator: sub, layers: layers,
-                                 mode: kvMode, arena: arena, geometry: geometry)
+                                 mode: kvMode, arena: arena, geometry: geometry,
+                                 layerSlidingWindows: windows, layerPoolWeights: weights)
         }
-        let kv = try makeSplitOrSingle(layers: attnLayers, totalBytes: trunkKVBytes)
-        let mtp = try makeSplitOrSingle(layers: [0], totalBytes: mtpKVBytes)
+        let kv = try makeSplitOrSingle(layers: attnLayers, totalBytes: trunkKVBytes,
+                                       windows: trunkWindows, weights: trunkWeights)
+        let mtp = try makeSplitOrSingle(layers: [0], totalBytes: mtpKVBytes,
+                                        windows: [0], weights: nil)
         return (kv, mtp)
     }
 

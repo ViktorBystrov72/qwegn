@@ -1,5 +1,6 @@
 import Foundation
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 // FlashNext decoder layer and text model (HF Qwen4ExpTextDecoderLayer / Qwen4ExpTextModel / Qwen4ExpForCausalLM).
 // Stream layout: rows x (hc*hidden). Layers: optional PLE residual -> HC -> mixer (GDN | full attention)

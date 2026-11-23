@@ -362,10 +362,11 @@ extension QWGemm {
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
-    /// Dense HQ4 GEMM on the NAX/MPP units with single-pass f16 activations: y32[rows, N] = x16 . W^T.
+    /// Dense HQ4/AQ/SHVQ GEMM on the NAX/MPP units with single-pass f16 activations: y32[rows, N] = x16 . W^T.
     public static func encodeNaxF32(_ enc: any MTLComputeCommandEncoder, hal: QWHal, weight: QWWeightView,
                                     x16: QWTensorValue, y16: QWTensorValue, y32: QWTensorValue, rows: Int) throws {
-        precondition(weight.n % 64 == 0 && weight.k % 64 == 0, "dense NAX needs N and K multiples of 64")
+        precondition((weight.n % 64 == 0 || !weight.isIncumbentContainer) && weight.k % 64 == 0,
+                     "dense NAX needs K multiple of 64 (and N multiple of 64 for incumbent HQ4)")
         // BM64 measures faster than BM128 at every M for both containers (M5 Max: 60-64 vs 26-56 TFLOPS).
         let name: String
         switch weight.containerKind {
@@ -380,11 +381,13 @@ extension QWGemm {
         }
         enc.setComputePipelineState(try hal.pipeline(name))
         enc.bindTensors(weight.blocks, x16, y16, y32, startIndex: 0)
-        let outBytes = y32.shape.dtype == .f16 ? 2 : 4
-        let flag = y32.shape.dtype == .f16 ? Int(bitPattern: 0x8000_0000) : 0
+        let outBytes = (y32.shape.dtype == .f16 || y32.shape.dtype == .bf16) ? 2 : 4
+        let flag = y32.shape.dtype == .f16 ? Int(bitPattern: 0x8000_0000)
+            : (y32.shape.dtype == .bf16 ? 0x1000_0000 : 0)
         let useSmallTile = hal.caps.isMetal4TensorCapable
         enc.setUInt32s(weight.n, weight.k, startIndex: 5)
         let chunk = naxRowChunk(rows: rows, k: weight.k)
+        let nTiles = (weight.n + 63) / 64
         var r0 = 0
         while r0 < rows {
             let r = min(chunk, rows - r0)
@@ -395,7 +398,7 @@ extension QWGemm {
                 y32.slice(byteOffset: r0 * weight.n * outBytes, count: r * weight.n).bind(enc, index: 3)
             }
             enc.setUInt32s(r | flag | modeBits, startIndex: 4)
-            enc.dispatchThreadgroups(MTLSize(width: weight.n / 64, height: (r + bm - 1) / bm, depth: 1),
+            enc.dispatchThreadgroups(MTLSize(width: nTiles, height: (r + bm - 1) / bm, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
             r0 += r
         }

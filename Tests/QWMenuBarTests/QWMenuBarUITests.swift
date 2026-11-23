@@ -534,6 +534,240 @@ final class QWMenuBarUITests: XCTestCase {
         fnSettings.mtpBackend = "variational"
         fnSettings.mtpDrafts = 3
         try renderTab(.speculative, settings: fnSettings, size: stdSize, slug: "settings_speculative_variational")
+
+        let inkSettings = QWServerSettings(
+            modelPackPath: "/tmp/Inkling-2-Mini-QWP-Fast",
+            modelName: "Inkling-2-Mini-QWP-Fast",
+            mtpDrafts: 15,
+            mtpBackend: "variational"
+        )
+        XCTAssertEqual(QWModelDescriptor.qwen38_27b.maxSpeculativeDrafts, 15)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "inkling2_loop")?.maxSpeculativeDrafts, 15)
+        XCTAssertEqual(inkSettings.mtpDrafts, 15)
+        try renderTab(.speculative, settings: inkSettings, size: stdSize, slug: "settings_speculative_15drafts")
+    }
+
+    @MainActor
+    func testMenuBarStatusItemFontHasZeroPixelWidthDriftAcrossRegimes() throws {
+        let _ = NSApplication.shared
+        func makeCard(_ id: String, value: String?, unit: String?, number: Double? = nil) -> QWDashboardCard {
+            QWDashboardCard(
+                id: id, title: id, value: value, unit: unit, number: number,
+                provenance: value == nil ? .unavailable : .measured,
+                sampledAt: value == nil ? nil : Date(),
+                age: value == nil ? nil : 0.1,
+                isStale: false, reason: value == nil ? "not measured" : nil, series: []
+            )
+        }
+        func makeDashboard(
+            decode: Double?,
+            prefill: Double?,
+            prefillText: String? = nil,
+            arena: Double?,
+            ctx: Double?,
+            temp: Double?
+        ) -> QWDashboardViewModel {
+            let prefillVal = prefillText ?? prefill.map { String(format: "%.1f", $0) }
+            let prefillUnit: String? = prefillText == nil ? "tok/s" : nil
+            return QWDashboardViewModel(
+                sampledAt: Date(),
+                lifecycle: .init(phase: .loaded, since: Date(), model: "m", detail: nil),
+                modelId: "m",
+                capabilities: [],
+                generation: .decode,
+                facts: nil,
+                cards: [
+                    makeCard("throughput.display_decode_tokens_per_sec", value: decode.map { String(format: "%.1f", $0) }, unit: "tok/s", number: decode),
+                    makeCard("throughput.display_prefill_tokens_per_sec", value: prefillVal, unit: prefillUnit, number: prefill),
+                    makeCard("memory.arena_reserved_bytes", value: arena.map { String(format: "%.2f", $0) }, unit: "GiB", number: arena),
+                    makeCard("context.active_tokens", value: ctx.map { String(Int($0)) }, unit: "tok", number: ctx),
+                    makeCard("hardware.gpu_temp_celsius", value: temp.map { String(format: "%.1f", $0) }, unit: "°C", number: temp),
+                ],
+                actions: [],
+                knobs: ["contextTokens": .int(262_144)],
+                knobSources: [:]
+            )
+        }
+
+        let regimes: [QWDashboardViewModel] = [
+            makeDashboard(decode: 9.5, prefill: 9.5, arena: 8.40, ctx: 38, temp: 48.2),
+            makeDashboard(decode: 91.9, prefill: 93.3, arena: 25.01, ctx: 512, temp: 54.2),
+            makeDashboard(decode: 248.3, prefill: 2450.0, arena: 108.42, ctx: 4096, temp: 102.0),
+            makeDashboard(decode: 1240.0, prefill: 12500.0, arena: 1024.0, ctx: 128_000, temp: 115.0),
+            makeDashboard(decode: 84.0, prefill: nil, prefillText: "from cache", arena: 25.01, ctx: 10_240, temp: 64.0),
+            makeDashboard(decode: nil, prefill: nil, arena: nil, ctx: nil, temp: nil),
+        ]
+
+        let statusImage = QGProcessorLogoView.statusBarImage(pointSize: 18, statusDotColor: .systemBlue)
+        let metricCombos: [Set<QWMenuBarMetric>] = [
+            [.decodeSpeed, .prefillSpeed],
+            Set(QWMenuBarMetric.allCases),
+        ]
+
+        var allButtonsForSnapshot: [NSButton] = []
+        for metrics in metricCombos {
+            var baselineAttrW: CGFloat?
+            var baselineBtnW: CGFloat?
+            for dash in regimes {
+                let title = try XCTUnwrap(QWMenuBarStatusFormatter.statusTitle(
+                    dashboard: dash, isConnected: true, enabledMetrics: metrics, hideSpeedsWhenIdle: false
+                ))
+                let attributed = QWMenuBarStatusStyle.attributedTitle(for: title)
+                let attrW = attributed.size().width
+
+                let button = NSButton()
+                button.isBordered = false
+                button.appearance = NSAppearance(named: .darkAqua)
+                button.image = statusImage
+                button.imagePosition = .imageLeading
+                button.alignment = .left
+                button.font = QWMenuBarStatusStyle.font
+                button.attributedTitle = attributed
+                button.sizeToFit()
+                let btnW = button.fittingSize.width
+
+                if let refAttr = baselineAttrW, let refBtn = baselineBtnW {
+                    XCTAssertEqual(attrW, refAttr, accuracy: 0.01, "Attributed width drifted for '\(title)'")
+                    XCTAssertEqual(btnW, refBtn, accuracy: 0.01, "NSButton width drifted for '\(title)'")
+                } else {
+                    baselineAttrW = attrW
+                    baselineBtnW = btnW
+                }
+                if metrics.count == QWMenuBarMetric.allCases.count {
+                    allButtonsForSnapshot.append(button)
+                }
+            }
+        }
+
+        if let dir = ProcessInfo.processInfo.environment["QWG_SNAPSHOT_DIR"], !dir.isEmpty {
+            let dirURL = URL(fileURLWithPath: dir, isDirectory: true)
+            try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+            let sheetWidth = max(460, ceil((allButtonsForSnapshot.map { $0.fittingSize.width }.max() ?? 432) + 24))
+            let rowHeight: CGFloat = 24
+            let sheetHeight = CGFloat(allButtonsForSnapshot.count) * rowHeight + 24
+            let container = NSView(frame: NSRect(x: 0, y: 0, width: sheetWidth, height: sheetHeight))
+            container.appearance = NSAppearance(named: .darkAqua)
+            container.wantsLayer = true
+            container.layer?.backgroundColor = NSColor(srgbRed: 0.067, green: 0.075, blue: 0.094, alpha: 1.0).cgColor
+            for (index, button) in allButtonsForSnapshot.enumerated() {
+                let y = sheetHeight - 12 - CGFloat(index + 1) * rowHeight
+                button.frame = NSRect(x: 12, y: y, width: button.fittingSize.width, height: rowHeight)
+                container.addSubview(button)
+            }
+            container.layoutSubtreeIfNeeded()
+            try write2xPNG(of: container, size: container.bounds.size, to: dirURL.appendingPathComponent("menubar_status_alignment_2x.png"))
+        }
+    }
+
+    func testShortcutRouterHandlesAllHotkeysCapsLockAndNonLatinLayouts() {
+        XCTAssertEqual(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: ",", keyCode: 43, modifierFlags: [.command],
+                isEditingText: false, isPopoverKey: false
+            ),
+            .openSettings
+        )
+        XCTAssertEqual(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: "R", keyCode: 15, modifierFlags: [.command, .capsLock],
+                isEditingText: false, isPopoverKey: false
+            ),
+            .restartServer
+        )
+        XCTAssertEqual(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: ",", keyCode: 43, modifierFlags: [.command, .function],
+                isEditingText: false, isPopoverKey: false
+            ),
+            .openSettings
+        )
+        XCTAssertEqual(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: "б", keyCode: 43, modifierFlags: [.command],
+                isEditingText: false, isPopoverKey: false
+            ),
+            .openSettings
+        )
+        XCTAssertEqual(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: "ц", keyCode: 13, modifierFlags: [.command],
+                isEditingText: false, isPopoverKey: false
+            ),
+            .closeFrontWindow
+        )
+        XCTAssertNil(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: "a", keyCode: 12, modifierFlags: [.command],
+                isEditingText: true, isPopoverKey: false
+            )
+        )
+        XCTAssertNil(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: "r", keyCode: 15, modifierFlags: [.command],
+                isEditingText: true, isPopoverKey: false
+            )
+        )
+        XCTAssertEqual(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: ",", keyCode: 43, modifierFlags: [.command],
+                isEditingText: true, isPopoverKey: false
+            ),
+            .openSettings
+        )
+        XCTAssertNil(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: ",", keyCode: 43, modifierFlags: [.command, .shift],
+                isEditingText: false, isPopoverKey: false
+            )
+        )
+        XCTAssertEqual(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: "\u{1B}", keyCode: 53, modifierFlags: [.capsLock],
+                isEditingText: false, isPopoverKey: true
+            ),
+            .dismissPopover
+        )
+        XCTAssertNil(
+            QWMenuBarShortcutRouter.resolve(
+                charactersIgnoringModifiers: "\u{1B}", keyCode: 53, modifierFlags: [],
+                isEditingText: false, isPopoverKey: false
+            )
+        )
+    }
+
+    @MainActor
+    func testAppDelegateOpensSingleSettingsWindowAndInstallsMainMenu() throws {
+        _ = NSApplication.shared
+        let telemetry = TelemetryObservable(startServices: false, enableAutoLifecycle: false, initialSettings: QWServerSettings())
+        let delegate = AppDelegate(telemetry: telemetry)
+
+        let repeatComma = try XCTUnwrap(
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [.command],
+                timestamp: 0, windowNumber: 0, context: nil,
+                characters: ",", charactersIgnoringModifiers: ",", isARepeat: true, keyCode: 43
+            )
+        )
+        XCTAssertNil(delegate.handleShortcutEvent(repeatComma))
+        XCTAssertNil(delegate.currentSettingsWindow)
+
+        delegate.openSettingsWindow()
+        let first = try XCTUnwrap(delegate.currentSettingsWindow)
+        delegate.openSettingsWindow()
+        let second = try XCTUnwrap(delegate.currentSettingsWindow)
+        XCTAssertTrue(first === second)
+        XCTAssertEqual(first.title, "Qwegn Settings")
+        XCTAssertEqual(first.identifier?.rawValue, "qwg.settings")
+        XCTAssertTrue(first.contentViewController is NSHostingController<SettingsView>)
+        first.close()
+
+        let menu = delegate.buildMainMenu()
+        let titles = menu.items.compactMap { $0.submenu?.items.map(\.title) }.joined()
+        XCTAssertEqual(menu.items.count, 3)
+        XCTAssertTrue(titles.contains("Settings…"))
+        XCTAssertTrue(titles.contains("Copy"))
+        XCTAssertTrue(titles.contains("Close"))
+        XCTAssertTrue(titles.contains("Quit Qwegn"))
     }
 
     @MainActor

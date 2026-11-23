@@ -38,12 +38,21 @@ private final class ChatStreamCapture: @unchecked Sendable {
     var stoppedByCustomRule = false
     var jsonTracker = QWEngineLifecycleActor.IncrementalJSONObjectTracker()
     var sawToolCallOpen = false
+    var sawInk2ToolOpen = false
+    let isInkling2: Bool
+    let ink2MessageModelId: Int?
+    let ink2ThinkingId: Int?
+    let ink2TextId: Int?
+    let ink2InvokeToolId: Int?
+    let ink2EndMessageId: Int?
+    let ink2ControlIds: Set<Int>
     let onToken: ((String) -> Void)?
     let onTokenLogprob: ((ChatLogprobTokenEntry) -> Void)?
     let modelBackend: any QWModelBackend
 
     init(
         tok: QWTokenizer,
+        isInkling2: Bool,
         initialPrefix: String,
         initialHealUTF8: Int,
         startsInThinking: Bool,
@@ -54,6 +63,16 @@ private final class ChatStreamCapture: @unchecked Sendable {
         modelBackend: any QWModelBackend
     ) {
         self.tok = tok
+        self.isInkling2 = isInkling2
+        self.ink2MessageModelId = isInkling2 ? tok.tokenId(for: "<|message_model|>") : nil
+        self.ink2ThinkingId = isInkling2 ? tok.tokenId(for: "<|content_thinking|>") : nil
+        self.ink2TextId = isInkling2 ? tok.tokenId(for: "<|content_text|>") : nil
+        self.ink2InvokeToolId = isInkling2 ? tok.tokenId(for: "<|content_invoke_tool_json|>") : nil
+        self.ink2EndMessageId = isInkling2 ? tok.tokenId(for: "<|end_message|>") : nil
+        self.ink2ControlIds = Set([
+            self.ink2MessageModelId, self.ink2ThinkingId, self.ink2TextId,
+            self.ink2InvokeToolId, self.ink2EndMessageId,
+        ].compactMap { $0 })
         self.stopScanner = QWEngineLifecycleActor.IncrementalStopScanner(stops: customStops)
         self.endThinkCloseTag = endThinkCloseTag
         self.streamDecoder = QWStreamDecoder(tok)
@@ -141,7 +160,16 @@ private final class ChatStreamCapture: @unchecked Sendable {
                 telemetry.recordDecodeToken()
             }
             let wasInThinking = inThinking
-            if inThinking {
+            if isInkling2 {
+                if id == ink2ThinkingId {
+                    inThinking = true
+                } else if id == ink2EndMessageId || id == ink2MessageModelId || id == ink2TextId || id == ink2InvokeToolId {
+                    inThinking = false
+                    if id == ink2InvokeToolId { sawInk2ToolOpen = true }
+                } else if inThinking {
+                    reasoningTokenCount += 1
+                }
+            } else if inThinking {
                 reasoningTokenCount += 1
                 if id == endThinkTokenId { inThinking = false }
             }
@@ -154,7 +182,7 @@ private final class ChatStreamCapture: @unchecked Sendable {
                     stoppedByCustomRule = true
                     return (false, nil)
                 }
-            } else if let decoded = try? streamDecoder.decode(id, skipSpecialTokens: true) {
+            } else if let decoded = try? streamDecoder.decode(id, skipSpecialTokens: !ink2ControlIds.contains(id)) {
                 piece = (decoded.isEmpty && wasInThinking && id == endThinkTokenId) ? endThinkCloseTag : decoded
             }
             guard !piece.isEmpty else { return (true, nil) }
@@ -193,6 +221,10 @@ private final class ChatStreamCapture: @unchecked Sendable {
             }
             if isConstrainedJson, let jsonEnd = jsonTracker.completedByteOffset {
                 fullUTF8.removeSubrange(jsonEnd..<fullUTF8.count)
+                stoppedByCustomRule = true
+                return (false, emitAndReturnStringLocked(upTo: fullUTF8.count))
+            }
+            if stopOnSingleTool && isInkling2 && sawInk2ToolOpen && id == ink2EndMessageId {
                 stoppedByCustomRule = true
                 return (false, emitAndReturnStringLocked(upTo: fullUTF8.count))
             }
@@ -383,7 +415,8 @@ extension QWEngineLifecycleActor {
             ? "</ernie:think>"
             : "</think>"
         let capture = ChatStreamCapture(
-            tok: tok, initialPrefix: prepared.isConstrainedJson ? "{" : "",
+            tok: tok, isInkling2: loaded.chatTemplate.isInkling2Template,
+            initialPrefix: prepared.isConstrainedJson ? "{" : "",
             initialHealUTF8: heal.stripUTF8Count, startsInThinking: prepared.shouldThink,
             customStops: prepared.customStopStrings, endThinkCloseTag: endThinkCloseTag,
             onToken: onToken, onTokenLogprob: onTokenLogprob, modelBackend: loaded.modelBackend

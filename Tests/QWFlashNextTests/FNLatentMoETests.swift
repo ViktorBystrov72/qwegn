@@ -1,7 +1,7 @@
 import Foundation
 import Metal
 import XCTest
-@testable import QWFlashNext
+@testable import QWEngine
 import QWAlloc
 import QWCore
 import QWGEMM

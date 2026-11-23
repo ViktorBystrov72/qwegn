@@ -42,14 +42,14 @@ final class QWMoEReuseTests: XCTestCase {
     func testExpertReuseAndIndependentRowsMatchCPU() throws {
         let experts = 15, routes = 3, hidden = 64, intermediate = 64
         let patterns: [[Int32]] = [
-            [0, 1, 2, 1, 3, 2, 0, 3, -1, 3, 1, 0, 4, 5, 6],
-            Array(0..<15).map(Int32.init),
+            [0, 1, 2, 1, 3, 2, 0, 3, -1, 3, 1, 0, 4, 5, 6, 0, 1, 0, 2, 0, 3, 1, 0, 4],
+            (0..<24).map { Int32($0 % experts) },
         ]
         for format in Format.allCases {
             let hal = try QWHal(geometry: .qwen38_27b, weightBasis: format.basis)
             let gateBank = try bank(rows: experts * 2 * intermediate, columns: hidden, format: format)
             let downBank = try bank(rows: experts * hidden, columns: intermediate, format: format)
-            for tokens in 1...5 {
+            for tokens in [1, 2, 3, 4, 5, 8] {
                 for pattern in patterns {
                     let ids = Array(pattern.prefix(tokens * routes))
                     let arena = try QWArena(hal: hal, weights: gateBank.count + downBank.count + (1 << 20),

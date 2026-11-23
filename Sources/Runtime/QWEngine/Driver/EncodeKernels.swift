@@ -231,10 +231,9 @@ extension QWEngineDriver {
                             kv: (k: QWKVLayerView, v: QWKVLayerView),
                             k: QWTensorValue, v: QWTensorValue,
                             startPos: Int, t: Int) {
-        // The frozen writer's row stride and its per-head scale/group map
-        // are the 27B's 4 heads × 256 halves, so it serves that shape only;
-        // every other shape takes the general writer (f16, q8 and q4 pages).
-        let general = !geometry.is27BKVShape
+        // The specialized writer's row stride and per-head scale/group map
+        // require 4 KV heads × 256 halves (1024-half row stride); others use general.
+        let general = !geometry.matchesKVStride1024Kernel
         enc.setComputePipelineState(general ? psoKVPagedWriteGeneral : psoKVPagedWrite)
         enc.setBuffer(kv.k.pool.buffer, offset: kv.k.pool.base, index: 0)
         enc.setBuffer(kv.v.pool.buffer, offset: kv.v.pool.base, index: 1)
@@ -251,9 +250,10 @@ extension QWEngineDriver {
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }
 
-    /// Whether the attention zero-pad serves this geometry.
+    /// Whether the attention zero-pad serves the specialized non-paged prefill kernel.
     public static func zeroPadServes(geometry: QWModelGeometry) -> Bool {
-        geometry.is27BShape
+        geometry.matchesHead256GQA6Kernel && geometry.attnOutputGate
+            && (geometry.descriptor.slidingWindow ?? 0) == 0
     }
 
     /// The threadgroup count for the SwiGLU kernel's grid. Rounded UP to

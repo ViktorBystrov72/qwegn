@@ -126,7 +126,7 @@ public enum QWImageDecoder {
         throw QWImageDecoderError.disallowedImageSource("Rejected image URL '\(trimmed.prefix(48))'")
     }
 
-    private static func resolveSourceData(urlOrDataUri: String, policy: QWImageDecodePolicy) throws -> Data {
+    static func resolveSourceData(urlOrDataUri: String, policy: QWImageDecodePolicy) throws -> Data {
         let classified = try validateSourcePolicy(urlOrDataUri: urlOrDataUri, policy: policy)
         switch classified {
         case .dataURI(let trimmed):
@@ -141,7 +141,7 @@ public enum QWImageDecoder {
         }
     }
 
-    private static func resolveSourceDataAsync(urlOrDataUri: String, policy: QWImageDecodePolicy) async throws -> Data {
+    static func resolveSourceDataAsync(urlOrDataUri: String, policy: QWImageDecodePolicy) async throws -> Data {
         let classified = try validateSourcePolicy(urlOrDataUri: urlOrDataUri, policy: policy)
         switch classified {
         case .remoteURL(let url):
@@ -191,7 +191,7 @@ public enum QWImageDecoder {
         return decoded
     }
 
-    private static func runOffCooperativePool<T: Sendable>(
+    static func runOffCooperativePool<T: Sendable>(
         _ work: @escaping @Sendable () throws -> T
     ) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
@@ -299,6 +299,7 @@ public enum QWImageDecoder {
         let patch: Int
         let merge: Int
         let posSide: Int
+        let isInkling2: Bool
         let allowDataURLs: Bool
         let allowLocalImagePaths: Bool
         let allowRemoteImageURLs: Bool
@@ -378,6 +379,7 @@ public enum QWImageDecoder {
             patch: spec.patch,
             merge: spec.merge,
             posSide: spec.posSide,
+            isInkling2: spec.isInkling2,
             allowDataURLs: policy.allowDataURLs,
             allowLocalImagePaths: policy.allowLocalImagePaths,
             allowRemoteImageURLs: policy.allowRemoteImageURLs
@@ -454,13 +456,26 @@ public enum QWImageDecoder {
                     try visionBackend.prepareForPrompt(hasImages: true)
                     loadedNow = !wasLoaded && visionBackend.isLoaded
                 }
-                let (decoded, grid) = try await decodeSmartResizedAsync(
-                    urlOrDataUri: urlStr, maxPixels: maxPixels, policy: policy, spec: spec
-                )
+                let patches: [Float]
+                let grid: QWVisionGrid
+                if spec.isInkling2 {
+                    let prep = try await prepareInkling2PatchesAsync(
+                        urlOrDataUri: urlStr, maxPixels: maxPixels, policy: policy, spec: spec
+                    )
+                    patches = prep.patches
+                    grid = prep.grid
+                } else {
+                    let (decoded, decodedGrid) = try await decodeSmartResizedAsync(
+                        urlOrDataUri: urlStr, maxPixels: maxPixels, policy: policy, spec: spec
+                    )
+                    grid = decodedGrid
+                    patches = try qwBuildPatchSlab(
+                        imageRGB: decoded.rgb, height: decoded.height, width: decoded.width, grid: grid
+                    )
+                }
                 let t0 = clock.now
-                let visualTokens = try await qwEncodeVision(
-                    imageRGB: decoded.rgb, height: decoded.height, width: decoded.width,
-                    grid: grid, backend: visionBackend
+                let visualTokens = try await visionBackend.encode(
+                    patches: patches, grid: grid.plan, bins: grid.interpBins, posIds: grid.ropePositions
                 )
                 let d = t0.duration(to: clock.now)
                 let ms = Double(d.components.attoseconds) / 1e15 + Double(d.components.seconds) * 1e3
@@ -507,7 +522,7 @@ public enum QWImageDecoder {
         )
     }
 
-    private static func inspectSource(
+    static func inspectSource(
         data: Data,
         policy: QWImageDecodePolicy
     ) throws -> (source: CGImageSource, width: Int, height: Int, orientation: UInt32) {
@@ -670,12 +685,23 @@ public final class QWCLIVisionController: @unchecked Sendable {
             if !backend.isLoaded {
                 try backend.prepareForPrompt(hasImages: true)
             }
-            let (decoded, grid) = try QWImageDecoder.decodeSmartResized(
-                urlOrDataUri: path, maxPixels: maxPixels, policy: .cliLocal, spec: spec
-            )
-            let patches = try qwBuildPatchSlab(
-                imageRGB: decoded.rgb, height: decoded.height, width: decoded.width, grid: grid
-            )
+            let patches: [Float]
+            let grid: QWVisionGrid
+            if spec.isInkling2 {
+                let prep = try QWImageDecoder.prepareInkling2Patches(
+                    urlOrDataUri: path, maxPixels: maxPixels, policy: .cliLocal, spec: spec
+                )
+                patches = prep.patches
+                grid = prep.grid
+            } else {
+                let (decoded, decodedGrid) = try QWImageDecoder.decodeSmartResized(
+                    urlOrDataUri: path, maxPixels: maxPixels, policy: .cliLocal, spec: spec
+                )
+                grid = decodedGrid
+                patches = try qwBuildPatchSlab(
+                    imageRGB: decoded.rgb, height: decoded.height, width: decoded.width, grid: grid
+                )
+            }
             let visualTokens = try backend.encodeSync(
                 patches: patches, grid: grid.plan, bins: grid.interpBins, posIds: grid.ropePositions
             )

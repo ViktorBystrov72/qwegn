@@ -3,9 +3,10 @@ import Foundation
 import QWCore
 import QWHAL
 import QWAlloc
+import QWAttn
 import QWGEMM
 import QWRope
-@testable import QWFlashNext
+@testable import QWEngine
 
 /// Sparse gated attention (one query, selected 4-token blocks plus the causal tail) at decode depth, against a CPU
 /// reference of the same math: scores over the selected slots, softmax, value sum, sigmoid gate, 32-point WHT.
@@ -263,7 +264,7 @@ final class FNMetalSparseAttnTests: XCTestCase {
             rotaryDim: rot, compress: 4, blockTopK: 512, bankRows: bankRows,
             rope: QWRopeCPU(rotaryDim: rot, theta: 10000.0)
         )
-        let state = try FNGPUAttnDecodeState(arena: arena, mixer: mixer, hidden: 2560, capacity: cap, kvMode: .f16)
+        let state = try QWQSACacheState(arena: arena, mixer: mixer, hidden: 2560, capacity: cap, kvMode: .f16)
         XCTAssertEqual(state.fullCapacity, cap)
         XCTAssertEqual(state.capacity, cap)
 
@@ -305,18 +306,18 @@ final class FNMetalSparseAttnTests: XCTestCase {
             heads: 16, kvHeads: 4, headDim: 256, indexHeads: NI, indexKVHeads: 1, indexHeadDim: DI,
             rotaryDim: 64, compress: 4, blockTopK: topK, bankRows: 16 * 512 + 8 * 256 + 5 * 128,
             rope: QWRopeCPU(rotaryDim: 64, theta: 10000.0))
-        let dummyState = try FNGPUAttnDecodeState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
+        let dummyState = try QWQSACacheState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
 
-        let wardReg = try FNGPUAttnDecodeState.allocateLSAClusters(
+        let wardReg = try QWQSACacheState.allocateLSAClusters(
             hal: Self.hal, kvCap: 262_144, indexHeadDim: DI,
             states: Array(repeating: (dummyState, nil), count: 13), clusterBlock: 512)
-        let emReg = try FNGPUAttnDecodeState.allocateLSAClusters(
+        let emReg = try QWQSACacheState.allocateLSAClusters(
             hal: Self.hal, kvCap: 262_144, indexHeadDim: DI,
             states: Array(repeating: (dummyState, nil), count: 13), clusterBlock: 4096)
         XCTAssertLessThan(Double(emReg.length), Double(wardReg.length) * 0.25,
                           "e-means QSA cluster region must shrink per-layer cluster RAM dramatically vs Ward")
 
-        _ = try FNGPUAttnDecodeState.allocateLSAClusters(
+        _ = try QWQSACacheState.allocateLSAClusters(
             hal: Self.hal, kvCap: totalTokens, indexHeadDim: DI, states: [(dummyState, nil)], clusterBlock: 4096)
         let clusters = try XCTUnwrap(dummyState.lsaClusters)
         XCTAssertTrue(clusters.isEmeans)
@@ -416,11 +417,11 @@ final class FNMetalSparseAttnTests: XCTestCase {
             heads: 16, kvHeads: 4, headDim: 256, indexHeads: NI, indexKVHeads: 1, indexHeadDim: DI,
             rotaryDim: 64, compress: 4, blockTopK: topK, bankRows: 16 * 512 + 8 * 256 + 5 * 128,
             rope: QWRopeCPU(rotaryDim: 64, theta: 10000.0))
-        let stWard = try FNGPUAttnDecodeState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
-        let stEm = try FNGPUAttnDecodeState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
-        _ = try FNGPUAttnDecodeState.allocateLSAClusters(
+        let stWard = try QWQSACacheState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
+        let stEm = try QWQSACacheState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
+        _ = try QWQSACacheState.allocateLSAClusters(
             hal: Self.hal, kvCap: maxT, indexHeadDim: DI, states: [(stWard, nil)], clusterBlock: 512)
-        _ = try FNGPUAttnDecodeState.allocateLSAClusters(
+        _ = try QWQSACacheState.allocateLSAClusters(
             hal: Self.hal, kvCap: maxT, indexHeadDim: DI, states: [(stEm, nil)], clusterBlock: 4096)
         let wardC = try XCTUnwrap(stWard.lsaClusters)
         let emC = try XCTUnwrap(stEm.lsaClusters)
@@ -589,5 +590,175 @@ final class FNMetalSparseAttnTests: XCTestCase {
         print(String(format: "QSA-COARSE-TILED T=%d maxAbsErr=%.3e maxRelErr=%.3e", T, maxAbsErr, maxRelErr))
         XCTAssertLessThan(maxAbsErr, 1e-4, "coarse tiled QSA max abs err \(maxAbsErr)")
         XCTAssertLessThan(maxRelErr, 5e-4, "coarse tiled QSA max rel err \(maxRelErr)")
+    }
+
+    func testRecommendedNAXSplitsAndCacheStateSplitBuffers() throws {
+        XCTAssertEqual(QWQSAEncoders.recommendedNAXSplits(rows: 1, kvHeads: 2, pos0: 2048), 20)
+        XCTAssertEqual(QWQSAEncoders.recommendedNAXSplits(rows: 1, kvHeads: 4, pos0: 2048), 20)
+        XCTAssertEqual(QWQSAEncoders.recommendedNAXSplits(rows: 4, kvHeads: 2, pos0: 2048), 10)
+        XCTAssertEqual(QWQSAEncoders.recommendedNAXSplits(rows: 8, kvHeads: 2, pos0: 2048), 5)
+        XCTAssertEqual(QWQSAEncoders.recommendedNAXSplits(rows: 1, kvHeads: 2, pos0: 256), 3)
+        XCTAssertEqual(FNKVStorageMode.f32.sparseGatedNAXSplitKernelName, "qwg_attn_sparse_gated_nax_split_f32")
+        XCTAssertEqual(FNKVStorageMode.f16.sparseGatedNAXSplitKernelName, "qwg_attn_sparse_gated_nax_split_f16")
+        XCTAssertEqual(FNKVStorageMode.q8.sparseGatedNAXSplitKernelName, "qwg_attn_sparse_gated_nax_split_q8")
+        XCTAssertEqual(FNKVStorageMode.q4.sparseGatedNAXSplitKernelName, "qwg_attn_sparse_gated_nax_split_q4")
+        XCTAssertEqual(FNKVStorageMode.sparseGatedNAXCombineKernelName, "qwg_attn_sparse_gated_nax_combine")
+
+        let nh = 24, nkv = 2, D = 256, rot = 64
+        let arena = try QWArena(hal: Self.hal, weights: 2 << 20, activations: 64 << 20, kv: 64 << 20, gdnStates: 0)
+        let dummyW = try arena.weightsRegion().allocate(QWTensorShape([256], .f16))
+        let dummyView = try XCTUnwrap(QWWeightView(blocks: dummyW, n: 16, k: 32, isRotated: true))
+        let dummyNorm = try arena.activationsRegion().allocate(QWTensorShape([D], .f32))
+        let mixer = FNGPUAttnMixer(
+            bank: dummyView, oProj: dummyView, qNorm: dummyNorm, kNorm: dummyNorm, iqNorm: dummyNorm, ikNorm: dummyNorm,
+            heads: nh, kvHeads: nkv, headDim: D, indexHeads: 4, indexKVHeads: 1, indexHeadDim: 128,
+            rotaryDim: rot, compress: 4, blockTopK: 512, bankRows: nh * 2 * D + 2 * nkv * D + 5 * 128,
+            rope: QWRopeCPU(rotaryDim: rot, theta: 10000.0))
+        let st1 = try QWQSACacheState(arena: arena, mixer: mixer, hidden: 2560, capacity: 1024, kvMode: .q4)
+        XCTAssertEqual(st1.maxSplits, 32)
+        XCTAssertEqual(st1.splitPartO.shape.dims, [1, nh, 32, D])
+        XCTAssertEqual(st1.splitPartML.shape.dims, [1, nh, 32, 2])
+        let st4 = try QWQSACacheState(sharingCachesOf: st1, arena: arena, mixer: mixer, rows: 4)
+        XCTAssertEqual(st4.splitPartO.shape.dims, [4, nh, 32, D])
+        XCTAssertEqual(st4.splitPartML.shape.dims, [4, nh, 32, 2])
+        let st12 = try QWQSACacheState(sharingCachesOf: st1, arena: arena, mixer: mixer, rows: 12)
+        XCTAssertEqual(st12.splitPartO.shape.dims, [8, nh, 32, D])
+        XCTAssertEqual(st12.splitPartML.shape.dims, [8, nh, 32, 2])
+    }
+
+    func testSplitKNAXParityAcrossKVModesAndSplits() throws {
+        try XCTSkipUnless(Self.hal.caps.isMetal4TensorCapable, "Sparse NAX attention requires Metal 4 tensor hardware")
+        for mode: FNKVStorageMode in [.f32, .f16, .q8, .q4] {
+            try checkSplitKNAX(rows: 1, heads: 16, kvHeads: 4, pos0: 300, mode: mode, splitsList: [1, 4, 20])
+            try checkSplitKNAX(rows: 4, heads: 24, kvHeads: 2, pos0: 2500, mode: mode, splitsList: [1, 4, 20])
+        }
+    }
+
+    private func checkSplitKNAX(rows T: Int, heads nh: Int, kvHeads nkv: Int, pos0: Int,
+                                mode: FNKVStorageMode, splitsList: [Int]) throws {
+        let D = 256, cache = pos0 + T, maxSplits = 32
+        let arena = try QWArena(hal: Self.hal, weights: 1 << 20, activations: 64 << 20, kv: 0, gdnStates: 0)
+        let act = arena.activationsRegion()
+        var seed: UInt32 = 13579 &+ UInt32(T * 31 + nh * 7 + pos0)
+        func rnd() -> Float {
+            seed = seed &* 1664525 &+ 1013904223
+            return Float(Int32(truncatingIfNeeded: seed)) * 1e-9 * 0.25
+        }
+        let qVals = (0..<(T * nh * D)).map { _ in rnd() }
+        let gVals = (0..<(T * nh * D)).map { _ in rnd() }
+        var listV = [Int32](repeating: 0, count: T * 512)
+        for t in 0..<T {
+            let complete = (pos0 + t + 1) / 4
+            let baseBlk = max(0, complete - 512) / 2
+            for i in 0..<min(512, complete) { listV[t * 512 + i] = Int32(baseBlk + i) }
+        }
+        let q = try act.allocate(QWTensorShape([T * nh * D], .f32))
+        let gate = try act.allocate(QWTensorShape([T * nh * D], .f32))
+        let list = try act.allocate(QWTensorShape([T * 512], .i32))
+        let partO = try act.allocate(QWTensorShape([T, nh, maxSplits, D], .f32))
+        let partML = try act.allocate(QWTensorShape([T, nh, maxSplits, 2], .f32))
+        let outScalar = try act.allocate(QWTensorShape([T * nh * D], .f32))
+        let outNAX = try act.allocate(QWTensorShape([T * nh * D], .f32))
+        let outSplit = try act.allocate(QWTensorShape([T * nh * D], .f32))
+        let outSplit16 = try act.allocate(QWTensorShape([T * nh * D], .f16))
+        arena.write(q, from: qVals); arena.write(gate, from: gVals); arena.write(list, from: listV)
+
+        let segs = cache * nkv
+        let k: QWTensorValue, v: QWTensorValue, kMeta: QWTensorValue, vMeta: QWTensorValue
+        switch mode {
+        case .f32:
+            k = try act.allocate(QWTensorShape([segs * D], .f32))
+            v = try act.allocate(QWTensorShape([segs * D], .f32))
+            kMeta = try act.allocate(QWTensorShape([1], .f16)); vMeta = kMeta
+            arena.write(k, from: (0..<(segs * D)).map { _ in rnd() })
+            arena.write(v, from: (0..<(segs * D)).map { _ in rnd() })
+        case .f16:
+            k = try act.allocate(QWTensorShape([segs * D], .f16))
+            v = try act.allocate(QWTensorShape([segs * D], .f16))
+            kMeta = try act.allocate(QWTensorShape([1], .f16)); vMeta = kMeta
+            arena.write(k, from: (0..<(segs * D)).map { _ in Float16(rnd()).bitPattern })
+            arena.write(v, from: (0..<(segs * D)).map { _ in Float16(rnd()).bitPattern })
+        case .q8:
+            k = try act.allocate(QWTensorShape([segs * (D / 2)], .f16))
+            v = try act.allocate(QWTensorShape([segs * (D / 2)], .f16))
+            kMeta = try act.allocate(QWTensorShape([segs], .f16))
+            vMeta = try act.allocate(QWTensorShape([segs], .f16))
+            let kQ = (0..<(segs * D)).map { _ in Int8(max(-127, min(127, Int((rnd() * 200.0).rounded())))) }
+            let vQ = (0..<(segs * D)).map { _ in Int8(max(-127, min(127, Int((rnd() * 200.0).rounded())))) }
+            arena.copyIn(k, from: kQ.withUnsafeBufferPointer { Data(buffer: $0) })
+            arena.copyIn(v, from: vQ.withUnsafeBufferPointer { Data(buffer: $0) })
+            arena.write(kMeta, from: (0..<segs).map { _ in Float16(0.005).bitPattern })
+            arena.write(vMeta, from: (0..<segs).map { _ in Float16(0.005).bitPattern })
+        case .q4:
+            k = try act.allocate(QWTensorShape([segs * (D / 4)], .f16))
+            v = try act.allocate(QWTensorShape([segs * (D / 4)], .f16))
+            kMeta = try act.allocate(QWTensorShape([segs * 4], .f16))
+            vMeta = try act.allocate(QWTensorShape([segs * 4], .f16))
+            arena.copyIn(k, from: Data((0..<(segs * (D / 2))).map { _ -> UInt8 in
+                seed = seed &* 1664525 &+ 1013904223
+                return UInt8(truncatingIfNeeded: seed >> 24)
+            }))
+            arena.copyIn(v, from: Data((0..<(segs * (D / 2))).map { _ -> UInt8 in
+                seed = seed &* 1664525 &+ 1013904223
+                return UInt8(truncatingIfNeeded: seed >> 24)
+            }))
+            let mPat = (0..<segs).flatMap { _ -> [UInt16] in
+                [Float16(0.04).bitPattern, Float16(-0.3).bitPattern, Float16(0.04).bitPattern, Float16(-0.3).bitPattern]
+            }
+            arena.write(kMeta, from: mPat); arena.write(vMeta, from: mPat)
+        }
+
+        guard let (cbRef, encRef) = Self.hal.begin() else { throw XCTSkip("no command buffer") }
+        try QWGemm.encodeFnAttnSparseGatedF32(encRef, hal: Self.hal, q: q, k: k, v: v, gate: gate, list: list,
+                                              out: outScalar, rows: T, heads: nh, kvHeads: nkv, pos0: pos0,
+                                              kvMode: mode, kMeta: kMeta, vMeta: vMeta)
+        encRef.setComputePipelineState(try Self.hal.pipeline(mode.sparseGatedNAXKernelName))
+        encRef.bindTensors(q, k, v, gate, list, outNAX, startIndex: 0)
+        encRef.setUInt32s(T, nh, nkv, pos0, startIndex: 6)
+        kMeta.bind(encRef, index: 10); vMeta.bind(encRef, index: 11); outNAX.bind(encRef, index: 12)
+        encRef.setUInt32s(0, startIndex: 13)
+        encRef.dispatchThreadgroups(MTLSize(width: T, height: nkv, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        Self.hal.end(cbRef, encRef)
+        cbRef.waitUntilCompleted()
+        XCTAssertNil(cbRef.error)
+
+        let refScalar = arena.read(outScalar, as: Float.self, count: T * nh * D)
+        let refNAX = arena.read(outNAX, as: Float.self, count: T * nh * D)
+        func relErr(_ a: [Float], _ b: [Float]) -> Double {
+            var s = 0.0, r = 0.0
+            for i in 0..<a.count { let e = Double(a[i]) - Double(b[i]); s += e * e; r += Double(b[i]) * Double(b[i]) }
+            return (s / max(r, 1e-30)).squareRoot()
+        }
+        for sp in splitsList {
+            // Seed stale NaNs in unused split slots to verify combine ignores ml.y == 0 splits.
+            let staleNan = [Float](repeating: .nan, count: T * nh * maxSplits * D)
+            arena.write(partO, from: staleNan)
+            guard let (cb, enc) = Self.hal.begin() else { throw XCTSkip("no command buffer") }
+            try QWGemm.encodeFnAttnSparseGatedF32(enc, hal: Self.hal, q: q, k: k, v: v, gate: gate, list: list,
+                                                  out: outSplit, rows: T, heads: nh, kvHeads: nkv, pos0: pos0,
+                                                  kvMode: mode, kMeta: kMeta, vMeta: vMeta,
+                                                  splitPartO: partO, splitPartML: partML, maxSplits: maxSplits, splits: sp)
+            Self.hal.end(cb, enc)
+            cb.waitUntilCompleted()
+            XCTAssertNil(cb.error)
+            let got = arena.read(outSplit, as: Float.self, count: T * nh * D)
+            XCTAssertLessThan(relErr(got, refNAX), sp == 1 ? 1e-6 : 5e-4,
+                              "Split-K vs unsplit NAX mismatch (mode=\(mode), T=\(T), splits=\(sp))")
+            XCTAssertLessThan(relErr(got, refScalar), 3e-3,
+                              "Split-K vs scalar mismatch (mode=\(mode), T=\(T), splits=\(sp))")
+        }
+        if mode == .q4 && T == 1 {
+            guard let (cb16, enc16) = Self.hal.begin() else { throw XCTSkip("no command buffer") }
+            try QWGemm.encodeFnAttnSparseGatedF32(enc16, hal: Self.hal, q: q, k: k, v: v, gate: gate, list: list,
+                                                  out: outSplit, rows: T, heads: nh, kvHeads: nkv, pos0: pos0,
+                                                  kvMode: mode, kMeta: kMeta, vMeta: vMeta, out16: outSplit16,
+                                                  splitPartO: partO, splitPartML: partML, maxSplits: maxSplits, splits: 20)
+            Self.hal.end(cb16, enc16)
+            cb16.waitUntilCompleted()
+            XCTAssertNil(cb16.error)
+            let got16 = arena.read(outSplit16, as: UInt16.self, count: T * nh * D).map { Float(Float16(bitPattern: $0)) }
+            XCTAssertLessThan(relErr(got16, refNAX), 2e-3, "Split-K out16 mismatch")
+        }
     }
 }

@@ -88,7 +88,7 @@ public final class QWKVSharedPrefix: @unchecked Sendable {
         self.epoch = epoch
         self.pages = pages
         self.mode = mode
-        self.pageCount = pages.reduce(0) { $0 + $1.count }
+        self.pageCount = pages.reduce(0) { $0 + $1.filter { $0 >= 0 }.count }
         self.memoryBytes = self.pageCount * cache.bytesPerPage
     }
 

@@ -88,7 +88,32 @@ METAL_FUNC void qwg_fwht32_vec8_f32(thread float (&w)[8], ushort lane) {
     }
 }
 
-template <uint KV_MODE>
+template <typename TileT>
+static inline void qwg_fn_extract_of_vec8(thread const TileT& of0, thread const TileT& of1,
+                                          thread const TileT& of2, thread const TileT& of3,
+                                          short i, short jj, float scale, thread float (&w)[8]) {
+    #pragma unroll
+    for (short j = 0; j < 4; ++j) {
+        float e0, e1;
+        if (jj == 0) {
+            e0 = of0[4 * i + j];
+            e1 = of0[8 + 4 * i + j];
+        } else if (jj == 1) {
+            e0 = of1[4 * i + j];
+            e1 = of1[8 + 4 * i + j];
+        } else if (jj == 2) {
+            e0 = of2[4 * i + j];
+            e1 = of2[8 + 4 * i + j];
+        } else {
+            e0 = of3[4 * i + j];
+            e1 = of3[8 + 4 * i + j];
+        }
+        w[j]     = e0 * scale;
+        w[4 + j] = e1 * scale;
+    }
+}
+
+template <uint KV_MODE, bool SPLIT>
 static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
                                                   device const uchar* k,
                                                   device const uchar* v,
@@ -100,14 +125,24 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
                                                   device const half*  vMeta,
                                                   device half*        out16,
                                                   uint                hasOut16,
+                                                  device float*       partO,
+                                                  device float2*      partML,
+                                                  uint                splits,
                                                   threadgroup float (&xchg)[2][256],
-                                                  uint2 tg, ushort dh, ushort lane) {
+                                                  uint3 tg, ushort dh, ushort lane) {
     constexpr uint D = 256u;
     constexpr uint TOPK = 512u;
     constexpr int SB = 8;
     const uint tq = tg.x;
     const uint kvh = tg.y;
     if (tq >= T || kvh >= nkv) return;
+    if constexpr (SPLIT) {
+        if (tg.z >= splits) return;
+    } else {
+        (void)partO;
+        (void)partML;
+        (void)splits;
+    }
     const uint gqa = nh / nkv;
     const bool gqa8 = (gqa <= 8u);
     const short qid = short(lane >> 2u);
@@ -119,6 +154,26 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
     const bool r1_ok = !gqa8 && (uint(fm + 8) < gqa);
     const uint h0 = kvh * gqa + (r0_ok ? uint(fm) : 0u);
     const uint h1 = kvh * gqa + (r1_ok ? uint(fm + 8) : 0u);
+
+    const uint pq = pos0 + tq;
+    const int complete = int((pq + 1u) >> 2u);
+    const int nsel = min(int(TOPK), complete);
+    const int ntail = int(pq + 1u) - (complete << 2);
+    const int U = nsel + (ntail > 0 ? 1 : 0);
+    const uint total = uint(nsel) * 4u + uint(ntail);
+    uint sBegin = 0u, sEnd = total;
+    if constexpr (SPLIT) {
+        const uint chunk = (((total + splits - 1u) / splits) + 31u) & ~31u;
+        sBegin = min(total, tg.z * chunk);
+        sEnd = min(total, sBegin + chunk);
+        if (sBegin >= sEnd) {
+            if (dh == 0u && fn == 0) {
+                if (r0_ok) partML[(tq * nh + h0) * splits + tg.z] = float2(-1e30f, 0.0f);
+                if (r1_ok) partML[(tq * nh + h1) * splits + tg.z] = float2(-1e30f, 0.0f);
+            }
+            return;
+        }
+    }
 
     device const float* qp0 = q + (tq * nh + h0) * D + dBase;
     device const float* qp1 = q + (tq * nh + h1) * D + dBase;
@@ -172,12 +227,9 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
         of3[i] = 0.0f;
     }
 
-    const uint pq = pos0 + tq;
-    const int complete = int((pq + 1u) >> 2u);
-    const int nsel = min(int(TOPK), complete);
-    const int ntail = int(pq + 1u) - (complete << 2);
-    const int U = nsel + (ntail > 0 ? 1 : 0);
-    const int nsteps = (U + SB - 1) / SB;
+    const int u0_start = SPLIT ? int(sBegin >> 2u) : 0;
+    const int U_end = SPLIT ? int((sEnd + 3u) >> 2u) : U;
+    const int nsteps = (U_end - u0_start + SB - 1) / SB;
     const float scale2 = rsqrt(float(D)) * 1.4426950408889634f;
     device const int* blk = list + tq * TOPK;
 
@@ -196,15 +248,15 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
         #pragma unroll
         for (short r = 0; r < 4; ++r) {
             const int u = u0 + ((16 * (r >> 1) + int(fm) + 8 * (r & 1)) >> 2);
-            nrow_b[r] = (u < U) ? blk_at(u) : 0;
+            nrow_b[r] = (u < U_end) ? blk_at(u) : 0;
         }
         #pragma unroll
         for (short f = 0; f < 2; ++f) {
             const int u = u0 + 4 * f + (int(fn) >> 2);
-            ncol_n[f] = (u < nsel) ? 4 : ((u < U) ? ntail : 0);
+            ncol_n[f] = (u < min(nsel, U_end)) ? 4 : ((u < U_end) ? ntail : 0);
         }
     };
-    fetch(0);
+    fetch(u0_start);
 
     for (int step = 0; step < nsteps; ++step) {
         uint kseg[4];
@@ -221,7 +273,7 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
             nvis[f] = ncol_n[f];
         }
         if (step + 1 < nsteps) {
-            fetch((step + 1) * SB);
+            fetch(u0_start + (step + 1) * SB);
         }
 
         auto s_ct = qk_op.template get_destination_cooperative_tensor<qa_t, kb_t, float>();
@@ -442,33 +494,36 @@ static inline void qwg_attn_sparse_gated_nax_impl(device const float* q,
         }
     }
 
+    if constexpr (SPLIT) {
+        (void)gate; (void)out; (void)out16; (void)hasOut16;
+        for (short i = 0; i < (gqa8 ? 1 : 2); ++i) {
+            const bool row_ok = (i == 0) ? r0_ok : r1_ok;
+            if (!row_ok) continue;
+            const uint h = (i == 0) ? h0 : h1;
+            if (dh == 0u && fn == 0) {
+                partML[(tq * nh + h) * splits + tg.z] = float2(max_s[i], sum_s[i]);
+            }
+            const size_t outBase = (size_t(tq * nh + h) * splits + tg.z) * D + dBase;
+            #pragma unroll
+            for (short jj = 0; jj < 4; ++jj) {
+                float w[8];
+                qwg_fn_extract_of_vec8(of0, of1, of2, of3, i, jj, 1.0f, w);
+                *(device float4*)(partO + outBase + uint(32 * jj))      = float4(w[0], w[1], w[2], w[3]);
+                *(device float4*)(partO + outBase + uint(32 * jj) + 4u) = float4(w[4], w[5], w[6], w[7]);
+            }
+        }
+        return;
+    }
+
     for (short i = 0; i < (gqa8 ? 1 : 2); ++i) {
         const bool row_ok = (i == 0) ? r0_ok : r1_ok;
         const uint h = (i == 0) ? h0 : h1;
         const float rr = (sum_s[i] > 0.0f) ? (1.0f / sum_s[i]) : 0.0f;
         #pragma unroll
         for (short jj = 0; jj < 4; ++jj) {
-            const uint baseIdx = (tq * nh + h) * D + dBase + uint(32 * jj);
+            const size_t baseIdx = size_t(tq * nh + h) * D + dBase + uint(32 * jj);
             float w[8];
-            #pragma unroll
-            for (short j = 0; j < 4; ++j) {
-                float e0, e1;
-                if (jj == 0) {
-                    e0 = of0[4 * i + j];
-                    e1 = of0[8 + 4 * i + j];
-                } else if (jj == 1) {
-                    e0 = of1[4 * i + j];
-                    e1 = of1[8 + 4 * i + j];
-                } else if (jj == 2) {
-                    e0 = of2[4 * i + j];
-                    e1 = of2[8 + 4 * i + j];
-                } else {
-                    e0 = of3[4 * i + j];
-                    e1 = of3[8 + 4 * i + j];
-                }
-                w[j]     = e0 * rr;
-                w[4 + j] = e1 * rr;
-            }
+            qwg_fn_extract_of_vec8(of0, of1, of2, of3, i, jj, rr, w);
             if (row_ok) {
                 const float4 g0 = *(device const float4*)(gate + baseIdx);
                 const float4 g1 = *(device const float4*)(gate + baseIdx + 4u);
@@ -517,10 +572,106 @@ kernel void NAME(device const float* q        [[buffer(0)]], \
                  ushort dh   [[simdgroup_index_in_threadgroup]], \
                  ushort lane [[thread_index_in_simdgroup]]) { \
     threadgroup float xchg[2][256]; \
-    qwg_attn_sparse_gated_nax_impl<MODE>(q, k, v, gate, list, out, T, nh, nkv, pos0, kMeta, vMeta, out16, hasOut16, xchg, tg, dh, lane); \
+    qwg_attn_sparse_gated_nax_impl<MODE, false>( \
+        q, k, v, gate, list, out, T, nh, nkv, pos0, kMeta, vMeta, out16, hasOut16, \
+        nullptr, nullptr, 1u, xchg, uint3(tg.x, tg.y, 0u), dh, lane); \
+}
+
+#define DEFINE_ATTN_SPARSE_GATED_NAX_SPLIT_KERNEL(NAME, MODE) \
+kernel void NAME(device const float* q      [[buffer(0)]], \
+                 device const uchar* k      [[buffer(1)]], \
+                 device const uchar* v      [[buffer(2)]], \
+                 device const int*   list   [[buffer(3)]], \
+                 device float*       partO  [[buffer(4)]], \
+                 device float2*      partML [[buffer(5)]], \
+                 constant uint&      T      [[buffer(6)]], \
+                 constant uint&      nh     [[buffer(7)]], \
+                 constant uint&      nkv    [[buffer(8)]], \
+                 constant uint&      pos0   [[buffer(9)]], \
+                 constant uint&      splits [[buffer(10)]], \
+                 device const half*  kMeta  [[buffer(11)]], \
+                 device const half*  vMeta  [[buffer(12)]], \
+                 uint3  tg   [[threadgroup_position_in_grid]], \
+                 ushort dh   [[simdgroup_index_in_threadgroup]], \
+                 ushort lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float xchg[2][256]; \
+    qwg_attn_sparse_gated_nax_impl<MODE, true>( \
+        q, k, v, nullptr, list, nullptr, T, nh, nkv, pos0, kMeta, vMeta, nullptr, 0u, \
+        partO, partML, splits, xchg, tg, dh, lane); \
+}
+
+kernel void qwg_attn_sparse_gated_nax_combine(device const float*  partO    [[buffer(0)]],
+                                              device const float2* partML   [[buffer(1)]],
+                                              device const float*  gate     [[buffer(2)]],
+                                              device float*        out      [[buffer(3)]],
+                                              constant uint&       T        [[buffer(4)]],
+                                              constant uint&       nh       [[buffer(5)]],
+                                              constant uint&       splits   [[buffer(6)]],
+                                              device half*         out16    [[buffer(7)]],
+                                              constant uint&       hasOut16 [[buffer(8)]],
+                                              uint   tg   [[threadgroup_position_in_grid]],
+                                              ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint D = 256u;
+    const uint tq = tg / nh;
+    const uint h = tg - tq * nh;
+    if (tq >= T || h >= nh || splits == 0u) return;
+    const uint block32 = ((lane >> 2u) & 4u) | ((lane >> 1u) & 3u);
+    const uint fcol = (((lane >> 2u) & 2u) | (lane & 1u)) * 8u;
+    const uint d = block32 * 32u + fcol;
+    const size_t mlBase = size_t(tq * nh + h) * splits;
+    float mMax = -1e30f;
+    for (uint z = 0u; z < splits; ++z) {
+        const float2 ml = partML[mlBase + z];
+        if (ml.y > 0.0f) mMax = max(mMax, ml.x);
+    }
+    float lSum = 0.0f;
+    float w[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint z = 0u; z < splits; ++z) {
+        const float2 ml = partML[mlBase + z];
+        if (ml.y > 0.0f) {
+            const float alpha = fast::exp2(ml.x - mMax);
+            lSum += ml.y * alpha;
+            const size_t pBase = (mlBase + z) * D + d;
+            const float4 p0 = *(device const float4*)(partO + pBase);
+            const float4 p1 = *(device const float4*)(partO + pBase + 4u);
+            w[0] += alpha * p0.x;
+            w[1] += alpha * p0.y;
+            w[2] += alpha * p0.z;
+            w[3] += alpha * p0.w;
+            w[4] += alpha * p1.x;
+            w[5] += alpha * p1.y;
+            w[6] += alpha * p1.z;
+            w[7] += alpha * p1.w;
+        }
+    }
+    const float invL = (lSum > 0.0f) ? (1.0f / lSum) : 0.0f;
+    const size_t outIdx = size_t(tq * nh + h) * D + d;
+    const float4 g0 = *(device const float4*)(gate + outIdx);
+    const float4 g1 = *(device const float4*)(gate + outIdx + 4u);
+    w[0] = (w[0] * invL) / (1.0f + exp(-g0.x));
+    w[1] = (w[1] * invL) / (1.0f + exp(-g0.y));
+    w[2] = (w[2] * invL) / (1.0f + exp(-g0.z));
+    w[3] = (w[3] * invL) / (1.0f + exp(-g0.w));
+    w[4] = (w[4] * invL) / (1.0f + exp(-g1.x));
+    w[5] = (w[5] * invL) / (1.0f + exp(-g1.y));
+    w[6] = (w[6] * invL) / (1.0f + exp(-g1.z));
+    w[7] = (w[7] * invL) / (1.0f + exp(-g1.w));
+    qwg_fwht32_vec8_f32(w, lane);
+    if (hasOut16 != 0u) {
+        *(device half4*)(out16 + outIdx)      = half4(half(w[0]), half(w[1]), half(w[2]), half(w[3]));
+        *(device half4*)(out16 + outIdx + 4u) = half4(half(w[4]), half(w[5]), half(w[6]), half(w[7]));
+    } else {
+        *(device float4*)(out + outIdx)      = float4(w[0], w[1], w[2], w[3]);
+        *(device float4*)(out + outIdx + 4u) = float4(w[4], w[5], w[6], w[7]);
+    }
 }
 
 DEFINE_ATTN_SPARSE_GATED_NAX_KERNEL(qwg_attn_sparse_gated_nax_f32, 0u)
 DEFINE_ATTN_SPARSE_GATED_NAX_KERNEL(qwg_attn_sparse_gated_nax_f16, 1u)
 DEFINE_ATTN_SPARSE_GATED_NAX_KERNEL(qwg_attn_sparse_gated_nax_q8,  2u)
 DEFINE_ATTN_SPARSE_GATED_NAX_KERNEL(qwg_attn_sparse_gated_nax_q4,  3u)
+
+DEFINE_ATTN_SPARSE_GATED_NAX_SPLIT_KERNEL(qwg_attn_sparse_gated_nax_split_f32, 0u)
+DEFINE_ATTN_SPARSE_GATED_NAX_SPLIT_KERNEL(qwg_attn_sparse_gated_nax_split_f16, 1u)
+DEFINE_ATTN_SPARSE_GATED_NAX_SPLIT_KERNEL(qwg_attn_sparse_gated_nax_split_q8,  2u)
+DEFINE_ATTN_SPARSE_GATED_NAX_SPLIT_KERNEL(qwg_attn_sparse_gated_nax_split_q4,  3u)

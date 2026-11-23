@@ -16,9 +16,11 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
+import QWLoad
 
 extension QWEngineDriver {
     struct StartupContainers {
+        let cfg: StartupConfig
         let tuning: QWEngineTuning
         let osReserveGiB: Double?
         let geometry: QWModelGeometry
@@ -118,11 +120,38 @@ extension QWEngineDriver {
         let tuning = baseTuning.overlaid(environment: cfg.environment)
         let osReserveGiB = explicitOSReserveGiB ?? tuning.osReserveGiB
         let explicitResE = residentExpertsPerLayer ?? tuning.residentExpertsPerLayer
-        let rawGeometry = try QWModelGeometry.load(packPath: packPath).withResidentExperts(explicitResE)
+        var rawGeometry = try QWModelGeometry.load(packPath: packPath).withResidentExperts(explicitResE)
         let root = QWModelRoot(url: URL(fileURLWithPath: packPath))
         let isSafetensors = (root.kind == .safetensorsSingle || root.kind == .safetensorsSharded)
         let stContainer = isSafetensors ? try QWSafeTensorsContainer(url: root.weights) : nil
         let pack = isSafetensors ? nil : try QWQuant.Pack(url: URL(fileURLWithPath: packPath))
+        func ckptHasTensor(_ name: String) -> Bool {
+            func rawExists(_ candidate: String) -> Bool {
+                if let pk = pack { return (try? pk.entry(candidate)) != nil }
+                if let st = stContainer { return st.tensor(candidate) != nil }
+                return false
+            }
+            let resolved = QWCheckpointTensorLoader.resolveName(
+                name,
+                defaultPrefix: Self.P,
+                tieWordEmbeddings: rawGeometry.descriptor.tieWordEmbeddings,
+                rawExists: rawExists
+            )
+            return rawExists(resolved)
+        }
+        if let firstAttnLayer = rawGeometry.descriptor.fullAttentionLayers.first,
+           !rawGeometry.usesLatentOrCompressedAttention {
+            let attnPfx = "\(Self.P)layers.\(firstAttnLayer).self_attn."
+            let ckptHasQKV = ckptHasTensor(attnPfx + "q_proj.bias")
+                || ckptHasTensor(attnPfx + "k_proj.bias")
+                || ckptHasTensor(attnPfx + "v_proj.bias")
+            let ckptHasO = ckptHasTensor(attnPfx + "o_proj.bias")
+            let resolvedQKV = rawGeometry.descriptor.hasQKVBias || rawGeometry.descriptor.hasAttnOutputBias || ckptHasQKV
+            if resolvedQKV != rawGeometry.descriptor.hasQKVBias || ckptHasO != rawGeometry.descriptor.hasAttnOutputBias {
+                rawGeometry = QWModelGeometry(
+                    descriptor: rawGeometry.descriptor.withAttentionBias(qkv: resolvedQKV, output: ckptHasO))
+            }
+        }
         let nextNMTPName = "model.language_model.layers.\(rawGeometry.numLayers).enorm.weight"
         let nextNMTPAltName = "model.layers.\(rawGeometry.numLayers).enorm.weight"
         let maxwellMTPName = "mtp_layers.0.enorm.weight"
@@ -147,19 +176,23 @@ extension QWEngineDriver {
         let allowWeightFreeMTP = !hasMTPWeights && cfg.mtpBackend != .dflash2 && resolvedDraftStrategy == .ngram
         let mtpDrafts = (cfg.mtpBackend == .dflash2 || hasMTPWeights)
             ? requestedMTPDrafts
-            : (allowWeightFreeMTP ? min(requestedMTPDrafts, 7) : 0)
+            : (allowWeightFreeMTP ? min(requestedMTPDrafts, 15) : 0)
         let mtpWeightDrafts = (cfg.mtpBackend == .dflash2) ? 0 : (hasMTPWeights ? mtpDrafts : 0)
         try Self.validateGeometry(rawGeometry, kvMode: kvMode)
         let choice = try Self.weightFormatChoice(for: root, quantization: rawGeometry.descriptor.quantization,
                                                  geometry: rawGeometry, mtpDrafts: mtpWeightDrafts, pack: pack)
+        let headSpec = Self.resolveHeadSpec(st: stContainer, pack: pack, trunkFormat: choice.format,
+                                            geometry: rawGeometry)
+        let resolvedCfg = try cfg.resolvingHead(isQ4g: headSpec.isQ4g, format: headSpec.format)
         let prelimHal = try QWHal(geometry: rawGeometry, weightBasis: choice.format.basis)
         let allowExpertReduction = (explicitResE == nil && rawGeometry.numExperts > 0)
         let (geometry, plannedChunk) = try Self.planResidencyAndChunk(
-            raw: rawGeometry, cfg: cfg, hal: prelimHal, format: choice.format, tuning: tuning,
+            raw: rawGeometry, cfg: resolvedCfg, hal: prelimHal, format: choice.format, tuning: tuning,
             osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize, maxTokens: maxTokens,
             ropeRows: ropeRows, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts, kvMode: kvMode,
             allowExpertReduction: allowExpertReduction)
         return StartupContainers(
+            cfg: resolvedCfg,
             tuning: tuning, osReserveGiB: osReserveGiB, geometry: geometry, hal: prelimHal,
             pack: pack, stContainer: stContainer, weightFormat: choice.format,
             weightFormatDeclineReason: choice.declineReason,
@@ -279,8 +312,9 @@ extension QWEngineDriver {
             } else {
                 embedScalesReader = nil; embedBiasesReader = nil
             }
-            if allowDeviceEmbed, eReader.tensorInfo.dtype != .u32,
-               let sURL = st.shardURL(of: embedName), let rng = st.byteRange(of: embedName) {
+            if allowDeviceEmbed, eReader.tensorInfo.dtype == .bf16,
+               let sURL = st.shardURL(of: embedName), let rng = st.byteRange(of: embedName),
+               rng.lowerBound % 2 == 0 {
                 mtpDeviceEmbedding = try QWMTPEmbeddingTable(hal: hal, path: sURL.path, offset: rng.lowerBound,
                                                              vocabulary: geometry.vocab, hidden: geometry.hidden)
             } else {
@@ -305,7 +339,8 @@ extension QWEngineDriver {
             }
             mtpDraftHead = nil
         }
-        let headStorage = try Self.loadHead(loader: &L, headIsQ4g: cfg.headIsQ4g, geometry: geometry)
+        let headStorage = try Self.loadHead(loader: &L, headIsQ4g: cfg.headIsQ4g,
+                                            headFormat: cfg.headFormat, geometry: geometry)
         if case .q4g(let hw) = headStorage {
             switch hw.view.containerKind {
             case .incumbentHQ4G32:
@@ -314,7 +349,10 @@ extension QWEngineDriver {
                 let isSHVQ = hw.view.containerKind.isSHVQ
                 for name in [QWGemmAQ.kernelName(bits: bits, group: group, isSHVQ: isSHVQ),
                              QWGemmAQ.decodeKernelName(bits: bits, group: group, isSHVQ: isSHVQ),
-                             QWGemmAQ.headArgmaxKernelName(bits: bits, group: group, isSHVQ: isSHVQ)].compactMap({ $0 }) {
+                             QWGemmAQ.decodeM4KernelName(bits: bits, group: group, isSHVQ: isSHVQ),
+                             QWGemmAQ.headArgmaxKernelName(bits: bits, group: group, isSHVQ: isSHVQ),
+                             QWGemmAQ.headArgmaxM4KernelName(bits: bits, group: group, isSHVQ: isSHVQ),
+                             QWGemmAQ.headArgmaxM16KernelName(bits: bits, group: group, isSHVQ: isSHVQ)].compactMap({ $0 }) {
                     _ = try hal.pipeline(name)
                 }
             }

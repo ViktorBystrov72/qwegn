@@ -37,6 +37,7 @@ CLI_FLAGS = {
     "lazyLoad": ("lazy", []),
     "dflashDraftPackPath": ("dflash-draft-pack", []),
     "dflashSelectorTopK": ("dflash-top-k", []),
+    "lsaCrossLoopReuse": ("lsa-cross-loop-reuse", []),
 }
 
 # How a bool knob is spelled. A flag is the CLI idiom, but the thinking
@@ -55,7 +56,7 @@ CLI_COMMANDS = {
     "qwg run": [
         "contextTokens", "maxTokens", "kvMode", "enableThinking", "reasoningEffort",
         "systemPrompt", "gdnPrefill", "evictPrefillScratch",
-        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath",
+        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse",
         "mtpDrafts", "mtpBackend",
         "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth",
         "mtpEntropyThreshold",
@@ -67,7 +68,7 @@ CLI_COMMANDS = {
     "qwg repl": [
         "contextTokens", "maxTokens", "kvMode", "enableThinking", "reasoningEffort",
         "systemPrompt", "warmCacheLimitGiB", "ssdCacheLimitGiB", "cacheDir",
-        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath",
+        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse",
         "mtpDrafts",
         "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding",
         "mtpAdaptiveDepth", "mtpEntropyThreshold",
@@ -78,7 +79,7 @@ CLI_COMMANDS = {
     ],
     "qwg serve": [
         "contextTokens", "kvMode",
-        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath",
+        "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse",
         "mtpDrafts", "mtpBackend",
         "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth",
         "mtpEntropyThreshold",
@@ -123,12 +124,13 @@ CLI_HELP = {
     "memoryPolicy": "Unified-memory residency policy: maxResident or safe.",
     "osReserveGiB": "OS RAM reserve in GiB, subtracted from physical memory.",
     "residentExpertsPerLayer": "Resident hot experts per MoE layer in unified memory (0 sizes automatically from memory policy).",
-    "moeSpecBudget": "MoE-Spec routed expert budget per verify layer (0 is lossless, 1...8 caps cold SSD reads).",
+    "moeSpecBudget": "MoE-Spec routed expert budget per verify layer (0 is lossless, 1...64 caps unique verify experts).",
     "evictPrefillScratch": "Evict the prefill scratchpad from RAM: auto, always or never.",
     "lsaMode": "Latent Sparse Attention mode: off, auto, sidecar, svd or qsa-cluster (arXiv:2610.42147).",
     "lsaBudget": "LSA active key budget k in tokens (512...8192, default 2048).",
     "lsaClusterBlock": "LSA cluster block size L in tokens (256...4096, default 512; 4096 enables e-means).",
     "lsaSidecarPath": "Explicit path to a .qlsa (QLSA0001) projection sidecar file.",
+    "lsaCrossLoopReuse": "Reuse LSA block selections across recurrent visits to the same physical global attention layer (opt-in, lossy).",
     "lazyLoad": "Load the model on the first request instead of at startup.",
     "loadVision": "Load the vision tower into memory for multimodal processing.",
     "streamNgrams": "Stream PLE N-gram table from SSD (~64 MB cache) instead of loading into RAM.",

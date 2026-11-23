@@ -20,7 +20,7 @@ struct Qwg: AsyncParsableCommand {
         commandName: "qwg",
         abstract: "QWEngine — native Swift+Metal inference for Qwen3.8-27B and Qwen3.8-Flash-Next.",
         version: QWVersion.current,
-        subcommands: [Init.self, Inspect.self, Plan.self, Quantize.self, LsaConvert.self, Index.self, Pull.self, Run.self, Repl.self, Bench.self, Serve.self, Telemetry.self])
+        subcommands: [Init.self, Inspect.self, Plan.self, Quantize.self, LsaConvert.self, Index.self, Pull.self, Run.self, Repl.self, Bench.self, Serve.self, Telemetry.self, FanHelper.self, Update.self])
 }
 
 

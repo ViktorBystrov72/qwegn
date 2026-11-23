@@ -375,10 +375,20 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
         let attnYSlice = driver.prefixRows(sc.attnY16, rows: 1, cols: qkvCols, dt: .f16)
         try driver.gemvH16T4(enc, n: qkvCols, k: H, x: sc.ln1, gs: sc.gs, wQ4: w.qkvProj, y16: attnYSlice)
         // C07 fused per-head norm + partial rope (position [pos]).
-        try driver.ropeApply.encodeQK(enc, hal: driver.hal, q: sc.q16, k: sc.k16,
-                                      wq: w.wq, wk: w.wkTiled,
-                                      qOut: sc.qR, kOut: sc.kR,
-                                      positionStart: pos, count: 1)
+        if let qkvBias = w.qkvBias {
+            try driver.ropeApply.encodeExtractQK(enc, hal: driver.hal,
+                                                  attnY: attnYSlice,
+                                                  qOut: sc.qR, kOut: sc.kR, vOut: sc.v16,
+                                                  wq: w.wq, wk: w.wkTiled,
+                                                  qkvBias: qkvBias,
+                                                  positionStart: pos, count: 1,
+                                                  inRowCols: qkvCols)
+        } else {
+            try driver.ropeApply.encodeQK(enc, hal: driver.hal, q: sc.q16, k: sc.k16,
+                                          wq: w.wq, wk: w.wkTiled,
+                                          qOut: sc.qR, kOut: sc.kR,
+                                          positionStart: pos, count: 1)
+        }
         if let mbsa = driver.mbsaOperator, let mbsaW = w.mbsa, pos + 1 <= mbsa.maxContext {
             let idxCols = (geometry.kvHeads + 1) * geometry.headDim
             if let idxProj = mbsaW.qkvIdxProj {
@@ -401,6 +411,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
         // C09 split-K decode: attends the new row from knew/vnew AND
         // materialises it into the page slot in the same launch.
         let attnDecode = driver.attnDecode!
+        let layerSW = geometry.virtualLayerSlidingWindow(l)
         if let mbsa = driver.mbsaOperator, w.mbsa != nil,
            pos >= mbsa.config.denseEquivalenceTokens, pos + 1 <= mbsa.maxContext {
             driver.encodePagedKVWrite(enc, kv: views, k: sc.kR, v: sc.v16, startPos: pos, t: 1)
@@ -408,7 +419,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             mbsa.encodeSelectAndAttend(enc, qgate: sc.qR, kv: views, out: sc.attOut,
                                        layerIndex: fullAttnIdx, pos0: pos, rows: 1,
                                        partials: sc.partials)
-        } else if let lsa = driver.lsaOperator,
+        } else if layerSW == 0, let lsa = driver.lsaOperator,
                   !(context.session.batchedDecodeTouched && pos < driver.lsaConfig.denseBypassThreshold) {
             let isSparse = pos >= driver.lsaConfig.denseBypassThreshold
             lsa.encodeIndexAndCluster(enc, qgate: sc.qR, kIn: sc.kR,
@@ -421,25 +432,31 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                     enc, qgate: sc.qR, kv: views,
                     knew: sc.kR, vnew: sc.v16,
                     partials: sc.partials, out: sc.attOut,
-                    blockList: lsa.blockListScratch,
-                    blockCount: lsa.blockCountScratch,
-                    C: pos, splits: QWAttnDecode.splits(forKeys: activeKeys),
+                    blockList: lsa.blockList(forFullAttnLayer: fullAttnIdx),
+                    blockCount: lsa.blockCount(forFullAttnLayer: fullAttnIdx),
+                    C: pos, splits: QWAttnDecode.splits(forKeys: activeKeys, kvHeads: geometry.kvHeads),
                     listStride: lsa.listStride)
             } else {
                 try attnDecode.encode(enc, qgate: sc.qR, kv: views,
                                       knew: sc.kR, vnew: sc.v16,
                                       partials: sc.partials, out: sc.attOut,
-                                      C: pos, splits: QWAttnDecode.splits(forKeys: pos + 1))
+                                      C: pos, splits: QWAttnDecode.splits(forKeys: pos + 1, kvHeads: geometry.kvHeads),
+                                      slidingWindow: layerSW)
             }
         } else {
+            let activeKeys = layerSW > 0 ? min(pos + 1, layerSW) : (pos + 1)
             try attnDecode.encode(enc, qgate: sc.qR, kv: views,
                                   knew: sc.kR, vnew: sc.v16,
                                   partials: sc.partials, out: sc.attOut,
-                                  C: pos, splits: QWAttnDecode.splits(forKeys: pos + 1))
+                                  C: pos, splits: QWAttnDecode.splits(forKeys: activeKeys, kvHeads: geometry.kvHeads),
+                                  slidingWindow: layerSW)
         }
         // o_proj (K = qHeads·headDim = 6144 — the C08 law, NOT 5120)
         try driver.gemvH16T4(enc, n: H, k: geometry.qHeads * geometry.headDim,
                       x: sc.attOut, gs: sc.gs48, wQ4: w.o, y16: sc.o16)
+        if let oBias = w.oBias {
+            try QWNorm.encodeAddBiasF16(enc, hal: driver.hal, x: sc.o16, bias: oBias, rows: 1, cols: H)
+        }
     }
 
     override func encodeAttentionPrefill(_ context: QWLayerPrefillContext) throws {
@@ -506,6 +523,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                                               kOut: driver.prefixRows(psc.attKR16, rows: T, cols: kvC, dt: .f16),
                                               vOut: driver.prefixRows(psc.attV16, rows: T, cols: kvC, dt: .f16),
                                               wq: w.wq, wk: w.wkTiled,
+                                              qkvBias: w.qkvBias,
                                               positionStart: pos, count: T,
                                               inRowCols: qkvCols)
         if let mbsa = driver.mbsaOperator, let mbsaW = w.mbsa, pos + T <= mbsa.maxContext {
@@ -529,7 +547,8 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                                      qkvSource: idxSlice, qkvRowStrideCols: qkvCols)
             }
         }
-        if let lsa = driver.lsaOperator {
+        let layerSW = geometry.virtualLayerSlidingWindow(l)
+        if layerSW == 0, let lsa = driver.lsaOperator {
             let sparseActive = (pos + T) > driver.lsaConfig.denseBypassThreshold
             let qMode: QWLSAOperator.IndexPrepQMode = !sparseActive
                 ? .none
@@ -562,21 +581,23 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                 out: driver.prefixRows(psc.attOut, rows: T, cols: qC, dt: .f16),
                 layerIndex: fullAttnIdx, pos0: pos, rows: T,
                 partials: T == 1 ? driver.sc.partials : (T <= 8 ? driver.mtpSharedAttentionPartials : nil))
-        } else if let lsa = driver.lsaOperator, pos + T > driver.lsaConfig.denseBypassThreshold {
+        } else if layerSW == 0, let lsa = driver.lsaOperator, pos + T > driver.lsaConfig.denseBypassThreshold {
             driver.encodePagedKVWrite(enc, kv: views,
                                k: driver.prefixRows(psc.attKR16, rows: T, cols: kvC, dt: .f16),
                                v: driver.prefixRows(psc.attV16, rows: T, cols: kvC, dt: .f16),
                                startPos: pos, t: T)
             let useNAX = driver.geometry.supportsNAXPagedAttnPrefill
             lsa.encodeSelectBlocks(enc, fullAttnLayer: fullAttnIdx, pos0: pos, rows: T, tiled32: useNAX)
+            let blockListTV = lsa.blockList(forFullAttnLayer: fullAttnIdx)
+            let blockCountTV = lsa.blockCount(forFullAttnLayer: fullAttnIdx)
             if !useNAX {
                 try driver.pagedAttnPrefillGeneral.encodeSparse(
                     enc,
                     qgate: driver.prefixRows(psc.attQR16, rows: sp, cols: qOut, dt: .f16),
                     kv: views,
                     out: driver.prefixRows(psc.attOut, rows: T, cols: qC, dt: .f16),
-                    blockList: lsa.blockListScratch,
-                    blockCount: lsa.blockCountScratch,
+                    blockList: blockListTV,
+                    blockCount: blockCountTV,
                     pos: pos, T: T, listStride: lsa.listStride)
             } else {
                 try driver.pagedAttnPrefill.encodeSparse(
@@ -584,8 +605,8 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                     qgate: driver.prefixRows(psc.attQR16, rows: sp, cols: qOut, dt: .f16),
                     kv: views,
                     out: driver.prefixRows(psc.attOut, rows: T, cols: qC, dt: .f16),
-                    blockList: lsa.blockListScratch,
-                    blockCount: lsa.blockCountScratch,
+                    blockList: blockListTV,
+                    blockCount: blockCountTV,
                     pos: pos, T: T, listStride: lsa.listStride)
             }
         } else if !driver.geometry.supportsNAXPagedAttnPrefill {
@@ -598,8 +619,9 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                                                qgate: driver.prefixRows(psc.attQR16, rows: sp, cols: qOut, dt: .f16),
                                                kv: views,
                                                out: driver.prefixRows(psc.attOut, rows: T, cols: qC, dt: .f16),
-                                               pos: pos, T: T)
-        } else if pos == 0 && T < 128 && driver.geometry.is27BShape {
+                                               pos: pos, T: T, slidingWindow: layerSW)
+        } else if pos == 0 && T < 128 && driver.geometry.matchesHead256GQA6Kernel
+                    && driver.geometry.attnOutputGate && layerSW == 0 {
             try driver.attnPrefill.encode(enc,
                                           qgate: driver.prefixRows(psc.attQR16, rows: sp, cols: qOut, dt: .f16),
                                           k: driver.prefixRows(psc.attKR16, rows: sp, cols: kvC, dt: .f16),
@@ -620,12 +642,18 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                                                qgate: driver.prefixRows(psc.attQR16, rows: sp, cols: qOut, dt: .f16),
                                                kv: views,
                                                out: driver.prefixRows(psc.attOut, rows: T, cols: qC, dt: .f16),
-                                               pos: pos, T: T)
+                                               pos: pos, T: T, slidingWindow: layerSW)
         }
         try driver.gemmBatchedH16(enc, m: T, n: H, k: qC,
                        x: driver.prefixRows(psc.attOut, rows: T, cols: qC, dt: .f16),
                        wQ4: w.o,
                        y16: driver.prefixRows(psc.o16, rows: T, cols: H, dt: .f16))
+        if let oBias = w.oBias {
+            try QWNorm.encodeAddBiasF16(
+                enc, hal: driver.hal,
+                x: driver.prefixRows(psc.o16, rows: T, cols: H, dt: .f16),
+                bias: oBias, rows: T, cols: H)
+        }
     }
 
     static func encodeAttentionBatch(
@@ -655,6 +683,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             output: driver.prefixRows(psc.attnY16, rows: B, cols: geometry.attnTotalN, dt: .f16),
             activeRows: B)
         enc.memoryBarrier(scope: .buffers)
+        let layerSW = geometry.virtualLayerSlidingWindow(l)
         for b in 0..<B {
             let sess = sessions[b]
             let pos = sess.position
@@ -667,12 +696,15 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             try driver.ropeApply.encodeExtractQK(
                 enc, hal: driver.hal,
                 attnY: yRow, qOut: qRow, kOut: kRow, vOut: vRow,
-                wq: w.wq, wk: w.wkTiled, positionStart: pos, count: 1)
+                wq: w.wq, wk: w.wkTiled, qkvBias: w.qkvBias,
+                positionStart: pos, count: 1)
             enc.memoryBarrier(scope: .buffers)
+            let activeKeys = layerSW > 0 ? min(pos + 1, layerSW) : (pos + 1)
             try attnDecode.encode(
                 enc, qgate: qRow, kv: views, knew: kRow, vnew: vRow,
                 partials: driver.sc.partials, out: oRow,
-                C: pos, splits: QWAttnDecode.splits(forKeys: pos + 1))
+                C: pos, splits: QWAttnDecode.splits(forKeys: activeKeys, kvHeads: geometry.kvHeads),
+                slidingWindow: layerSW)
             enc.memoryBarrier(scope: .buffers)
         }
         try batchMLP.encodeProjection(
@@ -682,5 +714,12 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             output: driver.prefixRows(psc.o16, rows: B, cols: H, dt: .f16),
             activeRows: B)
         enc.memoryBarrier(scope: .buffers)
+        if let oBias = w.oBias {
+            try QWNorm.encodeAddBiasF16(
+                enc, hal: driver.hal,
+                x: driver.prefixRows(psc.o16, rows: B, cols: H, dt: .f16),
+                bias: oBias, rows: B, cols: H)
+            enc.memoryBarrier(scope: .buffers)
+        }
     }
 }

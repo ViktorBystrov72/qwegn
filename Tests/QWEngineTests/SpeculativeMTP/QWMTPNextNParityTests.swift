@@ -7,7 +7,6 @@ import XCTest
 import QWAlloc
 import QWAttn
 import QWCore
-import QWFlashNext
 import QWHAL
 import QWKV
 @testable import QWEngine
@@ -426,7 +425,7 @@ final class QWMTPNextNParityTests: XCTestCase {
         let box = Box()
         let group = DispatchGroup()
         let maxNewPerReq = [2, 2, 5]
-        FNBatchAdmissionTracker.beginPreparing()
+        QWBatchAdmissionTracker.beginPreparing()
         for idx in 0..<3 {
             group.enter()
             DispatchQueue.global().async {
@@ -437,7 +436,7 @@ final class QWMTPNextNParityTests: XCTestCase {
             }
         }
         usleep(2000)
-        FNBatchAdmissionTracker.endPreparing()
+        QWBatchAdmissionTracker.endPreparing()
         group.wait()
         for idx in 0..<3 {
             XCTAssertEqual(box.values[idx]?.tokens, Array(serialOutputs[idx].prefix(maxNewPerReq[idx])))

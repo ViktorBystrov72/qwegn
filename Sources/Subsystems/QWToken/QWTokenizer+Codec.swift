@@ -33,7 +33,8 @@ extension QWTokenizer {
             ?? tokenId(for: "</ernie:think>")
             ?? fallback.endThinkTokenId
         var extra = fallback.extraStopTokenIds
-        for s in ["<|im_end|>", "<|ernie:im_end|>", "<|maxwell_end|>", "<|ERNIE_endofprompt|>", "<|endoftext|>", "<|eot_id|>", "</s>"] {
+        for s in ["<|im_end|>", "<|ernie:im_end|>", "<|maxwell_end|>", "<|ERNIE_endofprompt|>",
+                  "<|content_model_end_sampling|>", "<|endoftext|>", "<|eot_id|>", "</s>"] {
             if let id = tokenId(for: s), !extra.contains(id) {
                 extra.append(id)
             }
@@ -51,6 +52,15 @@ extension QWTokenizer {
             extraStopTokenIds: extra,
             usesChatTemplateIds: hasChatIds
         )
+    }
+
+    private func directVocabTokenId(bytes: [UInt8], lo: Int, hi: Int) -> Int? {
+        var scalars = String.UnicodeScalarView()
+        scalars.reserveCapacity(hi - lo)
+        for bi in lo..<hi {
+            scalars.append(byteMap[Int(bytes[bi])])
+        }
+        return vocab[String(scalars)]
     }
 
     // MARK: BPE one word (already ByteLevel-mapped) → ids
@@ -287,6 +297,18 @@ extension QWTokenizer {
                     }
                     if hit { continue }
                     missHash = h
+                }
+                if ignoreMerges, let directTokId = directVocabTokenId(bytes: bytes, lo: pLo, hi: pHi) {
+                    if let hash = missHash {
+                        tokScratch.removeAll(keepingCapacity: true)
+                        tokScratch.append(directTokId)
+                        bytes.withUnsafeBufferPointer { buf in
+                            guard let base = buf.baseAddress else { return }
+                            wordCache.insert(base.advanced(by: pLo), count: byteLen, hash: hash, tokens: tokScratch)
+                        }
+                    }
+                    ids.append(directTokId)
+                    continue
                 }
                 wordScratch.removeAll(keepingCapacity: true)
                 for bi in pLo..<pHi {

@@ -287,10 +287,12 @@ extension QWLSASidecar {
         case .gqaKeyProj:
             return (
                 proj: [
+                    "language_model.model.layers.\(layer).self_attn.k_proj.weight",
                     "model.language_model.layers.\(layer).self_attn.k_proj.weight",
                     "model.layers.\(layer).self_attn.k_proj.weight",
                 ],
                 norm: [
+                    "language_model.model.layers.\(layer).self_attn.k_norm.weight",
                     "model.language_model.layers.\(layer).self_attn.k_norm.weight",
                     "model.layers.\(layer).self_attn.k_norm.weight",
                 ]

@@ -1,9 +1,8 @@
-// QWContextCeilingBoundaryTests.swift — Tests universal KV pressure, RoPE boundary step-down, and FN headroom.
+// QWContextCeilingBoundaryTests.swift — Tests universal KV pressure, RoPE boundary step-down, and HyperStream headroom.
 import CryptoKit
 import Foundation
 import XCTest
 @testable import QWCore
-import QWFlashNext
 import QWHAL
 import QWHead
 import QWKV
@@ -173,34 +172,58 @@ final class QWContextCeilingBoundaryTests: XCTestCase {
     }
 
     func testFlashNextEstimateContextMemoryAddsHeadroomBelow32KAndFallsBackWhenTight() throws {
-        let desc = QWModelDescriptor.qwen38_27b
+        let layerTypes = (0..<48).map { ($0 + 1) % 4 == 0 ? "full_attention" : "linear_attention" }
+        let desc = QWModelDescriptor(
+            family: .qwen38FlashNext, modelType: "qwen4_exp", capabilities: [.mtp],
+            hidden: 2560, vocab: 248_320, denseIntermediate: nil, numLayers: 48,
+            layerTypes: layerTypes, fullAttentionInterval: 4, rmsEps: 1e-6,
+            maxPositionEmbeddings: 262_144, qHeads: 24, kvHeads: 2, headDim: 256,
+            attnOutputGate: false, partialRotaryFactor: 0.25, ropeTheta: 1e7,
+            indexerHeads: 16, indexerKvHeads: 1, indexerHeadDim: 128,
+            indexerBudget: 2048, indexerCompressRatio: 16,
+            numExperts: 256, expertsPerTok: 8, moeIntermediate: 640,
+            sharedExpertIntermediate: 640, expertGateType: nil,
+            hcCount: 4, hcLowrank: 320,
+            gdnQKHeads: 16, gdnVHeads: 48, gdnHeadDim: 128,
+            gdnQKVChannels: 10_240, gdnZChannels: 6_144, gdnConvKernel: 4,
+            pleLayerIds: nil, pleEmbedDim: nil, pleConvKernel: nil,
+            ngramSize: nil, headsPerNgram: nil, ngramVocabSizeBase: nil,
+            makeNgramVocabDivisibleBy: nil, splitNgramParts: nil,
+            mtpLayers: 1, mtpUseDedicatedEmbeddings: false, eosTokenId: 248_044
+        )
+        let qsaLayers = 12 + 1
+        let kvPerLayer = 2 * desc.kvHeads * desc.headDim * 2
+        let idxDim = desc.indexerHeadDim ?? 0
+        let idxPerLayer = idxDim * 2 + (idxDim * 2) / (desc.indexerCompressRatio ?? 4)
+        let perTokenBytes = qsaLayers * (kvPerLayer + idxPerLayer) + desc.rotaryDims * 8
+
         let roomy = 128 * (1 << 30)
-        let est4k = FlashNextModule.estimateContextMemory(
+        let est4k = QWEngineDriver.estimateDriverContextMemory(
             descriptor: desc, packPath: nil, contextTokens: 4096, kvMode: .f16,
             mtpDrafts: 0, mtpBackend: "standard", prefillChunkSize: 1024,
             tuning: .default, physicalMemoryBytes: roomy
         )
-        XCTAssertEqual(est4k.kvBytes, (4096 + 1024) * FNKVStorageMode.f16.perTokenBytes)
+        XCTAssertEqual(est4k.kvBytes, (4096 + 1024) * perTokenBytes)
         XCTAssertTrue(est4k.fits)
 
-        let est16k = FlashNextModule.estimateContextMemory(
+        let est16k = QWModuleRegistry.estimateContextMemory(
             descriptor: desc, packPath: nil, contextTokens: 16_384, kvMode: .f16,
             mtpDrafts: 0, mtpBackend: "standard", prefillChunkSize: 1024,
             tuning: .default, physicalMemoryBytes: roomy
         )
-        XCTAssertEqual(est16k.kvBytes, (16_384 + 1024) * FNKVStorageMode.f16.perTokenBytes)
+        XCTAssertEqual(est16k.kvBytes, (16_384 + 1024) * perTokenBytes)
         XCTAssertTrue(est16k.fits)
 
         // Tight physical memory: fits 4096 but not 4096 + 1024 -> falls back cleanly to 4096.
         let reserve = Int((Double(QWCapacityBudget.osReserveBytes >> 30) * Double(1 << 30)).rounded())
         let fixedBytes = est4k.weightsBytes + est4k.scratchAndStateBytes
-        let tightPhys = reserve + fixedBytes + 4096 * FNKVStorageMode.f16.perTokenBytes
-        let estTight = FlashNextModule.estimateContextMemory(
+        let tightPhys = reserve + fixedBytes + 4096 * perTokenBytes
+        let estTight = DenseModule.estimateContextMemory(
             descriptor: desc, packPath: nil, contextTokens: 4096, kvMode: .f16,
             mtpDrafts: 0, mtpBackend: "standard", prefillChunkSize: 1024,
             tuning: .default, physicalMemoryBytes: tightPhys
         )
-        XCTAssertEqual(estTight.kvBytes, 4096 * FNKVStorageMode.f16.perTokenBytes)
+        XCTAssertEqual(estTight.kvBytes, 4096 * perTokenBytes)
         XCTAssertTrue(estTight.fits)
     }
 

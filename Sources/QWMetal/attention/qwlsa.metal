@@ -100,7 +100,7 @@ kernel void qwg_lsa_index_prep(device const half* qgate      [[buffer(0)]],
     for (uint ch = sg; ch < indexDim; ch += 4u) {
         const float accK = lsa_dot_row_tg(sliceBuf, wkIdx + uint64_t(ch) * inputDim, inputDim, lane);
         if (lane == 0u) {
-            kPending[ringSlot * indexDim + ch] = half(accK);
+            kPending[uint64_t(ringSlot) * indexDim + ch] = half(accK);
         }
     }
 
@@ -137,7 +137,7 @@ kernel void qwg_lsa_index_prep(device const half* qgate      [[buffer(0)]],
     const float qNormSq = partial[0] + partial[1] + partial[2] + partial[3];
     const float qInv = rsqrt(max(qNormSq, 1e-12f));
     if (tid < dCap) {
-        qIdxOut[t * indexDim + tid] = half(qVal * qInv);
+        qIdxOut[uint64_t(t) * indexDim + tid] = half(qVal * qInv);
     }
 }
 
@@ -161,7 +161,7 @@ kernel void qwg_lsa_pool_keys(device const half* kPending   [[buffer(0)]],
         float sum4 = 0.0f;
         for (uint k = 0u; k < 4u; k++) {
             const uint slot = (baseTok + k) & ringMask;
-            sum4 += float(kPending[slot * indexDim + tid]);
+            sum4 += float(kPending[uint64_t(slot) * indexDim + tid]);
         }
         meanVal = sum4 * 0.25f;
     }
@@ -172,7 +172,7 @@ kernel void qwg_lsa_pool_keys(device const half* kPending   [[buffer(0)]],
     const float normSq = partial[0] + partial[1] + partial[2] + partial[3];
     const float invNorm = rsqrt(max(normSq, 1e-12f));
     if (tid < indexDim) {
-        pooledKeys[b * indexDim + tid] = half(meanVal * invNorm);
+        pooledKeys[uint64_t(b) * indexDim + tid] = half(meanVal * invNorm);
     }
 }
 
@@ -476,7 +476,7 @@ kernel void qwg_lsa_qsa_select(device const float*  idxQ          [[buffer(0)]],
     const uint n = (pq + 1u) >> 2u;
     if (n <= blockTopK) {
         for (uint b = tid; b < n; b += 256u) {
-            list[t * blockTopK + b] = int(b);
+            list[uint64_t(t) * blockTopK + b] = int(b);
         }
         return;
     }
@@ -484,7 +484,7 @@ kernel void qwg_lsa_qsa_select(device const float*  idxQ          [[buffer(0)]],
     const uint sg = tid >> 5u;
     const uint lane = tid & 31u;
     for (uint i = tid; i < NI * DI; i += 256u) {
-        qs[i] = idxQ[t * NI * DI + i];
+        qs[i] = idxQ[uint64_t(t) * NI * DI + i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

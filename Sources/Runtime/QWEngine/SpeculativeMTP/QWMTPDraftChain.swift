@@ -30,7 +30,7 @@ enum QWMTPDraftChain {
             throw QWEngineDriverError.state("draft chain requires a target head")
         }
         let vocabulary = draft.scratch.draftLogits.shape.elementCount
-        guard (1...7).contains(drafts), (0..<vocabulary).contains(pendingToken),
+        guard (1...15).contains(drafts), (0..<vocabulary).contains(pendingToken),
               position > 0, position <= draft.positionCapacity - drafts,
               cacheRows >= 0, cacheRows <= QWKVCache.maxTokensPerSeq - drafts else {
             throw QWEngineDriverError.state("draft chain token, count, or boundary is invalid")
@@ -223,7 +223,7 @@ enum QWMTPDraftChain {
         table: QWMTPEmbeddingTable, journalTokenOffset: Int = 0
     ) throws -> [any MTLCommandBuffer] {
         let vocabulary = draft.scratch.draftLogits.shape.elementCount
-        guard (1...7).contains(drafts), (0..<vocabulary).contains(pendingToken),
+        guard (1...15).contains(drafts), (0..<vocabulary).contains(pendingToken),
               position > 0, position <= draft.positionCapacity - drafts,
               cacheRows >= 0, cacheRows <= QWKVCache.maxTokensPerSeq - drafts,
               journalTokenOffset >= 0, (journalTokenOffset + drafts) * 4 <= table.tokens.length,

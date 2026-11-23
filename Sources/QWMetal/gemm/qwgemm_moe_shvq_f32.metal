@@ -24,8 +24,28 @@ using namespace metal;
         threadgroup float tgAct[128];                                                  \
         threadgroup ShvqTgLut<BITS> tgLut;                                             \
         const QWMoEGateUpF32Params p = { N, K, E };                                    \
-        qwg_moe_gateup_f32_r1_body<QWQuantSHVQ<BITS, GROUP>>(                          \
-            w, x, ids, out, p, coldW, tg, tid, sgi, lane, tgAct, tgLut);               \
+        qwg_moe_gateup_f32_r1_body<QWQuantSHVQ<BITS, GROUP>, false>(                   \
+            w, x, ids, out, p, coldW, float2(0.0f), tg, tid, sgi, lane, tgAct, tgLut); \
+    }                                                                                  \
+    kernel void qwg_moe_gateup_shvq##BITS##_g##GROUP##_f32_r1_sc(                       \
+        device const char*  w        [[buffer(0)]],                                    \
+        device const float* x        [[buffer(1)]],                                    \
+        device const int*   ids      [[buffer(2)]],                                    \
+        device float*       out      [[buffer(3)]],                                    \
+        constant uint&      N        [[buffer(4)]],                                    \
+        constant uint&      K        [[buffer(5)]],                                    \
+        constant uint&      E        [[buffer(6)]],                                    \
+        device const char*  coldW    [[buffer(7)]],                                    \
+        constant float2&    softcaps [[buffer(8)]],                                    \
+        uint3 tg   [[threadgroup_position_in_grid]],                                   \
+        uint  tid  [[thread_index_in_threadgroup]],                                    \
+        uint  sgi  [[simdgroup_index_in_threadgroup]],                                 \
+        uint  lane [[thread_index_in_simdgroup]]) {                                    \
+        threadgroup float tgAct[128];                                                  \
+        threadgroup ShvqTgLut<BITS> tgLut;                                             \
+        const QWMoEGateUpF32Params p = { N, K, E };                                    \
+        qwg_moe_gateup_f32_r1_body<QWQuantSHVQ<BITS, GROUP>, true>(                    \
+            w, x, ids, out, p, coldW, softcaps, tg, tid, sgi, lane, tgAct, tgLut);     \
     }                                                                                  \
     kernel void qwg_moe_down_shared_combine_shvq##BITS##_g##GROUP##_f32(                \
         device const char*  wBytes     [[buffer(0)]],                                  \

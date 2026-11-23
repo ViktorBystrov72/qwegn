@@ -62,6 +62,7 @@ jobs:
           python3 Scripts/check_metallib_target.py
           swift build -c release --product qwg
           swift build -c release --product qwg-menu
+          swift build -c release --product qwg-smc-helper
 
       - name: Build macOS .pkg installer and portable .tar.gz
         run: |

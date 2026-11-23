@@ -13,7 +13,7 @@ import QWMTP
 import QWQuant
 
 extension QWEngineDriver {
-    private static let cachedPackFormats = OSAllocatedUnfairLock<[String: (format: QWWeightFormat, headQ4g: Bool)]>(initialState: [:])
+    private static let cachedPackFormats = OSAllocatedUnfairLock<[String: (format: QWWeightFormat, headQ4g: Bool, headFormat: QWWeightFormat?)]>(initialState: [:])
 
     /// Default OS RAM reserve (GiB) per memory policy when `osReserveGiB` is not explicitly set:
     /// 16 GiB under `.maxResident` and 24 GiB under `.safe` (matching `docs/benchmarks.md`).
@@ -196,7 +196,20 @@ extension QWEngineDriver {
         tuning: QWEngineTuning = .default,
         physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes()
     ) -> QWContextMemoryEstimate {
-        QWScratchArenaBuilder.estimateDriverContextMemory(
+        if descriptor.family == .inkling2Loop {
+            return QWInkling2Runtime.estimateContextMemory(
+                descriptor: descriptor, packPath: packPath, contextTokens: contextTokens,
+                kvMode: kvMode, mtpDrafts: mtpDrafts, prefillChunkSize: prefillChunkSize,
+                tuning: tuning, physicalMemoryBytes: physicalMemoryBytes)
+        }
+        if (descriptor.hcCount ?? 0) > 1 {
+            return estimateHyperStreamContextMemory(
+                descriptor: descriptor, packPath: packPath, contextTokens: contextTokens,
+                kvMode: kvMode, mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
+                prefillChunkSize: prefillChunkSize, tuning: tuning,
+                physicalMemoryBytes: physicalMemoryBytes)
+        }
+        return QWScratchArenaBuilder.estimateDriverContextMemory(
             descriptor: descriptor, packPath: packPath, contextTokens: contextTokens,
             kvMode: kvMode, mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
             prefillChunkSize: prefillChunkSize, tuning: tuning,
@@ -207,40 +220,137 @@ extension QWEngineDriver {
             })
     }
 
+    private static func estimateHyperStreamContextMemory(
+        descriptor: QWModelDescriptor,
+        packPath: String?,
+        contextTokens: Int,
+        kvMode: QWKVMode,
+        mtpDrafts: Int,
+        mtpBackend: String,
+        prefillChunkSize: Int,
+        tuning: QWEngineTuning,
+        physicalMemoryBytes: Int?
+    ) -> QWContextMemoryEstimate {
+        let clampedContext = max(64, min(1_048_576, contextTokens))
+        let isDFlash = mtpDrafts > 0 && FNGPUDFlash.isDFlashName(mtpBackend)
+        let qsaBaseLayers = max(1, descriptor.numLayers - descriptor.linearAttentionLayers.count)
+        let qsaLayers = qsaBaseLayers + max(1, descriptor.mtpLayers)
+        let kvPerLayer: Int = switch kvMode {
+        case .f16: 2 * descriptor.kvHeads * descriptor.headDim * 2
+        case .q8:  2 * descriptor.kvHeads * descriptor.headDim + 2 * descriptor.kvHeads * 2
+        case .q4:  descriptor.kvHeads * descriptor.headDim + 2 * descriptor.kvHeads * 8
+        }
+        let idxDim = descriptor.indexerHeadDim ?? 0
+        let compress = max(1, descriptor.indexerCompressRatio ?? 4)
+        let idxPerLayer = idxDim > 0 ? (idxDim * 2 + (idxDim * 2) / compress) : 0
+        let rawPerTokBytes = qsaLayers * (kvPerLayer + idxPerLayer) + descriptor.rotaryDims * 8
+        let perTokBytes = FNGPUDFlash.adjustedPerTokenKVBytes(rawPerTokBytes, usesDFlash: isDFlash)
+
+        let bits = max(2, descriptor.quantization?.bits ?? 4)
+        let groupSize = max(16, descriptor.quantization?.groupSize ?? 32)
+        let bytesPerParam = Double(bits) / 8.0 + 4.0 / Double(groupSize)
+        let embedBytes = descriptor.vocab * descriptor.hidden * 2
+        let headBytes = Int(Double(descriptor.vocab * descriptor.hidden) * bytesPerParam)
+        let moeCount = descriptor.numExperts ?? 0
+        let denseInter = descriptor.denseIntermediate ?? 0
+        let moeInter = descriptor.moeIntermediate ?? denseInter
+        let sharedInter = descriptor.sharedExpertIntermediate ?? 0
+        let mlpParams = (moeCount > 0 ? moeCount * 3 * descriptor.hidden * moeInter : 3 * descriptor.hidden * denseInter)
+            + (sharedInter > 0 ? 3 * descriptor.hidden * sharedInter : 0)
+        let gdnCount = descriptor.linearAttentionLayers.count
+        let attnCount = max(0, descriptor.numLayers - gdnCount)
+        let gdnProjParams = (descriptor.gdnQKVChannels + 2 * descriptor.gdnZChannels
+            + descriptor.gdnVHeads * descriptor.gdnHeadDim) * descriptor.hidden
+        let qsaProjParams = (descriptor.qHeads * descriptor.headDim + 2 * descriptor.kvHeads * descriptor.headDim
+            + descriptor.qHeads * descriptor.headDim
+            + (descriptor.indexerHeads ?? 0) * idxDim) * descriptor.hidden
+        let hcCount = max(1, descriptor.hcCount ?? 1)
+        let hcLowrank = descriptor.hcLowrank ?? 0
+        let hcParams = 2 * descriptor.numLayers * (2 * hcCount * hcLowrank * hcCount * descriptor.hidden)
+        let trunkWeightBytes = Int(Double(gdnCount * (mlpParams + gdnProjParams)
+            + attnCount * (mlpParams + qsaProjParams) + hcParams) * bytesPerParam)
+        let minWeights = max(512 << 20, embedBytes + headBytes + trunkWeightBytes)
+
+        let onDisk = QWResidencyAdmission.flashNextOnDiskFootprint(packPath: packPath, minWeightsBytes: minWeights)
+        let dflashDelta = FNGPUDFlash.estimateFootprint(
+            targetDescriptor: descriptor, targetPackPath: packPath, dflashPackPath: nil, isDFlash: isDFlash)
+        let weightsBytes = max(512 << 20, onDisk.weightsBytes - dflashDelta.nativeMTPWeightBytes + dflashDelta.dflashWeightBytes)
+            + onDisk.pleBytes
+
+        let alignedCap = QWCapacityPlan.steppedCapacity(clampedContext)
+        let gdnStatePerSlot = gdnCount * (descriptor.gdnVHeads * descriptor.gdnHeadDim * descriptor.gdnHeadDim * 4 * 8
+            + max(0, descriptor.gdnConvKernel - 1) * descriptor.gdnQKVChannels * 2 * 8)
+        let pleHistoryPerSlot = max(0, descriptor.pleLayerIds?.count ?? 0) * descriptor.hidden * 2 * 8
+        let prefillScratch = QWHyperStreamRuntime.prefillActivationBytes(
+            maxRows: min(max(256, prefillChunkSize), 1024), capacity: alignedCap)
+        let decodeScratch = max(32 << 20, descriptor.vocab * 4 * 8 + hcCount * descriptor.hidden * 4 * 64
+            + max(moeInter, denseInter) * 4 * 32)
+        let lsaClusterBytes = idxDim > 0 ? (qsaLayers * max(1, (alignedCap + 2047) / 2048) * 64 * idxDim * 2) : 0
+        let scratchBytes = FNGPUBatchScheduler.maxSlots * (gdnStatePerSlot + pleHistoryPerSlot)
+            + prefillScratch + decodeScratch + lsaClusterBytes
+            + (isDFlash ? max(0, dflashDelta.dflashScratchBytes - (112 << 20)) : 0)
+
+        let fixedBytes = weightsBytes + scratchBytes
+        let reserveGiB = tuning.osReserveGiB ?? Double(QWCapacityBudget.osReserveBytes >> 30)
+        let reserveBytes = max(0, Int((reserveGiB * Double(1 << 30)).rounded()))
+        let availBytes = max(0, (physicalMemoryBytes ?? 0) - reserveBytes)
+        let kvCap = availBytes > 0
+            ? QWHyperStreamRuntime.resolveKVCapacity(
+                alignedCap: alignedCap,
+                fixedBytes: fixedBytes,
+                perTokenBytes: perTokBytes,
+                availableBytes: availBytes
+            )
+            : (alignedCap >= 4096 ? (alignedCap + 1024) : alignedCap)
+        let kvBytes = kvCap * perTokBytes
+        let requiredBytes = fixedBytes + kvBytes
+        let maxFitting = availBytes > fixedBytes ? min(1_048_576, (availBytes - fixedBytes) / perTokBytes) : 0
+        return QWContextMemoryEstimate(
+            contextTokens: clampedContext, weightsBytes: weightsBytes, kvBytes: kvBytes,
+            scratchAndStateBytes: scratchBytes, requiredBytes: requiredBytes,
+            availableBytes: availBytes, maxFittingContext: maxFitting,
+            fits: availBytes == 0 || requiredBytes <= availBytes)
+    }
+
     private static func resolvePackFormatForEstimate(
         packPath: String?,
         descriptor: QWModelDescriptor,
         rawGeometry: QWModelGeometry,
         mtpWeightDrafts: Int
-    ) -> (QWWeightFormat, Bool) {
+    ) -> (QWWeightFormat, Bool, QWWeightFormat?) {
         if let path = packPath, !path.isEmpty {
-            if let hit = cachedPackFormats.withLock({ $0[path] }) { return hit }
+            let cacheKey = "\(path)|\(mtpWeightDrafts > 0)|\(descriptor.geometryDigestV2)"
+            if let hit = cachedPackFormats.withLock({ $0[cacheKey] }) { return hit }
             let root = QWModelRoot(url: URL(fileURLWithPath: path))
             let isSafetensors = (root.kind == .safetensorsSingle || root.kind == .safetensorsSharded)
             let pk = (root.kind == .qwp1 || root.kind == nil)
                 ? (try? QWQuant.Pack(url: URL(fileURLWithPath: path), descriptor: descriptor))
                 : nil
-            let resolvedHeadQ4g = isSafetensors
-                ? true
-                : ((try? pk?.entry("lm_head.weight").quantized) ?? false)
+            let st = isSafetensors ? (try? QWSafeTensorsContainer(url: root.weights)) : nil
             if let choice = try? Self.weightFormatChoice(
                 for: root, quantization: descriptor.quantization, geometry: rawGeometry,
                 mtpDrafts: mtpWeightDrafts, pack: pk) {
-                cachedPackFormats.withLock { $0[path] = (choice.format, resolvedHeadQ4g) }
-                return (choice.format, resolvedHeadQ4g)
+                let headSpec = Self.resolveHeadSpec(st: st, pack: pk, trunkFormat: choice.format,
+                                                    geometry: rawGeometry)
+                let res = (choice.format, headSpec.isQ4g, headSpec.format)
+                cachedPackFormats.withLock { $0[cacheKey] = res }
+                return res
             }
             if isSafetensors {
                 if let q = descriptor.quantization, let b = q.bits, let g = q.groupSize,
                    QWAQBlock.isSupported(bits: b, group: g) {
-                    return (.nativeAffine(bits: b, groupSize: g), true)
+                    let trunkFmt = QWWeightFormat.nativeAffine(bits: b, groupSize: g)
+                    let headSpec = Self.resolveHeadSpec(st: st, pack: nil, trunkFormat: trunkFmt,
+                                                        geometry: rawGeometry)
+                    return (trunkFmt, headSpec.isQ4g, headSpec.format)
                 }
-                return (.hq4G32, true)
+                return (.hq4G32, true, .hq4G32)
             }
         }
         if let q = descriptor.quantization, let b = q.bits, let g = q.groupSize,
            QWAQBlock.isSupported(bits: b, group: g) {
-            return (.nativeAffine(bits: b, groupSize: g), false)
+            return (.nativeAffine(bits: b, groupSize: g), false, nil)
         }
-        return (.hq4G32, false)
+        return (.hq4G32, false, nil)
     }
 }

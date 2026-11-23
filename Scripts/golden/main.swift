@@ -85,19 +85,23 @@ func loadInt32s(_ d: Data, _ base: Int, _ n: Int) -> [Int32] {
     }
 }
 
-// The same prompt through the unified core loop: the dense family on the
-// module seam must produce the very same tokens, byte for byte.
+// The same prompt through the unified engine seam: DenseModule must produce
+// the exact same tokens, byte for byte.
 if argv.contains("--module") {
-    let module = try DenseModule.make(plan: engine.plan, engine: engine)
-    // The dense module serves no speculative round yet, so the request asks
-    // for none — a request that asked for drafts would be refused.
+    guard let module = try DenseModule.make(plan: engine.plan, engine: engine) as? any QWInferenceEngine else {
+        print("FAIL module cast: DenseModule did not conform to QWInferenceEngine")
+        exit(1)
+    }
     let noDrafts = QWSpeculativeParameters(enabled: false, mtpDrafts: 0)
-    let core = try QWEngineCore(configuration: QWEngineCoreConfiguration(
-        plan: engine.plan, module: module, sampling: .greedy, maxSessions: 1,
-        speculative: noDrafts))
     var moduleTokens: [Int32] = prompt.map(Int32.init)
-    _ = try core.generate(prompt: prompt, maxNew: 64, stopIDs: [], sampling: .greedy,
-                          speculative: noDrafts) { token in
+    _ = try module.generate(
+        request: QWGenerationRequest(
+            prompt: prompt,
+            maxNew: 64,
+            sampling: .greedy,
+            speculative: noDrafts
+        )
+    ) { token in
         moduleTokens.append(Int32(token))
         return true
     }

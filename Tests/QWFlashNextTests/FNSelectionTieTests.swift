@@ -1,6 +1,6 @@
 import XCTest
 import QWRope
-@testable import QWFlashNext
+@testable import QWEngine
 import QWCore
 
 // MLX/oMLX tie contract: with every block score equal (all zero: q = 0 after the zero projection), the

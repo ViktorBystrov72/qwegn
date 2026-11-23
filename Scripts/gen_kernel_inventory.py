@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "Scripts" / "kernel_inventory.json"
 OUTPUT = ROOT / "Sources" / "Runtime" / "QWEngine" / "Module" / "QWKernelInventory.swift"
-GROUPS = ("common", "standard_only", "dense_only", "flash_only", "moe_only")
+GROUPS = ("common", "dense_only", "hyper_only", "inkling2_only")
 
 
 def load_manifest():
@@ -22,11 +22,9 @@ def load_manifest():
             raise ValueError(f"invalid kernel names in {group}")
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate kernel names in {group}")
-    for groups in (("common", "standard_only", "dense_only"),
-                   ("common", "flash_only"), ("common", "standard_only", "moe_only")):
-        names = [name for group in groups for name in inventory[group]]
-        if len(names) != len(set(names)):
-            raise ValueError(f"duplicate kernel names across {groups}")
+    all_names = [name for group in GROUPS for name in inventory[group]]
+    if len(all_names) != len(set(all_names)):
+        raise ValueError("duplicate kernel names across inventory groups")
     return inventory
 
 
@@ -37,10 +35,10 @@ def render(inventory):
         lines.append(f"    static let {group}: [String] = [")
         lines.extend(f'        "{name}",' for name in inventory[group])
         lines.append("    ]")
-    lines.extend(["    static let standard = common + standard_only",
-                  "    static let dense = standard + dense_only",
-                  "    static let flash = common + flash_only",
-                  "    static let moe = standard + moe_only",
+    lines.extend(["    static let dense = common + dense_only",
+                  "    static let flash = common + hyper_only",
+                  "    static let inkling2 = inkling2_only",
+                  "    static let all = common + dense_only + hyper_only + inkling2_only",
                   "}", ""])
     return "\n".join(lines)
 

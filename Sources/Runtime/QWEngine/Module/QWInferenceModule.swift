@@ -12,17 +12,6 @@ import QWHead
 import QWKV
 @_exported import QWMTP
 
-/// A module-owned session. The core allocates and recycles it; everything
-/// behind it belongs to the module.
-public protocol QWModuleSessionState: AnyObject, Sendable {
-    /// Tokens the session has consumed so far.
-    var activeTokens: Int { get }
-    /// Returns the state to a clean slate before it is handed out again.
-    /// The request's contract travels with the reset: a session is handed
-    /// out per request, and two concurrent requests may sample differently.
-    func reset(sampling: QWSamplerConfig, speculative: QWSpeculativeParameters) throws
-}
-
 /// The family-native engine a module wraps. The registry hands it over
 /// untouched: only the module knows its own engine's concrete type.
 public protocol QWLoadedEngine: AnyObject, Sendable {
@@ -80,40 +69,18 @@ public protocol QWInferenceModule: AnyObject, Sendable {
     var onCacheEvent: (@Sendable (QWPrefixCacheEvent) -> Void)? { get set }
     /// Configures the module's prefix-cache storage.
     func configurePrefixCache(_ config: QWCacheConfig) throws
-    /// Creates a fresh session state owned by this module.
-    func makeSessionState() throws -> any QWModuleSessionState
-    /// Prepares the module for a request. The core calls this before the
-    /// prefill starts, so the work a request needs up front — the prefill
-    /// stack, for instance — does not land inside the measured prefill.
-    func prepare(_ state: any QWModuleSessionState, prompt: [Int], maxNew: Int) throws
-    /// The request is over. The module releases what it held for it: the
-    /// engine session, the admission permit, the KV pages. A module that
-    /// holds nothing does nothing here.
-    func finish(_ state: any QWModuleSessionState)
-    /// Runs one prefill chunk and returns the head's token for its last row.
-    /// `runsHead` is true only for the final chunk — there the head runs, and
-    /// its token is the first generated one. The prompt is fed exactly once.
-    func encodePrefill(_ state: any QWModuleSessionState, tokens: [Int],
-                       chunk: Range<Int>, runsHead: Bool) throws -> Int
-    /// Runs one decode step and returns the token the model produced.
-    func encodeDecodeStep(_ state: any QWModuleSessionState, token: Int, position: Int) throws -> Int
-    /// The wall time, in milliseconds, the module attributes to the token the
-    /// last step produced. A module that commits several tokens in one step
-    /// splits the step's time across them. Zero means it does not measure.
-    func lastStepMilliseconds(_ state: any QWModuleSessionState) -> Double
-    /// The GPU time the prefill of this session spent, in seconds. The
-    /// module owns the measurement; a module that cannot measure reports
-    /// zero, and the caller treats it as "not measured" rather than "fast".
-    func prefillGPUSeconds(_ state: any QWModuleSessionState) -> Double
-    /// Tokens committed per speculative verification round in this session,
-    /// when the module runs speculative rounds internally.
-    func roundTokenCounts(_ state: any QWModuleSessionState) -> [Int]
 }
 
 extension QWInferenceModule {
-    public func roundTokenCounts(_ state: any QWModuleSessionState) -> [Int] { [] }
-
     public static func resolveSpeculation(
+        _ requested: QWSpeculativeParameters, descriptor: QWModelDescriptor,
+        environment: [String: String], modelSwitch: Bool
+    ) throws -> QWResolvedSpeculation {
+        try defaultResolveSpeculation(requested, descriptor: descriptor,
+                                      environment: environment, modelSwitch: modelSwitch)
+    }
+
+    public static func defaultResolveSpeculation(
         _ requested: QWSpeculativeParameters, descriptor: QWModelDescriptor,
         environment: [String: String], modelSwitch: Bool
     ) throws -> QWResolvedSpeculation {
@@ -139,7 +106,7 @@ extension QWInferenceModule {
             let stillDFlash = ["dflash2", "dflash", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "")
             let supportsWeightFreeNgramSwitch = !descriptor.capabilities.contains(.mtp)
                 && Self.capabilities.contains(.speculative) && isNgramStrategy
-            let maximum = stillDFlash ? 15 : (supportsWeightFreeNgramSwitch ? 7 : max(1, descriptor.maxSpeculativeDrafts))
+            let maximum = stillDFlash ? 15 : (supportsWeightFreeNgramSwitch ? 15 : max(1, descriptor.maxSpeculativeDrafts))
             parameters.mtpDrafts = min(parameters.mtpDrafts, maximum)
         }
         let supportsWeightFreeNgram = Self.capabilities.contains(.speculative) && isNgramStrategy
@@ -176,10 +143,8 @@ public enum QWModuleError: Error, Equatable, CustomStringConvertible {
     case unsupportedFamily(QWModelDescriptor.Family)
     case unsupportedKVStorageMode(model: String, mode: String, supported: [String])
     case unsupportedCapability(model: String, capability: QWKnobCapability)
-    case sessionExhausted
     case invalidToken(Int)
     case invalidState(String)
-    case planMismatch(model: String)
     case notImplemented(String)
 
     public var description: String {
@@ -190,16 +155,24 @@ public enum QWModuleError: Error, Equatable, CustomStringConvertible {
             return "QWModule: '\(model)' does not implement KV mode '\(mode)' (has \(supported.joined(separator: "|")))"
         case .unsupportedCapability(let model, let capability):
             return "QWModule: '\(model)' does not provide capability '\(capability.rawValue)'"
-        case .sessionExhausted:
-            return "QWModule: session pool exhausted"
         case .invalidToken(let token):
             return "QWModule: token id \(token) outside the model vocabulary"
         case .invalidState(let message):
             return "QWModule: \(message)"
-        case .planMismatch(let model):
-            return "QWModule: '\(model)' module and plan disagree — the plan digest does not match"
         case .notImplemented(let what):
             return "QWModule: \(what) is not implemented yet"
+        }
+    }
+
+    /// Maps the shared engine's error type onto the module's own.
+    static func from(_ error: QWEngineError) -> QWModuleError {
+        switch error {
+        case .badToken(let token):
+            return .invalidToken(token)
+        case .state(let message):
+            return .invalidState(message)
+        default:
+            return .invalidState(String(describing: error))
         }
     }
 }

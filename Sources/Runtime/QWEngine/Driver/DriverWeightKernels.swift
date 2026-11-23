@@ -8,6 +8,7 @@ import QWHAL
 import QWAlloc
 import QWGEMM
 import QWHead
+import QWLoad
 import QWQuant
 
 extension QWEngineDriver {
@@ -82,11 +83,62 @@ extension QWEngineDriver {
         return name
     }
 
+    struct HeadWeightSpec: Sendable, Equatable {
+        let isQ4g: Bool
+        let format: QWWeightFormat?
+    }
+
+    /// Resolves head precision and format against tied embeddings or explicit `lm_head.weight`.
+    static func resolveHeadSpec(
+        st: QWSafeTensorsContainer?,
+        pack: QWQuant.Pack?,
+        trunkFormat: QWWeightFormat,
+        geometry: QWModelGeometry
+    ) -> HeadWeightSpec {
+        let tie = geometry.descriptor.tieWordEmbeddings
+        let rawExists: (String) -> Bool = { name in
+            if let pack { return (try? pack.entry(name)) != nil }
+            if let st { return st.tensor(name) != nil }
+            return false
+        }
+        let resolvedName = QWCheckpointTensorLoader.resolveName(
+            "lm_head.weight",
+            defaultPrefix: P,
+            tieWordEmbeddings: tie,
+            rawExists: rawExists
+        )
+        if let pack {
+            let isQ4g = (try? pack.entry(resolvedName).quantized) ?? false
+            return HeadWeightSpec(isQ4g: isQ4g, format: nil)
+        }
+        guard let st else {
+            return HeadWeightSpec(isQ4g: false, format: nil)
+        }
+        guard trunkFormat.isNativeAffine else {
+            return HeadWeightSpec(isQ4g: true, format: .hq4G32)
+        }
+        if resolvedName.hasSuffix(".weight") {
+            let stem = String(resolvedName.dropLast(".weight".count))
+            if st.tensor(stem + ".scales") != nil,
+               let layout = try? QWAQRepacker.layout(container: st, name: resolvedName,
+                                                     rows: geometry.vocab, cols: geometry.hidden),
+               QWAQBlock.isSupported(bits: layout.bits, group: layout.group) {
+                return HeadWeightSpec(
+                    isQ4g: true,
+                    format: .nativeAffine(bits: layout.bits, groupSize: layout.group)
+                )
+            }
+        }
+        return HeadWeightSpec(isQ4g: false, format: nil)
+    }
+
     /// The head's bank: the family's own container, or the incumbent's.
     static func loadHead(loader: inout WeightLoader, headIsQ4g: Bool,
+                         headFormat: QWWeightFormat? = nil,
                          geometry: QWModelGeometry) throws -> QWHeadStorage {
         guard headIsQ4g else { return .f16(try loader.convertBF16("lm_head.weight")) }
-        let view = try loader.q4("lm_head.weight", n: geometry.vocab, k: geometry.hidden)
+        let view = try loader.q4("lm_head.weight", n: geometry.vocab, k: geometry.hidden,
+                                 formatOverride: headFormat)
         guard let weight = QWHeadWeight(blocks: view.blocks, n: view.n, k: view.k,
                                         bits: view.bits, groupSize: view.groupSize,
                                         isRotated: view.isRotated,

@@ -55,6 +55,7 @@ public final class QWLSAOperator: @unchecked Sendable {
     public let listStride: Int
     public let region: QWMRegion
     public let layers: [LayerState]
+    public let loopReusePlan: QWLSALoopReusePlan
     /// Session whose indexer pools and Ward clusters the layers currently hold.
     public weak var stateOwner: AnyObject?
 
@@ -62,9 +63,12 @@ public final class QWLSAOperator: @unchecked Sendable {
     public let scoreScratch: QWTensorValue
     public let blockListScratch: QWTensorValue
     public let blockCountScratch: QWTensorValue
+    let reuseBlockLists: [QWTensorValue]
+    let reuseBlockCounts: [QWTensorValue]
 
     let hal: QWHal
     let psoIndexPrep: any MTLComputePipelineState
+    let psoIndexPrepBF16: any MTLComputePipelineState
     let psoPoolKeys: any MTLComputePipelineState
     let psoWardCluster: any MTLComputePipelineState
     let psoSelectBlocks: any MTLComputePipelineState
@@ -131,6 +135,7 @@ public final class QWLSAOperator: @unchecked Sendable {
         self.listStride = listStride
 
         self.psoIndexPrep = try hal.pipeline("qwg_lsa_index_prep")
+        self.psoIndexPrepBF16 = try hal.pipeline("qwg_lsa_index_prep_bf16")
         self.psoPoolKeys = try hal.pipeline("qwg_lsa_pool_keys")
         self.psoWardCluster = try hal.pipeline("qwg_lsa_ward_cluster_512")
         self.psoSelectBlocks = try hal.pipeline("qwg_lsa_select_blocks")
@@ -143,58 +148,22 @@ public final class QWLSAOperator: @unchecked Sendable {
             : nil
 
         let nAttnLayers = layerWeights.count
-        var cursor = 0
-        func align256(_ x: Int) -> Int { (x + 255) & ~255 }
-        func reserve(_ bytes: Int) -> Int {
-            let off = cursor
-            cursor = align256(cursor + max(256, bytes))
-            return off
-        }
+        let reusePlan = QWLSALoopReusePlan.build(
+            physicalLayers: layerWeights.map(\.physicalLayer),
+            enabled: config.crossLoopReuse,
+            stride: config.loopShareStride
+        )
+        self.loopReusePlan = reusePlan
 
-        struct LayerOffsets {
-            let wqOff: Int
-            let wkOff: Int
-            let kPendOff: Int
-            let pooledOff: Int
-            let centOff: Int
-            let memOff: Int
-            let sizeOff: Int
-        }
+        let layout = Self.buildLayoutPlan(
+            inDim: inDim, indexDim: indexDim, ringCap: ringCap,
+            maxBlocks: maxBlocks, maxSuperblocks: maxSuperblocks, maxBuckets: maxBuckets,
+            listStride: listStride, maxPrefillChunk: self.maxPrefillChunk,
+            emeans: emeans, physicalLayers: layerWeights.map(\.physicalLayer), reusePlan: reusePlan
+        )
+        let layerOffsets = layout.layerOffsets
 
-        var layerOffsets: [LayerOffsets] = []
-        layerOffsets.reserveCapacity(nAttnLayers)
-        for _ in 0..<nAttnLayers {
-            let wqOff = reserve(indexDim * inDim * 2)
-            let wkOff = reserve(indexDim * inDim * 2)
-            let kPendOff = reserve(ringCap * indexDim * 2)
-            let pooledOff = reserve(maxBlocks * indexDim * 2)
-            let centOff = reserve(maxBuckets * indexDim * 2)
-            let memOff = reserve(emeans ? maxSuperblocks * 2048 : maxBuckets * 4)
-            let sizeOff = reserve(emeans ? maxBuckets * 4 : maxBuckets)
-            layerOffsets.append(LayerOffsets(
-                wqOff: wqOff, wkOff: wkOff, kPendOff: kPendOff,
-                pooledOff: pooledOff, centOff: centOff, memOff: memOff, sizeOff: sizeOff
-            ))
-        }
-
-        let selectBatch = min(self.maxPrefillChunk, Self.maxSelectBatchRows)
-        let qIdxOff = reserve(self.maxPrefillChunk * indexDim * 2)
-        let scoreRows = emeans ? 1 : selectBatch
-        let scoreCols = emeans ? 64 : maxBlocks
-        let scoreOff = reserve(scoreRows * scoreCols * 4)
-        let listOff = reserve(self.maxPrefillChunk * listStride * 4)
-        let countOff = reserve(self.maxPrefillChunk * 4)
-        let markStride = emeans ? 1 : ((maxBlocks + 31) / 32)
-        let candCap = Self.selectCandidateCap
-        let selCScoreOff = reserve(selectBatch * maxBuckets * 4)
-        let selHistOff = reserve(selectBatch * 512 * 4)
-        let selCountCols = emeans ? 2 : 1
-        let selCountOff = reserve(selectBatch * selCountCols * 4)
-        let selMarksOff = reserve(selectBatch * markStride * 4)
-        let selCandMOff = reserve(selectBatch * candCap * 4)
-        let selCandUOff = reserve(selectBatch * candCap * 4)
-
-        let totalBytes = max(4096, cursor)
+        let totalBytes = layout.totalBytes
         guard let buf = hal.device.makeBuffer(length: totalBytes, options: .storageModeShared) else {
             throw QWAllocError.outOfSpace(region: "lsa-cache", asked: totalBytes, free: 0)
         }
@@ -207,7 +176,7 @@ public final class QWLSAOperator: @unchecked Sendable {
         builtLayers.reserveCapacity(nAttnLayers)
         let basePtr = reg.pointer
         let wBytes = indexDim * inDim * 2
-        for i in 0..<nAttnLayers {
+        for i in layout.uniqueWeightIndices {
             let offs = layerOffsets[i]
             let lw = layerWeights[i]
             lw.wqIdxF16.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
@@ -220,6 +189,9 @@ public final class QWLSAOperator: @unchecked Sendable {
                     memcpy(basePtr.advanced(by: offs.wkOff), ptr, min(src.count, wBytes))
                 }
             }
+        }
+        for i in 0..<nAttnLayers {
+            let offs = layerOffsets[i]
             builtLayers.append(LayerState(
                 fullAttentionIndex: i,
                 wqIdx: QWTensorValue(region: reg, offset: offs.wqOff, shape: QWTensorShape([indexDim, inDim], .f16)),
@@ -234,43 +206,227 @@ public final class QWLSAOperator: @unchecked Sendable {
             ))
         }
         self.layers = builtLayers
+        let maxChunk = self.maxPrefillChunk
+        self.reuseBlockLists = layout.reuseOffsets.map {
+            QWTensorValue(region: reg, offset: $0.listOff, shape: QWTensorShape([maxChunk, listStride], .i32))
+        }
+        self.reuseBlockCounts = layout.reuseOffsets.map {
+            QWTensorValue(region: reg, offset: $0.countOff, shape: QWTensorShape([maxChunk], .i32))
+        }
 
         self.qIdxScratch = QWTensorValue(
-            region: reg, offset: qIdxOff,
+            region: reg, offset: layout.qIdxOff,
             shape: QWTensorShape([self.maxPrefillChunk, indexDim], .f16))
         self.scoreScratch = QWTensorValue(
-            region: reg, offset: scoreOff,
-            shape: QWTensorShape([scoreRows, scoreCols], .i32))
+            region: reg, offset: layout.scoreOff,
+            shape: QWTensorShape([layout.scoreRows, layout.scoreCols], .i32))
         self.blockListScratch = QWTensorValue(
-            region: reg, offset: listOff,
+            region: reg, offset: layout.listOff,
             shape: QWTensorShape([self.maxPrefillChunk, listStride], .i32))
         self.blockCountScratch = QWTensorValue(
-            region: reg, offset: countOff,
+            region: reg, offset: layout.countOff,
             shape: QWTensorShape([self.maxPrefillChunk], .i32))
-        self.selMarkStride = markStride
-        self.selCScore = QWTensorValue(region: reg, offset: selCScoreOff,
-                                       shape: QWTensorShape([selectBatch, maxBuckets], .i32))
-        self.selHist = QWTensorValue(region: reg, offset: selHistOff,
-                                     shape: QWTensorShape([selectBatch, 512], .i32))
-        self.selCount = QWTensorValue(region: reg, offset: selCountOff,
-                                      shape: QWTensorShape([selectBatch * selCountCols], .i32))
-        self.selMarks = QWTensorValue(region: reg, offset: selMarksOff,
-                                      shape: QWTensorShape([selectBatch, markStride], .i32))
-        self.selCandM = QWTensorValue(region: reg, offset: selCandMOff,
-                                      shape: QWTensorShape([selectBatch, candCap], .i32))
-        let candUVal = QWTensorValue(region: reg, offset: selCandUOff,
-                                     shape: QWTensorShape([selectBatch, candCap], .i32))
+        self.selMarkStride = layout.markStride
+        self.selCScore = QWTensorValue(region: reg, offset: layout.selCScoreOff,
+                                       shape: QWTensorShape([layout.selectBatch, maxBuckets], .i32))
+        self.selHist = QWTensorValue(region: reg, offset: layout.selHistOff,
+                                     shape: QWTensorShape([layout.selectBatch, 512], .i32))
+        self.selCount = QWTensorValue(region: reg, offset: layout.selCountOff,
+                                      shape: QWTensorShape([layout.selectBatch * layout.selCountCols], .i32))
+        self.selMarks = QWTensorValue(region: reg, offset: layout.selMarksOff,
+                                      shape: QWTensorShape([layout.selectBatch, layout.markStride], .i32))
+        self.selCandM = QWTensorValue(region: reg, offset: layout.selCandMOff,
+                                      shape: QWTensorShape([layout.selectBatch, layout.candCap], .i32))
+        let candUVal = QWTensorValue(region: reg, offset: layout.selCandUOff,
+                                     shape: QWTensorShape([layout.selectBatch, layout.candCap], .i32))
         self.selCandU = candUVal
         if let loadedCoarse {
             let scratch = QWCoarsePoolIndex.Scratch(
                 cScore: selCScore, uHist: selHist, candState: selCount,
                 candPools: selCandM, candU: candUVal,
-                maxBatchRows: Self.maxSelectBatchRows, clusterStride: maxBuckets, candCap: candCap)
+                maxBatchRows: Self.maxSelectBatchRows, clusterStride: maxBuckets, candCap: layout.candCap)
             self.coarsePipeline = QWCoarseSelectionPipeline(
                 variant: .lsa, loaded: loadedCoarse, scratch: scratch, layerCount: nAttnLayers)
         } else {
             self.coarsePipeline = nil
         }
+    }
+
+    struct LayerOffsets {
+        let wqOff: Int
+        let wkOff: Int
+        let kPendOff: Int
+        let pooledOff: Int
+        let centOff: Int
+        let memOff: Int
+        let sizeOff: Int
+    }
+
+    struct LayoutPlan {
+        let layerOffsets: [LayerOffsets]
+        let uniqueWeightIndices: [Int]
+        let reuseOffsets: [(listOff: Int, countOff: Int)]
+        let qIdxOff: Int
+        let scoreOff: Int
+        let scoreRows: Int
+        let scoreCols: Int
+        let listOff: Int
+        let countOff: Int
+        let selectBatch: Int
+        let markStride: Int
+        let selCountCols: Int
+        let candCap: Int
+        let selCScoreOff: Int
+        let selHistOff: Int
+        let selCountOff: Int
+        let selMarksOff: Int
+        let selCandMOff: Int
+        let selCandUOff: Int
+        let totalBytes: Int
+    }
+
+    static func buildLayoutPlan(
+        inDim: Int, indexDim: Int, ringCap: Int,
+        maxBlocks: Int, maxSuperblocks: Int, maxBuckets: Int,
+        listStride: Int, maxPrefillChunk: Int, emeans: Bool,
+        physicalLayers: [Int], reusePlan: QWLSALoopReusePlan
+    ) -> LayoutPlan {
+        var cursor = 0
+        func align256(_ x: Int) -> Int { (x + 255) & ~255 }
+        func reserve(_ bytes: Int) -> Int {
+            let off = cursor
+            cursor = align256(cursor + max(256, bytes))
+            return off
+        }
+        var physWeightOffs: [Int: (wqOff: Int, wkOff: Int)] = [:]
+        var uniqueWeightIndices: [Int] = []
+        var layerOffsets = Array(repeating: LayerOffsets(
+            wqOff: 0, wkOff: 0, kPendOff: 0, pooledOff: 0, centOff: 0, memOff: 0, sizeOff: 0
+        ), count: physicalLayers.count)
+        for (i, physLayer) in physicalLayers.enumerated() {
+            let leader = reusePlan.sourceForFullAttnLayer[i]
+            if leader != i {
+                layerOffsets[i] = layerOffsets[leader]
+                continue
+            }
+            let wPair: (wqOff: Int, wkOff: Int)
+            if let existing = physWeightOffs[physLayer] {
+                wPair = existing
+            } else {
+                wPair = (wqOff: reserve(indexDim * inDim * 2), wkOff: reserve(indexDim * inDim * 2))
+                physWeightOffs[physLayer] = wPair
+                uniqueWeightIndices.append(i)
+            }
+            layerOffsets[i] = LayerOffsets(
+                wqOff: wPair.wqOff, wkOff: wPair.wkOff,
+                kPendOff: reserve(ringCap * indexDim * 2),
+                pooledOff: reserve(maxBlocks * indexDim * 2),
+                centOff: reserve(maxBuckets * indexDim * 2),
+                memOff: reserve(emeans ? maxSuperblocks * 2048 : maxBuckets * 4),
+                sizeOff: reserve(emeans ? maxBuckets * 4 : maxBuckets)
+            )
+        }
+        var reuseOffsets: [(listOff: Int, countOff: Int)] = []
+        reuseOffsets.reserveCapacity(reusePlan.reuseSlotCount)
+        for _ in 0..<reusePlan.reuseSlotCount {
+            reuseOffsets.append((
+                listOff: reserve(maxPrefillChunk * listStride * 4),
+                countOff: reserve(maxPrefillChunk * 4)
+            ))
+        }
+        let selectBatch = min(maxPrefillChunk, Self.maxSelectBatchRows)
+        let qIdxOff = reserve(maxPrefillChunk * indexDim * 2)
+        let scoreRows = emeans ? 1 : selectBatch
+        let scoreCols = emeans ? 64 : maxBlocks
+        let scoreOff = reserve(scoreRows * scoreCols * 4)
+        let listOff = reserve(maxPrefillChunk * listStride * 4)
+        let countOff = reserve(maxPrefillChunk * 4)
+        let markStride = emeans ? 1 : ((maxBlocks + 31) / 32)
+        let candCap = Self.selectCandidateCap
+        let selCScoreOff = reserve(selectBatch * maxBuckets * 4)
+        let selHistOff = reserve(selectBatch * 512 * 4)
+        let selCountCols = emeans ? 2 : 1
+        let selCountOff = reserve(selectBatch * selCountCols * 4)
+        let selMarksOff = reserve(selectBatch * markStride * 4)
+        let selCandMOff = reserve(selectBatch * candCap * 4)
+        let selCandUOff = reserve(selectBatch * candCap * 4)
+        return LayoutPlan(
+            layerOffsets: layerOffsets, uniqueWeightIndices: uniqueWeightIndices,
+            reuseOffsets: reuseOffsets, qIdxOff: qIdxOff, scoreOff: scoreOff,
+            scoreRows: scoreRows, scoreCols: scoreCols, listOff: listOff, countOff: countOff,
+            selectBatch: selectBatch, markStride: markStride, selCountCols: selCountCols,
+            candCap: candCap, selCScoreOff: selCScoreOff, selHistOff: selHistOff,
+            selCountOff: selCountOff, selMarksOff: selMarksOff,
+            selCandMOff: selCandMOff, selCandUOff: selCandUOff,
+            totalBytes: max(4096, cursor)
+        )
+    }
+
+    /// Estimates total Metal region bytes required for LSA at `(maxContext, maxPrefillChunk)`.
+    public static func estimateRegionBytes(
+        geometry: QWModelGeometry,
+        lsaConfig: QWLSAConfig,
+        attnLayers: [Int],
+        maxContext: Int,
+        maxPrefillChunk: Int,
+        indexDim: Int = QWLSAConfig.defaultIndexDim
+    ) -> Int {
+        guard lsaConfig.isEnabled, !attnLayers.isEmpty else { return 0 }
+        let effCfg = lsaConfig.resolvingLoopShareEnvironment()
+        let emeans = (effCfg.alignedClusterBlock == QWLSAConfig.emeansClusterBlock)
+        let clampedCtx = max(512, maxContext)
+        let chunk = max(32, maxPrefillChunk)
+        var rc = 4096
+        while rc < chunk * 2 { rc <<= 1 }
+        let maxBlocks = max(128, (clampedCtx + 3) / 4)
+        let maxSuperblocks = emeans
+            ? QWCoarsePoolIndex.maxMacros(forMaxContext: clampedCtx)
+            : max(1, (clampedCtx + 511) / 512)
+        let plan = geometry.executionPlan
+        let physLayers = attnLayers.map { plan.indices.contains($0) ? plan[$0] : $0 }
+        let reusePlan = QWLSALoopReusePlan.build(
+            physicalLayers: physLayers, enabled: effCfg.crossLoopReuse, stride: effCfg.loopShareStride
+        )
+        let layout = buildLayoutPlan(
+            inDim: geometry.lsaInputDim, indexDim: indexDim, ringCap: rc,
+            maxBlocks: maxBlocks, maxSuperblocks: maxSuperblocks, maxBuckets: maxSuperblocks * 64,
+            listStride: max(512, effCfg.maxTotalSelectedBlocks), maxPrefillChunk: chunk,
+            emeans: emeans, physicalLayers: physLayers, reusePlan: reusePlan
+        )
+        let coarseExtra = emeans ? (maxSuperblocks * 4 * physLayers.count) : 0
+        return layout.totalBytes + coarseExtra
+    }
+
+    /// True when `fullAttnLayer` reuses its leader's LSA block list instead of indexing/selecting.
+    public func isSelectionFollower(fullAttnLayer: Int) -> Bool {
+        guard fullAttnLayer >= 0, fullAttnLayer < loopReusePlan.isFollower.count else { return false }
+        return loopReusePlan.isFollower[fullAttnLayer]
+    }
+
+    /// Leader `fullAttnLayer` index whose LSA state and block selections serve `fullAttnLayer`.
+    public func selectionSourceLayer(forFullAttnLayer fullAttnLayer: Int) -> Int {
+        guard fullAttnLayer >= 0, fullAttnLayer < loopReusePlan.sourceForFullAttnLayer.count else {
+            return fullAttnLayer
+        }
+        return loopReusePlan.sourceForFullAttnLayer[fullAttnLayer]
+    }
+
+    /// Selected block list tensor to bind for `fullAttnLayer` (leader cache if shared, else scratch).
+    public func blockList(forFullAttnLayer fullAttnLayer: Int) -> QWTensorValue {
+        let src = selectionSourceLayer(forFullAttnLayer: fullAttnLayer)
+        if let slot = loopReusePlan.reuseCacheSlotForLeader[src], slot < reuseBlockLists.count {
+            return reuseBlockLists[slot]
+        }
+        return blockListScratch
+    }
+
+    /// Selected block count tensor to bind for `fullAttnLayer` (leader cache if shared, else scratch).
+    public func blockCount(forFullAttnLayer fullAttnLayer: Int) -> QWTensorValue {
+        let src = selectionSourceLayer(forFullAttnLayer: fullAttnLayer)
+        if let slot = loopReusePlan.reuseCacheSlotForLeader[src], slot < reuseBlockCounts.count {
+            return reuseBlockCounts[slot]
+        }
+        return blockCountScratch
     }
 
     /// Mirrors `LSASelParams` in qwlsa.metal.

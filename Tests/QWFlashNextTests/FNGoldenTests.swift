@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
-@testable import QWFlashNext
+@testable import QWEngine
+@testable import QWHyperPLE
 
 // Goldens: Scripts/flashnext/gen_goldens.py (HF qwen4_exp, seed 20261020).
 final class FNGoldenTests: XCTestCase {

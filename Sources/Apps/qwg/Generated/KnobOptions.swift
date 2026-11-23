@@ -136,6 +136,10 @@ public struct QWGKnobOptions: ParsableArguments {
     @Option(name: [.customLong("lsa-sidecar-path")], help: "Explicit path to a .qlsa (QLSA0001) projection sidecar file.")
     public var lsaSidecarPath: String?
 
+    /// Reuse LSA block selections across recurrent visits to the same physical global attention layer (opt-in, lossy).
+    @Flag(name: [.customLong("lsa-cross-loop-reuse")], inversion: .prefixedNo, help: "Reuse LSA block selections across recurrent visits to the same physical global attention layer (opt-in, lossy).")
+    public var lsaCrossLoopReuse: Bool?
+
     /// Load the model on the first request instead of at startup.
     @Flag(name: [.customLong("lazy")], inversion: .prefixedNo, help: "Load the model on the first request instead of at startup.")
     public var lazy: Bool?
@@ -168,8 +172,8 @@ public struct QWGKnobOptions: ParsableArguments {
     @Option(name: [.customLong("kv-mode")], help: "KV cache quantization: f16, q8 or q4.", transform: { $0.lowercased() })
     public var kvMode: String?
 
-    /// MoE-Spec routed expert budget per verify layer (0 is lossless, 1...8 caps cold SSD reads).
-    @Option(name: [.customLong("moe-spec-budget")], help: "MoE-Spec routed expert budget per verify layer (0 is lossless, 1...8 caps cold SSD reads).")
+    /// MoE-Spec routed expert budget per verify layer (0 is lossless, 1...64 caps unique verify experts).
+    @Option(name: [.customLong("moe-spec-budget")], help: "MoE-Spec routed expert budget per verify layer (0 is lossless, 1...64 caps unique verify experts).")
     public var moeSpecBudget: Int?
 
     /// GDN prefill algorithm: chunked, regres or naive.
@@ -223,6 +227,7 @@ public struct QWGKnobOptions: ParsableArguments {
         QWGKnobBinding(id: "lsaBudget", property: "lsaBudget", flag: "lsa-budget"),
         QWGKnobBinding(id: "lsaClusterBlock", property: "lsaClusterBlock", flag: "lsa-cluster-block"),
         QWGKnobBinding(id: "lsaSidecarPath", property: "lsaSidecarPath", flag: "lsa-sidecar-path"),
+        QWGKnobBinding(id: "lsaCrossLoopReuse", property: "lsaCrossLoopReuse", flag: "lsa-cross-loop-reuse"),
         QWGKnobBinding(id: "lazyLoad", property: "lazy", flag: "lazy"),
         QWGKnobBinding(id: "loadVision", property: "loadVision", flag: "load-vision"),
         QWGKnobBinding(id: "logLevel", property: "logLevel", flag: "log-level"),
@@ -270,6 +275,7 @@ public struct QWGKnobOptions: ParsableArguments {
         if let v = lsaBudget { out["lsaBudget"] = .int(v) }
         if let v = lsaClusterBlock { out["lsaClusterBlock"] = .int(v) }
         if let v = lsaSidecarPath { out["lsaSidecarPath"] = .string(v) }
+        if let v = lsaCrossLoopReuse { out["lsaCrossLoopReuse"] = .bool(v) }
         if let v = lazy { out["lazyLoad"] = .bool(v) }
         if let v = loadVision { out["loadVision"] = .bool(v) }
         if let v = logLevel { out["logLevel"] = .string(v) }
@@ -311,9 +317,9 @@ public struct QWGKnobOptions: ParsableArguments {
     /// The knobs each command honours. A knob the user set that the
     /// command cannot honour is refused, not ignored.
     public static let honoured: [String: Set<String>] = [
-        "qwg run": ["contextTokens", "maxTokens", "kvMode", "enableThinking", "reasoningEffort", "systemPrompt", "gdnPrefill", "evictPrefillScratch", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "prefillChunkRows", "temperature", "topP", "topK", "repetitionPenalty", "seed", "prefixCacheEnabled", "cacheDir", "loadVision", "streamNgrams"],
-        "qwg repl": ["contextTokens", "maxTokens", "kvMode", "enableThinking", "reasoningEffort", "systemPrompt", "warmCacheLimitGiB", "ssdCacheLimitGiB", "cacheDir", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "prefillChunkRows", "temperature", "topP", "topK", "repetitionPenalty", "seed", "loadVision", "streamNgrams"],
-        "qwg serve": ["contextTokens", "kvMode", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "gdnPrefill", "evictPrefillScratch", "prefillChunkRows", "maxConcurrentSessions", "warmCacheLimitGiB", "ssdCacheLimitGiB", "cacheDir", "logLevel", "temperature", "topP", "topK", "maxTokens", "repetitionPenalty", "seed", "enableThinking", "reasoningEffort", "systemPrompt", "lazyLoad", "loadVision", "streamNgrams"],
+        "qwg run": ["contextTokens", "maxTokens", "kvMode", "enableThinking", "reasoningEffort", "systemPrompt", "gdnPrefill", "evictPrefillScratch", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "prefillChunkRows", "temperature", "topP", "topK", "repetitionPenalty", "seed", "prefixCacheEnabled", "cacheDir", "loadVision", "streamNgrams"],
+        "qwg repl": ["contextTokens", "maxTokens", "kvMode", "enableThinking", "reasoningEffort", "systemPrompt", "warmCacheLimitGiB", "ssdCacheLimitGiB", "cacheDir", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "prefillChunkRows", "temperature", "topP", "topK", "repetitionPenalty", "seed", "loadVision", "streamNgrams"],
+        "qwg serve": ["contextTokens", "kvMode", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "gdnPrefill", "evictPrefillScratch", "prefillChunkRows", "maxConcurrentSessions", "warmCacheLimitGiB", "ssdCacheLimitGiB", "cacheDir", "logLevel", "temperature", "topP", "topK", "maxTokens", "repetitionPenalty", "seed", "enableThinking", "reasoningEffort", "systemPrompt", "lazyLoad", "loadVision", "streamNgrams"],
         "qwg plan": ["contextTokens", "kvMode"],
     ]
 
@@ -332,6 +338,7 @@ public struct QWGKnobOptions: ParsableArguments {
         "logLevel": ["qwg serve"],
         "lsaBudget": ["qwg run", "qwg repl", "qwg serve"],
         "lsaClusterBlock": ["qwg run", "qwg repl", "qwg serve"],
+        "lsaCrossLoopReuse": ["qwg run", "qwg repl", "qwg serve"],
         "lsaMode": ["qwg run", "qwg repl", "qwg serve"],
         "lsaSidecarPath": ["qwg run", "qwg repl", "qwg serve"],
         "maxConcurrentSessions": ["qwg serve"],

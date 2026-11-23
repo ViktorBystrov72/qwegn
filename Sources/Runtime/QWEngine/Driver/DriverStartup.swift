@@ -31,12 +31,53 @@ extension QWEngineDriver {
         let draftHeadEnabled: Bool
         let verifyHeadQ4Enabled: Bool
         let headIsQ4g: Bool
+        let headFormat: QWWeightFormat?
+        let requestedMTPDrafts: Int
         let dflashDraftPackPath: String
         let dflashSelectorTopK: Int?
         let environment: [String: String]
+        let isHyperStream: Bool
+        let isInkling2: Bool
+        let targetDescriptor: QWModelDescriptor?
+
+        func resolvingHead(isQ4g: Bool, format: QWWeightFormat?) throws -> StartupConfig {
+            let maxDrafts = 15
+            let resolvedDraftHead = try QWEngineDriver.resolveMTPFlag(
+                name: "QW_MTP_DRAFT_HEAD",
+                value: environment["QW_MTP_DRAFT_HEAD"],
+                drafts: requestedMTPDrafts,
+                defaultValue: isQ4g,
+                maxDrafts: maxDrafts
+            )
+            try QWEngineDriver.validateMTPVerifyHeadQ4(
+                enabled: verifyHeadQ4Enabled, draftHead: resolvedDraftHead)
+            return StartupConfig(
+                mtpBackend: mtpBackend,
+                prefillScratchEviction: prefillScratchEviction,
+                mtpAdaptiveDepth: mtpAdaptiveDepth,
+                mtpAdaptiveEntropyThreshold: mtpAdaptiveEntropyThreshold,
+                mtpRelaxedMargin: mtpRelaxedMargin,
+                mtpDraftStrategy: mtpDraftStrategy,
+                mtpQuadraticSeeding: mtpQuadraticSeeding,
+                mtpStageProfiling: mtpStageProfiling,
+                mtpVerificationProfiling: mtpVerificationProfiling,
+                draftHeadEnabled: resolvedDraftHead,
+                verifyHeadQ4Enabled: verifyHeadQ4Enabled,
+                headIsQ4g: isQ4g,
+                headFormat: format,
+                requestedMTPDrafts: requestedMTPDrafts,
+                dflashDraftPackPath: dflashDraftPackPath,
+                dflashSelectorTopK: dflashSelectorTopK,
+                environment: environment,
+                isHyperStream: isHyperStream,
+                isInkling2: isInkling2,
+                targetDescriptor: targetDescriptor
+            )
+        }
     }
 
     static func resolveStartup(packPath: String, kvMode: QWKVMode,
+                              rawKVMode: String? = nil,
                               mtpDrafts: Int, mtpBackend: QWMTPBackend?,
                               prefillScratchEviction: QWPrefillScratchEvictionPolicy,
                               mtpAdaptiveDepth: Bool?, mtpAdaptiveEntropyThreshold: Double?,
@@ -57,7 +98,7 @@ extension QWEngineDriver {
         } catch QWEngineError.badMTPDrafts(let d) {
             throw QWEngineDriverError.badMTPDrafts(d)
         }
-        let maxDrafts = mtpBackendResolved == .dflash2 ? 15 : 7
+        let maxDrafts = 15
         guard mtpDrafts >= 0 && mtpDrafts <= maxDrafts else {
             throw QWEngineDriverError.badMTPDrafts(mtpDrafts)
         }
@@ -67,37 +108,49 @@ extension QWEngineDriver {
         let root = QWModelRoot(url: URL(fileURLWithPath: packPath))
         let isSafetensors = (root.kind == .safetensorsSingle || root.kind == .safetensorsSharded)
         var targetDescriptor: QWModelDescriptor?
+        var resolvedPackFamily: QWModelDescriptor.Family?
         if isSafetensors {
             guard let cfgURL = root.configURL else {
                 throw QWEngineDriverError.packMissing(packPath)
             }
             let desc = try QWModelDescriptor.decode(configJSON: Data(contentsOf: cfgURL))
             targetDescriptor = desc
-            let served = QWModuleRegistry.moduleType(for: desc.family)
-            guard served is DenseModule.Type else {
-                throw QWEngineDriverError.unsupportedModel(desc.family.rawValue)
-            }
+            try Self.ensureDriverServes(descriptor: desc)
         } else {
             if let cfgURL = root.configURL {
                 let desc = try QWModelDescriptor.decode(configJSON: Data(contentsOf: cfgURL))
                 targetDescriptor = desc
-                let served = QWModuleRegistry.moduleType(for: desc.family)
-                guard served is DenseModule.Type else {
-                    throw QWEngineDriverError.unsupportedModel(desc.family.rawValue)
-                }
+                try Self.ensureDriverServes(descriptor: desc)
             } else {
                 let identity = try QWQuant.Pack.peekProvenance(url: URL(fileURLWithPath: packPath))
-                let family = identity.modelId.flatMap { QWModuleRegistry.family(forPackModelId: $0) }
-                let served = family.flatMap { QWModuleRegistry.moduleType(for: $0) }
-                if let mid = identity.modelId, !(served is DenseModule.Type) {
-                    throw QWEngineDriverError.unsupportedModel(mid)
+                if let mid = identity.modelId {
+                    let family = QWModuleRegistry.family(forPackModelId: mid)
+                    guard let family, Self.servesFamilyOnDenseDriver(family) else {
+                        throw QWEngineDriverError.unsupportedModel(mid)
+                    }
+                    resolvedPackFamily = family
                 }
             }
         }
-        // Validate KV mode before any arena work (f16, q8, and q4 are all
-        // shipped and parity-gated across prefill, decode, and MTP verify).
-        try Self.validateKVMode(mode: kvMode)
-        let headIsQ4g = isSafetensors
+        let isHyperStream = ((targetDescriptor?.hcCount ?? 0) > 1) || (resolvedPackFamily == .qwen38FlashNext)
+        let isInkling2 = (targetDescriptor?.family == .inkling2Loop) || (resolvedPackFamily == .inkling2Loop)
+        let normRawKV = rawKVMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let effectiveKVString = normRawKV ?? String(describing: kvMode)
+        if let desc = targetDescriptor {
+            guard QWModelCapabilities.supportedKVStorageModes(for: desc).contains(effectiveKVString) else {
+                throw QWEngineDriverError.unsupportedKVMode(rawKVMode ?? String(describing: kvMode))
+            }
+        } else if isHyperStream {
+            guard ["f32", "f16", "q8", "q4"].contains(effectiveKVString) else {
+                throw QWEngineDriverError.unsupportedKVMode(rawKVMode ?? String(describing: kvMode))
+            }
+        } else {
+            if normRawKV == "f32" {
+                throw QWEngineDriverError.unsupportedKVMode(rawKVMode ?? "f32")
+            }
+            try Self.validateKVMode(mode: kvMode)
+        }
+        let headIsQ4g = (isSafetensors || isHyperStream || isInkling2)
             ? true
             : ((try? QWQuant.Pack(url: URL(fileURLWithPath: packPath))
                 .entry("lm_head.weight").quantized) ?? false)
@@ -187,8 +240,24 @@ extension QWEngineDriver {
             draftHeadEnabled: draftHeadEnabled,
             verifyHeadQ4Enabled: verifyHeadQ4Enabled,
             headIsQ4g: headIsQ4g,
+            headFormat: nil,
+            requestedMTPDrafts: mtpDrafts,
             dflashDraftPackPath: resolvedDFlashPackPath,
             dflashSelectorTopK: resolvedDFlashTopK,
-            environment: environment)
+            environment: environment,
+            isHyperStream: isHyperStream,
+            isInkling2: isInkling2,
+            targetDescriptor: targetDescriptor)
+    }
+
+    private static func servesFamilyOnDenseDriver(_ family: QWModelDescriptor.Family) -> Bool {
+        QWModuleRegistry.moduleType(for: family) != nil
+    }
+
+    private static func ensureDriverServes(descriptor: QWModelDescriptor) throws {
+        guard descriptor.role != .speculativeDrafter,
+              servesFamilyOnDenseDriver(descriptor.family) else {
+            throw QWEngineDriverError.unsupportedModel(descriptor.family.rawValue)
+        }
     }
 }
