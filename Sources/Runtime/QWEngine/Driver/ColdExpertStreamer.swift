@@ -182,9 +182,12 @@ extension QWEngineDriver {
 
         func syncGPUSlotMap() {
             guard let map = gpuSlotMap else { return }
-            slotOfExpert.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                guard let base = raw.baseAddress, !raw.isEmpty else { return }
-                map.contents().copyMemory(from: base, byteCount: raw.count)
+            let dst = map.contents()
+            withExtendedLifetime(map) {
+                slotOfExpert.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    guard let base = raw.baseAddress, !raw.isEmpty else { return }
+                    dst.copyMemory(from: base, byteCount: raw.count)
+                }
             }
         }
 

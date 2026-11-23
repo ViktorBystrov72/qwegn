@@ -121,13 +121,17 @@ enum QWEngineSessionState {
             try mtpCache.rollback(mtpKV, by: mtpCache.written(mtpKV) - written)
             session.mtpKVViews = [try mtpCache.layerViews(mtpKV, layer: 0)]
         }
-        snapshot.recData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            session.recSlab.region.pointer.advanced(by: session.recSlab.offset)
-                .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+        let recDst = session.recSlab.region.pointer.advanced(by: session.recSlab.offset)
+        withExtendedLifetime(session.recSlab.region.buffer) {
+            snapshot.recData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                recDst.copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+            }
         }
-        snapshot.ringData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            session.ringSlab.region.pointer.advanced(by: session.ringSlab.offset)
-                .copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+        let ringDst = session.ringSlab.region.pointer.advanced(by: session.ringSlab.offset)
+        withExtendedLifetime(session.ringSlab.region.buffer) {
+            snapshot.ringData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                ringDst.copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+            }
         }
         session.position = snapshot.position
         session.promptTokenCount = snapshot.promptTokenCount
@@ -135,17 +139,24 @@ enum QWEngineSessionState {
         session.roundRecord = snapshot.roundRecord
         if let owner = session.stochastic { session.roundRecord.samplerDrawIndex = owner.stream.drawsConsumed }
         if let hidden = session.trunkHidden, let data = snapshot.trunkHiddenData {
-            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                hidden.region.pointer.advanced(by: hidden.offset).copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+            let hiddenDst = hidden.region.pointer.advanced(by: hidden.offset)
+            withExtendedLifetime(hidden.region.buffer) {
+                data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    hiddenDst.copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+                }
             }
         }
         if let dSlot = session.dflashSlot, let kData = snapshot.dflashKData, let vData = snapshot.dflashVData,
            kData.count == dSlot.kSlab.bytes, vData.count == dSlot.vSlab.bytes {
-            kData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset).copyMemory(from: raw.baseAddress!, byteCount: raw.count)
-            }
-            vData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset).copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+            let kDst = dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset)
+            let vDst = dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset)
+            withExtendedLifetime(dSlot) {
+                kData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    kDst.copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+                }
+                vData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    vDst.copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+                }
             }
         }
         session.dflashCacheOffset = snapshot.dflashCacheOffset

@@ -18,8 +18,9 @@ extension OperatorSuites {
         let rows = gdnRows
         let bank = AQBanks.makeIncumbent4G32(rows: rows, cols: cols)
         let weights = try BenchRunner.buffer(device, bytes: bank.count)
+        let weightsPtr = weights.contents()
         bank.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-            weights.contents().copyMemory(from: src.baseAddress!, byteCount: bank.count)
+            weightsPtr.copyMemory(from: src.baseAddress!, byteCount: bank.count)
         }
         let xs = BenchRunner.makeActivations(cols: cols)
         let x = try BenchRunner.buffer(device, bytes: cols * 2)
@@ -136,8 +137,9 @@ extension OperatorSuites {
         let rows = headRows
         let bank = AQBanks.makeIncumbent4G32(rows: rows, cols: cols)
         let weights = try BenchRunner.buffer(device, bytes: bank.count)
+        let weightsPtr = weights.contents()
         bank.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-            weights.contents().copyMemory(from: src.baseAddress!, byteCount: bank.count)
+            weightsPtr.copyMemory(from: src.baseAddress!, byteCount: bank.count)
         }
         let xs = BenchRunner.makeActivations(cols: cols)
         let x = try BenchRunner.buffer(device, bytes: cols * 2)

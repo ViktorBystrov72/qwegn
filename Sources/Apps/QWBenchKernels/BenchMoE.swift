@@ -233,8 +233,9 @@ enum MoESuites {
         // --- the weights ---
         let bankBytes = MoEWeights.build(rows: experts * rowsPerExpert, cols: hidden)
         let bankBuf = try BenchRunner.buffer(device, bytes: bankBytes.count)
+        let bankPtr = bankBuf.contents()
         bankBytes.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-            bankBuf.contents().copyMemory(from: src.baseAddress!, byteCount: bankBytes.count)
+            bankPtr.copyMemory(from: src.baseAddress!, byteCount: bankBytes.count)
         }
 
         // --- the activations ---

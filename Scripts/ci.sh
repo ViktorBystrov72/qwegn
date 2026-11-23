@@ -81,6 +81,7 @@ if [ "$bbstatus" -ne 0 ]; then
   exit "$bbstatus"
 fi
 tail -1 "$CI_TMP_DIR/bench_build.log"
+python3 Scripts/check_swifterror_abi.py ./.build/release/qwg-bench-kernels || { echo "FAIL: swifterror ABI gate"; exit 1; }
 if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
   echo "skipping qwg-bench-kernels execution on GitHub Actions paravirtual GPU"
 else

@@ -152,12 +152,12 @@ extension Ink2BumpAllocator {
         from st: QWSafeTensorsContainer
     ) throws -> Ink2Slice {
         let slab = try allocateBytes(experts * 2 * bytesPerExpert, label: label)
+        let dst = slab.buffer.contents().advanced(by: slab.offset)
         try st.withBytes(of: gateName) { gRaw in
             try st.withBytes(of: upName) { uRaw in
                 guard gRaw.count == experts * bytesPerExpert, uRaw.count == experts * bytesPerExpert else {
                     throw QWInkling2Error.badState("\(label) byte mismatch")
                 }
-                let dst = slab.buffer.contents().advanced(by: slab.offset)
                 guard let gPtr = gRaw.baseAddress, let uPtr = uRaw.baseAddress else {
                     throw QWInkling2Error.badState("\(label) pointer missing")
                 }
@@ -191,16 +191,18 @@ extension Ink2BumpAllocator {
             experts: experts, bytesPerExpert: expSBytes, label: "\(sw)gate_up.scales", from: st
         )
         let guS2 = try allocateBytes(2 * s2Bytes, label: "\(sw)gate_up.scales2")
+        let guS2Dst = guS2.buffer.contents().advanced(by: guS2.offset)
         try st.withBytes(of: "\(sw)gate_proj.weight_scale_2") { gRaw in
-            try st.withBytes(of: "\(sw)up_proj.weight_scale_2") { uRaw in
-                guard gRaw.count == s2Bytes, uRaw.count == s2Bytes,
-                      let gPtr = gRaw.baseAddress, let uPtr = uRaw.baseAddress else {
-                    throw QWInkling2Error.badState("\(sw)gate/up scales2 mismatch")
-                }
-                let dst = guS2.buffer.contents().advanced(by: guS2.offset)
-                memcpy(dst, gPtr, s2Bytes)
-                memcpy(dst.advanced(by: s2Bytes), uPtr, s2Bytes)
+            guard gRaw.count == s2Bytes, let gPtr = gRaw.baseAddress else {
+                throw QWInkling2Error.badState("\(sw)gate scales2 mismatch")
             }
+            memcpy(guS2Dst, gPtr, s2Bytes)
+        }
+        try st.withBytes(of: "\(sw)up_proj.weight_scale_2") { uRaw in
+            guard uRaw.count == s2Bytes, let uPtr = uRaw.baseAddress else {
+                throw QWInkling2Error.badState("\(sw)up scales2 mismatch")
+            }
+            memcpy(guS2Dst.advanced(by: s2Bytes), uPtr, s2Bytes)
         }
         let dw = try copy("\(sw)down_proj.weight", from: st)
         let ds = try copy("\(sw)down_proj.scales", from: st)

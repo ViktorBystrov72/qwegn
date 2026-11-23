@@ -165,13 +165,12 @@ extension QWEngineDriver {
                     }
                 }
             case .f16:
+                let dstPtr = dst.region.buffer.contents().advanced(by: dst.region.base + dst.offset)
                 try reader.withBytes { raw in
                     guard raw.count >= total * 2, let base = raw.baseAddress else {
                         throw QWEngineDriverError.weightMissing(name, "f16 tensor byte length mismatch")
                     }
-                    dst.region.buffer.contents()
-                        .advanced(by: dst.region.base + dst.offset)
-                        .copyMemory(from: base, byteCount: total * 2)
+                    dstPtr.copyMemory(from: base, byteCount: total * 2)
                 }
             case .f32:
                 let floats = try st.readFloats(name, expectedElementCount: total)
@@ -278,11 +277,10 @@ extension QWEngineDriver {
             let t = try allocateWeight(QWTensorShape([elems], .f16))
             var bits = [UInt16](repeating: 0, count: elems)
             for i in 0..<elems { bits[i] = QWQuant.f32tof16Bits(src[i]) }
+            let dstPtr = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
             bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 guard let base = raw.baseAddress else { return }
-                t.region.buffer.contents()
-                    .advanced(by: t.region.base + t.offset)
-                    .copyMemory(from: base, byteCount: elems * 2)
+                dstPtr.copyMemory(from: base, byteCount: elems * 2)
             }
             return t
         }
@@ -307,11 +305,10 @@ extension QWEngineDriver {
             guard shift != 0 else { return try f16w(name, elems) }
             let bits = try normGammaBits(name, elems)
             let t = try allocateWeight(QWTensorShape([elems], .f16))
+            let dstPtr = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
             bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 guard let base = raw.baseAddress else { return }
-                t.region.buffer.contents()
-                    .advanced(by: t.region.base + t.offset)
-                    .copyMemory(from: base, byteCount: elems * 2)
+                dstPtr.copyMemory(from: base, byteCount: elems * 2)
             }
             return t
         }
@@ -324,11 +321,10 @@ extension QWEngineDriver {
         mutating func f32w(_ name: String, _ elems: Int) throws -> QWTensorValue {
             let src = try rawFloats(name, elems)
             let t = try allocateWeight(QWTensorShape([elems], .f32))
+            let dstPtr = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
             src.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 guard let base = raw.baseAddress else { return }
-                t.region.buffer.contents()
-                    .advanced(by: t.region.base + t.offset)
-                    .copyMemory(from: base, byteCount: elems * 4)
+                dstPtr.copyMemory(from: base, byteCount: elems * 4)
             }
             return t
         }
@@ -349,11 +345,10 @@ extension QWEngineDriver {
                 src = try rawFloats(name, elems)
             }
             let t = try allocateWeight(QWTensorShape([elems], .f32))
+            let dstPtr = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
             src.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 guard let base = raw.baseAddress else { return }
-                t.region.buffer.contents()
-                    .advanced(by: t.region.base + t.offset)
-                    .copyMemory(from: base, byteCount: elems * 4)
+                dstPtr.copyMemory(from: base, byteCount: elems * 4)
             }
             return t
         }

@@ -56,13 +56,15 @@ final class Ink2BumpAllocator {
 
     func copy(_ name: String, from st: QWSafeTensorsContainer) throws -> Ink2Slice {
         let alignedOff = ((used + 255) / 256) * 256
+        let cap = buffer.length
+        let dst = buffer.contents().advanced(by: alignedOff)
         return try st.withBytes(of: name) { raw in
             let len = raw.count
-            guard alignedOff + len <= buffer.length else {
+            guard alignedOff + len <= cap else {
                 throw QWInkling2Error.allocationFailed("overflow storing \(name)")
             }
             if let src = raw.baseAddress, len > 0 {
-                memcpy(buffer.contents().advanced(by: alignedOff), src, len)
+                memcpy(dst, src, len)
             }
             used = alignedOff + len
             return Ink2Slice(buffer: buffer, offset: alignedOff, length: len)

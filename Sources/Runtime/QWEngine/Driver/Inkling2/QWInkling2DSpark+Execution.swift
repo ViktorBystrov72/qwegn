@@ -732,9 +732,13 @@ extension QWInkling2DSpark {
                 }
             }
         }
-        lastTap.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            guard let base = raw.baseAddress else { return }
-            memcpy(lastTapBuf.contents(), base, min(lastTap.count, lastTapBuf.length))
+        let tapDst = lastTapBuf.contents()
+        let tapBytes = min(lastTap.count, lastTapBuf.length)
+        withExtendedLifetime(lastTapBuf) {
+            lastTap.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                memcpy(tapDst, base, tapBytes)
+            }
         }
         ctxLen = pos
     }

@@ -148,10 +148,10 @@ extension QWEngineDriver.WeightLoader {
 
     private mutating func allocateF32(_ src: [Float]) throws -> QWTensorValue {
         let t = try allocateWeight(QWTensorShape([src.count], .f32))
+        let dst = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
         src.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             if let base = raw.baseAddress, !raw.isEmpty {
-                t.region.buffer.contents().advanced(by: t.region.base + t.offset)
-                    .copyMemory(from: base, byteCount: raw.count)
+                dst.copyMemory(from: base, byteCount: raw.count)
             }
         }
         return t
@@ -160,10 +160,10 @@ extension QWEngineDriver.WeightLoader {
     private mutating func allocateF16(_ src: [Float]) throws -> QWTensorValue {
         let t = try allocateWeight(QWTensorShape([src.count], .f16))
         let bits = src.map { QWQuant.f32tof16Bits($0) }
+        let dst = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
         bits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             if let base = raw.baseAddress, !raw.isEmpty {
-                t.region.buffer.contents().advanced(by: t.region.base + t.offset)
-                    .copyMemory(from: base, byteCount: raw.count)
+                dst.copyMemory(from: base, byteCount: raw.count)
             }
         }
         return t

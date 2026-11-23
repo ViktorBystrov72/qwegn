@@ -42,8 +42,9 @@ public struct QWDeviceEmbedTable: Sendable {
         let bytes = vocab * hidden * 2
         // Copy raw bf16 bytes into the wired weights region to avoid unwired-page faults.
         let t = try arena.weightsRegion().allocate(QWTensorShape([vocab * hidden], .f16))
+        let dst = arena.cpuPointer(of: t)
         _ = try pack.withRawPointer(at: off, byteCount: bytes) { src in
-            memcpy(arena.cpuPointer(of: t), src, bytes)
+            memcpy(dst, src, bytes)
         }
         return QWDeviceEmbedTable(storage: .bf16(t), vocab: vocab, hidden: hidden, hc: hc,
                                   containerNote: "the pack's raw bf16 plane")

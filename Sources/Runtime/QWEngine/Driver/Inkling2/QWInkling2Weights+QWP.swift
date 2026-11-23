@@ -33,8 +33,9 @@ private extension Ink2BumpAllocator {
         }
         let slice = try allocateBytes(bytes, alignment: 256, label: name)
         if bytes > 0 {
+            let dst = slice.buffer.contents().advanced(by: slice.offset)
             try pack.withRawPointer(at: off, byteCount: bytes) { ptr in
-                _ = memcpy(slice.buffer.contents().advanced(by: slice.offset), ptr, bytes)
+                _ = memcpy(dst, ptr, bytes)
             }
         }
         return (slice, entry)

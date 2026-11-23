@@ -79,54 +79,62 @@ struct QWEnginePrefixState: Sendable {
     /// All geometry and cache operations must succeed before publication.
     func publish(into session: QWEngineSession, stochastic owner: QWStochasticSession? = nil) {
         if !recData.isEmpty {
-            recData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                if let base = raw.baseAddress {
-                    session.recSlab.region.pointer.advanced(by: session.recSlab.offset)
-                        .copyMemory(from: base, byteCount: raw.count)
+            let recDst = session.recSlab.region.pointer.advanced(by: session.recSlab.offset)
+            withExtendedLifetime(session.recSlab.region.buffer) {
+                recData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    if let base = raw.baseAddress {
+                        recDst.copyMemory(from: base, byteCount: raw.count)
+                    }
                 }
             }
         }
         if !ringData.isEmpty {
-            ringData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                if let base = raw.baseAddress {
-                    session.ringSlab.region.pointer.advanced(by: session.ringSlab.offset)
-                        .copyMemory(from: base, byteCount: raw.count)
+            let ringDst = session.ringSlab.region.pointer.advanced(by: session.ringSlab.offset)
+            withExtendedLifetime(session.ringSlab.region.buffer) {
+                ringData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    if let base = raw.baseAddress {
+                        ringDst.copyMemory(from: base, byteCount: raw.count)
+                    }
                 }
             }
         }
         if let hidden = session.trunkHidden, let data = trunkHiddenData, !data.isEmpty {
-            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                if let base = raw.baseAddress {
-                    hidden.region.pointer.advanced(by: hidden.offset)
-                        .copyMemory(from: base, byteCount: raw.count)
+            let hiddenDst = hidden.region.pointer.advanced(by: hidden.offset)
+            withExtendedLifetime(hidden.region.buffer) {
+                data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    if let base = raw.baseAddress {
+                        hiddenDst.copyMemory(from: base, byteCount: raw.count)
+                    }
                 }
             }
         }
         var restoredDFlashOffset = 0
         if let dSlot = session.dflashSlot {
+            let kDst = dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset)
+            let vDst = dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset)
             if let kData = dflashKData, let vData = dflashVData,
                kData.count == dSlot.kSlab.bytes, vData.count == dSlot.vSlab.bytes,
                dflashCacheOffset > 0 {
-                if !kData.isEmpty {
-                    kData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                        if let base = raw.baseAddress {
-                            dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset)
-                                .copyMemory(from: base, byteCount: raw.count)
+                withExtendedLifetime(dSlot) {
+                    if !kData.isEmpty {
+                        kData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                            if let base = raw.baseAddress {
+                                kDst.copyMemory(from: base, byteCount: raw.count)
+                            }
                         }
                     }
-                }
-                if !vData.isEmpty {
-                    vData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                        if let base = raw.baseAddress {
-                            dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset)
-                                .copyMemory(from: base, byteCount: raw.count)
+                    if !vData.isEmpty {
+                        vData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                            if let base = raw.baseAddress {
+                                vDst.copyMemory(from: base, byteCount: raw.count)
+                            }
                         }
                     }
                 }
                 restoredDFlashOffset = dflashCacheOffset
             } else {
-                memset(dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset), 0, dSlot.kSlab.bytes)
-                memset(dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset), 0, dSlot.vSlab.bytes)
+                memset(kDst, 0, dSlot.kSlab.bytes)
+                memset(vDst, 0, dSlot.vSlab.bytes)
             }
         }
         session.position = position

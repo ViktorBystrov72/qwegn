@@ -307,16 +307,18 @@ final class QWInkling2DSpark: @unchecked Sendable {
             }
         }
         let wBuf = try alloc(cursor, label: "weights")
+        let wBufPtr = wBuf.contents()
         for name in orderedKeys {
             guard let off = offsets[name] else { continue }
+            let dstPtr = wBufPtr.advanced(by: off)
             if name == rnnProjKey && !isRaw(rnnProjKey) {
                 let f32 = try Self.dequantizeMatrixToF32(src: src, name: rnnProjKey, nRows: 3 * R, kCols: 2 * R + 2 * H)
-                let dst = wBuf.contents().advanced(by: off).assumingMemoryBound(to: UInt16.self)
+                let dst = dstPtr.assumingMemoryBound(to: UInt16.self)
                 for i in 0..<f32.count { dst[i] = Self.f32ToBF16(f32[i]) }
             } else {
                 try src.withBytes(of: name) { bytes in
                     guard let base = bytes.baseAddress else { return }
-                    memcpy(wBuf.contents().advanced(by: off), base, bytes.count)
+                    memcpy(dstPtr, base, bytes.count)
                 }
             }
         }

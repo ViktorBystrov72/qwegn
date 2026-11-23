@@ -244,8 +244,9 @@ enum BenchRunner {
                                    rows: Int, cols: Int, xs: [Float]) throws -> BenchWork {
         let bank = AQBanks.make(bits: bits, group: group, rows: rows, cols: cols)
         let weights = try makeBuffer(device: device, bytes: bank.count)
+        let weightsPtr = weights.contents()
         bank.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-            weights.contents().copyMemory(from: src.baseAddress!, byteCount: bank.count)
+            weightsPtr.copyMemory(from: src.baseAddress!, byteCount: bank.count)
         }
         let x = try makeBuffer(device: device, bytes: cols * 2)
         let y = try makeBuffer(device: device, bytes: rows * 4)
@@ -266,8 +267,9 @@ enum BenchRunner {
                                           xs: [Float]) throws -> BenchWork {
         let bank = AQBanks.makeIncumbent4G32(rows: rows, cols: cols)
         let weights = try makeBuffer(device: device, bytes: bank.count)
+        let weightsPtr = weights.contents()
         bank.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-            weights.contents().copyMemory(from: src.baseAddress!, byteCount: bank.count)
+            weightsPtr.copyMemory(from: src.baseAddress!, byteCount: bank.count)
         }
         let x = try makeBuffer(device: device, bytes: cols * 2)
         let y = try makeBuffer(device: device, bytes: rows * 4)

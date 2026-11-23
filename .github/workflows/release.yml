@@ -63,6 +63,8 @@ jobs:
           swift build -c release --product qwg
           swift build -c release --product qwg-menu
           swift build -c release --product qwg-smc-helper
+          BIN_DIR="$(swift build -c release --show-bin-path)"
+          python3 Scripts/check_swifterror_abi.py "$BIN_DIR/qwg" "$BIN_DIR/qwg-menu" "$BIN_DIR/qwg-smc-helper"
 
       - name: Build macOS .pkg installer and portable .tar.gz
         run: |

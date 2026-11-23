@@ -369,16 +369,17 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
             throw QWAllocError.outOfSpace(region: "hca-cache", asked: totalBytes, free: 0)
         }
         buf.label = "hca-cache"
-        memset(buf.contents(), 0, totalBytes)
+        let bufPtr = buf.contents()
+        memset(bufPtr, 0, totalBytes)
         invFreqArr.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             if let src = raw.baseAddress, !raw.isEmpty {
-                buf.contents().advanced(by: invFreqOff).copyMemory(from: src, byteCount: raw.count)
+                bufPtr.advanced(by: invFreqOff).copyMemory(from: src, byteCount: raw.count)
             }
         }
         let negInf = Array(repeating: -Float.infinity, count: zeroSinkCount)
         negInf.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             if let src = raw.baseAddress {
-                buf.contents().advanced(by: zeroSinkOff).copyMemory(from: src, byteCount: raw.count)
+                bufPtr.advanced(by: zeroSinkOff).copyMemory(from: src, byteCount: raw.count)
             }
         }
         let reg = QWMRegion(buffer: buf, base: 0, length: totalBytes)

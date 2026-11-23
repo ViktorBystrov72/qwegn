@@ -72,7 +72,8 @@ extension QWEngineDriver {
             return nil
         }
         buf.label = "hca-lsa-sidecar"
-        memset(buf.contents(), 0, totalBytes)
+        let bufPtr = buf.contents()
+        memset(bufPtr, 0, totalBytes)
         let reg = QWMRegion(buffer: buf, base: 0, length: totalBytes)
         var out: [Int: (wq: QWTensorValue, wk: QWTensorValue)] = [:]
         var cursor = 0
@@ -81,14 +82,16 @@ extension QWEngineDriver {
             cursor += strideBytes
             let wkOff = cursor
             cursor += strideBytes
+            let wqDst = bufPtr.advanced(by: wqOff)
             item.wq.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 if let base = raw.baseAddress, !raw.isEmpty {
-                    buf.contents().advanced(by: wqOff).copyMemory(from: base, byteCount: raw.count)
+                    wqDst.copyMemory(from: base, byteCount: raw.count)
                 }
             }
+            let wkDst = bufPtr.advanced(by: wkOff)
             item.wk.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 if let base = raw.baseAddress, !raw.isEmpty {
-                    buf.contents().advanced(by: wkOff).copyMemory(from: base, byteCount: raw.count)
+                    wkDst.copyMemory(from: base, byteCount: raw.count)
                 }
             }
             let wqT = QWTensorValue(region: reg, offset: wqOff, shape: QWTensorShape([elemsPerMat], .f16))

@@ -218,9 +218,10 @@ extension QWEngineDriver {
             let session = try admitSession(promptTokens: prompt.count, prefix: value.prefix)
             if resolvedHit.tokenCount == prompt.count {
                 if !value.logits.isEmpty {
+                    let logitsDst = sc.logits.region.pointer.advanced(by: sc.logits.offset)
                     value.logits.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                         if let base = raw.baseAddress {
-                            sc.logits.region.pointer.advanced(by: sc.logits.offset).copyMemory(from: base, byteCount: raw.count)
+                            logitsDst.copyMemory(from: base, byteCount: raw.count)
                         }
                     }
                 }

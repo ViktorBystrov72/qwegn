@@ -570,9 +570,12 @@ public final class QWArena: @unchecked Sendable {
         precondition(t.offset >= 0 && d.count <= t.bytes && !ovReg && regEnd <= t.region.length,
                      "copyIn \(d.count) > tensor \(t.bytes)")
         guard !d.isEmpty else { return }
-        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            guard let base = raw.baseAddress else { return }
-            memcpy(cpuPointer(of: t), base, raw.count)
+        let dst = cpuPointer(of: t)
+        withExtendedLifetime(t.region.buffer) {
+            d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                memcpy(dst, base, raw.count)
+            }
         }
     }
 
@@ -585,9 +588,12 @@ public final class QWArena: @unchecked Sendable {
         precondition(t.offset >= 0 && byteCount <= t.bytes && !ovReg && regEnd <= t.region.length,
                      "write \(byteCount) > tensor \(t.bytes)")
         guard byteCount > 0 else { return }
-        array.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            guard let base = raw.baseAddress else { return }
-            memcpy(cpuPointer(of: t), base, byteCount)
+        let dst = cpuPointer(of: t)
+        withExtendedLifetime(t.region.buffer) {
+            array.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                memcpy(dst, base, byteCount)
+            }
         }
     }
 

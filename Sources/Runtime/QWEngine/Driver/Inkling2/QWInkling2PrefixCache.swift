@@ -231,9 +231,13 @@ final class QWInkling2PrefixCache: @unchecked Sendable {
             }
             lsa.stateOwner = stateOwner
         }
-        entry.convData.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            memcpy(slot.convStatesSlab.contents(), base, entry.convData.count)
+        let convDst = slot.convStatesSlab.contents()
+        let convBytes = entry.convData.count
+        withExtendedLifetime(slot.convStatesSlab) {
+            entry.convData.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                memcpy(convDst, base, convBytes)
+            }
         }
         for (idx, slice) in entry.visitSlices.enumerated() where idx < slot.visitKVs.count {
             let kv = slot.visitKVs[idx]

@@ -583,15 +583,17 @@ public final class QWKVCache: @unchecked Sendable {
     func uploadSlot(_ seq: QWKVSeqID, _ li: Int, _ kind: QWKVKind, _ ids: [Int32]) {
         let base = slotBase(seq, li, kind)
         let byteCount = ids.count * 4
-        if byteCount > 0 {
-            ids.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                guard let addr = raw.baseAddress else { return }
-                _ = memcpy(tableBuffer.contents().advanced(by: base), addr, byteCount)
+        let dstBase = tableBuffer.contents().advanced(by: base)
+        withExtendedLifetime(tableBuffer) {
+            if byteCount > 0 {
+                ids.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    guard let addr = raw.baseAddress else { return }
+                    _ = memcpy(dstBase, addr, byteCount)
+                }
             }
-        }
-        if byteCount < Self.tableSlotBytes {
-            memset(tableBuffer.contents().advanced(by: base + byteCount), 0,
-                   Self.tableSlotBytes - byteCount)
+            if byteCount < Self.tableSlotBytes {
+                memset(dstBase.advanced(by: byteCount), 0, Self.tableSlotBytes - byteCount)
+            }
         }
     }
 }
