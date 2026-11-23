@@ -144,16 +144,14 @@ final class QWInkling2DescriptorTests: XCTestCase {
         XCTAssertLessThan(resBytes, 24_000_000_000)
     }
 
-    func testDecodeOnBackground512KBStack() throws {
+    func testDecodeOnBackground512KBStack() async throws {
         let jsonData = makeInkling2JSON()
-        let exp = expectation(description: "background stack decode")
-        var result: Result<QWModelDescriptor, any Error>?
-        DispatchQueue.global(qos: .userInitiated).async {
-            result = Result { try QWModelDescriptor.decode(configJSON: jsonData) }
-            exp.fulfill()
+        let decoded = try await withCheckedThrowingContinuation {
+            (cont: CheckedContinuation<QWModelDescriptor, any Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                cont.resume(with: Result { try QWModelDescriptor.decode(configJSON: jsonData) })
+            }
         }
-        wait(for: [exp], timeout: 5.0)
-        let decoded = try XCTUnwrap(result).get()
         XCTAssertEqual(decoded.family, .inkling2Loop)
     }
 }
