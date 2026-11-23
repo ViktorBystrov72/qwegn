@@ -501,8 +501,8 @@ final class QWDFlashDiscoveryTests: XCTestCase {
     func testWebUIActionsExposesDFlash2AndDSpineControls() throws {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let actionsJS = try String(
-            contentsOf: repoRoot.appendingPathComponent("Sources/Apps/QWServer/Resources/js/actions.js"),
+        let settingsJS = try String(
+            contentsOf: repoRoot.appendingPathComponent("Sources/Apps/QWServer/Resources/js/settings.js"),
             encoding: .utf8
         )
         let stateJS = try String(
@@ -519,7 +519,7 @@ final class QWDFlashDiscoveryTests: XCTestCase {
             "handleWebDrafterSelectChange",
             "discoveredDraftersList",
         ] {
-            XCTAssertTrue(actionsJS.contains(needle), "Missing expected WebUI settings symbol '\(needle)' in actions.js")
+            XCTAssertTrue(settingsJS.contains(needle), "Missing expected WebUI settings symbol '\(needle)' in settings.js")
         }
     }
 }

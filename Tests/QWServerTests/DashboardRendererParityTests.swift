@@ -31,6 +31,7 @@ final class DashboardRendererParityTests: XCTestCase {
         "Sources/Apps/QWServer/Resources/js/chat-presets.js",
         "Sources/Apps/QWServer/Resources/js/chat.js",
         "Sources/Apps/QWServer/Resources/js/actions.js",
+        "Sources/Apps/QWServer/Resources/js/settings.js",
         "Sources/Apps/QWServer/Resources/js/updates.js",
     ]
 
@@ -443,6 +444,7 @@ final class DashboardRendererParityTests: XCTestCase {
             ("/ui/js/chat-presets.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/chat-presets.js"),
             ("/ui/js/chat.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/chat.js"),
             ("/ui/js/actions.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/actions.js"),
+            ("/ui/js/settings.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/settings.js"),
             ("/ui/js/updates.js", "application/javascript", "Sources/Apps/QWServer/Resources/js/updates.js"),
         ]
         for spec in assetSpecs {

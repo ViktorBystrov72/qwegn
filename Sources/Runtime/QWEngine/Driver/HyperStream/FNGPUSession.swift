@@ -122,7 +122,7 @@ public struct FNGPUSessionData {
     /// Tokens committed per speculative verification round in this session.
     public var roundTokenCounts: [Int] = []
     /// Window size (trailing generated tokens) used for repetition-penalty tracking.
-    public static let repetitionPenaltyWindow = 64
+    public static let repetitionPenaltyWindow = 256
     /// Trailing generated token IDs used to populate `seenTokens` and `seenTokenList`.
     public var recentGeneratedTokens: [Int] = []
     /// Unique valid token IDs seen in recent generated tokens, maintained incrementally

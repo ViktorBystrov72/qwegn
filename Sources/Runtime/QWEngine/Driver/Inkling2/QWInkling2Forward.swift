@@ -230,6 +230,7 @@ final class QWInkling2Forward: @unchecked Sendable {
         visualSpans: [QWVisualSpan] = [],
         slot: Ink2SlotState? = nil,
         useLSA: Bool = true,
+        forceDenseAttention: Bool = false,
         profiler: QWInkling2Profiler? = nil,
         moeSpecBudget: Int = 0
     ) throws {
@@ -398,7 +399,7 @@ final class QWInkling2Forward: @unchecked Sendable {
             )
 
             let updConv = updateState && !recordVerifyConv && treePlan == nil
-            let writeLSAKConv = useSlotLSA && !lw.isSliding && (lsaOperator.map {
+            let writeLSAKConv = !lw.isSliding && useSlotLSA && (lsaOperator.map {
                 !$0.isSelectionFollower(fullAttnLayer: globalVisitToAttnIndex[visit] ?? -1)
             } ?? false)
             try encodeKVSConvAndQKVR(
@@ -414,7 +415,7 @@ final class QWInkling2Forward: @unchecked Sendable {
             let faEnc = try encoder(.flashAttn)
             try encodeAttentionBlock(
                 faEnc, visit: visit, lw: lw, kv: kv, proj: proj, t: t, posOffset: posOffset,
-                useLSA: useSlotLSA, treePlan: treePlan
+                useLSA: useSlotLSA, forceDenseAttention: forceDenseAttention, treePlan: treePlan
             )
 
             let oEnc = try encoder(.denseAttnProj)

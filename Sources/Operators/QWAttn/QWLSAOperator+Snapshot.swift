@@ -4,9 +4,12 @@
 import Foundation
 
 extension QWLSAOperator {
+    private var snapshotPooledBlockBytes: Int { isMultiHeadDirect ? pooledRowBytes : (indexDim * 2) }
+    private var snapshotPendingRowBytes: Int { isMultiHeadDirect ? (pendingRowElems * 2) : (indexDim * 2) }
+
     /// Registers or clears a pinned `.qwcache` base LSA state so subsequent turn captures/restores only copy delta blocks.
     public func setPinnedBaseState(_ data: Data?, position: Int) {
-        let unitTok = clusterUnitTokens
+        let unitTok = isMultiHeadDirect ? 16 : clusterUnitTokens
         let baseAligned = (position / unitTok) * unitTok
         if let data, baseAligned >= unitTok, data.count == fullIndexerStateBytes(position: position) {
             pinnedBaseData = data
@@ -23,23 +26,27 @@ extension QWLSAOperator {
 
     /// Full uncompressed bytes required to snapshot pooled keys, pending ring rows, and coarse clusters at `position`.
     public func fullIndexerStateBytes(position: Int) -> Int {
-        let rowBytes = indexDim * 2
-        let pooledBytes = (position / 4) * rowBytes
-        let pendingBytes = (position % 4) * rowBytes
-        let numUnits = position / clusterUnitTokens
-        let unitBytes = 64 * rowBytes + clusterMemBytesPerUnit + clusterSizeBytesPerUnit
-        return loopReusePlan.uniqueLeaderIndices.count * (pooledBytes + pendingBytes + numUnits * unitBytes)
+        let poolBlkBytes = snapshotPooledBlockBytes
+        let pendRowBytes = snapshotPendingRowBytes
+        let pooledBytes = (position / 4) * poolBlkBytes
+        let coarsePooledBytes = isMultiHeadDirect ? ((position / 16) * poolBlkBytes) : 0
+        let pendingBytes = (position % 4) * pendRowBytes
+        let numUnits = isMultiHeadDirect ? 0 : (position / clusterUnitTokens)
+        let unitBytes = 64 * (indexDim * 2) + clusterMemBytesPerUnit + clusterSizeBytesPerUnit
+        return loopReusePlan.uniqueLeaderIndices.count * (pooledBytes + coarsePooledBytes + pendingBytes + numUnits * unitBytes)
     }
 
     /// Compact delta bytes required to snapshot `(basePos512 ..< position)` above a chunk-aligned pinned base.
     public func deltaIndexerStateBytes(basePos512: Int, position: Int) -> Int {
-        let rowBytes = indexDim * 2
+        let poolBlkBytes = snapshotPooledBlockBytes
+        let pendRowBytes = snapshotPendingRowBytes
         let unitTok = clusterUnitTokens
-        let deltaPooledBytes = max(0, (position / 4) - (basePos512 / 4)) * rowBytes
-        let pendingBytes = (position % 4) * rowBytes
-        let deltaUnits = max(0, (position / unitTok) - (basePos512 / unitTok))
-        let unitBytes = 64 * rowBytes + clusterMemBytesPerUnit + clusterSizeBytesPerUnit
-        return 16 + loopReusePlan.uniqueLeaderIndices.count * (deltaPooledBytes + pendingBytes + deltaUnits * unitBytes)
+        let deltaPooledBytes = max(0, (position / 4) - (basePos512 / 4)) * poolBlkBytes
+        let deltaCoarseBytes = isMultiHeadDirect ? (max(0, (position / 16) - (basePos512 / 16)) * poolBlkBytes) : 0
+        let pendingBytes = (position % 4) * pendRowBytes
+        let deltaUnits = isMultiHeadDirect ? 0 : max(0, (position / unitTok) - (basePos512 / unitTok))
+        let unitBytes = 64 * (indexDim * 2) + clusterMemBytesPerUnit + clusterSizeBytesPerUnit
+        return 16 + loopReusePlan.uniqueLeaderIndices.count * (deltaPooledBytes + deltaCoarseBytes + pendingBytes + deltaUnits * unitBytes)
     }
 
     /// Bytes required to snapshot LSA state at `position` (uses delta encoding when extending a pinned base).
@@ -69,19 +76,22 @@ extension QWLSAOperator {
     /// Captures all layers' LSA indexer and coarse cluster state at `position` (caller must wait for GPU first).
     public func captureIndexerState(position: Int, forceFull: Bool = false) -> Data {
         let unitTok = clusterUnitTokens
-        precondition(position >= 0 && position / 4 <= maxBlocks && (position / unitTok) <= maxSuperblocks)
-        let rowBytes = indexDim * 2
-        let centPerUnit = 64 * rowBytes
+        precondition(position >= 0 && position / 4 <= maxBlocks && (isMultiHeadDirect || (position / unitTok) <= maxSuperblocks))
+        let poolBlkBytes = snapshotPooledBlockBytes
+        let pendRowBytes = snapshotPendingRowBytes
+        let centPerUnit = 64 * indexDim * 2
         let memPerUnit = clusterMemBytesPerUnit
         let sizePerUnit = clusterSizeBytesPerUnit
         let openStart = (position / 4) * 4
         let base = region.pointer
         if !forceFull && pinnedBasePos512 > 0 && position > pinnedBasePos512 {
             let baseAligned = pinnedBasePos512
-            let startPooledOff = (baseAligned / 4) * rowBytes
-            let deltaPooledBytes = ((position / 4) - (baseAligned / 4)) * rowBytes
+            let startPooledOff = (baseAligned / 4) * poolBlkBytes
+            let deltaPooledBytes = ((position / 4) - (baseAligned / 4)) * poolBlkBytes
+            let startCoarseOff = isMultiHeadDirect ? ((baseAligned / 16) * poolBlkBytes) : 0
+            let deltaCoarseBytes = isMultiHeadDirect ? (((position / 16) - (baseAligned / 16)) * poolBlkBytes) : 0
             let startUnits = baseAligned / unitTok
-            let deltaUnits = (position / unitTok) - startUnits
+            let deltaUnits = isMultiHeadDirect ? 0 : ((position / unitTok) - startUnits)
             let deltaCentBytes = deltaUnits * centPerUnit
             let deltaMemBytes = deltaUnits * memPerUnit
             let deltaSizeBytes = deltaUnits * sizePerUnit
@@ -98,10 +108,14 @@ extension QWLSAOperator {
                     out.append(base.advanced(by: ls.pooledKeys.offset + startPooledOff).assumingMemoryBound(to: UInt8.self),
                                count: deltaPooledBytes)
                 }
+                if deltaCoarseBytes > 0 {
+                    out.append(base.advanced(by: ls.pooledCoarseKeys.offset + startCoarseOff).assumingMemoryBound(to: UInt8.self),
+                               count: deltaCoarseBytes)
+                }
                 for p in openStart..<position {
                     let row = p & (ringCap - 1)
-                    out.append(base.advanced(by: ls.kPending.offset + row * rowBytes).assumingMemoryBound(to: UInt8.self),
-                               count: rowBytes)
+                    out.append(base.advanced(by: ls.kPending.offset + row * pendRowBytes).assumingMemoryBound(to: UInt8.self),
+                               count: pendRowBytes)
                 }
                 if deltaUnits > 0 {
                     out.append(base.advanced(by: ls.centroids.offset + startUnits * centPerUnit).assumingMemoryBound(to: UInt8.self),
@@ -114,8 +128,9 @@ extension QWLSAOperator {
             }
             return out
         }
-        let pooledBytes = (position / 4) * rowBytes
-        let numUnits = position / unitTok
+        let pooledBytes = (position / 4) * poolBlkBytes
+        let coarsePooledBytes = isMultiHeadDirect ? ((position / 16) * poolBlkBytes) : 0
+        let numUnits = isMultiHeadDirect ? 0 : (position / unitTok)
         let centBytes = numUnits * centPerUnit
         let memBytes = numUnits * memPerUnit
         let sizeBytes = numUnits * sizePerUnit
@@ -126,10 +141,14 @@ extension QWLSAOperator {
                 out.append(base.advanced(by: ls.pooledKeys.offset).assumingMemoryBound(to: UInt8.self),
                            count: pooledBytes)
             }
+            if coarsePooledBytes > 0 {
+                out.append(base.advanced(by: ls.pooledCoarseKeys.offset).assumingMemoryBound(to: UInt8.self),
+                           count: coarsePooledBytes)
+            }
             for p in openStart..<position {
                 let row = p & (ringCap - 1)
-                out.append(base.advanced(by: ls.kPending.offset + row * rowBytes).assumingMemoryBound(to: UInt8.self),
-                           count: rowBytes)
+                out.append(base.advanced(by: ls.kPending.offset + row * pendRowBytes).assumingMemoryBound(to: UInt8.self),
+                           count: pendRowBytes)
             }
             if numUnits > 0 {
                 out.append(base.advanced(by: ls.centroids.offset).assumingMemoryBound(to: UInt8.self),
@@ -146,16 +165,19 @@ extension QWLSAOperator {
     private func restorePinnedBasePrefix(upTo baseAligned: Int) {
         guard let baseData = pinnedBaseData, baseAligned > 0, baseAligned <= pinnedBasePos512 else { return }
         let unitTok = clusterUnitTokens
-        let rowBytes = indexDim * 2
-        let centPerUnit = 64 * rowBytes
+        let poolBlkBytes = snapshotPooledBlockBytes
+        let pendRowBytes = snapshotPendingRowBytes
+        let centPerUnit = 64 * indexDim * 2
         let memPerUnit = clusterMemBytesPerUnit
         let sizePerUnit = clusterSizeBytesPerUnit
         let fullPos = pinnedBaseFullPosition
-        let fullPooledBytes = (fullPos / 4) * rowBytes
-        let copyPooledBytes = (baseAligned / 4) * rowBytes
-        let fullPendingBytes = (fullPos % 4) * rowBytes
-        let fullUnits = fullPos / unitTok
-        let copyUnits = baseAligned / unitTok
+        let fullPooledBytes = (fullPos / 4) * poolBlkBytes
+        let copyPooledBytes = (baseAligned / 4) * poolBlkBytes
+        let fullCoarseBytes = isMultiHeadDirect ? ((fullPos / 16) * poolBlkBytes) : 0
+        let copyCoarseBytes = isMultiHeadDirect ? ((baseAligned / 16) * poolBlkBytes) : 0
+        let fullPendingBytes = (fullPos % 4) * pendRowBytes
+        let fullUnits = isMultiHeadDirect ? 0 : (fullPos / unitTok)
+        let copyUnits = isMultiHeadDirect ? 0 : (baseAligned / unitTok)
         let base = region.pointer
         baseData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             var src = 0
@@ -165,7 +187,12 @@ extension QWLSAOperator {
                     base.advanced(by: ls.pooledKeys.offset)
                         .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: copyPooledBytes)
                 }
-                src += fullPooledBytes + fullPendingBytes
+                src += fullPooledBytes
+                if copyCoarseBytes > 0 {
+                    base.advanced(by: ls.pooledCoarseKeys.offset)
+                        .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: copyCoarseBytes)
+                }
+                src += fullCoarseBytes + fullPendingBytes
                 if copyUnits > 0 {
                     base.advanced(by: ls.centroids.offset)
                         .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: copyUnits * centPerUnit)
@@ -189,9 +216,10 @@ extension QWLSAOperator {
     /// Restores all layers' LSA indexer and coarse cluster state at `position`, or returns false on size mismatch.
     public func restoreIndexerState(_ data: Data, position: Int) -> Bool {
         let unitTok = clusterUnitTokens
-        guard position >= 0, position / 4 <= maxBlocks, (position / unitTok) <= maxSuperblocks else { return false }
-        let rowBytes = indexDim * 2
-        let centPerUnit = 64 * rowBytes
+        guard position >= 0, position / 4 <= maxBlocks, isMultiHeadDirect || (position / unitTok) <= maxSuperblocks else { return false }
+        let poolBlkBytes = snapshotPooledBlockBytes
+        let pendRowBytes = snapshotPendingRowBytes
+        let centPerUnit = 64 * indexDim * 2
         let memPerUnit = clusterMemBytesPerUnit
         let sizePerUnit = clusterSizeBytesPerUnit
         let openStart = (position / 4) * 4
@@ -208,27 +236,34 @@ extension QWLSAOperator {
                 if residentPos512 < baseAligned {
                     restorePinnedBasePrefix(upTo: baseAligned)
                 }
-                let startPooledOff = (baseAligned / 4) * rowBytes
-                let deltaPooledBytes = ((position / 4) - (baseAligned / 4)) * rowBytes
+                let startPooledOff = (baseAligned / 4) * poolBlkBytes
+                let deltaPooledBytes = ((position / 4) - (baseAligned / 4)) * poolBlkBytes
+                let startCoarseOff = isMultiHeadDirect ? ((baseAligned / 16) * poolBlkBytes) : 0
+                let deltaCoarseBytes = isMultiHeadDirect ? (((position / 16) - (baseAligned / 16)) * poolBlkBytes) : 0
                 let startUnits = baseAligned / unitTok
-                let deltaUnits = (position / unitTok) - startUnits
+                let deltaUnits = isMultiHeadDirect ? 0 : ((position / unitTok) - startUnits)
                 let deltaCentBytes = deltaUnits * centPerUnit
                 let deltaMemBytes = deltaUnits * memPerUnit
                 let deltaSizeBytes = deltaUnits * sizePerUnit
                 data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                     var src = 16
                     for idx in loopReusePlan.uniqueLeaderIndices {
-                let ls = layers[idx]
+                        let ls = layers[idx]
                         if deltaPooledBytes > 0 {
                             base.advanced(by: ls.pooledKeys.offset + startPooledOff)
                                 .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: deltaPooledBytes)
                             src += deltaPooledBytes
                         }
+                        if deltaCoarseBytes > 0 {
+                            base.advanced(by: ls.pooledCoarseKeys.offset + startCoarseOff)
+                                .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: deltaCoarseBytes)
+                            src += deltaCoarseBytes
+                        }
                         for p in openStart..<position {
                             let row = p & (ringCap - 1)
-                            base.advanced(by: ls.kPending.offset + row * rowBytes)
-                                .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: rowBytes)
-                            src += rowBytes
+                            base.advanced(by: ls.kPending.offset + row * pendRowBytes)
+                                .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: pendRowBytes)
+                            src += pendRowBytes
                         }
                         if deltaUnits > 0 {
                             base.advanced(by: ls.centroids.offset + startUnits * centPerUnit)
@@ -249,35 +284,44 @@ extension QWLSAOperator {
         guard data.count == fullIndexerStateBytes(position: position) else { return false }
         if pinnedBasePos512 > 0 && position == pinnedBaseFullPosition && residentPos512 >= pinnedBasePos512 {
             let baseAligned = pinnedBasePos512
-            let fullPooledBytes = (position / 4) * rowBytes
-            let startPooledOff = (baseAligned / 4) * rowBytes
+            let fullPooledBytes = (position / 4) * poolBlkBytes
+            let startPooledOff = (baseAligned / 4) * poolBlkBytes
             let tailPooledBytes = fullPooledBytes - startPooledOff
-            let numUnits = position / unitTok
+            let fullCoarseBytes = isMultiHeadDirect ? ((position / 16) * poolBlkBytes) : 0
+            let startCoarseOff = isMultiHeadDirect ? ((baseAligned / 16) * poolBlkBytes) : 0
+            let tailCoarseBytes = fullCoarseBytes - startCoarseOff
+            let numUnits = isMultiHeadDirect ? 0 : (position / unitTok)
             let unitBytes = centPerUnit + memPerUnit + sizePerUnit
-            let tailCopyNeeded = tailPooledBytes > 0 || openStart < position
+            let tailCopyNeeded = tailPooledBytes > 0 || tailCoarseBytes > 0 || openStart < position
             guard tailCopyNeeded else { return true }
             data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 var src = 0
                 for idx in loopReusePlan.uniqueLeaderIndices {
-                let ls = layers[idx]
+                    let ls = layers[idx]
                     if tailPooledBytes > 0 {
                         base.advanced(by: ls.pooledKeys.offset + startPooledOff)
                             .copyMemory(from: raw.baseAddress!.advanced(by: src + startPooledOff), byteCount: tailPooledBytes)
                     }
                     src += fullPooledBytes
+                    if tailCoarseBytes > 0 {
+                        base.advanced(by: ls.pooledCoarseKeys.offset + startCoarseOff)
+                            .copyMemory(from: raw.baseAddress!.advanced(by: src + startCoarseOff), byteCount: tailCoarseBytes)
+                    }
+                    src += fullCoarseBytes
                     for p in openStart..<position {
                         let row = p & (ringCap - 1)
-                        base.advanced(by: ls.kPending.offset + row * rowBytes)
-                            .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: rowBytes)
-                        src += rowBytes
+                        base.advanced(by: ls.kPending.offset + row * pendRowBytes)
+                            .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: pendRowBytes)
+                        src += pendRowBytes
                     }
                     src += numUnits * unitBytes
                 }
             }
             return true
         }
-        let pooledBytes = (position / 4) * rowBytes
-        let numUnits = position / unitTok
+        let pooledBytes = (position / 4) * poolBlkBytes
+        let coarsePooledBytes = isMultiHeadDirect ? ((position / 16) * poolBlkBytes) : 0
+        let numUnits = isMultiHeadDirect ? 0 : (position / unitTok)
         let centBytes = numUnits * centPerUnit
         let memBytes = numUnits * memPerUnit
         let sizeBytes = numUnits * sizePerUnit
@@ -290,11 +334,16 @@ extension QWLSAOperator {
                         .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: pooledBytes)
                     src += pooledBytes
                 }
+                if coarsePooledBytes > 0 {
+                    base.advanced(by: ls.pooledCoarseKeys.offset)
+                        .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: coarsePooledBytes)
+                    src += coarsePooledBytes
+                }
                 for p in openStart..<position {
                     let row = p & (ringCap - 1)
-                    base.advanced(by: ls.kPending.offset + row * rowBytes)
-                        .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: rowBytes)
-                    src += rowBytes
+                    base.advanced(by: ls.kPending.offset + row * pendRowBytes)
+                        .copyMemory(from: raw.baseAddress!.advanced(by: src), byteCount: pendRowBytes)
+                    src += pendRowBytes
                 }
                 if numUnits > 0 {
                     base.advanced(by: ls.centroids.offset)

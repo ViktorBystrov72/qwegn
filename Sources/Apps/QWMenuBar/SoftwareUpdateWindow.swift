@@ -201,12 +201,8 @@ public struct SoftwareUpdateView: View {
             }
 
             ScrollView(.vertical, showsIndicators: true) {
-                Text(renderReleaseMarkdown(release.notes))
-                    .font(TelemetryTheme.ui(11.5))
-                    .foregroundStyle(TelemetryTheme.primary(increasedContrast: increasedContrast))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .padding(10)
+                ReleaseMarkdownView(markdown: release.notes, increasedContrast: increasedContrast)
+                    .padding(12)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(TelemetryTheme.substrate)
@@ -324,16 +320,6 @@ public struct SoftwareUpdateView: View {
             return "\(formatBytes(done)) / \(formatBytes(total)) · \(pct)%"
         }
         return formatBytes(done)
-    }
-
-    private func renderReleaseMarkdown(_ notes: String) -> AttributedString {
-        let trimmed = notes.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return AttributedString("No release notes provided.") }
-        let opts = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        if let parsed = try? AttributedString(markdown: trimmed, options: opts) {
-            return parsed
-        }
-        return AttributedString(trimmed)
     }
 
     private func formatBytes(_ bytes: Int64) -> String {

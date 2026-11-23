@@ -219,4 +219,19 @@ final class QWUpdateServerTests: XCTestCase {
         let decoded = try JSONDecoder().decode(QWServerSettings.self, from: legacyJSON)
         XCTAssertEqual(decoded.updateCheckSchedule, QWUpdateCheckSchedule.onLaunchAndDaily.rawValue)
     }
+
+    func testWebUIUpdateModalEnablesMarkdownStyling() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let resources = repoRoot.appendingPathComponent("Sources/Apps/QWServer/Resources")
+        let html = try String(contentsOf: resources.appendingPathComponent("controlbar.html"), encoding: .utf8)
+        let panelsCSS = try String(contentsOf: resources.appendingPathComponent("css/panels.css"), encoding: .utf8)
+        let updatesJS = try String(contentsOf: resources.appendingPathComponent("js/updates.js"), encoding: .utf8)
+
+        XCTAssertTrue(html.contains(#"id="update-notes-body" class="update-notes-box probe-markdown""#))
+        XCTAssertTrue(panelsCSS.contains(".update-notes-box.probe-markdown"))
+        XCTAssertTrue(updatesJS.contains("renderSmokeProbeMarkdown(rel.notes)"))
+    }
 }

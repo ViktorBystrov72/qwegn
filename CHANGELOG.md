@@ -8,6 +8,12 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.35.0] - 2026-11-23
+
+### Added & Improved
+- **Full-Slice Q4 Multi-Head LSA (`isMultiHeadDirect`), Exact Softmax Correction & Decode Loop Guard**: Replaced symmetric 64-dim centroid indexing with direct per-head Q4 pooled scoring across `qwlsa_mh.metal` / `qwlsa_mh_select.metal` (`isMultiHeadDirect`, paired with the `6.0 MiB` `model.qlsa` `QLSA` v1 SVD sidecar on `Inkling-2-Mini-QWP-Fast`), added two-stage `p16 -> p4` top-`k` selection with exact full-denominator `all_sum` softmax tail correction and a 64-token dense tail, added capacity-scaled adaptive LSA key budgeting (`98K -> 4096`, `196K..786K -> 8192`, `>= 786K -> 16384` for `k=2048`), and added a deterministic 256-token / `period <= 96` / `3x` 8-gram decode loop guard across sampler/runtime paths (`QWLSA*`, `QWInkling2*`). Achieves **`3/3 (12/12, 100%)` multi-hop needle recall across `8K–1M` tokens** on both `Inkling-2-Mini-QWP-Fast` (`2,338.6 / 43.40` @256K, `2,298.4 / 42.32` @512K, **`2,016.5 / 33.92 tok/s` @1M** = **`3.74×` prefill / `4.51×` decode** vs dense `539.3 / 7.52`, `29 ms` p50, `21.77 GiB` RSS, `0` allocs) and `Inkling-2-Mini-MLX` (`2,235.8 / 35.17` @256K, `2,338.0 / 33.73` @512K, **`1,935.1 / 28.15 tok/s` @1M** = **`3.59× / 3.87×`**, `29.91 GiB` RSS, `0` allocs).
+- **100% CLI–GUI (`QWMenuBar`)–WebUI (`/ui`) Parameter Parity**: Exposed `gdnPrefill` and `lsaCrossLoopReuse` (`[restart]` badge) + `none` log level in `QWMenuBar` (`QWKnobRegistry`, `SettingsView+Performance.swift`, `SettingsView+Sections.swift`), published `lsaCrossLoopReuse` in `QWServerConfigKnobs`, modularized `/ui` Settings into `Sources/Apps/QWServer/Resources/js/settings.js` exposing all CLI knobs and typed `QWKnobValue` `engineTuning` controls with XSS escaping and JSON round-trip validation, and added `QWCliGuiWebParityTests`.
+
 ## [0.34.1] - 2026-11-23
 
 > **Supersedes `v0.34.0` for macOS 26 release binaries.** Fixes an upstream Xcode 26.6 LLVM AArch64 codegen crash (`SIGSEGV` in `_swift_errorRetain` during model/prefix loading) and adds an automated binary ABI verification gate.

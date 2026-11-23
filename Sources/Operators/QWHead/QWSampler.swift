@@ -498,7 +498,7 @@ public final class QWSampler {
         let m = window.count
         guard m >= 4 else { return }
         let base = window.startIndex
-        for period in 1...min(16, m / 2) {
+        for period in 1...min(96, m / 2) {
             let repeats = period == 1 ? 4 : (period == 2 ? 3 : 2)
             let span = period * repeats
             guard m >= span else { continue }
@@ -524,6 +524,33 @@ public final class QWSampler {
                 if count >= 6 {
                     out.append(candidate)
                     break
+                }
+            }
+        }
+        // Detect >= 2 earlier copies of the trailing 8-gram (3rd occurrence) without firing on 2 copies.
+        let ngram = 8
+        if m >= 3 * ngram {
+            let tailGram = base + m - ngram
+            var priorMatches = 0
+            for pos in base..<tailGram {
+                var same = true
+                for o in 0..<ngram where window[pos + o] != window[tailGram + o] {
+                    same = false
+                    break
+                }
+                if same { priorMatches += 1 }
+            }
+            if priorMatches >= 2 {
+                for pos in base..<tailGram {
+                    var same = true
+                    for o in 0..<ngram where window[pos + o] != window[tailGram + o] {
+                        same = false
+                        break
+                    }
+                    if same {
+                        let candidate = window[pos + ngram]
+                        if !out.contains(candidate) { out.append(candidate) }
+                    }
                 }
             }
         }

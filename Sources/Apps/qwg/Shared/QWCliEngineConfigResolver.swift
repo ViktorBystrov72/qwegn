@@ -257,13 +257,15 @@ struct QWResolvedCliEngineConfig {
             ?? envLoopShare?.enabled
             ?? effectivePair.settings.lsaCrossLoopReuse
         let resolvedLoopShareStride = resolvedCrossLoopReuse ? (envLoopShare?.stride ?? 0) : 0
+        let explicitBudget = (knobs.lsaBudget != nil) || (effectivePair.settings.lsaBudget != QWLSAConfig.defaultBudget)
         let lsaConfig = QWLSAConfig(
             mode: resolvedLSAMode,
             budget: knobs.lsaBudget ?? effectivePair.settings.lsaBudget,
             clusterBlock: knobs.lsaClusterBlock ?? memoryPack?.manifest.clusterBlockTokens ?? effectivePair.settings.lsaClusterBlock,
             sidecarPath: knobs.lsaSidecarPath ?? effectivePair.settings.lsaSidecarPath,
             crossLoopReuse: resolvedCrossLoopReuse,
-            loopShareStride: resolvedLoopShareStride
+            loopShareStride: resolvedLoopShareStride,
+            explicitBudget: explicitBudget
         )
         let tok = try QWTokenizer(json: runtimeAssets.tokenizerJSON)
         let specialTokens = tok.resolveSpecialTokens(fallback: runtimeAssets.descriptor.specialTokens)

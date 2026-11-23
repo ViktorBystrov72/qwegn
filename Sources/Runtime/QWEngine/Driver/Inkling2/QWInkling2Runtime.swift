@@ -153,6 +153,7 @@ final class QWInkling2Runtime: @unchecked Sendable {
             baseModelBytes = try QWAdmissionPlan.modelResidentBytes(descriptor: desc)
         }
         let availBytes = QWCapacityBudget.availableBytes(osReserveGiB: osReserveGiB)
+        let lsaHint = Self.resolveLSAAdmissionHint(packPath: expanded, descriptor: desc, lsaConfig: lsaConfig)
         let sizing = try Self.computeAdmissionSizing(
             descriptor: desc,
             ink2: ink2,
@@ -164,6 +165,8 @@ final class QWInkling2Runtime: @unchecked Sendable {
             requestedTokens: maxTokens,
             prefillChunkSize: prefillChunkSize,
             lsaConfig: lsaConfig,
+            lsaIndexDim: lsaHint.indexDim,
+            lsaMultiHeadDirect: lsaHint.isMultiHeadDirect,
             availableBytes: availBytes
         )
         let capPlan = sizing.capacityPlan
@@ -218,8 +221,9 @@ final class QWInkling2Runtime: @unchecked Sendable {
         )
         self.configuredPrefillChunkSize = session.maxChunk
         let globalVisitIndices = desc.executionPlan.indices.filter { !ink2.isSlidingLayer(desc.executionPlan[$0]) }
+        let effectiveLSAConfig = lsaConfig.resolvingAdaptiveBudget(forMaxContext: finalCap)
         let lsaOperator = try QWLSAOperator.makeIfEnabled(
-            hal: hal, geometry: self.geometry, lsaConfig: lsaConfig, packPath: expanded,
+            hal: hal, geometry: self.geometry, lsaConfig: effectiveLSAConfig, packPath: expanded,
             pack: qwpPack, safetensors: st, attnLayers: globalVisitIndices,
             maxContext: finalCap, maxPrefillChunk: session.maxChunk
         )
@@ -376,7 +380,7 @@ final class QWInkling2Runtime: @unchecked Sendable {
         Double(duration.components.seconds) + Double(duration.components.attoseconds) * 1e-18
     }
 
-    static let repetitionPenaltyWindow = 64
+    static let repetitionPenaltyWindow = 256
 
     static func recordGeneratedTokenForPenalty(
         _ token: Int,
@@ -502,7 +506,7 @@ final class QWInkling2Runtime: @unchecked Sendable {
             let lpSampler = request.collectLogprobs ? QWSampler(config: request.sampling) : nil
             let topKCount = max(0, min(20, request.topLogprobsCount))
             let usePenalty = sampler.config.repetitionPenalty != 1.0
-            let canUseGreedyHead = sampler.config.isGreedy && !usePenalty
+            let canUseGreedyHeadBase = sampler.config.isGreedy
                 && request.constraint == nil && lpSampler == nil
 
             prefillProfiler?.reset()
@@ -514,26 +518,34 @@ final class QWInkling2Runtime: @unchecked Sendable {
                     request.prompt.count
                 }
                 let rem = targetLimit - pos
+                let denseTailTokens = 64
                 let chunkSize: Int
                 if rem > session.maxChunk {
                     let nChunks = (rem + session.maxChunk - 1) / session.maxChunk
                     chunkSize = min(session.maxChunk, max(64, ((rem + nChunks - 1) / nChunks + 63) & ~63))
+                } else if let lsa = lsaOperator,
+                          targetLimit == request.prompt.count,
+                          request.prompt.count > lsa.config.denseBypassThreshold,
+                          rem > denseTailTokens {
+                    chunkSize = rem - denseTailTokens
                 } else {
                     chunkSize = rem
                 }
                 let nextEnd = pos + chunkSize
                 let chunk = Array(request.prompt[pos..<nextEnd])
                 let isLast = (nextEnd == request.prompt.count)
+                let forceDenseTail = isLast && lsaOperator != nil && chunk.count <= denseTailTokens
                 let tapDS = dsparkActive ? dspark : nil
                 try forwardPass.forward(
                     tokens: chunk,
                     posOffset: pos,
                     runHeadRows: isLast ? 1 : 0,
-                    greedyHead: isLast && canUseGreedyHead,
+                    greedyHead: isLast && canUseGreedyHeadBase,
                     updateState: true,
                     captureTapBuf: tapDS?.tapBuf,
                     tapVisits: tapDS?.config.targetLayerIds ?? [],
                     visualSpans: request.visualSpans,
+                    forceDenseAttention: forceDenseTail,
                     profiler: prefillProfiler
                 )
                 if let ds = tapDS {
@@ -586,7 +598,7 @@ final class QWInkling2Runtime: @unchecked Sendable {
 
             if effectiveMaxNew > 0 {
                 let tok0: Int
-                if canUseGreedyHead {
+                if canUseGreedyHeadBase {
                     tok0 = Int(headTokPtr[0])
                 } else {
                     let firstRow = UnsafeBufferPointer(start: logitsPtr, count: V)
@@ -656,14 +668,15 @@ final class QWInkling2Runtime: @unchecked Sendable {
                         while !decodeDone && generated.count < effectiveMaxNew {
                             let stepStart = clock.now
                             let lastTok = generated[generated.count - 1]
+                            let stepGreedyHead = canUseGreedyHeadBase && (!usePenalty || penaltyHistory.isEmpty)
                             try forwardPass.forward(
                                 tokens: [lastTok], posOffset: pos, runHeadRows: 1,
-                                greedyHead: canUseGreedyHead,
+                                greedyHead: stepGreedyHead,
                                 updateState: true, profiler: decodeProfiler
                             )
                             pos += 1
                             let tok: Int
-                            if canUseGreedyHead {
+                            if stepGreedyHead {
                                 tok = Int(headTokPtr[0])
                             } else {
                                 let row = UnsafeBufferPointer(start: logitsPtr, count: V)

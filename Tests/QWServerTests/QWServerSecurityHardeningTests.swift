@@ -685,6 +685,7 @@ final class QWServerSecurityHardeningTests: XCTestCase {
             "Sources/Apps/QWServer/Resources/js/state.js",
             "Sources/Apps/QWServer/Resources/js/markdown.js",
             "Sources/Apps/QWServer/Resources/js/actions.js",
+            "Sources/Apps/QWServer/Resources/js/settings.js",
             "Sources/Apps/QWServer/Resources/js/chat-presets.js",
             "Sources/Apps/QWServer/Resources/js/chat.js"
         ]

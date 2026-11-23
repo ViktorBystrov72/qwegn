@@ -83,6 +83,20 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
     /// Default sparse token budget ($k = 2048$ tokens = 512 four-token blocks).
     public static let defaultBudget: Int = 2048
 
+    /// True for training-free SVD sidecar methods superseded by Full-Slice Q4 Direct when eligible.
+    public static func isTrainingFreeSidecarMethod(_ method: String) -> Bool {
+        ["weight_svd", "weight_svd_v1", "svd", "head_svd"].contains(
+            method.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        )
+    }
+
+    /// True when geometry supports Full-Slice Q4 Multi-Head Direct LSA (2-stage p16->p4 + all_sum).
+    public static func supportsFullSliceQ4Direct(qHeads: Int, kvHeads: Int, sliceDim: Int) -> Bool {
+        guard kvHeads >= 1, qHeads >= kvHeads, qHeads <= 64, qHeads % kvHeads == 0,
+              sliceDim >= 4, sliceDim <= 256, sliceDim % 4 == 0 else { return false }
+        return qHeads * sliceDim <= 12288
+    }
+
     public var mode: QWLSAMode
     public var budget: Int
     public var clusterBlock: Int
@@ -93,6 +107,8 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
     public var loopShareStride: Int
     /// Whether `crossLoopReuse` was explicitly provided (`false` overrides `QW_LSA_LOOP_SHARE`).
     public var hasExplicitLoopShareOverride: Bool
+    /// Whether `budget` was explicitly pinned rather than defaulting to `defaultBudget`.
+    public var hasExplicitBudgetOverride: Bool
 
     public static let loopShareEnvKey = "QW_LSA_LOOP_SHARE"
 
@@ -104,7 +120,8 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
         clusterBlock: Int = QWLSAConfig.defaultClusterBlock,
         sidecarPath: String = "",
         crossLoopReuse: Bool? = nil,
-        loopShareStride: Int = 0
+        loopShareStride: Int = 0,
+        explicitBudget: Bool? = nil
     ) {
         self.mode = mode
         self.budget = budget
@@ -113,6 +130,7 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
         self.crossLoopReuse = crossLoopReuse ?? false
         self.loopShareStride = max(0, loopShareStride)
         self.hasExplicitLoopShareOverride = (crossLoopReuse != nil)
+        self.hasExplicitBudgetOverride = explicitBudget ?? (budget != Self.defaultBudget)
     }
 
     public static func == (lhs: QWLSAConfig, rhs: QWLSAConfig) -> Bool {
@@ -137,13 +155,33 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.mode = try c.decodeIfPresent(QWLSAMode.self, forKey: .mode) ?? .off
-        self.budget = try c.decodeIfPresent(Int.self, forKey: .budget) ?? Self.defaultBudget
+        let decodedBudget = try c.decodeIfPresent(Int.self, forKey: .budget)
+        self.budget = decodedBudget ?? Self.defaultBudget
         self.clusterBlock = try c.decodeIfPresent(Int.self, forKey: .clusterBlock) ?? Self.defaultClusterBlock
         self.sidecarPath = try c.decodeIfPresent(String.self, forKey: .sidecarPath) ?? ""
         let decodedReuse = try c.decodeIfPresent(Bool.self, forKey: .crossLoopReuse)
         self.crossLoopReuse = decodedReuse ?? false
         self.loopShareStride = max(0, try c.decodeIfPresent(Int.self, forKey: .loopShareStride) ?? 0)
         self.hasExplicitLoopShareOverride = (decodedReuse != nil)
+        self.hasExplicitBudgetOverride = (decodedBudget != nil && decodedBudget != Self.defaultBudget)
+    }
+
+    /// Context-scaled default budget maintaining >= 3.1% floor up to 256K and >= 1.56% at 512K..1M.
+    public static func adaptiveBudget(forMaxContext maxContext: Int) -> Int {
+        if maxContext >= 786_432 { return 16_384 }
+        if maxContext >= 196_608 { return 8192 }
+        if maxContext >= 98_304 { return 4096 }
+        return defaultBudget
+    }
+
+    /// Scales default budget for `maxContext` unless the user pinned an explicit budget.
+    public func resolvingAdaptiveBudget(forMaxContext maxContext: Int) -> QWLSAConfig {
+        guard isEnabled, !hasExplicitBudgetOverride else { return self }
+        let target = Self.adaptiveBudget(forMaxContext: maxContext)
+        guard target != budget else { return self }
+        var copy = self
+        copy.budget = target
+        return copy
     }
 
     public static func parseLoopShareEnv(_ raw: String?) -> (enabled: Bool, stride: Int)? {
@@ -172,9 +210,9 @@ public struct QWLSAConfig: Sendable, Codable, Equatable, Hashable {
         return copy
     }
 
-    /// Selected token budget $k$, clamped to `512...8192` and aligned to a 4-token block boundary.
+    /// Selected token budget $k$, clamped to `512...16384` and aligned to a 4-token block boundary.
     public var alignedBudget: Int {
-        let clamped = min(8192, max(512, budget))
+        let clamped = min(16_384, max(512, budget))
         return (clamped / Self.poolSize) * Self.poolSize
     }
 

@@ -124,8 +124,8 @@ public struct QWGKnobOptions: ParsableArguments {
     @Option(name: [.customLong("lsa-mode")], help: "Latent Sparse Attention mode: off, auto, sidecar, svd or qsa-cluster (arXiv:2610.42147).", transform: { $0.lowercased() })
     public var lsaMode: String?
 
-    /// LSA active key budget k in tokens (512...8192, default 2048).
-    @Option(name: [.customLong("lsa-budget")], help: "LSA active key budget k in tokens (512...8192, default 2048).")
+    /// LSA active key budget k in tokens (512...16384, default 2048).
+    @Option(name: [.customLong("lsa-budget")], help: "LSA active key budget k in tokens (512...16384, default 2048).")
     public var lsaBudget: Int?
 
     /// LSA cluster block size L in tokens (256...4096, default 512; 4096 enables e-means).

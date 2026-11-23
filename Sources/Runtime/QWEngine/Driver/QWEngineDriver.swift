@@ -245,7 +245,6 @@ public final class QWEngineDriver: @unchecked Sendable {
             ?? String(describing: kvMode)
         self.kvMode = kvMode
         self.rawKVMode = resolvedRawKV
-        self.lsaConfig = lsaConfig
         let cfg = try Self.resolveStartup(packPath: packPath, kvMode: kvMode,
                                           rawKVMode: rawKVMode,
                                           mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
@@ -325,6 +324,7 @@ public final class QWEngineDriver: @unchecked Sendable {
             self.mtpBackend = cfg.mtpBackend
             self.prefillScratchEviction = cfg.prefillScratchEviction
             self.prefillChunkSize = runtime.maxPrefillRows
+            self.lsaConfig = lsaConfig
             self.hyperRuntime = runtime
             self.inkling2Runtime = nil
             self.standardState = nil
@@ -378,6 +378,7 @@ public final class QWEngineDriver: @unchecked Sendable {
             self.mtpBackend = cfg.mtpBackend
             self.prefillScratchEviction = cfg.prefillScratchEviction
             self.prefillChunkSize = runtime.session.maxChunk
+            self.lsaConfig = runtime.lsaOperator?.config ?? lsaConfig.resolvingAdaptiveBudget(forMaxContext: runtime.capacity)
             self.hyperRuntime = nil
             self.inkling2Runtime = runtime
             self.standardState = nil
@@ -543,8 +544,12 @@ public final class QWEngineDriver: @unchecked Sendable {
             gsub: gsub, geometry: geometry, gdnLayerCount: gdnL.count,
             mtpDrafts: startup.mtpDrafts, dflashDrafter: dflash)
 
+        let effectiveLSAConfig = (!geometry.usesAnyMLA && geometry.blockSparseGQAConfig == nil)
+            ? lsaConfig.resolvingAdaptiveBudget(forMaxContext: budget.effectiveMaxTokens)
+            : lsaConfig
+        self.lsaConfig = effectiveLSAConfig
         let lsaOp = try QWLSAOperator.makeIfEnabled(
-            hal: prelimHal, geometry: geometry, lsaConfig: lsaConfig, packPath: packPath,
+            hal: prelimHal, geometry: geometry, lsaConfig: effectiveLSAConfig, packPath: packPath,
             pack: startup.pack, safetensors: stContainer, attnLayers: attnL,
             maxContext: budget.effectiveMaxTokens, maxPrefillChunk: chunkRows)
         let mlaOp = try QWMLAAttnOperator.makeIfEnabled(

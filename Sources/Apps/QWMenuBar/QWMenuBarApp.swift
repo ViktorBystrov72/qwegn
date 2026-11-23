@@ -493,7 +493,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
         window.identifier = NSUserInterfaceItemIdentifier("qwg.updates")
         window.title = "Software Update"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 500, height: 420))
+        window.setContentSize(NSSize(width: 540, height: 460))
         window.minSize = NSSize(width: 460, height: 340)
         window.isMovableByWindowBackground = false
         window.isReleasedWhenClosed = false

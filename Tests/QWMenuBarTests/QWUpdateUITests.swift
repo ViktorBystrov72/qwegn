@@ -14,13 +14,13 @@ private final class MockUIUpdateTransport: QWUpdateHTTPTransport, @unchecked Sen
     let releaseJSON: Data
     let checksumsText: String
 
-    init(tag: String = "v99.0.0") {
+    init(tag: String = "v99.0.0", body: String = "## What's New\n- Cupertino Software Update window") {
         let sum = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
         self.checksumsText = "\(sum)  Qwegn-99.0.0-macos-arm64.pkg\n"
         let obj: [String: Any] = [
             "tag_name": tag,
             "name": "Qwegn \(tag)",
-            "body": "## What's New\n- Cupertino Software Update window",
+            "body": body,
             "draft": false,
             "prerelease": false,
             "published_at": "2026-11-23T12:00:00Z",
@@ -174,7 +174,7 @@ final class QWUpdateUITests: XCTestCase {
         XCTAssertLessThanOrEqual(popSize.width, 440.5)
 
         let updHost = NSHostingView(rootView: SoftwareUpdateView(telemetry: telemetry))
-        updHost.frame = NSRect(x: 0, y: 0, width: 500, height: 420)
+        updHost.frame = NSRect(x: 0, y: 0, width: 540, height: 460)
         updHost.layoutSubtreeIfNeeded()
         XCTAssertGreaterThanOrEqual(updHost.fittingSize.width, 460)
 
@@ -182,5 +182,119 @@ final class QWUpdateUITests: XCTestCase {
         settingsHost.frame = NSRect(x: 0, y: 0, width: 740, height: 540)
         settingsHost.layoutSubtreeIfNeeded()
         XCTAssertGreaterThan(settingsHost.bounds.width, 700)
+    }
+
+    func testReleaseMarkdownParserCoversReleaseNotesBlocks() {
+        XCTAssertTrue(ReleaseMarkdownParser.parse("   \n\t  ").isEmpty)
+
+        let sample = """
+        > **Supersedes `v0.34.0`** for macOS 26 release binaries.
+
+        ### Fixed
+        - **ABI Fix**: Hoisted `MTLBuffer.contents()` lookups.
+          - Sub-detail with `x21` preservation
+        - [x] Verified CI gate
+        - [ ] Tag next release
+
+        1. Build release binary
+        2. Run ABI check
+
+        ```swift
+        let ver = QWVersion.current
+        ```
+
+        | Component | Status |
+        | :--- | ---: |
+        | `QWMenuBar` | OK |
+
+        ---
+
+        Summary paragraph line 1
+        line 2.
+        """
+        let blocks = ReleaseMarkdownParser.parse(sample)
+        XCTAssertEqual(blocks.count, 8)
+        guard blocks.count == 8 else { return }
+        XCTAssertEqual(blocks[0], .blockquote(blocks: [.paragraph(text: "**Supersedes `v0.34.0`** for macOS 26 release binaries.")]))
+        XCTAssertEqual(blocks[1], .heading(level: 3, text: "Fixed"))
+        guard case let .list(firstList) = blocks[2] else {
+            return XCTFail("Expected bullet/task list block")
+        }
+        XCTAssertEqual(firstList, [
+            ReleaseMarkdownListItem(depth: 0, marker: .unordered, text: "**ABI Fix**: Hoisted `MTLBuffer.contents()` lookups."),
+            ReleaseMarkdownListItem(depth: 1, marker: .unordered, text: "Sub-detail with `x21` preservation"),
+            ReleaseMarkdownListItem(depth: 0, marker: .task(checked: true), text: "Verified CI gate"),
+            ReleaseMarkdownListItem(depth: 0, marker: .task(checked: false), text: "Tag next release"),
+        ])
+        XCTAssertEqual(blocks[3], .list(items: [
+            ReleaseMarkdownListItem(depth: 0, marker: .ordered(1), text: "Build release binary"),
+            ReleaseMarkdownListItem(depth: 0, marker: .ordered(2), text: "Run ABI check"),
+        ]))
+        XCTAssertEqual(blocks[4], .codeBlock(language: "swift", code: "let ver = QWVersion.current"))
+        XCTAssertEqual(blocks[5], .table(
+            headers: ["Component", "Status"],
+            alignments: [.leading, .trailing],
+            rows: [["`QWMenuBar`", "OK"]]
+        ))
+        XCTAssertEqual(blocks[6], .thematicBreak)
+        XCTAssertEqual(blocks[7], .paragraph(text: "Summary paragraph line 1 line 2."))
+    }
+
+    func testReleaseMarkdownInlineStylesCodeAndSanitizesLinks() {
+        let md = "Use `qwg update`, [Release](https://github.com/qwegnai/qwegn), [JS](javascript:alert(1)), and [Local](file:///etc/passwd)."
+        let attr = ReleaseMarkdownInline.attributedString(for: md, baseSize: 11.5)
+        let runs = Array(attr.runs)
+        let codeRun = runs.first { String(attr[$0.range].characters) == "qwg update" }
+        XCTAssertTrue(codeRun?.inlinePresentationIntent?.contains(.code) == true)
+        XCTAssertNotNil(codeRun?.swiftUI.backgroundColor)
+
+        let httpsRun = runs.first { String(attr[$0.range].characters) == "Release" }
+        XCTAssertEqual(httpsRun?.link?.absoluteString, "https://github.com/qwegnai/qwegn")
+
+        let jsRun = runs.first { String(attr[$0.range].characters) == "JS" }
+        XCTAssertNil(jsRun?.link)
+
+        let localRun = runs.first { String(attr[$0.range].characters) == "Local" }
+        XCTAssertNil(localRun?.link)
+    }
+
+    @MainActor
+    func testSoftwareUpdateViewWithRichMarkdownNotesFitsBounds() async throws {
+        let dir = try makeTempDir()
+        let richNotes = """
+        > **Supersedes `v0.34.0`**. Fixes codegen crash.
+
+        ### Fixed
+        - **ABI Fix**: Hoisted `MTLBuffer.contents()`.
+          - Eliminates sibling tail-call clobbers.
+
+        | Binary | Gate |
+        | :--- | ---: |
+        | `qwg` | PASS |
+        """
+        let transport = MockUIUpdateTransport(tag: "v99.1.0", body: richNotes)
+        let controller = QWUpdateController(
+            schedule: .onLaunchAndDaily,
+            currentVersion: "0.34.1",
+            installOrigin: .pkgReceipt,
+            stateURL: dir.appendingPathComponent("update-state.json"),
+            cacheDirectory: dir.appendingPathComponent("cache", isDirectory: true),
+            checker: QWUpdateChecker(transport: transport)
+        )
+        await controller.checkNowAndAwait(force: true)
+
+        let telemetry = TelemetryObservable(
+            startServices: false,
+            enableAutoLifecycle: false,
+            initialSettings: QWServerSettings(),
+            updateController: controller
+        )
+        for size in [NSSize(width: 540, height: 460), NSSize(width: 460, height: 340)] {
+            let host = NSHostingView(rootView: SoftwareUpdateView(telemetry: telemetry))
+            host.frame = NSRect(origin: .zero, size: size)
+            host.layoutSubtreeIfNeeded()
+            XCTAssertGreaterThanOrEqual(host.bounds.width, 460)
+            XCTAssertGreaterThanOrEqual(host.bounds.height, 340)
+        }
     }
 }

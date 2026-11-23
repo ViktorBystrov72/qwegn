@@ -19,7 +19,7 @@ import QWQuant
 
 /// THE PER-LAYER STATE LAW (C23 fix — the single-slot version conflated
 public final class QWEngineSession: @unchecked Sendable {
-    public static let repetitionPenaltyWindow = 64
+    public static let repetitionPenaltyWindow = 256
     public internal(set) var position: Int = 0        // next token's absolute position
     public internal(set) var promptTokenCount: Int = 0
     public internal(set) var generated: Int = 0

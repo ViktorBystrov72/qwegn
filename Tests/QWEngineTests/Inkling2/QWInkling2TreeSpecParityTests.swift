@@ -465,7 +465,8 @@ final class QWInkling2TreeSpecParityTests: XCTestCase {
         recent.removeAll()
         active.removeAll()
         var refWindow: [Int] = []
-        for step in 0..<180 {
+        let totalSteps = QWInkling2Runtime.repetitionPenaltyWindow + 64
+        for step in 0..<totalSteps {
             let tok = (step % 5 == 0) ? 42 : ((step % 2 == 0) ? 7 : 8)
             QWInkling2Runtime.recordGeneratedTokenForPenalty(
                 tok, vocab: 256_000, recentGenerated: &recent, activeLoopTokens: &active
@@ -474,7 +475,7 @@ final class QWInkling2TreeSpecParityTests: XCTestCase {
             if refWindow.count > QWInkling2Runtime.repetitionPenaltyWindow {
                 refWindow.removeFirst(refWindow.count - QWInkling2Runtime.repetitionPenaltyWindow)
             }
-            XCTAssertLessThanOrEqual(recent.count, 64)
+            XCTAssertLessThanOrEqual(recent.count, QWInkling2Runtime.repetitionPenaltyWindow)
             XCTAssertEqual(recent, refWindow)
             XCTAssertEqual(active, QWSampler.loopRepetitionTokens(in: refWindow))
         }

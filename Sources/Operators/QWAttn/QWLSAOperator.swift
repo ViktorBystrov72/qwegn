@@ -18,10 +18,17 @@ public final class QWLSAOperator: @unchecked Sendable {
         public let physicalLayer: Int
         public let wqIdxF16: [UInt16]
         public let wkIdxF16: [UInt16]
-        public init(physicalLayer: Int, wqIdxF16: [UInt16], wkIdxF16: [UInt16]) {
+        public let isHeadFactorized: Bool
+        public init(
+            physicalLayer: Int,
+            wqIdxF16: [UInt16],
+            wkIdxF16: [UInt16],
+            isHeadFactorized: Bool = false
+        ) {
             self.physicalLayer = physicalLayer
             self.wqIdxF16 = wqIdxF16
             self.wkIdxF16 = wkIdxF16
+            self.isHeadFactorized = isHeadFactorized
         }
     }
 
@@ -31,16 +38,24 @@ public final class QWLSAOperator: @unchecked Sendable {
         public let wkIdx: QWTensorValue
         public let kPending: QWTensorValue
         public let pooledKeys: QWTensorValue
+        public let pooledCoarseKeys: QWTensorValue
         public let centroids: QWTensorValue
         public let bucketMembers: QWTensorValue
         public let bucketSizes: QWTensorValue
     }
 
     public static let maxSelectBatchRows = 32
+    public static let maxMHSelectBatchRows = 16
     public static let emeansProbeClusters = 320
 
     public let config: QWLSAConfig
     public let isEmeansCoarse: Bool
+    public let isMultiHeadDirect: Bool
+    public let qIndexStride: Int
+    public let kL2Clip: Float
+    public let pooledMetaBytes: Int
+    public let pooledRowBytes: Int
+    public let pendingRowElems: Int
     public let geometry: QWModelGeometry
     public let maxContext: Int
     public let maxPrefillChunk: Int
@@ -50,6 +65,9 @@ public final class QWLSAOperator: @unchecked Sendable {
     public let inputDim: Int
     public let ringCap: Int
     public let maxBlocks: Int
+    public let maxCoarseBlocks: Int
+    public let mhCoarseCap: Int
+    public let mhFineCandCap: Int
     public let maxSuperblocks: Int
     public let maxBuckets: Int
     public let listStride: Int
@@ -76,7 +94,26 @@ public final class QWLSAOperator: @unchecked Sendable {
     let psoSelectHist2: any MTLComputePipelineState
     let psoSelectExpand: any MTLComputePipelineState
     let psoSelectFinalize: any MTLComputePipelineState
+    let psoIndexPrepMH: any MTLComputePipelineState
+    let psoIndexPrepBF16MH: any MTLComputePipelineState
+    let psoPoolKeysMH: any MTLComputePipelineState
+    let psoPoolCoarseMH: any MTLComputePipelineState
+    let psoMHScoreHeads: any MTLComputePipelineState
+    let psoMHReduceLSE: any MTLComputePipelineState
+    let psoMHAggHist: any MTLComputePipelineState
+    let psoMHCollect: any MTLComputePipelineState
+    let psoMHCoarseExpand: any MTLComputePipelineState
+    let psoMHFinalize: any MTLComputePipelineState
     let coarsePipeline: QWCoarseSelectionPipeline?
+
+    let mhHeadScores: QWTensorValue
+    let mhTGStats: QWTensorValue
+    let mhHeadLSE: QWTensorValue
+    let mhFineCandIdx: QWTensorValue
+    let mhFineCandCount: QWTensorValue
+    let mhDummySink: QWTensorValue
+    let mhHeadScoreCols: Int
+    let mhScoreTilesX: Int
 
     /// Parallel selector scratch (zero at rest; restored by `qwg_lsa_select_finalize`).
     let selCScore: QWTensorValue
@@ -105,12 +142,26 @@ public final class QWLSAOperator: @unchecked Sendable {
                 indexDim: Int = QWLSAConfig.defaultIndexDim,
                 layerWeights: [LayerWeights],
                 maxContext: Int,
-                maxPrefillChunk: Int = 512) throws {
+                maxPrefillChunk: Int = 512,
+                isMultiHeadDirect: Bool? = nil) throws {
         self.hal = hal
         self.geometry = geometry
-        self.config = config
-        let emeans = (config.alignedClusterBlock == QWLSAConfig.emeansClusterBlock)
+        let resolvedConfig = config.resolvingAdaptiveBudget(forMaxContext: maxContext)
+        self.config = resolvedConfig
+        let emeans = (resolvedConfig.alignedClusterBlock == QWLSAConfig.emeansClusterBlock)
         self.isEmeansCoarse = emeans
+        let supportsFullMH = !emeans && QWLSAConfig.supportsFullSliceQ4Direct(
+            qHeads: geometry.qHeads, kvHeads: geometry.kvHeads, sliceDim: geometry.lsaHeadSliceDim)
+        let mhDirect = supportsFullMH && (isMultiHeadDirect ?? (!layerWeights.isEmpty && layerWeights.allSatisfy(\.isHeadFactorized)))
+        let qIdxStride = mhDirect ? (geometry.qHeads * geometry.lsaHeadSliceDim) : indexDim
+        self.isMultiHeadDirect = mhDirect
+        self.qIndexStride = qIdxStride
+        self.kL2Clip = max(0, geometry.descriptor.inkling2Config?.qkL2ClipThreshold ?? 0)
+        let pMeta = (geometry.kvHeads * 4 + 15) & ~15
+        let pRow = (pMeta + ((geometry.kvHeads * geometry.lsaHeadSliceDim) >> 1) + 15) & ~15
+        self.pooledMetaBytes = mhDirect ? pMeta : 0
+        self.pooledRowBytes = mhDirect ? pRow : (indexDim * 2)
+        self.pendingRowElems = mhDirect ? (geometry.kvHeads * geometry.lsaHeadSliceDim) : indexDim
         self.maxContext = max(512, maxContext)
         self.maxPrefillChunk = max(32, maxPrefillChunk)
         self.indexDim = indexDim
@@ -123,13 +174,19 @@ public final class QWLSAOperator: @unchecked Sendable {
         while rc < self.maxPrefillChunk * 2 { rc <<= 1 }
         let ringCap = rc
         let maxBlocks = max(128, (self.maxContext + 3) / 4)
+        let maxCoarseBlocks = max(1, maxBlocks / 4)
+        let mhCoarseCap = min(4096, max(2048, resolvedConfig.budgetBlocks * 2))
+        let mhFineCandCap = mhCoarseCap * 4
         let maxSuperblocks = emeans
             ? QWCoarsePoolIndex.maxMacros(forMaxContext: self.maxContext)
             : max(1, (self.maxContext + 511) / 512)
         let maxBuckets = maxSuperblocks * 64
-        let listStride = max(512, config.maxTotalSelectedBlocks)
+        let listStride = max(512, resolvedConfig.maxTotalSelectedBlocks)
         self.ringCap = ringCap
         self.maxBlocks = maxBlocks
+        self.maxCoarseBlocks = maxCoarseBlocks
+        self.mhCoarseCap = mhCoarseCap
+        self.mhFineCandCap = mhFineCandCap
         self.maxSuperblocks = maxSuperblocks
         self.maxBuckets = maxBuckets
         self.listStride = listStride
@@ -143,6 +200,16 @@ public final class QWLSAOperator: @unchecked Sendable {
         self.psoSelectHist2 = try hal.pipeline("qwg_lsa_select_hist2")
         self.psoSelectExpand = try hal.pipeline("qwg_lsa_select_expand")
         self.psoSelectFinalize = try hal.pipeline("qwg_lsa_select_finalize")
+        self.psoIndexPrepMH = try hal.pipeline("qwg_lsa_index_prep_mh")
+        self.psoIndexPrepBF16MH = try hal.pipeline("qwg_lsa_index_prep_bf16_mh")
+        self.psoPoolKeysMH = try hal.pipeline("qwg_lsa_pool_keys_mh")
+        self.psoPoolCoarseMH = try hal.pipeline("qwg_lsa_pool_coarse_mh")
+        self.psoMHScoreHeads = try hal.pipeline("qwg_lsa_mh_score_heads")
+        self.psoMHReduceLSE = try hal.pipeline("qwg_lsa_mh_reduce_lse")
+        self.psoMHAggHist = try hal.pipeline("qwg_lsa_mh_agg_hist")
+        self.psoMHCollect = try hal.pipeline("qwg_lsa_mh_collect")
+        self.psoMHCoarseExpand = try hal.pipeline("qwg_lsa_mh_coarse_expand")
+        self.psoMHFinalize = try hal.pipeline("qwg_lsa_mh_finalize")
         let loadedCoarse = emeans
             ? try QWCoarseSelectionPipeline.LoadedPipelines.load(hal: hal, variant: .lsa)
             : nil
@@ -150,8 +217,8 @@ public final class QWLSAOperator: @unchecked Sendable {
         let nAttnLayers = layerWeights.count
         let reusePlan = QWLSALoopReusePlan.build(
             physicalLayers: layerWeights.map(\.physicalLayer),
-            enabled: config.crossLoopReuse,
-            stride: config.loopShareStride
+            enabled: resolvedConfig.crossLoopReuse,
+            stride: resolvedConfig.loopShareStride
         )
         self.loopReusePlan = reusePlan
 
@@ -159,7 +226,10 @@ public final class QWLSAOperator: @unchecked Sendable {
             inDim: inDim, indexDim: indexDim, ringCap: ringCap,
             maxBlocks: maxBlocks, maxSuperblocks: maxSuperblocks, maxBuckets: maxBuckets,
             listStride: listStride, maxPrefillChunk: self.maxPrefillChunk,
-            emeans: emeans, physicalLayers: layerWeights.map(\.physicalLayer), reusePlan: reusePlan
+            emeans: emeans, physicalLayers: layerWeights.map(\.physicalLayer), reusePlan: reusePlan,
+            qIndexStride: qIdxStride, isMultiHeadDirect: mhDirect,
+            qHeads: geometry.qHeads, kvHeads: geometry.kvHeads, sliceDim: geometry.lsaHeadSliceDim,
+            budgetBlocks: resolvedConfig.budgetBlocks
         )
         let layerOffsets = layout.layerOffsets
 
@@ -175,34 +245,46 @@ public final class QWLSAOperator: @unchecked Sendable {
         var builtLayers: [LayerState] = []
         builtLayers.reserveCapacity(nAttnLayers)
         let basePtr = reg.pointer
-        let wBytes = indexDim * inDim * 2
-        for i in layout.uniqueWeightIndices {
-            let offs = layerOffsets[i]
-            let lw = layerWeights[i]
-            lw.wqIdxF16.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-                if let ptr = src.baseAddress {
-                    memcpy(basePtr.advanced(by: offs.wqOff), ptr, min(src.count, wBytes))
+        let wBytes = mhDirect ? 0 : (indexDim * inDim * 2)
+        if wBytes > 0 {
+            for i in layout.uniqueWeightIndices {
+                let offs = layerOffsets[i]
+                let lw = layerWeights[i]
+                lw.wqIdxF16.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
+                    if let ptr = src.baseAddress {
+                        memcpy(basePtr.advanced(by: offs.wqOff), ptr, min(src.count, wBytes))
+                    }
                 }
-            }
-            lw.wkIdxF16.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-                if let ptr = src.baseAddress {
-                    memcpy(basePtr.advanced(by: offs.wkOff), ptr, min(src.count, wBytes))
+                lw.wkIdxF16.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
+                    if let ptr = src.baseAddress {
+                        memcpy(basePtr.advanced(by: offs.wkOff), ptr, min(src.count, wBytes))
+                    }
                 }
             }
         }
+        let kPendElems = self.pendingRowElems
         for i in 0..<nAttnLayers {
             let offs = layerOffsets[i]
             builtLayers.append(LayerState(
                 fullAttentionIndex: i,
-                wqIdx: QWTensorValue(region: reg, offset: offs.wqOff, shape: QWTensorShape([indexDim, inDim], .f16)),
-                wkIdx: QWTensorValue(region: reg, offset: offs.wkOff, shape: QWTensorShape([indexDim, inDim], .f16)),
-                kPending: QWTensorValue(region: reg, offset: offs.kPendOff, shape: QWTensorShape([ringCap, indexDim], .f16)),
-                pooledKeys: QWTensorValue(region: reg, offset: offs.pooledOff, shape: QWTensorShape([maxBlocks, indexDim], .f16)),
-                centroids: QWTensorValue(region: reg, offset: offs.centOff, shape: QWTensorShape([maxBuckets, indexDim], .f16)),
-                bucketMembers: QWTensorValue(region: reg, offset: offs.memOff,
-                                             shape: QWTensorShape([emeans ? maxSuperblocks * 512 : maxBuckets], .i32)),
-                bucketSizes: QWTensorValue(region: reg, offset: offs.sizeOff,
-                                           shape: QWTensorShape([emeans ? maxBuckets : max(1, maxBuckets / 4)], .i32))
+                wqIdx: QWTensorValue(region: reg, offset: offs.wqOff, shape: QWTensorShape([mhDirect ? 1 : indexDim, mhDirect ? 1 : inDim], .f16)),
+                wkIdx: QWTensorValue(region: reg, offset: offs.wkOff, shape: QWTensorShape([mhDirect ? 1 : indexDim, mhDirect ? 1 : inDim], .f16)),
+                kPending: QWTensorValue(region: reg, offset: offs.kPendOff, shape: QWTensorShape([ringCap, kPendElems], .f16)),
+                pooledKeys: mhDirect
+                    ? QWTensorValue(region: reg, offset: offs.pooledOff, shape: QWTensorShape([maxBlocks, pRow / 2], .f16))
+                    : QWTensorValue(region: reg, offset: offs.pooledOff, shape: QWTensorShape([maxBlocks, indexDim], .f16)),
+                pooledCoarseKeys: mhDirect
+                    ? QWTensorValue(region: reg, offset: offs.coarsePooledOff, shape: QWTensorShape([maxCoarseBlocks, pRow / 2], .f16))
+                    : QWTensorValue(region: reg, offset: offs.coarsePooledOff, shape: QWTensorShape([1, 1], .f16)),
+                centroids: QWTensorValue(
+                    region: reg, offset: offs.centOff,
+                    shape: QWTensorShape([mhDirect ? 1 : maxBuckets, mhDirect ? 1 : indexDim], .f16)),
+                bucketMembers: QWTensorValue(
+                    region: reg, offset: offs.memOff,
+                    shape: QWTensorShape([mhDirect ? 1 : (emeans ? maxSuperblocks * 512 : maxBuckets)], .i32)),
+                bucketSizes: QWTensorValue(
+                    region: reg, offset: offs.sizeOff,
+                    shape: QWTensorShape([mhDirect ? 1 : (emeans ? maxBuckets : max(1, maxBuckets / 4))], .i32))
             ))
         }
         self.layers = builtLayers
@@ -216,10 +298,30 @@ public final class QWLSAOperator: @unchecked Sendable {
 
         self.qIdxScratch = QWTensorValue(
             region: reg, offset: layout.qIdxOff,
-            shape: QWTensorShape([self.maxPrefillChunk, indexDim], .f16))
+            shape: QWTensorShape([self.maxPrefillChunk, qIdxStride], .f16))
         self.scoreScratch = QWTensorValue(
             region: reg, offset: layout.scoreOff,
             shape: QWTensorShape([layout.scoreRows, layout.scoreCols], .i32))
+        self.mhHeadScoreCols = layout.mhHeadScoreCols
+        self.mhScoreTilesX = layout.mhScoreTilesX
+        self.mhHeadScores = QWTensorValue(
+            region: reg, offset: layout.mhHeadScoresOff,
+            shape: QWTensorShape([mhDirect ? layout.selectBatch * layout.mhHeadScoreCols : 1, mhDirect ? geometry.qHeads : 1], .f16))
+        self.mhTGStats = QWTensorValue(
+            region: reg, offset: layout.mhTGStatsOff,
+            shape: QWTensorShape([mhDirect ? layout.selectBatch * geometry.qHeads * layout.mhScoreTilesX * 2 : 1], .f32))
+        self.mhHeadLSE = QWTensorValue(
+            region: reg, offset: layout.mhHeadLSEOff,
+            shape: QWTensorShape([mhDirect ? layout.selectBatch * geometry.qHeads : 1], .f32))
+        self.mhFineCandIdx = QWTensorValue(
+            region: reg, offset: layout.mhFineCandIdxOff,
+            shape: QWTensorShape([mhDirect ? layout.selectBatch : 1, mhDirect ? layout.mhFineCandCap : 1], .i32))
+        self.mhFineCandCount = QWTensorValue(
+            region: reg, offset: layout.mhFineCandCountOff,
+            shape: QWTensorShape([mhDirect ? layout.selectBatch : 1], .i32))
+        self.mhDummySink = QWTensorValue(
+            region: reg, offset: layout.mhDummySinkOff,
+            shape: QWTensorShape([128], .bf16))
         self.blockListScratch = QWTensorValue(
             region: reg, offset: layout.listOff,
             shape: QWTensorShape([self.maxPrefillChunk, listStride], .i32))
@@ -227,14 +329,16 @@ public final class QWLSAOperator: @unchecked Sendable {
             region: reg, offset: layout.countOff,
             shape: QWTensorShape([self.maxPrefillChunk], .i32))
         self.selMarkStride = layout.markStride
-        self.selCScore = QWTensorValue(region: reg, offset: layout.selCScoreOff,
-                                       shape: QWTensorShape([layout.selectBatch, maxBuckets], .i32))
+        self.selCScore = QWTensorValue(
+            region: reg, offset: layout.selCScoreOff,
+            shape: QWTensorShape([mhDirect ? 1 : layout.selectBatch, mhDirect ? 1 : maxBuckets], .i32))
         self.selHist = QWTensorValue(region: reg, offset: layout.selHistOff,
                                      shape: QWTensorShape([layout.selectBatch, 512], .i32))
         self.selCount = QWTensorValue(region: reg, offset: layout.selCountOff,
                                       shape: QWTensorShape([layout.selectBatch * layout.selCountCols], .i32))
-        self.selMarks = QWTensorValue(region: reg, offset: layout.selMarksOff,
-                                      shape: QWTensorShape([layout.selectBatch, layout.markStride], .i32))
+        self.selMarks = QWTensorValue(
+            region: reg, offset: layout.selMarksOff,
+            shape: QWTensorShape([mhDirect ? 1 : layout.selectBatch, mhDirect ? 1 : layout.markStride], .i32))
         self.selCandM = QWTensorValue(region: reg, offset: layout.selCandMOff,
                                       shape: QWTensorShape([layout.selectBatch, layout.candCap], .i32))
         let candUVal = QWTensorValue(region: reg, offset: layout.selCandUOff,
@@ -257,6 +361,7 @@ public final class QWLSAOperator: @unchecked Sendable {
         let wkOff: Int
         let kPendOff: Int
         let pooledOff: Int
+        let coarsePooledOff: Int
         let centOff: Int
         let memOff: Int
         let sizeOff: Int
@@ -276,6 +381,16 @@ public final class QWLSAOperator: @unchecked Sendable {
         let markStride: Int
         let selCountCols: Int
         let candCap: Int
+        let mhCoarseCap: Int
+        let mhFineCandCap: Int
+        let mhHeadScoreCols: Int
+        let mhScoreTilesX: Int
+        let mhHeadScoresOff: Int
+        let mhTGStatsOff: Int
+        let mhHeadLSEOff: Int
+        let mhFineCandIdxOff: Int
+        let mhFineCandCountOff: Int
+        let mhDummySinkOff: Int
         let selCScoreOff: Int
         let selHistOff: Int
         let selCountOff: Int
@@ -289,8 +404,21 @@ public final class QWLSAOperator: @unchecked Sendable {
         inDim: Int, indexDim: Int, ringCap: Int,
         maxBlocks: Int, maxSuperblocks: Int, maxBuckets: Int,
         listStride: Int, maxPrefillChunk: Int, emeans: Bool,
-        physicalLayers: [Int], reusePlan: QWLSALoopReusePlan
+        physicalLayers: [Int], reusePlan: QWLSALoopReusePlan,
+        qIndexStride: Int? = nil, isMultiHeadDirect: Bool = false,
+        qHeads: Int = 0, kvHeads: Int = 0, sliceDim: Int = 0,
+        budgetBlocks: Int = QWLSAConfig.defaultBudget / QWLSAConfig.poolSize
     ) -> LayoutPlan {
+        let mhValid = isMultiHeadDirect && qHeads > 0 && kvHeads > 0 && sliceDim > 0
+        let resolvedQIdxStride = qIndexStride ?? (mhValid ? qHeads * sliceDim : indexDim)
+        let pendingRowBytes = mhValid ? (kvHeads * sliceDim * 2) : (indexDim * 2)
+        let pooledMetaBytes = mhValid ? ((kvHeads * 4 + 15) & ~15) : 0
+        let pooledRowBytes = mhValid ? ((pooledMetaBytes + ((kvHeads * sliceDim) >> 1) + 15) & ~15) : (indexDim * 2)
+        let maxCoarseBlocks = max(1, maxBlocks / 4)
+        let mhCoarseCap = min(4096, max(2048, budgetBlocks * 2))
+        let mhFineCandCap = mhCoarseCap * 4
+        let oneStageMaxBlocks = min(maxBlocks, mhFineCandCap + 512)
+        let mhHeadScoreCols = max(oneStageMaxBlocks, maxCoarseBlocks)
         var cursor = 0
         func align256(_ x: Int) -> Int { (x + 255) & ~255 }
         func reserve(_ bytes: Int) -> Int {
@@ -301,7 +429,7 @@ public final class QWLSAOperator: @unchecked Sendable {
         var physWeightOffs: [Int: (wqOff: Int, wkOff: Int)] = [:]
         var uniqueWeightIndices: [Int] = []
         var layerOffsets = Array(repeating: LayerOffsets(
-            wqOff: 0, wkOff: 0, kPendOff: 0, pooledOff: 0, centOff: 0, memOff: 0, sizeOff: 0
+            wqOff: 0, wkOff: 0, kPendOff: 0, pooledOff: 0, coarsePooledOff: 0, centOff: 0, memOff: 0, sizeOff: 0
         ), count: physicalLayers.count)
         for (i, physLayer) in physicalLayers.enumerated() {
             let leader = reusePlan.sourceForFullAttnLayer[i]
@@ -313,17 +441,19 @@ public final class QWLSAOperator: @unchecked Sendable {
             if let existing = physWeightOffs[physLayer] {
                 wPair = existing
             } else {
-                wPair = (wqOff: reserve(indexDim * inDim * 2), wkOff: reserve(indexDim * inDim * 2))
+                let wBytes = mhValid ? 256 : (indexDim * inDim * 2)
+                wPair = (wqOff: reserve(wBytes), wkOff: reserve(wBytes))
                 physWeightOffs[physLayer] = wPair
                 uniqueWeightIndices.append(i)
             }
             layerOffsets[i] = LayerOffsets(
                 wqOff: wPair.wqOff, wkOff: wPair.wkOff,
-                kPendOff: reserve(ringCap * indexDim * 2),
-                pooledOff: reserve(maxBlocks * indexDim * 2),
-                centOff: reserve(maxBuckets * indexDim * 2),
-                memOff: reserve(emeans ? maxSuperblocks * 2048 : maxBuckets * 4),
-                sizeOff: reserve(emeans ? maxBuckets * 4 : maxBuckets)
+                kPendOff: reserve(ringCap * pendingRowBytes),
+                pooledOff: reserve(maxBlocks * pooledRowBytes),
+                coarsePooledOff: reserve(mhValid ? (maxCoarseBlocks * pooledRowBytes) : 256),
+                centOff: reserve(isMultiHeadDirect ? 256 : maxBuckets * indexDim * 2),
+                memOff: reserve(isMultiHeadDirect ? 256 : (emeans ? maxSuperblocks * 2048 : maxBuckets * 4)),
+                sizeOff: reserve(isMultiHeadDirect ? 256 : (emeans ? maxBuckets * 4 : maxBuckets))
             )
         }
         var reuseOffsets: [(listOff: Int, countOff: Int)] = []
@@ -334,20 +464,29 @@ public final class QWLSAOperator: @unchecked Sendable {
                 countOff: reserve(maxPrefillChunk * 4)
             ))
         }
-        let selectBatch = min(maxPrefillChunk, Self.maxSelectBatchRows)
-        let qIdxOff = reserve(maxPrefillChunk * indexDim * 2)
+        let selectBatch = mhValid
+            ? min(maxPrefillChunk, Self.maxMHSelectBatchRows)
+            : min(maxPrefillChunk, Self.maxSelectBatchRows)
+        let qIdxOff = reserve(maxPrefillChunk * resolvedQIdxStride * 2)
         let scoreRows = emeans ? 1 : selectBatch
-        let scoreCols = emeans ? 64 : maxBlocks
+        let scoreCols = emeans ? 64 : (mhValid ? mhHeadScoreCols : maxBlocks)
         let scoreOff = reserve(scoreRows * scoreCols * 4)
+        let mhScoreTilesX = max(1, (mhHeadScoreCols + 255) / 256)
+        let mhHeadScoresOff = reserve(mhValid ? (selectBatch * mhHeadScoreCols * qHeads * 2) : 256)
+        let mhTGStatsOff = reserve(mhValid ? (selectBatch * qHeads * mhScoreTilesX * 8) : 256)
+        let mhHeadLSEOff = reserve(mhValid ? (selectBatch * qHeads * 4) : 256)
+        let mhFineCandIdxOff = reserve(mhValid ? (selectBatch * mhFineCandCap * 4) : 256)
+        let mhFineCandCountOff = reserve(mhValid ? (selectBatch * 4) : 256)
+        let mhDummySinkOff = reserve(256)
         let listOff = reserve(maxPrefillChunk * listStride * 4)
         let countOff = reserve(maxPrefillChunk * 4)
         let markStride = emeans ? 1 : ((maxBlocks + 31) / 32)
         let candCap = Self.selectCandidateCap
-        let selCScoreOff = reserve(selectBatch * maxBuckets * 4)
+        let selCScoreOff = reserve(isMultiHeadDirect ? 256 : selectBatch * maxBuckets * 4)
         let selHistOff = reserve(selectBatch * 512 * 4)
         let selCountCols = emeans ? 2 : 1
         let selCountOff = reserve(selectBatch * selCountCols * 4)
-        let selMarksOff = reserve(selectBatch * markStride * 4)
+        let selMarksOff = reserve(isMultiHeadDirect ? 256 : selectBatch * markStride * 4)
         let selCandMOff = reserve(selectBatch * candCap * 4)
         let selCandUOff = reserve(selectBatch * candCap * 4)
         return LayoutPlan(
@@ -355,7 +494,12 @@ public final class QWLSAOperator: @unchecked Sendable {
             reuseOffsets: reuseOffsets, qIdxOff: qIdxOff, scoreOff: scoreOff,
             scoreRows: scoreRows, scoreCols: scoreCols, listOff: listOff, countOff: countOff,
             selectBatch: selectBatch, markStride: markStride, selCountCols: selCountCols,
-            candCap: candCap, selCScoreOff: selCScoreOff, selHistOff: selHistOff,
+            candCap: candCap, mhCoarseCap: mhCoarseCap, mhFineCandCap: mhFineCandCap,
+            mhHeadScoreCols: mhHeadScoreCols, mhScoreTilesX: mhScoreTilesX,
+            mhHeadScoresOff: mhHeadScoresOff, mhTGStatsOff: mhTGStatsOff, mhHeadLSEOff: mhHeadLSEOff,
+            mhFineCandIdxOff: mhFineCandIdxOff, mhFineCandCountOff: mhFineCandCountOff,
+            mhDummySinkOff: mhDummySinkOff,
+            selCScoreOff: selCScoreOff, selHistOff: selHistOff,
             selCountOff: selCountOff, selMarksOff: selMarksOff,
             selCandMOff: selCandMOff, selCandUOff: selCandUOff,
             totalBytes: max(4096, cursor)
@@ -369,11 +513,16 @@ public final class QWLSAOperator: @unchecked Sendable {
         attnLayers: [Int],
         maxContext: Int,
         maxPrefillChunk: Int,
-        indexDim: Int = QWLSAConfig.defaultIndexDim
+        indexDim: Int = QWLSAConfig.defaultIndexDim,
+        isMultiHeadDirect: Bool? = nil
     ) -> Int {
         guard lsaConfig.isEnabled, !attnLayers.isEmpty else { return 0 }
-        let effCfg = lsaConfig.resolvingLoopShareEnvironment()
+        let effCfg = lsaConfig.resolvingLoopShareEnvironment().resolvingAdaptiveBudget(forMaxContext: maxContext)
         let emeans = (effCfg.alignedClusterBlock == QWLSAConfig.emeansClusterBlock)
+        let supportsMH = !emeans && QWLSAConfig.supportsFullSliceQ4Direct(
+            qHeads: geometry.qHeads, kvHeads: geometry.kvHeads, sliceDim: geometry.lsaHeadSliceDim)
+        let mhDirect = (isMultiHeadDirect ?? false) && supportsMH
+        let qIdxStride = mhDirect ? (geometry.qHeads * geometry.lsaHeadSliceDim) : indexDim
         let clampedCtx = max(512, maxContext)
         let chunk = max(32, maxPrefillChunk)
         var rc = 4096
@@ -391,7 +540,10 @@ public final class QWLSAOperator: @unchecked Sendable {
             inDim: geometry.lsaInputDim, indexDim: indexDim, ringCap: rc,
             maxBlocks: maxBlocks, maxSuperblocks: maxSuperblocks, maxBuckets: maxSuperblocks * 64,
             listStride: max(512, effCfg.maxTotalSelectedBlocks), maxPrefillChunk: chunk,
-            emeans: emeans, physicalLayers: physLayers, reusePlan: reusePlan
+            emeans: emeans, physicalLayers: physLayers, reusePlan: reusePlan,
+            qIndexStride: qIdxStride, isMultiHeadDirect: mhDirect,
+            qHeads: geometry.qHeads, kvHeads: geometry.kvHeads, sliceDim: geometry.lsaHeadSliceDim,
+            budgetBlocks: effCfg.budgetBlocks
         )
         let coarseExtra = emeans ? (maxSuperblocks * 4 * physLayers.count) : 0
         return layout.totalBytes + coarseExtra
@@ -443,6 +595,32 @@ public final class QWLSAOperator: @unchecked Sendable {
         var bucketStride: UInt32
         var candCap: UInt32
         var markStride: UInt32
+    }
+
+    /// Mirrors `LSAMHSelParams` in qwlsa_mh.metal.
+    struct MHSelectParams {
+        var T: UInt32
+        var pos0: UInt32
+        var sliceDim: UInt32
+        var kvHeads: UInt32
+        var qHeads: UInt32
+        var qIndexStride: UInt32
+        var pooledMetaBytes: UInt32
+        var pooledRowBytes: UInt32
+        var budgetBlocks: UInt32
+        var windowBlocks: UInt32
+        var listStride: UInt32
+        var scoreStride: UInt32
+        var headScoreStride: UInt32
+        var rowStep: UInt32
+        var maxRow: UInt32
+        var candCap: UInt32
+        var bqTile: UInt32
+        var scoreTilesX: UInt32
+        var coarseCap: UInt32
+        var hasSink: UInt32
+        var sinkRowStride: UInt32
+        var stageMode: UInt32
     }
 
     /// Centroid-bucket count of the last (largest-position) unit when it is in the

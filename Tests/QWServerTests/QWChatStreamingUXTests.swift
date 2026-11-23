@@ -233,6 +233,7 @@ final class QWChatStreamingUXTests: XCTestCase {
             "Sources/Apps/QWServer/Resources/js/chat-presets.js",
             "Sources/Apps/QWServer/Resources/js/chat.js",
             "Sources/Apps/QWServer/Resources/js/actions.js",
+            "Sources/Apps/QWServer/Resources/js/settings.js",
         ] {
             let lineCount = try read(rel).components(separatedBy: "\n").count
             XCTAssertLessThanOrEqual(lineCount, 800, "\(rel) exceeded 800 lines")

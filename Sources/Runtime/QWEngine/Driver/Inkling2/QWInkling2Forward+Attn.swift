@@ -20,6 +20,7 @@ extension QWInkling2Forward {
         rPrepOff: Int = 0,
         attnOutOff: Int = 0,
         useLSA: Bool = true,
+        forceDenseAttention: Bool = false,
         treePlan: Ink2TreeVerifyPlan? = nil
     ) throws {
         let cfg = lw.isSliding ? session.slidingAttnConfig : session.globalAttnConfig
@@ -40,9 +41,9 @@ extension QWInkling2Forward {
 
         if useLSA, !lw.isSliding, let lsa = lsaOperator, let fullAttnIdx = globalVisitToAttnIndex[visit] {
             let isPrefill = t > QWAttnSinkRel.maxDecodeBatchTokens
-            let sparseActive = isPrefill
+            let sparseActive = !forceDenseAttention && (isPrefill
                 ? (kvLen > lsa.config.denseBypassThreshold)
-                : (posOffset >= lsa.config.denseBypassThreshold)
+                : (posOffset >= lsa.config.denseBypassThreshold))
             let useNaxSparse = isPrefill && hal.caps.isMetal4TensorCapable
                 && cfg.headDim == 128 && (cfg.nH / cfg.nKV) <= 16
             let reuseBlocks = lsa.isSelectionFollower(fullAttnLayer: fullAttnIdx)
@@ -62,7 +63,8 @@ extension QWInkling2Forward {
                 )
                 if sparseActive {
                     lsa.encodeSelectBlocks(
-                        enc, fullAttnLayer: fullAttnIdx, pos0: posOffset, rows: t, tiled32: useNaxSparse
+                        enc, fullAttnLayer: fullAttnIdx, pos0: posOffset, rows: t,
+                        tiled32: useNaxSparse, sink: sinkTV
                     )
                 }
             }

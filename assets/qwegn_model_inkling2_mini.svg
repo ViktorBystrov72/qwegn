@@ -41,9 +41,9 @@
   <g transform="translate(28, 24)">
     <rect x="0.0" y="0.0" width="266" height="28" rx="14.0" fill="#062e22" stroke="#10b981" stroke-width="1.2"/>
     <circle cx="15.0" cy="14.0" r="4.5" fill="#34d399"/>
-    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">QWEGN v0.34.0 · MODEL PROFILE</text>
+    <text x="27.0" y="18.6" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">QWEGN v0.35.0 · MODEL PROFILE</text>
     <rect x="276.0" y="0.0" width="430" height="28" rx="14.0" fill="#064e3b" stroke="#10b981" stroke-width="1.2"/>
-    <text x="491.0" y="18.6" text-anchor="middle" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">NEEDLE RECALL: 3/3 @ 16K–128K · 1M LSA QUALIFIED</text>
+    <text x="491.0" y="18.6" text-anchor="middle" class="sans" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.25">NEEDLE RECALL: 3/3 (12/12) 100% · 8K–1M LSA</text>
     <text x="0" y="64" fill="#f8fafc" class="title" font-size="27">Inkling-2-Mini (SHVQ4 + SHVQ2/3 + DSpark)</text>
     <text x="0" y="92" fill="#cbd5e1" class="subtitle" font-size="14.5">48-Visit Looped MoE Architecture (24 Physical Layers · Loop [6..18] ×3 · 128 Experts, 8/tok)</text>
     <text x="0" y="114" fill="#cbd5e1" class="subtitle" font-size="14.5">Sink+RelBias GQA &amp; SWA-1024 · AttnRes-6 + SConv-4 · 23-Layer Vision · DSpark Markov+Tree MTP</text>
@@ -77,7 +77,7 @@
     <text x="164.5" y="88" fill="#c084fc" class="title mono" font-size="17">tok/s</text>
     <text x="18" y="120" fill="#f8fafc" class="title" font-size="14.5">B=4 HTTP Wavefront · 1M q4 LSA</text>
     <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13">77.4 tok/s B=3 (eq=True) · 100.6 B=4</text>
-    <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13">1M q4: 19.72 GiB plan / 78.0 tok/s</text>
+    <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13">1M filled: 2,017 / 33.9 tok/s (21.8G)</text>
     <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
     <text x="18" y="218" fill="#c084fc" class="mono" font-size="12.5">9.94 GiB GPU weights (Fast 10.2G)</text>
     <text x="18" y="238" fill="#c084fc" class="mono" font-size="12.5">Zero steady GPU allocations</text>
@@ -103,8 +103,8 @@
     <text x="22" y="68" fill="#f8fafc" class="title" font-size="18">48 Effective Layer Visits (24 Physical, 3× Core Loop) · 1M 64-Bit LSA</text>
     <text x="22" y="98" fill="#38bdf8" class="mono" font-size="14.5">• Loop + MoE   : [6..18] ×3 (4+12×3+4 visits) · 128 experts 8/tok · AttnRes-6 + SConv-4</text>
     <text x="22" y="122" fill="#38bdf8" class="mono" font-size="14.5">• 2K / 8K Ctx  : 3,507 / 3,638 tok/s prefill · 99.9 peak d=3 · 86.2 code256 (budget 12)</text>
-    <text x="22" y="146" fill="#38bdf8" class="mono" font-size="14.5">• 16K / 32K Ctx: 3,430 / 3,218 tok/s prefill · 96.6 @16K (B=12) · 61.8 @32K loop-reuse</text>
-    <text x="22" y="170" fill="#38bdf8" class="mono" font-size="14.5">• 128K / 1M Ctx: 3,200 / 71.9 @128K (3/3 needle) · 78.0 @1M (19.72 GiB plan / 20.69 RSS)</text>
+    <text x="22" y="146" fill="#38bdf8" class="mono" font-size="14.5">• 16K / 128K   : 3,430 / 3,200 prefill · 96.6 @16K (B=12) · 71.9 @128K d=3 (3/3 needle)</text>
+    <text x="22" y="170" fill="#38bdf8" class="mono" font-size="14.5">• 256K–1M LSA  : 2,339→2,017 pre · 43.4→33.9 dec (4.5× vs dense) · 21.8 GiB · 12/12 to 1M</text>
     <text x="22" y="194" fill="#34d399" class="mono" font-size="14.5">• Wavefront B=4: 100.6 tok/s aggregate HTTP decode (77.4 B=3 eq_all=True) · 0 allocs</text>
   </g>
   <g transform="translate(28, 676)">
@@ -125,6 +125,6 @@
     <text x="62" y="29" text-anchor="middle" class="mono" font-size="11" font-weight="800" fill="#7dd3fc">M5 MAX</text>
     <text x="62" y="43" text-anchor="middle" class="mono" font-size="10.5" fill="#94a3b8">128 GB UMA</text>
     <text x="122" y="27" class="mono" font-size="11.5" font-weight="700" fill="#e2e8f0">Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
-    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26.2+ · Qwegn v0.34.0 · q4 KV · Zero External Runtimes · Temp 0 · 0 Steady Allocs</text>
+    <text x="122" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26.2+ · Qwegn v0.35.0 · q4 KV · Zero External Runtimes · Temp 0 · 0 Steady Allocs</text>
   </g>
 </svg>

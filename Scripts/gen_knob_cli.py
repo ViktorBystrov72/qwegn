@@ -127,7 +127,7 @@ CLI_HELP = {
     "moeSpecBudget": "MoE-Spec routed expert budget per verify layer (0 is lossless, 1...64 caps unique verify experts).",
     "evictPrefillScratch": "Evict the prefill scratchpad from RAM: auto, always or never.",
     "lsaMode": "Latent Sparse Attention mode: off, auto, sidecar, svd or qsa-cluster (arXiv:2610.42147).",
-    "lsaBudget": "LSA active key budget k in tokens (512...8192, default 2048).",
+    "lsaBudget": "LSA active key budget k in tokens (512...16384, default 2048).",
     "lsaClusterBlock": "LSA cluster block size L in tokens (256...4096, default 512; 4096 enables e-means).",
     "lsaSidecarPath": "Explicit path to a .qlsa (QLSA0001) projection sidecar file.",
     "lsaCrossLoopReuse": "Reuse LSA block selections across recurrent visits to the same physical global attention layer (opt-in, lossy).",

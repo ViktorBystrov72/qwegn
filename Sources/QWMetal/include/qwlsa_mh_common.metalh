@@ -1,0 +1,120 @@
+// qwlsa_mh_common.metalh — Shared params, geometry, radix selection, and Q4 packing helpers for MH LSA.
+#ifndef QW_LSA_MH_COMMON_METALH
+#define QW_LSA_MH_COMMON_METALH
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+struct LSAMHSelParams {
+    uint T;
+    uint pos0;
+    uint sliceDim;
+    uint kvHeads;
+    uint qHeads;
+    uint qIndexStride;
+    uint pooledMetaBytes;
+    uint pooledRowBytes;
+    uint budgetBlocks;
+    uint windowBlocks;
+    uint listStride;
+    uint scoreStride;
+    uint headScoreStride;
+    uint rowStep;
+    uint maxRow;
+    uint candCap;
+    uint bqTile;
+    uint scoreTilesX;
+    uint coarseCap;
+    uint hasSink;
+    uint sinkRowStride;
+    uint stageMode;
+};
+
+struct LSAMHGeom {
+    uint qRow;
+    uint totalBlocks;
+    uint middleEnd;
+    uint numMiddle;
+    uint kEff;
+    uint isSparse;
+    uint totalCoarse;
+    uint numCoarseMid;
+    uint coarseKEff;
+};
+
+static inline LSAMHGeom lsa_mh_geom(constant LSAMHSelParams& p, uint unit) {
+    LSAMHGeom g;
+    g.qRow = (p.rowStep > 1u) ? min(unit * p.rowStep + (p.rowStep - 1u), p.maxRow - 1u) : unit;
+    g.totalBlocks = (p.pos0 + g.qRow + 1u) >> 2u;
+    g.isSparse = (g.totalBlocks > 1u + p.budgetBlocks + p.windowBlocks) ? 1u : 0u;
+    g.middleEnd = g.isSparse != 0u ? (g.totalBlocks - p.windowBlocks) : 0u;
+    g.numMiddle = (g.middleEnd > 1u) ? (g.middleEnd - 1u) : 0u;
+    g.kEff = min(p.budgetBlocks, g.numMiddle);
+    g.totalCoarse = g.totalBlocks >> 2u;
+    g.numCoarseMid = (g.middleEnd + 3u) >> 2u;
+    g.coarseKEff = min(p.coarseCap, g.numCoarseMid);
+    return g;
+}
+
+static inline float lsa_mh_bf16_to_f32(ushort bits) {
+    return as_type<float>(uint(bits) << 16u);
+}
+
+static inline void lsa_mh_pack_q4_head(device half2* metaOut,
+                                       device uchar* payOut,
+                                       uint head,
+                                       uint sPairs,
+                                       uint tid, uint sg, uint lane,
+                                       bool active,
+                                       float v0, float v1,
+                                       threadgroup float* tgMin,
+                                       threadgroup float* tgMax) {
+    const float lMin = active ? min(v0, v1) : 1e30f;
+    const float lMax = active ? max(v0, v1) : -1e30f;
+    const float sgMin = simd_min(lMin);
+    const float sgMax = simd_max(lMax);
+    if (lane == 0u) { tgMin[sg] = sgMin; tgMax[sg] = sgMax; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float mnF = min(min(tgMin[0], tgMin[1]), min(tgMin[2], tgMin[3]));
+    const float mxF = max(max(tgMax[0], tgMax[1]), max(tgMax[2], tgMax[3]));
+    const half mnH = half(mnF);
+    const half scH = half(max(0.0f, mxF - mnF) / 15.0f);
+    if (tid == 0u) metaOut[head] = half2(scH, mnH);
+    if (active) {
+        const float scVal = float(scH);
+        const float mnVal = float(mnH);
+        const float invSc = (scVal > 0.0f) ? (1.0f / scVal) : 0.0f;
+        const uint q0 = uint(clamp(rint((v0 - mnVal) * invSc), 0.0f, 15.0f));
+        const uint q1 = uint(clamp(rint((v1 - mnVal) * invSc), 0.0f, 15.0f));
+        payOut[head * sPairs + tid] = uchar(q0 | (q1 << 4u));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void lsa_mh_pick_radix_bin(threadgroup uint* hist,
+                                         threadgroup uint* scanSum,
+                                         threadgroup uint& greaterAccum,
+                                         threadgroup uint& chosenBin,
+                                         threadgroup uint& sgTotal,
+                                         uint kEff,
+                                         bool addGreater,
+                                         uint tid, uint sg, uint lane) {
+    const uint c = (tid < 256u) ? hist[255u - tid] : 0u;
+    const uint pSum = simd_prefix_inclusive_sum(c);
+    if (lane == 31u) scanSum[sg] = pSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint sOff = 0u;
+    for (uint s = 0u; s < sg; s++) sOff += scanSum[s];
+    const uint incl = sOff + pSum;
+    const uint excl = incl - c;
+    const uint base = addGreater ? greaterAccum : 0u;
+    if (base + excl < kEff && base + incl >= kEff) {
+        chosenBin = 255u - tid;
+        sgTotal = base + incl;
+        greaterAccum = base + excl;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+#endif

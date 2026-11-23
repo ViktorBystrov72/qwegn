@@ -36,6 +36,7 @@ extension QWEngineLifecycleActor.Config {
         out["lsaBudget"] = .int(lsaConfig.budget)
         out["lsaClusterBlock"] = .int(lsaConfig.clusterBlock)
         out["lsaSidecarPath"] = .string(lsaConfig.sidecarPath)
+        out["lsaCrossLoopReuse"] = .bool(lsaConfig.crossLoopReuse)
         out["kvMode"] = .string(Self.modeName(kvMode))
         out["ropeScalingFactor"] = .double(ropeScalingFactor)
         out["mtpAdaptiveDepth"] = .bool(mtpAdaptiveDepth)

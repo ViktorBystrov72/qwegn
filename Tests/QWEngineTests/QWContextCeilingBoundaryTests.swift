@@ -466,21 +466,22 @@ final class QWContextCeilingBoundaryTests: XCTestCase {
         XCTAssertEqual(session.activeRepetitionHistory(), [20])
         session.tokenHistory = prompt + [42, 1, 42, 2, 42, 3, 42, 4, 42, 5, 42]
         XCTAssertEqual(session.activeRepetitionHistory(), [42])
-        // Loop outside the 64-token generated window drops cleanly without false positives.
-        session.tokenHistory = prompt + [55, 55, 55, 55] + (100..<164).map { $0 }
+        // Loop outside the generated window drops cleanly without false positives.
+        let postLoopDistinct = (100..<(100 + QWEngineSession.repetitionPenaltyWindow)).map { $0 }
+        session.tokenHistory = prompt + [55, 55, 55, 55] + postLoopDistinct
         XCTAssertEqual(session.activeRepetitionHistory(), [])
 
         var fnSession = FNGPUSessionData(history: [Int64(stopTok), Int64(stopTok), Int64(stopTok), Int64(stopTok)], sampler: QWSampler(config: .greedy))
-        for tok in 100..<180 {
-            fnSession.recordSeenToken(tok, vocab: 256)
+        for tok in 100..<(100 + FNGPUSessionData.repetitionPenaltyWindow + 16) {
+            fnSession.recordSeenToken(tok, vocab: 512)
         }
         XCTAssertEqual(fnSession.recentGeneratedTokens.count, FNGPUSessionData.repetitionPenaltyWindow)
         XCTAssertEqual(fnSession.seenTokenList, [])
         for _ in 0..<3 {
-            fnSession.recordSeenToken(210, vocab: 256)
+            fnSession.recordSeenToken(210, vocab: 512)
         }
         XCTAssertEqual(fnSession.seenTokenList, [])
-        fnSession.recordSeenToken(210, vocab: 256)
+        fnSession.recordSeenToken(210, vocab: 512)
         XCTAssertEqual(fnSession.seenTokenList, [210])
         XCTAssertFalse(fnSession.seenTokens.contains(stopTok))
     }

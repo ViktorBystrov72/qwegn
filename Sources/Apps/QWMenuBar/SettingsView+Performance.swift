@@ -92,6 +92,17 @@ extension SettingsView {
                              range: Double(QWPrefillLimits.minRows)...Double(QWPrefillLimits.maxRows),
                              step: Double(QWPrefillLimits.rowStep), readout: { "\($0) rows" },
                              value: $draftSettings.prefillChunkSize)
+
+                formRow(label: "GDN Prefill:", key: "gdnPrefill") {
+                    Picker("", selection: $draftSettings.gdnPrefill) {
+                        Text("Chunked (Default)").tag("chunked")
+                        Text("Regression (Parallel)").tag("regres")
+                        Text("Naive (Stepwise)").tag("naive")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
 
             settingsGroup(title: "Thermal & Cooling", icon: "fanblades") {
@@ -220,9 +231,10 @@ extension SettingsView {
                         Picker("", selection: $draftSettings.lsaBudget) {
                             Text("512 tokens").tag(512)
                             Text("1,024 tokens").tag(1024)
-                            Text("2,048 tokens (Recommended)").tag(2048)
+                            Text("Auto / 2,048 (Adaptive ≤16K)").tag(2048)
                             Text("4,096 tokens").tag(4096)
                             Text("8,192 tokens").tag(8192)
+                            Text("16,384 tokens").tag(16384)
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
@@ -252,7 +264,13 @@ extension SettingsView {
                         }
                     }
 
-                    Text("Auto selects .qlsa / Weight-SVD on GQA (<= k+516 runs exact dense), native flat QSA <= 262K + e-means-4096 > 262K on QSA, and < 41K flat bypass + >= 41K e-means coarse pruning on MLA.")
+                    settingsToggleRow(
+                        "Cross-Loop Block Reuse (Looped Attention)",
+                        key: "lsaCrossLoopReuse",
+                        isOn: $draftSettings.lsaCrossLoopReuse
+                    )
+
+                    Text("Auto selects .qlsa / Weight-SVD on GQA (<= k+516 runs exact dense; k=2,048 scales adaptively from 4K at 98K+ up to 16K at 786K+), native flat QSA <= 262K + e-means-4096 > 262K on QSA, and < 41K flat bypass + >= 41K e-means coarse pruning on MLA. Keep Cross-Loop Reuse off for full-slice recall.")
                         .font(TelemetryTheme.ui(11))
                         .foregroundColor(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
                         .fixedSize(horizontal: false, vertical: true)
@@ -301,6 +319,7 @@ extension SettingsView {
         draftSettings.prefillChunkSize = baseline.prefillChunkSize
         draftSettings.maxConcurrentSessions = baseline.maxConcurrentSessions
         draftSettings.gdnPrefill = baseline.gdnPrefill
+        draftSettings.lsaCrossLoopReuse = baseline.lsaCrossLoopReuse
     }
 
     private func tuningValue(_ id: String) -> QWKnobValue? {

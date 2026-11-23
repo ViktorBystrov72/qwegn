@@ -302,6 +302,7 @@ final class QWTelemetryHonestyTests: XCTestCase {
             "Sources/Apps/QWServer/Resources/js/chat-presets.js",
             "Sources/Apps/QWServer/Resources/js/chat.js",
             "Sources/Apps/QWServer/Resources/js/actions.js",
+            "Sources/Apps/QWServer/Resources/js/settings.js",
             "Sources/Apps/QWServer/Resources/js/updates.js",
         ].map { try source($0) }.joined(separator: "\n")
         XCTAssertFalse(dashboard.contains("util.gpuUsagePercent || 0"),

@@ -125,6 +125,10 @@ final class QWWave5ConstraintScratchTests: XCTestCase {
     }
 
     func testLoopRepetitionTokensIntoScratchMatchesAllocatingReference() {
+        let cycle40 = Array(1000..<1040)
+        let ngram8 = [501, 502, 503, 504, 505, 506, 507, 508]
+        let twoCopyNonConsec = ngram8 + [901] + Array(600..<620) + ngram8
+        let threeCopyNonConsec = ngram8 + [901] + Array(600..<612) + ngram8 + [902] + Array(700..<712) + ngram8
         let windows: [[Int]] = [
             [],
             [1, 2, 3],
@@ -132,7 +136,10 @@ final class QWWave5ConstraintScratchTests: XCTestCase {
             [1, 2, 1, 2, 1, 2],
             [10, 20, 30, 10, 20, 30, 10, 20, 30],
             [1, 2, 3, 4, 5, 1, 6, 1, 7, 1, 8, 1, 9, 1, 10, 1],
-            Array(0..<32) + [7, 8, 7, 8, 7, 8]
+            Array(0..<32) + [7, 8, 7, 8, 7, 8],
+            cycle40 + cycle40,
+            twoCopyNonConsec,
+            threeCopyNonConsec,
         ]
         var scratch: [Int] = [999, 888, 777]
         for w in windows {
@@ -143,5 +150,8 @@ final class QWWave5ConstraintScratchTests: XCTestCase {
             QWSampler.loopRepetitionTokens(in: w[...], into: &scratch)
             XCTAssertEqual(scratch, expected)
         }
+        XCTAssertEqual(QWSampler.loopRepetitionTokens(in: cycle40 + cycle40), [1000])
+        XCTAssertEqual(QWSampler.loopRepetitionTokens(in: twoCopyNonConsec), [])
+        XCTAssertEqual(QWSampler.loopRepetitionTokens(in: threeCopyNonConsec), [901, 902])
     }
 }

@@ -203,6 +203,7 @@ extension SettingsView {
                         Text("Info").tag("info")
                         Text("Warn").tag("warn")
                         Text("Error").tag("error")
+                        Text("None").tag("none")
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)

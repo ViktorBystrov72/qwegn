@@ -101,8 +101,12 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
 
     /// Cohesive Latent Sparse Attention configuration resolved for the server.
     public var lsaConfig: QWLSAConfig {
-        QWLSAConfig(mode: QWLSAMode.resolve(lsaMode) ?? .off, budget: lsaBudget,
-                    clusterBlock: lsaClusterBlock, sidecarPath: lsaSidecarPath,
-                    crossLoopReuse: lsaCrossLoopReuse, loopShareStride: lsaLoopShareStride)
+        let explicitBudget = sourceSummary["lsaBudget"] == "cli"
+            || sourceSummary["lsaBudget"] == "env"
+            || lsaBudget != QWLSAConfig.defaultBudget
+        return QWLSAConfig(mode: QWLSAMode.resolve(lsaMode) ?? .off, budget: lsaBudget,
+                           clusterBlock: lsaClusterBlock, sidecarPath: lsaSidecarPath,
+                           crossLoopReuse: lsaCrossLoopReuse, loopShareStride: lsaLoopShareStride,
+                           explicitBudget: explicitBudget)
     }
 }

@@ -67,6 +67,8 @@ extension QWInkling2Runtime {
         requestedTokens: Int?,
         prefillChunkSize: Int,
         lsaConfig: QWLSAConfig,
+        lsaIndexDim: Int = QWLSAConfig.defaultIndexDim,
+        lsaMultiHeadDirect: Bool? = nil,
         availableBytes: Int
     ) throws -> AdmissionSizing {
         let elemsPerRow = desc.kvHeads * desc.headDim
@@ -102,12 +104,15 @@ extension QWInkling2Runtime {
                 config: dsparkCfg!, capacity: targetCtxForFixed, maxPrefillChunk: maxChunkPlan) + (32 << 20))
             : 0
         let globalVisitIndices = desc.executionPlan.indices.filter { !ink2.isSlidingLayer(desc.executionPlan[$0]) }
+        let effectiveLSA = lsaConfig.resolvingAdaptiveBudget(forMaxContext: targetCtxForFixed)
         let lsaBytes = QWLSAOperator.estimateRegionBytes(
             geometry: QWModelGeometry(descriptor: desc),
-            lsaConfig: lsaConfig,
+            lsaConfig: effectiveLSA,
             attnLayers: globalVisitIndices,
             maxContext: targetCtxForFixed,
-            maxPrefillChunk: QWInkling2Session.resolveMaxChunk(prefillChunkSize: maxChunkPlan, capacity: targetCtxForFixed)
+            maxPrefillChunk: QWInkling2Session.resolveMaxChunk(prefillChunkSize: maxChunkPlan, capacity: targetCtxForFixed),
+            indexDim: lsaIndexDim,
+            isMultiHeadDirect: lsaMultiHeadDirect
         )
         let fixedScratchEst = slidingVisits * slidingCap * kvRowTotal + convBytes + dsparkFixedEst + lsaBytes + (640 << 20)
 
@@ -191,6 +196,7 @@ extension QWInkling2Runtime {
             ? QWInkling2DSpark.estimateWeightBytes(
                 mtpURL: dsparkURL!, config: dsparkCfg!, unpaddedVocab: ink2.unpaddedVocabSize)
             : 0
+        let lsaHint = resolveLSAAdmissionHint(packPath: packPath, descriptor: descriptor, lsaConfig: lsaConfig)
         guard let sizing = try? computeAdmissionSizing(
             descriptor: descriptor,
             ink2: ink2,
@@ -202,6 +208,8 @@ extension QWInkling2Runtime {
             requestedTokens: clampedCtx,
             prefillChunkSize: prefillChunkSize,
             lsaConfig: lsaConfig,
+            lsaIndexDim: lsaHint.indexDim,
+            lsaMultiHeadDirect: lsaHint.isMultiHeadDirect,
             availableBytes: availBytes
         ) else {
             return QWContextMemoryEstimate(
@@ -221,5 +229,32 @@ extension QWInkling2Runtime {
             maxFittingContext: sizing.capacityPlan.maxFittingContext,
             fits: sizing.capacityPlan.fits
         )
+    }
+
+    static func resolveLSAAdmissionHint(
+        packPath: String?,
+        descriptor: QWModelDescriptor,
+        lsaConfig: QWLSAConfig
+    ) -> (indexDim: Int, isMultiHeadDirect: Bool) {
+        let emeans = (lsaConfig.alignedClusterBlock == QWLSAConfig.emeansClusterBlock)
+        let supportsFullMH = !emeans && descriptor.kvHeads * descriptor.lsaHeadSliceDim > 0
+            && QWLSAConfig.supportsFullSliceQ4Direct(
+                qHeads: descriptor.qHeads, kvHeads: descriptor.kvHeads, sliceDim: descriptor.lsaHeadSliceDim)
+        guard lsaConfig.isEnabled, lsaConfig.mode != .svd, let packPath, !packPath.isEmpty,
+              let url = QWLSAConfig.resolveSidecarURL(packPath: packPath, explicitSidecarPath: lsaConfig.sidecarPath),
+              let info = try? QWLSASidecar.peekInfo(url: url, descriptor: descriptor),
+              info.geometryMatches, info.indexDim > 0 else {
+            return (QWLSAConfig.defaultIndexDim, supportsFullMH)
+        }
+        let sidecarMH = supportsFullMH && QWLSAConfig.isTrainingFreeSidecarMethod(info.method)
+        return (info.indexDim, sidecarMH)
+    }
+
+    static func resolveLSAIndexDim(
+        packPath: String?,
+        descriptor: QWModelDescriptor,
+        lsaConfig: QWLSAConfig
+    ) -> Int {
+        resolveLSAAdmissionHint(packPath: packPath, descriptor: descriptor, lsaConfig: lsaConfig).indexDim
     }
 }
