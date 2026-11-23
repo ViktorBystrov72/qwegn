@@ -197,16 +197,7 @@ public final class QWHttpServer: @unchecked Sendable {
             return true
         }
         guard accepted else {
-            logger.log(.warn, "Rejecting connection: max concurrent connections (\(maxConcurrentConnections)) reached")
-            connection.start(queue: queue)
-            let body = Data("Service Unavailable\n".utf8)
-            let header = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
-            connection.send(content: Data(header.utf8) + body, completion: .contentProcessed({ _ in
-                connection.cancel()
-            }))
-            queue.asyncAfter(deadline: .now() + 2.0) {
-                connection.cancel()
-            }
+            rejectOverCapacity(connection)
             return
         }
         let readTimeout = QWRequestReadTimeout(seconds: requestReadTimeoutSeconds, queue: queue) { [weak self, weak connection] in
@@ -225,10 +216,46 @@ public final class QWHttpServer: @unchecked Sendable {
         receiveNextChunk(connection: connection, parser: QWHttpIncrementalParser(), readTimeout: readTimeout, emptyFrames: 0)
     }
 
-    private func cleanupConnectionState(for id: ObjectIdentifier) {
+    func cleanupConnectionState(for id: ObjectIdentifier) {
         connectionStateLock.withLock {
             cancellationHubs.removeValue(forKey: id)
             connectionOrigins.removeValue(forKey: id)
+        }
+    }
+
+    private func rejectOverCapacity(_ connection: NWConnection) {
+        logger.log(.warn, "Rejecting connection: max concurrent connections (\(maxConcurrentConnections)) reached")
+        connection.start(queue: queue)
+        let body = Data("Service Unavailable\n".utf8)
+        let header = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        connection.send(
+            content: Data(header.utf8) + body,
+            contentContext: .finalMessage,
+            isComplete: true,
+            completion: .contentProcessed { error in
+                if error != nil {
+                    connection.cancel()
+                }
+            }
+        )
+        drainRejectedConnection(connection, remainingBytes: 65_536)
+        queue.asyncAfter(deadline: .now() + 2.0) {
+            connection.cancel()
+        }
+    }
+
+    private func drainRejectedConnection(_ connection: NWConnection, remainingBytes: Int) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, isComplete, error in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            let nextRemaining = remainingBytes - (data?.count ?? 0)
+            if isComplete || error != nil || nextRemaining <= 0 {
+                connection.cancel()
+                return
+            }
+            self.drainRejectedConnection(connection, remainingBytes: nextRemaining)
         }
     }
 
@@ -359,7 +386,16 @@ public final class QWHttpServer: @unchecked Sendable {
             corsHeader += "Access-Control-Expose-Headers: x-request-id, x-session-id\r\n"
             corsHeader += "Access-Control-Max-Age: 86400\r\n"
             corsHeader += "Content-Length: 0\r\nConnection: close\r\n\r\n"
-            connection.send(content: Data(corsHeader.utf8), completion: .contentProcessed({ _ in connection.cancel() }))
+            let id = ObjectIdentifier(connection)
+            connection.send(
+                content: Data(corsHeader.utf8),
+                contentContext: .finalMessage,
+                isComplete: true,
+                completion: .contentProcessed { [weak self] _ in
+                    self?.cleanupConnectionState(for: id)
+                    connection.cancel()
+                }
+            )
             return
         }
 

@@ -90,6 +90,7 @@ final class QWServerSecurityHardeningTests: XCTestCase {
         private let queue = DispatchQueue(label: "qwegine.sec-test.raw-http")
         private let lock = NSLock()
         private var finished = false
+        private var didStartIO = false
         private var acc = Data()
         private var continuation: CheckedContinuation<RawHTTPResponse, Error>?
 
@@ -112,14 +113,14 @@ final class QWServerSecurityHardeningTests: XCTestCase {
                     guard let self else { return }
                     switch state {
                     case .ready:
-                        self.conn.send(content: rawRequest, completion: .contentProcessed { [weak self] err in
-                            guard let self else { return }
-                            if let err {
-                                self.complete(.failure(err))
-                                return
-                            }
-                            self.readMore()
-                        })
+                        let shouldStart = self.lock.withLock { () -> Bool in
+                            guard !self.didStartIO else { return false }
+                            self.didStartIO = true
+                            return true
+                        }
+                        guard shouldStart else { return }
+                        self.readMore()
+                        self.conn.send(content: rawRequest, completion: .contentProcessed { _ in })
                     case .failed(let err):
                         self.complete(.failure(err))
                     default:
@@ -409,16 +410,24 @@ final class QWServerSecurityHardeningTests: XCTestCase {
             idle1.cancel()
             idle2.cancel()
         }
-        try await Task.sleep(nanoseconds: 40_000_000)
+        for _ in 0..<100 where server.activeConnectionCount < 2 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(server.activeConnectionCount, 2)
 
-        let overCap = try await sendRawHTTP(
-            port: port,
-            rawRequest: Data("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".utf8)
-        )
-        XCTAssertEqual(overCap.statusCode, 503)
+        for _ in 0..<5 {
+            let overCap = try await sendRawHTTP(
+                port: port,
+                rawRequest: Data("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".utf8)
+            )
+            XCTAssertEqual(overCap.statusCode, 503)
+        }
 
         // Wait past requestReadTimeoutSeconds (0.25s) so idle1 & idle2 receive 408 and free slots.
-        try await Task.sleep(nanoseconds: 500_000_000)
+        for _ in 0..<200 where server.activeConnectionCount > 0 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(server.activeConnectionCount, 0)
         for _ in 0..<4 {
             let okResp = try await sendRawHTTP(
                 port: port,

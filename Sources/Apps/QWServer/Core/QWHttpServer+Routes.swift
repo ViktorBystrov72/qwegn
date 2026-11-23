@@ -203,9 +203,16 @@ extension QWHttpServer {
 
         var packet = Data(header.utf8)
         packet.append(data)
-        connection.send(content: packet, completion: .contentProcessed({ _ in
-            connection.cancel()
-        }))
+        let id = ObjectIdentifier(connection)
+        connection.send(
+            content: packet,
+            contentContext: .finalMessage,
+            isComplete: true,
+            completion: .contentProcessed { [weak self] _ in
+                self?.cleanupConnectionState(for: id)
+                connection.cancel()
+            }
+        )
     }
 
     func sendSimpleResponse(_ connection: NWConnection, status: Int, body: String) {
