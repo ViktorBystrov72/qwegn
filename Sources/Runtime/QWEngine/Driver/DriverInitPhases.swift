@@ -70,7 +70,7 @@ extension QWEngineDriver {
             let mPostAttnNorm = try L.f16wNorm("mtp.layers.0.post_attention_layernorm.weight", geometry.hidden)
             let experts = geometry.numExperts
             let mMoE: MoEW? = experts > 0
-                ? try L.packedMoE("mtp.layers.0.", experts: experts, topK: geometry.expertsPerTok)
+                ? try L.packedMoE("mtp.layers.0.", experts: experts, topK: geometry.expertsPerTok, layer: geometry.numLayers)
                 : nil
             let mGu: QWMLPWeight
             let mDown: QWWeightView
@@ -114,7 +114,18 @@ extension QWEngineDriver {
     /// Creates every door the engine may dispatch, ONCE. The doors come
     /// from the module that owns the engine: there is no global list.
     static func prewarmPipelines(hal: QWHal, doors: [String]) throws {
-        for k in doors { _ = try hal.pipeline(k) }
+        let specs = hal.geometry.swigluClampConfig?.distinctSpecs() ?? []
+        let clampSubstrings = [
+            "silu", "swiglu", "moe_route_decode", "moe_gateup", "moe_compact", "mlp_gate_up"
+        ]
+        for k in doors {
+            _ = try hal.pipeline(k)
+            if !specs.isEmpty && clampSubstrings.contains(where: { k.contains($0) }) {
+                for spec in specs {
+                    _ = try hal.pipeline(k, swigluClamp: spec)
+                }
+            }
+        }
         hal.freezePipelines()
     }
 
@@ -227,7 +238,7 @@ extension QWEngineDriver {
         let qkvC = geometry.gdnQKVChannels, zC = geometry.gdnZChannels
         let gdnVH = geometry.gdnVHeads, qC = geometry.qChannels
         let glogC = geometry.gdnGlogChannels
-        let fgbC = 2 * geometry.gdnLowRankDim + gdnVH
+        let fgbC = geometry.kdaFgbChannels
 
         let gdnY = try tv(geometry.gdnTotalN, .f32)
         let gdnY16 = try tv(geometry.gdnTotalN, .f16)

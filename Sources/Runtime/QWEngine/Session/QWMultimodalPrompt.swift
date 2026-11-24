@@ -68,10 +68,18 @@ public struct QWMultimodalPrompt: Sendable {
         var out: [QWVisualSpan] = []
         var visOffset = 0
         for span in plan.spans {
-            if case .vision(_, _, let rows) = span.content {
+            if case .vision(let grid, _, let rows) = span.content {
                 let count = rows * hiddenDim
                 let slice = Array(visualTokens[visOffset..<(visOffset + count)])
-                out.append(QWVisualSpan(tokenOffset: span.rowStart, tokenCount: rows, embeddings: slice))
+                out.append(QWVisualSpan(
+                    tokenOffset: span.rowStart,
+                    tokenCount: rows,
+                    embeddings: slice,
+                    gridT: grid.t,
+                    gridH: grid.h,
+                    gridW: grid.w,
+                    spatialMergeSize: grid.spec.merge
+                ))
                 visOffset += count
             }
         }

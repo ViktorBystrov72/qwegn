@@ -287,14 +287,32 @@ public final class QWHal: @unchecked Sendable {
         return name
     }
 
-    /// Cached pipeline state. First use pays creation; post-freeze hits take no lock.
-    public func pipeline(_ name: String) throws -> any MTLComputePipelineState {
-        try pipeline(name, isAQ4: false)
-    }
-
-    /// Cached pipeline state specialized for HQ4 (`isAQ4 == false`) or AQ4 (`isAQ4 == true`).
-    public func pipeline(_ name: String, isAQ4: Bool) throws -> any MTLComputePipelineState {
-        let key = isAQ4 ? "\(name)#aq4" : name
+    /// Cached pipeline state specialized for HQ4/AQ4 and optional per-layer SwiGLU clamp.
+    /// Post-freeze hits take no lock.
+    public func pipeline(
+        _ name: String,
+        isAQ4: Bool = false,
+        swigluClamp: QWSwiGLUClampSpec? = nil
+    ) throws -> any MTLComputePipelineState {
+        let baseKey = isAQ4 ? "\(name)#aq4" : name
+        let defaultLim = Float(geometry.swigluLimit ?? 0.0)
+        let key: String
+        let customClamp: QWSwiGLUClampSpec?
+        if let clamp = swigluClamp, clamp.limit > 0 {
+            if clamp.limit == defaultLim && !clamp.postSilu {
+                key = baseKey
+                customClamp = nil
+            } else {
+                key = "\(baseKey)#sw=\(clamp.limit.bitPattern)\(clamp.postSilu ? "p" : "r")"
+                customClamp = clamp
+            }
+        } else if swigluClamp != nil, defaultLim > 0 {
+            key = "\(baseKey)#sw=0"
+            customClamp = QWSwiGLUClampSpec(limit: 0, postSilu: false)
+        } else {
+            key = baseKey
+            customClamp = nil
+        }
         if let raw = frozenSnapshotPtr.load(ordering: .acquiring),
            let hit = Unmanaged<FrozenPSOSnapshot>.fromOpaque(raw).takeUnretainedValue().map[key] {
             return hit
@@ -307,7 +325,12 @@ public final class QWHal: @unchecked Sendable {
             }
             let fn: any MTLFunction
             do {
-                let constants = isAQ4 ? aq4FunctionConstants : functionConstants
+                let constants: MTLFunctionConstantValues
+                if let customClamp {
+                    constants = Self.makeFunctionConstants(geometry: geometry, isAQ4: isAQ4, swigluClamp: customClamp)
+                } else {
+                    constants = isAQ4 ? aq4FunctionConstants : functionConstants
+                }
                 fn = try metallib.makeFunction(name: name, constantValues: constants)
             } catch {
                 throw QWHalError.kernelMissing(name)

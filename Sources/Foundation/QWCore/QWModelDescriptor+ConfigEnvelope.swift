@@ -41,6 +41,7 @@ extension QWModelDescriptor {
             let rms_norm_eps: Double?
             let hidden_act: String?
             let model_type: String?
+            var disable_merger_proj: Bool? = nil
         }
         struct GenerationConfig: Decodable {
             let eos_token_id: JSONIntOrList?
@@ -83,11 +84,12 @@ extension QWModelDescriptor {
             let low_rank_dim: Int?
         }
         final class Text: Decodable {
-            let model_type: String
+            var model_type: String? = nil
             let hidden_size: Int
             let vocab_size: Int
             let num_hidden_layers: Int
             var layer_types: [String]? = nil
+            var layer_group_size: Int? = nil
             var compress_ratios: [Int]? = nil
             var full_attention_interval: Int? = nil
             let rms_norm_eps: Double
@@ -126,9 +128,11 @@ extension QWModelDescriptor {
             var sliding_window_pattern: Int? = nil
             var original_max_position_embeddings: Int? = nil
             var mla_use_nope: Bool? = nil
+            var use_mla_nope: Bool? = nil
             var use_mla: Bool? = nil
             var partial_rotary_factor: Double? = nil
             var rotary_percent: Double? = nil
+            var rotary_dim: Int? = nil
             let rope_theta: Double?
             var compress_rope_theta: Double? = nil
             var rope_parameters: RopeParameters? = nil
@@ -139,6 +143,7 @@ extension QWModelDescriptor {
             let output_gate_type: String?
             var attn_output_gate: Bool? = nil
             var use_gated_attn: Bool? = nil
+            var gated_attention_proj_granularity_type: String? = nil
             var use_attn_merger: Bool? = nil
             var use_vha_attention: Bool? = nil
             var add_full_attention_sink_bias: Bool? = nil
@@ -157,6 +162,13 @@ extension QWModelDescriptor {
             let linear_num_value_heads: Int?
             let linear_value_head_dim: Int?
             let linear_conv_kernel_dim: Int?
+            var num_kv_heads_for_linear_attn: Int? = nil
+            var short_conv_kernel_size: Int? = nil
+            var no_kda_lora: Bool? = nil
+            var use_kda_lora: Bool? = nil
+            var kda_safe_gate: Bool? = nil
+            var kda_lower_bound: Float? = nil
+            var linear_silu: Bool? = nil
             var linear_attn_config: RawLinearAttnConfig? = nil
             let num_experts: Int?
             var n_routed_experts: Int? = nil
@@ -165,11 +177,15 @@ extension QWModelDescriptor {
             var moe_latent_size: Int? = nil
             var latent_moe_use_norm: Bool? = nil
             let shared_expert_intermediate_size: Int?
+            var moe_shared_expert_intermediate_size: Int? = nil
             var n_shared_experts: Int? = nil
+            var num_shared_experts: Int? = nil
             var moe_shared_expert_gate: Bool? = nil
             var use_shared_expert_gate: Bool? = nil
             var moe_split_feature_routing: Bool? = nil
             var moe_router_enable_expert_bias: Bool? = nil
+            var n_group: Int? = nil
+            var topk_group: Int? = nil
             var first_k_dense_replace: Int? = nil
             var mlp_only_layers: [Int]? = nil
             var decoder_sparse_step: Int? = nil
@@ -177,11 +193,14 @@ extension QWModelDescriptor {
             var routed_scaling_factor: Float? = nil
             var routed_scaling_factor_learnable: Bool? = nil
             var scoring_func: String? = nil
+            var score_function: String? = nil
             var router_score_function: String? = nil
             var topk_method: String? = nil
             var mlp_clamp: Bool? = nil
             var swiglu_limit: Float? = nil
             var swiglu_limits: Float? = nil
+            var expert_swiglu_limit_list: [Float]? = nil
+            var share_expert_swiglu_limit_list: [Float]? = nil
             var norm_topk_prob: Bool? = nil
             var hidden_act: String? = nil
             var activation_situ_beta: Float? = nil
@@ -245,6 +264,7 @@ extension QWModelDescriptor {
         let architectures: [String]?
         let tie_word_embeddings: Bool?
         let original_max_position_embeddings: Int?
+        let mrope_section: [Int]?
         let loop_settings: RawLoopSettings?
         let mhc: MHCValue?
     }

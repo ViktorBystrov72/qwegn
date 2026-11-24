@@ -59,7 +59,7 @@ public final class QWEngine: QWInferenceEngine, @unchecked Sendable {
         let resolvedModule: any QWInferenceModule.Type
         if let moduleType {
             resolvedModule = moduleType
-        } else if let found = QWModuleRegistry.moduleType(for: resolvedDescriptor.family) {
+        } else if let found = QWModuleRegistry.moduleType(forPackModelId: resolvedDescriptor.modelType) {
             resolvedModule = found
         } else {
             throw QWModuleError.unsupportedFamily(resolvedDescriptor.family)

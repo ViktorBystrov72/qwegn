@@ -76,7 +76,16 @@ the owner's private `docs/agent-retrospective-*.md`.
     capability, container family, attention complexity, or UMA ratio across
     both `DenseModule` and `HybridMoEModule`, CLI and `QWServer`, and all KV
     modes (`f16`/`q8`/`q4`) — never gate fast paths on a single incumbent
-    format or model name.
+    format or model name. `Sources/Operators/`, `Sources/Subsystems/`,
+    `Sources/Runtime/`, and `Sources/Apps/` must dispatch strictly on loaded
+    capability structs (`KDAConfig`, `MLAConfig`, `MoERoutingConfig`,
+    `SwiGLUClampConfig`, `VisionTowerConfig`, `MTPConfig`, `HCAConfig`,
+    `BlockSparseGQAConfig`, `MRoPELayout`) enforced by
+    `Scripts/lint_capability_seams.py` — never on `descriptor.family` or
+    `model_type` strings outside `QWCore` config decoding and `QWLoad`
+    tensor-name resolution. When onboarding or decoding a new HF checkpoint,
+    inspect `configuration_*.py` `__init__` defaults alongside `config.json`,
+    since checkpoints omit keys matching Python class defaults.
 
 ## Code law
 
@@ -142,6 +151,19 @@ the owner's private `docs/agent-retrospective-*.md`.
     uploads alone when `.github/workflows/release.yml` overwrites assets with
     `--clobber` — validate the final GitHub-compiled tarball/`.pkg` after
     `release.yml` finishes.
+30. **Graceful `NWConnection` close & deterministic server test synchronization**:
+    Every terminal HTTP `Connection: close` send (`sendRawData`, `OPTIONS`,
+    `503` over-capacity rejects) MUST pass
+    `contentContext: .finalMessage, isComplete: true` and release
+    `cancellationHubs` state synchronously in `.contentProcessed` before
+    `connection.cancel()`. Early reject paths that respond before reading the
+    peer request (`rejectOverCapacity`) MUST drain peer bytes up to a bounded
+    cap (`64 KiB`) until `isComplete || error != nil` (with a short fallback
+    deadline, e.g. `2.0s`) rather than cancelling immediately, preventing Darwin
+    TCP `RST` (`POSIXErrorCode 54`) on virtualized CI runners. Raw
+    `NWConnection` test clients must start `receive` concurrently with `send`
+    on `.ready` and poll `server.activeConnectionCount` deterministically rather
+    than relying on fixed sleeps.
 
 Verification footer: when you finish and merge to `master`, bump the semantic
 version in `Sources/Foundation/QWCore/QWVersion.swift`, `CHANGELOG.md`,

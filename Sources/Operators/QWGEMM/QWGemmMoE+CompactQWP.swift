@@ -2,6 +2,7 @@
 import Foundation
 import Metal
 import QWAlloc
+import QWCore
 import QWHAL
 
 private struct QWMoECompactQWPParams {
@@ -86,7 +87,8 @@ extension QWGemm {
         unweightedSingle: Bool = false, numGroups: Int = 0,
         concurrentBarriers: Bool = false,
         skipOut32: Bool = false,
-        nofmaShared: Bool = true
+        nofmaShared: Bool = true,
+        swigluClamp: QWSwiGLUClampSpec? = nil
     ) throws {
         let hasSoftcap = (gateSoftcap > 0 || upSoftcap > 0)
         guard let guKernel = compactGateUpKernelName(for: gateUp.containerKind, hasSoftcap: hasSoftcap),
@@ -94,7 +96,7 @@ extension QWGemm {
             throw QWGemmError.badWeights(
                 "unsupported QWP compact MoE containers: \(gateUp.formatName) / \(down.formatName)")
         }
-        guard tokens >= 1, tokens <= 16, experts >= 1, experts <= 512, routes >= 1,
+        guard tokens >= 1, tokens <= 16, experts >= 1, experts <= 1024, routes >= 1,
               hidden > 0, hidden % 32 == 0, intermediate > 0, intermediate % 32 == 0 else {
             throw QWGemmError.badShape(
                 "compact QWP MoE invalid shape T=\(tokens) E=\(experts) R=\(routes) H=\(hidden) I=\(intermediate)")
@@ -176,7 +178,7 @@ extension QWGemm {
             gateCap: gateSoftcap, upCap: upSoftcap)
         let indBuf = activeIndirect.region.buffer
         let indBase = activeIndirect.region.base + activeIndirect.offset
-        enc.setComputePipelineState(try hal.pipeline(guKernel))
+        enc.setComputePipelineState(try hal.pipeline(guKernel, swigluClamp: hasSoftcap ? nil : swigluClamp))
         enc.bindTensors(
             gateUp.blocks, x, expertOff, activeExperts, activeIndirect,
             sortedTok, sortedPairIdx, actBuf, (coldGateUp ?? gateUp).blocks, startIndex: 0)

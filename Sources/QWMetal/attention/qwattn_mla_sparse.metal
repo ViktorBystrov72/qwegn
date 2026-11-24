@@ -534,12 +534,13 @@ METAL_FUNC void qwg_mla_proj_uv_impl(
     if (r >= p.vHeadDim) return;
 
     const uint outStride = p.qHeads * p.vHeadDim;
-    if (inc == 1u && p.kvLoraRank == 512u && p.vHeadDim == 256u) {
+    const bool fastVHead = (p.vHeadDim >= 32u && (p.vHeadDim & 31u) == 0u && p.vHeadDim <= 256u);
+    if (inc == 1u && p.kvLoraRank == 512u && fastVHead) {
         const uint sg = r >> 5u;
         const uint subRow = lane >> 4u;
         const uint blkIdx = lane & 15u;
         device const Block_HQ4_G32* headBlocks = ((device const Block_HQ4_G32*)kvBBlocks)
-            + (size_t)(h * (p.nopeDim + 256u) + p.nopeDim + sg * 32u) * 16u;
+            + (size_t)(h * (p.nopeDim + p.vHeadDim) + p.nopeDim + sg * 32u) * 16u;
         if (validM == 1u) {
             threadgroup const half* uBase0 = &shU[0][blkIdx * 32u];
             float myOut = 0.0f;
@@ -556,7 +557,7 @@ METAL_FUNC void qwg_mla_proj_uv_impl(
                 if (lane == pIdx * 2u + 1u) myOut = r1;
             }
             const float rot = skipFwht ? myOut : qwg_fwht32_lane_f32(myOut, lane);
-            attOut[(size_t)tBase * outStride + h * 256u + r] = half(rot);
+            attOut[(size_t)tBase * outStride + h * p.vHeadDim + r] = half(rot);
             return;
         }
         if (validM == 2u) {
@@ -579,8 +580,8 @@ METAL_FUNC void qwg_mla_proj_uv_impl(
             }
             const float rot0 = skipFwht ? myOut0 : qwg_fwht32_lane_f32(myOut0, lane);
             const float rot1 = skipFwht ? myOut1 : qwg_fwht32_lane_f32(myOut1, lane);
-            attOut[(size_t)(tBase + 0u) * outStride + h * 256u + r] = half(rot0);
-            attOut[(size_t)(tBase + 1u) * outStride + h * 256u + r] = half(rot1);
+            attOut[(size_t)(tBase + 0u) * outStride + h * p.vHeadDim + r] = half(rot0);
+            attOut[(size_t)(tBase + 1u) * outStride + h * p.vHeadDim + r] = half(rot1);
             return;
         }
         float myOut[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -621,16 +622,16 @@ METAL_FUNC void qwg_mla_proj_uv_impl(
         }
         for (uint m = 0u; m < validM; ++m) {
             const float rot = skipFwht ? myOut[m] : qwg_fwht32_lane_f32(myOut[m], lane);
-            attOut[(size_t)(tBase + m) * outStride + h * 256u + r] = half(rot);
+            attOut[(size_t)(tBase + m) * outStride + h * p.vHeadDim + r] = half(rot);
         }
         return;
-    } else if (p.kvLoraRank == 512u && p.vHeadDim == 256u && p.group >= 32u && (p.group & 31u) == 0u
+    } else if (p.kvLoraRank == 512u && fastVHead && p.group >= 32u && (p.group & 31u) == 0u
                && ((inc == 2u && (SUB2 ? (p.bits == 1u || p.bits == 15u) : (p.bits >= 2u && p.bits <= 4u)))
                    || (!SUB2 && inc == 0u))) {
         const uint sg = r >> 5u;
         const uint subRow = lane >> 4u;
         const uint blkIdx = lane & 15u;
-        const uint baseRow = h * (p.nopeDim + 256u) + p.nopeDim + sg * 32u;
+        const uint baseRow = h * (p.nopeDim + p.vHeadDim) + p.nopeDim + sg * 32u;
         const uint col0 = blkIdx * 32u;
         if (validM == 1u) {
             float4 uLo0[4], uHi0[4];
@@ -661,7 +662,7 @@ METAL_FUNC void qwg_mla_proj_uv_impl(
                 if (lane == pIdx * 2u + 1u) myOut = r1;
             }
             const float rot = skipFwht ? myOut : qwg_fwht32_lane_f32(myOut, lane);
-            attOut[(size_t)tBase * outStride + h * 256u + r] = half(rot);
+            attOut[(size_t)tBase * outStride + h * p.vHeadDim + r] = half(rot);
             return;
         }
         float myOut[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -689,7 +690,7 @@ METAL_FUNC void qwg_mla_proj_uv_impl(
         }
         for (uint m = 0u; m < validM; ++m) {
             const float rot = skipFwht ? myOut[m] : qwg_fwht32_lane_f32(myOut[m], lane);
-            attOut[(size_t)(tBase + m) * outStride + h * 256u + r] = half(rot);
+            attOut[(size_t)(tBase + m) * outStride + h * p.vHeadDim + r] = half(rot);
         }
         return;
     }

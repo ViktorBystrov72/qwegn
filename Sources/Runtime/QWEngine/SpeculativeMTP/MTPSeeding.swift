@@ -71,10 +71,13 @@ extension QWEngineDriver {
             }
             hal.touchKeepAlive(enc)
             do {
+                let seedMRoPE = mlaOperator.flatMap {
+                    session.mropeSlice(pos: pos, count: pairs, mropeLayout: $0.mropeLayout)
+                }
                 try encodeBatchedMTPPairSeed(
                     enc, mtpWeights: mtpWeights, embeddings: embeddings, hidden: hidden,
                     previous: previous, pos: pos, tStart: pos == 0 ? 1 : 0,
-                    pairs: pairs, cacheRows: cacheRows, views: views)
+                    pairs: pairs, cacheRows: cacheRows, views: views, mropePositions: seedMRoPE)
             } catch {
                 enc.endEncoding()
                 throw error
@@ -94,7 +97,8 @@ extension QWEngineDriver {
         }
         try QWMTPPromptSeeder.encodeChunk(cb, draft: mtpDraftEncoder, embeddings: embeddings,
                                           trunkHidden: hidden, previousHidden: previous,
-                                          position: session.position, count: count, cacheRows: cacheRows, kv: views)
+                                          position: session.position, count: count, cacheRows: cacheRows, kv: views,
+                                          mropeDelta: session.roundRecord.mropeDelta)
     }
 
     func encodeBatchedMTPPairSeed(
@@ -107,7 +111,8 @@ extension QWEngineDriver {
         tStart: Int,
         pairs: Int,
         cacheRows: Int,
-        views: (k: QWKVLayerView, v: QWKVLayerView)
+        views: (k: QWKVLayerView, v: QWKVLayerView),
+        mropePositions: [Int32]? = nil
     ) throws {
         let H = geometry.hidden
         let concatBuf = prefixRows(psc.guRaw16, rows: pairs, cols: 2 * H, dt: .f16)
@@ -124,13 +129,13 @@ extension QWEngineDriver {
         try gemmBatchedH16(enc, m: pairs, n: H, k: 2 * H, x: concatBuf, wQ4: mtpWeights.fc, y16: fcOutBuf)
         try encodeRMSNormFast(enc, x: fcOutBuf, gamma: mtpWeights.inputNorm, out: ln1Buf, rows: pairs)
         if let mla = mlaOperator, let mlaW = mtpWeights.mla {
-            let latentN = geometry.qLoraRank + geometry.kvLoraRank + geometry.indexerHeadDim
+            let latentN = mla.latentStride
             let latentBuf = prefixRows(mla.mlaLatentScratch, rows: pairs, cols: latentN, dt: .f16)
             try gemmBatchedH16(enc, m: pairs, n: latentN, k: H, x: ln1Buf, wQ4: mtpWeights.qkvProj, y16: latentBuf)
             mla.encodeLatentPrepAndPool(
                 enc, ln1: ln1Buf, mlaW: mlaW,
                 kv: views, fullAttnLayer: attnLayers.count,
-                pos0: cacheRows, rows: pairs)
+                pos0: cacheRows, rows: pairs, mropePositions: mropePositions)
         } else {
             guard let wq = mtpWeights.wq, let wkTiled = mtpWeights.wkTiled else {
                 throw QWEngineDriverError.state("MTP seeding Q/K norms are missing")

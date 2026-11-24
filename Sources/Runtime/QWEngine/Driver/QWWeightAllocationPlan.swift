@@ -93,8 +93,52 @@ struct QWWeightAllocationPlan {
                 tensor(kv, .f16)
             }
             if hasMBSA {
-                tensor(geometry.headDim, .f16)
-                tensor(geometry.headDim, .f16)
+                tensor(geometry.mbsaIndexerHeadDim, .f16)
+                tensor(geometry.mbsaIndexerHeadDim, .f16)
+            }
+        }
+        func appendDecoupledMLAWeights() {
+            let mla = geometry.mlaConfig
+            let hmla = geometry.hybridMLAConfig
+            let qHeads = mla?.qHeads ?? hmla?.qHeads ?? geometry.qHeads
+            let qRank = mla?.qLoraRank ?? hmla?.qLoraRank ?? 0
+            let kvRank = mla?.kvLoraRank ?? hmla?.kvLoraRank ?? geometry.kvLoraRank
+            let nopeDim = mla?.qkNopeHeadDim ?? hmla?.qkNopeHeadDim ?? geometry.qkNopeHeadDim
+            let ropeDim = mla?.qkRopeHeadDim ?? hmla?.qkRopeHeadDim ?? geometry.qkRopeHeadDim
+            let vDim = mla?.vHeadDim ?? hmla?.vHeadDim ?? geometry.vHeadDim
+            let isDirectQ = mla?.isDirectQ ?? (qRank <= 0)
+            let hasIndexer = mla?.hasIndexer ?? (geometry.indexerHeads > 0)
+            let gateMode = mla?.outputGateMode
+                ?? (geometry.attnOutputGate ? .elementWiseFromQLora : .none)
+            let hasInlineGate = gateMode == .elementWiseFromQLora
+            let idxH = hasIndexer ? max(1, geometry.indexerHeads) : 0
+            let idxD = hasIndexer ? max(32, geometry.indexerHeadDim) : 0
+            let qCh = qHeads * (nopeDim + ropeDim + (hasInlineGate ? vDim : 0))
+            let useVHA = mla?.useVHA ?? hmla?.useVHA ?? false
+            let hasAttnSink = mla?.hasAttnSinkBias ?? hmla?.hasAttnSinkBias ?? false
+            q4((isDirectQ ? 0 : qRank) + kvRank + ropeDim + idxD, h)
+            if !isDirectQ {
+                tensor(qRank, .f16)
+            }
+            tensor(kvRank, .f16)
+            if hasIndexer {
+                tensor(idxD, .f16)
+                tensor(idxD, .f16)
+                tensor(idxH * h, .f16)
+            }
+            q4(qCh + idxH * idxD, isDirectQ ? h : qRank)
+            q4(qHeads * (nopeDim + vDim), kvRank)
+            q4(h, qHeads * vDim)
+            if gateMode == .headWiseFromHidden {
+                tensor(qHeads * h, .f16)
+            } else if gateMode == .elementWiseFromHidden {
+                tensor(qHeads * vDim * h, .f16)
+            }
+            if useVHA {
+                tensor(qHeads * qHeads, .f16)
+            }
+            if hasAttnSink {
+                tensor(qHeads, .f32)
             }
         }
         func appendMHCWeights(_ mhc: QWModelDescriptor.MHCConfig) {
@@ -156,41 +200,24 @@ struct QWWeightAllocationPlan {
                     q4(qTotal + idxH * idxD, qRank)
                     q4(qTotal + vTotal, kvRank)
                     q4(h, vTotal)
-                } else if geometry.usesDecoupledRopeMLA, let hmla = geometry.hybridMLAConfig {
-                    let qHeads = hmla.qHeads
-                    let qRank = hmla.qLoraRank
-                    let kvRank = hmla.kvLoraRank
-                    let nopeDim = hmla.qkNopeHeadDim
-                    let ropeDim = hmla.qkRopeHeadDim
-                    let vDim = hmla.vHeadDim
-                    let idxH = max(1, geometry.indexerHeads)
-                    let idxD = max(32, geometry.indexerHeadDim)
-                    let qCh = qHeads * (nopeDim + ropeDim + (geometry.attnOutputGate ? vDim : 0))
-                    q4(qRank + kvRank + ropeDim + idxD, h)
-                    tensor(qRank, .f16)
-                    tensor(kvRank, .f16)
-                    tensor(idxD, .f16)
-                    tensor(idxD, .f16)
-                    tensor(idxH * h, .f16)
-                    q4(qCh + idxH * idxD, qRank)
-                    q4(qHeads * (nopeDim + vDim), kvRank)
-                    q4(h, qHeads * vDim)
-                    if hmla.useVHA {
-                        tensor(qHeads * qHeads, .f16)
-                    }
-                    if hmla.hasAttnSinkBias {
-                        tensor(qHeads, .f32)
-                    }
+                } else if geometry.usesDecoupledRopeMLA {
+                    appendDecoupledMLAWeights()
                 } else {
                     appendGQAWeights(includeMBSA: true)
                 }
             } else {
                 if geometry.gdnVectorDecay {
-                    let lr = geometry.gdnLowRankDim
-                    q4(geometry.gdnQKVChannels, h)
-                    q4(2 * lr + geometry.gdnVHeads, h)
-                    tensor(geometry.gdnZChannels * lr, .f16)
-                    tensor(geometry.gdnZChannels * lr, .f16)
+                    if geometry.kdaConfig?.isFullRank == true {
+                        q4(geometry.gdnQKVChannels, h)
+                        q4(2 * geometry.gdnZChannels, h)
+                        tensor(geometry.gdnVHeads * h, .f16)
+                    } else {
+                        let lr = geometry.kdaConfig?.lowRankDim ?? geometry.gdnLowRankDim
+                        q4(geometry.gdnQKVChannels, h)
+                        q4(2 * lr + geometry.gdnVHeads, h)
+                        tensor(geometry.gdnZChannels * lr, .f16)
+                        tensor(geometry.gdnZChannels * lr, .f16)
+                    }
                     tensor(geometry.gdnQKVChannels * geometry.gdnConvKernel, .f16)
                     tensor(geometry.gdnHeadDim, .f16)
                     tensor(geometry.gdnVHeads, .f32)
@@ -281,6 +308,8 @@ struct QWWeightAllocationPlan {
                 q4(qTotal + idxH * idxD, qRank)
                 q4(qTotal + vTotal, kvRank)
                 q4(h, vTotal)
+            } else if geometry.usesDecoupledRopeMLA {
+                appendDecoupledMLAWeights()
             } else {
                 q4(geometry.qProjOut + 2 * kv, h)
                 q4(h, geometry.qHeads * geometry.headDim)
@@ -297,26 +326,7 @@ struct QWWeightAllocationPlan {
             tensor(h, .f16)
             // 10. mlp gate_up / down_proj (or sparse MoE bank + shared expert)
             if geometry.numExperts > 0 {
-                let resE = geometry.effectiveResidentExperts
-                let coldE = max(0, geometry.numExperts - resE)
-                tensor(geometry.numExperts * h, .f32)
-                if geometry.hasBiasCorrectedRouter {
-                    tensor(geometry.numExperts, .f32)
-                }
-                q4Expert(resE * 2 * geometry.moeIntermediate, h)
-                q4ExpertDown(resE * h, geometry.moeIntermediate)
-                if coldE > 0 && !allocatedSharedCold {
-                    allocatedSharedCold = true
-                    q4Expert(coldE * 2 * geometry.moeIntermediate, h)
-                    q4ExpertDown(coldE * h, geometry.moeIntermediate)
-                }
-                if geometry.sharedExpertIntermediate > 0 {
-                    q4(2 * geometry.sharedExpertIntermediate, h)
-                    q4(h, geometry.sharedExpertIntermediate)
-                    if geometry.sharedExpertHasGate {
-                        tensor(h, .f32)
-                    }
-                }
+                appendMoEWeights()
             } else {
                 q4(2 * i, h)
                 q4(h, i)

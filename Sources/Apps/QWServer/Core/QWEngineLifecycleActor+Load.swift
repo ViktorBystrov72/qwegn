@@ -245,7 +245,7 @@ extension QWEngineLifecycleActor {
                 selectorTopK: config.dflashSelectorTopK
             )
         }
-        let tokenizer = try QWTokenizer(json: runtimeAssets.tokenizerJSON)
+        let tokenizer = try runtimeAssets.makeTokenizer()
         let telemetry = QWEngineTelemetryRegistry.shared
         let hardware = QWMachineHardwareInfo.current()
 

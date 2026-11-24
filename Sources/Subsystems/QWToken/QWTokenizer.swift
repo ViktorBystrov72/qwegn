@@ -73,6 +73,9 @@ public final class QWTokenizer: @unchecked Sendable {
     let rawAddedFirstByte: [Bool]
     let normAddedPats: [AddedPattern]
     let normAddedFirstByte: [Bool]
+    let storedTokenizerConfigJSON: Data?
+    let storedSpecialTokensMapJSON: Data?
+    let storedGenerationConfigJSON: Data?
 
     public enum Error: Swift.Error, CustomStringConvertible {
         case badJSON(String), unresolvedByte(String), regex(String)
@@ -86,7 +89,15 @@ public final class QWTokenizer: @unchecked Sendable {
     }
 
     // MARK: load
-    public init(json: Data) throws {
+    public init(
+        json: Data,
+        tokenizerConfigJSON: Data? = nil,
+        specialTokensMapJSON: Data? = nil,
+        generationConfigJSON: Data? = nil
+    ) throws {
+        self.storedTokenizerConfigJSON = tokenizerConfigJSON
+        self.storedSpecialTokensMapJSON = specialTokensMapJSON
+        self.storedGenerationConfigJSON = generationConfigJSON
         guard let root = try JSONSerialization.jsonObject(with: json) as? [String: Any] else {
             throw Error.badJSON("not an object")
         }

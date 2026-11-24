@@ -167,7 +167,15 @@ for (mod, test) in components {
     // QWMMTests parses golden JSON via the C17 value model.
     if mod == "QWMM" { deps.append(contentsOf: [.byName(name: "QWToken"), .byName(name: "QWVision")]) }
     // QWEngineTests binds planning laws and C19 plans without upward app edges.
-    if mod == "QWEngine" { deps.append(contentsOf: [.byName(name: "QWMM"), .byName(name: "QWToken"), .byName(name: "QWGEMM"), .byName(name: "QWHyperPLE"), .byName(name: "QWVision")]) }
+    if mod == "QWEngine" {
+        deps.append(contentsOf: [
+            .byName(name: "QWCore"), .byName(name: "QWHAL"), .byName(name: "QWAlloc"),
+            .byName(name: "QWQuant"), .byName(name: "QWKV"), .byName(name: "QWRope"),
+            .byName(name: "QWAttn"), .byName(name: "QWGDN"),
+            .byName(name: "QWMM"), .byName(name: "QWToken"),
+            .byName(name: "QWGEMM"), .byName(name: "QWHyperPLE"), .byName(name: "QWVision"),
+        ])
+    }
     if mod == "QWKV" { deps.append(contentsOf: [.byName(name: "QWCore"), .byName(name: "QWHAL"), .byName(name: "QWAlloc")]) }
     // QWLoadTests race the mover against legacy bytes using lower-layer helpers only.
     if mod == "QWLoad" { deps.append(contentsOf: [.byName(name: "QWQuant"), .byName(name: "QWHAL")]) }

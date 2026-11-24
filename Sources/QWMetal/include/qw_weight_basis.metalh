@@ -43,6 +43,8 @@ constant float QW_FC_SWIGLU_LIMIT [[function_constant(224)]];
 constant float QW_FC_ROUTED_SCALE [[function_constant(225)]];
 constant float QW_FC_SITU_BETA    [[function_constant(228)]];
 constant float QW_FC_SITU_LIN_BETA [[function_constant(229)]];
+constant bool  QW_FC_SWIGLU_POST_SILU [[function_constant(233)]];
+constant bool  QW_FC_GDN_NORM_SIGMOID [[function_constant(234)]];
 #endif
 
 /// Generalized gated FFN activation: specializes at PSO creation time to bounded `SituAndMul`
@@ -56,6 +58,11 @@ METAL_FUNC float qwg_swiglu_mul(float gate, float up) {
         return g * u;
     }
     if (QW_FC_SWIGLU_LIMIT > 0.0f) {
+        if (QW_FC_SWIGLU_POST_SILU) {
+            const float act = min(gate / (1.0f + exp(-gate)), QW_FC_SWIGLU_LIMIT);
+            up = clamp(up, -QW_FC_SWIGLU_LIMIT, QW_FC_SWIGLU_LIMIT);
+            return act * up;
+        }
         gate = min(gate, QW_FC_SWIGLU_LIMIT);
         up = clamp(up, -QW_FC_SWIGLU_LIMIT, QW_FC_SWIGLU_LIMIT);
     }

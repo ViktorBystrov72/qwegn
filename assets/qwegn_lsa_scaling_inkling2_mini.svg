@@ -7,7 +7,10 @@
       <stop offset="0" stop-color="#131c31" stop-opacity="0.96"/><stop offset="1" stop-color="#0b1120" stop-opacity="0.98"/>
     </linearGradient>
     <linearGradient id="aEm" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#10b981" stop-opacity="0.25"/><stop offset="1" stop-color="#10b981" stop-opacity="0.02"/>
+      <stop offset="0" stop-color="#10b981" stop-opacity="0.22"/><stop offset="1" stop-color="#10b981" stop-opacity="0.02"/>
+    </linearGradient>
+    <linearGradient id="aAmb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fbbf24" stop-opacity="0.16"/><stop offset="1" stop-color="#fbbf24" stop-opacity="0.01"/>
     </linearGradient>
     <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#38bdf8"/>
@@ -26,7 +29,7 @@
     <rect x="0" y="0" width="332" height="28" rx="14" fill="#062e22" stroke="#10b981" stroke-width="1.2"/>
     <text x="166.0" y="18.6" text-anchor="middle" class="mono" font-size="12.5" font-weight="700" fill="#6ee7b7" letter-spacing="0.3">LOOPED-MOE FULL-SLICE Q4 MH LSA</text>
     <text x="0" y="64" class="sans" font-size="27" font-weight="800" fill="#f8fafc">Inkling-2-Mini (SHVQ4 + SHVQ2/3 · 10.20 GiB)</text>
-    <text x="0" y="90" class="mono" font-size="12" fill="#cbd5e1">48 Visits (24L, Loop [6..18] ×3) · Adaptive Q4 MH LSA (k=2K→16K) · Matched 8K–1M (q4 KV, mtp=0)</text>
+    <text x="0" y="90" class="mono" font-size="11.8" fill="#cbd5e1">48 Visits (24L, Loop [6..18] ×3) · Full-Slice Q4 MH LSA (k=2K→16K) · Matched 8K–1M (q4 KV, d=0 &amp; DSpark d=3)</text>
   </g>
   <g transform="translate(772, 20)">
     <rect width="200" height="58" rx="13" fill="#0b1222" stroke="#334155" stroke-width="1.3"/>
@@ -36,28 +39,28 @@
     <text x="57" y="46" class="mono" font-size="11.5" font-weight="700" fill="#94a3b8">SWIFT 6.2 · METAL 4</text>
   </g>
 
-  <g transform="translate(28, 142)">
+  <g transform="translate(28, 138)">
     <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#10b981" stroke-opacity="0.52" stroke-width="1.2"/>
     <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#6ee7b7">3.74×</text>
     <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">prefill vs Dense @ 1M</text>
   </g>
-  <g transform="translate(268, 142)">
+  <g transform="translate(268, 138)">
     <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#10b981" stroke-opacity="0.52" stroke-width="1.2"/>
     <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#6ee7b7">4.51×</text>
-    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">decode vs Dense @ 1M</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">decode vs Dense @ 1M (d=0)</text>
   </g>
-  <g transform="translate(508, 142)">
-    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#10b981" stroke-opacity="0.52" stroke-width="1.2"/>
-    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#6ee7b7">2,017 / 33.9</text>
-    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">tok/s pre / dec @ 1M</text>
+  <g transform="translate(508, 138)">
+    <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#f59e0b" stroke-opacity="0.58" stroke-width="1.2"/>
+    <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#fde68a">84.3 → 55.0</text>
+    <text x="16" y="56" class="sans" font-size="12.5" font-weight="600" fill="#cbd5e1">tok/s DSpark d=3 (8K→512K)</text>
   </g>
-  <g transform="translate(748, 142)">
+  <g transform="translate(748, 138)">
     <rect width="224" height="72" rx="12" fill="#0f172a" stroke="#10b981" stroke-opacity="0.52" stroke-width="1.2"/>
     <text x="16" y="34" class="sans" font-size="22" font-weight="800" fill="#6ee7b7">12/12 · 100%</text>
-    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">8K–1M recall · 21.8 GiB</text>
+    <text x="16" y="56" class="sans" font-size="13" font-weight="600" fill="#cbd5e1">8K–1M recall · 0 allocs</text>
   </g>
 
-  <g transform="translate(28, 230)">
+  <g transform="translate(28, 226)">
     <rect width="460" height="384" rx="14" fill="url(#card)" stroke="#1e293b" stroke-width="1.4"/>
     <text x="20" y="32" class="sans" font-size="15" font-weight="800" fill="#f8fafc" letter-spacing="0.2">PREFILL PERFORMANCE PROFILE</text>
     <rect x="372" y="15" width="68" height="22" rx="6" fill="#0b1324" stroke="#334155" stroke-width="1"/>
@@ -110,7 +113,7 @@
     <text x="436.0" y="276.6" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="#fca5a5">539</text>
   </g>
 
-  <g transform="translate(512, 230)">
+  <g transform="translate(512, 226)">
     <rect width="460" height="384" rx="14" fill="url(#card)" stroke="#1e293b" stroke-width="1.4"/>
     <text x="20" y="32" class="sans" font-size="15" font-weight="800" fill="#f8fafc" letter-spacing="0.2">DECODE THROUGHPUT PROFILE</text>
     <rect x="372" y="15" width="68" height="22" rx="6" fill="#0b1324" stroke="#334155" stroke-width="1"/>
@@ -119,13 +122,13 @@
     <line x1="68.0" y1="82.0" x2="68.0" y2="322.0" stroke="#475569" stroke-width="1.4"/>
     <text x="58.0" y="326.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">0</text>
     <line x1="68.0" y1="262.0" x2="424.0" y2="262.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
-    <text x="58.0" y="266.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">20</text>
+    <text x="58.0" y="266.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">25</text>
     <line x1="68.0" y1="202.0" x2="424.0" y2="202.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
-    <text x="58.0" y="206.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">40</text>
+    <text x="58.0" y="206.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">50</text>
     <line x1="68.0" y1="142.0" x2="424.0" y2="142.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
-    <text x="58.0" y="146.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">60</text>
+    <text x="58.0" y="146.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">75</text>
     <line x1="68.0" y1="82.0" x2="424.0" y2="82.0" stroke="#1e293b" stroke-width="1" stroke-dasharray="3 3"/>
-    <text x="58.0" y="86.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">80</text>
+    <text x="58.0" y="86.5" text-anchor="end" class="mono" font-size="12" fill="#94a3b8">100</text>
     <line x1="68.0" y1="322.0" x2="68.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
     <text x="68.0" y="345.0" text-anchor="middle" class="mono" font-size="12.5" fill="#cbd5e1">8K</text>
     <line x1="186.7" y1="322.0" x2="186.7" y2="327.0" stroke="#475569" stroke-width="1.2"/>
@@ -135,44 +138,63 @@
     <line x1="424.0" y1="322.0" x2="424.0" y2="327.0" stroke="#475569" stroke-width="1.2"/>
     <text x="424.0" y="345.0" text-anchor="middle" class="mono" font-size="12.5" fill="#cbd5e1">1M</text>
     <text x="246.0" y="370.0" text-anchor="middle" class="mono" font-size="11" fill="#64748b">PROMPT CONTEXT TOKENS</text>
-    <polygon points="68.0,154.8 186.7,191.8 305.3,195.0 424.0,220.2 424.0,322.0 68.0,322.0" fill="url(#aEm)"/>
-    <polyline points="186.7,251.7 305.3,281.9 424.0,299.4" fill="none" stroke="#f87171" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6 4"/>
-    <circle cx="186.7" cy="251.7" r="4.5" fill="#f87171" stroke="#0b1220" stroke-width="1.2"/>
-    <circle cx="305.3" cy="281.9" r="4.5" fill="#f87171" stroke="#0b1220" stroke-width="1.2"/>
-    <circle cx="424.0" cy="299.4" r="4.5" fill="#f87171" stroke="#0b1220" stroke-width="1.2"/>
-    <polyline points="68.0,154.8 186.7,191.8 305.3,195.0 424.0,220.2" fill="none" stroke="#10b981" stroke-width="3.4" stroke-linejoin="round" stroke-linecap="round"/>
-    <circle cx="68.0" cy="154.8" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
-    <circle cx="186.7" cy="191.8" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
-    <circle cx="305.3" cy="195.0" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
-    <circle cx="424.0" cy="220.2" r="5.2" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
 
-    <text x="72.0" y="140.8" text-anchor="start" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">55.7</text>
-    <text x="72.0" y="140.8" text-anchor="start" class="mono" font-size="12" font-weight="800" fill="#34d399">55.7</text>
-    <text x="186.7" y="177.8" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">43.4</text>
-    <text x="186.7" y="177.8" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="#34d399">43.4</text>
-    <text x="305.3" y="181.0" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">42.3</text>
-    <text x="305.3" y="181.0" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="#34d399">42.3</text>
-    <text x="436.0" y="206.2" text-anchor="end" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">33.9</text>
-    <text x="436.0" y="206.2" text-anchor="end" class="mono" font-size="12" font-weight="800" fill="#34d399">33.9</text>
+    <polygon points="68.0,119.6 186.7,177.5 305.3,190.1 305.3,322.0 68.0,322.0" fill="url(#aAmb)"/>
+    <polygon points="68.0,188.3 186.7,217.8 305.3,220.5 424.0,240.6 424.0,322.0 68.0,322.0" fill="url(#aEm)"/>
+    <polyline points="186.7,265.8 305.3,289.8 424.0,304.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6 4"/>
+    <circle cx="186.7" cy="265.8" r="4.5" fill="#f87171" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="305.3" cy="289.8" r="4.5" fill="#f87171" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="424.0" cy="304.0" r="4.5" fill="#f87171" stroke="#0b1220" stroke-width="1.2"/>
 
-    <text x="186.7" y="237.7" text-anchor="middle" class="mono" font-size="12" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">23.4</text>
-    <text x="186.7" y="237.7" text-anchor="middle" class="mono" font-size="12" font-weight="700" fill="#fca5a5">23.4</text>
-    <text x="305.3" y="267.9" text-anchor="middle" class="mono" font-size="12" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">13.4</text>
-    <text x="305.3" y="267.9" text-anchor="middle" class="mono" font-size="12" font-weight="700" fill="#fca5a5">13.4</text>
-    <text x="436.0" y="285.4" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">7.5</text>
-    <text x="436.0" y="285.4" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="#fca5a5">7.5</text>
+    <polyline points="68.0,188.3 186.7,217.8 305.3,220.5 424.0,240.6" fill="none" stroke="#10b981" stroke-width="3.2" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="68.0" cy="188.3" r="4.8" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="186.7" cy="217.8" r="4.8" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="305.3" cy="220.5" r="4.8" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="424.0" cy="240.6" r="4.8" fill="#10b981" stroke="#0b1220" stroke-width="1.2"/>
+
+    <polyline points="68.0,119.6 186.7,177.5 305.3,190.1" fill="none" stroke="#fbbf24" stroke-width="3.4" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="68.0" cy="119.6" r="5.2" fill="#fbbf24" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="186.7" cy="177.5" r="5.2" fill="#fbbf24" stroke="#0b1220" stroke-width="1.2"/>
+    <circle cx="305.3" cy="190.1" r="5.2" fill="#fbbf24" stroke="#0b1220" stroke-width="1.2"/>
+
+    <text x="72.0" y="105.6" text-anchor="start" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">84.3</text>
+    <text x="72.0" y="105.6" text-anchor="start" class="mono" font-size="12" font-weight="800" fill="#fde68a">84.3</text>
+    <text x="186.7" y="163.5" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">60.2</text>
+    <text x="186.7" y="163.5" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="#fde68a">60.2</text>
+    <text x="305.3" y="176.1" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">55.0</text>
+    <text x="305.3" y="176.1" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="#fde68a">55.0</text>
+
+    <text x="72.0" y="207.0" text-anchor="start" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">55.7</text>
+    <text x="72.0" y="207.0" text-anchor="start" class="mono" font-size="12" font-weight="800" fill="#34d399">55.7</text>
+    <text x="186.7" y="236.5" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">43.4</text>
+    <text x="186.7" y="236.5" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="#34d399">43.4</text>
+    <text x="305.3" y="239.0" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">42.3</text>
+    <text x="305.3" y="239.0" text-anchor="middle" class="mono" font-size="12" font-weight="800" fill="#34d399">42.3</text>
+    <text x="434.0" y="226.6" text-anchor="end" class="mono" font-size="12" font-weight="800" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">33.9</text>
+    <text x="434.0" y="226.6" text-anchor="end" class="mono" font-size="12" font-weight="800" fill="#34d399">33.9</text>
+
+    <text x="186.7" y="284.5" text-anchor="middle" class="mono" font-size="12" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">23.4</text>
+    <text x="186.7" y="284.5" text-anchor="middle" class="mono" font-size="12" font-weight="700" fill="#fca5a5">23.4</text>
+    <text x="305.3" y="308.0" text-anchor="middle" class="mono" font-size="12" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">13.4</text>
+    <text x="305.3" y="308.0" text-anchor="middle" class="mono" font-size="12" font-weight="700" fill="#fca5a5">13.4</text>
+    <text x="434.0" y="290.0" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="none" stroke="#0b1120" stroke-width="4.2" stroke-linejoin="round">7.5</text>
+    <text x="434.0" y="290.0" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="#fca5a5">7.5</text>
   </g>
 
-  <g transform="translate(28, 628)">
-    <rect width="944" height="54" rx="11" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
-    <line x1="20" y1="27" x2="50" y2="27" stroke="#10b981" stroke-width="3.2"/>
-    <circle cx="35" cy="27" r="5" fill="#10b981"/>
-    <text x="60" y="23" class="sans" font-size="13" font-weight="700" fill="#34d399">Full-Slice Q4 MH LSA (Adaptive k=2K→16K, mtp = 0)</text>
-    <text x="60" y="40" class="mono" font-size="11" fill="#94a3b8">3/3 (12/12) 100% 8K–1M · 23–29 ms p50 · 21.8 GiB @1M</text>
-    <line x1="518" y1="27" x2="548" y2="27" stroke="#f87171" stroke-width="3.2" stroke-dasharray="6 4"/>
-    <circle cx="533" cy="27" r="5" fill="#f87171"/>
-    <text x="558" y="23" class="sans" font-size="13" font-weight="700" fill="#fca5a5">Without LSA (Dense Baseline, mtp = 0)</text>
-    <text x="558" y="40" class="mono" font-size="11" fill="#94a3b8">3/3 (12/12) to 1M · 539 pre / 7.5 dec (133 ms p50)</text>
+  <g transform="translate(28, 624)">
+    <rect width="944" height="58" rx="11" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
+    <line x1="14" y1="29" x2="40" y2="29" stroke="#fbbf24" stroke-width="3.2"/>
+    <circle cx="27" cy="29" r="4.8" fill="#fbbf24"/>
+    <text x="48" y="24" class="sans" font-size="12.5" font-weight="700" fill="#fde68a">LSA + DSpark d=3 (8K–512K)</text>
+    <text x="48" y="42" class="mono" font-size="10.5" fill="#94a3b8">12/12 · 3.06–3.88 tok/rnd · 4.11× @512K</text>
+    <line x1="342" y1="29" x2="368" y2="29" stroke="#10b981" stroke-width="3.2"/>
+    <circle cx="355" cy="29" r="4.8" fill="#10b981"/>
+    <text x="376" y="24" class="sans" font-size="12.5" font-weight="700" fill="#34d399">Full-Slice Q4 MH LSA (d=0)</text>
+    <text x="376" y="42" class="mono" font-size="10.5" fill="#94a3b8">12/12 8K–1M · 21.8 GiB @1M · 4.51×</text>
+    <line x1="658" y1="29" x2="684" y2="29" stroke="#f87171" stroke-width="3.2" stroke-dasharray="6 4"/>
+    <circle cx="671" cy="29" r="4.5" fill="#f87171"/>
+    <text x="692" y="24" class="sans" font-size="12.5" font-weight="700" fill="#fca5a5">Dense Baseline (no LSA, d=0)</text>
+    <text x="692" y="42" class="mono" font-size="10.5" fill="#94a3b8">12/12 to 1M · 539 pre / 7.5 dec</text>
   </g>
   <g transform="translate(28, 696)">
     <rect width="944" height="62" rx="11" fill="#0a101f" stroke="#334155" stroke-width="1.2"/>
@@ -182,6 +204,6 @@
     <text x="124" y="27" class="mono" font-size="12" font-weight="700" fill="#e2e8f0">INFERENCE MACHINE · Apple M5 Max (Mac17,6) · 18-Core CPU · 40-Core Apple10 NAX GPU · 128 GB Unified Memory</text>
     <text x="124" y="46" class="mono" font-size="11.5" fill="#94a3b8">585 GB/s DRAM · 950 GB/s SLC · macOS 26.2+ · Qwegn v0.35.0 (Swift 6.2 &amp; Metal 4) · q4 KV · Temp 0 · 0 Steady Allocs</text>
   </g>
-  <text x="500" y="782" text-anchor="middle" class="mono" font-size="12" fill="#94a3b8">Matched 3-needle multi-hop audit (7,503–1,040,016 filled tok, mtp=0) · Dense 1M TTFT 32.1 min vs LSA 8.6 min (12/12).</text>
-  <text x="500" y="802" text-anchor="middle" class="mono" font-size="12" fill="#64748b">MLX FP4 parity @1M: 1,935 / 28.2 tok/s (3.59× / 3.87×, 12/12, 29.9 GiB) · DSpark d=3: 99.9 peak · 86.2 code · 71.9 @128K.</text>
+  <text x="500" y="782" text-anchor="middle" class="mono" font-size="11.5" fill="#94a3b8">DSpark d=3 lossless (12/12): 84.3 @8K · 78.9 @32K · 64.8 @128K · 60.2 @256K · 55.0 tok/s @512K (1.29× vs d=0, 4.11× vs Dense).</text>
+  <text x="500" y="802" text-anchor="middle" class="mono" font-size="11.5" fill="#64748b">B=12 MoE-Spec: 88.5 @8K · 83.6 @32K · 59.3 @512K (12/12) · MLX FP4 @1M: 1,935 / 28.2 tok/s (3.59× / 3.87×, 12/12, 29.9 GiB).</text>
 </svg>

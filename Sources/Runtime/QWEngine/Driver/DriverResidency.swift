@@ -196,7 +196,7 @@ extension QWEngineDriver {
         tuning: QWEngineTuning = .default,
         physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes()
     ) -> QWContextMemoryEstimate {
-        if descriptor.family == .inkling2Loop {
+        if case .recurrentLoop(_, let ink) = descriptor.executionTopology, ink != nil {
             return QWInkling2Runtime.estimateContextMemory(
                 descriptor: descriptor, packPath: packPath, contextTokens: contextTokens,
                 kvMode: kvMode, mtpDrafts: mtpDrafts, prefillChunkSize: prefillChunkSize,

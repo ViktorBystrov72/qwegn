@@ -88,12 +88,12 @@
     <text x="105.5" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#fde68a" letter-spacing="0.2">SPECULATIVE DECODE</text>
     <text x="18" y="90" fill="url(#amberGrad)" class="title mono" font-size="44">99.9</text>
     <text x="136.0" y="88" fill="#fbbf24" class="title mono" font-size="17">tok/s</text>
-    <text x="18" y="120" fill="#f8fafc" class="title" font-size="14.5">DSpark d=3 · 96.6 @16K · 86.2 Code</text>
-    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13">3.10–3.63 tok/step Auto-DSpark + Tree</text>
-    <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13">73.2 d=0 · 79.9 Cand5 var5 · 0..15 drafts</text>
+    <text x="18" y="120" fill="#f8fafc" class="title" font-size="14">DSpark d=3 · 84.3→55.0 (8K–512K)</text>
+    <text x="18" y="144" fill="#cbd5e1" class="subtitle" font-size="13">3.06–3.88 tok/rnd · 12/12 @512K</text>
+    <text x="18" y="165" fill="#cbd5e1" class="subtitle" font-size="13">88.5 @8K · 59.3 @512K (B=12 opt-in)</text>
     <line x1="18" y1="196" x2="270" y2="196" stroke="#1e293b" stroke-width="1"/>
-    <text x="18" y="218" fill="#fbbf24" class="mono" font-size="12.5">Shared-KV SinkRel + Compact SHVQ</text>
-    <text x="18" y="238" fill="#fbbf24" class="mono" font-size="12.5">Union MoE-Spec (budget 12 opt-in)</text>
+    <text x="18" y="218" fill="#fbbf24" class="mono" font-size="12">1.29×–1.50× vs d=0 · 4.11× @512K</text>
+    <text x="18" y="238" fill="#fbbf24" class="mono" font-size="12">73.2 d=0 · Cand5 80.1 · 0..15 drafts</text>
   </g>
 
   <g transform="translate(28, 446)">
@@ -101,11 +101,11 @@
     <rect x="22.0" y="16.0" width="388" height="26" rx="13.0" fill="#062e22" stroke="#10b981" stroke-width="1.2"/>
     <text x="216.0" y="33.5" text-anchor="middle" class="sans" font-size="13" font-weight="700" fill="#6ee7b7" letter-spacing="0.3">LOOPED-MOE GEOMETRY &amp; 2K–1M LSA LADDER</text>
     <text x="22" y="68" fill="#f8fafc" class="title" font-size="18">48 Effective Layer Visits (24 Physical, 3× Core Loop) · 1M 64-Bit LSA</text>
-    <text x="22" y="98" fill="#38bdf8" class="mono" font-size="14.5">• Loop + MoE   : [6..18] ×3 (4+12×3+4 visits) · 128 experts 8/tok · AttnRes-6 + SConv-4</text>
-    <text x="22" y="122" fill="#38bdf8" class="mono" font-size="14.5">• 2K / 8K Ctx  : 3,507 / 3,638 tok/s prefill · 99.9 peak d=3 · 86.2 code256 (budget 12)</text>
-    <text x="22" y="146" fill="#38bdf8" class="mono" font-size="14.5">• 16K / 128K   : 3,430 / 3,200 prefill · 96.6 @16K (B=12) · 71.9 @128K d=3 (3/3 needle)</text>
-    <text x="22" y="170" fill="#38bdf8" class="mono" font-size="14.5">• 256K–1M LSA  : 2,339→2,017 pre · 43.4→33.9 dec (4.5× vs dense) · 21.8 GiB · 12/12 to 1M</text>
-    <text x="22" y="194" fill="#34d399" class="mono" font-size="14.5">• Wavefront B=4: 100.6 tok/s aggregate HTTP decode (77.4 B=3 eq_all=True) · 0 allocs</text>
+    <text x="22" y="98" fill="#38bdf8" class="mono" font-size="14">• Loop + MoE   : [6..18] ×3 (4+12×3+4 visits) · 128 experts 8/tok · AttnRes-6 + SConv-4</text>
+    <text x="22" y="122" fill="#38bdf8" class="mono" font-size="14">• 2K–32K Spec  : 3,507–3,638 pre · 99.9 pk · 84.3 @8K (88.5 B=12) · 78.9 @32K (83.6 B=12)</text>
+    <text x="22" y="146" fill="#38bdf8" class="mono" font-size="14">• 128K–512K d3 : 64.8 @128K (3.21/rnd) · 60.2 @256K (3.25) · 55.0 @512K (59.3 B=12) · 12/12</text>
+    <text x="22" y="170" fill="#38bdf8" class="mono" font-size="14">• 256K–1M LSA  : d=0 2,339→2,017 pre · 43.4→33.9 dec (4.5× vs dense) · 21.8 GiB · 12/12</text>
+    <text x="22" y="194" fill="#34d399" class="mono" font-size="14">• Wavefront B=4: 100.6 tok/s aggregate HTTP decode (77.4 B=3 eq_all=True) · 0 allocs</text>
   </g>
   <g transform="translate(28, 676)">
     <rect width="904" height="214" rx="16" fill="url(#cardGrad)" stroke="#1f3b3d" stroke-width="1.4"/>

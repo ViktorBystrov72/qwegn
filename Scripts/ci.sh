@@ -24,8 +24,9 @@ python3 Scripts/test_kernel_inventory.py || { echo "FAIL: kernel inventory tests
 python3 Scripts/check_metallib_target.py || { echo "FAIL: metallib target gate"; exit 1; }
 python3 Scripts/lint_kernels.py || { echo "FAIL: kernel reachability gate"; exit 1; }
 python3 Scripts/check_basis.py || { echo "FAIL: basis gate"; exit 1; }
-echo "== geometry defaults & package DAG gates"
+echo "== geometry defaults, capability seams & package DAG gates"
 python3 Scripts/lint_geometry_defaults.py Sources || { echo "FAIL: geometry-default gate"; exit 1; }
+python3 Scripts/lint_capability_seams.py || { echo "FAIL: capability-seam gate"; exit 1; }
 python3 Scripts/lint_package_dag.py || { echo "FAIL: package DAG gate"; exit 1; }
 echo "== paired performance harness tests (no model or GPU)"
 if [ "${GITHUB_ACTIONS:-}" = "true" ]; then

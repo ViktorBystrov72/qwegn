@@ -15,11 +15,12 @@ import QWMLP
 import QWHead
 import QWMTP
 import QWQuant
+import QWMM
 
 extension QWEngineDriver {
     /// Whether full-attention layers run O(T·B) subquadratic prefill at long context (`>= 131K`).
     var usesSubquadraticLongPrefill: Bool {
-        geometry.usesLatentOrCompressedAttention || lsaOperator != nil || mbsaOperator != nil
+        geometry.hasSubquadraticAttention || lsaOperator != nil || mbsaOperator != nil
     }
 
     func stridedRow(_ tv: QWTensorValue, row: Int, cols: Int, dt: QWDType, rowStrideBytes: Int? = nil) -> QWTensorValue {
@@ -286,10 +287,73 @@ extension QWEngineDriver {
         return stepCap
     }
 
+    private func prepareTurnMRoPE(_ session: QWEngineSession, tokensCount: Int) -> Int {
+        let initialDelta = session.roundRecord.mropeDelta
+        guard let mla = mlaOperator, mla.mropeLayout != .none1D, tokensCount > 0 else {
+            session.clearTurnMRoPE()
+            return initialDelta
+        }
+        let startPos = session.position
+        let overlapping = activeVisualSpans
+            .filter {
+                $0.gridH > 0 && $0.gridW > 0
+                    && $0.tokenOffset < startPos + tokensCount
+                    && ($0.tokenOffset + $0.tokenCount) > startPos
+            }
+            .sorted { $0.tokenOffset < $1.tokenOffset }
+        guard !overlapping.isEmpty else {
+            session.clearTurnMRoPE()
+            return initialDelta
+        }
+        var blocks: [QWMMBlock] = []
+        var cursor = startPos
+        let baseSpec = QWMMSpec(descriptor: geometry.descriptor)
+        for span in overlapping {
+            if cursor < span.tokenOffset {
+                blocks.append(.text([Int](repeating: 0, count: span.tokenOffset - cursor)))
+                cursor = span.tokenOffset
+            }
+            let segStart = max(cursor, span.tokenOffset)
+            let segEnd = min(startPos + tokensCount, span.tokenOffset + span.tokenCount)
+            guard segStart < segEnd else { continue }
+            let segLen = segEnd - segStart
+            let spanSpec = QWMMSpec(
+                patch: max(1, baseSpec.patch), temporal: max(1, baseSpec.temporal),
+                merge: max(1, span.spatialMergeSize), posSide: max(1, baseSpec.posSide),
+                imageToken: baseSpec.imageToken, videoToken: baseSpec.videoToken,
+                usesUnfoldedPatchEmbed: baseSpec.usesUnfoldedPatchEmbed,
+                mropeLayout: mla.mropeLayout
+            )
+            if let grid = try? QWVisionGrid(t: max(1, span.gridT), h: span.gridH, w: span.gridW, spec: spanSpec),
+               grid.tokens == segLen {
+                let tokFill = [Int](repeating: 0, count: segLen)
+                blocks.append(span.gridT > 1 ? .video(tokens: tokFill, grid: grid) : .image(tokens: tokFill, grid: grid))
+            } else {
+                blocks.append(.text([Int](repeating: 0, count: segLen)))
+            }
+            cursor = segEnd
+        }
+        if cursor < startPos + tokensCount {
+            blocks.append(.text([Int](repeating: 0, count: startPos + tokensCount - cursor)))
+        }
+        let rope = qwMRopePositions(
+            blocks: blocks,
+            merge: geometry.visMerge > 0 ? geometry.visMerge : nil,
+            layout: mla.mropeLayout,
+            initialCursor: startPos + initialDelta
+        )
+        session.mropeTurnPositions = rope.pos
+        session.mropeTurnStartPos = startPos
+        session.mropeTurnTokenCount = tokensCount
+        return initialDelta + rope.delta
+    }
+
     func prefill(_ session: QWEngineSession, tokens: [Int],
                          mode: GDNPrefillMode?, permit: QWGenerationPermit,
                          evictScratchOnCompletion: Bool = true) throws -> Int {
         guard !tokens.isEmpty else { return 0 }
+        let endMRoPEDelta = prepareTurnMRoPE(session, tokensCount: tokens.count)
+        defer { session.clearTurnMRoPE() }
         if session.position == 0 {
             session.tokenRecycler.reset()
             session.tokenHistory = tokens
@@ -327,6 +391,7 @@ extension QWEngineDriver {
                     emitPrefillProgress(session, done: idx + 1, promptCount: tokens.count)
                 }
             }
+            session.roundRecord.mropeDelta = endMRoPEDelta
             return lastToken
         case .chunked, .regres:
             // .regres only swaps the GDN-layer recurrence kernel (inner
@@ -361,6 +426,7 @@ extension QWEngineDriver {
             if evictScratchOnCompletion, prefillScratchEviction.shouldEvict(wiredEngineBytes: arena.committedBytes) {
                 evictPrefillScratch()
             }
+            session.roundRecord.mropeDelta = endMRoPEDelta
             return lastToken
         }
     }

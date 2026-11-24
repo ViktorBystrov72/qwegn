@@ -299,7 +299,9 @@ public enum QWImageDecoder {
         let patch: Int
         let merge: Int
         let posSide: Int
-        let isInkling2: Bool
+        let usesUnfoldedPatchEmbed: Bool
+        let imageMean: [Float]
+        let imageStd: [Float]
         let allowDataURLs: Bool
         let allowLocalImagePaths: Bool
         let allowRemoteImageURLs: Bool
@@ -379,7 +381,9 @@ public enum QWImageDecoder {
             patch: spec.patch,
             merge: spec.merge,
             posSide: spec.posSide,
-            isInkling2: spec.isInkling2,
+            usesUnfoldedPatchEmbed: spec.usesUnfoldedPatchEmbed,
+            imageMean: spec.imageMean,
+            imageStd: spec.imageStd,
             allowDataURLs: policy.allowDataURLs,
             allowLocalImagePaths: policy.allowLocalImagePaths,
             allowRemoteImageURLs: policy.allowRemoteImageURLs

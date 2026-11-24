@@ -82,9 +82,10 @@ extension QWGemm {
     /// silu(gate) * up followed by the 32-point WHT, f32. Requires intermediate % 32 == 0.
     public static func encodeSiluMulF32(_ enc: any MTLComputeCommandEncoder, hal: QWHal, gu: QWTensorValue,
                                         act: QWTensorValue, rows: Int, intermediate: Int,
-                                        act16: QWTensorValue? = nil) throws {
+                                        act16: QWTensorValue? = nil,
+                                        swigluClamp: QWSwiGLUClampSpec? = nil) throws {
         precondition(intermediate % 32 == 0, "f32 silu-mul needs intermediate % 32 == 0")
-        enc.setComputePipelineState(try hal.pipeline("qwg_silu_mul_f32"))
+        enc.setComputePipelineState(try hal.pipeline("qwg_silu_mul_f32", swigluClamp: swigluClamp))
         enc.bindTensors(gu, act, startIndex: 0)
         enc.setUInt32s(rows, intermediate, startIndex: 2)
         (act16 ?? act).bind(enc, index: 4)
@@ -96,8 +97,9 @@ extension QWGemm {
     /// silu(gate) * up in f32 + 32-point WHT, emitting hi/lo f16 split halves (outHi + outLo).
     public static func encodeSiluMulSplitF16(_ enc: any MTLComputeCommandEncoder, hal: QWHal, gu: QWTensorValue,
                                              outHi: QWTensorValue, outLo: QWTensorValue,
-                                             rows: Int, intermediate: Int) throws {
-        enc.setComputePipelineState(try hal.pipeline("qwg_silu_mul_split_f16"))
+                                             rows: Int, intermediate: Int,
+                                             swigluClamp: QWSwiGLUClampSpec? = nil) throws {
+        enc.setComputePipelineState(try hal.pipeline("qwg_silu_mul_split_f16", swigluClamp: swigluClamp))
         enc.bindTensors(gu, outHi, outLo, startIndex: 0)
         enc.setUInt32s(rows, intermediate, startIndex: 3)
         enc.dispatchThreads(MTLSize(width: (intermediate + 7) / 8, height: rows, depth: 1),

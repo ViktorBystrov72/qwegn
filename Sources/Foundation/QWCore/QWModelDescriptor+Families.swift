@@ -57,6 +57,15 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
     public let maxSpeculativeDrafts: Int
     public let supportsExpertStreaming: Bool
     public let isOfficialSupported: Bool
+    public let defaultMHCEpsFromRMSNorm: Bool
+    public let defaultBlockSparseGQA: Bool
+    public let defaultMTPSplitEProjHProj: Bool
+    public let defaultSharedExpertHasGate: Bool?
+    public let defaultRopeInterleave: Bool
+    public let defaultBailingVideoRope: Bool
+    public let defaultSpecialTokens: QWModelSpecialTokens?
+    public let defaultVisionMean: [Float]
+    public let defaultVisionStd: [Float]
 
     public init(
         modelType: String,
@@ -72,7 +81,16 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
         disallowsMoEConfig: Bool? = nil,
         maxSpeculativeDrafts: Int? = nil,
         supportsExpertStreaming: Bool? = nil,
-        isOfficialSupported: Bool = true
+        isOfficialSupported: Bool = true,
+        defaultMHCEpsFromRMSNorm: Bool = false,
+        defaultBlockSparseGQA: Bool = false,
+        defaultMTPSplitEProjHProj: Bool = false,
+        defaultSharedExpertHasGate: Bool? = nil,
+        defaultRopeInterleave: Bool = false,
+        defaultBailingVideoRope: Bool = false,
+        defaultSpecialTokens: QWModelSpecialTokens? = nil,
+        defaultVisionMean: [Float] = [0.5, 0.5, 0.5],
+        defaultVisionStd: [Float] = [0.5, 0.5, 0.5]
     ) {
         self.modelType = modelType
         self.family = family
@@ -85,13 +103,22 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
         self.defaultAllFullAttention = defaultAllFullAttention
             ?? [.qwen3Dense, .qwen3MoE, .qwen2Dense, .llamaDense, .mistralDense].contains(family)
         self.defaultNormTopKProb = defaultNormTopKProb
-            ?? [.qwen38MoE, .qwen38FlashNext, .glm5Next, .ernie55MoE, .maxwellMoE].contains(family)
+            ?? [.qwen38MoE, .qwen38FlashNext, .glm5Next, .ernie55MoE, .maxwellMoE, .bailingMoeV3].contains(family)
         self.requiresSparseMoEConfig = requiresSparseMoEConfig ?? (family == .qwen3MoE)
         self.disallowsMoEConfig = disallowsMoEConfig
             ?? [.qwen3Dense, .qwen2Dense, .llamaDense, .mistralDense, .qwen38Dense, .senseNovaLoop].contains(family)
         self.maxSpeculativeDrafts = maxSpeculativeDrafts ?? 15
         self.supportsExpertStreaming = supportsExpertStreaming ?? true
         self.isOfficialSupported = isOfficialSupported
+        self.defaultMHCEpsFromRMSNorm = defaultMHCEpsFromRMSNorm
+        self.defaultBlockSparseGQA = defaultBlockSparseGQA
+        self.defaultMTPSplitEProjHProj = defaultMTPSplitEProjHProj
+        self.defaultSharedExpertHasGate = defaultSharedExpertHasGate
+        self.defaultRopeInterleave = defaultRopeInterleave
+        self.defaultBailingVideoRope = defaultBailingVideoRope
+        self.defaultSpecialTokens = defaultSpecialTokens
+        self.defaultVisionMean = defaultVisionMean
+        self.defaultVisionStd = defaultVisionStd
     }
 }
 
@@ -155,7 +182,88 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
             defaultAttnOutputGate: false,
             defaultExpertGateType: "sigmoid",
             usesPlusOneRMSNorm: false,
-            usesQwenChatTemplateIds: false
+            usesQwenChatTemplateIds: false,
+            defaultMHCEpsFromRMSNorm: true,
+            defaultBlockSparseGQA: true,
+            defaultMTPSplitEProjHProj: true,
+            defaultSharedExpertHasGate: false,
+            defaultSpecialTokens: QWModelSpecialTokens(
+                eosTokenId: 200001,
+                imStartTokenId: 200000,
+                imEndTokenId: 200001,
+                thinkTokenId: 200006,
+                endThinkTokenId: 200007,
+                usesChatTemplateIds: true
+            )
+        ),
+        QWModelFamilySpec(
+            modelType: "bailing_moe_v3",
+            family: .bailingMoeV3,
+            defaultAttnOutputGate: false,
+            defaultExpertGateType: "sigmoid",
+            usesPlusOneRMSNorm: false,
+            usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: true,
+            defaultNormTopKProb: true,
+            defaultSharedExpertHasGate: false,
+            defaultRopeInterleave: true,
+            defaultBailingVideoRope: true,
+            defaultSpecialTokens: QWModelSpecialTokens(
+                eosTokenId: 156895,
+                imStartTokenId: 157151,
+                imEndTokenId: 156895,
+                thinkTokenId: 156903,
+                endThinkTokenId: 156904,
+                usesChatTemplateIds: false
+            ),
+            defaultVisionMean: [0.48145466, 0.4578275, 0.40821073],
+            defaultVisionStd: [0.26862954, 0.26130258, 0.27577711]
+        ),
+        QWModelFamilySpec(
+            modelType: "bailing_moe_v3_vl",
+            family: .bailingMoeV3,
+            defaultAttnOutputGate: false,
+            defaultExpertGateType: "sigmoid",
+            usesPlusOneRMSNorm: false,
+            usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: true,
+            defaultNormTopKProb: true,
+            defaultSharedExpertHasGate: false,
+            defaultRopeInterleave: true,
+            defaultBailingVideoRope: true,
+            defaultSpecialTokens: QWModelSpecialTokens(
+                eosTokenId: 156895,
+                imStartTokenId: 157151,
+                imEndTokenId: 156895,
+                thinkTokenId: 156903,
+                endThinkTokenId: 156904,
+                usesChatTemplateIds: false
+            ),
+            defaultVisionMean: [0.48145466, 0.4578275, 0.40821073],
+            defaultVisionStd: [0.26862954, 0.26130258, 0.27577711]
+        ),
+        QWModelFamilySpec(
+            modelType: "bailing_moe_v3_text",
+            family: .bailingMoeV3,
+            defaultAttnOutputGate: false,
+            defaultExpertGateType: "sigmoid",
+            usesPlusOneRMSNorm: false,
+            usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: true,
+            defaultNormTopKProb: true,
+            defaultSharedExpertHasGate: false,
+            defaultRopeInterleave: true,
+            defaultBailingVideoRope: true,
+            defaultSpecialTokens: QWModelSpecialTokens(
+                eosTokenId: 156895,
+                imStartTokenId: 157151,
+                imEndTokenId: 156895,
+                thinkTokenId: 156903,
+                endThinkTokenId: 156904,
+                usesChatTemplateIds: false
+            ),
+            defaultVisionMean: [0.48145466, 0.4578275, 0.40821073],
+            defaultVisionStd: [0.26862954, 0.26130258, 0.27577711]
         ),
         QWModelFamilySpec(
             modelType: "qwen4_exp",

@@ -25,6 +25,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
         case llamaDense = "llama-dense"
         case mistralDense = "mistral-dense"
         case inkling2Loop = "inkling2_loop"
+        case bailingMoeV3 = "bailing_moe_v3"
     }
 
     public enum Capability: String, Sendable, Hashable, CaseIterable, Codable {
@@ -102,7 +103,15 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let mtpSharedLastLayer: Bool
     public let inkling2Config: Inkling2Config?
 
-    // Text stack
+    public let mlaConfig: MLAConfig?
+    public let kdaConfig: KDAConfig?
+    public let attentionSinkRelConfig: AttentionSinkRelConfig?
+    public let moeRoutingConfig: MoERoutingConfig?
+    public let swigluClampConfig: SwiGLUClampConfig?
+    public let mtpConfig: MTPConfig?
+    public let visionTowerConfig: VisionTowerConfig?
+    public let ropeInterleave: Bool
+
     public let hidden: Int
     public let vocab: Int
     public let denseIntermediate: Int?           // dense MLP intermediate
@@ -216,38 +225,6 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let visionStartTokenId: Int
     public let visionEndTokenId: Int
 
-    /// Resolved special token IDs for chat template framing, reasoning tags, and stop sets.
-    public var specialTokens: QWModelSpecialTokens {
-        var stops = eosTokenIds.filter { $0 >= 0 && $0 < vocab }
-        if family == .maxwellMoE {
-            let maxwellEnd = 200001
-            if maxwellEnd < vocab && !stops.contains(maxwellEnd) {
-                stops.append(maxwellEnd)
-            }
-            return QWModelSpecialTokens(
-                eosTokenId: eosTokenId,
-                imStartTokenId: 200000,
-                imEndTokenId: maxwellEnd,
-                thinkTokenId: 200006,
-                endThinkTokenId: 200007,
-                extraStopTokenIds: stops,
-                usesChatTemplateIds: true
-            )
-        }
-        if family == .inkling2Loop { return inkling2SpecialTokens(stops: stops) }
-        return QWModelSpecialTokens(eosTokenId: eosTokenId,
-                                     extraStopTokenIds: stops,
-                                     usesChatTemplateIds: usesChatTemplateIds)
-    }
-
-    /// The Qwen3.8 pack's chat template carries im_start/im_end/think ids.
-    public var usesChatTemplateIds: Bool {
-        if let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelType) {
-            return spec.usesQwenChatTemplateIds && vocab > 248046
-        }
-        return [.qwen38Dense, .qwen38MoE, .qwen38FlashNext, .senseNovaLoop].contains(family) && vocab > 248046
-    }
-
     public init(family: Family, modelType: String, capabilities: Set<Capability>,
                 hidden: Int, vocab: Int, denseIntermediate: Int?, numLayers: Int,
                 layerTypes: [String], fullAttentionInterval: Int, rmsEps: Float,
@@ -321,6 +298,14 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 multimaxHead: Bool = false,
                 mtpSharedLastLayer: Bool = false,
                 inkling2Config: Inkling2Config? = nil,
+                mlaConfig: MLAConfig? = nil,
+                kdaConfig: KDAConfig? = nil,
+                attentionSinkRelConfig: AttentionSinkRelConfig? = nil,
+                moeRoutingConfig: MoERoutingConfig? = nil,
+                swigluClampConfig: SwiGLUClampConfig? = nil,
+                mtpConfig: MTPConfig? = nil,
+                visionTowerConfig: VisionTowerConfig? = nil,
+                ropeInterleave: Bool? = nil,
                 role: QWModelRole? = nil) {
         self.family = family; self.modelType = modelType
         self.role = role ?? (capabilities.contains(.vision) ? .multimodalConditionalLM : .causalLM)
@@ -398,6 +383,38 @@ public struct QWModelDescriptor: Sendable, Hashable {
         self.quantization = quantization; self.hasMropeSection = hasMropeSection
         self.tieWordEmbeddings = tieWordEmbeddings; self.normTopKProb = normTopKProb
         self.eosTokenIds = eosTokenIds.isEmpty ? [eosTokenId] : eosTokenIds
+        let defInterleave = QWModelFamilyRegistry.shared.spec(forModelType: modelType)?.defaultRopeInterleave ?? false
+        let resolvedInterleave = ropeInterleave ?? (hybridMLAConfig?.ropeInterleave ?? (indexerRopeInterleave || defInterleave))
+        self.ropeInterleave = resolvedInterleave
+        let effSwLimit = swigluLimit
+        let synth = Self.synthesizeCapabilityBundle(
+            family: family, modelType: modelType, capabilities: capabilities,
+            qHeads: qHeads, headDim: headDim, attnOutputGate: attnOutputGate,
+            ropeTheta: ropeTheta, ropeInterleave: resolvedInterleave,
+            indexerHeads: indexerHeads, indexKPoolCompress: indexKPoolCompress, mlaUseNoPE: mlaUseNoPE,
+            kvLoraRank: kvLoraRank, qLoraRank: qLoraRank, qkNopeHeadDim: qkNopeHeadDim,
+            qkRopeHeadDim: qkRopeHeadDim, vHeadDim: vHeadDim, hybridMLAConfig: hybridMLAConfig,
+            numExperts: numExperts, sharedExpertHasGate: sharedExpertHasGate,
+            expertGateType: expertGateType, topkMethod: topkMethod,
+            moeRouterEnableExpertBias: moeRouterEnableExpertBias, routedScalingFactor: routedScalingFactor,
+            routedScalingFactorLearnable: routedScalingFactorLearnable, normTopKProb: normTopKProb,
+            swigluLimit: effSwLimit, mtpLayers: mtpLayers, mtpUseDedicatedEmbeddings: mtpUseDedicatedEmbeddings,
+            mtpSharedLastLayer: mtpSharedLastLayer, mhcConfig: mhcConfig,
+            gdnQKHeads: gdnQKHeads, gdnVHeads: gdnVHeads, gdnHeadDim: gdnHeadDim, gdnConvKernel: gdnConvKernel,
+            gdnVectorDecay: gdnVectorDecay, gdnLowRankDim: gdnLowRankDim,
+            gdnGateLowerBound: gdnGateLowerBound, gdnSeparateConv: gdnSeparateConv,
+            visDepth: visDepth, visHidden: visHidden, visHeads: visHeads, visIntermediate: visIntermediate,
+            visPatch: visPatch, visTemporal: visTemporal, visMerge: visMerge, visPosEmbeds: visPosEmbeds,
+            visOut: visOut ?? hidden, hasMropeSection: hasMropeSection, slidingWindow: slidingWindow,
+            inkling2Config: inkling2Config
+        )
+        self.kdaConfig = kdaConfig ?? synth.kda
+        self.mlaConfig = mlaConfig ?? synth.mla
+        self.attentionSinkRelConfig = attentionSinkRelConfig ?? synth.sinkRel
+        self.moeRoutingConfig = moeRoutingConfig ?? synth.moe
+        self.swigluClampConfig = swigluClampConfig ?? synth.swiglu
+        self.mtpConfig = mtpConfig ?? synth.mtp
+        self.visionTowerConfig = visionTowerConfig ?? synth.vision
     }
 
     // MARK: - Derived views
@@ -513,7 +530,11 @@ public struct QWModelDescriptor: Sendable, Hashable {
             moeRouterEnableExpertBias: moeRouterEnableExpertBias,
             routedScalingFactorLearnable: routedScalingFactorLearnable,
             multimaxHead: multimaxHead, mtpSharedLastLayer: mtpSharedLastLayer,
-            inkling2Config: inkling2Config, role: role
+            inkling2Config: inkling2Config,
+            mlaConfig: mlaConfig, kdaConfig: kdaConfig, attentionSinkRelConfig: attentionSinkRelConfig,
+            moeRoutingConfig: moeRoutingConfig, swigluClampConfig: swigluClampConfig,
+            mtpConfig: mtpConfig, visionTowerConfig: visionTowerConfig,
+            ropeInterleave: ropeInterleave, role: role
         )
     }
 
@@ -606,72 +627,6 @@ public struct QWModelDescriptor: Sendable, Hashable {
         sha256Hex(geometryDigestV3)
     }
 
-    internal static func digestV3Fields(_ d: QWModelDescriptor) -> [String] {
-        var f = digestFields(d)
-        f.append("family=\(d.family.rawValue)")
-        f.append("role=\(d.role.rawValue)")
-        f.append("env_type=\(d.envelopeModelType ?? "-")")
-        let gateBoundHex = d.gdnGateLowerBound.map { "0x" + String($0.bitPattern, radix: 16, uppercase: false) } ?? "-"
-        f.append("kda=\(d.gdnVectorDecay ? 1 : 0),\(d.gdnLowRankDim ?? 0),\(d.gdnSeparateConv ? 1 : 0),\(gateBoundHex)")
-        f.append("mla=\(d.mlaUseNoPE ? 1 : 0),\(d.kvLoraRank ?? 0),\(d.qLoraRank ?? 0),\(d.hybridMLAConfig != nil ? 1 : 0)")
-        f.append("loop=\(d.loopSettings.map { "\($0.start),\($0.end),\($0.evalCount)" } ?? "-")")
-        f.append("mhc=\(d.mhcConfig.map { "\($0.start),\($0.end),\($0.streams),\($0.iterations)" } ?? "-")")
-        switch d.activationKind {
-        case .silu:
-            f.append("act=silu")
-        case .situ(let beta, let linearBeta):
-            let bHex = String(beta.bitPattern, radix: 16, uppercase: false)
-            let lbHex = String(linearBeta.bitPattern, radix: 16, uppercase: false)
-            f.append("act=situ,0x\(bHex),0x\(lbHex)")
-        }
-        let swigluHex = d.swigluLimit.map { "0x" + String($0.bitPattern, radix: 16, uppercase: false) } ?? "-"
-        f.append("swiglu_lim=\(swigluHex)")
-        f.append("route_scale=0x\(String(d.routedScalingFactor.bitPattern, radix: 16, uppercase: false))")
-        f.append("norm_topk=\(d.normTopKProb ? 1 : 0)")
-        f.append("tie_emb=\(d.tieWordEmbeddings ? 1 : 0)")
-        f.append("qk_norm=\(d.hasQKNorm ? 1 : 0)")
-        if d.hasQKVBias { f.append("qkv_bias=1") }
-        if d.hasAttnOutputBias { f.append("o_bias=1") }
-        f.append("plus1_rms=\(d.usesPlusOneRMSNorm ? 1 : 0)")
-        if let bsa = d.blockSparseGQAConfig {
-            f.append("bsa=\(bsa.blockSize),\(bsa.prefixBlocks),\(bsa.localBlocks),\(bsa.remoteBlocks)")
-        }
-        func appendYarn(_ label: String, _ y: YarnRopeConfig?) {
-            guard let y else { return }
-            let vals = [y.factor, y.betaFast, y.betaSlow, y.mscale, y.mscaleAllDim]
-                .map { "0x" + String($0.bitPattern, radix: 16, uppercase: false) }
-                .joined(separator: ",")
-            f.append("\(label)=\(vals),\(y.originalMaxPositionEmbeddings)")
-        }
-        appendYarn("yarn", d.yarnRopeConfig)
-        appendYarn("hca_yarn", d.hcaConfig?.yarn)
-        appendYarn("mla_yarn", d.hybridMLAConfig?.yarn)
-        if case .linear(let factor) = d.ropeScaling {
-            f.append("rope_scale=linear,0x\(String(factor.bitPattern, radix: 16, uppercase: false))")
-        } else if case .dynamic(let factor, let orig) = d.ropeScaling {
-            f.append("rope_scale=dynamic,0x\(String(factor.bitPattern, radix: 16, uppercase: false)),\(orig ?? 0)")
-        }
-        if let sw = d.slidingWindow, sw > 0 {
-            f.append("sw=\(sw)")
-        }
-        if let swL = d.layerSlidingWindows {
-            f.append("sw_layers=\(swL.map(String.init).joined(separator: ","))")
-        }
-        if !d.mlpOnlyLayers.isEmpty {
-            f.append("mlp_only=\(d.mlpOnlyLayers.sorted().map(String.init).joined(separator: ","))")
-        }
-        if d.decoderSparseStep > 1 {
-            f.append("sparse_step=\(d.decoderSparseStep)")
-        }
-        if d.capabilities.contains(.vision) {
-            f.append("vis=\(d.visDepth),\(d.visHidden),\(d.visHeads),\(d.visIntermediate),\(d.visPatch),\(d.visMerge),\(d.visPosEmbeds),\(d.visOut),\(d.imageTokenId),\(d.videoTokenId)")
-        } else {
-            f.append("vis=-")
-        }
-        appendInkling2DigestFields(d, into: &f)
-        return f
-    }
-
     internal static func digestFields(_ d: QWModelDescriptor) -> [String] {
         let kinds = d.layerTypes.map { kind -> String in
             if kind == "full_attention" { return "F" }
@@ -734,52 +689,6 @@ public struct QWModelDescriptor: Sendable, Hashable {
             ngramSize: nil, headsPerNgram: nil, ngramVocabSizeBase: nil,
             makeNgramVocabDivisibleBy: nil, splitNgramParts: nil,
             mtpLayers: 1, mtpUseDedicatedEmbeddings: false, eosTokenId: 248044, hasQKNorm: true)
-    }
-
-    /// Validates core positive dimensions, divisibility, layer kinds, and dependent counts.
-    public func verifyInternalConsistency() -> [String] {
-        var bad: [String] = []
-        if hidden <= 0 { bad.append("hidden") }
-        if vocab <= 0 { bad.append("vocab") }
-        if numLayers <= 0 { bad.append("numLayers") }
-        if qHeads <= 0 { bad.append("qHeads") }
-        if kvHeads <= 0 { bad.append("kvHeads") }
-        if headDim <= 0 { bad.append("headDim") }
-        if qHeads > 0, kvHeads > 0, qHeads % kvHeads != 0 { bad.append("qHeads%kvHeads") }
-        if maxPositionEmbeddings <= 0 { bad.append("maxPositionEmbeddings") }
-        if !(rmsEps > 0 && rmsEps.isFinite) { bad.append("rmsEps") }
-        if !(ropeTheta > 0 && ropeTheta.isFinite) { bad.append("ropeTheta") }
-        if !(partialRotaryFactor > 0 && partialRotaryFactor <= 1.0 && partialRotaryFactor.isFinite) {
-            bad.append("partialRotaryFactor")
-        }
-        if let n = numExperts {
-            if n <= 0 { bad.append("numExperts") }
-            if let k = expertsPerTok, k <= 0 || k > n { bad.append("expertsPerTok") }
-        }
-        let validKinds: Set<String> = ["full_attention", "linear_attention", "compressed_attention", "sliding_attention"]
-        if layerTypes.count != numLayers { bad.append("layerTypes.count") }
-        if !layerTypes.allSatisfy({ validKinds.contains($0) }) { bad.append("layerTypes") }
-        if let swL = layerSlidingWindows, (swL.count != numLayers || swL.contains(where: { $0 < 0 })) {
-            bad.append("layerSlidingWindows")
-        }
-        if hasMropeSection, mropeW + mropeH + mropeT != rotaryDims / 2 { bad.append("mropeSection") }
-        if !linearAttentionLayers.isEmpty, (gdnQKHeads <= 0 || gdnVHeads <= 0 || gdnHeadDim <= 0) {
-            bad.append("gdnDims")
-        }
-        if gdnQKVChannels != (2 * gdnQKHeads + gdnVHeads) * gdnHeadDim { bad.append("gdnQKVChannels") }
-        if gdnZChannels != gdnVHeads * gdnHeadDim { bad.append("gdnZChannels") }
-        if fullAttentionInterval > 0, layerTypes.count == numLayers,
-           layerTypes.contains("linear_attention") || layerTypes.contains("compressed_attention") {
-            let every = fullAttentionLayers.allSatisfy { ($0 + 1) % fullAttentionInterval == 0 }
-            if !every { bad.append("full-layer cadence vs interval") }
-        }
-        if let ids = pleLayerIds {
-            for id in ids where id < 1 || id > numLayers || id - 1 >= layerTypes.count
-                || layerTypes[id - 1] != "linear_attention" {
-                bad.append("ple id \(id)")
-            }
-        }
-        return bad
     }
 }
 

@@ -21,8 +21,8 @@ kernel void qwg_moe_group_pairs_f32(device const int* selected [[buffer(0)]],
                                      device int*       tileCount [[buffer(11)]],
                                      constant uint&    writeTiles [[buffer(12)]],
                                      uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup atomic_int tgCount[512];
-    threadgroup int tgOff[513];
+    threadgroup atomic_int tgCount[1024];
+    threadgroup int tgOff[1025];
     for (int e = int(tid); e < int(experts); e += 256)
         atomic_store_explicit(&tgCount[e], 0, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);

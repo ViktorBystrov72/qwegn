@@ -24,6 +24,7 @@ extension QWMLAAttnOperator {
         var kvMode: UInt32
         var mscale: Float
         var useHadamard: UInt32
+        var ropeFlags: UInt32
     }
 
     private struct QRopeIdxPrepParams {
@@ -38,6 +39,7 @@ extension QWMLAAttnOperator {
         var qFullStride: UInt32
         var mscale: Float
         var useHadamard: UInt32
+        var ropeFlags: UInt32
     }
 
     private struct DSASparseAttnParams {
@@ -60,10 +62,29 @@ extension QWMLAAttnOperator {
         var T: UInt32
         var qHeads: UInt32
         var vHeadDim: UInt32
-        var qFullStride: UInt32
+        var gateStride: UInt32
         var oGateOffset: UInt32
         var hasVHA: UInt32
         var hasOGate: UInt32
+    }
+
+    private struct HeadGateProjParams {
+        var T: UInt32
+        var hidden: UInt32
+        var nGate: UInt32
+    }
+
+    internal func stageMRoPEPositions(_ mropePositions: [Int32]?, rows: Int) -> Bool {
+        guard mropeLayout != .none1D, let pos = mropePositions, pos.count >= 3 * rows, rows > 0 else {
+            return false
+        }
+        let dst = region.pointer.advanced(by: mropePosScratch.offset)
+        pos.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            if let src = raw.baseAddress {
+                dst.copyMemory(from: src, byteCount: 3 * rows * MemoryLayout<Int32>.stride)
+            }
+        }
+        return true
     }
 
     internal func captureDSAIndexerState(position: Int) -> Data {
@@ -179,10 +200,13 @@ extension QWMLAAttnOperator {
                                                 kv: (k: QWKVLayerView, v: QWKVLayerView),
                                                 fullAttnLayer: Int,
                                                 pos0: Int,
-                                                rows: Int) {
-        guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0,
-              let kPe = layers[fullAttnLayer].kPeCache else { return }
+                                                rows: Int,
+                                                mropePositions: [Int32]? = nil) {
+        guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0 else { return }
         let ls = layers[fullAttnLayer]
+        let kPe = ls.kPeCache ?? mlaLatentScratch
+        let hasMRoPE = stageMRoPEPositions(mropePositions, rows: rows)
+        let ropeFlags: UInt32 = (ropeInterleave ? 1 : 0) | (hasMRoPE ? 2 : 0)
         var dsaP = DSALatentPrepParams(
             T: UInt32(rows),
             pos0: UInt32(pos0),
@@ -194,7 +218,8 @@ extension QWMLAAttnOperator {
             kNormEps: 1e-6,
             kvMode: Self.kvModeCode(kv.k.mode),
             mscale: ropeMscale,
-            useHadamard: useFastHadamard ? 1 : 0
+            useHadamard: useFastHadamard ? 1 : 0,
+            ropeFlags: ropeFlags
         )
 
         enc.setComputePipelineState(psoDSALatentPrep)
@@ -212,32 +237,36 @@ extension QWMLAAttnOperator {
         kPe.bind(enc, index: 11)
         ls.pooledKeys.bind(enc, index: 12)
         enc.setBytes(&dsaP, length: MemoryLayout<DSALatentPrepParams>.stride, index: 13)
+        mropePosScratch.bind(enc, index: 14)
+        ropeAxisMapBuf.bind(enc, index: 15)
         enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-        var gwP = LatentPrepParams(
-            T: UInt32(rows),
-            pos0: UInt32(pos0),
-            hidden: UInt32(geometry.hidden),
-            qLoraRank: UInt32(qLoraRank),
-            kvLoraRank: UInt32(kvLoraRank),
-            idxDim: UInt32(idxDim),
-            idxHeads: UInt32(idxHeads),
-            ringMask: UInt32(ringCap - 1),
-            rmsEps: geometry.rmsEps,
-            kNormEps: 1e-6,
-            kvMode: Self.kvModeCode(kv.k.mode) | 0x100
-        )
-        enc.setComputePipelineState(psoGateWeightsProj)
-        ln1.bind(enc, index: 0)
-        mlaW.wGateWeights.bind(enc, index: 1)
-        ls.gatePending.bind(enc, index: 2)
-        idxWeightsScratch.bind(enc, index: 3)
-        enc.setBytes(&gwP, length: MemoryLayout<LatentPrepParams>.stride, index: 4)
-        enc.dispatchThreadgroups(MTLSize(width: (idxHeads + 7) / 8, height: rows, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        if hasIndexer, idxHeads > 0, idxDim > 0 {
+            var gwP = LatentPrepParams(
+                T: UInt32(rows),
+                pos0: UInt32(pos0),
+                hidden: UInt32(geometry.hidden),
+                qLoraRank: UInt32(qLoraRank),
+                kvLoraRank: UInt32(kvLoraRank),
+                idxDim: UInt32(idxDim),
+                idxHeads: UInt32(idxHeads),
+                ringMask: UInt32(ringCap - 1),
+                rmsEps: geometry.rmsEps,
+                kNormEps: 1e-6,
+                kvMode: Self.kvModeCode(kv.k.mode) | 0x100
+            )
+            enc.setComputePipelineState(psoGateWeightsProj)
+            ln1.bind(enc, index: 0)
+            mlaW.wGateWeights.bind(enc, index: 1)
+            ls.gatePending.bind(enc, index: 2)
+            idxWeightsScratch.bind(enc, index: 3)
+            enc.setBytes(&gwP, length: MemoryLayout<LatentPrepParams>.stride, index: 4)
+            enc.dispatchThreadgroups(MTLSize(width: (idxHeads + 7) / 8, height: rows, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
-        updateCoarseClusters(enc, ls: ls, fullAttnLayer: fullAttnLayer, pos0: pos0, rows: rows)
+            updateCoarseClusters(enc, ls: ls, fullAttnLayer: fullAttnLayer, pos0: pos0, rows: rows)
+        }
     }
 
     internal func encodeIndexerSelection(_ enc: any MTLComputeCommandEncoder,
@@ -424,7 +453,7 @@ extension QWMLAAttnOperator {
                                mTiles: Int) {
         let inc = absP.isIncumbent & 0xFF
         let isSub2SHVQ = inc == 2 && (absP.bits == 1 || absP.bits == 15)
-        let projUVMMA = absorbMMA && vHeadDim == 256
+        let projUVMMA = absorbMMA && vHeadDim >= 128 && (vHeadDim % 128) == 0 && vHeadDim <= 256
         enc.setComputePipelineState(projUVMMA ? (isSub2SHVQ ? psoProjUVMMASub2 : psoProjUVMMA)
                                               : (isSub2SHVQ ? psoProjUVSub2 : psoProjUV))
         uLatScratch.bind(enc, index: 0)
@@ -447,14 +476,19 @@ extension QWMLAAttnOperator {
                                                             fullAttnLayer: Int,
                                                             pos0: Int,
                                                             rows: Int,
+                                                            ln1: QWTensorValue? = nil,
+                                                            mropePositions: [Int32]? = nil,
+                                                            externalGatePrecomputed: Bool = false,
                                                             stage: ((String) -> (any MTLComputeCommandEncoder)?)? = nil) {
-        guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0,
-              let kPe = layers[fullAttnLayer].kPeCache else { return }
+        guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0 else { return }
         var enc = enc
         func mark(_ name: String) { if let e = stage?(name) { enc = e } }
         let ls = layers[fullAttnLayer]
+        let kPe = ls.kPeCache ?? mlaLatentScratch
+        let hasMRoPE = stageMRoPEPositions(mropePositions, rows: rows)
+        let ropeFlags: UInt32 = (ropeInterleave ? 1 : 0) | (hasMRoPE ? 2 : 0)
 
-        // 0. In-place GPT-J RoPE on q_rope + NeoX RoPE and H_128 on q_idx inside mlaQFull.
+        // 0. In-place RoPE (GPT-J or NeoX; 1D or 3D MRoPE) on q_rope + optional NeoX/H_128 on q_idx.
         mark("mla.q_rope_idx")
         var qrP = QRopeIdxPrepParams(
             T: UInt32(rows),
@@ -467,19 +501,39 @@ extension QWMLAAttnOperator {
             qChannels: UInt32(qChannels),
             qFullStride: UInt32(qFullStride),
             mscale: ropeMscale,
-            useHadamard: useFastHadamard ? 1 : 0
+            useHadamard: useFastHadamard ? 1 : 0,
+            ropeFlags: ropeFlags
         )
         enc.setComputePipelineState(psoQRopeIdxPrep)
         mlaQFullScratch.bind(enc, index: 0)
         invFreqBuf.bind(enc, index: 1)
         enc.setBytes(&qrP, length: MemoryLayout<QRopeIdxPrepParams>.stride, index: 2)
+        mropePosScratch.bind(enc, index: 3)
+        ropeAxisMapBuf.bind(enc, index: 4)
         enc.dispatchThreadgroups(MTLSize(width: qHeads + idxHeads, height: rows, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         QWCoarsePoolIndex.barrierIfConcurrent(enc)
 
-        // 1. Exact dense bypass at seqLen <= topK + windowTokens; split MMA or e-means above.
+        let extGateMode = (outputGateMode == .headWiseFromHidden || outputGateMode == .elementWiseFromHidden)
+        let extGateCols = outputGateMode == .headWiseFromHidden ? qHeads : (qHeads * vHeadDim)
+        if !externalGatePrecomputed, extGateMode, let gateF16 = mlaW.oGateF16, let ln1 {
+            var hgP = HeadGateProjParams(
+                T: UInt32(rows),
+                hidden: UInt32(geometry.hidden),
+                nGate: UInt32(extGateCols)
+            )
+            enc.setComputePipelineState(psoHeadGateProj)
+            ln1.bind(enc, index: 0)
+            gateF16.bind(enc, index: 1)
+            oGateScratch.bind(enc, index: 2)
+            enc.setBytes(&hgP, length: MemoryLayout<HeadGateProjParams>.stride, index: 3)
+            enc.dispatchThreadgroups(MTLSize(width: extGateCols, height: rows, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        }
+
+        // 1. Exact dense bypass at seqLen <= topK + windowTokens (or O(1)-SRAM dense stream when !hasIndexer).
         mark("mla.score_select")
-        if pos0 + rows > topKPools + windowTokens {
+        if hasIndexer, pos0 + rows > topKPools + windowTokens {
             encodeIndexerSelection(enc, ls: ls, pos0: pos0, rows: rows,
                                    probeClusters: Self.dsaEmeansProbeClusters,
                                    windowBlocks: windowTokens)
@@ -487,7 +541,11 @@ extension QWMLAAttnOperator {
 
         // 2. Absorb W_{UK, h} into q_nope -> qAbs [rows, qHeads, kvLoraRank]
         let baseInc: UInt32 = mlaW.kvBProj.isIncumbentContainer ? 1 : (mlaW.kvBProj.isSHVQ ? 2 : 0)
-        let needsPostEpilogue = (mlaW.vhaMix != nil) || mlaW.hasOGate || geometry.attnOutputGate
+        let hasInlineOrFlagGate = mlaW.hasOGate
+            || outputGateMode == .elementWiseFromQLora
+            || (geometry.mlaConfig == nil && geometry.attnOutputGate)
+        let hasAnyOGate = extGateMode || hasInlineOrFlagGate
+        let needsPostEpilogue = (mlaW.vhaMix != nil) || hasAnyOGate
         var absP = AbsorbParams(
             T: UInt32(rows),
             qHeads: UInt32(qHeads),
@@ -503,7 +561,7 @@ extension QWMLAAttnOperator {
         mark("mla.absorb_q")
         let absorbMMA = encodeAbsorbQ(enc, kvBProj: mlaW.kvBProj, absP: &absP, rows: rows, mTiles: mTiles)
 
-        // 3. Decoupled-RoPE DSA attention (c_KV + k_pe + attn_sink) -> uLat
+        // 3. Decoupled-RoPE DSA or dense-stream attention (c_KV + k_pe + attn_sink) -> uLat
         QWCoarsePoolIndex.barrierIfConcurrent(enc)
         let sinkTensor = mlaW.attnSink ?? zeroSinkBuf
         var attnP = DSASparseAttnParams(
@@ -522,11 +580,15 @@ extension QWMLAAttnOperator {
             hasSink: mlaW.attnSink != nil ? 1 : 0
         )
         mark("mla.sparse_attn")
+        let supportsNAXRopeDim = (ropeDim == 0 || ropeDim == 32 || ropeDim == 64 || ropeDim == 128)
+        let supportsMMARopeDim = (ropeDim == 32 || ropeDim == 64)
+        let naxAvail = (psoDSASparseAttnNAX != nil) && supportsNAXRopeDim
         let useMMA = sparseAttnMMAEnabled && attnP.kvMode <= 2 && rows >= 16
             && kvLoraRank == 512 && qHeads % 16 == 0
+            && (naxAvail || supportsMMARopeDim)
         let split = (sparseAttnMMAEnabled && !useMMA && attnP.kvMode <= 2 && rows <= Self.splitMaxRows
-            && qHeads % 16 == 0) ? psoDSASparseAttnSplit : nil
-        enc.setComputePipelineState(split?.attend ?? (useMMA ? (psoDSASparseAttnNAX ?? psoDSASparseAttnMMA) : psoDSASparseAttn))
+            && qHeads % 16 == 0 && kvLoraRank == 512 && supportsNAXRopeDim) ? psoDSASparseAttnSplit : nil
+        enc.setComputePipelineState(split?.attend ?? (useMMA ? (naxAvail ? psoDSASparseAttnNAX! : psoDSASparseAttnMMA) : psoDSASparseAttn))
         qAbsScratch.bind(enc, index: 0)
         kv.k.pool.bindTo(enc, index: 1)
         kv.v.pool.bindTo(enc, index: 2)
@@ -577,18 +639,23 @@ extension QWMLAAttnOperator {
         if needsPostEpilogue {
             QWCoarsePoolIndex.barrierIfConcurrent(enc)
             mark("mla.vha_gate")
+            let gateCode: UInt32 = switch outputGateMode {
+            case .headWiseFromHidden: 2
+            case .elementWiseFromHidden, .elementWiseFromQLora: 1
+            case .none: hasInlineOrFlagGate ? 1 : 0
+            }
             var vgP = VHAGateParams(
                 T: UInt32(rows),
                 qHeads: UInt32(qHeads),
                 vHeadDim: UInt32(vHeadDim),
-                qFullStride: UInt32(qFullStride),
-                oGateOffset: UInt32(oGateOffset),
+                gateStride: UInt32(extGateMode ? extGateCols : qFullStride),
+                oGateOffset: UInt32(extGateMode ? 0 : self.oGateOffset),
                 hasVHA: mlaW.vhaMix != nil ? 1 : 0,
-                hasOGate: (mlaW.hasOGate || geometry.attnOutputGate) ? 1 : 0
+                hasOGate: gateCode
             )
             enc.setComputePipelineState(psoVHAGateRot)
             yVhaScratch.bind(enc, index: 0)
-            mlaQFullScratch.bind(enc, index: 1)
+            (extGateMode ? oGateScratch : mlaQFullScratch).bind(enc, index: 1)
             (mlaW.vhaMix ?? yVhaScratch).bind(enc, index: 2)
             attOut.bind(enc, index: 3)
             enc.setBytes(&vgP, length: MemoryLayout<VHAGateParams>.stride, index: 4)

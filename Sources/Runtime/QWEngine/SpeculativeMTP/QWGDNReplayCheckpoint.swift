@@ -282,6 +282,50 @@ final class QWGDNReplayCheckpoint {
         captured[layer] |= UInt32((1 << activeRows) - 1)
     }
 
+    func encodeBatchedKDADirect(_ enc: any MTLComputeCommandEncoder,
+                                conv: QWGDNConv, decoder: QWGDNDecode,
+                                layer: Int, activeRows: Int,
+                                gdnProjection: QWTensorValue, fgbProjection: QWTensorValue,
+                                ln1: QWTensorValue, bProjF16: QWTensorValue?,
+                                aLog: QWTensorValue, dtBias: QWTensorValue,
+                                convWeight: QWTensorValue, normWeight: QWTensorValue,
+                                zScratch: QWTensorValue,
+                                ring: QWTensorValue, state: QWTensorValue,
+                                output: QWTensorValue) throws {
+        guard sourceRec != nil, sourceRing != nil,
+              (0..<layers).contains(layer), (2...rows).contains(activeRows) else {
+            throw QWEngineDriverError.state("GPU batched KDA capture index or active row count is invalid")
+        }
+        let startRow = layer * rows
+        let qkvC = geometry.gdnQKVChannels, gdnVH = geometry.gdnVHeads, zC = geometry.gdnZChannels
+        let glogC = geometry.gdnGlogChannels
+        let r = slice(raw, startRow: startRow, rowCount: activeRows, rowWidth: qkvC)
+        let n = slice(normalized, startRow: startRow, rowCount: activeRows, rowWidth: qkvC)
+        let b = slice(betas, startRow: startRow, rowCount: activeRows, rowWidth: gdnVH)
+        let g = slice(glog, startRow: startRow, rowCount: activeRows, rowWidth: glogC)
+        let inv = slice(innovations, startRow: startRow, rowCount: activeRows, rowWidth: zC)
+        let xView = QWTensorValue(region: gdnProjection.region, offset: gdnProjection.offset,
+                                  shape: QWTensorShape([activeRows * qkvC], .f16))
+        let zView = QWTensorValue(region: zScratch.region, offset: zScratch.offset,
+                                  shape: QWTensorShape([activeRows * zC], .f16))
+        let recTarget = prepareBatchedVerifyTarget(layer: layer, activeRows: activeRows, state: state)
+        try decoder.encodeKDAGatesDirect(
+            enc, fgb: fgbProjection, ln1: ln1, bProjF16: bProjF16,
+            aLog: aLog, dtBias: dtBias, betas: b, glog: g, zOut: zView, rows: activeRows)
+        try conv.encodeRowsWithHeadnorm(
+            enc, x: xView, w: convWeight, bias: nil,
+            stIn: ring, y: n, stOut: ring,
+            rows: activeRows, xStride: qkvC, rawCapture: r)
+        enc.memoryBarrier(scope: .buffers)
+        try decoder.encodeRows(
+            enc, y: n, betas: b, glog: g, state: state,
+            zBase: zView, w: normWeight, o: output, innovation: inv,
+            rows: activeRows, zStride: zC,
+            stateOut: recTarget.stateOut, unstableSuffixMask: recTarget.stabilityMask)
+        enc.memoryBarrier(scope: .buffers)
+        captured[layer] |= UInt32((1 << activeRows) - 1)
+    }
+
     func encodeBatchedGDN(_ enc: any MTLComputeCommandEncoder,
                           conv: QWGDNConv, decoder: QWGDNDecode,
                           layer: Int, activeRows: Int,

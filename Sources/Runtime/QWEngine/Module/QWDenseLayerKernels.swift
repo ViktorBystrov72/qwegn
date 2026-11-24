@@ -46,8 +46,11 @@ class DenseLayerKernel: @unchecked Sendable {
         let view = context.weights.gu.view
         let fuseFwht = !view.isIncumbentContainer && geometry.intermediate > 0 && (geometry.intermediate % 32 == 0)
         // MLP (M=1 route: silu_pair_dx_h16 + fwht32)
+        let plan = geometry.executionPlan
+        let p = plan.indices.contains(context.layer) ? plan[context.layer] : context.layer
+        let clamp = geometry.routedSwiGLUClamp(layer: p)
         try driver.mlpSiluPairH16(enc, x: sc.ln2, gs: sc.gs, wQ4: view,
-                                  h16: sc.gu16, fuseFwht32: fuseFwht)
+                                  h16: sc.gu16, fuseFwht32: fuseFwht, swigluClamp: clamp)
         if !fuseFwht {
             driver.encodeFwht32Fast(enc, x: sc.gu16)
         }
@@ -68,21 +71,26 @@ class DenseLayerKernel: @unchecked Sendable {
         let H = geometry.hidden
         let I = geometry.intermediate
         let T = context.rows
+        let plan = geometry.executionPlan
+        let p = plan.indices.contains(context.layer) ? plan[context.layer] : context.layer
+        let clamp = geometry.routedSwiGLUClamp(layer: p)
         if (I & 31) == 0 && driver.hal.caps.isMetal4TensorCapable {
             try driver.gemmBatchedH16SwiGLU(
                 enc, m: T, i: I, k: H,
                 x: driver.prefixRows(psc.ln2, rows: T, cols: H, dt: .f16),
                 wQ4: lw.gu.view,
-                out16: driver.prefixRows(psc.gu16, rows: T, cols: I, dt: .f16))
+                out16: driver.prefixRows(psc.gu16, rows: T, cols: I, dt: .f16),
+                swigluClamp: clamp)
         } else {
             try driver.gemmBatchedH16(enc, m: T, n: 2 * I, k: H,
                                x: driver.prefixRows(psc.ln2, rows: T, cols: H, dt: .f16),
                                wQ4: lw.gu.view,
                                y16: driver.prefixRows(psc.guRaw16, rows: T, cols: 2 * I, dt: .f16))
-            driver.encodeSiluMulF16(enc,
+            try driver.encodeSiluMulF16(enc,
                              gu: driver.prefixRows(psc.guRaw16, rows: T, cols: 2 * I, dt: .f16),
                              out: driver.prefixRows(psc.gu16, rows: T, cols: I, dt: .f16),
-                             m: T, i: I)
+                             m: T, i: I,
+                             swigluClamp: clamp)
         }
         try driver.gemmBatchedH16(enc, m: T, n: H, k: I,
                        x: driver.prefixRows(psc.gu16, rows: T, cols: I, dt: .f16),

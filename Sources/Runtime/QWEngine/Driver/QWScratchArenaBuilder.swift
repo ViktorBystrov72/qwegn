@@ -197,7 +197,7 @@ enum QWScratchArenaBuilder {
 
         let attnScratchF16 = usesMLA ? 0 : (geometry.attnProjTotalN + 2 * kvE + qOut)
         let attOutCols = max(qC, geometry.qHeads * geometry.vHeadDim)
-        let fgbC = geometry.gdnVectorDecay ? (2 * geometry.gdnLowRankDim + vh) : 0
+        let fgbC = geometry.gdnVectorDecay ? geometry.kdaFgbChannels : 0
         let gdnYF32 = geometry.gdnVectorDecay ? 0 : (2 * vh)
         let needsWy = !geometry.gdnVectorDecay && geometry.gdnLayerCount > 0 && maxPrefillChunk > 4096
         let attnF16 = attnScratchF16 + 2 * qkvC + 2 * zC + attOutCols + fgbC
@@ -263,8 +263,9 @@ enum QWScratchArenaBuilder {
             return activeAttnLayers * ((geometry.indexerHeadDim * 2) / 4)
         }
         if geometry.usesDecoupledRopeMLA {
-            let ropeDim = geometry.hybridMLAConfig?.qkRopeHeadDim ?? 64
-            return activeAttnLayers * ((geometry.indexerHeadDim + ropeDim) * 2)
+            let ropeDim = geometry.mlaConfig?.qkRopeHeadDim ?? geometry.hybridMLAConfig?.qkRopeHeadDim ?? 64
+            let idxDim = geometry.mlaHasIndexer ? max(32, geometry.indexerHeadDim) : 0
+            return activeAttnLayers * ((idxDim + ropeDim) * 2)
         }
         return 0
     }

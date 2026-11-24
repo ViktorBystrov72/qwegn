@@ -36,6 +36,12 @@ public struct QWRoundRecord: Sendable, Equatable, Codable {
     public var mtpPhysicalRows: Int
     public var absolutePosition: Int
     public var samplerDrawIndex: UInt64
+    public var mropeDelta: Int
+
+    enum CodingKeys: String, CodingKey {
+        case pendingToken, consumedCount, outputCount, trunkHiddenSeed
+        case mtpPhysicalRows, absolutePosition, samplerDrawIndex, mropeDelta
+    }
 
     public init(
         pendingToken: Int? = nil,
@@ -44,7 +50,8 @@ public struct QWRoundRecord: Sendable, Equatable, Codable {
         trunkHiddenSeed: [Float]? = nil,
         mtpPhysicalRows: Int = 0,
         absolutePosition: Int = 0,
-        samplerDrawIndex: UInt64 = 0
+        samplerDrawIndex: UInt64 = 0,
+        mropeDelta: Int = 0
     ) {
         self.pendingToken = pendingToken
         self.consumedCount = consumedCount
@@ -53,6 +60,19 @@ public struct QWRoundRecord: Sendable, Equatable, Codable {
         self.mtpPhysicalRows = mtpPhysicalRows
         self.absolutePosition = absolutePosition
         self.samplerDrawIndex = samplerDrawIndex
+        self.mropeDelta = mropeDelta
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        pendingToken = try c.decodeIfPresent(Int.self, forKey: .pendingToken)
+        consumedCount = try c.decode(Int.self, forKey: .consumedCount)
+        outputCount = try c.decode(Int.self, forKey: .outputCount)
+        trunkHiddenSeed = try c.decodeIfPresent([Float].self, forKey: .trunkHiddenSeed)
+        mtpPhysicalRows = try c.decode(Int.self, forKey: .mtpPhysicalRows)
+        absolutePosition = try c.decode(Int.self, forKey: .absolutePosition)
+        samplerDrawIndex = try c.decode(UInt64.self, forKey: .samplerDrawIndex)
+        mropeDelta = try c.decodeIfPresent(Int.self, forKey: .mropeDelta) ?? 0
     }
 }
 

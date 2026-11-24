@@ -23,8 +23,20 @@ public struct QWModelRuntimeAssets: Sendable {
     public let assetsURL: URL
     public let descriptor: QWModelDescriptor
     public let tokenizerJSON: Data
+    public let tokenizerConfigJSON: Data?
+    public let specialTokensMapJSON: Data?
+    public let generationConfigJSON: Data?
     public let chatTemplate: QWChatTemplate
     public let generationDefaults: QWModelGenerationDefaults
+
+    public func makeTokenizer() throws -> QWTokenizer {
+        try QWTokenizer(
+            json: tokenizerJSON,
+            tokenizerConfigJSON: tokenizerConfigJSON,
+            specialTokensMapJSON: specialTokensMapJSON,
+            generationConfigJSON: generationConfigJSON
+        )
+    }
 
     public enum Error: Swift.Error, CustomStringConvertible {
         case badJSON(String)
@@ -61,7 +73,23 @@ public struct QWModelRuntimeAssets: Sendable {
             throw Error.tokenizerMissing(tokenizerURL.path)
         }
 
-        let descriptor = try validateModelConfig(at: assets.appendingPathComponent("config.json"))
+        var descriptor = try validateModelConfig(at: assets.appendingPathComponent("config.json"))
+        let preprocURL = assets.appendingPathComponent("preprocessor_config.json")
+        if let preprocData = FileManager.default.contents(atPath: preprocURL.path),
+           let preprocObj = (try? JSONSerialization.jsonObject(with: preprocData)) as? [String: Any] {
+            let mean = (preprocObj["image_mean"] as? [NSNumber])?.map(\.floatValue)
+            let std = (preprocObj["image_std"] as? [NSNumber])?.map(\.floatValue)
+            descriptor = descriptor.withVisionNormalization(mean: mean, std: std)
+        }
+        let tokenizerConfigJSON = FileManager.default.contents(
+            atPath: assets.appendingPathComponent("tokenizer_config.json").path
+        )
+        let specialTokensMapJSON = FileManager.default.contents(
+            atPath: assets.appendingPathComponent("special_tokens_map.json").path
+        )
+        let generationConfigJSON = FileManager.default.contents(
+            atPath: assets.appendingPathComponent("generation_config.json").path
+        )
         let (templateSource, tokenizerContext) = try loadChatTemplate(assets: assets)
         let chatTemplate = try QWChatTemplate(source: templateSource, tokenizerContext: tokenizerContext)
 
@@ -78,6 +106,9 @@ public struct QWModelRuntimeAssets: Sendable {
 
         return QWModelRuntimeAssets(assetsURL: assets, descriptor: descriptor,
                                    tokenizerJSON: tokenizerJSON,
+                                   tokenizerConfigJSON: tokenizerConfigJSON,
+                                   specialTokensMapJSON: specialTokensMapJSON,
+                                   generationConfigJSON: generationConfigJSON,
                                    chatTemplate: chatTemplate,
                                    generationDefaults: generationDefaults)
     }
@@ -101,14 +132,22 @@ public struct QWModelRuntimeAssets: Sendable {
         let templateURL = assets.appendingPathComponent("chat_template.jinja")
         let tokenizerTemplate: String?
         var tokenizerContext: [String: QWJson] = [:]
+        let specialMapURL = assets.appendingPathComponent("special_tokens_map.json")
+        if FileManager.default.fileExists(atPath: specialMapURL.path),
+           let mapObj = try? jsonObject(at: specialMapURL) {
+            for (k, v) in mapObj where k.hasSuffix("_token") {
+                if let token = tokenizerToken(from: v) {
+                    tokenizerContext[k] = .string(token)
+                }
+            }
+        }
         if FileManager.default.fileExists(atPath: tokenizerConfigURL.path) {
             let object = try jsonObject(at: tokenizerConfigURL)
             tokenizerTemplate = try chatTemplate(from: object["chat_template"],
                                                  path: tokenizerConfigURL.path)
-            for name in ["bos_token", "eos_token", "unk_token", "pad_token", "sep_token",
-                         "cls_token", "mask_token"] {
-                if let token = tokenizerToken(from: object[name]) {
-                    tokenizerContext[name] = .string(token)
+            for (k, v) in object where k.hasSuffix("_token") {
+                if let token = tokenizerToken(from: v) {
+                    tokenizerContext[k] = .string(token)
                 }
             }
         } else {

@@ -355,11 +355,10 @@ kernel void qwg_hca_lsa_q_prep(
     }
 }
 
-// 4. Joint MQA 512D attention over compressed summaries + SWA ring (unsplit prefill & Split-K decode).
+// 4. Joint MQA attention (headDim % 128 == 0, <= 512) over compressed summaries + SWA ring.
 // Grid: (T, qHeads / 16, nSplit), Threadgroup: (128, 1, 1).
 #define HCA_HG   16u
 #define HCA_TK   16u
-#define HCA_DIM  512u
 #define HCA_KS   520u
 
 kernel void qwg_hca_attn_mma(
@@ -382,7 +381,8 @@ kernel void qwg_hca_attn_mma(
     const uint h0 = tg.y * HCA_HG;
     const uint z = tg.z;
     const uint nSplit = ntg.z;
-    if (t >= p.T || h0 >= p.qHeads) return;
+    const uint hd = p.headDim;
+    if (t >= p.T || h0 >= p.qHeads || hd == 0u || hd > 512u || (hd & 127u) != 0u) return;
 
     threadgroup half  ks[HCA_TK * HCA_KS];
     threadgroup float sbuf[HCA_HG * HCA_TK];
@@ -398,7 +398,7 @@ kernel void qwg_hca_attn_mma(
     const uint swaStart = (pos + 1u > p.slidingWindow) ? (pos + 1u - p.slidingWindow) : 0u;
     const uint nSwaSlots = (pos + 1u) - swaStart;
     const uint slots = nCompSlots + nSwaSlots;
-    const float scale = rsqrt(float(HCA_DIM));
+    const float scale = rsqrt(float(hd));
 
     uint sBegin = 0u, sEnd = slots;
     if (nSplit > 1u) {
@@ -421,7 +421,10 @@ kernel void qwg_hca_attn_mma(
 
     const uint rl = qw_hca_row(lane), cl = qw_hca_col(lane);
     const uint sHb = sg & 1u, sTb = sg >> 1u;
-    device const half* qBase = qUpGate + (size_t)t * p.qUpStride + (size_t)(h0 + sHb * 8u) * HCA_DIM;
+    const uint sgCols = hd >> 2u;
+    const uint bTiles = sgCols >> 3u;
+    const uint vecCols = hd >> 2u;
+    device const half* qBase = qUpGate + (size_t)t * p.qUpStride + (size_t)(h0 + sHb * 8u) * hd;
     device const int* rowList = blockList + (size_t)t * p.listStride;
 
     simdgroup_float8x8 oacc[2][16];
@@ -432,18 +435,18 @@ kernel void qwg_hca_attn_mma(
     }
 
     for (uint s0 = sBegin; s0 < sEnd; s0 += HCA_TK) {
-        for (uint i = tid; i < HCA_TK * (HCA_DIM / 4u); i += 128u) {
-            const uint r = i >> 7u;
-            const uint c4 = (i & 127u) * 4u;
+        for (uint i = tid; i < HCA_TK * vecCols; i += 128u) {
+            const uint r = i / vecCols;
+            const uint c4 = (i - r * vecCols) * 4u;
             const uint slot = s0 + r;
             half4 v = half4(0.0h);
             if (slot < sEnd) {
                 if (slot < nCompSlots) {
                     const uint cIdx = sparseComp ? uint(rowList[slot]) : slot;
-                    v = *(device const half4*)(compKV + (size_t)cIdx * HCA_DIM + c4);
+                    v = *(device const half4*)(compKV + (size_t)cIdx * hd + c4);
                 } else {
                     const uint swaPos = swaStart + (slot - nCompSlots);
-                    v = *(device const half4*)(swaKV + (size_t)(swaPos & p.ringMask) * HCA_DIM + c4);
+                    v = *(device const half4*)(swaKV + (size_t)(swaPos & p.ringMask) * hd + c4);
                 }
             }
             *(threadgroup half4*)(ks + r * HCA_KS + c4) = v;
@@ -452,9 +455,9 @@ kernel void qwg_hca_attn_mma(
 
         {
             simdgroup_float8x8 sacc = simdgroup_float8x8(0.0f);
-            for (uint d = 0u; d < HCA_DIM / 8u; ++d) {
+            for (uint d = 0u; d < (hd >> 3u); ++d) {
                 simdgroup_half8x8 qf, kf;
-                simdgroup_load(qf, qBase + d * 8u, HCA_DIM);
+                simdgroup_load(qf, qBase + d * 8u, hd);
                 simdgroup_load(kf, ks + sTb * 8u * HCA_KS + d * 8u, HCA_KS, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(sacc, qf, kf, sacc);
             }
@@ -505,9 +508,8 @@ kernel void qwg_hca_attn_mma(
                 for (uint k = 0u; k < 2u; ++k)
                     simdgroup_load(pf[a][k], pbuf + a * 8u * HCA_TK + k * 8u, HCA_TK);
             }
-            #pragma unroll
-            for (uint b = 0u; b < 16u; ++b) {
-                const uint col = sg * 128u + b * 8u;
+            for (uint b = 0u; b < bTiles; ++b) {
+                const uint col = sg * sgCols + b * 8u;
                 simdgroup_half8x8 kf0, kf1;
                 simdgroup_load(kf0, ks + col, HCA_KS);
                 simdgroup_load(kf1, ks + 8u * HCA_KS + col, HCA_KS);
@@ -535,11 +537,10 @@ kernel void qwg_hca_attn_mma(
         const size_t rowIdx = (nSplit > 1u) ? (((size_t)t * nSplit + z) * p.qHeads + h)
                                             : ((size_t)t * p.qHeads + h);
         if (nSplit > 1u && sg == 0u && cl == 0u) partML[rowIdx] = float2(mH[hr], l);
-        device half* dst = outBuf + rowIdx * HCA_DIM;
-        #pragma unroll
-        for (uint b = 0u; b < 16u; ++b) {
+        device half* dst = outBuf + rowIdx * hd;
+        for (uint b = 0u; b < bTiles; ++b) {
             auto e = oacc[a][b].thread_elements();
-            const uint col = sg * 128u + b * 8u + cl;
+            const uint col = sg * sgCols + b * 8u + cl;
             *(device half2*)(dst + col) = half2(half(e[0] * inv), half(e[1] * inv));
         }
     }
@@ -559,7 +560,8 @@ kernel void qwg_hca_attn_combine(
 ) {
     const uint t = tg / p.qHeads;
     const uint h = tg - t * p.qHeads;
-    if (t >= p.T) return;
+    const uint hd = p.headDim;
+    if (t >= p.T || tid * 4u >= hd) return;
     const size_t base = (size_t)t * nSplit * p.qHeads + h;
     float sink = -1e30f;
     bool validSink = false;
@@ -580,8 +582,8 @@ kernel void qwg_hca_attn_combine(
         if (ml.y <= 0.0f) continue;
         const float w = ml.y * exp(ml.x - mMax);
         wSum += w;
-        acc += w * float4(*(device const half4*)(partO + row * HCA_DIM + tid * 4u));
+        acc += w * float4(*(device const half4*)(partO + row * hd + tid * 4u));
     }
     const float inv = (wSum > 0.0f) ? (1.0f / wSum) : 0.0f;
-    *(device half4*)(attOut + ((size_t)t * p.qHeads + h) * HCA_DIM + tid * 4u) = half4(acc * inv);
+    *(device half4*)(attOut + ((size_t)t * p.qHeads + h) * hd + tid * 4u) = half4(acc * inv);
 }

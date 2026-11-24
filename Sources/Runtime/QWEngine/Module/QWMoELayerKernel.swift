@@ -54,7 +54,13 @@ enum QWMoEChain {
                 sharedIntermediate: geometry.sharedExpertIntermediate,
                 normTopK: geometry.normTopKProb,
                 reuseExpertsAcrossTokens: true,
-                moeSpecExpertBudget: isVerifyWindow ? (driver?.activeMoESpecExpertBudget(rows: rows) ?? 0) : 0
+                moeSpecExpertBudget: isVerifyWindow ? (driver?.activeMoESpecExpertBudget(rows: rows) ?? 0) : 0,
+                useSigmoidScore: moe.useSigmoidScore,
+                nGroup: moe.nGroup,
+                topkGroup: moe.topkGroup,
+                groupTopM: moe.groupTopM,
+                routedSwigluClamp: moe.routedSwigluClamp,
+                sharedSwigluClamp: moe.sharedSwigluClamp
             )
             let scratch = QWMoEOperator.Scratch(
                 xRot32: s.xRot32, xPlain32: s.xPlain32,
@@ -138,7 +144,9 @@ enum QWMoEChain {
             try QWGemm.encodeFnMoeRoute(enc, hal: hal, logits: s.logits, idx: s.idx, wts: s.wts,
                                         rows: rows, experts: E, topK: K,
                                         normTopK: geometry.normTopKProb,
-                                        bias: moe.routerBias)
+                                        bias: moe.routerBias,
+                                        useSigmoid: moe.useSigmoidScore, nGroup: moe.nGroup,
+                                        topkGroup: moe.topkGroup, groupTopM: moe.groupTopM)
             let shScratch0 = naxX16.slice(byteOffset: 0, count: rows * H, dtype: .f16)
             let dnAcc16 = s.dnAcc.slice(byteOffset: 0, count: rows * K * H, dtype: .f16)
 
@@ -155,7 +163,8 @@ enum QWMoEChain {
                                                   naxX16: shScratch0, naxY16: shScratch0, maxTileWidth: H,
                                                   rows: rows, x16Precast: rows >= 64 ? x16 : nil)
                     try QWGemm.encodeSiluMulF32(targetEnc, hal: hal, gu: guSh, act: actSh, rows: rows,
-                                                intermediate: ISh, act16: shAct16)
+                                                intermediate: ISh, act16: shAct16,
+                                                swigluClamp: moe.sharedSwigluClamp)
                     let shScratch = shAct16 ?? shScratch0
                     try QWGemm.encodeDenseProjF32(targetEnc, hal: hal, weight: shDown, x: actSh, y: s.shared,
                                                   naxX16: shScratch, naxY16: shScratch,
@@ -207,7 +216,8 @@ enum QWMoEChain {
                                                       sortedTok: sortedTok, coldBank: moe.coldGateUp,
                                                       tileFilter: .residentOnly)
                         try QWGemm.encodeSiluMulSplitF16(resEnc, hal: hal, gu: gu16, outHi: dnHi, outLo: dnHi,
-                                                         rows: rows * K, intermediate: I)
+                                                         rows: rows * K, intermediate: I,
+                                                         swigluClamp: moe.routedSwigluClamp)
                         try QWGemm.encodeMoENaxSplitF32(resEnc, hal: hal, xHi: dnHi, xLo: dnHi, bank: moe.down,
                                                         expertOff: expOff, tileE: tileE, tileR: tileR,
                                                         tileCount: tileCount, y32: dnAcc16, rowsPerExpert: H,
@@ -225,7 +235,8 @@ enum QWMoEChain {
                 if let active = driver.activeEnc { enc = active }
                 if stagedCount > 0 {
                     try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: gu16, outHi: dnHi, outLo: dnHi,
-                                                     rows: rows * K, intermediate: I)
+                                                     rows: rows * K, intermediate: I,
+                                                     swigluClamp: moe.routedSwigluClamp)
                     try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: dnHi, xLo: dnHi, bank: moe.down,
                                                     expertOff: expOff, tileE: tileE, tileR: tileR,
                                                     tileCount: tileCount, y32: dnAcc16, rowsPerExpert: H,
@@ -264,7 +275,8 @@ enum QWMoEChain {
                                                           sortedTok: sortedTok, coldBank: moe.coldGateUp,
                                                           tileFilter: .residentOnly)
                             try QWGemm.encodeSiluMulSplitF16(resEnc, hal: hal, gu: sp.gu, outHi: sp.dnHi, outLo: sp.dnHi,
-                                                             rows: sp.spanPairs, intermediate: I)
+                                                             rows: sp.spanPairs, intermediate: I,
+                                                             swigluClamp: moe.routedSwigluClamp)
                             try QWGemm.encodeMoENaxSplitF32(resEnc, hal: hal, xHi: sp.dnHi, xLo: sp.dnHi, bank: moe.down,
                                                             expertOff: expOff, tileE: tileE, tileR: tileR,
                                                             tileCount: tileCount, y32: sp.dnAcc, rowsPerExpert: H,
@@ -298,7 +310,8 @@ enum QWMoEChain {
                                                               tileFilter: .coldOnly)
                             }
                             try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: sp.gu, outHi: sp.dnHi, outLo: sp.dnHi,
-                                                             rows: sp.spanPairs, intermediate: I)
+                                                             rows: sp.spanPairs, intermediate: I,
+                                                             swigluClamp: moe.routedSwigluClamp)
                             try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: sp.dnHi, xLo: sp.dnHi, bank: moe.down,
                                                             expertOff: expOff, tileE: tileE, tileR: tileR,
                                                             tileCount: tileCount, y32: sp.dnAcc, rowsPerExpert: H,
@@ -318,7 +331,8 @@ enum QWMoEChain {
                                                       gu16: sp.gu, rowsPerExpert: 2 * I, tilePlan: sp.plan,
                                                       sortedTok: sortedTok, coldBank: moe.coldGateUp)
                         try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: sp.gu, outHi: sp.dnHi, outLo: sp.dnHi,
-                                                         rows: sp.spanPairs, intermediate: I)
+                                                         rows: sp.spanPairs, intermediate: I,
+                                                         swigluClamp: moe.routedSwigluClamp)
                         try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: sp.dnHi, xLo: sp.dnHi, bank: moe.down,
                                                         expertOff: expOff, tileE: tileE, tileR: tileR,
                                                         tileCount: tileCount, y32: sp.dnAcc, rowsPerExpert: H,
@@ -354,7 +368,10 @@ enum QWMoEChain {
                                         actSh: fuseSh ? s.actSh32 : nil,
                                         sharedIntermediate: fuseSh ? ISh : 0,
                                         bias: moe.routerBias,
-                                        expertBudget: moeSpecBudget)
+                                        expertBudget: moeSpecBudget,
+                                        useSigmoid: moe.useSigmoidScore, nGroup: moe.nGroup,
+                                        topkGroup: moe.topkGroup, groupTopM: moe.groupTopM,
+                                        sharedSwigluClamp: moe.sharedSwigluClamp)
             var shDownEncoded = false
             let encodeSharedDown: (any MTLComputeCommandEncoder) throws -> Void = { targetEnc in
                 guard !shDownEncoded else { return }
@@ -362,7 +379,8 @@ enum QWMoEChain {
                 if let shDown = moe.sharedDown,
                    let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
                     if !fuseSh {
-                        try QWGemm.encodeSiluMulF32(targetEnc, hal: hal, gu: guSh, act: actSh, rows: rows, intermediate: ISh)
+                        try QWGemm.encodeSiluMulF32(targetEnc, hal: hal, gu: guSh, act: actSh, rows: rows,
+                                                    intermediate: ISh, swigluClamp: moe.sharedSwigluClamp)
                     }
                     try QWGemm.encodeHQ4F32V4(targetEnc, hal: hal, weight: shDown, x: actSh, y: s.shared, rows: rows)
                 }
@@ -382,10 +400,11 @@ enum QWMoEChain {
                                                    ids: ids, out: fuseRoutedGU ? actSlice : guSlice,
                                                    rowsPerExpert: 2 * I, routes: K, tokens: rows,
                                                    fuseSiluFwht: fuseRoutedGU, coldBank: moe.coldGateUp,
-                                                   tileFilter: filter)
+                                                   tileFilter: filter, swigluClamp: moe.routedSwigluClamp)
                     if !fuseRoutedGU {
                         try QWGemm.encodeSiluMulF32(targetEnc, hal: hal, gu: guSlice, act: actSlice,
-                                                    rows: rows * K, intermediate: I)
+                                                    rows: rows * K, intermediate: I,
+                                                    swigluClamp: moe.routedSwigluClamp)
                     }
                     try QWGemm.encodeMoEDownSharedCombineF32(targetEnc, hal: hal, x: actSlice, bank: moe.down,
                                                             rowsPerRoute: H, routes: K, weights: wtsSlice,
@@ -430,10 +449,12 @@ enum QWMoEChain {
                                                            ids: idsSlice, out: fuseRoutedGU ? actSlice : guSlice,
                                                            rowsPerExpert: 2 * I, routes: K, tokens: spanRows,
                                                            fuseSiluFwht: fuseRoutedGU, coldBank: moe.coldGateUp,
-                                                           tileFilter: .residentOnly)
+                                                           tileFilter: .residentOnly,
+                                                           swigluClamp: moe.routedSwigluClamp)
                             if !fuseRoutedGU {
                                 try QWGemm.encodeSiluMulF32(resEnc, hal: hal, gu: guSlice, act: actSlice,
-                                                            rows: spanRows * K, intermediate: I)
+                                                            rows: spanRows * K, intermediate: I,
+                                                            swigluClamp: moe.routedSwigluClamp)
                             }
                             try QWGemm.encodeMoEDownSharedCombineF32(resEnc, hal: hal, x: actSlice, bank: moe.down,
                                                                     rowsPerRoute: H, routes: K, weights: wtsSlice,
@@ -453,10 +474,12 @@ enum QWMoEChain {
                                                            ids: idsSlice, out: fuseRoutedGU ? actSlice : guSlice,
                                                            rowsPerExpert: 2 * I, routes: K, tokens: spanRows,
                                                            fuseSiluFwht: fuseRoutedGU, coldBank: moe.coldGateUp,
-                                                           tileFilter: .coldOnly)
+                                                           tileFilter: .coldOnly,
+                                                           swigluClamp: moe.routedSwigluClamp)
                             if !fuseRoutedGU {
                                 try QWGemm.encodeSiluMulF32(guEnc, hal: hal, gu: guSlice, act: actSlice,
-                                                            rows: spanRows * K, intermediate: I)
+                                                            rows: spanRows * K, intermediate: I,
+                                                            swigluClamp: moe.routedSwigluClamp)
                             }
                         }
                     )
@@ -484,10 +507,12 @@ enum QWMoEChain {
                                                            ids: idsSlice, out: fuseRoutedGU ? actSlice : guSlice,
                                                            rowsPerExpert: 2 * I, routes: K, tokens: spanRows,
                                                            fuseSiluFwht: fuseRoutedGU, coldBank: moe.coldGateUp,
-                                                           tileFilter: filter)
+                                                           tileFilter: filter,
+                                                           swigluClamp: moe.routedSwigluClamp)
                             if !fuseRoutedGU {
                                 try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSlice, act: actSlice,
-                                                            rows: spanRows * K, intermediate: I)
+                                                            rows: spanRows * K, intermediate: I,
+                                                            swigluClamp: moe.routedSwigluClamp)
                             }
                         }
                         try QWGemm.encodeMoEDownSharedCombineF32(enc, hal: hal, x: actSlice, bank: moe.down,

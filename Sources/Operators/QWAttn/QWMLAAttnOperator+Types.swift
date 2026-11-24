@@ -18,6 +18,8 @@ extension QWMLAAttnOperator {
         public let vhaMix: QWTensorValue?
         public let attnSink: QWTensorValue?
         public let hasOGate: Bool
+        public let oGateF16: QWTensorValue?
+        public let oGateProj: QWWeightView?
 
         public init(qANormW: QWTensorValue,
                     kvANormW: QWTensorValue,
@@ -29,7 +31,9 @@ extension QWMLAAttnOperator {
                     kvBProj: QWWeightView,
                     vhaMix: QWTensorValue? = nil,
                     attnSink: QWTensorValue? = nil,
-                    hasOGate: Bool = false) {
+                    hasOGate: Bool = false,
+                    oGateF16: QWTensorValue? = nil,
+                    oGateProj: QWWeightView? = nil) {
             self.qANormW = qANormW
             self.kvANormW = kvANormW
             self.kNormW = kNormW
@@ -41,6 +45,8 @@ extension QWMLAAttnOperator {
             self.vhaMix = vhaMix
             self.attnSink = attnSink
             self.hasOGate = hasOGate
+            self.oGateF16 = oGateF16
+            self.oGateProj = oGateProj
         }
     }
 

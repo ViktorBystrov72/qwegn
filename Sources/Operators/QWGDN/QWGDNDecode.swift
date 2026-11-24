@@ -24,6 +24,7 @@ public final class QWGDNDecode {
     private let psoRollbackRows: any MTLComputePipelineState
     private var cachedKDAGates: (any MTLComputePipelineState)?
     private var cachedKDAGatesMMA: (any MTLComputePipelineState)?
+    private var cachedKDAGatesDirect: (any MTLComputePipelineState)?
 
     private func kdaGatesPipeline(mma: Bool) throws -> any MTLComputePipelineState {
         if mma {
@@ -35,6 +36,13 @@ public final class QWGDNDecode {
         if let p = cachedKDAGates { return p }
         let p = try hal.pipeline("qwg_kda_gates")
         cachedKDAGates = p
+        return p
+    }
+
+    private func kdaGatesDirectPipeline() throws -> any MTLComputePipelineState {
+        if let p = cachedKDAGatesDirect { return p }
+        let p = try hal.pipeline("qwg_kda_gates_direct")
+        cachedKDAGatesDirect = p
         return p
     }
     /// Prefill rows use the 32-token simdgroup-MMA gates kernel (`QW_KDA_GATES_MMA=0` disables).
@@ -52,7 +60,11 @@ public final class QWGDNDecode {
         self.psoRecRows = try hal.pipeline("qwg_gdn_recurrent_rows")
         self.psoRollbackRows = try hal.pipeline("qwg_gdn_rollback_rows")
         if hal.geometry.gdnVectorDecay {
-            _ = try hal.pipeline("qwg_kda_gates")
+            if hal.geometry.kdaConfig?.isFullRank == true {
+                _ = try hal.pipeline("qwg_kda_gates_direct")
+            } else {
+                _ = try hal.pipeline("qwg_kda_gates")
+            }
         }
     }
 
@@ -60,10 +72,14 @@ public final class QWGDNDecode {
                                fgb: QWTensorValue, fB: QWTensorValue, gB: QWTensorValue,
                                aLog: QWTensorValue, dtBias: QWTensorValue,
                                betas: QWTensorValue, glog: QWTensorValue, zOut: QWTensorValue,
-                               rows: Int = 1) throws {
-        let vh = instVHeads, zCh = instZCh
+                               rows: Int = 1, lowRankDim: Int? = nil) throws {
+        let vh = instVHeads, hd = instHeadDim
         guard rows > 0 else { return }
-        let useMMA = kdaGatesMMAEnabled && rows >= 16
+        let lr = lowRankDim ?? hal.geometry.kdaConfig?.lowRankDim ?? hal.geometry.gdnLowRankDim
+        guard lr > 0, lr <= 256, lr % 4 == 0 else {
+            throw QWGDNDecodeError.badShape("KDA lowRankDim \(lr) must be multiple of 4 in 4...256")
+        }
+        let useMMA = kdaGatesMMAEnabled && rows >= 16 && (lr % 8 == 0) && hd <= 128
         enc.setComputePipelineState(try kdaGatesPipeline(mma: useMMA))
         fgb.bind(enc, index: 0)
         fB.bind(enc, index: 1)
@@ -75,11 +91,40 @@ public final class QWGDNDecode {
         zOut.bind(enc, index: 7)
         var glb = hal.geometry.gdnGateLowerBound
         var tU = UInt32(rows)
+        var lrU = UInt32(lr)
         enc.setBytes(&glb, length: 4, index: 8)
         enc.setBytes(&tU, length: 4, index: 9)
+        enc.setBytes(&lrU, length: 4, index: 10)
         enc.dispatchThreadgroups(MTLSize(width: vh, height: useMMA ? (rows + 31) / 32 : rows, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-        _ = zCh
+                                 threadsPerThreadgroup: MTLSize(width: useMMA ? 128 : hd, height: 1, depth: 1))
+    }
+
+    public func encodeKDAGatesDirect(_ enc: any MTLComputeCommandEncoder,
+                                     fgb: QWTensorValue, ln1: QWTensorValue? = nil,
+                                     bProjF16: QWTensorValue? = nil, aLog: QWTensorValue,
+                                     dtBias: QWTensorValue, betas: QWTensorValue,
+                                     glog: QWTensorValue, zOut: QWTensorValue,
+                                     rows: Int = 1) throws {
+        let vh = instVHeads, hd = instHeadDim
+        guard rows > 0 else { return }
+        let hasRawB = (ln1 != nil && bProjF16 != nil)
+        enc.setComputePipelineState(try kdaGatesDirectPipeline())
+        fgb.bind(enc, index: 0)
+        (ln1 ?? fgb).bind(enc, index: 1)
+        (bProjF16 ?? fgb).bind(enc, index: 2)
+        aLog.bind(enc, index: 3)
+        dtBias.bind(enc, index: 4)
+        betas.bind(enc, index: 5)
+        glog.bind(enc, index: 6)
+        zOut.bind(enc, index: 7)
+        var glb = hal.geometry.gdnGateLowerBound
+        var tU = UInt32(rows)
+        var rawBU: UInt32 = hasRawB ? 1 : 0
+        enc.setBytes(&glb, length: 4, index: 8)
+        enc.setBytes(&tU, length: 4, index: 9)
+        enc.setBytes(&rawBU, length: 4, index: 10)
+        enc.dispatchThreadgroups(MTLSize(width: vh, height: rows, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: hd, height: 1, depth: 1))
     }
 
     /// Encode ONE decode token: `y` (this step's post-conv q̂‖k̂‖v, qkvCh f16),

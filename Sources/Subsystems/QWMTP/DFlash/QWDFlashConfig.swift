@@ -136,7 +136,7 @@ public struct QWDFlashConfig: Sendable, Equatable {
         for url in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             guard isDir || url.pathExtension == "qwp", isDrafterPack(at: url) else { continue }
-            let cfg = load(from: url)
+            let cfg = load(from: url, target: target)
             let layerBound = cfg.usesVirtualCapture(for: target)
                 ? max(target.numLayers, target.executionPlan.count)
                 : target.numLayers
@@ -184,7 +184,7 @@ public struct QWDFlashConfig: Sendable, Equatable {
         guard FileManager.default.fileExists(atPath: resolvedURL.path) else {
             throw QWDFlashError.packMissing(resolvedURL.path)
         }
-        let cfg = Self.load(from: resolvedURL, topKOverride: selectorTopK)
+        let cfg = Self.load(from: resolvedURL, topKOverride: selectorTopK, target: targetDescriptor)
         let maxDrafts = max(7, cfg.blockSize - 1)
         guard (1...maxDrafts).contains(drafts) else {
             throw QWDFlashError.state(
@@ -262,12 +262,24 @@ public struct QWDFlashConfig: Sendable, Equatable {
         return (cfg.isDSpine ? "dspine" : "dflash2", max(7, min(15, cfg.blockSize - 1)))
     }
 
-    public static func load(from packURL: URL, topKOverride: Int? = nil) -> QWDFlashConfig {
+    public static func load(
+        from packURL: URL,
+        topKOverride: Int? = nil,
+        target: QWModelDescriptor? = nil
+    ) -> QWDFlashConfig {
         let dir = packURL.pathExtension == "qwp" ? packURL.deletingLastPathComponent() : packURL
         let cfgURL = dir.appendingPathComponent("assets/config.json")
         guard let data = try? Data(contentsOf: cfgURL),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return QWDFlashConfig(selectorTopK: topKOverride ?? 16)
+            return QWDFlashConfig(
+                hiddenSize: target?.hidden ?? 5120,
+                numAttentionHeads: target?.qHeads ?? 32,
+                numKeyValueHeads: target?.kvHeads ?? 8,
+                headDim: target?.headDim ?? 128,
+                intermediateSize: target?.denseIntermediate ?? 17408,
+                vocabSize: target?.vocab ?? 248320,
+                selectorTopK: topKOverride ?? 16
+            )
         }
         let dflash = json["dflash_config"] as? [String: Any] ?? [:]
         let rope = (json["rope_parameters"] as? [String: Any]) ?? (json["rope_scaling"] as? [String: Any]) ?? [:]
@@ -282,15 +294,15 @@ public struct QWDFlashConfig: Sendable, Equatable {
             ?? (dflash["selector_top_k"] as? Int)
             ?? 16
         return QWDFlashConfig(
-            hiddenSize: (json["hidden_size"] as? Int) ?? 5120,
+            hiddenSize: (json["hidden_size"] as? Int) ?? target?.hidden ?? 5120,
             numLayers: (json["num_hidden_layers"] as? Int) ?? 5,
-            numAttentionHeads: (json["num_attention_heads"] as? Int) ?? 32,
-            numKeyValueHeads: (json["num_key_value_heads"] as? Int) ?? 8,
-            headDim: (json["head_dim"] as? Int) ?? 128,
-            intermediateSize: (json["intermediate_size"] as? Int) ?? 17408,
-            vocabSize: (json["vocab_size"] as? Int) ?? 248320,
-            rmsNormEps: Float((json["rms_norm_eps"] as? Double) ?? 1e-6),
-            ropeTheta: Float((json["rope_theta"] as? Double) ?? (rope["rope_theta"] as? Double) ?? 10_000_000.0),
+            numAttentionHeads: (json["num_attention_heads"] as? Int) ?? target?.qHeads ?? 32,
+            numKeyValueHeads: (json["num_key_value_heads"] as? Int) ?? target?.kvHeads ?? 8,
+            headDim: (json["head_dim"] as? Int) ?? target?.headDim ?? 128,
+            intermediateSize: (json["intermediate_size"] as? Int) ?? target?.denseIntermediate ?? 17408,
+            vocabSize: (json["vocab_size"] as? Int) ?? target?.vocab ?? 248320,
+            rmsNormEps: Float((json["rms_norm_eps"] as? Double) ?? Double(target?.rmsEps ?? 1e-6)),
+            ropeTheta: Float((json["rope_theta"] as? Double) ?? (rope["rope_theta"] as? Double) ?? target?.ropeTheta ?? 10_000_000.0),
             slidingWindow: (json["sliding_window"] as? Int) ?? (isDSpine ? 8192 : 2048),
             blockSize: (dflash["block_size"] as? Int) ?? (json["block_size"] as? Int) ?? (isDSpine ? 16 : 8),
             maskTokenId: (dflash["mask_token_id"] as? Int) ?? 248070,

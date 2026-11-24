@@ -76,7 +76,8 @@ extension QWEngineDriver {
                 hal: hal, draft: mtpDraftEncoder, headStorage: headStorage,
                 draftHead: mtpDraftHead, hidden: hidden, kv: views,
                 pendingToken: pending, drafts: neuralCount, position: session.position,
-                cacheRows: basePairs, table: table, journalTokenOffset: 1)
+                cacheRows: basePairs, mropeDelta: session.roundRecord.mropeDelta,
+                table: table, journalTokenOffset: 1)
         } else {
             return nil
         }

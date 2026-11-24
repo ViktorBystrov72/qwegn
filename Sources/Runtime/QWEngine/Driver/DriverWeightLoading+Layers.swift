@@ -30,7 +30,7 @@ extension QWEngineDriver.WeightLoader {
         /// The router is the pack's RAW bf16 plane (the packer copies it
         /// verbatim — not quantised, not rotated), widened to f32; the banks
         /// are ONE contiguous view each, the experts stacked in order (C119).
-        mutating func packedMoE(_ blk: String, experts: Int, topK: Int) throws -> MoEW {
+        mutating func packedMoE(_ blk: String, experts: Int, topK: Int, layer: Int = 0) throws -> MoEW {
             let I = geometry.moeIntermediate
             let H = geometry.hidden
             let outDim = geometry.moeRoutedDim
@@ -219,15 +219,21 @@ extension QWEngineDriver.WeightLoader {
                         splitFeatureRouting: geometry.moeSplitFeatureRouting,
                         latent: latent,
                         coldGateUp: coldBanks?.gu, coldDown: coldBanks?.down,
-                        coldStreamer: coldStreamer)
+                        coldStreamer: coldStreamer,
+                        useSigmoidScore: geometry.descriptor.moeRoutingConfig?.scoreFunction == "sigmoid",
+                        nGroup: geometry.descriptor.moeRoutingConfig?.nGroup ?? 1,
+                        topkGroup: geometry.descriptor.moeRoutingConfig?.topkGroup ?? 1,
+                        groupTopM: geometry.descriptor.moeRoutingConfig?.groupTopM ?? 1,
+                        routedSwigluClamp: geometry.routedSwiGLUClamp(layer: layer),
+                        sharedSwigluClamp: geometry.sharedSwiGLUClamp(layer: layer))
         }
 
         mutating func loadLayerMLP(
-            _ blk: String, isMoE: Bool, geometry: QWModelGeometry
+            _ blk: String, isMoE: Bool, geometry: QWModelGeometry, layer: Int = 0
         ) throws -> (gu: QWMLPWeight, down: QWWeightView, moe: MoEW?) {
             let experts = isMoE ? geometry.numExperts : 0
             let moe: MoEW? = experts > 0
-                ? try packedMoE(blk, experts: experts, topK: geometry.expertsPerTok)
+                ? try packedMoE(blk, experts: experts, topK: geometry.expertsPerTok, layer: layer)
                 : nil
             if let moe {
                 let outDim = geometry.moeRoutedDim
@@ -306,10 +312,12 @@ extension QWEngineDriver.WeightLoader {
             ]
             let hasMBSA = includeMBSA && geometry.blockSparseGQAConfig != nil
             let idxPfx = blk + "self_attn.indexer."
+            let idxH = geometry.mbsaIndexerHeads
+            let idxD = geometry.mbsaIndexerHeadDim
             if hasMBSA {
                 attnSpecs.append(contentsOf: [
-                    (idxPfx + "linear_q_proj.weight", geometry.kvHeads * geometry.headDim),
-                    (idxPfx + "linear_k_proj.weight", geometry.headDim)
+                    (idxPfx + "linear_q_proj.weight", idxH * idxD),
+                    (idxPfx + "linear_k_proj.weight", idxD)
                 ])
             }
             let (qkvProj, attnSub) = try concatQ4(attnSpecs, k: geometry.hidden)
@@ -342,8 +350,8 @@ extension QWEngineDriver.WeightLoader {
             }
             let mbsaW: QWMBSAAttnOperator.LayerWeights?
             if hasMBSA {
-                let wqIdx = try f16wNorm(idxPfx + "q_layernorm.weight", geometry.headDim)
-                let wkIdx = try f16wNorm(idxPfx + "k_layernorm.weight", geometry.headDim)
+                let wqIdx = try f16wNorm(idxPfx + "q_layernorm.weight", idxD)
+                let wkIdx = try f16wNorm(idxPfx + "k_layernorm.weight", idxD)
                 mbsaW = QWMBSAAttnOperator.LayerWeights(qkvIdxProj: nil, wqIdx: wqIdx, wkIdx: wkIdx)
             } else {
                 mbsaW = nil
@@ -359,7 +367,7 @@ extension QWEngineDriver.WeightLoader {
                 let blk = "\(QWEngineDriver.P)layers.\(l)."
                 let ln1 = try f16wNorm(blk + "input_layernorm.weight", geometry.hidden)
                 let ln2 = try f16wNorm(blk + "post_attention_layernorm.weight", geometry.hidden)
-                let (gu, down, moe) = try loadLayerMLP(blk, isMoE: geometry.isMoELayer(l), geometry: geometry)
+                let (gu, down, moe) = try loadLayerMLP(blk, isMoE: geometry.isMoELayer(l), geometry: geometry, layer: l)
                 if geometry.isCompressedAttention(l) {
                     ws.append(try loadHCAAttnLayer(
                         blk: blk, layer: l, ln1: ln1, ln2: ln2,

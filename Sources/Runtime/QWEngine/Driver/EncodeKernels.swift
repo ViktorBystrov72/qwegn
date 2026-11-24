@@ -45,9 +45,11 @@ extension QWEngineDriver {
         defaultPSO: any MTLComputePipelineState,
         opName: String,
         incumbentKernel: String,
+        swigluClamp: QWSwiGLUClampSpec? = nil,
         aqKernel: () -> String?
     ) throws -> any MTLComputePipelineState {
-        let matchesDefault = wQ4.isIncumbentContainer == weightFormat.denseIsIncumbentContainer
+        let matchesDefault = swigluClamp == nil
+            && wQ4.isIncumbentContainer == weightFormat.denseIsIncumbentContainer
             && wQ4.bits == weightFormat.bits
             && wQ4.groupSize == weightFormat.groupSize
             && wQ4.isSHVQ == weightFormat.denseIsSHVQ
@@ -57,7 +59,7 @@ extension QWEngineDriver {
             throw QWEngineDriverError.unsupportedModel(
                 "no \(opName) kernel for \(wQ4.bits)-bit group \(wQ4.groupSize)")
         }
-        return try hal.pipeline(kernelName)
+        return try hal.pipeline(kernelName, swigluClamp: swigluClamp)
     }
 
     func gemvH16T4(_ enc: any MTLComputeCommandEncoder,
@@ -157,11 +159,13 @@ extension QWEngineDriver {
                               m: Int, i: Int, k: Int,
                               x: QWTensorValue, wQ4: QWWeightView,
                               out16: QWTensorValue,
-                              xStride: Int? = nil, yStride: Int? = nil) throws {
+                              xStride: Int? = nil, yStride: Int? = nil,
+                              swigluClamp: QWSwiGLUClampSpec? = nil) throws {
         let pso = try Self.resolveWeightPSO(
             for: wQ4, weightFormat: weightFormat, hal: hal,
             defaultPSO: psoGemmBatchedH16SwiGLU, opName: "fused SwiGLU GEMM",
             incumbentKernel: "qwg_gemm_q4g_h16_swiglu",
+            swigluClamp: swigluClamp,
             aqKernel: { QWGemmAQ.swigluGemmKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ) }
         )
         enc.setComputePipelineState(pso)
@@ -216,8 +220,10 @@ extension QWEngineDriver {
 
     func encodeSiluMulF16(_ enc: any MTLComputeCommandEncoder,
                           gu: QWTensorValue, out: QWTensorValue,
-                          m: Int, i: Int) {
-        enc.setComputePipelineState(psoSiluMulF16)
+                          m: Int, i: Int,
+                          swigluClamp: QWSwiGLUClampSpec? = nil) throws {
+        let pso = try swigluClamp.map { try hal.pipeline("qwg_silu_mul_f16", swigluClamp: $0) } ?? psoSiluMulF16
+        enc.setComputePipelineState(pso)
         enc.bindTensors(gu, out, startIndex: 0)
         enc.setUInt32s(m, i, startIndex: 2)
         // grid.x covers ceil(I/8) = 2176 = 17 * 128 — 128 threads/TG has zero tail waste.
@@ -297,12 +303,14 @@ extension QWEngineDriver {
 
     func mlpSiluPairH16(_ enc: any MTLComputeCommandEncoder,
                         x: QWTensorValue, gs: QWTensorValue, wQ4: QWWeightView,
-                        h16: QWTensorValue, fuseFwht32: Bool = false) throws {
+                        h16: QWTensorValue, fuseFwht32: Bool = false,
+                        swigluClamp: QWSwiGLUClampSpec? = nil) throws {
         _ = gs
         let pso = try Self.resolveWeightPSO(
             for: wQ4, weightFormat: weightFormat, hal: hal,
             defaultPSO: psoGEMVSiluPairH16, opName: "MLP SiLU pair GEMV",
             incumbentKernel: "qwg_gemv_q4g_silu_pair_dx_h16",
+            swigluClamp: swigluClamp,
             aqKernel: { QWGemmAQ.siluPairKernelName(bits: wQ4.bits, group: wQ4.groupSize, isSHVQ: wQ4.isSHVQ) }
         )
         enc.setComputePipelineState(pso)

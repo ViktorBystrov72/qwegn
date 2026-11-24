@@ -437,4 +437,55 @@ final class QWTokenTests: XCTestCase {
         XCTAssertTrue(resolved.defaultStopTokenIds.contains(200006))
         XCTAssertFalse(resolved.defaultStopTokenIds.contains(200010))
     }
+
+    func testDynamicBailingAndConfigBackedSpecialTokens() throws {
+        var addedTokens: [[String: Any]] = []
+        let specials = ["<|endoftext|>", "<|role_end|>", "<think>", "</think>", "<role>", "</role>"]
+        for (idx, s) in specials.enumerated() {
+            addedTokens.append(["id": 10 + idx, "content": s, "special": s.hasPrefix("<|") || s == "<role>"])
+        }
+        var vocab: [String: Int] = [:]
+        var nextId = 20
+        var n = 0
+        for b in 0..<256 {
+            let idc = Unicode.Scalar(UInt8(b))
+            let printable = (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF)
+            let sc: Unicode.Scalar = printable ? idc : Unicode.Scalar(0x100 + n)!
+            if !printable { n += 1 }
+            if b == 0xC0 || b == 0xC1 || b >= 0xF5 { continue }
+            vocab[String(sc)] = nextId
+            nextId += 1
+        }
+        let pretokenizers: [[String: Any]] = [
+            ["type": "Split", "pattern": ["Regex": "[A-Za-z]+|\\s+"], "behavior": "Isolated", "invert": false],
+            ["type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false]
+        ]
+        let tokJSON = try JSONSerialization.data(withJSONObject: [
+            "added_tokens": addedTokens,
+            "model": ["type": "BPE", "vocab": vocab, "merges": []],
+            "pre_tokenizer": ["type": "Sequence", "pretokenizers": pretokenizers]
+        ] as [String: Any])
+        let tcJSON = try JSONSerialization.data(withJSONObject: [
+            "eos_token": ["content": "<|role_end|>"],
+            "pad_token": "<|endoftext|>",
+        ] as [String: Any])
+        let genJSON = try JSONSerialization.data(withJSONObject: [
+            "eos_token_id": [10, 11, 999_999],
+        ] as [String: Any])
+        let tok = try QWTokenizer(
+            json: tokJSON,
+            tokenizerConfigJSON: tcJSON,
+            generationConfigJSON: genJSON
+        )
+        let resolved = tok.resolveSpecialTokens(
+            fallback: QWModelSpecialTokens(eosTokenId: 11, usesChatTemplateIds: false)
+        )
+        XCTAssertEqual(resolved.eosTokenId, 10)
+        XCTAssertEqual(resolved.imStartTokenId, 14)
+        XCTAssertEqual(resolved.imEndTokenId, 11)
+        XCTAssertEqual(resolved.thinkTokenId, 12)
+        XCTAssertEqual(resolved.endThinkTokenId, 13)
+        XCTAssertEqual(resolved.defaultStopTokenIds, Set([10, 11]))
+        XCTAssertFalse(resolved.usesChatTemplateIds)
+    }
 }

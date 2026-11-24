@@ -127,7 +127,9 @@ extension QWMoEOperator {
             try QWGemm.encodeFnMoeRoute(enc, hal: hal, logits: s.logits, idx: s.idx, wts: s.wts,
                                         rows: T, experts: E, topK: K, normTopK: w.normTopK,
                                         bias: w.routerBias, splitFeature: w.splitFeatureRouting,
-                                        routedScaleParam: w.routedScaleParam)
+                                        routedScaleParam: w.routedScaleParam,
+                                        useSigmoid: w.useSigmoidScore, nGroup: w.nGroup,
+                                        topkGroup: w.topkGroup, groupTopM: w.groupTopM)
             try QWGemm.encodeLatentNormH32F32(enc, hal: hal, x: ls.bufA32, gamma: nil,
                                               out32: ls.bufB32, out16: xLat16,
                                               rows: T, latent: L, skipOut32: true)
@@ -138,7 +140,8 @@ extension QWMoEOperator {
                                               rows: T, x16Precast: shPrecast16, minNaxRows: minNax)
                 barrier()
                 try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
-                                            intermediate: ISh, act16: shAct16)
+                                            intermediate: ISh, act16: shAct16,
+                                            swigluClamp: w.sharedSwigluClamp)
                 barrier()
                 let canUseScratch0ForDown = naxScratch0.shape.elementCount >= T * ISh && naxY.shape.elementCount >= T * ISh
                 let shScratch = shAct16 ?? naxScratch0
@@ -166,7 +169,8 @@ extension QWMoEOperator {
                                           sortedTok: sortedTok, coldBank: w.coldGateUp)
             barrier()
             try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: gu16, outHi: dnHi, outLo: dnHi,
-                                             rows: T * K, intermediate: I)
+                                             rows: T * K, intermediate: I,
+                                             swigluClamp: w.routedSwigluClamp)
             barrier()
             try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: dnHi, xLo: dnHi, bank: w.down,
                                             expertOff: expOff, tileE: tileE, tileR: tileR,
@@ -228,7 +232,10 @@ extension QWMoEOperator {
                                     bias: w.routerBias,
                                     expertBudget: w.moeSpecExpertBudget,
                                     splitFeature: w.splitFeatureRouting,
-                                    routedScaleParam: w.routedScaleParam)
+                                    routedScaleParam: w.routedScaleParam,
+                                    useSigmoid: w.useSigmoidScore, nGroup: w.nGroup,
+                                    topkGroup: w.topkGroup, groupTopM: w.groupTopM,
+                                    sharedSwigluClamp: w.sharedSwigluClamp)
         try QWGemm.encodeLatentNormH32F32(enc, hal: hal, x: ls.bufA32, gamma: nil,
                                           out32: ls.bufB32, rows: T, latent: L)
         barrier()
@@ -238,7 +245,8 @@ extension QWMoEOperator {
         if let shDown = w.sharedDown, let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
             if !fuseSh {
                 try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
-                                            intermediate: ISh, act16: shAct16)
+                                            intermediate: ISh, act16: shAct16,
+                                            swigluClamp: w.sharedSwigluClamp)
                 barrier()
             }
             let canAliasShDown0 = (s.naxX16?.shape.elementCount ?? 0) >= T * ISh
@@ -261,10 +269,12 @@ extension QWMoEOperator {
                                         rowsPerExpert: 2 * I, routes: K, tokens: T,
                                         fuseSiluFwht: fuseRoutedGU,
                                         coldBank: w.coldGateUp,
-                                        reuseExpertsAcrossTokens: w.reuseExpertsAcrossTokens)
+                                        reuseExpertsAcrossTokens: w.reuseExpertsAcrossTokens,
+                                        swigluClamp: w.routedSwigluClamp)
         barrier()
         if !fuseRoutedGU {
-            try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guBuf32, act: actBuf32, rows: T * K, intermediate: I)
+            try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guBuf32, act: actBuf32, rows: T * K,
+                                        intermediate: I, swigluClamp: w.routedSwigluClamp)
             barrier()
         }
         if !concurrentBarriers, let nextEnc = profileStage?("moe.experts_down") { enc = nextEnc }

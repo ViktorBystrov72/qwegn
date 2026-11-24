@@ -422,18 +422,16 @@ def quantize_model(source: Path, destination: Path,
         raise ValueError(f"no .safetensors under {source}")
     config = json.loads((source / "config.json").read_text())
     tc0 = config["text_config"] if "text_config" in config else config
-    if tc0.get("model_type") in ("ernie5_5_moe", "ernie5_5_moe_text"):
-        from ernie55_adapter import quantize_ernie55_model
-        return quantize_ernie55_model(
-            source=source, destination=destination, flat_root=flat_root,
-            quant=quant, group_size=group_size, dense_quant=dense_quant,
-            expert_quant=expert_quant, expert_down_quant=expert_down_quant)
-    if tc0.get("model_type") == "maxwell_moe":
-        from maxwell_adapter import quantize_maxwell_model
-        return quantize_maxwell_model(
-            source=source, destination=destination, flat_root=flat_root,
-            quant=quant, group_size=group_size, dense_quant=dense_quant,
-            expert_quant=expert_quant, expert_down_quant=expert_down_quant)
+    _ADAPTERS = {
+        **dict.fromkeys(("ernie5_5_moe", "ernie5_5_moe_text"), ("ernie55_adapter", "quantize_ernie55_model")),
+        "maxwell_moe": ("maxwell_adapter", "quantize_maxwell_model"),
+        **dict.fromkeys(("bailing_moe_v3", "bailing_moe_v3_vl", "bailing_moe_v3_text"), ("bailing_adapter", "quantize_bailing_model")),
+    }
+    if (adapter := _ADAPTERS.get(tc0.get("model_type") or config.get("model_type"))):
+        fn = getattr(__import__(adapter[0]), adapter[1])
+        return fn(source=source, destination=destination, flat_root=flat_root,
+                  quant=quant, group_size=group_size, dense_quant=dense_quant,
+                  expert_quant=expert_quant, expert_down_quant=expert_down_quant)
     qcfg = config.get("quantization_config")
     fp8_block_size = 128
     if qcfg is not None:

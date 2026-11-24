@@ -147,8 +147,12 @@ final class QWMTPDraftEncoder {
         self.geometry = geometry
         let h = geometry.hidden, kv = geometry.kvHeads * geometry.headDim
         let i = weights.down.k
+        let ropeDim = geometry.usesDecoupledRopeMLA ? geometry.qkRopeHeadDim : 0
+        let idxDim = geometry.mlaHasIndexer ? max(32, geometry.indexerHeadDim) : 0
+        let fallbackLatentCols = (geometry.mlaHasDirectQ ? 0 : geometry.qLoraRank)
+            + geometry.kvLoraRank + ropeDim + idxDim
         let expectedQKVCols = weights.mla != nil
-            ? (geometry.qLoraRank + geometry.kvLoraRank + geometry.indexerHeadDim)
+            ? (mlaOperator?.latentStride ?? fallbackLatentCols)
             : (geometry.qProjOut + 2 * kv)
         let expectedOutK = weights.mla != nil
             ? (geometry.qHeads * geometry.vHeadDim)
@@ -279,9 +283,14 @@ final class QWMTPDraftEncoder {
                           geometry: geometry)
     }
 
+    private func mropePositionsForRow(cacheRows: Int, mropeDelta: Int) -> [Int32]? {
+        guard let mla = mlaOperator, mla.mropeLayout != .none1D, mropeDelta != 0 else { return nil }
+        return [Int32](repeating: Int32(cacheRows + mropeDelta), count: 3)
+    }
+
     private func encodeQKV(_ enc: any MTLComputeCommandEncoder, embedding: QWTensorValue,
                            hidden: QWTensorValue, kv: (k: QWKVLayerView, v: QWKVLayerView),
-                           cacheRows: Int, absolutePosition: Int) throws {
+                           cacheRows: Int, absolutePosition: Int, mropeDelta: Int = 0) throws {
         try encodePreAttn(enc, embedding: embedding, hidden: hidden, kv: kv,
                           cacheRows: cacheRows, absolutePosition: absolutePosition)
         let s = scratch, w = weights
@@ -293,7 +302,8 @@ final class QWMTPDraftEncoder {
                         plan: qkvPlan, y32: s.qkv32, y16: latent1)
             mla.encodeLatentPrepAndPool(enc, ln1: s.ln1, mlaW: mlaW,
                                         kv: kv, fullAttnLayer: mlaLayerIndex,
-                                        pos0: cacheRows, rows: 1)
+                                        pos0: cacheRows, rows: 1,
+                                        mropePositions: mropePositionsForRow(cacheRows: cacheRows, mropeDelta: mropeDelta))
             return
         }
         try project(enc, x: s.ln1, gs: s.gsHidden, w: w.qkvProj,
@@ -314,9 +324,10 @@ final class QWMTPDraftEncoder {
     /// outputs. Seed K/V without attention readout, output projection, or MLP.
     func encodePairCache(_ enc: any MTLComputeCommandEncoder, embedding: QWTensorValue,
                          hidden: QWTensorValue, kv: (k: QWKVLayerView, v: QWKVLayerView),
-                         cacheRows: Int, absolutePosition: Int) throws {
+                         cacheRows: Int, absolutePosition: Int, mropeDelta: Int = 0) throws {
         try encodeQKV(enc, embedding: embedding, hidden: hidden, kv: kv,
-                       cacheRows: cacheRows, absolutePosition: absolutePosition)
+                       cacheRows: cacheRows, absolutePosition: absolutePosition,
+                       mropeDelta: mropeDelta)
         if mlaOperator != nil, weights.mla != nil {
             return
         }
@@ -360,31 +371,38 @@ final class QWMTPDraftEncoder {
 
     func encode(_ enc: any MTLComputeCommandEncoder, embedding: QWTensorValue,
                 hidden: QWTensorValue, kv: (k: QWKVLayerView, v: QWKVLayerView),
-                cacheRows: Int, absolutePosition: Int) throws {
+                cacheRows: Int, absolutePosition: Int, mropeDelta: Int = 0) throws {
         var current = enc
         try encode(&current, embedding: embedding, hidden: hidden, kv: kv,
-                   cacheRows: cacheRows, absolutePosition: absolutePosition)
+                   cacheRows: cacheRows, absolutePosition: absolutePosition,
+                   mropeDelta: mropeDelta)
     }
 
     func encode(_ enc: inout any MTLComputeCommandEncoder, embedding: QWTensorValue,
                 hidden: QWTensorValue, kv: (k: QWKVLayerView, v: QWKVLayerView),
                 cacheRows: Int, absolutePosition: Int,
+                mropeDelta: Int = 0,
                 driver: QWEngineDriver? = nil, cb: (any MTLCommandBuffer)? = nil) throws {
         try encodeQKV(enc, embedding: embedding, hidden: hidden, kv: kv,
-                       cacheRows: cacheRows, absolutePosition: absolutePosition)
+                       cacheRows: cacheRows, absolutePosition: absolutePosition,
+                       mropeDelta: mropeDelta)
         let s = scratch, w = weights
         if let mla = mlaOperator, let mlaW = w.mla, let qBPlan {
-            let qResid1 = QWTensorValue(region: mla.qResidScratch.region,
-                                        offset: mla.qResidScratch.offset,
-                                        shape: QWTensorShape([mlaW.qBProj.k], .f16))
+            let qIn1 = mla.isDirectQ
+                ? s.ln1
+                : QWTensorValue(region: mla.qResidScratch.region,
+                                offset: mla.qResidScratch.offset,
+                                shape: QWTensorShape([mlaW.qBProj.k], .f16))
             let qFull1 = QWTensorValue(region: mla.mlaQFullScratch.region,
                                        offset: mla.mlaQFullScratch.offset,
                                        shape: QWTensorShape([mlaW.qBProj.n], .f16))
-            try project(enc, x: qResid1, gs: s.gsHidden, w: mlaW.qBProj,
+            try project(enc, x: qIn1, gs: s.gsHidden, w: mlaW.qBProj,
                         plan: qBPlan, y32: s.qkv32, y16: qFull1)
             mla.encodeScoreSelectAbsorbAttendAndProjUV(
                 enc, mlaW: mlaW, kv: kv, attOut: s.attOut,
-                fullAttnLayer: mlaLayerIndex, pos0: cacheRows, rows: 1)
+                fullAttnLayer: mlaLayerIndex, pos0: cacheRows, rows: 1,
+                ln1: s.ln1,
+                mropePositions: mropePositionsForRow(cacheRows: cacheRows, mropeDelta: mropeDelta))
         } else {
             try attention.encode(enc, qgate: s.qRope, kv: kv, knew: s.kRope, vnew: s.v16,
                                  partials: s.partials, out: s.attOut,

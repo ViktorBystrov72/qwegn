@@ -73,7 +73,7 @@ extension QWGemm {
                                               tileCount: QWTensorValue? = nil,
                                               tilePlan: MoETilePlan? = nil,
                                               directSlotTok: Bool = false) throws {
-        precondition(experts <= 512, "the expert-sorted pair order holds 512 experts")
+        precondition(experts <= 1024, "the expert-sorted pair order holds 1024 experts")
         let hasTiles = tileE != nil && tileR != nil && tileCount != nil
         var writeWord = 0
         if hasTiles {
@@ -104,7 +104,7 @@ extension QWGemm {
     public static func encodeMoESpanIds(_ enc: any MTLComputeCommandEncoder, hal: QWHal, ids: QWTensorValue,
                                         slotMap: any MTLBuffer, out: QWTensorValue, count: Int,
                                         experts: Int, residentExperts: Int) throws {
-        precondition(experts <= 512, "the span map holds 512 experts")
+        precondition(experts <= 1024, "the span map holds 1024 experts")
         enc.setComputePipelineState(try hal.pipeline("qwg_moe_span_ids"))
         ids.bind(enc, index: 0)
         enc.setBuffer(slotMap, offset: 0, index: 1)
@@ -124,7 +124,8 @@ extension QWGemm {
                                             coldBank: QWWeightView? = nil,
                                             tileFilter: MoETileFilter = .all,
                                             reuseExpertsAcrossTokens: Bool = true,
-                                            gateSoftcap: Float = 0, upSoftcap: Float = 0) throws {
+                                            gateSoftcap: Float = 0, upSoftcap: Float = 0,
+                                            swigluClamp: QWSwiGLUClampSpec? = nil) throws {
         let intermediate = rowsPerExpert / 2
         let useFused = fuseSiluFwht && intermediate > 0 && (intermediate % 32 == 0)
         let residentE = coldBank != nil ? (bank.n / max(1, rowsPerExpert)) : 0
@@ -133,15 +134,17 @@ extension QWGemm {
         let eBase = (routes & 0x3FF) | dedupToks | filterBits | ((residentE & 0x7FFF) << 16)
         let ePacked = useFused ? (eBase | 0x8000_0000) : eBase
         let hasSoftcap = (gateSoftcap > 0 || upSoftcap > 0)
+        let clamp = (useFused && !hasSoftcap) ? swigluClamp : nil
         if bank.isIncumbentContainer {
             enc.setComputePipelineState(try hal.pipeline(
-                hasSoftcap ? "qwg_moe_gateup_q4g_f32_r1_sc" : "qwg_moe_gateup_q4g_f32_r1"))
+                hasSoftcap ? "qwg_moe_gateup_q4g_f32_r1_sc" : "qwg_moe_gateup_q4g_f32_r1",
+                swigluClamp: clamp))
         } else {
             guard let aqName = QWGemmAQ.moeGateUpF32R1KernelName(bits: bank.bits, group: bank.groupSize,
                                                                  isSHVQ: bank.isSHVQ, hasSoftcap: hasSoftcap) else {
                 throw QWGemmError.badWeights("no affine-quantised moe gateup r1 kernel for \(bank.bits)-bit group \(bank.groupSize)")
             }
-            enc.setComputePipelineState(try hal.pipeline(aqName))
+            enc.setComputePipelineState(try hal.pipeline(aqName, swigluClamp: clamp))
         }
         enc.bindTensors(bank.blocks, x, ids, out, startIndex: 0)
         enc.setUInt32s(rowsPerExpert, bank.k, ePacked, startIndex: 4)

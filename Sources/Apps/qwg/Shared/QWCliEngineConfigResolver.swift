@@ -267,7 +267,7 @@ struct QWResolvedCliEngineConfig {
             loopShareStride: resolvedLoopShareStride,
             explicitBudget: explicitBudget
         )
-        let tok = try QWTokenizer(json: runtimeAssets.tokenizerJSON)
+        let tok = try runtimeAssets.makeTokenizer()
         let specialTokens = tok.resolveSpecialTokens(fallback: runtimeAssets.descriptor.specialTokens)
         let resolvedCacheDirURL = knobs.cacheDir.map(\.canonicalFileURL) ?? QWCacheConfig.defaultCacheDirectory
         return QWResolvedCliEngineConfig(

@@ -24,13 +24,16 @@ enum QWMTPAdaptiveDepth {
         for layer in geometry.executionPlan {
             if geometry.isFullAttention(layer) {
                 if geometry.usesAnyMLA {
-                    let qkvCols = Double(geometry.qLoraRank + geometry.kvLoraRank + geometry.indexerHeadDim)
+                    let ropeDim = geometry.usesNoPEMLA ? 0 : geometry.qkRopeHeadDim
+                    let idxDim = geometry.mlaHasIndexer ? max(32, geometry.indexerHeadDim) : 0
+                    let qInDim = geometry.mlaHasDirectQ ? geometry.hidden : geometry.qLoraRank
+                    let qkvCols = Double((geometry.mlaHasDirectQ ? 0 : geometry.qLoraRank) + geometry.kvLoraRank + ropeDim + idxDim)
                     let gateCols = geometry.attnOutputGate ? Double(geometry.qHeads * geometry.vHeadDim) : 0.0
-                    let qBCols = Double(geometry.qHeads * (geometry.qkNopeHeadDim + geometry.qkRopeHeadDim)) + gateCols
+                    let qBCols = Double(geometry.qHeads * (geometry.qkNopeHeadDim + ropeDim)) + gateCols
                     let kvBCols = Double(geometry.qHeads * (geometry.qkNopeHeadDim + geometry.vHeadDim))
                     let oCols = Double(geometry.qHeads * geometry.vHeadDim)
                     trunkParams += qkvCols * h
-                    trunkParams += qBCols * Double(geometry.qLoraRank)
+                    trunkParams += qBCols * Double(qInDim)
                     trunkParams += kvBCols * Double(geometry.kvLoraRank)
                     trunkParams += h * oCols
                 } else {

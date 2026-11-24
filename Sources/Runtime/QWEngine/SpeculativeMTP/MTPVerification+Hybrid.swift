@@ -328,6 +328,7 @@ extension QWEngineDriver {
                     hal: hal, draft: draftEncoder, headStorage: headStorage,
                     draftHead: mtpDraftHead, hidden: hidden, kv: views,
                     pendingToken: pending, drafts: neuralCount, position: session.position, cacheRows: basePairs,
+                    mropeDelta: session.roundRecord.mropeDelta,
                     selection: .gpuChecked,
                     deviceEmbedding: owner != nil ? nil : mtpDeviceEmbedding,
                     embedding: { try self.copyEmbedRow($0, to: $1) },
@@ -581,14 +582,19 @@ extension QWEngineDriver {
                                      rows: rows, destination: embSlice)
             }
             if let mw = mtpWeights, rows >= 2, rows <= psc.maxChunk, h % 256 == 0 {
+                let seedMRoPE = mlaOperator.flatMap {
+                    session.mropeSlice(pos: startPos, count: rows, mropeLayout: $0.mropeLayout)
+                }
                 try encodeBatchedMTPPairSeed(
                     enc, mtpWeights: mw, embeddings: embSlice, hidden: trunkSlice,
                     previous: prevHidden, pos: startPos, tStart: 0,
-                    pairs: rows, cacheRows: startCacheRow, views: views)
+                    pairs: rows, cacheRows: startCacheRow, views: views,
+                    mropePositions: seedMRoPE)
             } else {
                 try QWMTPPromptSeeder.encode(enc, draft: draft, embeddings: embSlice, trunkHidden: trunkSlice,
                                              previousHidden: prevHidden, position: startPos,
-                                             count: rows, cacheRows: startCacheRow, kv: views)
+                                             count: rows, cacheRows: startCacheRow, kv: views,
+                                             mropeDelta: session.roundRecord.mropeDelta)
             }
         } catch {
             enc.endEncoding()

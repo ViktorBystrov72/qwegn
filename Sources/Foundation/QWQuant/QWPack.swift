@@ -103,16 +103,17 @@ public enum QWQuant {
                     let lowerMid = mid.lowercased()
                     let isDrafterMid = descriptor.role == .speculativeDrafter
                         && (lowerMid.hasPrefix("dflash") || lowerMid.hasPrefix("dspine"))
-                    let familyMatches = midFamily == descriptor.family
-                        || isDrafterMid
-                        || (midFamily == .qwen3MoE && descriptor.family == .qwen38MoE && (descriptor.numExperts ?? 0) > 0)
-                        || (midFamily == .qwen38Dense && [.qwen38MoE, .senseNovaLoop, .glm5Next, .ernie55MoE, .maxwellMoE].contains(descriptor.family))
+                    let dg = header.provenance.geometry_digest
+                    let hasMatchingDigest = dg.map {
+                        !$0.isEmpty && ($0 == descriptor.geometryDigestV2Hex || $0 == descriptor.geometryDigestV3Hex)
+                    } ?? false
+                    let isLegacySharedMid = (midFamily == .qwen38Dense || midFamily == .qwen3MoE) && hasMatchingDigest
+                    let familyMatches = (midFamily == descriptor.family) || isDrafterMid || isLegacySharedMid
                     guard familyMatches else {
                         throw QWQuantError.modelMismatch(pack: mid, expected: descriptor.family.rawValue)
                     }
-                    if let dg = header.provenance.geometry_digest, !dg.isEmpty {
-                        let matchesDigest = dg == descriptor.geometryDigestV2Hex || dg == descriptor.geometryDigestV3Hex
-                        guard matchesDigest else {
+                    if let dg, !dg.isEmpty {
+                        guard hasMatchingDigest else {
                             throw QWQuantError.geometryMismatch(pack: dg, expected: descriptor.geometryDigestV3Hex)
                         }
                     } else if descriptor.role == .speculativeDrafter, header.provenance.geometry_hash != nil {

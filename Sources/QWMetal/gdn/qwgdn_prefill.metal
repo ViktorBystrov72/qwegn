@@ -712,7 +712,7 @@ kernel void qwg_gdn_prefill_norm(
     // z: token t = row/48; z[h] at t·6144 + h·128 + tid = row·128 + tid (exact algebraic identity)
     const uint64_t off = row_off + tid;
     const float zn = float(zrow[off]);
-    const float gate = QW_GDN_VECTOR_DECAY ? (1.0f / (1.0f + exp(-zn))) : (zn / (1.0f + exp(-zn)));
+    const float gate = QW_GDN_NORM_SIGMOID ? (1.0f / (1.0f + exp(-zn))) : (zn / (1.0f + exp(-zn)));
     const half hg = half((o * rms * float(w[tid])) * gate);
     o_out[off] = simd_fwht32(hg, simd);
 }

@@ -108,7 +108,8 @@ extension QWEngineDriver {
         let root = QWModelRoot(url: URL(fileURLWithPath: packPath))
         let isSafetensors = (root.kind == .safetensorsSingle || root.kind == .safetensorsSharded)
         var targetDescriptor: QWModelDescriptor?
-        var resolvedPackFamily: QWModelDescriptor.Family?
+        var resolvedPackIsHyperStream = false
+        var resolvedPackIsRecurrentLoop = false
         if isSafetensors {
             guard let cfgURL = root.configURL else {
                 throw QWEngineDriverError.packMissing(packPath)
@@ -124,16 +125,21 @@ extension QWEngineDriver {
             } else {
                 let identity = try QWQuant.Pack.peekProvenance(url: URL(fileURLWithPath: packPath))
                 if let mid = identity.modelId {
-                    let family = QWModuleRegistry.family(forPackModelId: mid)
-                    guard let family, Self.servesFamilyOnDenseDriver(family) else {
+                    guard QWModuleRegistry.moduleType(forPackModelId: mid) != nil else {
                         throw QWEngineDriverError.unsupportedModel(mid)
                     }
-                    resolvedPackFamily = family
+                    resolvedPackIsHyperStream = QWModuleRegistry.isHyperStreamPackModelId(mid)
+                    resolvedPackIsRecurrentLoop = QWModuleRegistry.isRecurrentLoopPackModelId(mid)
                 }
             }
         }
-        let isHyperStream = ((targetDescriptor?.hcCount ?? 0) > 1) || (resolvedPackFamily == .qwen38FlashNext)
-        let isInkling2 = (targetDescriptor?.family == .inkling2Loop) || (resolvedPackFamily == .inkling2Loop)
+        let isHyperStream = ((targetDescriptor?.hcCount ?? 0) > 1) || resolvedPackIsHyperStream
+        let isInkling2: Bool = {
+            if let td = targetDescriptor, case .recurrentLoop(_, let ink) = td.executionTopology, ink != nil {
+                return true
+            }
+            return resolvedPackIsRecurrentLoop
+        }()
         let normRawKV = rawKVMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let effectiveKVString = normRawKV ?? String(describing: kvMode)
         if let desc = targetDescriptor {
@@ -250,14 +256,10 @@ extension QWEngineDriver {
             targetDescriptor: targetDescriptor)
     }
 
-    private static func servesFamilyOnDenseDriver(_ family: QWModelDescriptor.Family) -> Bool {
-        QWModuleRegistry.moduleType(for: family) != nil
-    }
-
     private static func ensureDriverServes(descriptor: QWModelDescriptor) throws {
         guard descriptor.role != .speculativeDrafter,
-              servesFamilyOnDenseDriver(descriptor.family) else {
-            throw QWEngineDriverError.unsupportedModel(descriptor.family.rawValue)
+              QWModuleRegistry.moduleType(forPackModelId: descriptor.modelType) != nil else {
+            throw QWEngineDriverError.unsupportedModel(descriptor.modelType)
         }
     }
 }

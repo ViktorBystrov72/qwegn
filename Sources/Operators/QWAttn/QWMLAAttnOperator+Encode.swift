@@ -144,10 +144,12 @@ extension QWMLAAttnOperator {
                                         kv: (k: QWKVLayerView, v: QWKVLayerView),
                                         fullAttnLayer: Int,
                                         pos0: Int,
-                                        rows: Int) {
+                                        rows: Int,
+                                        mropePositions: [Int32]? = nil) {
         if isDecoupledDSA {
             encodeDSALatentPrepAndCluster(enc, ln1: ln1, mlaW: mlaW, kv: kv,
-                                          fullAttnLayer: fullAttnLayer, pos0: pos0, rows: rows)
+                                          fullAttnLayer: fullAttnLayer, pos0: pos0, rows: rows,
+                                          mropePositions: mropePositions)
             return
         }
         guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0 else { return }
@@ -239,11 +241,16 @@ extension QWMLAAttnOperator {
                                                        fullAttnLayer: Int,
                                                        pos0: Int,
                                                        rows: Int,
+                                                       ln1: QWTensorValue? = nil,
+                                                       mropePositions: [Int32]? = nil,
+                                                       externalGatePrecomputed: Bool = false,
                                                        stage: ((String) -> (any MTLComputeCommandEncoder)?)? = nil) {
         if isDecoupledDSA {
             encodeDSAScoreSelectAbsorbAttendAndProjUV(
                 enc, mlaW: mlaW, kv: kv, attOut: attOut,
-                fullAttnLayer: fullAttnLayer, pos0: pos0, rows: rows, stage: stage)
+                fullAttnLayer: fullAttnLayer, pos0: pos0, rows: rows,
+                ln1: ln1, mropePositions: mropePositions,
+                externalGatePrecomputed: externalGatePrecomputed, stage: stage)
             return
         }
         guard fullAttnLayer >= 0, fullAttnLayer < layers.count, rows > 0 else { return }

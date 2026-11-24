@@ -172,7 +172,7 @@ kernel void qwg_gdn_recurrent(
         const float total = redNorm[0] + redNorm[1] + redNorm[2] + redNorm[3];
         const float rms = rsqrt(total * (1.0f / 128.0f) + QW_RMS_EPS);
         const float zn = float(zrow[(uint64_t)h * 128u + c]);
-        const float gate = QW_GDN_VECTOR_DECAY ? (1.0f / (1.0f + exp(-zn))) : (zn / (1.0f + exp(-zn)));
+        const float gate = QW_GDN_NORM_SIGMOID ? (1.0f / (1.0f + exp(-zn))) : (zn / (1.0f + exp(-zn)));
         const float gated = (o * rms * float(w[c])) * gate;
         const half hg = simd_fwht32(half(gated), c & 31u);
         o_out[(uint64_t)h * 128u + c] = hg;
@@ -314,7 +314,7 @@ kernel void qwg_gdn_recurrent_rows(
             const float total = redNorm[0] + redNorm[1] + redNorm[2] + redNorm[3];
             const float rms = rsqrt(total * (1.0f / 128.0f) + QW_RMS_EPS);
             const float zn = float(zBase[(uint64_t)r * zStride + idx]);
-            const float gate = QW_GDN_VECTOR_DECAY ? (1.0f / (1.0f + exp(-zn))) : (zn / (1.0f + exp(-zn)));
+            const float gate = QW_GDN_NORM_SIGMOID ? (1.0f / (1.0f + exp(-zn))) : (zn / (1.0f + exp(-zn)));
             const float gated = (o * rms * float(w[c])) * gate;
             const half hg = simd_fwht32(half(gated), c & 31u);
             o_out[(uint64_t)r * QW_GDN_Z_CH + idx] = hg;
@@ -410,13 +410,12 @@ kernel void qwg_gdn_rollback_rows(
     }
 }
 
-// Fused low-rank KDA gates: f_b_proj(f_low) + dt_bias -> glog (stored as exp(g), the per-channel
-// decay, so recurrences skip the exp), g_b_proj(g_low) -> zOut, and sigmoid(b_raw) -> betas.
-// Grid: (QW_GDN_V_HEADS, T, 1) x 128 threads/TG.
+// Fused low-rank KDA gates: f_b_proj(f_low) + dt_bias -> glog (exp(g)), g_b_proj(g_low) -> zOut.
+// Grid: (QW_GDN_V_HEADS, T, 1) x QW_GDN_HEAD_DIM threads/TG.
 kernel void qwg_kda_gates(
-        device const half*  fgb            [[buffer(0)]],   // [T][256 + QW_GDN_V_HEADS]
-        device const half*  fB             [[buffer(1)]],   // [QW_GDN_Z_CH][128]
-        device const half*  gB             [[buffer(2)]],   // [QW_GDN_Z_CH][128]
+        device const half*  fgb            [[buffer(0)]],   // [T][2*lowRank + QW_GDN_V_HEADS]
+        device const half*  fB             [[buffer(1)]],   // [QW_GDN_Z_CH][lowRank]
+        device const half*  gB             [[buffer(2)]],   // [QW_GDN_Z_CH][lowRank]
         device const float* aLog           [[buffer(3)]],   // [QW_GDN_V_HEADS]
         device const float* dtBias         [[buffer(4)]],   // [QW_GDN_Z_CH]
         device float*       betas          [[buffer(5)]],   // [T][QW_GDN_V_HEADS]
@@ -424,38 +423,41 @@ kernel void qwg_kda_gates(
         device half*        zOut           [[buffer(7)]],   // [T][QW_GDN_Z_CH]
         constant float&     gateLowerBound [[buffer(8)]],
         constant uint&      T              [[buffer(9)]],
+        constant uint&      lowRank        [[buffer(10)]],
         uint2 tg  [[threadgroup_position_in_grid]],
         uint  tid [[thread_index_in_threadgroup]]) {
     const uint h = tg.x;
     const uint t = tg.y;
-    if (h >= QW_GDN_V_HEADS || t >= T || tid >= 128u) return;
+    if (h >= QW_GDN_V_HEADS || t >= T || tid >= QW_GDN_HEAD_DIM) return;
 
-    const uint fgbStride = 256u + QW_GDN_V_HEADS;
+    const uint fgbStride = 2u * lowRank + QW_GDN_V_HEADS;
     device const half* row = fgb + (size_t)t * fgbStride;
 
-    threadgroup float sF[128];
-    threadgroup float sG[128];
+    threadgroup float sF[256];
+    threadgroup float sG[256];
     threadgroup float sDecayRate;
 
-    sF[tid] = float(row[tid]);
-    sG[tid] = float(row[128u + tid]);
+    for (uint i = tid; i < lowRank; i += QW_GDN_HEAD_DIM) {
+        sF[i] = float(row[i]);
+        sG[i] = float(row[lowRank + i]);
+    }
     if (tid == 0u) {
-        const float bVal = float(row[256u + h]);
+        const float bVal = float(row[2u * lowRank + h]);
         betas[(size_t)t * QW_GDN_V_HEADS + h] = 1.0f / (1.0f + exp(-bVal));
         sDecayRate = exp(aLog[h]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint c = h * 128u + tid;
-    device const half4* fRow4 = (device const half4*)(fB + (size_t)c * 128u);
-    device const half4* gRow4 = (device const half4*)(gB + (size_t)c * 128u);
+    const uint c = h * QW_GDN_HEAD_DIM + tid;
+    device const half4* fRow4 = (device const half4*)(fB + (size_t)c * lowRank);
+    device const half4* gRow4 = (device const half4*)(gB + (size_t)c * lowRank);
     threadgroup const float4* sF4 = (threadgroup const float4*)sF;
     threadgroup const float4* sG4 = (threadgroup const float4*)sG;
 
     float fAcc = 0.0f;
     float gAcc = 0.0f;
-    #pragma unroll
-    for (uint q = 0u; q < 32u; ++q) {
+    const uint qCount = lowRank >> 2u;
+    for (uint q = 0u; q < qCount; ++q) {
         const float4 fv = sF4[q];
         const float4 gv = sG4[q];
         const float4 fw = float4(fRow4[q]);
@@ -475,13 +477,10 @@ kernel void qwg_kda_gates(
     zOut[outIdx] = half(gAcc);
 }
 
-
-// Prefill variant of qwg_kda_gates on simdgroup MMA: one threadgroup computes 32 tokens x one
-// head (128 channels) for both expansions, so each f_b/g_b head slice is read once per 32 tokens
-// instead of once per token. Same epilogue as the scalar kernel.
+// Prefill variant of qwg_kda_gates on simdgroup MMA (32 tokens x one head, sequential f/g stage <= 17 KiB).
 // Grid: (QW_GDN_V_HEADS, (T + 31) / 32, 1) x 128 threads/TG.
 #define KDA_MMA_TM 32u
-#define KDA_MMA_AS 136u
+#define KDA_MMA_AS 264u
 
 static inline uint qw_kda_row(uint l) { return ((l >> 4) & 1u) * 4u + ((l >> 2) & 1u) * 2u + ((l >> 1) & 1u); }
 static inline uint qw_kda_col(uint l) { return ((l >> 3) & 1u) * 4u + (l & 1u) * 2u; }
@@ -497,6 +496,7 @@ kernel void qwg_kda_gates_mma(
         device half*        zOut           [[buffer(7)]],
         constant float&     gateLowerBound [[buffer(8)]],
         constant uint&      T              [[buffer(9)]],
+        constant uint&      lowRank        [[buffer(10)]],
         uint2 tg   [[threadgroup_position_in_grid]],
         uint  tid  [[thread_index_in_threadgroup]],
         uint  sg   [[simdgroup_index_in_threadgroup]],
@@ -504,61 +504,124 @@ kernel void qwg_kda_gates_mma(
     const uint h = tg.x;
     const uint tBase = tg.y * KDA_MMA_TM;
     if (h >= QW_GDN_V_HEADS || tBase >= T) return;
-    const uint fgbStride = 256u + QW_GDN_V_HEADS;
+    const uint fgbStride = 2u * lowRank + QW_GDN_V_HEADS;
+    const uint aStride = lowRank + 8u;
+    const uint jTiles = QW_GDN_HEAD_DIM >> 3u;
 
-    threadgroup half aF[KDA_MMA_TM * KDA_MMA_AS];
-    threadgroup half aG[KDA_MMA_TM * KDA_MMA_AS];
-    for (uint i = tid; i < KDA_MMA_TM * 256u; i += 128u) {
-        const uint r = i >> 8u, k = i & 255u;
-        const half v = (tBase + r < T) ? fgb[(size_t)(tBase + r) * fgbStride + k] : half(0.0h);
-        if (k < 128u) aF[r * KDA_MMA_AS + k] = v; else aG[r * KDA_MMA_AS + (k - 128u)] = v;
-    }
+    threadgroup half shA[KDA_MMA_TM * KDA_MMA_AS];
     if (tid < KDA_MMA_TM && tBase + tid < T) {
-        const float bVal = float(fgb[(size_t)(tBase + tid) * fgbStride + 256u + h]);
+        const float bVal = float(fgb[(size_t)(tBase + tid) * fgbStride + 2u * lowRank + h]);
         betas[(size_t)(tBase + tid) * QW_GDN_V_HEADS + h] = 1.0f / (1.0f + exp(-bVal));
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     const float decayRate = exp(aLog[h]);
     const uint t = tBase + sg * 8u + qw_kda_row(lane);
     const bool tValid = t < T;
+    const uint total = KDA_MMA_TM * lowRank;
     for (uint m = 0u; m < 2u; ++m) {
-        threadgroup const half* a = (m == 0u ? aF : aG) + sg * 8u * KDA_MMA_AS;
-        device const half* W = (m == 0u ? fB : gB) + (size_t)h * 128u * 128u;
+        const uint srcOff = m * lowRank;
+        for (uint i = tid; i < total; i += 128u) {
+            const uint r = i / lowRank;
+            const uint k = i - r * lowRank;
+            shA[r * aStride + k] = (tBase + r < T) ? fgb[(size_t)(tBase + r) * fgbStride + srcOff + k] : half(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* a = shA + sg * 8u * aStride;
+        device const half* W = (m == 0u ? fB : gB) + (size_t)h * QW_GDN_HEAD_DIM * lowRank;
         simdgroup_float8x8 acc[16];
         #pragma unroll
         for (uint j = 0u; j < 16u; ++j) acc[j] = simdgroup_float8x8(0.0f);
-        for (uint kk = 0u; kk < 128u; kk += 8u) {
+        for (uint kk = 0u; kk < lowRank; kk += 8u) {
             simdgroup_half8x8 af;
-            simdgroup_load(af, a + kk, KDA_MMA_AS);
-            #pragma unroll
-            for (uint j = 0u; j < 16u; ++j) {
+            simdgroup_load(af, a + kk, aStride);
+            for (uint j = 0u; j < jTiles; ++j) {
                 simdgroup_half8x8 bf;
-                simdgroup_load(bf, W + (size_t)j * 8u * 128u + kk, 128u, ulong2(0, 0), true);
+                simdgroup_load(bf, W + (size_t)j * 8u * lowRank + kk, lowRank, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(acc[j], af, bf, acc[j]);
             }
         }
-        if (!tValid) continue;
-        #pragma unroll
-        for (uint j = 0u; j < 16u; ++j) {
-            auto e = acc[j].thread_elements();
-            const uint c0 = h * 128u + j * 8u + qw_kda_col(lane);
-            const size_t o = (size_t)t * QW_GDN_Z_CH + c0;
-            #pragma unroll
-            for (uint q = 0u; q < 2u; ++q) {
-                const float v = e[q];
-                if (m == 0u) {
-                    const float gVal = v + dtBias[c0 + q];
-                    if (gateLowerBound > -1.0e30f) {
-                        glog[o + q] = exp(gateLowerBound / (1.0f + exp(-(decayRate * gVal))));
+        if (tValid) {
+            for (uint j = 0u; j < jTiles; ++j) {
+                auto e = acc[j].thread_elements();
+                const uint c0 = h * QW_GDN_HEAD_DIM + j * 8u + qw_kda_col(lane);
+                const size_t o = (size_t)t * QW_GDN_Z_CH + c0;
+                #pragma unroll
+                for (uint q = 0u; q < 2u; ++q) {
+                    const float v = e[q];
+                    if (m == 0u) {
+                        const float gVal = v + dtBias[c0 + q];
+                        if (gateLowerBound > -1.0e30f) {
+                            glog[o + q] = exp(gateLowerBound / (1.0f + exp(-(decayRate * gVal))));
+                        } else {
+                            const float sp = (gVal > 20.0f) ? gVal : log(1.0f + exp(gVal));
+                            glog[o + q] = exp(-decayRate * sp);
+                        }
                     } else {
-                        const float sp = (gVal > 20.0f) ? gVal : log(1.0f + exp(gVal));
-                        glog[o + q] = exp(-decayRate * sp);
+                        zOut[o + q] = half(v);
                     }
-                } else {
-                    zOut[o + q] = half(v);
                 }
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+// Full-rank KDA gate transformation (`no_kda_lora = true`) with optional raw F16 b_proj dot product.
+// Grid: (QW_GDN_V_HEADS, T, 1) x QW_GDN_HEAD_DIM threads/TG.
+kernel void qwg_kda_gates_direct(
+        device const half*  fgb            [[buffer(0)]],
+        device const half*  ln1            [[buffer(1)]],
+        device const half*  bProjF16       [[buffer(2)]],
+        device const float* aLog           [[buffer(3)]],
+        device const float* dtBias         [[buffer(4)]],
+        device float*       betas          [[buffer(5)]],
+        device float*       glog           [[buffer(6)]],
+        device half*        zOut           [[buffer(7)]],
+        constant float&     gateLowerBound [[buffer(8)]],
+        constant uint&      T              [[buffer(9)]],
+        constant uint&      hasRawBProj    [[buffer(10)]],
+        uint2 tg  [[threadgroup_position_in_grid]],
+        uint  tid [[thread_index_in_threadgroup]]) {
+    const uint h = tg.x;
+    const uint t = tg.y;
+    if (h >= QW_GDN_V_HEADS || t >= T || tid >= QW_GDN_HEAD_DIM) return;
+
+    const uint fgbStride = (hasRawBProj != 0u) ? (2u * QW_GDN_Z_CH) : (2u * QW_GDN_Z_CH + QW_GDN_V_HEADS);
+    device const half* fgbRow = fgb + (size_t)t * fgbStride;
+
+    threadgroup float sgSum[8];
+    threadgroup float sDecayRate;
+    if (hasRawBProj != 0u) {
+        device const half* xRow = ln1 + (size_t)t * QW_HIDDEN;
+        device const half* bRow = bProjF16 + (size_t)h * QW_HIDDEN;
+        float bPart = 0.0f;
+        for (uint k = tid; k < QW_HIDDEN; k += QW_GDN_HEAD_DIM) {
+            bPart = fma(float(xRow[k]), float(bRow[k]), bPart);
+        }
+        bPart = simd_sum(bPart);
+        if ((tid & 31u) == 0u) sgSum[tid >> 5u] = bPart;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            const uint nSG = (QW_GDN_HEAD_DIM + 31u) >> 5u;
+            float bVal = 0.0f;
+            for (uint s = 0u; s < nSG; ++s) bVal += sgSum[s];
+            betas[(size_t)t * QW_GDN_V_HEADS + h] = 1.0f / (1.0f + exp(-bVal));
+            sDecayRate = exp(aLog[h]);
+        }
+    } else if (tid == 0u) {
+        const float bVal = float(fgbRow[2u * QW_GDN_Z_CH + h]);
+        betas[(size_t)t * QW_GDN_V_HEADS + h] = 1.0f / (1.0f + exp(-bVal));
+        sDecayRate = exp(aLog[h]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint c = h * QW_GDN_HEAD_DIM + tid;
+    const float gVal = float(fgbRow[c]) + dtBias[c];
+    const size_t outIdx = (size_t)t * QW_GDN_Z_CH + c;
+    if (gateLowerBound > -1.0e30f) {
+        glog[outIdx] = exp(gateLowerBound / (1.0f + exp(-(sDecayRate * gVal))));
+    } else {
+        const float sp = (gVal > 20.0f) ? gVal : log(1.0f + exp(gVal));
+        glog[outIdx] = exp(-sDecayRate * sp);
+    }
+    zOut[outIdx] = fgbRow[QW_GDN_Z_CH + c];
 }

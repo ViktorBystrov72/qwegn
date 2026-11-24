@@ -275,9 +275,8 @@ extension QWEngineDriver {
                                     pack: QWQuant.Pack? = nil) throws -> QWWeightFormatChoice {
         switch root.kind {
         case .safetensorsSingle, .safetensorsSharded:
-            if geometry.descriptor.family == .inkling2Loop {
-                let counts = geometry.descriptor.inkling2Config?.expertModesCount(numLayers: geometry.numLayers)
-                    ?? (nvfp4: 0, mxfp8: 0, bf16: geometry.numLayers)
+            if case .recurrentLoop(_, let ink) = geometry.descriptor.executionTopology, let ink {
+                let counts = ink.expertModesCount(numLayers: geometry.numLayers)
                 return QWWeightFormatChoice(
                     format: .nativeMixedFP(denseBits: 16, nvfp4Layers: counts.nvfp4, mxfp8Layers: counts.mxfp8),
                     declineReason: nil)
@@ -439,19 +438,30 @@ extension QWEngineDriver {
         let maxT = max(32, prefillChunkRows)
         var ringCap = 4096
         while ringCap < maxT * 2 { ringCap <<= 1 }
-        let idxDim = max(32, geometry.indexerHeadDim)
-        let idxHeads = max(1, geometry.indexerHeads)
+        let hasIndexer = geometry.mlaHasIndexer
+        let idxDim = hasIndexer ? max(32, geometry.indexerHeadDim) : 0
+        let idxHeads = hasIndexer ? max(1, geometry.indexerHeads) : 0
+        let ropeDim = geometry.usesNoPEMLA ? 0 : geometry.qkRopeHeadDim
         let nopeDim = geometry.qkNopeHeadDim > 0 ? geometry.qkNopeHeadDim : geometry.headDim
-        let extraQ = geometry.usesNoPEMLA ? 0 : (geometry.qHeads * geometry.qkRopeHeadDim
-            + (geometry.attnOutputGate ? geometry.qHeads * geometry.vHeadDim : 0))
-        let latentStride = geometry.qLoraRank + geometry.kvLoraRank + idxDim
+        let gateMode = geometry.mlaConfig?.outputGateMode
+            ?? (geometry.attnOutputGate ? .elementWiseFromQLora : .none)
+        let inlineGate = (gateMode == .elementWiseFromQLora) ? geometry.qHeads * geometry.vHeadDim : 0
+        let extGateCols = gateMode == .headWiseFromHidden
+            ? geometry.qHeads
+            : (gateMode == .elementWiseFromHidden ? geometry.qHeads * geometry.vHeadDim : 0)
+        let yVhaCols = geometry.usesDecoupledRopeMLA ? (geometry.qHeads * geometry.vHeadDim) : 0
+        let extraQ = geometry.usesNoPEMLA ? 0 : (geometry.qHeads * ropeDim + inlineGate)
+        let latentStride = geometry.qLoraRank + geometry.kvLoraRank + ropeDim + idxDim
         let qFullStride = geometry.qHeads * nopeDim + extraQ + idxHeads * idxDim
-        let perLayerRings = activeAttnLayers * 2 * ringCap * idxDim * 2
+        let perLayerRings = (geometry.usesDecoupledRopeMLA || !hasIndexer)
+            ? 0
+            : (activeAttnLayers * 2 * ringCap * idxDim * 2)
         let perTokChunk = (latentStride + geometry.qLoraRank + qFullStride
-            + 2 * geometry.qHeads * geometry.kvLoraRank) * 2
-            + idxHeads * 4 + 1024 * 4 + 4
+            + 2 * geometry.qHeads * geometry.kvLoraRank + extGateCols + yVhaCols) * 2
+            + idxHeads * 4 + (hasIndexer ? 1024 * 4 : 0) + 16
         let splitPartials = min(maxT, 64) * 16 * geometry.qHeads * (geometry.kvLoraRank * 2 + 8)
-        return perLayerRings + maxT * perTokChunk + splitPartials + (72 << 20)
+        let indexerWorkspace = hasIndexer ? (72 << 20) : (2 << 20)
+        return perLayerRings + maxT * perTokChunk + splitPartials + indexerWorkspace
     }
 
     static func hcaFixedScratchBytes(
@@ -484,8 +494,10 @@ extension QWEngineDriver {
     ) -> Int {
         guard let bsa = geometry.blockSparseGQAConfig, attnLayerCount > 0 else { return 0 }
         let maxR = max(8, prefillChunkRows)
-        let qkv = maxR * (geometry.kvHeads + 1) * geometry.headDim * 2
-        let q = maxR * geometry.kvHeads * geometry.headDim * 2
+        let idxH = geometry.mbsaIndexerHeads
+        let idxD = geometry.mbsaIndexerHeadDim
+        let qkv = maxR * (idxH + 1) * idxD * 2
+        let q = maxR * idxH * idxD * 2
         let blkList = maxR * geometry.kvHeads * max(1, bsa.maxSelectedBlocks) * 4
         let blkCnt = maxR * geometry.kvHeads * 4
         let maxTiles = (maxR + 31) / 32
@@ -497,6 +509,6 @@ extension QWEngineDriver {
 
     static func mbsaPerTokenBytes(geometry: QWModelGeometry, attnLayerCount: Int) -> Int {
         guard geometry.blockSparseGQAConfig != nil, attnLayerCount > 0 else { return 0 }
-        return attnLayerCount * geometry.headDim * 2
+        return attnLayerCount * geometry.mbsaIndexerHeadDim * 2
     }
 }

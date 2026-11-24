@@ -72,7 +72,9 @@ extension QWVisionMetalBackend {
         }
     }
 
-    private static func weightBufferBytes(config cfg: QWVisionConfig, depth: Int, fc2Out: Int) -> Int {
+    private static func weightBufferBytes(
+        config cfg: QWVisionConfig, depth: Int, fc1Mid: Int, fc2Out: Int
+    ) -> Int {
         let d = cfg.dim, mlp = cfg.mlpInner, qkvD = cfg.qkvDim
         let merged = cfg.merged, pc = cfg.patchChannels
         let topBytes =
@@ -80,8 +82,8 @@ extension QWVisionMetalBackend {
             qwAlignUp(d * pc * 2) +
             qwAlignUp(d * 2) +
             qwAlignUp(d * 2) + qwAlignUp(d * 2) +
-            qwAlignUp(merged * merged * 2) + qwAlignUp(merged * 2) +
-            qwAlignUp(fc2Out * merged * 2) + qwAlignUp(fc2Out * 2) +
+            qwAlignUp(fc1Mid * merged * 2) + qwAlignUp(fc1Mid * 2) +
+            qwAlignUp(fc2Out * fc1Mid * 2) + qwAlignUp(fc2Out * 2) +
             qwAlignUp(cfg.invFreqCount * 4)
         let perBlockBytes =
             qwAlignUp(d * 2) * 4 +
@@ -95,6 +97,7 @@ extension QWVisionMetalBackend {
     private static func packTensors(
         config cfg: QWVisionConfig,
         depth: Int,
+        fc1Mid: Int,
         fc2Out: Int,
         device: any MTLDevice,
         posEmbed: () throws -> [Float],
@@ -111,7 +114,7 @@ extension QWVisionMetalBackend {
     ) throws -> MetalWeights {
         let d = cfg.dim, mlp = cfg.mlpInner, qkvD = cfg.qkvDim
         let merged = cfg.merged, pc = cfg.patchChannels
-        let totalBytes = weightBufferBytes(config: cfg, depth: depth, fc2Out: fc2Out)
+        let totalBytes = weightBufferBytes(config: cfg, depth: depth, fc1Mid: fc1Mid, fc2Out: fc2Out)
         guard let buffer = device.makeBuffer(length: max(256, totalBytes), options: .storageModeShared) else {
             throw QWHalError.noDevice
         }
@@ -152,9 +155,9 @@ extension QWVisionMetalBackend {
 
         let mergerGT = try uploadF16(try mergerG(), expectedCount: d)
         let mergerBT = try uploadF16(try mergerB(), expectedCount: d)
-        let fc1WT = try uploadF16(try fc1W(), expectedCount: merged * merged)
-        let fc1BT = try uploadF16(try fc1B(), expectedCount: merged)
-        let fc2WT = try uploadF16(try fc2W(), expectedCount: fc2Out * merged)
+        let fc1WT = try uploadF16(try fc1W(), expectedCount: fc1Mid * merged)
+        let fc1BT = try uploadF16(try fc1B(), expectedCount: fc1Mid)
+        let fc2WT = try uploadF16(try fc2W(), expectedCount: fc2Out * fc1Mid)
         let fc2BT = try uploadF16(try fc2B(), expectedCount: fc2Out)
         let invFreqT = try sub.allocate(QWTensorShape([invFreq.count], .f32))
         writePODArray(invFreq, into: invFreqT)
@@ -165,7 +168,7 @@ extension QWVisionMetalBackend {
             blocks: blocks,
             mergerG: mergerGT, mergerB: mergerBT,
             fc1W: fc1WT, fc1B: fc1BT, fc2W: fc2WT, fc2B: fc2BT,
-            invFreq: invFreqT, fc2Out: fc2Out
+            invFreq: invFreqT, fc1Mid: fc1Mid, fc2Out: fc2Out
         )
     }
 
@@ -173,6 +176,7 @@ extension QWVisionMetalBackend {
         try packTensors(
             config: w.config,
             depth: w.blocks.count,
+            fc1Mid: w.fc1Mid,
             fc2Out: w.fc2Out,
             device: device,
             posEmbed: { w.posEmbed },
@@ -213,6 +217,7 @@ extension QWVisionMetalBackend {
     ) throws -> MetalWeights {
         let cfg = ck.config
         let d = cfg.dim, merged = cfg.merged
+        let fc1Mid = QWVisionWeights.resolveFc1Mid(in: ck, config: cfg)
         let depth = try QWVisionWeights.countBlocks(in: ck)
         guard ck.has("merger.norm.weight"), ck.has("merger.norm.bias") else {
             throw QWVisionError.badLayout("merger.norm non-affine law violated (affine weights required)")
@@ -220,6 +225,7 @@ extension QWVisionMetalBackend {
         return try packTensors(
             config: cfg,
             depth: depth,
+            fc1Mid: fc1Mid,
             fc2Out: fc2Out,
             device: device,
             posEmbed: { try ck.f32("pos_embed.weight", want: [cfg.numPosEmbeds, d]) },
@@ -230,10 +236,18 @@ extension QWVisionMetalBackend {
             },
             mergerG: { try ck.f32("merger.norm.weight", want: [d]) },
             mergerB: { try ck.f32("merger.norm.bias", want: [d]) },
-            fc1W: { try ck.f32("merger.linear_fc1.weight", want: [merged, merged]) },
-            fc1B: { try ck.f32("merger.linear_fc1.bias", want: [merged]) },
-            fc2W: { try ck.f32("merger.linear_fc2.weight", want: [fc2Out, merged]) },
-            fc2B: { try ck.f32("merger.linear_fc2.bias", want: [fc2Out]) },
+            fc1W: { try ck.f32("merger.linear_fc1.weight", want: [fc1Mid, merged]) },
+            fc1B: {
+                cfg.projectorBias
+                    ? try ck.f32("merger.linear_fc1.bias", want: [fc1Mid])
+                    : [Float](repeating: 0, count: fc1Mid)
+            },
+            fc2W: { try ck.f32("merger.linear_fc2.weight", want: [fc2Out, fc1Mid]) },
+            fc2B: {
+                cfg.projectorBias
+                    ? try ck.f32("merger.linear_fc2.bias", want: [fc2Out])
+                    : [Float](repeating: 0, count: fc2Out)
+            },
             invFreq: QWVisionWeights.computeInvFreq(config: cfg)
         )
     }

@@ -52,7 +52,41 @@ public final class QWEngineSession: @unchecked Sendable {
     var stochastic: QWStochasticSession?
     var attnKVViews: [(k: QWKVLayerView, v: QWKVLayerView)] = []
     var mtpKVViews: [(k: QWKVLayerView, v: QWKVLayerView)] = []
+    var mropeTurnPositions: [Int32]?
+    var mropeTurnStartPos: Int = 0
+    var mropeTurnTokenCount: Int = 0
     public var mtpPhysicalRows: Int { roundRecord.mtpPhysicalRows }
+
+    func clearTurnMRoPE() {
+        mropeTurnPositions = nil
+        mropeTurnStartPos = 0
+        mropeTurnTokenCount = 0
+    }
+
+    func mropeSlice(pos: Int, count: Int, mropeLayout: QWModelDescriptor.MRoPELayout) -> [Int32]? {
+        guard mropeLayout != .none1D, count > 0 else { return nil }
+        if let buf = mropeTurnPositions, mropeTurnTokenCount > 0,
+           pos >= mropeTurnStartPos, pos + count <= mropeTurnStartPos + mropeTurnTokenCount {
+            let total = mropeTurnTokenCount
+            let off = pos - mropeTurnStartPos
+            var out = [Int32]()
+            out.reserveCapacity(3 * count)
+            out.append(contentsOf: buf[off..<(off + count)])
+            out.append(contentsOf: buf[(total + off)..<(total + off + count)])
+            out.append(contentsOf: buf[(2 * total + off)..<(2 * total + off + count)])
+            return out
+        }
+        let delta = roundRecord.mropeDelta
+        guard delta != 0 else { return nil }
+        var out = [Int32](repeating: 0, count: 3 * count)
+        for i in 0..<count {
+            let p = Int32(pos + delta + i)
+            out[i] = p
+            out[count + i] = p
+            out[2 * count + i] = p
+        }
+        return out
+    }
 
     init(kv: QWKVHandle, mtpKV: QWKVHandle? = nil, rec: [QWTensorValue],
          ring: [QWTensorValue], recSlab: QWTensorValue, ringSlab: QWTensorValue,

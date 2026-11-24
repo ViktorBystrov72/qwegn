@@ -268,7 +268,8 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
         self.ropeMscale = mscale
 
         let splits = Int(ProcessInfo.processInfo.environment["QW_HCA_ATTN_SPLIT"] ?? "") ?? 8
-        self.attnSplits = (self.headDim == 512 && self.qHeads % 16 == 0) ? max(1, min(32, splits)) : 1
+        self.attnSplits = (self.headDim >= 128 && self.headDim <= 512 && self.headDim % 128 == 0 && self.qHeads % 16 == 0)
+            ? max(1, min(32, splits)) : 1
 
         self.psoInPrep = try hal.pipeline("qwg_hca_in_prep")
         self.psoCompressBlocks = try hal.pipeline("qwg_hca_compress_blocks")

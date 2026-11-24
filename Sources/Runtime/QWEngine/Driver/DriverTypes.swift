@@ -25,15 +25,17 @@ extension QWEngineDriver {
         let conv: QWTensorValue, normW: QWTensorValue, aLog: QWTensorValue, dtBias: QWTensorValue
         let out: QWWeightView
         let fgbProj: QWWeightView?
+        let bProjF16: QWTensorValue?
         let fB: QWTensorValue?
         let gB: QWTensorValue?
 
         init(inProj: QWWeightView, qkv: QWWeightView, z: QWWeightView, a: QWWeightView, b: QWWeightView,
              conv: QWTensorValue, normW: QWTensorValue, aLog: QWTensorValue, dtBias: QWTensorValue,
-             out: QWWeightView, fgbProj: QWWeightView? = nil, fB: QWTensorValue? = nil, gB: QWTensorValue? = nil) {
+             out: QWWeightView, fgbProj: QWWeightView? = nil, bProjF16: QWTensorValue? = nil,
+             fB: QWTensorValue? = nil, gB: QWTensorValue? = nil) {
             self.inProj = inProj; self.qkv = qkv; self.z = z; self.a = a; self.b = b
             self.conv = conv; self.normW = normW; self.aLog = aLog; self.dtBias = dtBias
-            self.out = out; self.fgbProj = fgbProj; self.fB = fB; self.gB = gB
+            self.out = out; self.fgbProj = fgbProj; self.bProjF16 = bProjF16; self.fB = fB; self.gB = gB
         }
     }
     final class AttnW: @unchecked Sendable {
@@ -80,6 +82,12 @@ extension QWEngineDriver {
         let sharedDown: QWWeightView?
         let sharedGateScalar: QWTensorValue?
         let coldStreamer: ColdExpertStreamer?
+        let useSigmoidScore: Bool
+        let nGroup: Int
+        let topkGroup: Int
+        let groupTopM: Int
+        let routedSwigluClamp: QWSwiGLUClampSpec?
+        let sharedSwigluClamp: QWSwiGLUClampSpec?
 
         init(router: QWTensorValue, gateUp: QWWeightView, down: QWWeightView,
              numExperts: Int, expertsPerTok: Int,
@@ -90,7 +98,11 @@ extension QWEngineDriver {
              splitFeatureRouting: Bool = false,
              latent: QWMoEOperator.LatentBottleneck? = nil,
              coldGateUp: QWWeightView? = nil, coldDown: QWWeightView? = nil,
-             coldStreamer: ColdExpertStreamer? = nil) {
+             coldStreamer: ColdExpertStreamer? = nil,
+             useSigmoidScore: Bool = false,
+             nGroup: Int = 1, topkGroup: Int = 1, groupTopM: Int = 1,
+             routedSwigluClamp: QWSwiGLUClampSpec? = nil,
+             sharedSwigluClamp: QWSwiGLUClampSpec? = nil) {
             self.router = router
             self.routerBias = routerBias
             self.routedScaleParam = routedScaleParam
@@ -106,6 +118,12 @@ extension QWEngineDriver {
             self.sharedDown = sharedDown
             self.sharedGateScalar = sharedGateScalar
             self.coldStreamer = coldStreamer
+            self.useSigmoidScore = useSigmoidScore
+            self.nGroup = nGroup
+            self.topkGroup = topkGroup
+            self.groupTopM = groupTopM
+            self.routedSwigluClamp = routedSwigluClamp
+            self.sharedSwigluClamp = sharedSwigluClamp
         }
     }
     struct MHCLayerWeights {

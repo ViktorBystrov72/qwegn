@@ -364,19 +364,23 @@ final class QWEchoDraftEncoder: @unchecked Sendable {
         enc.memoryBarrier(scope: .buffers)
 
         if let mla = mlaOperator, let mlaW = attn.mla {
-            let qResid1 = QWTensorValue(region: mla.qResidScratch.region,
-                                        offset: mla.qResidScratch.offset,
-                                        shape: QWTensorShape([mlaW.qBProj.k], .f16))
+            let ln1Single = ln1.slice(byteOffset: 0, count: h, dtype: .f16)
+            let qIn1 = mla.isDirectQ
+                ? ln1Single
+                : QWTensorValue(region: mla.qResidScratch.region,
+                                offset: mla.qResidScratch.offset,
+                                shape: QWTensorShape([mlaW.qBProj.k], .f16))
             let qFull1 = QWTensorValue(region: mla.mlaQFullScratch.region,
                                        offset: mla.mlaQFullScratch.offset,
                                        shape: QWTensorShape([mlaW.qBProj.n], .f16))
             try driver.gemvH16T4(enc, n: mlaW.qBProj.n, k: mlaW.qBProj.k,
-                                 x: qResid1, gs: driver.sc.gs, wQ4: mlaW.qBProj, y16: qFull1)
+                                 x: qIn1, gs: driver.sc.gs, wQ4: mlaW.qBProj, y16: qFull1)
             enc.memoryBarrier(scope: .buffers)
 
             mla.encodeScoreSelectAbsorbAttendAndProjUV(
                 enc, mlaW: mlaW, kv: kv, attOut: attOut,
-                fullAttnLayer: mlaLayerIndex, pos0: cacheRows, rows: 1)
+                fullAttnLayer: mlaLayerIndex, pos0: cacheRows, rows: 1,
+                ln1: ln1Single)
         } else {
             guard let aDec = attnDecode,
                   let qRAll = qRScratch, let kRAll = kRScratch,

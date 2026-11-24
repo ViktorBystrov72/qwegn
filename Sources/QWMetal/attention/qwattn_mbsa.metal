@@ -54,8 +54,9 @@ kernel void qwg_mbsa_index_prep_f16(const device uint4* qkvRaw [[buffer(0)]],
     float xn[8];
     for (int i = 0; i < 8; i++) xn[i] = float(xv.v[i]) * rstd * (float(wv.v[i]) + 1.0f);
 
-    const uint ropeSlots = QW_ROPE_DIMS / 8u;
-    const uint partnerHalf = QW_ROPE_DIMS / 16u;
+    const uint effRopeDims = min(uint(QW_ROPE_DIMS), (headU4 * 8u) & ~15u);
+    const uint ropeSlots = effRopeDims / 8u;
+    const uint partnerHalf = effRopeDims / 16u;
     const uint partner = (ti < partnerHalf) ? (ti + partnerHalf) : (ti - partnerHalf);
 
     float pf[8];
@@ -93,12 +94,16 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
                                    const device half* idxKCache  [[buffer(1)]],
                                    device int*        blockList  [[buffer(2)]],
                                    device int*        blockCount [[buffer(3)]],
-                                   constant uint4&    p0         [[buffer(4)]], // (pos0, kvHeads, headDim, blockSize)
+                                   constant uint4&    p0         [[buffer(4)]], // (pos0, kvHeads | (idxHeads<<16), idxDim, blockSize)
                                    constant uint4&    p1         [[buffer(5)]], // (prefixBlks, localBlks, remoteBlks, listStride)
                                    uint2 tg [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]]) {
     const uint kvh = tg.x, qi = tg.y;
-    const uint pos = p0.x + qi, kvHeads = p0.y, headDim = p0.z, blockSize = p0.w;
+    const uint pos = p0.x + qi;
+    const uint kvHeads = p0.y & 0xFFFFu;
+    const uint rawIdxH = p0.y >> 16u;
+    const uint idxHeads = (rawIdxH != 0u) ? rawIdxH : kvHeads;
+    const uint headDim = p0.z, blockSize = p0.w;
     const uint prefixBlks = p1.x, localBlks = p1.y, remoteBlks = p1.z, listStride = p1.w;
     const uint curBlk = pos / blockSize;
     const uint localStartBlk = (curBlk + 1u > localBlks) ? (curBlk + 1u - localBlks) : 0u;
@@ -118,7 +123,9 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
     const uint rKeep = min(remoteBlks, 32u);
     if (tid < rKeep) { topScores[tid] = -1e30f; topIds[tid] = -1; }
     const float idxScale = rsqrt(float(headDim));
-    const device half* qRow = idxQ + ((size_t)qi * kvHeads + kvh) * headDim;
+    const uint subCount = max(1u, idxHeads / max(1u, kvHeads));
+    const uint idxHBase = (idxHeads < kvHeads) ? ((kvh * idxHeads) / kvHeads) : (kvh * subCount);
+    const device half* qRow = idxQ + ((size_t)qi * idxHeads + idxHBase) * headDim;
     for (uint d = tid; d < headDim; d += 256u) sharedQ[d] = float(qRow[d]) * idxScale;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -126,7 +133,7 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
     uint worstSlot = 0u;
     float worstScore = -1e30f;
 
-    if (headDim == 128u) {
+    if (headDim == 128u && subCount == 1u) {
         const uint hp = lane >> 4u, d8 = (lane & 15u) << 3u;
         const float4 qLo = *(threadgroup const float4*)(sharedQ + d8);
         const float4 qHi = *(threadgroup const float4*)(sharedQ + d8 + 4u);
@@ -180,9 +187,18 @@ kernel void qwg_mbsa_select_blocks(const device half* idxQ       [[buffer(0)]],
             float tokMax = -1e38f;
             for (uint off = sg; off < blockSize; off += 8u) {
                 const device half* kRow = idxKCache + (size_t)(tStart + off) * headDim;
-                float dotv = 0.0f;
-                for (uint d = lane; d < headDim; d += 32u) dotv += sharedQ[d] * float(kRow[d]);
-                tokMax = max(tokMax, simd_sum(dotv));
+                float subScore = 0.0f;
+                for (uint s = 0u; s < subCount; s++) {
+                    const device half* qs = (s == 0u) ? nullptr : (qRow + (size_t)s * headDim);
+                    float dotv = 0.0f;
+                    for (uint d = lane; d < headDim; d += 32u) {
+                        const float qv = (s == 0u) ? sharedQ[d] : (float(qs[d]) * idxScale);
+                        dotv += qv * float(kRow[d]);
+                    }
+                    const float sd = simd_sum(dotv);
+                    subScore = (subCount == 1u) ? sd : (subScore + sd / float(subCount));
+                }
+                tokMax = max(tokMax, subScore);
             }
             if (lane == 0u) sgMax[sg] = tokMax;
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -333,7 +349,11 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
     const uint tile0 = tileIdx * 32u;
     if (tile0 >= rows) return;
     const uint R = min(32u, rows - tile0);
-    const uint pos0 = p0.x, kvHeads = p0.y, headDim = p0.z, blockSize = p0.w;
+    const uint pos0 = p0.x;
+    const uint kvHeads = p0.y & 0xFFFFu;
+    const uint rawIdxH = p0.y >> 16u;
+    const uint idxHeads = (rawIdxH != 0u) ? rawIdxH : kvHeads;
+    const uint headDim = p0.z, blockSize = p0.w;
     const uint prefixBlks = p1.x, localBlks = p1.y, remoteBlks = p1.z, tileListStride = p1.w;
     const uint rKeep = min(remoteBlks, 32u);
     const uint kDim = min(headDim, 128u);
@@ -383,16 +403,17 @@ kernel void qwg_mbsa_select_blocks_tiled32(const device half* idxQ           [[b
         const uint sgRow = (sg >> 1u) * 16u;
         const uint sgCol = (sg & 1u) * 16u;
         const short validRows = short(clamp(int(R) - int(sgRow), 0, 16));
-        const device half* qBase = idxQ + ((size_t)(tile0 + sgRow) * kvHeads + kvh) * headDim;
+        const uint idxH = (idxHeads <= kvHeads) ? ((kvh * idxHeads) / kvHeads) : (kvh * (idxHeads / kvHeads));
+        const device half* qBase = idxQ + ((size_t)(tile0 + sgRow) * idxHeads + idxH) * headDim;
         NAXTile<half, 1, 1> Qf[8];
         STEEL_PRAGMA_UNROLL
         for (short id = 0; id < 8; ++id) {
             if (id < nq16 && validRows > 0) {
                 const short validCols = short(clamp(int(kDim) - int(id) * 16, 0, 16));
                 if (validRows == 16 && validCols == 16) {
-                    Qf[id].load(qBase + int(id) * 16, int(kvHeads * headDim));
+                    Qf[id].load(qBase + int(id) * 16, int(idxHeads * headDim));
                 } else {
-                    Qf[id].load_safe(qBase + int(id) * 16, int(kvHeads * headDim), short2(validCols, validRows));
+                    Qf[id].load_safe(qBase + int(id) * 16, int(idxHeads * headDim), short2(validCols, validRows));
                 }
             } else {
                 Qf[id].clear();

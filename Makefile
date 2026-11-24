@@ -77,10 +77,11 @@ else
 	@swift test --no-parallel
 endif
 
-lint: ## Style, geometry, DAG, and kernel-reachability gates
+lint: ## Style, geometry, DAG, capability-seam, and kernel-reachability gates
 	@python3 Scripts/lint_style.py Sources Tests Scripts
 	@python3 Scripts/lint_geometry_defaults.py Sources
 	@python3 Scripts/lint_package_dag.py
+	@python3 Scripts/lint_capability_seams.py
 	@python3 Scripts/test_kernel_inventory.py
 	@./Scripts/build_metallib.sh >/dev/null
 	@python3 Scripts/lint_kernels.py

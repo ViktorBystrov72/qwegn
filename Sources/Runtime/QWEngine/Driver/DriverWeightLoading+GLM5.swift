@@ -12,33 +12,6 @@ import QWQuant
 
 extension QWEngineDriver.WeightLoader {
 
-    /// Orthonormal 32-point Fast Walsh-Hadamard Transform in place over each
-    /// contiguous 32-element slice of `values`.
-    private static func fwht32OrthoInPlace(_ values: inout [Float]) {
-        let scale: Float = 1.0 / sqrt(32.0)
-        var base = 0
-        while base + 32 <= values.count {
-            var h = 1
-            while h < 32 {
-                var i = 0
-                while i < 32 {
-                    for j in i..<(i + h) {
-                        let a = values[base + j]
-                        let b = values[base + j + h]
-                        values[base + j] = a + b
-                        values[base + j + h] = a - b
-                    }
-                    i += h * 2
-                }
-                h *= 2
-            }
-            for k in 0..<32 {
-                values[base + k] *= scale
-            }
-            base += 32
-        }
-    }
-
     mutating func loadMLAAttnLayer(
         blk: String, layer: Int,
         ln1: QWTensorValue, ln2: QWTensorValue,
@@ -135,24 +108,50 @@ extension QWEngineDriver.WeightLoader {
         let h = geometry.hidden
         let kConv = geometry.gdnConvKernel
 
+        let ap = hasTensor(blk + "self_attn.q_proj.weight") ? (blk + "self_attn.") : (blk + "attention.")
         let (inProj, qkvSub) = try concatQ4([
-            (blk + "self_attn.q_proj.weight", qkCh),
-            (blk + "self_attn.k_proj.weight", qkCh),
-            (blk + "self_attn.v_proj.weight", zC)
+            (ap + "q_proj.weight", qkCh),
+            (ap + "k_proj.weight", qkCh),
+            (ap + "v_proj.weight", zC)
         ], k: h)
-        let (fgbProj, fgbSub) = try concatQ4([
-            (blk + "self_attn.f_a_proj.weight", lr),
-            (blk + "self_attn.g_a_proj.weight", lr),
-            (blk + "self_attn.b_proj.weight", vh)
-        ], k: h)
-        let fB = try f16w(blk + "self_attn.f_b_proj.weight", zC * lr)
-        let gB = try f16w(blk + "self_attn.g_b_proj.weight", zC * lr)
+
+        let fgbProj: QWWeightView
+        let fgbSub: [QWWeightView]
+        let bProjF16: QWTensorValue?
+        let fB: QWTensorValue?
+        let gB: QWTensorValue?
+        let bSlotView: QWWeightView
+        if geometry.kdaConfig?.isFullRank == true {
+            (fgbProj, fgbSub) = try concatQ4([
+                (ap + "f_proj.weight", zC),
+                (ap + "g_proj.weight", zC)
+            ], k: h)
+            var bFloats = try rawFloats(ap + "b_proj.weight", vh * h)
+            if hl.weightBasis.rotatesActivations {
+                Self.fwht32OrthoInPlace(&bFloats)
+            }
+            bProjF16 = try allocateF16(bFloats)
+            fB = nil
+            gB = nil
+            bSlotView = fgbSub[1]
+        } else {
+            let lowRank = geometry.kdaConfig?.lowRankDim ?? lr
+            (fgbProj, fgbSub) = try concatQ4([
+                (ap + "f_a_proj.weight", lowRank),
+                (ap + "g_a_proj.weight", lowRank),
+                (ap + "b_proj.weight", vh)
+            ], k: h)
+            fB = try f16w(ap + "f_b_proj.weight", zC * lowRank)
+            gB = try f16w(ap + "g_b_proj.weight", zC * lowRank)
+            bProjF16 = nil
+            bSlotView = fgbSub[2]
+        }
 
         let conv: QWTensorValue
-        if hasTensor(blk + "self_attn.q_conv1d.weight") {
-            let qC = try rawFloats(blk + "self_attn.q_conv1d.weight", qkCh * kConv)
-            let kC = try rawFloats(blk + "self_attn.k_conv1d.weight", qkCh * kConv)
-            let vC = try rawFloats(blk + "self_attn.v_conv1d.weight", zC * kConv)
+        if hasTensor(ap + "q_conv1d.weight") {
+            let qC = try rawFloats(ap + "q_conv1d.weight", qkCh * kConv)
+            let kC = try rawFloats(ap + "k_conv1d.weight", qkCh * kConv)
+            let vC = try rawFloats(ap + "v_conv1d.weight", zC * kConv)
             let allConv = qC + kC + vC
             let t = try allocateWeight(QWTensorShape([qkvC * kConv], .f16))
             var bits = [UInt16](repeating: 0, count: allConv.count)
@@ -165,13 +164,14 @@ extension QWEngineDriver.WeightLoader {
             }
             conv = t
         } else {
-            conv = try f16w(blk + "self_attn.conv1d.weight", qkvC * kConv)
+            conv = try f16w(ap + "conv1d.weight", qkvC * kConv)
         }
 
-        let gnw = try f16w(blk + "self_attn.o_norm.weight", geometry.gdnHeadDim)
-        let aLog = try f32w(blk + "self_attn.A_log", vh)
-        let dtB = try f32w(blk + "self_attn.dt_bias", zC)
-        let out = try q4(blk + "self_attn.o_proj.weight", n: h, k: zC)
+        let gnw = try f16w(ap + "o_norm.weight", geometry.gdnHeadDim)
+        let aLog = try f32w(ap + "A_log", vh)
+        let dtB = try f32w(ap + "dt_bias", zC)
+        let oName = hasTensor(ap + "o_proj.weight") ? (ap + "o_proj.weight") : (ap + "dense.weight")
+        let out = try q4(oName, n: h, k: zC)
 
         let mhcW: QWEngineDriver.MHCLayerWeights?
         if let mhc = geometry.mhcConfig, layer >= mhc.start, layer < mhc.end {
@@ -183,9 +183,9 @@ extension QWEngineDriver.WeightLoader {
             ln1: ln1, ln2: ln2, gu: gu, down: down,
             kind: moe == nil ? .gdn : .gdnMoe,
             gdn: QWEngineDriver.GdnW(
-                inProj: inProj, qkv: qkvSub[0], z: qkvSub[2], a: fgbSub[0], b: fgbSub[2],
+                inProj: inProj, qkv: qkvSub[0], z: qkvSub[2], a: fgbSub[0], b: bSlotView,
                 conv: conv, normW: gnw, aLog: aLog, dtBias: dtB, out: out,
-                fgbProj: fgbProj, fB: fB, gB: gB),
+                fgbProj: fgbProj, bProjF16: bProjF16, fB: fB, gB: gB),
             attn: nil, moe: moe, mhc: mhcW
         )
     }
@@ -211,9 +211,11 @@ extension QWEngineDriver.WeightLoader {
         let hNorm = try f16wNorm(blk + "hnorm.weight", h)
         let ehProj = try q4(blk + "eh_proj.weight", n: h, k: 2 * h)
         let ln1 = try f16wNorm(blk + "input_layernorm.weight", h)
-        let attnOnly = try loadMLAAttnWeights(blk: blk, geometry: geometry)
+        let attnOnly = geometry.usesDecoupledRopeMLA
+            ? try loadDecoupledMLAAttnWeights(blk: blk, geometry: geometry)
+            : try loadMLAAttnWeights(blk: blk, geometry: geometry)
         let ln2 = try f16wNorm(blk + "post_attention_layernorm.weight", h)
-        let moe = try packedMoE(blk, experts: geometry.numExperts, topK: geometry.expertsPerTok)
+        let moe = try packedMoE(blk, experts: geometry.numExperts, topK: geometry.expertsPerTok, layer: mtpIdx)
         let guView = try firstExpert(moe.gateUp, rows: 2 * geometry.moeIntermediate)
         guard let gu = QWMLPWeight(blocks: guView.blocks, n: 2 * geometry.moeIntermediate, k: h,
                                    bits: guView.bits, groupSize: guView.groupSize,
@@ -223,7 +225,10 @@ extension QWEngineDriver.WeightLoader {
             throw QWEngineDriverError.weightMissing(blk + "mlp.experts", "mtp gu view invalid")
         }
         let down = try firstExpert(moe.down, rows: h)
-        let sharedHeadNorm = try f16wNorm(blk + "shared_head.norm.weight", h)
+        let headNormName = hasTensor(blk + "shared_head.norm.weight")
+            ? (blk + "shared_head.norm.weight")
+            : (blk + "final_layernorm.weight")
+        let sharedHeadNorm = try f16wNorm(headNormName, h)
         let layer = QWEngineDriver.LayerW(
             ln1: ln1, ln2: ln2, gu: gu, down: down,
             kind: .moe, gdn: nil, attn: attnOnly, moe: moe, mhc: nil

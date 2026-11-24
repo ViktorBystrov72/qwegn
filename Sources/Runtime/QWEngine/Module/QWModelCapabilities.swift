@@ -12,9 +12,9 @@ public enum QWModelCapabilities {
     ) -> Set<QWKnobCapability> {
         let _ = weightFormat
         guard descriptor.role != .speculativeDrafter else { return [] }
-        if descriptor.family == .inkling2Loop {
+        if case .recurrentLoop(_, let ink) = descriptor.executionTopology, ink != nil {
             var caps: Set<QWKnobCapability> = [.prefixCache, .kvQuantQ8, .kvQuantQ4, .lsa, .mtpAdaptive]
-            if descriptor.inkling2Config?.dspark != nil { caps.insert(.speculative) }
+            if ink?.dspark != nil { caps.insert(.speculative) }
             if hasVisionWeights { caps.insert(.vision) }
             return caps
         }

@@ -165,6 +165,7 @@ struct QWSafetensors {
 public final class QWVisionCheckpoint: @unchecked Sendable {
     private let lock = NSLock()
     let index: [String: String]
+    let externalKeys: [String: (shard: String, fullKey: String)]
     private var shards: [String: QWSafetensors] = [:]
     let dir: String
     let prefix: String
@@ -172,10 +173,18 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
     private var pack: QWQuant.Pack?
     let packPrefix = "model.visual."
 
+    private static let externalMergerAliases: [(logical: String, candidates: [String])] = [
+        ("merger.linear_fc1.weight", ["linear_proj.0.weight", "multi_modal_projector.linear_1.weight", "mm_projector.0.weight"]),
+        ("merger.linear_fc1.bias", ["linear_proj.0.bias", "multi_modal_projector.linear_1.bias", "mm_projector.0.bias"]),
+        ("merger.linear_fc2.weight", ["linear_proj.2.weight", "multi_modal_projector.linear_2.weight", "mm_projector.2.weight"]),
+        ("merger.linear_fc2.bias", ["linear_proj.2.bias", "multi_modal_projector.linear_2.bias", "mm_projector.2.bias"]),
+    ]
+
     public init(pack packPath: String) throws {
         self.dir = packPath
         self.prefix = "vision_tower."
         self.index = [:]
+        self.externalKeys = [:]
         let pk = try QWQuant.Pack(url: URL(fileURLWithPath: packPath))
         self.pack = pk
         self.config = QWVisionConfig(descriptor: pk.descriptor)
@@ -185,24 +194,41 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
         self.dir = dir
         self.pack = nil
         let indexPath = dir + "/model.safetensors.index.json"
+        var ext: [String: (shard: String, fullKey: String)] = [:]
         if FileManager.default.fileExists(atPath: indexPath) {
             let idxData = try Data(contentsOf: URL(fileURLWithPath: indexPath))
             guard let obj = try JSONSerialization.jsonObject(with: idxData) as? [String: Any],
                   let wm = obj["weight_map"] as? [String: String] else {
                 throw QWVisionError.badLayout("malformed vision index json at \(indexPath)")
             }
-            let detected = wm.keys.contains(where: { $0.hasPrefix("model.visual.") }) ? "model.visual." : "vision_tower."
+            let detected = wm.keys.contains(where: { $0.hasPrefix("model.visual.") })
+                ? "model.visual."
+                : (wm.keys.contains(where: { $0.hasPrefix("vision.") }) ? "vision." : "vision_tower.")
             self.prefix = detected
             var v: [String: String] = [:]
             for (k, shard) in wm where k.hasPrefix(detected) { v[String(k.dropFirst(detected.count))] = shard }
+            for alias in Self.externalMergerAliases where v[alias.logical] == nil {
+                if let hit = alias.candidates.first(where: { wm[$0] != nil }), let shard = wm[hit] {
+                    ext[alias.logical] = (shard, hit)
+                }
+            }
             self.index = v
+            self.externalKeys = ext
         } else {
             let single = try QWSafetensors(path: dir + "/model.safetensors")
-            let detected = single.tensors.keys.contains(where: { $0.hasPrefix("model.visual.") }) ? "model.visual." : "vision_tower."
+            let detected = single.tensors.keys.contains(where: { $0.hasPrefix("model.visual.") })
+                ? "model.visual."
+                : (single.tensors.keys.contains(where: { $0.hasPrefix("vision.") }) ? "vision." : "vision_tower.")
             self.prefix = detected
             var v: [String: String] = [:]
             for k in single.tensors.keys where k.hasPrefix(detected) { v[String(k.dropFirst(detected.count))] = "model.safetensors" }
+            for alias in Self.externalMergerAliases where v[alias.logical] == nil {
+                if let hit = alias.candidates.first(where: { single.tensors[$0] != nil }) {
+                    ext[alias.logical] = ("model.safetensors", hit)
+                }
+            }
             self.index = v
+            self.externalKeys = ext
             self.shards["model.safetensors"] = single
         }
         if let cfgURL = QWModelRoot(url: URL(fileURLWithPath: dir)).configURL,
@@ -215,6 +241,7 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
                 dir: dir,
                 prefix: self.prefix,
                 index: self.index,
+                externalKeys: self.externalKeys,
                 shards: &self.shards
             )
         }
@@ -224,14 +251,22 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
         dir: String,
         prefix: String,
         index: [String: String],
+        externalKeys: [String: (shard: String, fullKey: String)],
         shards: inout [String: QWSafetensors]
     ) -> QWVisionConfig {
         func lookupShape(_ key: String) -> [Int]? {
-            guard let file = index[key] else { return nil }
-            if let s = shards[file] { return s.shape(prefix + key) }
-            guard let s = try? QWSafetensors(path: dir + "/" + file) else { return nil }
-            shards[file] = s
-            return s.shape(prefix + key)
+            let resolved: (file: String, fullKey: String)
+            if let file = index[key] {
+                resolved = (file, prefix + key)
+            } else if let ext = externalKeys[key] {
+                resolved = (ext.shard, ext.fullKey)
+            } else {
+                return nil
+            }
+            if let s = shards[resolved.file] { return s.shape(resolved.fullKey) }
+            guard let s = try? QWSafetensors(path: dir + "/" + resolved.file) else { return nil }
+            shards[resolved.file] = s
+            return s.shape(resolved.fullKey)
         }
         let posShape = lookupShape("pos_embed.weight")
         if index["embeddings.patch_embedding.weight"] != nil {
@@ -274,11 +309,15 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
             }
         }
         let mlpInner = lookupShape("blocks.0.mlp.linear_fc1.weight")?.first ?? (dim * 4)
-        let merged = lookupShape("merger.linear_fc1.weight")?.last ?? (dim * 4)
+        let fc1Shape = lookupShape("merger.linear_fc1.weight")
+        let merged = fc1Shape?.last ?? (dim * 4)
+        let fc1Mid = fc1Shape?.first ?? merged
         let merge = dim > 0 ? max(1, Int(Double(merged / dim).squareRoot().rounded())) : 2
         let outDim = lookupShape("merger.linear_fc2.bias")?.first
             ?? lookupShape("merger.linear_fc2.weight")?.first
             ?? ref.outDim
+        let hasProjBias = (lookupShape("merger.linear_fc1.bias") != nil)
+            || (lookupShape("merger.linear_fc2.bias") != nil)
         var depth = 0
         while lookupShape("blocks.\(depth).norm1.weight") != nil { depth += 1 }
         let heads = (dim > 0 && dim % 72 == 0) ? (dim / 72) : max(1, dim / 64)
@@ -295,7 +334,10 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
             numPosEmbeds: numPosEmbeds,
             outDim: outDim,
             imageTokenId: ref.imageTokenId,
-            videoTokenId: ref.videoTokenId
+            videoTokenId: ref.videoTokenId,
+            projectionHiddenDim: fc1Mid,
+            projectorBias: hasProjBias,
+            mergerIntermediateDim: (fc1Mid != merged ? fc1Mid : nil)
         )
     }
 
@@ -322,15 +364,26 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
             }
             return f
         }
-        guard let file = index[key] else { throw QWVisionError.missingTensor(key) }
-        let s = try lock.withLock { try shardLocked(file) }
-        return try s.f32(prefix + key, want: want)
+        if let file = index[key] {
+            let s = try lock.withLock { try shardLocked(file) }
+            return try s.f32(prefix + key, want: want)
+        }
+        if let ext = externalKeys[key] {
+            let s = try lock.withLock { try shardLocked(ext.shard) }
+            return try s.f32(ext.fullKey, want: want)
+        }
+        throw QWVisionError.missingTensor(key)
     }
 
     public func shape(_ key: String) -> [Int]? {
         if let p = lock.withLock({ pack }) { return try? p.entry(packPrefix + key).shape }
-        guard let file = index[key] else { return nil }
-        return try? lock.withLock { try shardLocked(file) }.shape(prefix + key)
+        if let file = index[key] {
+            return try? lock.withLock { try shardLocked(file) }.shape(prefix + key)
+        }
+        if let ext = externalKeys[key] {
+            return try? lock.withLock { try shardLocked(ext.shard) }.shape(ext.fullKey)
+        }
+        return nil
     }
 
     func has(_ key: String) -> Bool { shape(key) != nil }

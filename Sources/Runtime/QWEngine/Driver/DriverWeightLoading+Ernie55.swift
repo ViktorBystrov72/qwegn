@@ -13,7 +13,7 @@ import QWQuant
 
 extension QWEngineDriver.WeightLoader {
 
-    private static func fwht32OrthoInPlace(_ values: inout [Float]) {
+    static func fwht32OrthoInPlace(_ values: inout [Float]) {
         let scale: Float = 1.0 / sqrt(32.0)
         var base = 0
         while base + 32 <= values.count {
@@ -44,7 +44,7 @@ extension QWEngineDriver.WeightLoader {
         let routerRows = split ? (2 * experts) : experts
         let hasMlpExperts = hasTensor(blk + "mlp.experts.\(experts - 1).gate_proj.weight")
         let hasBsExperts = hasTensor(blk + "block_sparse_moe.experts.\(experts - 1).w1.weight")
-        let canPermute = coldE > 0 && geometry.hasBiasCorrectedRouter && (hasMlpExperts || hasBsExperts)
+        let canPermute = coldE > 0 && geometry.hasBiasCorrectedRouter && (hasMlpExperts || hasBsExperts) && (geometry.moeRoutingConfig?.nGroup ?? 1) <= 1
 
         func readRouterFloats() throws -> [Float] {
             if hasTensor(blk + "mlp.gate.weight") {
@@ -59,9 +59,11 @@ extension QWEngineDriver.WeightLoader {
         }
         let biasName = hasTensor(blk + "mlp.gate.e_score_correction_bias")
             ? (blk + "mlp.gate.e_score_correction_bias")
-            : (hasTensor(blk + "block_sparse_moe.e_score_correction_bias")
-                ? (blk + "block_sparse_moe.e_score_correction_bias")
-                : (blk + "block_sparse_moe.expert_bias"))
+            : (hasTensor(blk + "mlp.gate.expert_bias")
+                ? (blk + "mlp.gate.expert_bias")
+                : (hasTensor(blk + "block_sparse_moe.e_score_correction_bias")
+                    ? (blk + "block_sparse_moe.e_score_correction_bias")
+                    : (blk + "block_sparse_moe.expert_bias")))
         let scaleName = hasTensor(blk + "mlp.routed_scaling_factor_param")
             ? (blk + "mlp.routed_scaling_factor_param")
             : (blk + "block_sparse_moe.gate.routed_scaling_factor_param")
@@ -157,7 +159,7 @@ extension QWEngineDriver.WeightLoader {
         return t
     }
 
-    private mutating func allocateF16(_ src: [Float]) throws -> QWTensorValue {
+    mutating func allocateF16(_ src: [Float]) throws -> QWTensorValue {
         let t = try allocateWeight(QWTensorShape([src.count], .f16))
         let bits = src.map { QWQuant.f32tof16Bits($0) }
         let dst = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
@@ -332,6 +334,146 @@ extension QWEngineDriver.WeightLoader {
         )
     }
 
+    mutating func loadDecoupledMLAAttnWeights(
+        blk: String,
+        geometry: QWModelGeometry
+    ) throws -> QWEngineDriver.AttnW {
+        let mla = geometry.mlaConfig
+        let hmla = geometry.hybridMLAConfig
+        guard mla != nil || hmla != nil else {
+            throw QWEngineDriverError.badConfig("missing mlaConfig on decoupled MLA layer")
+        }
+        let h = geometry.hidden
+        let qHeads = mla?.qHeads ?? hmla?.qHeads ?? geometry.qHeads
+        let qRank = mla?.qLoraRank ?? hmla?.qLoraRank ?? 0
+        let kvRank = mla?.kvLoraRank ?? hmla?.kvLoraRank ?? geometry.kvLoraRank
+        let nopeDim = mla?.qkNopeHeadDim ?? hmla?.qkNopeHeadDim ?? geometry.qkNopeHeadDim
+        let ropeDim = mla?.qkRopeHeadDim ?? hmla?.qkRopeHeadDim ?? geometry.qkRopeHeadDim
+        let vDim = mla?.vHeadDim ?? hmla?.vHeadDim ?? geometry.vHeadDim
+        let isDirectQ = mla?.isDirectQ ?? (qRank <= 0)
+        let hasIndexer = mla?.hasIndexer ?? (geometry.indexerHeads > 0)
+        let outputGateMode = mla?.outputGateMode
+            ?? (geometry.attnOutputGate ? .elementWiseFromQLora : .none)
+        let hasInlineOGate = outputGateMode == .elementWiseFromQLora
+        let hasExternalOGate = outputGateMode == .headWiseFromHidden
+            || outputGateMode == .elementWiseFromHidden
+        let hasOGate = outputGateMode != .none
+        let idxH = hasIndexer ? max(1, geometry.indexerHeads) : 0
+        let idxD = hasIndexer ? max(32, geometry.indexerHeadDim) : 0
+        let qCh = qHeads * (nopeDim + ropeDim + (hasInlineOGate ? vDim : 0))
+        let useVHA = mla?.useVHA ?? hmla?.useVHA ?? false
+        let hasAttnSink = mla?.hasAttnSinkBias ?? hmla?.hasAttnSinkBias ?? false
+
+        let ap = (hasTensor(blk + "self_attn.kv_a_proj_with_mqa.weight")
+            || hasTensor(blk + "self_attn.q_a_proj.weight"))
+            ? (blk + "self_attn.")
+            : (blk + "attention.")
+        let idxPfx = hasTensor(ap + "indexer.wk.weight")
+            ? (ap + "indexer.")
+            : (ap + "core_attention.indexer.")
+
+        var qkvSpecs: [(name: String, n: Int)] = []
+        if !isDirectQ {
+            qkvSpecs.append((ap + "q_a_proj.weight", qRank))
+        }
+        qkvSpecs.append((ap + "kv_a_proj_with_mqa.weight", kvRank + ropeDim))
+        if hasIndexer {
+            qkvSpecs.append((idxPfx + "wk.weight", idxD))
+        }
+        let (qkvProj, qkvSub) = try concatQ4(qkvSpecs, k: h)
+
+        let kvANormW: QWTensorValue
+        let qANormW: QWTensorValue
+        if !isDirectQ {
+            qANormW = try f16w(ap + "q_a_layernorm.weight", qRank)
+            kvANormW = try f16w(ap + "kv_a_layernorm.weight", kvRank)
+        } else {
+            kvANormW = try f16w(ap + "kv_a_layernorm.weight", kvRank)
+            qANormW = kvANormW
+        }
+
+        let kNormW: QWTensorValue
+        let kNormB: QWTensorValue
+        let wGateWeights: QWTensorValue
+        if hasIndexer {
+            kNormW = try f16w(idxPfx + "k_norm.weight", idxD)
+            kNormB = try f16w(idxPfx + "k_norm.bias", idxD)
+            var wProjFloats = try rawFloats(idxPfx + "weights_proj.weight", idxH * h)
+            if hl.weightBasis.rotatesActivations {
+                Self.fwht32OrthoInPlace(&wProjFloats)
+            }
+            wGateWeights = try allocateF16(wProjFloats)
+        } else {
+            kNormW = kvANormW
+            kNormB = kvANormW
+            wGateWeights = kvANormW
+        }
+
+        let qBProj: QWWeightView
+        if isDirectQ {
+            let qDirectName = hasTensor(ap + "q_proj.weight") ? (ap + "q_proj.weight") : (ap + "q_b_proj.weight")
+            if hasIndexer {
+                let (big, _) = try concatQ4([
+                    (qDirectName, qCh),
+                    (idxPfx + "wq_b.weight", idxH * idxD)
+                ], k: h)
+                qBProj = big
+            } else {
+                qBProj = try q4(qDirectName, n: qCh, k: h)
+            }
+        } else if hasIndexer && hasTensor(ap + "q_b_gate_idx_proj.weight") {
+            qBProj = try q4(ap + "q_b_gate_idx_proj.weight", n: qCh + idxH * idxD, k: qRank)
+        } else if !hasIndexer && hasTensor(ap + "q_b_proj.weight") {
+            qBProj = try q4(ap + "q_b_proj.weight", n: qCh, k: qRank)
+        } else {
+            var qbSpecs: [(name: String, n: Int)] = [
+                (ap + "q_b_nope_proj.weight", qHeads * nopeDim),
+                (ap + "q_b_rope_proj.weight", qHeads * ropeDim)
+            ]
+            if hasInlineOGate {
+                qbSpecs.append((ap + "gate_proj.weight", qHeads * vDim))
+            }
+            if hasIndexer {
+                qbSpecs.append((idxPfx + "wq_b.weight", idxH * idxD))
+            }
+            let (big, _) = try concatQ4(qbSpecs, k: qRank)
+            qBProj = big
+        }
+        let kvBProj = try q4(ap + "kv_b_proj.weight", n: qHeads * (nopeDim + vDim), k: kvRank)
+        let oName = hasTensor(ap + "o_proj.weight") ? (ap + "o_proj.weight") : (ap + "dense.weight")
+        let o = try q4(oName, n: h, k: qHeads * vDim)
+
+        let oGateF16: QWTensorValue?
+        if hasExternalOGate {
+            let gateCols = outputGateMode == .headWiseFromHidden ? qHeads : (qHeads * vDim)
+            var gateFloats = try rawFloats(ap + "g_proj.weight", gateCols * h)
+            if hl.weightBasis.rotatesActivations {
+                Self.fwht32OrthoInPlace(&gateFloats)
+            }
+            oGateF16 = try allocateF16(gateFloats)
+        } else {
+            oGateF16 = nil
+        }
+
+        let vhaMix = useVHA ? try loadVHAMix(blk: blk, qHeads: qHeads) : nil
+        let attnSink = hasAttnSink ? try f32w(
+            hasTensor(ap + "attn_sink")
+                ? (ap + "attn_sink")
+                : (ap + "core_attention.softmax_offset"),
+            qHeads) : nil
+
+        let mlaW = QWMLAAttnOperator.LayerWeights(
+            qANormW: qANormW, kvANormW: kvANormW, kNormW: kNormW, kNormB: kNormB,
+            wGateWeights: wGateWeights, ape: nil, qBProj: qBProj, kvBProj: kvBProj,
+            vhaMix: vhaMix, attnSink: attnSink, hasOGate: hasOGate, oGateF16: oGateF16
+        )
+        return QWEngineDriver.AttnW(
+            qkvProj: qkvProj, q: qkvSub[0], k: qkvSub[min(1, qkvSub.count - 1)],
+            v: qkvSub[qkvSub.count - 1],
+            o: o, wq: nil, wkTiled: nil, mla: mlaW
+        )
+    }
+
     mutating func loadDecoupledMLAAttnLayer(
         blk: String, layer: Int,
         ln1: QWTensorValue, ln2: QWTensorValue,
@@ -339,69 +481,7 @@ extension QWEngineDriver.WeightLoader {
         moe: QWEngineDriver.MoEW?,
         geometry: QWModelGeometry
     ) throws -> QWEngineDriver.LayerW {
-        guard let hmla = geometry.hybridMLAConfig else {
-            throw QWEngineDriverError.badConfig("missing hybridMLAConfig on decoupled MLA layer \(layer)")
-        }
-        let h = geometry.hidden
-        let qHeads = hmla.qHeads
-        let qRank = hmla.qLoraRank
-        let kvRank = hmla.kvLoraRank
-        let nopeDim = hmla.qkNopeHeadDim
-        let ropeDim = hmla.qkRopeHeadDim
-        let vDim = hmla.vHeadDim
-        let idxH = max(1, geometry.indexerHeads)
-        let idxD = max(32, geometry.indexerHeadDim)
-        let hasOGate = geometry.attnOutputGate
-        let qCh = qHeads * (nopeDim + ropeDim + (hasOGate ? vDim : 0))
-
-        let idxPfx = hasTensor(blk + "self_attn.indexer.wk.weight")
-            ? (blk + "self_attn.indexer.")
-            : (blk + "self_attn.core_attention.indexer.")
-        let (qkvProj, qkvSub) = try concatQ4([
-            (blk + "self_attn.q_a_proj.weight", qRank),
-            (blk + "self_attn.kv_a_proj_with_mqa.weight", kvRank + ropeDim),
-            (idxPfx + "wk.weight", idxD)
-        ], k: h)
-        let qANormW = try f16w(blk + "self_attn.q_a_layernorm.weight", qRank)
-        let kvANormW = try f16w(blk + "self_attn.kv_a_layernorm.weight", kvRank)
-        let kNormW = try f16w(idxPfx + "k_norm.weight", idxD)
-        let kNormB = try f16w(idxPfx + "k_norm.bias", idxD)
-
-        var wProjFloats = try rawFloats(idxPfx + "weights_proj.weight", idxH * h)
-        if hl.weightBasis.rotatesActivations {
-            Self.fwht32OrthoInPlace(&wProjFloats)
-        }
-        let wGateWeights = try allocateF16(wProjFloats)
-
-        let qBProj: QWWeightView
-        if hasTensor(blk + "self_attn.q_b_gate_idx_proj.weight") {
-            qBProj = try q4(blk + "self_attn.q_b_gate_idx_proj.weight", n: qCh + idxH * idxD, k: qRank)
-        } else {
-            var qbSpecs: [(name: String, n: Int)] = [
-                (blk + "self_attn.q_b_nope_proj.weight", qHeads * nopeDim),
-                (blk + "self_attn.q_b_rope_proj.weight", qHeads * ropeDim)
-            ]
-            if hasOGate {
-                qbSpecs.append((blk + "self_attn.gate_proj.weight", qHeads * vDim))
-            }
-            qbSpecs.append((idxPfx + "wq_b.weight", idxH * idxD))
-            let (big, _) = try concatQ4(qbSpecs, k: qRank)
-            qBProj = big
-        }
-        let kvBProj = try q4(blk + "self_attn.kv_b_proj.weight", n: qHeads * (nopeDim + vDim), k: kvRank)
-        let o = try q4(blk + "self_attn.o_proj.weight", n: h, k: qHeads * vDim)
-        let vhaMix = hmla.useVHA ? try loadVHAMix(blk: blk, qHeads: qHeads) : nil
-        let attnSink = hmla.hasAttnSinkBias ? try f32w(
-            hasTensor(blk + "self_attn.attn_sink")
-                ? (blk + "self_attn.attn_sink")
-                : (blk + "self_attn.core_attention.softmax_offset"),
-            qHeads) : nil
-
-        let mlaW = QWMLAAttnOperator.LayerWeights(
-            qANormW: qANormW, kvANormW: kvANormW, kNormW: kNormW, kNormB: kNormB,
-            wGateWeights: wGateWeights, ape: nil, qBProj: qBProj, kvBProj: kvBProj,
-            vhaMix: vhaMix, attnSink: attnSink, hasOGate: hasOGate
-        )
+        let attnW = try loadDecoupledMLAAttnWeights(blk: blk, geometry: geometry)
         let mhcW: QWEngineDriver.MHCLayerWeights?
         if let mhc = geometry.mhcConfig, layer >= mhc.start, layer < mhc.end {
             mhcW = try loadMHCOrErnieHC(blk, mhc: mhc)
@@ -411,11 +491,7 @@ extension QWEngineDriver.WeightLoader {
         return QWEngineDriver.LayerW(
             ln1: ln1, ln2: ln2, gu: gu, down: down,
             kind: moe == nil ? .fullAttention : .moe,
-            gdn: nil,
-            attn: QWEngineDriver.AttnW(
-                qkvProj: qkvProj, q: qkvSub[0], k: qkvSub[1], v: qkvSub[2],
-                o: o, wq: nil, wkTiled: nil, mla: mlaW),
-            moe: moe, mhc: mhcW
+            gdn: nil, attn: attnW, moe: moe, mhc: mhcW
         )
     }
 

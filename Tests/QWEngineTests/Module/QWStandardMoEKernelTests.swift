@@ -651,13 +651,15 @@ final class QWStandardMoEKernelTests: XCTestCase {
             XCTAssertTrue("\(e)".contains("shared_expert_intermediate_size"), "\(e)")
         }
         XCTAssertEqual(try decode(sparse, ["shared_expert_intermediate_size": 0]).sharedExpertIntermediate, 0)
-        // The router's law: the experts tile 32 at a time and hold 16 tiles.
+        // The router's law: the experts tile 32 at a time up to 32 tiles (E <= 1024).
         // Zero experts is outside the law — the route would select nothing.
         XCTAssertThrowsError(try decode(sparse, ["num_experts": 0])) { e in
             XCTAssertTrue("\(e)".contains("num_experts"), "\(e)")
         }
         XCTAssertThrowsError(try decode(sparse, ["num_experts": 24]))
-        XCTAssertThrowsError(try decode(sparse, ["num_experts": 544]))
+        XCTAssertNoThrow(try decode(sparse, ["num_experts": 544]))
+        XCTAssertNoThrow(try decode(sparse, ["num_experts": 1024]))
+        XCTAssertThrowsError(try decode(sparse, ["num_experts": 1056]))
         XCTAssertThrowsError(try decode(sparse, ["num_experts_per_tok": 17]))
         // The model's own top-k normalisation flag is honoured.
         XCTAssertTrue(try decode(sparse, ["norm_topk_prob": true]).normTopKProb)

@@ -129,7 +129,7 @@ extension QWEngineDriver {
             let w = weights.gdn!
             if geometry.gdnVectorDecay {
                 let qkvC = geometry.gdnQKVChannels
-                let fgbC = 2 * geometry.gdnLowRankDim + geometry.gdnVHeads
+                let fgbC = geometry.kdaFgbChannels
                 let qkvOut = prefixRows(mtpBatchedTrunk.gdnProjection, rows: activeRows, cols: qkvC, dt: .f16)
                 try mtpBatchedMLP.encodeProjection(enc, input: activeNormalized, weight: w.inProj,
                                                    output: qkvOut, activeRows: activeRows)
@@ -189,7 +189,8 @@ extension QWEngineDriver {
         case .gdn, .gdnMoe:
             try encodeVerificationGDNCore(
                 enc, session: session, layer: layer, weights: weights,
-                checkpoint: checkpoint, mtpBatchedTrunk: mtpBatchedTrunk, activeRows: activeRows)
+                activeNormalized: activeNormalized, checkpoint: checkpoint,
+                mtpBatchedTrunk: mtpBatchedTrunk, activeRows: activeRows)
         case .fullAttention, .moe:
             try encodeVerificationAttnCore(
                 enc, session: session, layer: layer, weights: weights,
@@ -207,6 +208,7 @@ extension QWEngineDriver {
         session: QWEngineSession,
         layer: Int,
         weights: LayerW,
+        activeNormalized: QWTensorValue,
         checkpoint: QWGDNReplayCheckpoint,
         mtpBatchedTrunk: QWMTPBatchedTrunk,
         activeRows: Int
@@ -214,18 +216,33 @@ extension QWEngineDriver {
         let w = weights.gdn!, index = gdnIndexMap[layer]
         let gdnOut = prefixRows(mtpBatchedTrunk.outputInputs, rows: activeRows,
                                 cols: geometry.gdnZChannels, dt: .f16)
-        if geometry.gdnVectorDecay, let fB = w.fB, let gB = w.gB, let fgb16 = psc.fgb16 {
-            let fgbC = 2 * geometry.gdnLowRankDim + geometry.gdnVHeads
-            try checkpoint.encodeBatchedKDA(
-                enc, conv: gdnConv, decoder: gdnDecode,
-                layer: index, activeRows: activeRows,
-                gdnProjection: mtpBatchedTrunk.gdnProjection,
-                fgbProjection: prefixRows(fgb16, rows: activeRows, cols: fgbC, dt: .f16),
-                fBWeight: fB, gBWeight: gB, aLog: w.aLog, dtBias: w.dtBias,
-                convWeight: w.conv, normWeight: w.normW,
-                zScratch: psc.z16,
-                ring: session.ring[index], state: session.rec[index],
-                output: gdnOut)
+        if geometry.gdnVectorDecay, let fgb16 = psc.fgb16 {
+            let fgbC = geometry.kdaFgbChannels
+            let fgbView = prefixRows(fgb16, rows: activeRows, cols: fgbC, dt: .f16)
+            if let fB = w.fB, let gB = w.gB {
+                try checkpoint.encodeBatchedKDA(
+                    enc, conv: gdnConv, decoder: gdnDecode,
+                    layer: index, activeRows: activeRows,
+                    gdnProjection: mtpBatchedTrunk.gdnProjection,
+                    fgbProjection: fgbView,
+                    fBWeight: fB, gBWeight: gB, aLog: w.aLog, dtBias: w.dtBias,
+                    convWeight: w.conv, normWeight: w.normW,
+                    zScratch: psc.z16,
+                    ring: session.ring[index], state: session.rec[index],
+                    output: gdnOut)
+            } else {
+                try checkpoint.encodeBatchedKDADirect(
+                    enc, conv: gdnConv, decoder: gdnDecode,
+                    layer: index, activeRows: activeRows,
+                    gdnProjection: mtpBatchedTrunk.gdnProjection,
+                    fgbProjection: fgbView,
+                    ln1: activeNormalized, bProjF16: w.bProjF16,
+                    aLog: w.aLog, dtBias: w.dtBias,
+                    convWeight: w.conv, normWeight: w.normW,
+                    zScratch: psc.z16,
+                    ring: session.ring[index], state: session.rec[index],
+                    output: gdnOut)
+            }
         } else {
             try checkpoint.encodeBatchedGDN(
                 enc, conv: gdnConv, decoder: gdnDecode,
@@ -254,18 +271,23 @@ extension QWEngineDriver {
         let attnOut = prefixRows(mtpBatchedTrunk.outputInputs, rows: activeRows,
                                  cols: attnOutCols, dt: .f16)
         if let mla = mlaOperator, let mlaW = weights.attn?.mla {
+            let mropePos = session.mropeSlice(pos: session.position, count: activeRows, mropeLayout: mla.mropeLayout)
             mla.encodeLatentPrepAndPool(
                 enc, ln1: activeNormalized, mlaW: mlaW,
                 kv: views, fullAttnLayer: fullAttnIdx,
-                pos0: session.position, rows: activeRows)
+                pos0: session.position, rows: activeRows,
+                mropePositions: mropePos)
             enc.memoryBarrier(scope: .buffers)
-            let qNormView = prefixRows(mla.qResidScratch, rows: activeRows, cols: mlaW.qBProj.k, dt: .f16)
+            let qInView = mla.isDirectQ
+                ? activeNormalized
+                : prefixRows(mla.qResidScratch, rows: activeRows, cols: mlaW.qBProj.k, dt: .f16)
             let qFullView = prefixRows(mla.mlaQFullScratch, rows: activeRows, cols: mlaW.qBProj.n, dt: .f16)
-            try mtpBatchedMLP.encodeProjection(enc, input: qNormView, weight: mlaW.qBProj,
+            try mtpBatchedMLP.encodeProjection(enc, input: qInView, weight: mlaW.qBProj,
                                                output: qFullView, activeRows: activeRows)
             mla.encodeScoreSelectAbsorbAttendAndProjUV(
                 enc, mlaW: mlaW, kv: views, attOut: attnOut,
-                fullAttnLayer: fullAttnIdx, pos0: session.position, rows: activeRows)
+                fullAttnLayer: fullAttnIdx, pos0: session.position, rows: activeRows,
+                ln1: activeNormalized, mropePositions: mropePos)
             enc.memoryBarrier(scope: .buffers)
             return
         }

@@ -138,16 +138,43 @@ public struct QWModelGeometry: Sendable, Equatable {
     public var hybridMLAConfig: QWModelDescriptor.HybridMLAConfig? { descriptor.hybridMLAConfig }
     public var blockSparseGQAConfig: QWModelDescriptor.BlockSparseGQAConfig? { descriptor.blockSparseGQAConfig }
     public var hasDedicatedMHCMTP: Bool {
-        descriptor.family == .maxwellMoE && descriptor.mtpLayers > 0 && !descriptor.mtpSharedLastLayer && descriptor.mhcConfig != nil
+        descriptor.mtpConfig?.fusionMode == .splitEProjHProj && mhcConfig != nil
     }
     public var usesMultiStreamMTPHidden: Bool {
         (mtpSharedLastLayer || hasDedicatedMHCMTP) && mhcConfig != nil
     }
-    public var usesDecoupledRopeMLA: Bool { descriptor.hybridMLAConfig?.decoupledRope == true }
-    public var usesAnyMLA: Bool { usesNoPEMLA || descriptor.hybridMLAConfig != nil }
+    public var mlaConfig: QWModelDescriptor.MLAConfig? { descriptor.mlaConfig }
+    public var kdaConfig: QWModelDescriptor.KDAConfig? { descriptor.kdaConfig }
+    public var attentionSinkRelConfig: QWModelDescriptor.AttentionSinkRelConfig? { descriptor.attentionSinkRelConfig }
+    public var moeRoutingConfig: QWModelDescriptor.MoERoutingConfig? { descriptor.moeRoutingConfig }
+    public var swigluClampConfig: QWModelDescriptor.SwiGLUClampConfig? { descriptor.swigluClampConfig }
+    public var mtpConfig: QWModelDescriptor.MTPConfig? { descriptor.mtpConfig }
+    public var visionTowerConfig: QWModelDescriptor.VisionTowerConfig? { descriptor.visionTowerConfig }
+    public var ropeInterleave: Bool { descriptor.ropeInterleave }
+    public var mlaHasDirectQ: Bool { mlaConfig?.isDirectQ ?? (qLoraRank <= 0) }
+    public var mlaHasIndexer: Bool { mlaConfig?.hasIndexer ?? (indexerHeads > 0) }
+    public var hasSubquadraticAttention: Bool {
+        mlaHasIndexer || hcaConfig != nil || blockSparseGQAConfig != nil || indexerHeads > 0
+    }
+    public var kdaFgbChannels: Int {
+        guard let kda = kdaConfig else {
+            return gdnVectorDecay ? (2 * gdnLowRankDim + gdnVHeads) : gdnVHeads
+        }
+        return kda.isFullRank ? (2 * gdnZChannels) : (2 * (kda.lowRankDim ?? gdnHeadDim) + gdnVHeads)
+    }
+    public func routedSwiGLUClamp(layer: Int) -> QWSwiGLUClampSpec? {
+        swigluClampConfig?.routedSpec(layer: layer)
+    }
+    public func sharedSwiGLUClamp(layer: Int) -> QWSwiGLUClampSpec? {
+        swigluClampConfig?.sharedSpec(layer: layer)
+    }
+    public var usesDecoupledRopeMLA: Bool {
+        (mlaConfig?.qkRopeHeadDim ?? 0) > 0 || (descriptor.hybridMLAConfig?.decoupledRope == true)
+    }
+    public var usesAnyMLA: Bool { usesNoPEMLA || descriptor.mlaConfig != nil || descriptor.hybridMLAConfig != nil }
     public var usesLatentOrCompressedAttention: Bool { usesAnyMLA || descriptor.hcaConfig != nil }
-    public var kvLoraRank: Int { descriptor.kvLoraRank ?? 0 }
-    public var qLoraRank: Int { descriptor.qLoraRank ?? 0 }
+    public var kvLoraRank: Int { descriptor.mlaConfig?.kvLoraRank ?? descriptor.kvLoraRank ?? 0 }
+    public var qLoraRank: Int { descriptor.mlaConfig?.qLoraRank ?? descriptor.qLoraRank ?? 0 }
     public var qkNopeHeadDim: Int { descriptor.qkNopeHeadDim ?? 0 }
     public var qkRopeHeadDim: Int { descriptor.qkRopeHeadDim ?? 0 }
     public var vHeadDim: Int { descriptor.vHeadDim ?? headDim }
@@ -174,7 +201,16 @@ public struct QWModelGeometry: Sendable, Equatable {
     public var attnKRow0: Int { qProjOut }
     public var attnVRow0: Int { qProjOut + kvChannels }
     public var attnTotalN: Int { qProjOut + 2 * kvChannels }
-    public var attnProjTotalN: Int { attnTotalN + (blockSparseGQAConfig != nil ? (kvHeads + 1) * headDim : 0) }
+    public var mbsaIndexerHeads: Int {
+        (blockSparseGQAConfig?.indexerHeads ?? 0) > 0 ? blockSparseGQAConfig!.indexerHeads : kvHeads
+    }
+    public var mbsaIndexerHeadDim: Int {
+        (blockSparseGQAConfig?.indexerHeadDim ?? 0) > 0 ? blockSparseGQAConfig!.indexerHeadDim : headDim
+    }
+    public var mbsaIdxCols: Int {
+        blockSparseGQAConfig != nil ? (mbsaIndexerHeads + 1) * mbsaIndexerHeadDim : 0
+    }
+    public var attnProjTotalN: Int { attnTotalN + mbsaIdxCols }
     public var partialRotaryFactor: Double { descriptor.partialRotaryFactor }
     public var rotaryDims: Int { descriptor.rotaryDims }
     public var lsaHeadSliceStart: Int { descriptor.lsaHeadSliceStart }
@@ -242,7 +278,7 @@ public struct QWModelGeometry: Sendable, Equatable {
     /// Whether this geometry can use the hardware Grouped NAX MoE prefill pipeline.
     /// Requires <= 512 experts and 64-element tile alignment on hidden and moeIntermediate.
     public var supportsGroupedNAXMoEPrefill: Bool {
-        numExperts > 0 && numExperts <= 512 && hidden > 0 && hidden % 64 == 0
+        numExperts > 0 && numExperts <= 1024 && hidden > 0 && hidden % 64 == 0
             && moeRoutedDim > 0 && moeRoutedDim % 64 == 0
             && moeIntermediate > 0 && moeIntermediate % 64 == 0
     }

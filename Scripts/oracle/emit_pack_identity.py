@@ -21,7 +21,8 @@ def f64hex(x) -> str:
 def f32hex(x) -> str:
     return "0x" + format(struct.unpack(">I", struct.pack(">f", float(x)))[0], "x")
 
-def geo_v2(tc: dict) -> str:
+def geo_v2(tc: dict, parent_mt: str | None = None) -> str:
+    mt = tc.get("model_type") or parent_mt or ""
     num_layers = tc["num_hidden_layers"]
     raw_ratios = tc.get("compress_ratios")
     if tc.get("layer_types") is not None:
@@ -30,6 +31,12 @@ def geo_v2(tc: dict) -> str:
         raw_layer_types = [
             "compressed_attention" if r > 0 else "full_attention"
             for r in raw_ratios[:num_layers]
+        ]
+    elif tc.get("layer_group_size"):
+        gs = int(tc["layer_group_size"])
+        raw_layer_types = [
+            "full_attention" if (i + 1) % gs == 0 else "linear_attention"
+            for i in range(num_layers)
         ]
     else:
         raw_layer_types = ["full_attention"] * num_layers
@@ -40,6 +47,8 @@ def geo_v2(tc: dict) -> str:
     )
     if tc.get("full_attention_interval") is not None:
         fa_interval = tc["full_attention_interval"]
+    elif tc.get("layer_group_size") is not None:
+        fa_interval = int(tc["layer_group_size"])
     elif "F" in layer_kinds:
         cand = layer_kinds.index("F") + 1
         fa_indices = [i for i, ch in enumerate(layer_kinds) if ch == "F"]
@@ -61,21 +70,26 @@ def geo_v2(tc: dict) -> str:
     elif "use_gated_attn" in tc and tc["use_gated_attn"] is not None:
         gate_on = bool(tc["use_gated_attn"])
     else:
+        gran = (tc.get("gated_attention_proj_granularity_type") or "").lower()
         gate_on = (tc.get("output_gate_type") is not None
-                   or tc.get("model_type") in ("qwen3_5", "qwen3_5_text", "qwen4_exp", "qwen4_exp_text"))
+                   or gran in ("head_wise", "element_wise")
+                   or mt in ("qwen3_5", "qwen3_5_text", "qwen4_exp", "qwen4_exp_text"))
     qgate = 1 if gate_on else 0
     lin_cfg = tc.get("linear_attn_config") or {}
-    gdn_qk = tc.get("linear_num_key_heads") or lin_cfg.get("num_heads") or 0
-    gdn_v = tc.get("linear_num_value_heads") or lin_cfg.get("num_heads") or 0
-    gdn_hd = tc.get("linear_key_head_dim") or lin_cfg.get("head_dim") or 0
-    gdn_ck = tc.get("linear_conv_kernel_dim") or lin_cfg.get("short_conv_kernel_size") or 0
+    has_lin = "L" in layer_kinds
+    lin_kv = tc.get("num_kv_heads_for_linear_attn")
+    def_lin_qk = lin_kv if (lin_kv is not None and lin_kv > 0) else tc["num_attention_heads"]
+    gdn_qk = (tc.get("linear_num_key_heads") or lin_cfg.get("num_heads") or def_lin_qk) if has_lin else 0
+    gdn_v = (tc.get("linear_num_value_heads") or lin_cfg.get("num_heads") or tc["num_attention_heads"]) if has_lin else 0
+    gdn_hd = (tc.get("linear_key_head_dim") or lin_cfg.get("head_dim") or hd) if has_lin else 0
+    gdn_ck = (tc.get("linear_conv_kernel_dim") or lin_cfg.get("short_conv_kernel_size") or tc.get("short_conv_kernel_size") or 0) if has_lin else 0
     mtp_layers = tc.get("mtp_num_hidden_layers")
     if mtp_layers is None:
         mtp_layers = tc.get("num_nextn_predict_layers")
     if mtp_layers is None:
         mtp_layers = tc.get("mtp_num_layers", 0) or 0
     fields = [
-        f"model_type={tc['model_type']}",
+        f"model_type={mt}",
         f"hidden={tc['hidden_size']}",
         f"vocab={tc['vocab_size']}",
         f"layers={num_layers}",
@@ -102,15 +116,19 @@ def geo_v2(tc: dict) -> str:
     if idx_comp is None:
         idx_comp = 4 if tc.get("index_kpool_compress") else (1 if idx_heads else 0)
     fields.append("idx={},{},{},{},{}".format(idx_heads, idx_kv, idx_hd, idx_budget, idx_comp))
-    eg = tc.get("scoring_func") or tc.get("router_score_function") or (
-        "sigmoid" if tc.get("model_type") in (
+    eg = tc.get("scoring_func") or tc.get("router_score_function") or tc.get("score_function") or (
+        "sigmoid" if mt in (
             "qwen4_exp", "qwen4_exp_text", "glm5_next", "glm5_next_text",
             "ernie5_5_moe", "ernie5_5_moe_text", "maxwell_moe",
+            "bailing_moe_v3", "bailing_moe_v3_vl", "bailing_moe_v3_text",
         ) else "-"
     )
     num_exp = tc.get("num_experts") if tc.get("num_experts") is not None else (tc.get("n_routed_experts") or 0)
     moe_int = z("moe_intermediate_size")
     shared_int = tc.get("shared_expert_intermediate_size")
+    if shared_int is None and tc.get("moe_shared_expert_intermediate_size") is not None:
+        n_sh = tc.get("num_shared_experts") if tc.get("num_shared_experts") is not None else (tc.get("n_shared_experts") or 1)
+        shared_int = tc["moe_shared_expert_intermediate_size"] * max(1, n_sh)
     if shared_int is None:
         n_sh = tc.get("n_shared_experts") or 0
         shared_int = (n_sh * moe_int) if n_sh > 0 else 0
@@ -152,6 +170,9 @@ MODEL_ID = {
     "ernie5_5_moe": "ernie5_5_moe",
     "ernie5_5_moe_text": "ernie5_5_moe",
     "maxwell_moe": "maxwell_moe",
+    "bailing_moe_v3": "bailing_moe_v3",
+    "bailing_moe_v3_vl": "bailing_moe_v3",
+    "bailing_moe_v3_text": "bailing_moe_v3",
     "qwen2": "qwen2-dense",
     "llama": "llama-dense",
     "mistral": "mistral-dense",
@@ -162,9 +183,10 @@ def main() -> int:
     out_path = Path(sys.argv[2] if len(sys.argv) > 2 else "Scripts/oracle/flashnext_pack_identity.json")
     cfg = json.loads(cfg_path.read_text())
     tc = cfg["text_config"] if "text_config" in cfg else cfg
-    geo = geo_v2(tc)
+    mt = tc.get("model_type") or cfg.get("model_type", "")
+    geo = geo_v2(tc, parent_mt=cfg.get("model_type"))
     identity = {
-        "model_id": MODEL_ID[tc["model_type"]],
+        "model_id": MODEL_ID[mt],
         "geometry_digest": hashlib.sha256(geo.encode()).hexdigest(),
         "_canonical_string": geo,
         "_note": "pack.py successor injects model_id+geometry_digest into provenance (FN-AD-7); _canonical_string/_note are documentation, NOT packed",

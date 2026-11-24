@@ -31,7 +31,7 @@ struct QWMTPBatchedMLP {
 
     static func sumStride(geometry: QWModelGeometry) -> Int {
         let hcaOut = geometry.hcaConfig.map { max(1, $0.oGroups) * $0.oLoraRank } ?? 0
-        let mbsaIdxCols = geometry.blockSparseGQAConfig != nil ? (geometry.kvHeads + 1) * geometry.headDim : 0
+        let mbsaIdxCols = geometry.mbsaIdxCols
         let maxOut = max(geometry.intermediate,
                          max(geometry.gdnZChannels,
                              max(geometry.qHeads * geometry.headDim,
@@ -73,7 +73,7 @@ struct QWMTPBatchedMLP {
         sums = try allocator.allocate(QWTensorShape([rows * Self.sumStride(geometry: geometry)], .f32))
         let sumStorage = sums
         let hcaOutCols = geometry.hcaConfig.map { max(1, $0.oGroups) * $0.oLoraRank } ?? 0
-        let mbsaIdxCols = geometry.blockSparseGQAConfig != nil ? (geometry.kvHeads + 1) * geometry.headDim : 0
+        let mbsaIdxCols = geometry.mbsaIdxCols
         let outChannels = max(geometry.gdnZChannels,
                               max(geometry.qHeads * geometry.headDim,
                                   max(geometry.qHeads * geometry.vHeadDim, max(hcaOutCols, mbsaIdxCols))))
@@ -98,18 +98,32 @@ struct QWMTPBatchedMLP {
         let hcaOutCols = geometry.hcaConfig.map { max(1, $0.oGroups) * $0.oLoraRank } ?? 0
         let hcaInCols = geometry.hcaConfig.map { $0.qLoraRank + 3 * $0.headDim } ?? 0
         let hcaQUpCols = geometry.hcaConfig.map { $0.qHeads * $0.headDim + max(1, $0.oGroups) * $0.oLoraRank } ?? 0
-        let mlaLatentCols = geometry.qLoraRank + geometry.kvLoraRank + geometry.indexerHeadDim
-        let mlaQBCols = attnOutCols + geometry.indexerHeads * geometry.indexerHeadDim
-        let dMlaLatCols = geometry.hybridMLAConfig.map {
-            $0.qLoraRank + $0.kvLoraRank + $0.qkRopeHeadDim + max(32, geometry.indexerHeadDim)
-        } ?? 0
-        let dMlaQBCols = geometry.hybridMLAConfig.map {
-            $0.qHeads * ($0.qkNopeHeadDim + $0.qkRopeHeadDim + (geometry.attnOutputGate ? $0.vHeadDim : 0))
-                + max(1, geometry.indexerHeads) * max(32, geometry.indexerHeadDim)
-        } ?? 0
-        let dMlaQRank = geometry.hybridMLAConfig?.qLoraRank ?? geometry.qLoraRank
-        let kdaFgbCols = 2 * geometry.gdnLowRankDim + geometry.gdnVHeads
-        let mbsaIdxCols = geometry.blockSparseGQAConfig != nil ? (geometry.kvHeads + 1) * geometry.headDim : 0
+        let idxDim = geometry.mlaHasIndexer ? max(32, geometry.indexerHeadDim) : 0
+        let idxHeads = geometry.mlaHasIndexer ? max(1, geometry.indexerHeads) : 0
+        let mlaLatentCols = (geometry.mlaHasDirectQ ? 0 : geometry.qLoraRank) + geometry.kvLoraRank + idxDim
+        let mlaQBCols = attnOutCols + idxHeads * idxDim
+        let mlaQBInCols = geometry.mlaHasDirectQ ? geometry.hidden : geometry.qLoraRank
+        let decMla = geometry.mlaConfig
+        let hMla = geometry.hybridMLAConfig
+        let dMlaQRank = decMla?.qLoraRank ?? hMla?.qLoraRank ?? geometry.qLoraRank
+        let dMlaDirectQ = decMla?.isDirectQ ?? (dMlaQRank <= 0)
+        let dMlaHasIdx = decMla?.hasIndexer ?? (geometry.indexerHeads > 0)
+        let dMlaIdxD = dMlaHasIdx ? max(32, geometry.indexerHeadDim) : 0
+        let dMlaIdxH = dMlaHasIdx ? max(1, geometry.indexerHeads) : 0
+        let dMlaKvRank = decMla?.kvLoraRank ?? hMla?.kvLoraRank ?? geometry.kvLoraRank
+        let dMlaNope = decMla?.qkNopeHeadDim ?? hMla?.qkNopeHeadDim ?? geometry.qkNopeHeadDim
+        let dMlaRope = decMla?.qkRopeHeadDim ?? hMla?.qkRopeHeadDim ?? geometry.qkRopeHeadDim
+        let dMlaV = decMla?.vHeadDim ?? hMla?.vHeadDim ?? geometry.vHeadDim
+        let dMlaQHeads = decMla?.qHeads ?? hMla?.qHeads ?? geometry.qHeads
+        let dMlaInlineGate = (decMla?.outputGateMode ?? (geometry.attnOutputGate ? .elementWiseFromQLora : .none))
+            == .elementWiseFromQLora
+        let dMlaLatCols = (decMla != nil || hMla != nil)
+            ? ((dMlaDirectQ ? 0 : dMlaQRank) + dMlaKvRank + dMlaRope + dMlaIdxD) : 0
+        let dMlaQBCols = (decMla != nil || hMla != nil)
+            ? (dMlaQHeads * (dMlaNope + dMlaRope + (dMlaInlineGate ? dMlaV : 0)) + dMlaIdxH * dMlaIdxD) : 0
+        let dMlaQBInCols = dMlaDirectQ ? geometry.hidden : dMlaQRank
+        let kdaFgbCols = geometry.kdaFgbChannels
+        let mbsaIdxCols = geometry.mbsaIdxCols
         let validProj = (weight.n == geometry.hidden
                 && (weight.k == geometry.gdnZChannels || weight.k == attnOutCols
                     || weight.k == vOutCols || weight.k == hcaOutCols))
@@ -118,9 +132,9 @@ struct QWMTPBatchedMLP {
             || (weight.n == geometry.gdnQKVChannels && weight.k == geometry.hidden)
             || (weight.n == kdaFgbCols && weight.k == geometry.hidden)
             || (weight.n == mlaLatentCols && weight.k == geometry.hidden)
-            || (weight.n == mlaQBCols && weight.k == geometry.qLoraRank)
+            || (weight.n == mlaQBCols && weight.k == mlaQBInCols)
             || (weight.n == dMlaLatCols && weight.k == geometry.hidden)
-            || (weight.n == dMlaQBCols && weight.k == dMlaQRank)
+            || (weight.n == dMlaQBCols && weight.k == dMlaQBInCols)
             || (weight.n == hcaInCols && weight.k == geometry.hidden)
             || (weight.n == hcaQUpCols && weight.k == (geometry.hcaConfig?.qLoraRank ?? -1))
         guard validProj else {

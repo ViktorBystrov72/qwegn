@@ -18,6 +18,7 @@ enum QWMTPDraftChain {
                     draftHead: QWMTPTDraftHead? = nil,
                     hidden: QWTensorValue, kv: (k: QWKVLayerView, v: QWKVLayerView),
                     pendingToken: Int, drafts: Int, position: Int, cacheRows: Int,
+                    mropeDelta: Int = 0,
                     selection: Selection = .cpuReference,
                     deviceEmbedding: QWMTPEmbeddingTable? = nil,
                     embedding: (Int, QWTensorValue) throws -> Void,
@@ -45,7 +46,7 @@ enum QWMTPDraftChain {
             let cbs = try runDeviceChain(
                 hal: hal, draft: draft, headStorage: storage, draftHead: draftHead,
                 hidden: hidden, kv: kv, pendingToken: pendingToken, drafts: drafts,
-                position: position, cacheRows: cacheRows, table: table)
+                position: position, cacheRows: cacheRows, mropeDelta: mropeDelta, table: table)
             defer {
                 if !allDrained {
                     for sub in cbs { sub.waitUntilCompleted() }
@@ -136,6 +137,7 @@ enum QWMTPDraftChain {
                 try draft.encode(&enc, embedding: draft.scratch.embedding,
                                  hidden: row == 0 ? hidden : draft.scratch.postNorm,
                                  kv: kv, cacheRows: cacheRows + row, absolutePosition: position + row,
+                                 mropeDelta: mropeDelta,
                                  driver: activeDriver, cb: activeDriver?.activeCB ?? cb)
                 if let active = activeDriver?.activeEnc { enc = active }
                 if ObjectIdentifier(enc) != prevID {
@@ -219,7 +221,7 @@ enum QWMTPDraftChain {
         hal: QWHal, draft: QWMTPDraftEncoder, headStorage: QWHeadStorage,
         draftHead: QWMTPTDraftHead? = nil, hidden: QWTensorValue,
         kv: (k: QWKVLayerView, v: QWKVLayerView), pendingToken: Int,
-        drafts: Int, position: Int, cacheRows: Int,
+        drafts: Int, position: Int, cacheRows: Int, mropeDelta: Int = 0,
         table: QWMTPEmbeddingTable, journalTokenOffset: Int = 0
     ) throws -> [any MTLCommandBuffer] {
         let vocabulary = draft.scratch.draftLogits.shape.elementCount
@@ -259,6 +261,7 @@ enum QWMTPDraftChain {
                 try draft.encode(&enc, embedding: draft.scratch.embedding,
                                  hidden: row == 0 ? hidden : draft.scratch.postNorm,
                                  kv: kv, cacheRows: cacheRows + row, absolutePosition: position + row,
+                                 mropeDelta: mropeDelta,
                                  driver: activeDriver, cb: activeDriver?.activeCB ?? cb)
                 if let active = activeDriver?.activeEnc { enc = active }
                 if ObjectIdentifier(enc) != boundID {
@@ -304,13 +307,13 @@ enum QWMTPDraftChain {
         hal: QWHal, draft: QWMTPDraftEncoder, headStorage: QWHeadStorage,
         draftHead: QWMTPTDraftHead? = nil, hidden: QWTensorValue,
         kv: (k: QWKVLayerView, v: QWKVLayerView), pendingToken: Int,
-        drafts: Int, position: Int, cacheRows: Int,
+        drafts: Int, position: Int, cacheRows: Int, mropeDelta: Int = 0,
         table: QWMTPEmbeddingTable, journalTokenOffset: Int = 0
     ) throws -> [any MTLCommandBuffer] {
         let cbs = try runDeviceChain(
             hal: hal, draft: draft, headStorage: headStorage, draftHead: draftHead,
             hidden: hidden, kv: kv, pendingToken: pendingToken, drafts: drafts,
-            position: position, cacheRows: cacheRows, table: table,
+            position: position, cacheRows: cacheRows, mropeDelta: mropeDelta, table: table,
             journalTokenOffset: journalTokenOffset)
         guard !cbs.isEmpty else {
             throw QWEngineDriverError.state("device draft chain produced no command buffer")

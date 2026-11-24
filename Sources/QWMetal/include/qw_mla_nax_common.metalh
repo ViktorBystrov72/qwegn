@@ -256,8 +256,12 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
 ) {
     const uint halfRank = MLA_NAX_RANK / 2u;
     const uint seqLen = p.pos0 + t + 1u;
+    const bool isDenseStream = (p.topK == 0u);
+    const uint startTok = isDenseStream
+        ? ((p.windowTokens > 0u && seqLen > p.windowTokens) ? (seqLen - p.windowTokens) : 0u)
+        : 0u;
     const uint denseLim = p.topK + p.windowTokens;
-    const uint slots = min(min(seqLen, denseLim), 2560u);
+    const uint slots = isDenseStream ? (seqLen - startTok) : min(min(seqLen, denseLim), 2560u);
     const float scale2 = rsqrt(float(p.headDim)) * 1.4426950408889634f;
     uint sBegin = 0u, sEnd = slots;
     if (SPLIT) {
@@ -267,13 +271,15 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
     }
 
     const uint nThreads = NG * 128u;
-    if (seqLen <= denseLim) {
-        for (uint i = tid; i < slots; i += nThreads) blkIdx[i] = i;
-    } else {
-        device const int* rowList = blockList + (size_t)t * p.listStride;
-        for (uint i = tid; i < slots; i += nThreads) blkIdx[i] = min(uint(max(rowList[i], 0)), seqLen - 1u);
+    if (!isDenseStream) {
+        if (seqLen <= denseLim) {
+            for (uint i = tid; i < slots; i += nThreads) blkIdx[i] = i;
+        } else {
+            device const int* rowList = blockList + (size_t)t * p.listStride;
+            for (uint i = tid; i < slots; i += nThreads) blkIdx[i] = min(uint(max(rowList[i], 0)), seqLen - 1u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const short2 sc = BaseNAXFrag::get_coord();
     const short sm = sc.y, sn = sc.x;
@@ -297,15 +303,22 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
             }
         }
     }
-    mla_hfrag qrf = mla_hfrag(0.0h);
-    if (p.ropeDim == 64u) {
+    const uint nRopeFrags = (p.ropeDim > 64u) ? 2u : ((p.ropeDim > 0u) ? 1u : 0u);
+    mla_hfrag qrf[2] = {mla_hfrag(0.0h), mla_hfrag(0.0h)};
+    if (p.ropeDim > 0u) {
         device const half* qr0 = mlaQFull + (size_t)t * p.qFullStride + p.qRopeOffset
-                                 + (size_t)(h0 + uint(sm)) * 64u + sg_d * 16u + uint(sn);
+                                 + (size_t)(h0 + uint(sm)) * p.ropeDim;
         STEEL_PRAGMA_UNROLL
-        for (short i = 0; i < 2; i++) {
-            const half4 v = *(device const half4*)(qr0 + (size_t)i * 8u * 64u);
-            STEEL_PRAGMA_UNROLL
-            for (short j = 0; j < 4; j++) qrf[i * 4 + j] = v[j];
+        for (short r = 0; r < 2; r++) {
+            const uint col = uint(r) * 64u + sg_d * 16u + uint(sn);
+            if (uint(r) < nRopeFrags && col < p.ropeDim) {
+                STEEL_PRAGMA_UNROLL
+                for (short i = 0; i < 2; i++) {
+                    const half4 v = *(device const half4*)(qr0 + (size_t)i * 8u * p.ropeDim + col);
+                    STEEL_PRAGMA_UNROLL
+                    for (short j = 0; j < 4; j++) qrf[r][i * 4 + j] = v[j];
+                }
+            }
         }
     }
 
@@ -325,20 +338,26 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
     uint buf = 0u;
     for (uint s0 = sBegin; s0 < sEnd; s0 += MLA_NAX_BK) {
         mla_hfrag kf[2][8];
-        mla_hfrag krf[2] = {mla_hfrag(0.0h), mla_hfrag(0.0h)};
+        mla_hfrag krf[2][2] = {{mla_hfrag(0.0h), mla_hfrag(0.0h)}, {mla_hfrag(0.0h), mla_hfrag(0.0h)}};
         STEEL_PRAGMA_UNROLL
         for (short f = 0; f < 2; f++) {
             STEEL_PRAGMA_UNROLL
             for (short i = 0; i < 2; i++) {
                 const uint slot = s0 + uint(f * 16 + sm + i * 8);
                 const bool validSlot = (slot < sEnd);
-                const uint tokJ = validSlot ? blkIdx[slot] : 0u;
-                if (p.ropeDim == 64u) {
-                    const half4 rv = validSlot
-                        ? *(device const half4*)(kPeCache + (size_t)tokJ * 64u + sg_d * 16u + uint(sn))
-                        : half4(0.0h);
+                const uint tokJ = validSlot ? (isDenseStream ? (startTok + slot) : blkIdx[slot]) : 0u;
+                if (p.ropeDim > 0u) {
                     STEEL_PRAGMA_UNROLL
-                    for (short j = 0; j < 4; j++) krf[f][i * 4 + j] = rv[j];
+                    for (short r = 0; r < 2; r++) {
+                        const uint col = uint(r) * 64u + sg_d * 16u + uint(sn);
+                        if (uint(r) < nRopeFrags && col < p.ropeDim) {
+                            const half4 rv = validSlot
+                                ? *(device const half4*)(kPeCache + (size_t)tokJ * p.ropeDim + col)
+                                : half4(0.0h);
+                            STEEL_PRAGMA_UNROLL
+                            for (short j = 0; j < 4; j++) krf[r][f][i * 4 + j] = rv[j];
+                        }
+                    }
                 }
                 if constexpr (KV_MODE == 0u) {
                     device const half* src = nullptr;
@@ -394,9 +413,11 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
             BaseNAXFrag::mma(s[0], s[1], qf[d], metal::false_type{},
                              kf[0][d], kf[1][d], metal::true_type{});
         }
-        if (p.ropeDim == 64u) {
-            BaseNAXFrag::mma(s[0], s[1], qrf, metal::false_type{},
-                             krf[0], krf[1], metal::true_type{});
+        if (p.ropeDim > 0u) {
+            for (uint r = 0u; r < nRopeFrags; ++r) {
+                BaseNAXFrag::mma(s[0], s[1], qrf[r], metal::false_type{},
+                                 krf[r][0], krf[r][1], metal::true_type{});
+            }
         }
         if constexpr (NG == 2u) {
             if (s0 > sBegin) threadgroup_barrier(mem_flags::mem_threadgroup);

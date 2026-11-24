@@ -32,6 +32,8 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
     public let kvHeads: Int
     public let qHeads: Int
     public let headDim: Int
+    public let idxHeads: Int
+    public let idxDim: Int
     public let listStride: Int
     public let tileListStride: Int
     public let maxTiles: Int
@@ -126,6 +128,8 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
         self.kvHeads = geometry.kvHeads
         self.qHeads = geometry.qHeads
         self.headDim = geometry.headDim
+        self.idxHeads = geometry.mbsaIndexerHeads
+        self.idxDim = geometry.mbsaIndexerHeadDim
         self.listStride = max(1, config.maxSelectedBlocks)
         self.tileListStride = Self.tileListStride(config: config)
         self.maxTiles = (self.maxRows + 31) / 32
@@ -133,9 +137,11 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
             && geometry.supportsNAXPagedAttnPrefill
             && config.blockSize >= 32
             && self.headDim <= 128
+            && self.idxDim <= 128
+            && self.idxHeads <= self.kvHeads
             && config.remoteBlocks <= 32
         self.supportsSplitKDecode = geometry.gqaRatio <= 8 && self.headDim <= 256
-        self.layerKCacheElems = self.maxContext * self.headDim
+        self.layerKCacheElems = self.maxContext * self.idxDim
         let rawKBytes = self.layerKCacheElems * 2
         self.layerKCacheStrideBytes = (rawKBytes + 255) & ~255
 
@@ -165,8 +171,8 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
         self.psoCombineBatched = try hal.pipeline("qwg_attn_decode_combine_batched")
 
         func align256(_ n: Int) -> Int { (n + 255) & ~255 }
-        let qkvScratchElems = self.maxRows * (self.kvHeads + 1) * self.headDim
-        let qScratchElems = self.maxRows * self.kvHeads * self.headDim
+        let qkvScratchElems = self.maxRows * (self.idxHeads + 1) * self.idxDim
+        let qScratchElems = self.maxRows * self.idxHeads * self.idxDim
         let blkListElems = self.maxRows * self.kvHeads * self.listStride
         let blkCntElems = self.maxRows * self.kvHeads
         let tileListElems = self.maxTiles * self.kvHeads * self.tileListStride
@@ -213,8 +219,8 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
         qkvSource: QWTensorValue? = nil,
         qkvRowStrideCols: Int = 0
     ) {
-        let qkvSlice = qkvSource ?? idxQKVScratch.slice(byteOffset: 0, count: rows * (kvHeads + 1) * headDim, dtype: .f16)
-        let qSlice = idxQScratch.slice(byteOffset: 0, count: rows * kvHeads * headDim, dtype: .f16)
+        let qkvSlice = qkvSource ?? idxQKVScratch.slice(byteOffset: 0, count: rows * (idxHeads + 1) * idxDim, dtype: .f16)
+        let qSlice = idxQScratch.slice(byteOffset: 0, count: rows * idxHeads * idxDim, dtype: .f16)
         let kCache = idxKCaches[layerIndex]
         enc.setComputePipelineState(psoIndexPrep)
         qkvSlice.bind(enc, index: 0)
@@ -223,11 +229,11 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
         weights.wqIdx.bind(enc, index: 3)
         weights.wkIdx.bind(enc, index: 4)
         ropeTable.bind(enc, index: 5)
-        var dims: (UInt32, UInt32, UInt32, UInt32) = (UInt32(pos0), UInt32(kvHeads), UInt32(headDim / 8), UInt32(qkvRowStrideCols / 8))
+        var dims: (UInt32, UInt32, UInt32, UInt32) = (UInt32(pos0), UInt32(idxHeads), UInt32(idxDim / 8), UInt32(qkvRowStrideCols / 8))
         var eps = geometry.rmsEps
         enc.setBytes(&dims, length: 16, index: 6)
         enc.setBytes(&eps, length: 4, index: 7)
-        enc.dispatchThreadgroups(MTLSize(width: kvHeads + 1, height: rows, depth: 1),
+        enc.dispatchThreadgroups(MTLSize(width: idxHeads + 1, height: rows, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }
 
@@ -241,8 +247,9 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
         rows: Int,
         partials: QWMRegion? = nil
     ) {
-        let qSlice = idxQScratch.slice(byteOffset: 0, count: rows * kvHeads * headDim, dtype: .f16)
+        let qSlice = idxQScratch.slice(byteOffset: 0, count: rows * idxHeads * idxDim, dtype: .f16)
         let kCache = idxKCaches[layerIndex]
+        let packedHeads = UInt32(kvHeads & 0xFFFF) | (UInt32(idxHeads & 0xFFFF) << 16)
         if rows > 8 && supportsNAXPrefill {
             let numTiles = (rows + 31) / 32
             enc.setComputePipelineState(psoSelectBlocksTiled32)
@@ -252,7 +259,7 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
             tileBlockMaskScratch.bind(enc, index: 3)
             tileBlockCountScratch.bind(enc, index: 4)
             var p0: (UInt32, UInt32, UInt32, UInt32) = (
-                UInt32(pos0), UInt32(kvHeads), UInt32(headDim), UInt32(config.blockSize))
+                UInt32(pos0), packedHeads, UInt32(idxDim), UInt32(config.blockSize))
             var p1: (UInt32, UInt32, UInt32, UInt32) = (
                 UInt32(config.prefixBlocks), UInt32(config.localBlocks),
                 UInt32(config.remoteBlocks), UInt32(tileListStride))
@@ -294,7 +301,7 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
         blockListScratch.bind(enc, index: 2)
         blockCountScratch.bind(enc, index: 3)
         var p0: (UInt32, UInt32, UInt32, UInt32) = (
-            UInt32(pos0), UInt32(kvHeads), UInt32(headDim), UInt32(config.blockSize))
+            UInt32(pos0), packedHeads, UInt32(idxDim), UInt32(config.blockSize))
         var p1: (UInt32, UInt32, UInt32, UInt32) = (
             UInt32(config.prefixBlocks), UInt32(config.localBlocks),
             UInt32(config.remoteBlocks), UInt32(listStride))
@@ -363,13 +370,13 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
 
     public func indexerStateBytes(position: Int) -> Int {
         guard position > 0, position <= maxContext else { return 0 }
-        return layerCount * position * headDim * 2
+        return layerCount * position * idxDim * 2
     }
 
     public func captureIndexerState(position: Int) -> Data {
         let len = min(position, maxContext)
         guard len > 0 else { return Data() }
-        let rowBytes = len * headDim * 2
+        let rowBytes = len * idxDim * 2
         var data = Data(count: layerCount * rowBytes)
         data.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             guard let dst = raw.baseAddress else { return }
@@ -385,7 +392,7 @@ public final class QWMBSAAttnOperator: @unchecked Sendable {
     public func restoreIndexerState(_ data: Data, position: Int) -> Bool {
         let len = min(position, maxContext)
         guard len >= 0 else { return false }
-        let rowBytes = len * headDim * 2
+        let rowBytes = len * idxDim * 2
         guard data.count == layerCount * rowBytes else { return false }
         if rowBytes > 0 {
             data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in

@@ -17,8 +17,12 @@ public struct QWMMSpec: Sendable, Equatable, Hashable {
     public let videoToken: Int
     public let minPixels: Int
     public let maxPixels: Int
-    public let isInkling2: Bool
+    public let usesUnfoldedPatchEmbed: Bool
+    public let mropeLayout: QWModelDescriptor.MRoPELayout
+    public let imageMean: [Float]
+    public let imageStd: [Float]
 
+    public var isInkling2: Bool { usesUnfoldedPatchEmbed }
     public var factor: Int { patch * merge }
     public var patchArea: Int { patch * patch }
     public var temporalPatchArea: Int { temporal * patchArea }
@@ -33,7 +37,11 @@ public struct QWMMSpec: Sendable, Equatable, Hashable {
         videoToken: Int,
         minPixels: Int = 65_536,
         maxPixels: Int = 16_777_216,
-        isInkling2: Bool = false
+        usesUnfoldedPatchEmbed: Bool = false,
+        isInkling2: Bool? = nil,
+        mropeLayout: QWModelDescriptor.MRoPELayout = .qwenInterleaved,
+        imageMean: [Float] = [0.5, 0.5, 0.5],
+        imageStd: [Float] = [0.5, 0.5, 0.5]
     ) {
         self.patch = patch
         self.temporal = temporal
@@ -43,13 +51,18 @@ public struct QWMMSpec: Sendable, Equatable, Hashable {
         self.videoToken = videoToken
         self.minPixels = minPixels
         self.maxPixels = maxPixels
-        self.isInkling2 = isInkling2
+        self.usesUnfoldedPatchEmbed = isInkling2 ?? usesUnfoldedPatchEmbed
+        self.mropeLayout = mropeLayout
+        self.imageMean = imageMean.count == 3 ? imageMean : [0.5, 0.5, 0.5]
+        self.imageStd = imageStd.count == 3 ? imageStd : [0.5, 0.5, 0.5]
     }
 
     public init(
         visionConfig: QWVisionConfig,
         minPixels: Int = 65_536,
-        maxPixels: Int = 16_777_216
+        maxPixels: Int = 16_777_216,
+        imageMeanOverride: [Float]? = nil,
+        imageStdOverride: [Float]? = nil
     ) {
         self.init(
             patch: visionConfig.patch,
@@ -60,19 +73,35 @@ public struct QWMMSpec: Sendable, Equatable, Hashable {
             videoToken: visionConfig.videoTokenId,
             minPixels: minPixels,
             maxPixels: maxPixels,
-            isInkling2: visionConfig.architecture == .inkling2
+            usesUnfoldedPatchEmbed: visionConfig.architecture == .inkling2,
+            mropeLayout: visionConfig.mropeLayout,
+            imageMean: imageMeanOverride ?? visionConfig.imageMean,
+            imageStd: imageStdOverride ?? visionConfig.imageStd
         )
     }
 
     public init(
         descriptor: QWModelDescriptor,
         minPixels: Int = 65_536,
-        maxPixels: Int = 16_777_216
+        maxPixels: Int = 16_777_216,
+        imageMeanOverride: [Float]? = nil,
+        imageStdOverride: [Float]? = nil
     ) {
         self.init(
             visionConfig: QWVisionConfig(descriptor: descriptor),
             minPixels: minPixels,
-            maxPixels: maxPixels
+            maxPixels: maxPixels,
+            imageMeanOverride: imageMeanOverride,
+            imageStdOverride: imageStdOverride
+        )
+    }
+
+    public func withPixelNormalization(mean: [Float], std: [Float]) -> QWMMSpec {
+        QWMMSpec(
+            patch: patch, temporal: temporal, merge: merge, posSide: posSide,
+            imageToken: imageToken, videoToken: videoToken, minPixels: minPixels,
+            maxPixels: maxPixels, usesUnfoldedPatchEmbed: usesUnfoldedPatchEmbed,
+            mropeLayout: mropeLayout, imageMean: mean, imageStd: std
         )
     }
 
@@ -266,12 +295,17 @@ public enum QWMMBlock: Equatable, Sendable {
 }
 
 /// Builds 3-plane (t, h, w) mRope coordinates over text, image, and video blocks.
-public func qwMRopePositions(blocks: [QWMMBlock], merge: Int? = nil) -> (pos: [Int32], delta: Int) {
+public func qwMRopePositions(
+    blocks: [QWMMBlock],
+    merge: Int? = nil,
+    layout: QWModelDescriptor.MRoPELayout = .qwenInterleaved,
+    initialCursor: Int = 0
+) -> (pos: [Int32], delta: Int) {
     var S = 0; for b in blocks { S += b.tokens.count }
     guard S > 0 else { return ([], 0) }
     var pT = [Int32](), pH = [Int32](), pW = [Int32]()
     pT.reserveCapacity(S); pH.reserveCapacity(S); pW.reserveCapacity(S)
-    var cur = 0
+    var cur = initialCursor
     for b in blocks {
         switch b {
         case .text(let tokens):
@@ -282,14 +316,22 @@ public func qwMRopePositions(blocks: [QWMMBlock], merge: Int? = nil) -> (pos: [I
         case .image(let tokens, let g):
             let m = merge ?? g.spec.merge
             precondition(tokens.count == g.tokens, "image block token count ≠ grid tokens")
-            emitCube(t: g.t, h: g.h, w: g.w, merge: m, cur: cur, &pT, &pH, &pW)
-            cur += max(g.h, g.w) / m
+            if layout == .bailingVideoRope {
+                cur = emitBailingCube(t: g.t, h: g.h, w: g.w, merge: m, cur: cur, &pT, &pH, &pW)
+            } else {
+                emitCube(t: g.t, h: g.h, w: g.w, merge: m, cur: cur, &pT, &pH, &pW)
+                cur += max(g.h, g.w) / m
+            }
         case .video(let tokens, let g):
             let m = merge ?? g.spec.merge
             precondition(tokens.count == g.tokens, "video block token count ≠ grid tokens")
-            for _ in 0..<g.t {
-                emitCube(t: 1, h: g.h, w: g.w, merge: m, cur: cur, &pT, &pH, &pW)
-                cur += max(g.h, g.w) / m
+            if layout == .bailingVideoRope {
+                cur = emitBailingCube(t: g.t, h: g.h, w: g.w, merge: m, cur: cur, &pT, &pH, &pW)
+            } else {
+                for _ in 0..<g.t {
+                    emitCube(t: 1, h: g.h, w: g.w, merge: m, cur: cur, &pT, &pH, &pW)
+                    cur += max(g.h, g.w) / m
+                }
             }
         }
     }
@@ -298,7 +340,28 @@ public func qwMRopePositions(blocks: [QWMMBlock], merge: Int? = nil) -> (pos: [I
     for i in 0..<S { mx = max(mx, max(pT[i], max(pH[i], pW[i]))) }
     var pos = [Int32](); pos.reserveCapacity(3 * S)
     pos.append(contentsOf: pT); pos.append(contentsOf: pH); pos.append(contentsOf: pW)
-    return (pos, Int(mx) + 1 - S)
+    let delta = (layout == .bailingVideoRope) ? (cur - (initialCursor + S)) : (Int(mx) + 1 - (initialCursor + S))
+    return (pos, delta)
+}
+
+private func emitBailingCube(
+    t lt: Int, h hh: Int, w ww: Int, merge m: Int, cur: Int,
+    _ pT: inout [Int32], _ pH: inout [Int32], _ pW: inout [Int32]
+) -> Int {
+    guard lt > 0 else { return cur }
+    let lh = hh / m, lw = ww / m
+    let hCenter = (lh - 1) / 2, wCenter = (lw - 1) / 2
+    for ti in 0..<lt {
+        let baseT = cur + ti * 2
+        for hi in 0..<lh {
+            for wi in 0..<lw {
+                pT.append(Int32(baseT))
+                pH.append(Int32(baseT + hi - hCenter))
+                pW.append(Int32(baseT + wi - wCenter))
+            }
+        }
+    }
+    return cur + (lt - 1) * 2 + 1
 }
 
 private func emitCube(t lt: Int, h hh: Int, w ww: Int, merge m: Int, cur: Int,
@@ -408,12 +471,19 @@ public func qwBuildPatchSlab(normalizedRGB: [Float], height: Int, width: Int, gr
     return scatterPlanarPatches(planes: planes, grid: grid, width: width, pixelCount: pixelCount)
 }
 
-/// Construct the patch-slab layout from raw UInt8 RGB pixels [0, 255], normalizing to [-1, 1].
+/// Construct the patch-slab layout from raw UInt8 RGB pixels [0, 255], applying per-channel mean/std.
 public func qwBuildPatchSlab(imageRGB: [UInt8], height: Int, width: Int, grid: QWVisionGrid) throws -> [Float] {
-    if grid.spec.isInkling2 {
+    let mean = grid.spec.imageMean
+    let std = grid.spec.imageStd
+    if grid.spec.usesUnfoldedPatchEmbed {
         var norm = [Float](repeating: 0, count: imageRGB.count)
         let scale: Float = 1.0 / 255.0
-        for i in 0..<imageRGB.count { norm[i] = (Float(imageRGB[i]) * scale - 0.5) / 0.5 }
+        for idx in 0..<(imageRGB.count / 3) {
+            let b = idx * 3
+            norm[b] = (Float(imageRGB[b]) * scale - mean[0]) / max(1e-6, std[0])
+            norm[b + 1] = (Float(imageRGB[b + 1]) * scale - mean[1]) / max(1e-6, std[1])
+            norm[b + 2] = (Float(imageRGB[b + 2]) * scale - mean[2]) / max(1e-6, std[2])
+        }
         return try qwBuildInkling2PatchSlab(normalizedPaddedRGB: norm, paddedH: height, paddedW: width, grid: grid)
     }
     try validatePatchSlabInputs(grid: grid, height: height, width: width, sampleCount: imageRGB.count)
@@ -422,17 +492,17 @@ public func qwBuildPatchSlab(imageRGB: [UInt8], height: Int, width: Int, grid: Q
     var planes = [Float](repeating: 0, count: 3 * pixelCount)
     let vPixels = vDSP_Length(pixelCount)
     var div255: Float = 255.0
-    var negHalf: Float = -0.5
-    var two: Float = 2.0
     imageRGB.withUnsafeBufferPointer { src in
         planes.withUnsafeMutableBufferPointer { dst in
             guard let sBase = src.baseAddress, let pBase = dst.baseAddress else { return }
             for c in 0..<3 {
+                var negMean = -mean[c]
+                var invStd = 1.0 / max(1e-6, std[c])
                 let planeC = pBase + c * pixelCount
                 vDSP_vfltu8(sBase + c, 3, planeC, 1, vPixels)
                 vDSP_vsdiv(planeC, 1, &div255, planeC, 1, vPixels)
-                vDSP_vsadd(planeC, 1, &negHalf, planeC, 1, vPixels)
-                vDSP_vsmul(planeC, 1, &two, planeC, 1, vPixels)
+                vDSP_vsadd(planeC, 1, &negMean, planeC, 1, vPixels)
+                vDSP_vsmul(planeC, 1, &invStd, planeC, 1, vPixels)
             }
         }
     }
@@ -504,7 +574,7 @@ public struct QWX0Plan: Equatable, Sendable {
         guard ii == images.count, vi == videos.count else {
             throw QWGridError.placeholderOverflow
         }
-        let rope = qwMRopePositions(blocks: blocks, merge: spec.merge)
+        let rope = qwMRopePositions(blocks: blocks, merge: spec.merge, layout: spec.mropeLayout)
         precondition(rope.pos.count == 3 * out.count)
         self.tokens = out; self.spans = spans; self.positions = rope.pos; self.mropeDelta = rope.delta
     }

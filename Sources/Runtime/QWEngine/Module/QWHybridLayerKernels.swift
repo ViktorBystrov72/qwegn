@@ -30,8 +30,7 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
         let l = context.layer
         let w = context.weights.gdn!
         let H = geometry.hidden
-        if geometry.gdnVectorDecay, let fgbProj = w.fgbProj, let fgb16 = sc.fgb16,
-           let fB = w.fB, let gB = w.gB {
+        if geometry.gdnVectorDecay, let fgbProj = w.fgbProj, let fgb16 = sc.fgb16 {
             if context.weights.mhc == nil { mark("kda.in_proj") }
             try driver.gemvH16T4(enc, n: geometry.gdnQKVChannels, k: H, x: sc.ln1, gs: sc.gs,
                                  wQ4: w.inProj, y16: sc.qkv16)
@@ -39,9 +38,16 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
             try driver.gemvH16T4(enc, n: fgbProj.n, k: H, x: sc.ln1, gs: sc.gs,
                                  wQ4: fgbProj, y16: fgb16)
             mark("kda.gates")
-            try driver.gdnDecode.encodeKDAGates(
-                enc, fgb: fgb16, fB: fB, gB: gB, aLog: w.aLog, dtBias: w.dtBias,
-                betas: sc.betas, glog: sc.glog, zOut: sc.z16, rows: 1)
+            if let fB = w.fB, let gB = w.gB {
+                try driver.gdnDecode.encodeKDAGates(
+                    enc, fgb: fgb16, fB: fB, gB: gB, aLog: w.aLog, dtBias: w.dtBias,
+                    betas: sc.betas, glog: sc.glog, zOut: sc.z16, rows: 1)
+            } else {
+                try driver.gdnDecode.encodeKDAGatesDirect(
+                    enc, fgb: fgb16, ln1: sc.ln1, bProjF16: w.bProjF16,
+                    aLog: w.aLog, dtBias: w.dtBias,
+                    betas: sc.betas, glog: sc.glog, zOut: sc.z16, rows: 1)
+            }
         } else {
             if context.weights.mhc == nil { mark("gdn.in_proj") }
             try driver.gemvH16GdnInProjT4(enc, n: geometry.gdnTotalN, k: H, x: sc.ln1, gs: sc.gs, wQ4: w.inProj,
@@ -84,8 +90,7 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
         let gdnVH = geometry.gdnVHeads
         let glogC = geometry.gdnGlogChannels
         let gi = driver.gdnIndexMap[l]   // M6 FIX: single source of truth
-        if geometry.gdnVectorDecay, let fgbProj = w.fgbProj, let fgb16 = psc.fgb16,
-           let fB = w.fB, let gB = w.gB {
+        if geometry.gdnVectorDecay, let fgbProj = w.fgbProj, let fgb16 = psc.fgb16 {
             let activeLn1 = driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16)
             mark("kda.in_proj")
             try driver.gemmBatchedH16(enc, m: T, n: qkvC, k: H, x: activeLn1, wQ4: w.inProj,
@@ -94,14 +99,20 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
             try driver.gemmBatchedH16(enc, m: T, n: fgbProj.n, k: H, x: activeLn1, wQ4: fgbProj,
                                       y16: driver.prefixRows(fgb16, rows: T, cols: fgbProj.n, dt: .f16))
             mark("kda.gates")
-            try driver.gdnDecode.encodeKDAGates(
-                enc,
-                fgb: driver.prefixRows(fgb16, rows: T, cols: fgbProj.n, dt: .f16),
-                fB: fB, gB: gB, aLog: w.aLog, dtBias: w.dtBias,
-                betas: driver.prefixRows(psc.betas, rows: T, cols: gdnVH, dt: .f32),
-                glog: driver.prefixRows(psc.glog, rows: T, cols: glogC, dt: .f32),
-                zOut: driver.prefixRows(psc.z16, rows: T, cols: zC, dt: .f16),
-                rows: T)
+            let fgbRows = driver.prefixRows(fgb16, rows: T, cols: fgbProj.n, dt: .f16)
+            let betasRows = driver.prefixRows(psc.betas, rows: T, cols: gdnVH, dt: .f32)
+            let glogRows = driver.prefixRows(psc.glog, rows: T, cols: glogC, dt: .f32)
+            let zOutRows = driver.prefixRows(psc.z16, rows: T, cols: zC, dt: .f16)
+            if let fB = w.fB, let gB = w.gB {
+                try driver.gdnDecode.encodeKDAGates(
+                    enc, fgb: fgbRows, fB: fB, gB: gB, aLog: w.aLog, dtBias: w.dtBias,
+                    betas: betasRows, glog: glogRows, zOut: zOutRows, rows: T)
+            } else {
+                try driver.gdnDecode.encodeKDAGatesDirect(
+                    enc, fgb: fgbRows, ln1: activeLn1, bProjF16: w.bProjF16,
+                    aLog: w.aLog, dtBias: w.dtBias,
+                    betas: betasRows, glog: glogRows, zOut: zOutRows, rows: T)
+            }
             mark("kda.conv")
             try driver.gdnConv.encodePrefillWithHeadnorm(
                 enc,
@@ -212,8 +223,7 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
         let batchMLP = try driver.sharedBatchMLP()
         enc.useResource(batchMLP.downRows.region.buffer, usage: [.read, .write])
         enc.useResource(batchMLP.sums.region.buffer, usage: [.read, .write])
-        if geometry.gdnVectorDecay, let fgbProj = w.fgbProj, let fgb16 = psc.fgb16,
-           let fB = w.fB, let gB = w.gB {
+        if geometry.gdnVectorDecay, let fgbProj = w.fgbProj, let fgb16 = psc.fgb16 {
             try batchMLP.encodeProjection(enc, input: activeLn1, weight: w.inProj,
                                           output: driver.prefixRows(psc.qkv16, rows: B, cols: qkvC, dt: .f16),
                                           activeRows: B)
@@ -221,14 +231,20 @@ final class GDNLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecked Sendable
                                           output: driver.prefixRows(fgb16, rows: B, cols: fgbProj.n, dt: .f16),
                                           activeRows: B)
             enc.memoryBarrier(scope: .buffers)
-            try driver.gdnDecode.encodeKDAGates(
-                enc,
-                fgb: driver.prefixRows(fgb16, rows: B, cols: fgbProj.n, dt: .f16),
-                fB: fB, gB: gB, aLog: w.aLog, dtBias: w.dtBias,
-                betas: driver.prefixRows(psc.betas, rows: B, cols: gdnVH, dt: .f32),
-                glog: driver.prefixRows(psc.glog, rows: B, cols: glogC, dt: .f32),
-                zOut: driver.prefixRows(psc.z16, rows: B, cols: zC, dt: .f16),
-                rows: B)
+            let fgbRows = driver.prefixRows(fgb16, rows: B, cols: fgbProj.n, dt: .f16)
+            let betasRows = driver.prefixRows(psc.betas, rows: B, cols: gdnVH, dt: .f32)
+            let glogRows = driver.prefixRows(psc.glog, rows: B, cols: glogC, dt: .f32)
+            let zOutRows = driver.prefixRows(psc.z16, rows: B, cols: zC, dt: .f16)
+            if let fB = w.fB, let gB = w.gB {
+                try driver.gdnDecode.encodeKDAGates(
+                    enc, fgb: fgbRows, fB: fB, gB: gB, aLog: w.aLog, dtBias: w.dtBias,
+                    betas: betasRows, glog: glogRows, zOut: zOutRows, rows: B)
+            } else {
+                try driver.gdnDecode.encodeKDAGatesDirect(
+                    enc, fgb: fgbRows, ln1: activeLn1, bProjF16: w.bProjF16,
+                    aLog: w.aLog, dtBias: w.dtBias,
+                    betas: betasRows, glog: glogRows, zOut: zOutRows, rows: B)
+            }
             enc.memoryBarrier(scope: .buffers)
             for b in 0..<B {
                 let qkvRow = driver.stridedRow(psc.qkv16, row: b, cols: qkvC, dt: .f16)
@@ -345,22 +361,28 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
         let views = context.session.attnKVViews[fullAttnIdx]
         if let mla = driver.mlaOperator, let mlaW = w.mla {
             let latRow = driver.prefixRows(mla.mlaLatentScratch, rows: 1, cols: mla.latentStride, dt: .f16)
-            let qResRow = driver.prefixRows(mla.qResidScratch, rows: 1, cols: geometry.qLoraRank, dt: .f16)
             let qFullRow = driver.prefixRows(mla.mlaQFullScratch, rows: 1, cols: mla.qFullStride, dt: .f16)
+            let mropePos = context.session.mropeSlice(pos: pos, count: 1, mropeLayout: mla.mropeLayout)
             mark("mla.qkv_a_proj")
             try driver.gemvH16T4(enc, n: w.qkvProj.n, k: H, x: sc.ln1, gs: sc.gs, wQ4: w.qkvProj, y16: latRow)
             mark("mla.latent_prep")
             mla.encodeLatentPrepAndPool(
                 enc, ln1: sc.ln1,
                 mlaW: mlaW, kv: views,
-                fullAttnLayer: fullAttnIdx, pos0: pos, rows: 1)
+                fullAttnLayer: fullAttnIdx, pos0: pos, rows: 1,
+                mropePositions: mropePos)
             mark("mla.q_b_proj")
-            try driver.gemvH16T4(enc, n: mlaW.qBProj.n, k: geometry.qLoraRank, x: qResRow, gs: sc.gs, wQ4: mlaW.qBProj, y16: qFullRow)
+            let qBInput = mla.isDirectQ
+                ? sc.ln1
+                : driver.prefixRows(mla.qResidScratch, rows: 1, cols: mlaW.qBProj.k, dt: .f16)
+            try driver.gemvH16T4(enc, n: mlaW.qBProj.n, k: mlaW.qBProj.k, x: qBInput, gs: sc.gs, wQ4: mlaW.qBProj, y16: qFullRow)
             mark("mla.attend")
             mla.encodeScoreSelectAbsorbAttendAndProjUV(
                 enc, mlaW: mlaW, kv: views,
                 attOut: sc.attOut,
                 fullAttnLayer: fullAttnIdx, pos0: pos, rows: 1,
+                ln1: sc.ln1,
+                mropePositions: mropePos,
                 stage: QWEngineDriver.decodeProfileEnabled
                     ? { name in driver.profileStage(name); return driver.activeEnc } : nil)
             mark("mla.o_proj")
@@ -390,7 +412,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                                           positionStart: pos, count: 1)
         }
         if let mbsa = driver.mbsaOperator, let mbsaW = w.mbsa, pos + 1 <= mbsa.maxContext {
-            let idxCols = (geometry.kvHeads + 1) * geometry.headDim
+            let idxCols = geometry.mbsaIdxCols
             if let idxProj = mbsaW.qkvIdxProj {
                 try driver.gemvH16T4(
                     enc, n: idxCols, k: H,
@@ -476,7 +498,6 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
             let vCols = w.o.k
             let activeLn1 = driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16)
             let latRows = driver.prefixRows(mla.mlaLatentScratch, rows: T, cols: mla.latentStride, dt: .f16)
-            let qResRows = driver.prefixRows(mla.qResidScratch, rows: T, cols: geometry.qLoraRank, dt: .f16)
             let qFullRows = driver.prefixRows(mla.mlaQFullScratch, rows: T, cols: mla.qFullStride, dt: .f16)
             let attOutRows = driver.prefixRows(psc.attOut, rows: T, cols: vCols, dt: .f16)
             var enc = enc
@@ -485,19 +506,26 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                 if let a = driver.activeEnc { enc = a }
                 return driver.activeEnc
             }
+            let mropePos = context.session.mropeSlice(pos: pos, count: T, mropeLayout: mla.mropeLayout)
             _ = mark("mla.qkv_a_proj")
             try driver.gemmBatchedH16(enc, m: T, n: w.qkvProj.n, k: H, x: activeLn1, wQ4: w.qkvProj, y16: latRows)
             _ = mark("mla.latent_prep")
             mla.encodeLatentPrepAndPool(
                 enc, ln1: activeLn1,
                 mlaW: mlaW, kv: views,
-                fullAttnLayer: fullAttnIdx, pos0: pos, rows: T)
+                fullAttnLayer: fullAttnIdx, pos0: pos, rows: T,
+                mropePositions: mropePos)
             _ = mark("mla.q_b_proj")
-            try driver.gemmBatchedH16(enc, m: T, n: mlaW.qBProj.n, k: geometry.qLoraRank, x: qResRows, wQ4: mlaW.qBProj, y16: qFullRows)
+            let qBInput = mla.isDirectQ
+                ? activeLn1
+                : driver.prefixRows(mla.qResidScratch, rows: T, cols: mlaW.qBProj.k, dt: .f16)
+            try driver.gemmBatchedH16(enc, m: T, n: mlaW.qBProj.n, k: mlaW.qBProj.k, x: qBInput, wQ4: mlaW.qBProj, y16: qFullRows)
             mla.encodeScoreSelectAbsorbAttendAndProjUV(
                 enc, mlaW: mlaW, kv: views,
                 attOut: attOutRows,
                 fullAttnLayer: fullAttnIdx, pos0: pos, rows: T,
+                ln1: activeLn1,
+                mropePositions: mropePos,
                 stage: QWEngineDriver.prefillProfileEnabled ? mark : nil)
             _ = mark("mla.o_proj")
             enc = driver.activeEnc ?? enc
@@ -527,7 +555,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                                               positionStart: pos, count: T,
                                               inRowCols: qkvCols)
         if let mbsa = driver.mbsaOperator, let mbsaW = w.mbsa, pos + T <= mbsa.maxContext {
-            let idxCols = (geometry.kvHeads + 1) * geometry.headDim
+            let idxCols = geometry.mbsaIdxCols
             if let idxProj = mbsaW.qkvIdxProj {
                 try driver.gemmBatchedH16(
                     enc, m: T, n: idxCols, k: H,

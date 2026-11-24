@@ -100,7 +100,9 @@ extension QWMoEOperator {
             try QWGemm.encodeFnMoeRoute(enc, hal: hal, logits: s.logits, idx: s.idx, wts: s.wts,
                                         rows: T, experts: E, topK: K, normTopK: w.normTopK, bias: w.routerBias,
                                         splitFeature: w.splitFeatureRouting, routedScaleParam: w.routedScaleParam,
-                                        latentLabels: latentLabels, groupIds: groupIds, numGroups: NG)
+                                        latentLabels: latentLabels, groupIds: groupIds, numGroups: NG,
+                                        useSigmoid: w.useSigmoidScore, nGroup: w.nGroup,
+                                        topkGroup: w.topkGroup, groupTopM: w.groupTopM)
             if !concurrentBarriers, let shGU = w.sharedGateUp, let shDown = w.sharedDown,
                let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
                 let shScratch0 = naxX16.slice(byteOffset: 0, count: T * H, dtype: .f16)
@@ -108,7 +110,8 @@ extension QWMoEOperator {
                                               naxX16: shScratch0, naxY16: shScratch0, maxTileWidth: H,
                                               rows: T, x16Precast: shPrecast16)
                 try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
-                                            intermediate: ISh, act16: shAct16)
+                                            intermediate: ISh, act16: shAct16,
+                                            swigluClamp: w.sharedSwigluClamp)
                 let shScratch = shAct16 ?? shScratch0
                 try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shDown, x: actSh, y: s.shared,
                                               naxX16: shScratch, naxY16: shScratch,
@@ -116,7 +119,8 @@ extension QWMoEOperator {
                                               rows: T, x16Precast: shAct16)
             } else if concurrentBarriers, let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
                 try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
-                                            intermediate: ISh, act16: shAct16)
+                                            intermediate: ISh, act16: shAct16,
+                                            swigluClamp: w.sharedSwigluClamp)
             }
             barrier()
             guard let rotateEncoder else {
@@ -161,7 +165,8 @@ extension QWMoEOperator {
                                           sortedTok: sortedTok, coldBank: w.coldGateUp)
             barrier()
             try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: gu16, outHi: dnHi, outLo: dnHi,
-                                             rows: T * K, intermediate: I)
+                                             rows: T * K, intermediate: I,
+                                             swigluClamp: w.routedSwigluClamp)
             barrier()
             try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: dnHi, xLo: dnHi, bank: w.down,
                                             expertOff: expOff, tileE: tileE, tileR: tileR,
@@ -216,7 +221,10 @@ extension QWMoEOperator {
                                     sharedIntermediate: fuseSh ? ISh : 0,
                                     bias: w.routerBias, expertBudget: w.moeSpecExpertBudget,
                                     splitFeature: w.splitFeatureRouting, routedScaleParam: w.routedScaleParam,
-                                    latentLabels: latentLabels, groupIds: groupIds, numGroups: NG)
+                                    latentLabels: latentLabels, groupIds: groupIds, numGroups: NG,
+                                    useSigmoid: w.useSigmoidScore, nGroup: w.nGroup,
+                                    topkGroup: w.topkGroup, groupTopM: w.groupTopM,
+                                    sharedSwigluClamp: w.sharedSwigluClamp)
         barrier()
         if !concurrentBarriers, let nextEnc = profileStage?("moe.latent_down") { enc = nextEnc }
         try QWGemm.encodeMoEDownSharedCombineF32(enc, hal: hal, x: xRot, bank: latentD,
@@ -232,17 +240,20 @@ extension QWMoEOperator {
                                             out: fuseRoutedGU ? s.act32 : s.gu32,
                                             rowsPerExpert: 2 * I, routes: K, tokens: T,
                                             fuseSiluFwht: fuseRoutedGU, coldBank: w.coldGateUp,
-                                            reuseExpertsAcrossTokens: false)
+                                            reuseExpertsAcrossTokens: false,
+                                            swigluClamp: w.routedSwigluClamp)
             if let shDown = w.sharedDown, let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
                 if !fuseSh {
-                    try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T, intermediate: ISh)
+                    try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
+                                                intermediate: ISh, swigluClamp: w.sharedSwigluClamp)
                     barrier()
                 }
                 try QWGemm.encodeHQ4F32V4(enc, hal: hal, weight: shDown, x: actSh, y: s.shared, rows: T)
             }
             barrier()
             if !fuseRoutedGU {
-                try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: s.gu32, act: s.act32, rows: T * K, intermediate: I)
+                try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: s.gu32, act: s.act32, rows: T * K,
+                                            intermediate: I, swigluClamp: w.routedSwigluClamp)
                 barrier()
             }
             try QWGemm.encodeMoEDownSharedCombineF32(enc, hal: hal, x: s.act32, bank: w.down,
@@ -263,7 +274,8 @@ extension QWMoEOperator {
             if let nextEnc = profileStage?("moe.shared_down") { enc = nextEnc }
             if let shDown = w.sharedDown, let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
                 if !fuseSh {
-                    try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T, intermediate: ISh)
+                    try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
+                                                intermediate: ISh, swigluClamp: w.sharedSwigluClamp)
                 }
                 try QWGemm.encodeHQ4F32V4(enc, hal: hal, weight: shDown, x: actSh, y: s.shared, rows: T)
             }
@@ -272,9 +284,11 @@ extension QWMoEOperator {
                                             out: fuseRoutedGU ? s.act32 : s.gu32,
                                             rowsPerExpert: 2 * I, routes: K, tokens: T,
                                             fuseSiluFwht: fuseRoutedGU, coldBank: w.coldGateUp,
-                                            reuseExpertsAcrossTokens: false)
+                                            reuseExpertsAcrossTokens: false,
+                                            swigluClamp: w.routedSwigluClamp)
             if !fuseRoutedGU {
-                try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: s.gu32, act: s.act32, rows: T * K, intermediate: I)
+                try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: s.gu32, act: s.act32, rows: T * K,
+                                            intermediate: I, swigluClamp: w.routedSwigluClamp)
             }
             if let nextEnc = profileStage?("moe.experts_down") { enc = nextEnc }
             try QWGemm.encodeMoEDownSharedCombineF32(enc, hal: hal, x: s.act32, bank: w.down,

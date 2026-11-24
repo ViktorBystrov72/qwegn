@@ -114,11 +114,12 @@ public struct QWAdmissionPlan: Sendable, Equatable {
     /// Resident weights of the model: HQ4_G32_M5 for standard dense/MoE models, and
     /// config-derived mixed-precision (`HQ8_G32` trunk + `SHVQ` routed experts) for hybrid HCA / Latent-MoE models.
     public static func modelResidentBytes(descriptor d: QWModelDescriptor) throws -> Int {
-        if d.family == .inkling2Loop {
+        if case .recurrentLoop(_, let ink) = d.executionTopology, ink != nil {
             return inkling2ModelResidentBytes(descriptor: d)
         }
         let hcaLayers = d.compressedAttentionLayers.count
-        if hcaLayers > 0 || d.moeLatentSize != nil || d.hybridMLAConfig != nil {
+        if hcaLayers > 0 || d.moeLatentSize != nil || d.hybridMLAConfig != nil
+            || (d.mlaConfig != nil && !d.mlaUseNoPE) {
             return try hybridModelResidentBytes(descriptor: d)
         }
         let hq4 = { (elems: Int) in elems / QWHQ4Layout.group * QWHQ4Layout.blockBytes }
@@ -156,6 +157,9 @@ public struct QWAdmissionPlan: Sendable, Equatable {
             + d.gdnConvKernel * d.gdnQKVChannels
             + d.hidden * d.gdnVHeads * d.gdnHeadDim
         if d.gdnVectorDecay {
+            if let kda = d.kdaConfig, kda.isFullRank {
+                return base + (2 * d.gdnZChannels + d.gdnVHeads) * d.hidden
+            }
             let lr = d.gdnLowRankDim ?? d.gdnHeadDim
             return base + (2 * lr + d.gdnVHeads) * d.hidden + 2 * d.gdnZChannels * lr
         }
@@ -200,16 +204,26 @@ public struct QWAdmissionPlan: Sendable, Equatable {
         }
 
         let mlaCount = d.fullAttentionLayers.count
-        if let mla = d.hybridMLAConfig, mlaCount > 0 {
+        if let mla = d.mlaConfig, mlaCount > 0 {
             let idxH = d.indexerHeads ?? 0
             let idxD = d.indexerHeadDim ?? 0
-            let perMLA = d.hidden * mla.qLoraRank
-                + mla.qLoraRank * mla.qHeads * (mla.qkNopeHeadDim + mla.qkRopeHeadDim)
-                + mla.qLoraRank * mla.qHeads * mla.vHeadDim
+            let qElems = mla.qLoraRank > 0
+                ? (d.hidden * mla.qLoraRank + mla.qLoraRank * mla.qHeads * (mla.qkNopeHeadDim + mla.qkRopeHeadDim))
+                : (d.hidden * mla.qHeads * (mla.qkNopeHeadDim + mla.qkRopeHeadDim))
+            let gateElems: Int = {
+                switch mla.outputGateMode {
+                case .none: return 0
+                case .elementWiseFromQLora: return max(0, mla.qLoraRank) * mla.qHeads * mla.vHeadDim
+                case .elementWiseFromHidden: return d.hidden * mla.qHeads * mla.vHeadDim
+                case .headWiseFromHidden: return d.hidden * mla.qHeads
+                }
+            }()
+            let idxElems = (idxH > 0 && idxD > 0) ? (max(d.hidden, mla.qLoraRank) * idxH * idxD + d.hidden * idxD + d.hidden * idxH) : 0
+            let perMLA = qElems + gateElems
                 + d.hidden * (mla.kvLoraRank + mla.qkRopeHeadDim)
                 + mla.kvLoraRank * mla.qHeads * (mla.qkNopeHeadDim + mla.vHeadDim)
                 + d.hidden * (mla.qHeads * mla.vHeadDim)
-                + mla.qLoraRank * idxH * idxD + d.hidden * idxD + d.hidden * idxH
+                + idxElems
             trunkElems += mlaCount * perMLA
             rawBytes += mlaCount * (mla.qHeads * mla.qHeads * 4)
         }
@@ -316,7 +330,7 @@ public struct QWAdmissionPlan: Sendable, Equatable {
         let attnLayers = execPlan.filter { d.isFullAttention($0) }.count
         let hcaLayers = execPlan.filter { d.isCompressedAttention($0) }.count
         let kv: Int
-        if hcaLayers > 0 || d.hybridMLAConfig != nil {
+        if hcaLayers > 0 || d.hybridMLAConfig != nil || (d.mlaConfig != nil && !d.mlaUseNoPE) {
             var totalKV = 0
             if let hca = d.hcaConfig, hcaLayers > 0 {
                 let ratio = max(1, hca.defaultCompressRatio)
@@ -324,7 +338,9 @@ public struct QWAdmissionPlan: Sendable, Equatable {
                 let ringTokens = min(contextTokens, hca.slidingWindow)
                 totalKV += hcaLayers * (compTokens + ringTokens) * hca.kvHeads * hca.headDim * 2
             }
-            if let mla = d.hybridMLAConfig, attnLayers > 0 {
+            if let mla = d.mlaConfig ?? d.hybridMLAConfig.map({
+                QWModelDescriptor.MLAConfig(qHeads: $0.qHeads, qProjection: $0.qLoraRank > 0 ? .factored(rank: $0.qLoraRank) : .direct, kvLoraRank: $0.kvLoraRank, qkNopeHeadDim: $0.qkNopeHeadDim, qkRopeHeadDim: $0.qkRopeHeadDim, vHeadDim: $0.vHeadDim)
+            }), attnLayers > 0 {
                 let ckvBytes = kvDtype.kvBytes(elements: attnLayers * contextTokens * mla.kvLoraRank)
                 let ropeBytes = attnLayers * contextTokens * mla.qkRopeHeadDim * 2
                 let idxComp = max(1, d.indexerCompressRatio ?? 1)
@@ -344,8 +360,8 @@ public struct QWAdmissionPlan: Sendable, Equatable {
         let rec = d.gdnVHeads * d.gdnHeadDim * d.gdnHeadDim
         let ring = max(0, d.gdnConvKernel - 1) * d.gdnQKVChannels
         var gdn = gdnLayers * (rec * 4 + ring * 2)
-        if d.family == .inkling2Loop {
-            let sconvSlots = max(0, (d.inkling2Config?.sconvKernelSize ?? 4) - 1)
+        if case .recurrentLoop(_, let ink) = d.executionTopology, let ink {
+            let sconvSlots = max(0, ink.sconvKernelSize - 1)
             let convElems = 2 * d.hidden + 2 * d.kvHeads * d.headDim
             gdn += execPlan.count * sconvSlots * convElems * 4
         }
@@ -363,7 +379,7 @@ public struct QWAdmissionPlan: Sendable, Equatable {
         var res = perSequenceStateBytes(descriptor: d, kvDtype: dtype, contextTokens: contextTokens,
                                         scratchPerSeq: scratchPerSeq, prefillChunk: prefillChunk)
         if kvBytesPerParam > 0 && kvBytesPerParam != dtype.bytesPerParam {
-            let effTokens = d.hcaConfig == nil && d.hybridMLAConfig == nil && !d.mlaUseNoPE
+            let effTokens = d.hcaConfig == nil && d.hybridMLAConfig == nil && d.mlaConfig == nil && !d.mlaUseNoPE
                 ? effectiveGQAKeyTokens(descriptor: d, contextTokens: contextTokens, prefillChunk: prefillChunk)
                 : d.executionPlan.filter { d.isFullAttention($0) }.count * contextTokens
             res.kv = 2 * effTokens * d.kvHeads * d.headDim * kvBytesPerParam

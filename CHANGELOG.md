@@ -8,6 +8,17 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.36.0] - 2026-11-24
+
+### Added
+- **Capability-Driven Architecture Seams (`QWModelCapabilities`) & Linter Gate (`Scripts/lint_capability_seams.py`)**: Replaced `descriptor.family` / `model_type` branches across `Sources/Operators/`, `Sources/Subsystems/`, `Sources/Runtime/`, and `Sources/Apps/` with typed geometry capability structs (`KDAConfig`, `MLAConfig`, `MoERoutingConfig`, `SwiGLUClampConfig`, `VisionTowerConfig`, `MTPConfig`, `HCAConfig`, `BlockSparseGQAConfig`, `MRoPELayout`) codified in `AGENTS.md` Law 15 and `.agents/skills/qwegine-model-onboarding/SKILL.md`.
+- **Generalized Group-Limited MoE, SwiGLU Clamp, Full-Rank KDA, Direct-Q MLA & VideoRoPE ViT**: Added `n_group` / `topk_group` group-limited top-`k` Metal routing up to `1,024` experts, per-layer `SwiGLUClampConfig` (`expert_swiglu_limit_list` / `share_expert_swiglu_limit_list`), full-rank KDA projection (`no_kda_lora` / `use_kda_lora` / `kda_lower_bound`), Direct-Q decoupled-RoPE MLA (`q_lora_rank: null`, interleaved RoPE, `norm_qkv`), and `2`-layer GELU `linear_proj` + `3D VideoRoPE` `[8, 12, 12]` Metal ViT encoding.
+- **Native `bailing_moe_v3_vl` & `Ling-3.2-air-hq8g32-shvq3g64` Support**: Added runtime/packer support (`bailing_moe_v3`, `bailing_moe_v3_vl`, `bailing_moe_v3_text`) in `Scripts/quantize/bailing_adapter.py` and `QWEngineDriver`. Qualified `Ling-3.2-air-hq8g32-shvq3g64` (`124B` total / `5.5B` active, `52.23 GiB` `3.41 bpw`, `35` KDA + `7` MLA + `512` experts + NextN `mtp=1` + `27L` ViT) on Apple M5 Max: **`2,847 tok/s`** `@4.1K` / **`2,141.4 tok/s`** `@10.4K` prefill, **`100.0 tok/s`** sustained `QWServer` decode (**`110.5 tok/s`** predictable spec `1.98 tok/step`, **`103.7 tok/s`** CLI `mtp=1`), **`14.5×` warm prefix cache (`37 ms`)**, **`100%` capability (`strong`)**, **`98.04%` fidelity (`36/36`)**, **`285/293` API conformance**, and **`3/3` needle recall @ `16.9K`** with `0` steady-state allocations.
+- **Dedicated Model Catalog (`docs/models.md`) & `Ling-3.2-air` Infographic**: Added `docs/models.md` housing detailed model cards and SVG infographics (`assets/qwegn_model_ling32_air.svg`).
+
+### Changed
+- **Streamlined Root `README.md`**: Refactored `README.md` to focus on installation, quick start, compact architecture/benchmark overview tables, multi-protocol server endpoints, CLI reference, and documentation links, moving per-model SVG cards into `docs/models.md`.
+
 ## [0.35.0] - 2026-11-23
 
 ### Added & Improved

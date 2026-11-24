@@ -79,11 +79,14 @@ final class QWModelFamilyRegistryTests: XCTestCase {
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "mistral")?.family, .mistralDense)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "inkling2_loop")?.family, .inkling2Loop)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "inkling2_loop_text")?.family, .inkling2Loop)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "bailing_moe_v3")?.family, .bailingMoeV3)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "bailing_moe_v3_vl")?.family, .bailingMoeV3)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "bailing_moe_v3_text")?.family, .bailingMoeV3)
 
         let expected: Set<QWModelDescriptor.Family> = [
             .qwen38Dense, .qwen38MoE, .qwen38FlashNext, .senseNovaLoop, .glm5Next,
             .ernie55MoE, .maxwellMoE, .qwen3Dense, .qwen3MoE, .qwen2Dense, .llamaDense, .mistralDense,
-            .inkling2Loop,
+            .inkling2Loop, .bailingMoeV3,
         ]
         XCTAssertEqual(Set(QWModelDescriptor.Family.allCases), expected)
     }

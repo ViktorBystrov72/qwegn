@@ -46,10 +46,14 @@ kernel void qwg_moe_route(device const float* logits     [[buffer(0)]],
     const bool hasBias = (normTopK & 2u) != 0u;
     const bool splitFeature = (normTopK & 8u) != 0u;
     const bool hasScaleParam = (normTopK & 16u) != 0u;
+    const bool useSigmoid = ((normTopK & 32u) != 0u) || hasBias || splitFeature;
+    const uint nGroup = (normTopK >> 8u) & 0xFFu;
+    const uint topkGroup = (normTopK >> 16u) & 0xFFu;
+    const bool groupTop2 = (normTopK & (1u << 24u)) != 0u;
     const uint logitStride = splitFeature ? (2u * E) : E;
-    const uint JN = min((E + 31u) >> 5u, 16u);
-    float lv[16], ex[16], p[16];
-    bool validScore[16];
+    const uint JN = min((E + 31u) >> 5u, 32u);
+    float lv[32], ex[32], p[32];
+    bool validScore[32];
     float mx = -3.4e38f;
     bool hasFiniteLogit = false;
     for (uint j = 0u; j < JN; j++) {
@@ -63,7 +67,7 @@ kernel void qwg_moe_route(device const float* logits     [[buffer(0)]],
             }
         }
     }
-    if (hasBias || splitFeature) {
+    if (useSigmoid) {
         for (uint j = 0u; j < JN; j++) {
             const uint id = lane + 32u * j;
             if (id < E) {
@@ -99,9 +103,72 @@ kernel void qwg_moe_route(device const float* logits     [[buffer(0)]],
             validScore[j] = ok;
         }
     }
-    bool taken[16];
-    for (uint j = 0u; j < 16u; j++) taken[j] = false;
-    float wsel[16];
+    if (nGroup > 1u && topkGroup > 0u && topkGroup < nGroup && nGroup <= 64u && (E % nGroup) == 0u) {
+        const uint epg = E / nGroup;
+        float gScores[64];
+        bool gHas[64];
+        for (uint g = 0u; g < nGroup; ++g) {
+            float m1 = -3.4e38f, m2 = -3.4e38f;
+            uint i1 = 0xFFFFFFFFu;
+            bool has1 = false, has2 = false;
+            for (uint j = 0u; j < JN; ++j) {
+                const uint id = lane + 32u * j;
+                if (id < E && (id / epg) == g && validScore[j]) {
+                    const float v = p[j];
+                    if (!has1 || v > m1) {
+                        if (has1) { m2 = m1; has2 = true; }
+                        m1 = v; i1 = id; has1 = true;
+                    } else if (!has2 || v > m2) {
+                        m2 = v; has2 = true;
+                    }
+                }
+            }
+            const bool any1 = simd_any(has1);
+            const float gMax1 = simd_max(has1 ? m1 : -3.4e38f);
+            const uint gIdx1 = any1 ? simd_min((has1 && m1 == gMax1) ? i1 : 0xFFFFFFFFu) : 0xFFFFFFFFu;
+            float score = -3.4e38f;
+            if (any1) {
+                if (groupTop2 && epg > 1u) {
+                    const bool laneHas2 = (i1 == gIdx1) ? has2 : has1;
+                    const float cand2 = (i1 == gIdx1) ? m2 : m1;
+                    const bool any2 = simd_any(laneHas2);
+                    const float gMax2 = simd_max(laneHas2 ? cand2 : -3.4e38f);
+                    score = any2 ? (gMax1 + gMax2) : gMax1;
+                } else {
+                    score = gMax1;
+                }
+            }
+            gScores[g] = score;
+            gHas[g] = any1;
+        }
+        uint winMask[2] = {0u, 0u};
+        bool gTaken[64];
+        for (uint g = 0u; g < nGroup; ++g) gTaken[g] = false;
+        for (uint r = 0u; r < topkGroup; ++r) {
+            int bestG = -1;
+            float bestS = -3.4e38f;
+            for (uint g = 0u; g < nGroup; ++g) {
+                if (!gTaken[g] && gHas[g] && (bestG < 0 || gScores[g] > bestS)) {
+                    bestS = gScores[g];
+                    bestG = int(g);
+                }
+            }
+            if (bestG >= 0) {
+                gTaken[uint(bestG)] = true;
+                winMask[uint(bestG) >> 5u] |= (1u << (uint(bestG) & 31u));
+            }
+        }
+        for (uint j = 0u; j < JN; ++j) {
+            const uint id = lane + 32u * j;
+            if (id < E) {
+                const uint g = id / epg;
+                if ((winMask[g >> 5u] & (1u << (g & 31u))) == 0u) validScore[j] = false;
+            }
+        }
+    }
+    bool taken[32];
+    for (uint j = 0u; j < 32u; j++) taken[j] = false;
+    float wsel[32];
     uint activeMask = 0u;
     for (uint r = 0u; r < K; r++) {
         float bv = -3.4e38f;
@@ -122,12 +189,12 @@ kernel void qwg_moe_route(device const float* logits     [[buffer(0)]],
         const uint w = anyCand ? simd_min((hasCand && bv == vMax) ? bi : 0xFFFFFFFFu) : 0xFFFFFFFFu;
         if (w < E && (w & 31u) == lane) {
             const uint wj = w >> 5u;
-            if (wj < 16u) taken[wj] = true;
+            if (wj < 32u) taken[wj] = true;
         }
         const uint wj = (w < E) ? (w >> 5u) : 0u;
         float own = 0.0f;
         if (w < E) {
-            for (uint j = 0u; j < JN; j++) if (wj == j) own = (hasBias || splitFeature) ? ex[j] : p[j];
+            for (uint j = 0u; j < JN; j++) if (wj == j) own = useSigmoid ? ex[j] : p[j];
         }
         const float pw = (w < E) ? simd_broadcast(own, ushort(w & 31u)) : 0.0f;
         if (lane == 0u) {
@@ -152,7 +219,7 @@ kernel void qwg_moe_route(device const float* logits     [[buffer(0)]],
         float acc = 0.0f;
         if (doNorm) {
             for (uint r = 0u; r < K; r++) acc += wsel[r];
-            if (hasBias || splitFeature) acc += 1e-20f;
+            if (useSigmoid) acc += 1e-20f;
         }
         for (uint r = 0u; r < K; r++) {
             const size_t slot = (size_t)t * K + r;
@@ -225,50 +292,153 @@ kernel void qwg_moe_route_decode(device const float* logits0    [[buffer(0)]],
 
     const bool doNorm = (normTopK & 1u) != 0u;
     const bool hasBias = (normTopK & 2u) != 0u;
+    const bool useSigmoid = ((normTopK & 32u) != 0u) || hasBias || splitFeature;
+    const uint nGroup = (normTopK >> 8u) & 0xFFu;
+    const uint topkGroup = (normTopK >> 16u) & 0xFFu;
+    const bool groupTop2 = (normTopK & (1u << 24u)) != 0u;
     threadgroup float sMaxArr[16];
     threadgroup float sSumArr[16];
     threadgroup float sVal[2][16];
     threadgroup uint  sIdx[2][16];
-    threadgroup float wsel[16];
+    threadgroup float wsel[32];
+    threadgroup float sGroupP[1024];
+    threadgroup uchar sGroupValid[1024];
+    threadgroup float sGroupScore[64];
+    threadgroup uchar sGroupHas[64];
+    threadgroup uint  sWinMask[2];
 
     const uint JN = min((E + 31u) >> 5u, 16u);
-    const bool valid = (tid < E);
-    const float lv = valid ? logits[tid] : -1e30f;
-    const bool lvFinite = valid && qw_is_finite_bits(lv);
-    float p = -1e30f;
-    bool cand = false;
-    if (hasBias || splitFeature) {
-        float sig = lvFinite ? (1.0f / (1.0f + exp(-lv))) : 0.0f;
-        bool sfOk = true;
-        if (splitFeature && valid) {
-            const float lv1 = logits[E + tid];
-            sig += 1.0f / (1.0f + exp(-lv1));
-            sfOk = qw_is_finite_bits(lv1);
+    const uint e[2] = { tid, tid + 512u };
+    const bool valid[2] = { e[0] < E, e[1] < E };
+    const float lv[2] = {
+        valid[0] ? logits[e[0]] : -1e30f,
+        valid[1] ? logits[e[1]] : -1e30f
+    };
+    const bool lvFinite[2] = {
+        valid[0] && qw_is_finite_bits(lv[0]),
+        valid[1] && qw_is_finite_bits(lv[1])
+    };
+    float p[2] = { -1e30f, -1e30f };
+    bool cand[2] = { false, false };
+    if (useSigmoid) {
+        for (uint pass = 0u; pass < 2u; ++pass) {
+            float sig = lvFinite[pass] ? (1.0f / (1.0f + exp(-lv[pass]))) : 0.0f;
+            bool sfOk = true;
+            if (splitFeature && valid[pass]) {
+                const float lvSecond = logits[E + e[pass]];
+                sig += 1.0f / (1.0f + exp(-lvSecond));
+                sfOk = qw_is_finite_bits(lvSecond);
+            }
+            const float score = valid[pass] ? (hasBias ? (sig + bias[e[pass]]) : sig) : -1e30f;
+            cand[pass] = lvFinite[pass] && sfOk && qw_is_finite_bits(sig) && qw_is_finite_bits(score);
+            p[pass] = cand[pass] ? score : -1e30f;
         }
-        const float score = valid ? (hasBias ? (sig + bias[tid]) : sig) : -1e30f;
-        cand = lvFinite && sfOk && qw_is_finite_bits(sig) && qw_is_finite_bits(score);
-        p = cand ? score : -1e30f;
     } else {
-        const float sgMax = simd_max(lvFinite ? lv : -3.4e38f);
-        const bool sgHas = simd_any(lvFinite);
+        float myMax = -3.4e38f;
+        bool myHas = false;
+        if (lvFinite[0]) { myMax = lv[0]; myHas = true; }
+        if (lvFinite[1]) { myMax = myHas ? max(myMax, lv[1]) : lv[1]; myHas = true; }
+        const float sgMax = simd_max(myMax);
+        const bool sgHas = simd_any(myHas);
         if (lane == 0u) sMaxArr[sgi] = sgHas ? sgMax : -3.4e38f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         const float maxLogit = simd_max((lane < JN) ? sMaxArr[lane] : -3.4e38f);
-        const float ex = lvFinite ? exp(lv - maxLogit) : 0.0f;
-        const float sgSum = simd_sum(ex);
+        const float ex0 = lvFinite[0] ? exp(lv[0] - maxLogit) : 0.0f;
+        const float ex1 = lvFinite[1] ? exp(lv[1] - maxLogit) : 0.0f;
+        const float sgSum = simd_sum(ex0 + ex1);
         if (lane == 0u) sSumArr[sgi] = sgSum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float total = 0.0f;
         for (uint j = 0u; j < JN; j++) total += sSumArr[j];
-        cand = lvFinite && (total > 0.0f);
-        p = cand ? (ex / total) : -1e30f;
+        cand[0] = lvFinite[0] && (total > 0.0f);
+        cand[1] = lvFinite[1] && (total > 0.0f);
+        p[0] = cand[0] ? (ex0 / total) : -1e30f;
+        p[1] = cand[1] ? (ex1 / total) : -1e30f;
+    }
+    if (nGroup > 1u && topkGroup > 0u && topkGroup < nGroup && nGroup <= 64u && (E % nGroup) == 0u) {
+        if (valid[0]) { sGroupP[e[0]] = p[0]; sGroupValid[e[0]] = cand[0] ? 1u : 0u; }
+        if (valid[1]) { sGroupP[e[1]] = p[1]; sGroupValid[e[1]] = cand[1] ? 1u : 0u; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint epg = E / nGroup;
+        for (uint g = sgi; g < nGroup; g += 16u) {
+            const uint gBase = g * epg;
+            float m1 = -3.4e38f, m2 = -3.4e38f;
+            uint i1 = 0xFFFFFFFFu;
+            bool has1 = false, has2 = false;
+            for (uint k = lane; k < epg; k += 32u) {
+                const uint id = gBase + k;
+                if (sGroupValid[id] != 0u) {
+                    const float v = sGroupP[id];
+                    if (!has1 || v > m1) {
+                        if (has1) { m2 = m1; has2 = true; }
+                        m1 = v; i1 = id; has1 = true;
+                    } else if (!has2 || v > m2) {
+                        m2 = v; has2 = true;
+                    }
+                }
+            }
+            const bool any1 = simd_any(has1);
+            const float gMax1 = simd_max(has1 ? m1 : -3.4e38f);
+            const uint gIdx1 = any1 ? simd_min((has1 && m1 == gMax1) ? i1 : 0xFFFFFFFFu) : 0xFFFFFFFFu;
+            float score = -3.4e38f;
+            if (any1) {
+                if (groupTop2 && epg > 1u) {
+                    const bool laneHas2 = (i1 == gIdx1) ? has2 : has1;
+                    const float cand2 = (i1 == gIdx1) ? m2 : m1;
+                    const bool any2 = simd_any(laneHas2);
+                    const float gMax2 = simd_max(laneHas2 ? cand2 : -3.4e38f);
+                    score = any2 ? (gMax1 + gMax2) : gMax1;
+                } else {
+                    score = gMax1;
+                }
+            }
+            if (lane == 0u) { sGroupScore[g] = score; sGroupHas[g] = any1 ? 1u : 0u; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgi == 0u) {
+            if (lane < 2u) sWinMask[lane] = 0u;
+            bool gTaken[2] = { false, false };
+            for (uint r = 0u; r < topkGroup; ++r) {
+                float bv = -3.4e38f;
+                uint bi = 0xFFFFFFFFu;
+                bool bhas = false;
+                for (uint pass = 0u; pass < 2u; ++pass) {
+                    const uint g = lane + 32u * pass;
+                    if (g < nGroup && !gTaken[pass] && sGroupHas[g] != 0u) {
+                        const float v = sGroupScore[g];
+                        if (!bhas || v > bv) { bv = v; bi = g; bhas = true; }
+                    }
+                }
+                const bool anyG = simd_any(bhas);
+                const float gMax = simd_max(bhas ? bv : -3.4e38f);
+                const uint gw = anyG ? simd_min((bhas && bv == gMax) ? bi : 0xFFFFFFFFu) : 0xFFFFFFFFu;
+                if (gw < nGroup) {
+                    if ((gw & 31u) == lane) gTaken[gw >> 5u] = true;
+                    if (lane == 0u) sWinMask[gw >> 5u] |= (1u << (gw & 31u));
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid[0]) {
+            const uint g0 = e[0] / epg;
+            if ((sWinMask[g0 >> 5u] & (1u << (g0 & 31u))) == 0u) cand[0] = false;
+        }
+        if (valid[1]) {
+            const uint g1 = e[1] / epg;
+            if ((sWinMask[g1 >> 5u] & (1u << (g1 & 31u))) == 0u) cand[1] = false;
+        }
     }
     {
-        const float bMax = simd_max(cand ? p : -3.4e38f);
-        const bool sgHas = simd_any(cand);
-        const uint bIdx = sgHas ? simd_min((cand && p == bMax) ? tid : 0xFFFFFFFFu) : 0xFFFFFFFFu;
+        float myVal = -3.4e38f;
+        uint myIdx = 0xFFFFFFFFu;
+        bool myHas = false;
+        if (cand[0]) { myVal = p[0]; myIdx = e[0]; myHas = true; }
+        if (cand[1] && (!myHas || p[1] > myVal)) { myVal = p[1]; myIdx = e[1]; myHas = true; }
+        const float bMax = simd_max(myHas ? myVal : -3.4e38f);
+        const bool sgHas = simd_any(myHas);
+        const uint bIdx = sgHas ? simd_min((myHas && myVal == bMax) ? myIdx : 0xFFFFFFFFu) : 0xFFFFFFFFu;
         if (lane == 0u) {
             sVal[0][sgi] = sgHas ? bMax : -1e30f;
             sIdx[0][sgi] = bIdx;
@@ -296,7 +466,7 @@ kernel void qwg_moe_route_decode(device const float* logits0    [[buffer(0)]],
                 } else {
                     idx[r] = int(w);
                 }
-                if (hasBias || splitFeature) {
+                if (useSigmoid) {
                     float s = 1.0f / (1.0f + exp(-logits[w]));
                     if (splitFeature) s += 1.0f / (1.0f + exp(-logits[E + w]));
                     wsel[r] = s;
@@ -309,12 +479,18 @@ kernel void qwg_moe_route_decode(device const float* logits0    [[buffer(0)]],
             }
         }
         if (r + 1u == K) break;
-        const uint winSG = (w < E) ? (w >> 5u) : 0xFFFFFFFFu;
+        const uint winSG = (w < E) ? ((w & 511u) >> 5u) : 0xFFFFFFFFu;
         if (sgi == winSG) {
-            if (tid == w) cand = false;
-            const float bMax = simd_max(cand ? p : -3.4e38f);
-            const bool sgHas = simd_any(cand);
-            const uint bIdx = sgHas ? simd_min((cand && p == bMax) ? tid : 0xFFFFFFFFu) : 0xFFFFFFFFu;
+            if (e[0] == w) cand[0] = false;
+            if (e[1] == w) cand[1] = false;
+            float myVal = -3.4e38f;
+            uint myIdx = 0xFFFFFFFFu;
+            bool myHas = false;
+            if (cand[0]) { myVal = p[0]; myIdx = e[0]; myHas = true; }
+            if (cand[1] && (!myHas || p[1] > myVal)) { myVal = p[1]; myIdx = e[1]; myHas = true; }
+            const float bMax = simd_max(myHas ? myVal : -3.4e38f);
+            const bool sgHas = simd_any(myHas);
+            const uint bIdx = sgHas ? simd_min((myHas && myVal == bMax) ? myIdx : 0xFFFFFFFFu) : 0xFFFFFFFFu;
             if (lane == 0u) {
                 sVal[nxt][sgi] = sgHas ? bMax : -1e30f;
                 sIdx[nxt][sgi] = bIdx;
@@ -331,7 +507,7 @@ kernel void qwg_moe_route_decode(device const float* logits0    [[buffer(0)]],
         float acc = 0.0f;
         if (doNorm) {
             for (uint r = 0u; r < K; r++) acc += wsel[r];
-            if (hasBias || splitFeature) acc += 1e-20f;
+            if (useSigmoid) acc += 1e-20f;
         }
         for (uint r = 0u; r < K; r++) {
             const int rawId = idx[r];

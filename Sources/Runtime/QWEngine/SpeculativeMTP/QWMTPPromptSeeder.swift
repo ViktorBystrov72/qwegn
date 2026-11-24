@@ -14,13 +14,15 @@ enum QWMTPPromptSeeder {
     static func encodeChunk(_ cb: any MTLCommandBuffer, draft: QWMTPDraftEncoder,
                             embeddings: QWTensorValue, trunkHidden: QWTensorValue,
                             previousHidden: QWTensorValue, position: Int, count: Int,
-                            cacheRows: Int, kv: (k: QWKVLayerView, v: QWKVLayerView)) throws {
+                            cacheRows: Int, kv: (k: QWKVLayerView, v: QWKVLayerView),
+                            mropeDelta: Int = 0) throws {
         guard let enc = cb.makeComputeCommandEncoder() else {
             throw QWEngineDriverError.state("MTP seed encoder")
         }
         do {
             try encode(enc, draft: draft, embeddings: embeddings, trunkHidden: trunkHidden,
-                       previousHidden: previousHidden, position: position, count: count, cacheRows: cacheRows, kv: kv)
+                       previousHidden: previousHidden, position: position, count: count,
+                       cacheRows: cacheRows, kv: kv, mropeDelta: mropeDelta)
         } catch {
             enc.endEncoding()
             throw error
@@ -39,7 +41,8 @@ enum QWMTPPromptSeeder {
     static func encode(_ enc: any MTLComputeCommandEncoder, draft: QWMTPDraftEncoder,
                        embeddings: QWTensorValue, trunkHidden: QWTensorValue,
                        previousHidden: QWTensorValue, position: Int, count: Int,
-                       cacheRows: Int, kv: (k: QWKVLayerView, v: QWKVLayerView)) throws {
+                       cacheRows: Int, kv: (k: QWKVLayerView, v: QWKVLayerView),
+                       mropeDelta: Int = 0) throws {
         let h = draft.geometry.hidden
         func valid(_ t: QWTensorValue, elements: Int) -> Bool {
             t.shape.dtype == .f16 && t.shape.elementCount == elements
@@ -83,7 +86,8 @@ enum QWMTPPromptSeeder {
         for t in (position == 0 ? 1 : 0)..<count {
             try draft.encodePairCache(enc, embedding: row(embeddings, t),
                                       hidden: t == 0 ? previousHidden : row(trunkHidden, t - 1),
-                                      kv: kv, cacheRows: physicalRow, absolutePosition: position + t)
+                                      kv: kv, cacheRows: physicalRow, absolutePosition: position + t,
+                                      mropeDelta: mropeDelta)
             physicalRow += 1
         }
     }

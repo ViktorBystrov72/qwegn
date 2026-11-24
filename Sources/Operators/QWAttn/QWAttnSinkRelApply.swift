@@ -64,19 +64,19 @@ public struct QWSinkRelConfig: Sendable, Equatable {
         hasOutGate: Bool? = nil,
         kvMode: QWKVMode = .f16
     ) {
-        let ink = geometry.descriptor.inkling2Config
-        let resolvedDRel = ink?.dRel ?? 0
-        let resolvedRelExt = ink?.relExtent ?? 0
-        let resolvedSliding = isSliding ? (ink?.slidingWindowSize ?? geometry.descriptor.slidingWindow ?? 0) : 0
-        self.nH = (isSliding ? ink?.swaQHeads : nil) ?? geometry.qHeads
-        self.nKV = (isSliding ? ink?.swaKVHeads : nil) ?? geometry.kvHeads
-        self.headDim = (isSliding ? ink?.swaHeadDim : nil) ?? geometry.headDim
+        let sr = geometry.descriptor.attentionSinkRelConfig
+        let resolvedDRel = sr?.dRel ?? 0
+        let resolvedRelExt = sr?.relExtent ?? 0
+        let resolvedSliding = isSliding ? (sr?.slidingWindowSize ?? geometry.descriptor.slidingWindow ?? 0) : 0
+        self.nH = (isSliding ? sr?.swaQHeads : nil) ?? geometry.qHeads
+        self.nKV = (isSliding ? sr?.swaKVHeads : nil) ?? geometry.kvHeads
+        self.headDim = (isSliding ? sr?.swaHeadDim : nil) ?? geometry.headDim
         self.dRel = resolvedDRel
         self.relExtent = resolvedRelExt
         self.slidingWindow = resolvedSliding
-        self.hasSink = hasSink ?? (ink != nil)
+        self.hasSink = hasSink ?? (sr?.hasSink == true)
         self.hasRelBias = hasRelBias ?? (resolvedDRel > 0 && resolvedRelExt > 0)
-        self.hasOutGate = hasOutGate ?? (ink != nil || geometry.attnOutputGate)
+        self.hasOutGate = hasOutGate ?? (sr != nil || geometry.attnOutputGate)
         self.kvMode = kvMode
     }
 }

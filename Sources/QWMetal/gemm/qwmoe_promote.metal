@@ -49,7 +49,7 @@ kernel void qwg_moe_resident_ids(
 
 // Span router ids → bank rows for dynamic residency: resident → its slot, each distinct miss → residentE + its
 // rank among the span's misses in expert-id order, invalid → -1. The host stages misses from this same output,
-// so both sides agree by construction and the resident pass can precede the route readback. 1 TG; experts ≤ 512.
+// so both sides agree by construction and the resident pass can precede the route readback. 1 TG; experts ≤ 1024.
 kernel void qwg_moe_span_ids(
         device const int* ids [[buffer(0)]],
         device const int* slotMap [[buffer(1)]],
@@ -59,8 +59,8 @@ kernel void qwg_moe_span_ids(
         constant uint& residentE [[buffer(5)]],
         uint tid [[thread_index_in_threadgroup]],
         uint tgSize [[threads_per_threadgroup]]) {
-    threadgroup atomic_uint miss[512];
-    threadgroup uint rank[512];
+    threadgroup atomic_uint miss[1024];
+    threadgroup uint rank[1024];
     for (uint e = tid; e < experts; e += tgSize) atomic_store_explicit(&miss[e], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < count; i += tgSize) {

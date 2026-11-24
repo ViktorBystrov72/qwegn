@@ -468,15 +468,21 @@ kernel void qwg_mla_dsa_sparse_attn_mma(
 
     const uint halfRank = MLA_MMA_RANK / 2u;
     const uint seqLen = p.pos0 + t + 1u;
+    const bool isDenseStream = (p.topK == 0u);
+    const uint startTok = isDenseStream
+        ? ((p.windowTokens > 0u && seqLen > p.windowTokens) ? (seqLen - p.windowTokens) : 0u)
+        : 0u;
     const uint denseLim = p.topK + p.windowTokens;
-    const uint slots = min(min(seqLen, denseLim), 2560u);
+    const uint slots = isDenseStream ? (seqLen - startTok) : min(min(seqLen, denseLim), 2560u);
     const float scale = rsqrt(float(p.headDim));
 
-    if (seqLen <= denseLim) {
-        for (uint i = tid; i < slots; i += 128u) blkIdx[i] = i;
-    } else {
-        device const int* rowList = blockList + (size_t)t * p.listStride;
-        for (uint i = tid; i < slots; i += 128u) blkIdx[i] = min(uint(max(rowList[i], 0)), seqLen - 1u);
+    if (!isDenseStream) {
+        if (seqLen <= denseLim) {
+            for (uint i = tid; i < slots; i += 128u) blkIdx[i] = i;
+        } else {
+            device const int* rowList = blockList + (size_t)t * p.listStride;
+            for (uint i = tid; i < slots; i += 128u) blkIdx[i] = min(uint(max(rowList[i], 0)), seqLen - 1u);
+        }
     }
     if (tid < MLA_MMA_HG) {
         const float sk = (p.hasSink != 0u) ? attnSink[h0 + tid] : -1e30f;
@@ -503,7 +509,7 @@ kernel void qwg_mla_dsa_sparse_attn_mma(
             const uint slot = s0 + r;
             half4 v = half4(0.0h);
             if (slot < slots) {
-                const uint j = blkIdx[slot];
+                const uint j = isDenseStream ? (startTok + slot) : blkIdx[slot];
                 const uint pageSlot = j >> 8u, pageOff = j & 255u;
                 if (c4 < halfRank) {
                     const uint pg = uint(kTable[pageSlot]);
@@ -515,12 +521,14 @@ kernel void qwg_mla_dsa_sparse_attn_mma(
             }
             *(threadgroup half4*)(ks + r * MLA_MMA_KS + c4) = v;
         }
-        if (p.ropeDim == 64u) {
-            for (uint i = tid; i < MLA_MMA_TK * 16u; i += 128u) {
-                const uint r = i >> 4u, c4 = (i & 15u) * 4u;
+        if (p.ropeDim == 32u || p.ropeDim == 64u) {
+            const uint ropeVecs = p.ropeDim >> 2u;
+            for (uint i = tid; i < MLA_MMA_TK * ropeVecs; i += 128u) {
+                const uint r = i / ropeVecs, c4 = (i - r * ropeVecs) * 4u;
                 const uint slot = s0 + r;
+                const uint j = (slot < slots) ? (isDenseStream ? (startTok + slot) : blkIdx[slot]) : 0u;
                 const half4 rv = (slot < slots)
-                    ? *(device const half4*)(kPeCache + (size_t)blkIdx[slot] * 64u + c4)
+                    ? *(device const half4*)(kPeCache + (size_t)j * p.ropeDim + c4)
                     : half4(0.0h);
                 *(threadgroup half4*)(kps + r * MLA_MMA_KPS + c4) = rv;
             }
@@ -535,10 +543,11 @@ kernel void qwg_mla_dsa_sparse_attn_mma(
                 simdgroup_load(kf, ks + sTb * 8u * MLA_MMA_KS + d * 8u, MLA_MMA_KS, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(sacc, qf, kf, sacc);
             }
-            if (p.ropeDim == 64u) {
-                for (uint d = 0u; d < 8u; ++d) {
+            if (p.ropeDim == 32u || p.ropeDim == 64u) {
+                const uint ropeTiles = p.ropeDim >> 3u;
+                for (uint d = 0u; d < ropeTiles; ++d) {
                     simdgroup_half8x8 qf, kf;
-                    simdgroup_load(qf, qRopeBase + d * 8u, 64u);
+                    simdgroup_load(qf, qRopeBase + d * 8u, p.ropeDim);
                     simdgroup_load(kf, kps + sTb * 8u * MLA_MMA_KPS + d * 8u, MLA_MMA_KPS, ulong2(0, 0), true);
                     simdgroup_multiply_accumulate(sacc, qf, kf, sacc);
                 }

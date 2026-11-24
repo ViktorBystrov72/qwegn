@@ -1,5 +1,6 @@
 import Metal
 import QWAlloc
+import QWCore
 import QWHAL
 
 // The sparse-MoE router dispatch (Sources/QWMetal/subsystems/qwrouter.metal).
@@ -18,15 +19,28 @@ extension QWGemm {
                                         routedScaleParam: QWTensorValue? = nil,
                                         latentLabels: QWTensorValue? = nil,
                                         groupIds: QWTensorValue? = nil,
-                                        numGroups: Int = 0) throws {
-        precondition(experts % 32 == 0 && experts <= 512 && topK <= 16, "route needs E % 32 == 0, E <= 512, K <= 16")
+                                        numGroups: Int = 0,
+                                        useSigmoid: Bool = false,
+                                        nGroup: Int = 1,
+                                        topkGroup: Int = 1,
+                                        groupTopM: Int = 1,
+                                        sharedSwigluClamp: QWSwiGLUClampSpec? = nil) throws {
+        precondition(experts % 32 == 0 && experts <= 1024 && topK <= 32,
+                     "route needs E % 32 == 0, E <= 1024, K <= 32")
         let hasShared = guSh != nil && actSh != nil && sharedIntermediate > 0
+        let gCount = max(1, min(64, nGroup))
+        let gTopK = max(1, min(gCount, topkGroup))
         let normFlags = (normTopK ? 1 : 0)
             | (bias != nil ? 2 : 0)
             | (splitFeature ? 8 : 0)
             | (routedScaleParam != nil ? 16 : 0)
+            | (useSigmoid ? 32 : 0)
+            | ((gCount & 0xFF) << 8)
+            | ((gTopK & 0xFF) << 16)
+            | (groupTopM >= 2 ? (1 << 24) : 0)
         if rows == 1 || hasShared {
-            enc.setComputePipelineState(try hal.pipeline("qwg_moe_route_decode"))
+            let clamp = hasShared ? sharedSwigluClamp : nil
+            enc.setComputePipelineState(try hal.pipeline("qwg_moe_route_decode", swigluClamp: clamp))
             enc.bindTensors(logits, idx, wts, startIndex: 0)
             enc.setUInt32s(experts, topK, normFlags, startIndex: 3)
             (bias ?? logits).bind(enc, index: 9)

@@ -30,6 +30,7 @@ public final class QWVisionMetalBackend: QWVisionBackend, @unchecked Sendable {
         let fc2W: QWTensorValue
         let fc2B: QWTensorValue
         let invFreq: QWTensorValue
+        let fc1Mid: Int
         let fc2Out: Int
     }
 
@@ -212,8 +213,8 @@ public final class QWVisionMetalBackend: QWVisionBackend, @unchecked Sendable {
     ) throws -> [Float] {
         let cfg = config
         let d = cfg.dim, qkvD = cfg.qkvDim, mlp = cfg.mlpInner
-        let merged = cfg.merged, outD = w.fc2Out, pc = cfg.patchChannels
-        let workACount = max(nPatch * max(qkvD, mlp), nToken * merged)
+        let merged = cfg.merged, fc1Mid = w.fc1Mid, outD = w.fc2Out, pc = cfg.patchChannels
+        let workACount = max(nPatch * max(qkvD, mlp), nToken * fc1Mid)
         let outCount = nToken * outD
         let totalScratch =
             qwAlignUp(nPatch * pc * 2) +
@@ -284,10 +285,10 @@ public final class QWVisionMetalBackend: QWVisionBackend, @unchecked Sendable {
                         gamma: w.mergerG, beta: w.mergerB, out: normedT,
                         rows: nPatch, dim: d, eps: cfg.eps)
         encodeGemm(enc, pso: pipelines.gemm, x: normedT, w: w.fc1W, bias: w.fc1B,
-                   residual: nil, y: workAT, m: nToken, n: merged, k: merged)
-        encodeGelu(enc, pso: pipelines.geluErf, x: workAT, count: nToken * merged)
+                   residual: nil, y: workAT, m: nToken, n: fc1Mid, k: merged)
+        encodeGelu(enc, pso: pipelines.geluErf, x: workAT, count: nToken * fc1Mid)
         encodeGemm(enc, pso: pipelines.gemm, x: workAT, w: w.fc2W, bias: w.fc2B,
-                   residual: nil, y: outT, m: nToken, n: outD, k: merged)
+                   residual: nil, y: outT, m: nToken, n: outD, k: fc1Mid)
 
         hal.end(cb, enc)
         cb.waitUntilCompleted()

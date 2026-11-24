@@ -3,7 +3,11 @@ import Metal
 import QWCore
 
 extension QWHal {
-    public static func makeFunctionConstants(geometry: QWModelGeometry, isAQ4: Bool = false) -> MTLFunctionConstantValues {
+    public static func makeFunctionConstants(
+        geometry: QWModelGeometry,
+        isAQ4: Bool = false,
+        swigluClamp: QWSwiGLUClampSpec? = nil
+    ) -> MTLFunctionConstantValues {
         let fc = MTLFunctionConstantValues()
         func setU32(_ v: Int, at idx: Int) {
             var u = UInt32(v)
@@ -58,7 +62,7 @@ extension QWHal {
         fc.setConstantValue(&gdnVecDecay, type: .bool, index: 222)
         var gdnGateMin = Float(geometry.gdnGateLowerBound)
         fc.setConstantValue(&gdnGateMin, type: .float, index: 223)
-        var swigluLim = Float(geometry.swigluLimit ?? 0.0)
+        var swigluLim = Float(swigluClamp?.limit ?? geometry.swigluLimit ?? 0.0)
         fc.setConstantValue(&swigluLim, type: .float, index: 224)
         var routedScale = geometry.descriptor.routedScalingFactorLearnable ? Float(1.0) : Float(geometry.routedScalingFactor)
         fc.setConstantValue(&routedScale, type: .float, index: 225)
@@ -79,6 +83,10 @@ extension QWHal {
         fc.setConstantValue(&mhcHcEps, type: .float, index: 231)
         var aq4 = isAQ4
         fc.setConstantValue(&aq4, type: .bool, index: 232)
+        var postSilu = swigluClamp?.postSilu ?? (geometry.swigluClampConfig?.mode == .postSilu && geometry.swigluLimit != nil)
+        fc.setConstantValue(&postSilu, type: .bool, index: 233)
+        var gdnNormSigmoid = geometry.kdaConfig.map { $0.outputNormAct == .sigmoid } ?? geometry.gdnVectorDecay
+        fc.setConstantValue(&gdnNormSigmoid, type: .bool, index: 234)
         // The activation basis is NOT a function constant. It is a build-time
         // property of the metallib — see `QWWeightBasis.metallibFileName` —
         // because the rotation is a chain of `simd_shuffle_xor` calls and a

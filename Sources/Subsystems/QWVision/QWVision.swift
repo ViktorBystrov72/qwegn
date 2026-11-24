@@ -142,10 +142,11 @@ public final class QWVisionWeights: @unchecked Sendable {
     public let blocks: [QWVisionBlockW]
     public let mergerGamma: [Float]       // LN(dim) — affine presence asserted
     public let mergerBeta: [Float]
-    public let fc1W: [Float]              // [merged, merged]
-    public let fc1B: [Float]
+    public let fc1Mid: Int                // merger intermediate (fc1 out / fc2 in)
+    public let fc1W: [Float]              // [fc1Mid, merged]
+    public let fc1B: [Float]              // [fc1Mid]
     public let fc2Out: Int                // LLM hidden size (e.g. 5120, 2048, 2560)
-    public let fc2W: [Float]              // [fc2Out, merged]
+    public let fc2W: [Float]              // [fc2Out, fc1Mid]
     public let fc2B: [Float]              // [fc2Out]
     public let invFreq: [Float]           // [invFreqCount]
 
@@ -195,6 +196,12 @@ public final class QWVisionWeights: @unchecked Sendable {
         return blkIdx
     }
 
+    static func resolveFc1Mid(in ck: QWVisionCheckpoint, config cfg: QWVisionConfig) -> Int {
+        ck.shape("merger.linear_fc1.bias")?[0]
+            ?? ck.shape("merger.linear_fc1.weight")?[0]
+            ?? cfg.effectiveMergerIntermediateDim
+    }
+
     static func resolveFc2Out(in ck: QWVisionCheckpoint, config cfg: QWVisionConfig) -> Int {
         ck.shape("merger.linear_fc2.bias")?[0]
             ?? ck.shape("merger.linear_fc2.weight")?[0]
@@ -225,12 +232,22 @@ public final class QWVisionWeights: @unchecked Sendable {
         }
         self.mergerGamma = try ck.f32("merger.norm.weight", want: [d])
         self.mergerBeta = try ck.f32("merger.norm.bias", want: [d])
-        self.fc1W = try ck.f32("merger.linear_fc1.weight", want: [merged, merged])
-        self.fc1B = try ck.f32("merger.linear_fc1.bias", want: [merged])
+        let fc1Mid = Self.resolveFc1Mid(in: ck, config: cfg)
+        self.fc1Mid = fc1Mid
+        self.fc1W = try ck.f32("merger.linear_fc1.weight", want: [fc1Mid, merged])
+        self.fc1B = (cfg.projectorBias && ck.has("merger.linear_fc1.bias"))
+            ? try ck.f32("merger.linear_fc1.bias", want: [fc1Mid])
+            : (cfg.projectorBias
+                ? try ck.f32("merger.linear_fc1.bias", want: [fc1Mid])
+                : [Float](repeating: 0, count: fc1Mid))
         let outDim = Self.resolveFc2Out(in: ck, config: cfg)
         self.fc2Out = outDim
-        self.fc2W = try ck.f32("merger.linear_fc2.weight", want: [outDim, merged])
-        self.fc2B = try ck.f32("merger.linear_fc2.bias", want: [outDim])
+        self.fc2W = try ck.f32("merger.linear_fc2.weight", want: [outDim, fc1Mid])
+        self.fc2B = (cfg.projectorBias && ck.has("merger.linear_fc2.bias"))
+            ? try ck.f32("merger.linear_fc2.bias", want: [outDim])
+            : (cfg.projectorBias
+                ? try ck.f32("merger.linear_fc2.bias", want: [outDim])
+                : [Float](repeating: 0, count: outDim))
         self.invFreq = Self.computeInvFreq(config: cfg)
         ck.releaseBacking()
     }
@@ -557,22 +574,22 @@ public final class QWVisionRef: @unchecked Sendable {
     /// Merger: LN per patch row -> view-merge merge² -> fc1 -> GELU-ERF -> fc2 -> [nToken, fc2Out].
     func merger(_ s: inout [Float], plan: QWVisionGridPlan) {
         let cfg = w.config
-        let n = plan.nPatch, d = cfg.dim, nt = plan.nToken, merged = cfg.merged
-        guard n > 0, d > 0, nt > 0, merged > 0, w.fc2Out > 0 else { s = []; return }
+        let n = plan.nPatch, d = cfg.dim, nt = plan.nToken, merged = cfg.merged, fc1Mid = w.fc1Mid
+        guard n > 0, d > 0, nt > 0, merged > 0, fc1Mid > 0, w.fc2Out > 0 else { s = []; return }
         var normed = [Float](repeating: 0, count: n * d)
         qwLayerNorm(s, into: &normed, gamma: w.mergerGamma, beta: w.mergerBeta, rows: n, dim: d, eps: cfg.eps)
-        var h = [Float](repeating: 0, count: nt * merged)
+        var h = [Float](repeating: 0, count: nt * fc1Mid)
         var y = [Float](repeating: 0, count: nt * w.fc2Out)
         h.withUnsafeMutableBufferPointer { hb in
             guard let hPtr = hb.baseAddress else { return }
-            qwGemmRef(y: hPtr, ldY: merged, yBase: 0,
-                      x: normed, rows: nt, w: w.fc1W, nOut: merged, nIn: merged,
+            qwGemmRef(y: hPtr, ldY: fc1Mid, yBase: 0,
+                      x: normed, rows: nt, w: w.fc1W, nOut: fc1Mid, nIn: merged,
                       bias: w.fc1B, act: qwGeluErf)
         }
         y.withUnsafeMutableBufferPointer { yb in
             guard let yPtr = yb.baseAddress else { return }
             qwGemmRef(y: yPtr, ldY: w.fc2Out, yBase: 0,
-                      x: h, rows: nt, w: w.fc2W, nOut: w.fc2Out, nIn: merged,
+                      x: h, rows: nt, w: w.fc2W, nOut: w.fc2Out, nIn: fc1Mid,
                       bias: w.fc2B)
         }
         s = y

@@ -113,6 +113,14 @@ public enum QWCheckpointTensorLoader {
                 if rawExists(candidate) { return candidate }
             }
         }
+        if name.hasSuffix("embed_tokens.weight") {
+            let wordBase = String(name.dropLast("embed_tokens.weight".count)) + "word_embeddings.weight"
+            let resolvedWord = resolveName(wordBase,
+                                           defaultPrefix: defaultPrefix,
+                                           tieWordEmbeddings: false,
+                                           rawExists: rawExists)
+            if rawExists(resolvedWord) { return resolvedWord }
+        }
         if name == "lm_head.weight", tieWordEmbeddings {
             let tied = resolveName(defaultPrefix + "embed_tokens.weight",
                                    defaultPrefix: defaultPrefix,

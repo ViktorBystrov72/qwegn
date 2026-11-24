@@ -264,11 +264,27 @@ public struct QWVisualSpan: Sendable, Equatable {
     public let tokenOffset: Int
     public let tokenCount: Int
     public let embeddings: [Float]
+    public let gridT: Int
+    public let gridH: Int
+    public let gridW: Int
+    public let spatialMergeSize: Int
 
-    public init(tokenOffset: Int, tokenCount: Int, embeddings: [Float]) {
+    public init(
+        tokenOffset: Int,
+        tokenCount: Int,
+        embeddings: [Float],
+        gridT: Int = 0,
+        gridH: Int = 0,
+        gridW: Int = 0,
+        spatialMergeSize: Int = 1
+    ) {
         self.tokenOffset = tokenOffset
         self.tokenCount = tokenCount
         self.embeddings = embeddings
+        self.gridT = gridT
+        self.gridH = gridH
+        self.gridW = gridW
+        self.spatialMergeSize = spatialMergeSize
     }
 
     /// Deterministic 64-bit FNV-1a hash of the visual embedding payload and span geometry.

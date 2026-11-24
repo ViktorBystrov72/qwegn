@@ -21,7 +21,7 @@ extension QWEngineDriver.WeightLoader {
         let ln1 = try f16wNorm(dblk + "input_layernorm.weight", h)
         let ln2 = try f16wNorm(dblk + "post_attention_layernorm.weight", h)
         let (gu, down, moe) = try loadLayerMLP(
-            dblk, isMoE: geometry.numExperts > 0, geometry: geometry)
+            dblk, isMoE: geometry.numExperts > 0, geometry: geometry, layer: geometry.numLayers)
         let attn = try loadGQAAttn(dblk, geometry: geometry, includeMBSA: false)
         let mhcW: MHCLayerWeights?
         if let mhc = geometry.mhcConfig {
