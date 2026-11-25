@@ -111,6 +111,10 @@ extension QWEngineDriver {
             )
     }
 
+    static func prewarmDoors(_ doors: [String], hasLSAOperator: Bool) -> [String] {
+        hasLSAOperator ? doors : doors.filter { !$0.hasPrefix("qwg_lsa_select_") }
+    }
+
     /// Creates every door the engine may dispatch, ONCE. The doors come
     /// from the module that owns the engine: there is no global list.
     static func prewarmPipelines(hal: QWHal, doors: [String]) throws {
