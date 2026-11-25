@@ -40,6 +40,12 @@ extension QWServerConfigurationResolver {
         let ropeType: String
         let ropeFactor: Double
         let speculativeEnabled: Bool
+        let decisionModelPackPath: String
+        let decisionComputeUnit: String
+        let decisionLoadVision: Bool
+        let decisionDefaultScoreReadout: String
+        let decisionDefaultTruncation: String
+        let decisionAlwaysEmitBox: Bool
         let tuning: QWEngineTuning
     }
 
@@ -64,6 +70,9 @@ extension QWServerConfigurationResolver {
         cliLoadVision: Bool?, cliMemoryPolicy: String?,
         cliOSReserveGiB: Double?, cliResidentExpertsPerLayer: Int?,
         cliMoESpecBudget: Int?, cliStreamNgrams: Bool?,
+        cliDecisionModelPackPath: String? = nil, cliDecisionComputeUnit: String? = nil,
+        cliDecisionLoadVision: Bool? = nil, cliDecisionDefaultScoreReadout: String? = nil,
+        cliDecisionDefaultTruncation: String? = nil, cliDecisionAlwaysEmitBox: Bool? = nil,
         drafters: [QWServerSettings.DiscoveredModel]? = nil
     ) -> ExtraResolvedConfig {
         let requestedMTPBackend: String? = {
@@ -360,6 +369,60 @@ extension QWServerConfigurationResolver {
             sources["loadVision"] = "config-file"; return fileSettings.loadVision
         }()
 
+        let resolvedDecisionModelPackPath: String = {
+            func resolvePath(_ raw: String) -> String {
+                let ref = fileSettings.resolveModelReference(raw, allowArbitraryFilesystemPaths: true)
+                return ref.packPath.isEmpty ? raw.expandingTildePath : ref.packPath
+            }
+            if let p = cliDecisionModelPackPath, !p.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sources["decisionModelPackPath"] = "cli"; return resolvePath(p)
+            }
+            if let p = environment["QWG_DECISION_MODEL"] ?? environment["QW_DECISION_MODEL"],
+               !p.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sources["decisionModelPackPath"] = "env"; return resolvePath(p)
+            }
+            let fileP = fileSettings.decisionModelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !fileP.isEmpty {
+                sources["decisionModelPackPath"] = "config-file"; return resolvePath(fileP)
+            }
+            sources["decisionModelPackPath"] = "none"
+            return ""
+        }()
+
+        let resolvedDecisionComputeUnit: String = {
+            if let u = cliDecisionComputeUnit, !u.isEmpty { sources["decisionComputeUnit"] = "cli"; return u.lowercased() }
+            if let u = environment["QWG_DECISION_COMPUTE_UNIT"], !u.isEmpty { sources["decisionComputeUnit"] = "env"; return u.lowercased() }
+            sources["decisionComputeUnit"] = "config-file"; return fileSettings.decisionComputeUnit.lowercased()
+        }()
+
+        let resolvedDecisionLoadVision: Bool = {
+            if let v = cliDecisionLoadVision { sources["decisionLoadVision"] = "cli"; return v }
+            if let envStr = environment["QWG_DECISION_LOAD_VISION"] {
+                sources["decisionLoadVision"] = "env"; return envStr == "1" || envStr.lowercased() == "true"
+            }
+            sources["decisionLoadVision"] = "config-file"; return fileSettings.decisionLoadVision
+        }()
+
+        let resolvedDecisionScoreReadout: String = {
+            if let r = cliDecisionDefaultScoreReadout, !r.isEmpty { sources["decisionDefaultScoreReadout"] = "cli"; return r.lowercased() }
+            if let r = environment["QWG_DECISION_SCORE_READOUT"], !r.isEmpty { sources["decisionDefaultScoreReadout"] = "env"; return r.lowercased() }
+            sources["decisionDefaultScoreReadout"] = "config-file"; return fileSettings.decisionDefaultScoreReadout.lowercased()
+        }()
+
+        let resolvedDecisionTruncation: String = {
+            if let t = cliDecisionDefaultTruncation, !t.isEmpty { sources["decisionDefaultTruncation"] = "cli"; return t.lowercased() }
+            if let t = environment["QWG_DECISION_TRUNCATION"], !t.isEmpty { sources["decisionDefaultTruncation"] = "env"; return t.lowercased() }
+            sources["decisionDefaultTruncation"] = "config-file"; return fileSettings.decisionDefaultTruncation.lowercased()
+        }()
+
+        let resolvedDecisionAlwaysEmitBox: Bool = {
+            if let b = cliDecisionAlwaysEmitBox { sources["decisionAlwaysEmitBox"] = "cli"; return b }
+            if let envStr = environment["QWG_DECISION_ALWAYS_EMIT_BOX"] {
+                sources["decisionAlwaysEmitBox"] = "env"; return envStr == "1" || envStr.lowercased() == "true"
+            }
+            sources["decisionAlwaysEmitBox"] = "config-file"; return fileSettings.decisionAlwaysEmitBox
+        }()
+
         var resolvedTuning = fileSettings.resolvedEngineTuning
         if let cliPol = cliMemoryPolicy, let parsed = QWMemoryPolicy(rawValue: cliPol) {
             resolvedTuning.memoryPolicy = parsed
@@ -422,6 +485,12 @@ extension QWServerConfigurationResolver {
             ropeType: resolvedRopeType,
             ropeFactor: resolvedRopeFactor,
             speculativeEnabled: resolvedSpeculativeEnabled,
+            decisionModelPackPath: resolvedDecisionModelPackPath,
+            decisionComputeUnit: resolvedDecisionComputeUnit,
+            decisionLoadVision: resolvedDecisionLoadVision,
+            decisionDefaultScoreReadout: resolvedDecisionScoreReadout,
+            decisionDefaultTruncation: resolvedDecisionTruncation,
+            decisionAlwaysEmitBox: resolvedDecisionAlwaysEmitBox,
             tuning: resolvedTuning)
     }
 }

@@ -86,10 +86,25 @@ public enum QWHttpSecurity {
         return mediaType == "application/json"
     }
 
+    public static func isMultipartFormDataContentType(_ headers: [String: String]) -> Bool {
+        guard let raw = headers["content-type"] else { return false }
+        let parts = raw.split(separator: ";").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let media = parts.first?.lowercased(), media == "multipart/form-data" else {
+            return false
+        }
+        return parts.dropFirst().contains { param in
+            let low = param.lowercased()
+            guard low.hasPrefix("boundary=") else { return false }
+            let val = param.dropFirst("boundary=".count).trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+            return !val.isEmpty
+        }
+    }
+
     public static func isValidMutationOrigin(
         headers: [String: String],
         allowlist: [String],
-        requireJSONContentType: Bool = false
+        requireJSONContentType: Bool = false,
+        allowMultipartContentType: Bool = false
     ) -> Bool {
         if let rawOrigin = headers["origin"] {
             guard resolvedAllowedOrigin(rawOrigin, allowlist: allowlist) != nil else {
@@ -100,6 +115,9 @@ public enum QWHttpSecurity {
             .lowercased(),
                   secFetchSite == "cross-site" {
             return false
+        }
+        if allowMultipartContentType && isMultipartFormDataContentType(headers) {
+            return true
         }
         if requireJSONContentType {
             return isJSONContentType(headers)

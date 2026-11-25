@@ -91,6 +91,9 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
     public var decisionModelPackPath: String = ""
     public var decisionComputeUnit: String = "auto"
     public var decisionLoadVision: Bool = true
+    public var decisionDefaultScoreReadout: String = "mean"
+    public var decisionDefaultTruncation: String = "error"
+    public var decisionAlwaysEmitBox: Bool = false
 
     public struct DiscoveredModel: Identifiable, Hashable, Codable, Sendable {
         public var id: String { name }
@@ -104,11 +107,17 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         public let maxSpeculativeDrafts: Int
         public let hasLSASidecar: Bool
         public let lsaSidecarPath: String?
+        public let isDecisionCapable: Bool
+        public let isCoreAIBundle: Bool
+        public let decisionArchetype: String?
+        public let hasVision: Bool
 
         public init(name: String, packPath: String, family: String? = nil, nativeWindow: Int? = nil,
                     supported: Bool = true, reason: String? = nil,
                     capabilities: [String] = [], maxSpeculativeDrafts: Int = 15,
-                    hasLSASidecar: Bool = false, lsaSidecarPath: String? = nil) {
+                    hasLSASidecar: Bool = false, lsaSidecarPath: String? = nil,
+                    isDecisionCapable: Bool = false, isCoreAIBundle: Bool = false,
+                    decisionArchetype: String? = nil, hasVision: Bool = false) {
             self.name = name
             self.packPath = packPath
             self.family = family
@@ -119,6 +128,28 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
             self.maxSpeculativeDrafts = maxSpeculativeDrafts
             self.hasLSASidecar = hasLSASidecar
             self.lsaSidecarPath = lsaSidecarPath
+            self.isDecisionCapable = isDecisionCapable
+            self.isCoreAIBundle = isCoreAIBundle
+            self.decisionArchetype = decisionArchetype
+            self.hasVision = hasVision
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.name = try c.decode(String.self, forKey: .name)
+            self.packPath = try c.decode(String.self, forKey: .packPath)
+            self.family = try c.decodeIfPresent(String.self, forKey: .family)
+            self.nativeWindow = try c.decodeIfPresent(Int.self, forKey: .nativeWindow)
+            self.supported = try c.decodeIfPresent(Bool.self, forKey: .supported) ?? true
+            self.reason = try c.decodeIfPresent(String.self, forKey: .reason)
+            self.capabilities = try c.decodeIfPresent([String].self, forKey: .capabilities) ?? []
+            self.maxSpeculativeDrafts = try c.decodeIfPresent(Int.self, forKey: .maxSpeculativeDrafts) ?? 15
+            self.hasLSASidecar = try c.decodeIfPresent(Bool.self, forKey: .hasLSASidecar) ?? false
+            self.lsaSidecarPath = try c.decodeIfPresent(String.self, forKey: .lsaSidecarPath)
+            self.isDecisionCapable = try c.decodeIfPresent(Bool.self, forKey: .isDecisionCapable) ?? false
+            self.isCoreAIBundle = try c.decodeIfPresent(Bool.self, forKey: .isCoreAIBundle) ?? false
+            self.decisionArchetype = try c.decodeIfPresent(String.self, forKey: .decisionArchetype)
+            self.hasVision = try c.decodeIfPresent(Bool.self, forKey: .hasVision) ?? false
         }
     }
 
@@ -184,7 +215,10 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         updateCheckSchedule: String = QWUpdateCheckSchedule.onLaunchAndDaily.rawValue,
         decisionModelPackPath: String = "",
         decisionComputeUnit: String = "auto",
-        decisionLoadVision: Bool = true
+        decisionLoadVision: Bool = true,
+        decisionDefaultScoreReadout: String = "mean",
+        decisionDefaultTruncation: String = "error",
+        decisionAlwaysEmitBox: Bool = false
     ) {
         self.runAtStartup = runAtStartup
         self.autoStartServer = autoStartServer
@@ -253,6 +287,9 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.decisionModelPackPath = decisionModelPackPath
         self.decisionComputeUnit = decisionComputeUnit
         self.decisionLoadVision = decisionLoadVision
+        self.decisionDefaultScoreReadout = decisionDefaultScoreReadout
+        self.decisionDefaultTruncation = decisionDefaultTruncation
+        self.decisionAlwaysEmitBox = decisionAlwaysEmitBox
     }
 
     public init(from decoder: Decoder) throws {
@@ -334,6 +371,9 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.decisionModelPackPath = try c.decodeIfPresent(String.self, forKey: .decisionModelPackPath) ?? ""
         self.decisionComputeUnit = try c.decodeIfPresent(String.self, forKey: .decisionComputeUnit) ?? "auto"
         self.decisionLoadVision = try c.decodeIfPresent(Bool.self, forKey: .decisionLoadVision) ?? true
+        self.decisionDefaultScoreReadout = try c.decodeIfPresent(String.self, forKey: .decisionDefaultScoreReadout) ?? "mean"
+        self.decisionDefaultTruncation = try c.decodeIfPresent(String.self, forKey: .decisionDefaultTruncation) ?? "error"
+        self.decisionAlwaysEmitBox = try c.decodeIfPresent(Bool.self, forKey: .decisionAlwaysEmitBox) ?? false
     }
 
     /// Full expanded path to the log file

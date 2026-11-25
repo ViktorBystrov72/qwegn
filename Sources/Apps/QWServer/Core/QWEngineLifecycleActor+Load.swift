@@ -39,6 +39,9 @@ extension QWEngineLifecycleActor {
         public var decisionModelPackPath: String = ""
         public var decisionComputeUnit: String = "auto"
         public var decisionLoadVision: Bool = true
+        public var decisionDefaultScoreReadout: String = "mean"
+        public var decisionDefaultTruncation: String = "error"
+        public var decisionAlwaysEmitBox: Bool = false
         /// Where each setting came from, by setting key. The provenance
         /// travels with the values, so a reader is told without resolving
         /// the configuration a second time.
@@ -70,6 +73,9 @@ extension QWEngineLifecycleActor {
             decisionModelPackPath: String = "",
             decisionComputeUnit: String = "auto",
             decisionLoadVision: Bool = true,
+            decisionDefaultScoreReadout: String = "mean",
+            decisionDefaultTruncation: String = "error",
+            decisionAlwaysEmitBox: Bool = false,
             sourceSummary: [String: String] = [:]
         ) {
             self.packPath = packPath
@@ -117,6 +123,9 @@ extension QWEngineLifecycleActor {
             self.decisionModelPackPath = decisionModelPackPath
             self.decisionComputeUnit = decisionComputeUnit
             self.decisionLoadVision = decisionLoadVision
+            self.decisionDefaultScoreReadout = decisionDefaultScoreReadout
+            self.decisionDefaultTruncation = decisionDefaultTruncation
+            self.decisionAlwaysEmitBox = decisionAlwaysEmitBox
             self.sourceSummary = sourceSummary
         }
 

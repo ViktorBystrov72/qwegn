@@ -31,6 +31,7 @@ final class DashboardRendererParityTests: XCTestCase {
         "Sources/Apps/QWServer/Resources/js/markdown.js",
         "Sources/Apps/QWServer/Resources/js/chat-presets.js", "Sources/Apps/QWServer/Resources/js/chat-media.js",
         "Sources/Apps/QWServer/Resources/js/chat.js",
+        "Sources/Apps/QWServer/Resources/js/decisions-views.js",
         "Sources/Apps/QWServer/Resources/js/decisions.js",
         "Sources/Apps/QWServer/Resources/js/actions.js",
         "Sources/Apps/QWServer/Resources/js/settings.js",

@@ -8,6 +8,46 @@ may change CLI flags, pack formats or profile files.
 The single source of the version is `QWVersion.current` in
 `Sources/Foundation/QWCore/QWVersion.swift`; release tags are `vMAJOR.MINOR.PATCH`.
 
+## [0.42.0] - 2026-11-25
+
+Brings SOTA Metal 4 decision-model throughput (up to `9.8×` faster long-context prefill and `15,829 tok/s` peak on `d1-2B-hq8`), full unmodified SDK & wire-protocol compliance across `/v1/systemone`, `/v1/decisions`, RFC 7578 multipart image uploads, standalone `qwg serve <decision-pack> --no-lazy` boot, and unified configuration/UI integration across CLI, `Qwegn.app`, and `/ui`.
+
+### Added
+- **SOTA Metal 4 Decision Kernels, Scratch Arena & Coalesced Batching (`QWEngine`, `QWMetal`)**:
+  - Added Apple10 NAX cooperative-tensor BF16/F16 prefill GEMM (`qwg_gemm_bf16_nax_coop_fast`), tiled NAX topology FlashAttention kernels (`qwg_attn_topology_prefill_nax_d64` and `qwg_attn_topology_prefill_nax_d128`), and GPU residual cast (`qwg_cast_f16_to_f32`) backed by reusable `QWDecisionScratchArena` buffers and coalesced `/v1/decisions/batch` & `/v1/systemone/batch` GPU evaluation.
+- **Full Wire & SDK Compliance, Standalone Boot & Decision Knobs (`QWServer`, `QWCli`)**:
+  - Added full `/v1/systemone`, OpenAI `/v1/decisions`, RFC 7578 `multipart/form-data` image upload support, `/v1/models` decision capability metadata, UTF-8 `char_span` (`charSpan`) offsets, `always_emit_box` (`alwaysEmitBox`) best-effort coordinate emission, `X-Qwegn-Decision-Route` CORS-exposed routing headers (fail-open below `0.70` confidence, supporting `auto` and `high` `reasoningEffort`), and standalone `--no-lazy` server boot on decision packs.
+  - Exposed all 6 decision configuration knobs uniformly across CLI (`--decision-model`, `--decision-compute-unit`, `--decision-load-vision`, `--decision-score-readout`, `--decision-truncation`, `--decision-always-emit-box`), `QWG_DECISION_*` environment variables, `/v1/settings`, `Qwegn.app`, and WebUI Settings.
+- **Coherent Decision Telemetry & UI Across `Qwegn.app` and `/ui`**:
+  - Extended `QWDashboardFacts` (`decisionSidecarVision`, `decisionSidecarArchetype`, `decisionSidecarPromptTokens`), upgraded the `QWMenuBar` `Decision Sidecar` popover card and `SettingsView`, added Monitor `#decision-telemetry-card`, integrated live Chat `Sidecar` status + `X-Qwegn-Decision-Route` badge + `Decisions →` handoff, added `Models` Decision capability badges + `Load Sidecar` action, and refactored `?tab=decisions` (`js/decisions-views.js`, `js/decisions.js`, `css/decisions.css`) with presets, wire-dialect switcher, threshold/`always_emit_box` controls, live SDK snippets, and sidecar loading.
+
+### Fixed
+- **Exact Decision UMA Estimation Under Vision Toggles (`QWDecisionWeightLoader`)**:
+  - Updated `QWDecisionWeightLoader.estimateResidentBytes(root:descriptor:loadVision:)` (`QWDecisionPackEngine+Weights.swift`) to include resident vision buffer overhead when `loadVision && hasVision`, keeping UMA estimation error `<= 3.16%` across `d1-2B-hq8` and `d1-2B-bf16` with vision on and off (`vis1`/`vis0`).
+
+### Verified
+- **Paired Interleaved A/B (`v0.41.2` vs `v0.42.0`, Apple M5 Max, quiet GPU, 2 alternating rounds)**:
+  - `d1-2B-hq8`: `41`-tok `17.63/17.62 -> 14.93/14.74 ms` (`min 13.81 ms`), `1035`-tok `201.81/201.64 -> 68.87/68.77 ms` (`15,829 tok/s`), `4059`-tok `1952.93/1948.68 -> 306.30/303.30 ms` (`13,781 tok/s`, `6.4×`), `8091`-tok `7243.65/7208.51 -> 743.40/733.66 ms` (`11,264 tok/s`, `9.8×`), and `/v1/decisions/batch N=8` `129.24/129.72 -> 38.39/37.86 ms` (`4.73 ms/item`, `3.4×`).
+  - `d1-2B-bf16`: `41`-tok `51.91/51.88 -> 19.35/19.18 ms`, `1035`-tok `362.69/361.94 -> 93.20/87.06 ms` (`12,396 tok/s`, `4.1×`), `4059`-tok `2446.22/2461.90 -> 388.62/387.20 ms` (`10,732 tok/s`, `6.3×`), `8091`-tok `8041.58/8144.37 -> 871.93/872.90 ms` (`9,446 tok/s`, `9.3×`), and `/v1/decisions/batch N=8` `403.51/404.26 -> 43.36/43.71 ms` (`5.42 ms/item`, `9.3×`).
+  - Dual-slot co-residency (`Inkling-2-Mini-QWP-Fast` + `d1-2B-hq8`): solo decode unchanged (`72.01/72.11 -> 72.28/71.96 tok/s`), concurrent decode retention `91.3%` while queued sidecar latency drops `22.89/23.64 -> 19.39/19.44 ms`.
+  - UMA sizing accuracy: `d1-2B-hq8` `3,036.59 MiB` (est `2,940.61 MiB`, `3.16%`) / `vis0` `2,143.14 MiB` (est `2,170.18 MiB`, `1.26%`); `d1-2B-bf16` `4,259.42 MiB` (est `4,163.86 MiB`, `2.24%`) / `vis0` `3,365.92 MiB` (est `3,393.43 MiB`, `0.82%`).
+- **Zero-Shim Ecosystem Compliance & Benchmarks**:
+  - Unmodified `jeval check` PASS (`Kev` `/v1/systemone` and `OpenAI-Decisions` `/v1/decisions`), unmodified `typesafe-sdk` PASS (`models.list`, `system_one` text, multipart image), unmodified `s1kit test` `21/23` (`0` errors, `p50 26.0–27.1 ms`), Laya golden `10/10`, `/mcp` OK, `JevBench` (`231` questions) `77.06%` (`0.77056277`, `0` failed) on both `bf16` and `hq8`, and `ImageJevBench-Box` (`50` items) `50/50` valid (`Mean IoU 0.8032 / 0.8033`, Box Capability `80.59 / 80.93`, ranking floor PASS).
+
+### Screenshots
+Live co-resident telemetry (`Inkling-2-Mini-QWP-Fast` + `d1-2B-hq8` Decision Sidecar in unified memory), interactive `Decisions` workbench, and `Chat` auto-routing across `Qwegn.app` and `/ui`:
+
+<table>
+  <tr>
+    <td width="64%"><img src="https://raw.githubusercontent.com/qwegnai/qwegn/main/assets/qwegn_dashboard.png" alt="Qwegn /ui Monitor with co-resident Decision Sidecar and UMA memory" width="100%"></td>
+    <td width="36%" align="center"><img src="https://raw.githubusercontent.com/qwegnai/qwegn/main/assets/qwegn_menubar.png" alt="Qwegn.app control panel with co-resident LLM and Decision Sidecar" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="55%"><img src="https://raw.githubusercontent.com/qwegnai/qwegn/main/assets/qwegn_decisions.png" alt="Qwegn /ui Decisions workbench" width="100%"></td>
+    <td width="45%"><img src="https://raw.githubusercontent.com/qwegnai/qwegn/main/assets/qwegn_chat_decision.png" alt="Qwegn /ui Chat with Decision Sidecar route badge" width="100%"></td>
+  </tr>
+</table>
+
 ## [0.41.2] - 2026-11-25
 
 > **Supersedes `v0.41.1` for macOS 26 release binaries.** Fixes Xcode 26.6 AArch64 `swifterror` (`x21`) tail-call violations in `QWDecisionWeightLoader` and decision-sidecar path estimation / small-host admission on CI runners.

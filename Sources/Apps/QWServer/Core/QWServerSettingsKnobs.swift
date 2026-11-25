@@ -56,6 +56,12 @@ extension QWServerSettings {
         out["dflashDraftPackPath"] = .string(dflashDraftPackPath)
         out["dflashSelectorTopK"] = .int(dflashSelectorTopK)
         out["dsparkConfidenceSchedule"] = .bool(dsparkConfidenceSchedule)
+        out["decisionModelPackPath"] = .string(decisionModelPackPath)
+        out["decisionComputeUnit"] = .string(decisionComputeUnit)
+        out["decisionLoadVision"] = .bool(decisionLoadVision)
+        out["decisionDefaultScoreReadout"] = .string(decisionDefaultScoreReadout)
+        out["decisionDefaultTruncation"] = .string(decisionDefaultTruncation)
+        out["decisionAlwaysEmitBox"] = .bool(decisionAlwaysEmitBox)
         for id in QWEngineTuning.knobIds {
             out[id] = engineTuning[id] ?? QWKnobRegistry.descriptor(id)?.defaultValue
         }
@@ -123,6 +129,12 @@ extension QWServerSettings {
             case "dflashDraftPackPath": keys.insert("dflashDraftPackPath")
             case "dflashSelectorTopK": keys.insert("dflashSelectorTopK")
             case "dsparkConfidenceSchedule": keys.insert("dsparkConfidenceSchedule")
+            case "decisionModelPackPath": keys.insert("decisionModelPackPath")
+            case "decisionComputeUnit": keys.insert("decisionComputeUnit")
+            case "decisionLoadVision": keys.insert("decisionLoadVision")
+            case "decisionDefaultScoreReadout": keys.insert("decisionDefaultScoreReadout")
+            case "decisionDefaultTruncation": keys.insert("decisionDefaultTruncation")
+            case "decisionAlwaysEmitBox": keys.insert("decisionAlwaysEmitBox")
             case _ where QWEngineTuning.knobIds.contains(id): keys.insert("engineTuning")
             default: break
             }
@@ -199,6 +211,12 @@ extension QWServerSettings {
         if let v = values["dflashDraftPackPath"]?.stringValue { dflashDraftPackPath = v }
         if let v = values["dflashSelectorTopK"]?.intValue { dflashSelectorTopK = v }
         if let v = values["dsparkConfidenceSchedule"]?.boolValue { dsparkConfidenceSchedule = v }
+        if let v = values["decisionModelPackPath"]?.stringValue { decisionModelPackPath = v }
+        if let v = values["decisionComputeUnit"]?.stringValue { decisionComputeUnit = v }
+        if let v = values["decisionLoadVision"]?.boolValue { decisionLoadVision = v }
+        if let v = values["decisionDefaultScoreReadout"]?.stringValue { decisionDefaultScoreReadout = v }
+        if let v = values["decisionDefaultTruncation"]?.stringValue { decisionDefaultTruncation = v }
+        if let v = values["decisionAlwaysEmitBox"]?.boolValue { decisionAlwaysEmitBox = v }
         for id in QWEngineTuning.knobIds { if let v = values[id] { setEngineTuning(id, v) } }
     }
 

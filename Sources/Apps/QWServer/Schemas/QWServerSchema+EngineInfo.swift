@@ -28,13 +28,53 @@ public struct ModelObject: Codable, Sendable {
     }
 }
 
+public struct TypeSafeModelMetadata: Codable, Sendable {
+    public let name: String
+    public let description: String
+    public let releaseDate: String
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case description
+        case releaseDate = "release_date"
+    }
+
+    public init(name: String, description: String, releaseDate: String) {
+        self.name = name
+        self.description = description
+        self.releaseDate = releaseDate
+    }
+}
+
 public struct ModelListResponse: Codable, Sendable {
     public let object: String
     public let data: [ModelObject]
+    public let models: [TypeSafeModelMetadata]
 
-    public init(models: [ModelObject]) {
+    public init(models: [ModelObject], metadata: [TypeSafeModelMetadata]? = nil) {
         self.object = "list"
         self.data = models
+        if let metadata {
+            self.models = metadata
+        } else {
+            self.models = models.map { item in
+                TypeSafeModelMetadata(
+                    name: item.id,
+                    description: "Qwegn Engine model '\(item.id)'",
+                    releaseDate: Self.formatReleaseDate(unix: item.created)
+                )
+            }
+        }
+    }
+
+    public static func formatReleaseDate(unix: Int?) -> String {
+        guard let unix else { return "2026-09-15" }
+        let date = Date(timeIntervalSince1970: TimeInterval(unix))
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(secondsFromGMT: 0)
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: date)
     }
 }
 

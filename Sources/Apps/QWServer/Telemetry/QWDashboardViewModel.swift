@@ -103,6 +103,12 @@ public struct QWDashboardFacts: Sendable, Codable, Equatable {
     public let decisionSidecarTotalRequests: Int?
     /// Mean decision evaluation latency in milliseconds, when measured.
     public let decisionSidecarMeanLatencyMs: Double?
+    /// Whether the loaded decision sidecar has its vision tower active.
+    public let decisionSidecarVision: Bool?
+    /// Decision model architecture family (`causal_verbalizer`, `pooled_classifier`, `encoder_pointer`, etc.).
+    public let decisionSidecarArchetype: String?
+    /// Cumulative prompt tokens evaluated by the loaded decision sidecar.
+    public let decisionSidecarPromptTokens: Int?
 
     public init(quantization: String? = nil, hostLogicalCores: Int? = nil,
                 gdnPrefillMode: String? = nil, gpuName: String? = nil,
@@ -121,7 +127,10 @@ public struct QWDashboardFacts: Sendable, Codable, Equatable {
                 decisionSidecarComputeUnit: String? = nil,
                 decisionSidecarBytes: UInt64? = nil,
                 decisionSidecarTotalRequests: Int? = nil,
-                decisionSidecarMeanLatencyMs: Double? = nil) {
+                decisionSidecarMeanLatencyMs: Double? = nil,
+                decisionSidecarVision: Bool? = nil,
+                decisionSidecarArchetype: String? = nil,
+                decisionSidecarPromptTokens: Int? = nil) {
         self.quantization = quantization
         self.hostLogicalCores = hostLogicalCores
         self.gdnPrefillMode = gdnPrefillMode
@@ -144,6 +153,9 @@ public struct QWDashboardFacts: Sendable, Codable, Equatable {
         self.decisionSidecarBytes = decisionSidecarBytes
         self.decisionSidecarTotalRequests = decisionSidecarTotalRequests
         self.decisionSidecarMeanLatencyMs = decisionSidecarMeanLatencyMs
+        self.decisionSidecarVision = decisionSidecarVision
+        self.decisionSidecarArchetype = decisionSidecarArchetype
+        self.decisionSidecarPromptTokens = decisionSidecarPromptTokens
     }
 }
 

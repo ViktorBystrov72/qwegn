@@ -30,6 +30,7 @@ public final class QWDecisionPackEngine: QWDecisionExecutionBackend, @unchecked 
     let shortConv: QWShortConv
     let topoAttn: QWDecisionTopologyAttn
     let headOp: QWDecisionHeadOperator
+    let scratchArena: QWDecisionScratchArena
 
     private static let evalQueue = DispatchQueue(label: "qwegn.decision.pack.metal", qos: .userInteractive)
     private static let maxImageSourceBytes = 20 * 1024 * 1024
@@ -76,6 +77,7 @@ public final class QWDecisionPackEngine: QWDecisionExecutionBackend, @unchecked 
         self.shortConv = try QWShortConv(hal: hal)
         self.topoAttn = try QWDecisionTopologyAttn(hal: hal)
         self.headOp = try QWDecisionHeadOperator(hal: hal)
+        self.scratchArena = QWDecisionScratchArena(hal: hal)
     }
 
     public func evaluate(_ request: QWDecisionBackendBatchRequest) async throws -> QWDecisionBackendOutput {
@@ -108,11 +110,9 @@ public final class QWDecisionPackEngine: QWDecisionExecutionBackend, @unchecked 
                 Self.evalQueue.async {
                     do {
                         var out = [QWDecisionSlotOutput](repeating: QWDecisionSlotOutput(), count: request.slots.count)
-                        for item in prepared {
-                            let seqRes = try self.executeSequenceOnGPU(item, candidateIds: candIds)
-                            for (slotIdx, val) in seqRes {
-                                out[slotIdx] = val
-                            }
+                        let seqRes = try self.executeBatchOnGPU(prepared, candidateIds: candIds)
+                        for (slotIdx, val) in seqRes {
+                            if slotIdx < out.count { out[slotIdx] = val }
                         }
                         continuation.resume(returning: out)
                     } catch {

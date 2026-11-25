@@ -45,7 +45,10 @@ final class QWMenuBarDecisionTests: XCTestCase {
                 decisionSidecarComputeUnit: "metal",
                 decisionSidecarBytes: 1_920_000_000,
                 decisionSidecarTotalRequests: 42,
-                decisionSidecarMeanLatencyMs: 6.4
+                decisionSidecarMeanLatencyMs: 6.4,
+                decisionSidecarVision: true,
+                decisionSidecarArchetype: "causal_verbalizer",
+                decisionSidecarPromptTokens: 2048
             )
         )
 
@@ -88,6 +91,9 @@ final class QWMenuBarDecisionTests: XCTestCase {
         settings.decisionModelPackPath = "/tmp/d1-omni-600M.aimodel"
         settings.decisionComputeUnit = "ane"
         settings.decisionLoadVision = false
+        settings.decisionDefaultScoreReadout = "mode"
+        settings.decisionDefaultTruncation = "tail"
+        settings.decisionAlwaysEmitBox = true
 
         let telemetry = TelemetryObservable(
             startServices: false,
@@ -132,6 +138,9 @@ final class QWMenuBarDecisionTests: XCTestCase {
         XCTAssertTrue(menuBarSource.contains("decisionModelPackPath"))
         XCTAssertTrue(menuBarSource.contains("decisionComputeUnit"))
         XCTAssertTrue(menuBarSource.contains("decisionLoadVision"))
+        XCTAssertTrue(menuBarSource.contains("decisionDefaultScoreReadout"))
+        XCTAssertTrue(menuBarSource.contains("decisionDefaultTruncation"))
+        XCTAssertTrue(menuBarSource.contains("decisionAlwaysEmitBox"))
     }
 
     @MainActor

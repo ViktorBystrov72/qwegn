@@ -19,12 +19,14 @@ Follow these five steps when adding support for a new HuggingFace checkpoint arc
 2. **Capability-Seam Decoupling (`Scripts/lint_capability_seams.py`):**
    - Extend descriptor capability structs in `QWCore` (`KDAConfig`, `MLAConfig`, `MoERoutingConfig`, `SwiGLUClampConfig`, `VisionTowerConfig`, `MTPConfig`, `HCAConfig`, `BlockSparseGQAConfig`, `MRoPELayout`) and decode them in `QWModelDescriptor+Decode.swift`.
    - Dispatch in `Operators`, `Subsystems`, `Runtime`, and `Apps` exclusively via capability struct fields, never `descriptor.family` or `model_type` strings. Gate with `python3 Scripts/lint_capability_seams.py` (`0 violation(s)`).
+   - Express custom namespaced XML tool-call and thinking protocols (`<ns:tool_call>`, parallel `<invoke>`) via `QWChatTemplate` capability properties (`toolCallEnvelope`, `thinkOpenTag`, `thinkCloseTag`, `usesStandardToolCallHint`) and `QWToolCallParser+XMLInvoke.swift` (`0` model-name branches in `Sources/Apps/` as well as `Runtime`/`Subsystems`/`Operators`), and keep `QWToolCallConstraint.allowedTokens()` trie traversal iterative (explicit heap stack) so multi-KiB whitespace BPE tokens cannot overflow 512 KiB Dispatch QoS stacks.
 
 3. **QWP1 Packer Adapter Invariants (`Scripts/quantize/`):**
    - Check per-tensor `reader.has(name + "_scale_inv")` rather than global `quantization_config.modules_to_not_convert`: mixed FP8/BF16 checkpoints can keep trunk `g_proj.weight` in BF16 while quantizing NextN `attention.g_proj.weight` in FP8.
    - De-interleave Direct-Q MLA projections from per-head `[nope, rope]` to planar `[nope; rope]` (`[qHeads * nopeD; qHeads * ropeD]`).
    - Guard cold-expert routing permutations with `(geometry.moeRoutingConfig?.nGroup ?? 1) <= 1` so grouped MoE routing preserves contiguous expert group boundaries.
    - Keep sub-32-row projections (`< 32` rows, e.g., KDA `b_proj` or head-wise `g_proj`) as raw `bf16` in `.qwp` and apply `fwht32OrthoInPlace` at driver load time when `hl.weightBasis.rotatesActivations` is true.
+   - Decode OCP `mxfp4` (`uint8` E2M1 nibbles + `F8_E8M0` group-32 scales) and FP8 `_scale_inv` checkpoints through shared `dequant_with_scale_inv`, `validate_source_quant_config`, and `unpacked_safetensors_shape` (`Scripts/quantize/hq_blocks.py`) across `pack.py`, `eval_hq_kld.py`, and adapters.
 
 4. **2-Layer PyTorch-to-Metal Oracle (`max_abs_diff < 5e-3` + Argmax Identity):**
    - For ops requiring unavailable CUDA packages (e.g., `fla`, `einops`), register lightweight pure-PyTorch shims into `sys.modules` before loading `modeling_*.py` via a synthetic package namespace, and pass `_attn_implementation = "eager"`.

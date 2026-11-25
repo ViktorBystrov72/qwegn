@@ -60,8 +60,8 @@ public struct QWGKnobOptions: ParsableArguments {
     /// The knob's value, whichever spelling the user used.
     public var enableThinking: Bool? { enableThinkingOption ?? enableThinkingFlag }
 
-    /// Reasoning effort: low, medium or xhigh.
-    @Option(name: [.customLong("reasoning-effort")], help: "Reasoning effort: low, medium or xhigh.", transform: { $0.lowercased() })
+    /// Reasoning effort: auto, low, medium, high or xhigh.
+    @Option(name: [.customLong("reasoning-effort")], help: "Reasoning effort: auto, low, medium, high or xhigh.", transform: { $0.lowercased() })
     public var reasoningEffort: String?
 
     /// System prompt text.
@@ -152,6 +152,30 @@ public struct QWGKnobOptions: ParsableArguments {
     @Option(name: [.customLong("log-level")], help: "Log level: debug, info, warn, error or none.", transform: { $0.lowercased() })
     public var logLevel: String?
 
+    /// Path or model name for the System-1 decision sidecar.
+    @Option(name: [.customLong("decision-model")], help: "Path or model name for the System-1 decision sidecar.")
+    public var decisionModel: String?
+
+    /// Decision sidecar compute unit: auto, metal or ane.
+    @Option(name: [.customLong("decision-compute-unit")], help: "Decision sidecar compute unit: auto, metal or ane.", transform: { $0.lowercased() })
+    public var decisionComputeUnit: String?
+
+    /// Load the vision tower on the decision sidecar for image tasks.
+    @Flag(name: [.customLong("decision-load-vision")], inversion: .prefixedNo, help: "Load the vision tower on the decision sidecar for image tasks.")
+    public var decisionLoadVision: Bool?
+
+    /// Default score readout for decision requests: mean, median or argmax.
+    @Option(name: [.customLong("decision-score-readout")], help: "Default score readout for decision requests: mean, median or argmax.", transform: { $0.lowercased() })
+    public var decisionScoreReadout: String?
+
+    /// Default context truncation policy for decision requests: error, head, tail, middle or auto_state.
+    @Option(name: [.customLong("decision-truncation")], help: "Default context truncation policy for decision requests: error, head, tail, middle or auto_state.", transform: { $0.lowercased() })
+    public var decisionTruncation: String?
+
+    /// Always decode and emit best-effort coordinates for box questions even below threshold.
+    @Flag(name: [.customLong("decision-always-emit-box")], inversion: .prefixedNo, help: "Always decode and emit best-effort coordinates for box questions even below threshold.")
+    public var decisionAlwaysEmitBox: Bool?
+
     /// Unified-memory residency policy: maxResident or safe.
     @Option(name: [.customLong("memory-policy")], help: "Unified-memory residency policy: maxResident or safe.", transform: { s in ["maxResident", "safe"].first { $0.lowercased() == s.lowercased() } ?? s })
     public var memoryPolicy: String?
@@ -231,6 +255,12 @@ public struct QWGKnobOptions: ParsableArguments {
         QWGKnobBinding(id: "lazyLoad", property: "lazy", flag: "lazy"),
         QWGKnobBinding(id: "loadVision", property: "loadVision", flag: "load-vision"),
         QWGKnobBinding(id: "logLevel", property: "logLevel", flag: "log-level"),
+        QWGKnobBinding(id: "decisionModelPackPath", property: "decisionModel", flag: "decision-model"),
+        QWGKnobBinding(id: "decisionComputeUnit", property: "decisionComputeUnit", flag: "decision-compute-unit"),
+        QWGKnobBinding(id: "decisionLoadVision", property: "decisionLoadVision", flag: "decision-load-vision"),
+        QWGKnobBinding(id: "decisionDefaultScoreReadout", property: "decisionScoreReadout", flag: "decision-score-readout"),
+        QWGKnobBinding(id: "decisionDefaultTruncation", property: "decisionTruncation", flag: "decision-truncation"),
+        QWGKnobBinding(id: "decisionAlwaysEmitBox", property: "decisionAlwaysEmitBox", flag: "decision-always-emit-box"),
         QWGKnobBinding(id: "memoryPolicy", property: "memoryPolicy", flag: "memory-policy"),
         QWGKnobBinding(id: "osReserveGiB", property: "osReserve", flag: "os-reserve"),
         QWGKnobBinding(id: "residentExpertsPerLayer", property: "residentExpertsPerLayer", flag: "resident-experts-per-layer"),
@@ -279,6 +309,12 @@ public struct QWGKnobOptions: ParsableArguments {
         if let v = lazy { out["lazyLoad"] = .bool(v) }
         if let v = loadVision { out["loadVision"] = .bool(v) }
         if let v = logLevel { out["logLevel"] = .string(v) }
+        if let v = decisionModel { out["decisionModelPackPath"] = .string(v) }
+        if let v = decisionComputeUnit { out["decisionComputeUnit"] = .string(v) }
+        if let v = decisionLoadVision { out["decisionLoadVision"] = .bool(v) }
+        if let v = decisionScoreReadout { out["decisionDefaultScoreReadout"] = .string(v) }
+        if let v = decisionTruncation { out["decisionDefaultTruncation"] = .string(v) }
+        if let v = decisionAlwaysEmitBox { out["decisionAlwaysEmitBox"] = .bool(v) }
         if let v = memoryPolicy { out["memoryPolicy"] = .string(v) }
         if let v = osReserve { out["osReserveGiB"] = .double(v) }
         if let v = residentExpertsPerLayer { out["residentExpertsPerLayer"] = .int(v) }
@@ -319,7 +355,7 @@ public struct QWGKnobOptions: ParsableArguments {
     public static let honoured: [String: Set<String>] = [
         "qwg run": ["contextTokens", "maxTokens", "kvMode", "enableThinking", "reasoningEffort", "systemPrompt", "gdnPrefill", "evictPrefillScratch", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "prefillChunkRows", "temperature", "topP", "topK", "repetitionPenalty", "seed", "prefixCacheEnabled", "cacheDir", "loadVision", "streamNgrams"],
         "qwg repl": ["contextTokens", "maxTokens", "kvMode", "enableThinking", "reasoningEffort", "systemPrompt", "warmCacheLimitGiB", "ssdCacheLimitGiB", "cacheDir", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "prefillChunkRows", "temperature", "topP", "topK", "repetitionPenalty", "seed", "loadVision", "streamNgrams"],
-        "qwg serve": ["contextTokens", "kvMode", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "gdnPrefill", "evictPrefillScratch", "prefillChunkRows", "maxConcurrentSessions", "warmCacheLimitGiB", "ssdCacheLimitGiB", "cacheDir", "logLevel", "temperature", "topP", "topK", "maxTokens", "repetitionPenalty", "seed", "enableThinking", "reasoningEffort", "systemPrompt", "lazyLoad", "loadVision", "streamNgrams"],
+        "qwg serve": ["contextTokens", "kvMode", "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "mtpDrafts", "mtpBackend", "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding", "mtpAdaptiveDepth", "mtpEntropyThreshold", "dflashDraftPackPath", "dflashSelectorTopK", "memoryPolicy", "osReserveGiB", "residentExpertsPerLayer", "moeSpecBudget", "gdnPrefill", "evictPrefillScratch", "prefillChunkRows", "maxConcurrentSessions", "warmCacheLimitGiB", "ssdCacheLimitGiB", "cacheDir", "logLevel", "temperature", "topP", "topK", "maxTokens", "repetitionPenalty", "seed", "enableThinking", "reasoningEffort", "systemPrompt", "lazyLoad", "loadVision", "streamNgrams", "decisionModelPackPath", "decisionComputeUnit", "decisionLoadVision", "decisionDefaultScoreReadout", "decisionDefaultTruncation", "decisionAlwaysEmitBox"],
         "qwg plan": ["contextTokens", "kvMode"],
     ]
 
@@ -327,6 +363,12 @@ public struct QWGKnobOptions: ParsableArguments {
     public static let honouredBy: [String: [String]] = [
         "cacheDir": ["qwg run", "qwg repl", "qwg serve"],
         "contextTokens": ["qwg run", "qwg repl", "qwg serve", "qwg plan"],
+        "decisionAlwaysEmitBox": ["qwg serve"],
+        "decisionComputeUnit": ["qwg serve"],
+        "decisionDefaultScoreReadout": ["qwg serve"],
+        "decisionDefaultTruncation": ["qwg serve"],
+        "decisionLoadVision": ["qwg serve"],
+        "decisionModelPackPath": ["qwg serve"],
         "dflashDraftPackPath": ["qwg run", "qwg repl", "qwg serve"],
         "dflashSelectorTopK": ["qwg run", "qwg repl", "qwg serve"],
         "enableThinking": ["qwg run", "qwg repl", "qwg serve"],

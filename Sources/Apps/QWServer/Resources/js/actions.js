@@ -22,9 +22,17 @@ function renderModelsCards() {
   const activeName = publishedModel ? publishedModel.modelId : null;
   container.innerHTML = supported.map((m) => {
     const isActive = activeName && (m.name === activeName);
-    const caps = (m.capabilities || []).map((c) => `<span class="knob-pill mono">${escapeHtml(c)}</span>`).join("");
+    const rawCaps = Array.isArray(m.capabilities) ? m.capabilities.slice() : [];
+    const badges = rawCaps.slice();
+    if (m.isDecisionCapable && !badges.some((b) => String(b).toLowerCase() === "decision")) badges.push("Decision");
+    if (m.hasVision && !badges.some((b) => String(b).toLowerCase() === "vision")) badges.push("Vision");
+    if (m.isCoreAIBundle && !badges.some((b) => String(b).toLowerCase() === "coreai")) badges.push("CoreAI");
+    const caps = badges.map((c) => `<span class="knob-pill mono">${escapeHtml(c)}</span>`).join("");
     const modelName = String(m.name || "");
     const fullPath = String(m.packPath || "");
+    const loadSidecarBtn = m.isDecisionCapable
+      ? `<button type="button" class="btn btn-sm" style="white-space:nowrap;" data-load-decision-path="${escapeHtml(fullPath)}" data-load-decision-vision="${m.hasVision ? "true" : "false"}">Load Sidecar</button>`
+      : "";
     return `
       <div class="model-card">
         <div style="display:flex;flex-direction:column;gap:10px;min-width:0;">
@@ -37,7 +45,8 @@ function renderModelsCards() {
           </div>
           ${caps ? `<div class="model-card-caps">${caps}</div>` : ""}
         </div>
-        <div class="model-card-foot">
+        <div class="model-card-foot" style="gap:6px;flex-wrap:wrap;">
+          ${loadSidecarBtn}
           <button type="button" class="btn ${isActive ? "" : "btn-primary"} btn-sm" style="white-space:nowrap;" data-select-model-name="${escapeHtml(modelName)}" data-select-model-path="${escapeHtml(fullPath)}">
             ${isActive ? "Reload Model" : "Activate"}
           </button>
@@ -304,6 +313,13 @@ async function revealLogsInFinder() {
 }
 
 function handleDelegatedActionClick(event) {
+  const loadDecBtn = event.target && event.target.closest ? event.target.closest("[data-load-decision-path]") : null;
+  if (loadDecBtn && typeof loadDecisionSidecarFromWeb === "function") {
+    const p = loadDecBtn.getAttribute("data-load-decision-path") || "";
+    const vis = loadDecBtn.getAttribute("data-load-decision-vision") !== "false";
+    loadDecisionSidecarFromWeb(p, "auto", vis);
+    return;
+  }
   const btn = event.target && event.target.closest ? event.target.closest("[data-select-model-name]") : null;
   if (!btn) return;
   const name = btn.getAttribute("data-select-model-name") || "";

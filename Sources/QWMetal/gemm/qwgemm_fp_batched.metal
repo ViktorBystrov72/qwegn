@@ -168,7 +168,20 @@ kernel void qwg_gemm_bf16_nax_bm32(device const bfloat* W [[buffer(0)]],
                                    device float* yF32 [[buffer(4)]],
                                    constant QWGemmFPBF16Params& p [[buffer(5)]],
                                    uint2 tg [[threadgroup_position_in_grid]],
+                                   uint lid [[thread_index_in_threadgroup]],
                                    uint simd_gid [[simdgroup_index_in_threadgroup]]) {
+    threadgroup ushort4 aShU4[32 * 9];
+    threadgroup ushort4 bShU4[64 * 9];
+    const bool coopOk = (p.K & 31u) == 0u && ((size_t(W) & 7u) == 0u)
+        && ((size_t(xBF16) & 7u) == 0u) && (p.strideX & 3u) == 0u;
+    if (coopOk && p.inIsF32 == 0u) {
+        qwg_gemm_bf16_nax_coop_fast<32, false>(W, xBF16, yBF16, yF32, p, aShU4, bShU4, tg, lid, simd_gid);
+        return;
+    }
+    if (coopOk && p.inIsF32 == 2u) {
+        qwg_gemm_bf16_nax_coop_fast<32, true>(W, xBF16, yBF16, yF32, p, aShU4, bShU4, tg, lid, simd_gid);
+        return;
+    }
     qwg_gemm_bf16_nax_body<32, 64, 64, 2, 2>(W, xBF16, xF32, yBF16, yF32, p, tg, simd_gid);
 }
 
@@ -181,9 +194,16 @@ kernel void qwg_gemm_bf16_nax_bm64(device const bfloat* W [[buffer(0)]],
                                    uint2 tg [[threadgroup_position_in_grid]],
                                    uint lid [[thread_index_in_threadgroup]],
                                    uint simd_gid [[simdgroup_index_in_threadgroup]]) {
+    threadgroup ushort4 aShU4[64 * 9];
     threadgroup ushort4 bShU4[64 * 9];
-    if (p.inIsF32 == 0u && (p.K & 31u) == 0u && ((size_t(W) & 7u) == 0u) && ((size_t(xBF16) & 7u) == 0u) && (p.strideX & 3u) == 0u) {
-        qwg_gemm_bf16_nax_bm64_fast(W, xBF16, yBF16, yF32, p, bShU4, tg, lid, simd_gid);
+    const bool coopOk = (p.K & 31u) == 0u && ((size_t(W) & 7u) == 0u)
+        && ((size_t(xBF16) & 7u) == 0u) && (p.strideX & 3u) == 0u;
+    if (coopOk && p.inIsF32 == 0u) {
+        qwg_gemm_bf16_nax_coop_fast<64, false>(W, xBF16, yBF16, yF32, p, aShU4, bShU4, tg, lid, simd_gid);
+        return;
+    }
+    if (coopOk && p.inIsF32 == 2u) {
+        qwg_gemm_bf16_nax_coop_fast<64, true>(W, xBF16, yBF16, yF32, p, aShU4, bShU4, tg, lid, simd_gid);
         return;
     }
     qwg_gemm_bf16_nax_body<64, 64, 32, 2, 2>(W, xBF16, xF32, yBF16, yF32, p, tg, simd_gid);

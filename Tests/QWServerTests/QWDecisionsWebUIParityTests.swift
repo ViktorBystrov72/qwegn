@@ -46,7 +46,10 @@ final class QWDecisionsWebUIParityTests: XCTestCase {
             "id=\"nav-tab-decisions\"",
             "id=\"view-decisions\"",
             "id=\"decisions-workbench-host\"",
+            "id=\"decision-telemetry-card\"",
+            "id=\"chat-sidecar-badge\"",
             "/ui/css/decisions.css",
+            "/ui/js/decisions-views.js",
             "/ui/js/decisions.js",
         ] {
             XCTAssertTrue(html.contains(token), "controlbar.html missing \(token)")
@@ -55,10 +58,13 @@ final class QWDecisionsWebUIParityTests: XCTestCase {
         let files = [
             "controlbar.html",
             "css/decisions.css",
+            "js/decisions-views.js",
             "js/decisions.js",
             "js/state.js",
             "js/settings.js",
             "js/dashboard.js",
+            "js/chat.js",
+            "js/actions.js",
         ]
         for f in files {
             let text = try Self.readResource(f)
@@ -67,12 +73,18 @@ final class QWDecisionsWebUIParityTests: XCTestCase {
             XCTAssertFalse(text.contains("https" + "://"), "\(f) must remain 100% offline (no external CDN URLs)")
         }
 
+        let chatJS = try Self.readResource("js/chat.js")
+        XCTAssertTrue(chatJS.contains("x-qwegn-decision-route"), "chat.js must read X-Qwegn-Decision-Route header")
+
         let settingsJS = try Self.readResource("js/settings.js")
         for settingKey in [
             "value=\"auto\"",
             "data-setting=\"decisionModelPackPath\"",
             "data-setting=\"decisionComputeUnit\"",
             "data-setting-bool=\"decisionLoadVision\"",
+            "data-setting=\"decisionDefaultScoreReadout\"",
+            "data-setting=\"decisionDefaultTruncation\"",
+            "data-setting-bool=\"decisionAlwaysEmitBox\"",
         ] {
             XCTAssertTrue(settingsJS.contains(settingKey), "settings.js missing \(settingKey)")
         }
@@ -132,8 +144,10 @@ final class QWDecisionsWebUIParityTests: XCTestCase {
         XCTAssertNil(jsError, "JS stub setup error: \(jsError ?? "")")
 
         let stateJS = try Self.readResource("js/state.js")
+        let decViewsJS = try Self.readResource("js/decisions-views.js")
         let decJS = try Self.readResource("js/decisions.js")
         ctx.evaluateScript(stateJS)
+        ctx.evaluateScript(decViewsJS)
         ctx.evaluateScript(decJS)
         XCTAssertNil(jsError, "JS load error: \(jsError ?? "")")
 
@@ -262,6 +276,7 @@ final class QWDecisionsWebUIParityTests: XCTestCase {
         for (path, expectedSubstr) in [
             ("/ui", "nav-tab-decisions"),
             ("/ui/css/decisions.css", ".dec-box-stage"),
+            ("/ui/js/decisions-views.js", "DECISION_WORKBENCH_PRESETS"),
             ("/ui/js/decisions.js", "renderDecisionResultsHTML"),
         ] {
             let (data, resp) = try await URLSession.shared.data(from: base.appendingPathComponent(path))

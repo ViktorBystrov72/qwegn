@@ -318,4 +318,21 @@ public enum QWGemm {
         enc.dispatchThreadgroups(MTLSize(width: (Int(n) / 8 + 255) / 256, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
+
+    public static func encodeCastF16ToF32(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
+                                          x16: QWTensorValue, y32: QWTensorValue, count: Int? = nil) throws {
+        let n = count ?? x16.shape.elementCount
+        guard x16.shape.dtype == .f16, y32.shape.dtype == .f32,
+              n > 0, x16.shape.elementCount >= n, y32.shape.elementCount >= n, n % 8 == 0 else {
+            throw QWGemmError.badWeights("cast f16→f32: n=\(n) must fit buffers and divide 8")
+        }
+        let pso = try hal.pipeline("qwg_cast_f16_to_f32")
+        enc.setComputePipelineState(pso)
+        x16.bind(enc, index: 0)
+        y32.bind(enc, index: 1)
+        var nF8 = UInt32(n / 8)
+        enc.setBytes(&nF8, length: 4, index: 2)
+        enc.dispatchThreadgroups(MTLSize(width: (Int(n) / 8 + 255) / 256, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
 }

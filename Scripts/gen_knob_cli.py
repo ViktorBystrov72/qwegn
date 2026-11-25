@@ -38,6 +38,12 @@ CLI_FLAGS = {
     "dflashDraftPackPath": ("dflash-draft-pack", []),
     "dflashSelectorTopK": ("dflash-top-k", []),
     "lsaCrossLoopReuse": ("lsa-cross-loop-reuse", []),
+    "decisionModelPackPath": ("decision-model", []),
+    "decisionComputeUnit": ("decision-compute-unit", []),
+    "decisionLoadVision": ("decision-load-vision", []),
+    "decisionDefaultScoreReadout": ("decision-score-readout", []),
+    "decisionDefaultTruncation": ("decision-truncation", []),
+    "decisionAlwaysEmitBox": ("decision-always-emit-box", []),
 }
 
 # How a bool knob is spelled. A flag is the CLI idiom, but the thinking
@@ -90,6 +96,8 @@ CLI_COMMANDS = {
         "warmCacheLimitGiB", "ssdCacheLimitGiB", "cacheDir", "logLevel", "temperature",
         "topP", "topK", "maxTokens", "repetitionPenalty", "seed", "enableThinking",
         "reasoningEffort", "systemPrompt", "lazyLoad", "loadVision", "streamNgrams",
+        "decisionModelPackPath", "decisionComputeUnit", "decisionLoadVision",
+        "decisionDefaultScoreReadout", "decisionDefaultTruncation", "decisionAlwaysEmitBox",
     ],
     "qwg plan": ["contextTokens", "kvMode"],
 }
@@ -105,7 +113,7 @@ CLI_HELP = {
     "repetitionPenalty": "Repetition penalty factor.",
     "seed": "Deterministic RNG seed (-1 for random, written --seed=-1).",
     "enableThinking": "Enable or disable model thinking.",
-    "reasoningEffort": "Reasoning effort: low, medium or xhigh.",
+    "reasoningEffort": "Reasoning effort: auto, low, medium, high or xhigh.",
     "systemPrompt": "System prompt text.",
     "speculativeEnabled": "Enable speculative decoding.",
     "mtpDrafts": "MTP speculation depth (0 is serial decode).",
@@ -143,6 +151,12 @@ CLI_HELP = {
     "dflashDraftPackPath": "Path to the DFlash 2 / DSpine drafter model pack.",
     "dflashSelectorTopK": "DFlash 2 / DSpine candidate selector top-K.",
     "splitKTokensPerSplit": "Tokens per split in a split-K GEMV.",
+    "decisionModelPackPath": "Path or model name for the System-1 decision sidecar.",
+    "decisionComputeUnit": "Decision sidecar compute unit: auto, metal or ane.",
+    "decisionLoadVision": "Load the vision tower on the decision sidecar for image tasks.",
+    "decisionDefaultScoreReadout": "Default score readout for decision requests: mean, median or argmax.",
+    "decisionDefaultTruncation": "Default context truncation policy for decision requests: error, head, tail, middle or auto_state.",
+    "decisionAlwaysEmitBox": "Always decode and emit best-effort coordinates for box questions even below threshold.",
 }
 
 

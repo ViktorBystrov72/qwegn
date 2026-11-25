@@ -1,4 +1,4 @@
-// QWServerSchema+Decisions.swift — Wire DTOs for /v1/decisions, /v1/systemone, and /v1/laya.
+// QWServerSchema+Decisions.swift — Wire request DTOs & dialect normalization for decision APIs.
 
 import Foundation
 import QWCore
@@ -6,15 +6,70 @@ import QWDecision
 import QWEngine
 import QWToken
 
-/// Incoming question specification supporting both `/v1/decisions` and `/v1/systemone` dialects.
+public struct QWDecisionHTTPAsset: Codable, Sendable {
+    public let type: String?
+    public let format: String?
+    public let dataBase64: String?
+    public let part: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, format, part
+        case dataBase64 = "data_base64"
+    }
+}
+
+public struct QWDecisionHTTPOptionItem: Codable, Sendable {
+    public let value: String?
+    public let label: String?
+    public let description: String?
+}
+
+public struct QWDecisionQuestionWireMeta: Sendable {
+    public let name: String
+    public let incomingType: String
+    public let scoreLegend: [String: QWJson]
+
+    public init(name: String, incomingType: String, scoreLegend: [String: QWJson] = [:]) {
+        self.name = name
+        self.incomingType = incomingType
+        self.scoreLegend = scoreLegend
+    }
+}
+
+public struct QWDecisionRequestDefaults: Sendable {
+    public let scoreReadout: QWScoreReadout
+    public let truncation: QWTruncationPolicy?
+    public let alwaysEmitBox: Bool
+
+    public init(
+        scoreReadout: QWScoreReadout = .mean,
+        truncation: QWTruncationPolicy? = nil,
+        alwaysEmitBox: Bool = false
+    ) {
+        self.scoreReadout = scoreReadout
+        self.truncation = truncation
+        self.alwaysEmitBox = alwaysEmitBox
+    }
+}
+
+public struct QWDecisionPreparedHTTPInput: Sendable {
+    public let request: QWDecisionRequest
+    public let questionMeta: [QWDecisionQuestionWireMeta]
+    public let isOpenAIDialect: Bool
+    public let preferredModel: String?
+}
+
+/// Incoming question specification supporting `/v1/decisions`, `/v1/systemone`, and OpenAI dialects.
 public struct QWDecisionHTTPQuestion: Codable, Sendable {
     public let name: String?
     public let kind: String?
     public let type: String?
-    public let instructions: String?
+    public let instructions: QWJson?
     public let question: String?
     public let prompt: String?
     public let criteria: QWJson?
+    public let choices: [QWDecisionHTTPOptionItem]?
+    public let levels: [QWDecisionHTTPOptionItem]?
     public let options: [String]?
     public let labels: [String]?
     public let abstainBelow: Double?
@@ -31,9 +86,11 @@ public struct QWDecisionHTTPQuestion: Codable, Sendable {
     public let maxBoxes: Int?
     public let jsonPath: String?
     public let chain: String?
+    public let alwaysEmitBox: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case name, kind, type, instructions, question, prompt, criteria, options, labels, unit, chain
+        case name, kind, type, instructions, question, prompt, criteria
+        case choices, levels, options, labels, unit, chain
         case abstainBelow = "abstain_below"
         case selectThreshold = "select_threshold"
         case scoreReadout = "score_readout"
@@ -46,6 +103,7 @@ public struct QWDecisionHTTPQuestion: Codable, Sendable {
         case stepValue = "step"
         case maxBoxes = "max_boxes"
         case jsonPath = "json_path"
+        case alwaysEmitBox = "always_emit_box"
     }
 
     public init(
@@ -56,6 +114,8 @@ public struct QWDecisionHTTPQuestion: Codable, Sendable {
         question: String? = nil,
         prompt: String? = nil,
         criteria: QWJson? = nil,
+        choices: [QWDecisionHTTPOptionItem]? = nil,
+        levels: [QWDecisionHTTPOptionItem]? = nil,
         options: [String]? = nil,
         labels: [String]? = nil,
         abstainBelow: Double? = nil,
@@ -71,15 +131,18 @@ public struct QWDecisionHTTPQuestion: Codable, Sendable {
         stepValue: Double? = nil,
         maxBoxes: Int? = nil,
         jsonPath: String? = nil,
-        chain: String? = nil
+        chain: String? = nil,
+        alwaysEmitBox: Bool? = nil
     ) {
         self.name = name
         self.kind = kind
         self.type = type
-        self.instructions = instructions
+        self.instructions = instructions.map { .string($0) }
         self.question = question
         self.prompt = prompt
         self.criteria = criteria
+        self.choices = choices
+        self.levels = levels
         self.options = options
         self.labels = labels
         self.abstainBelow = abstainBelow
@@ -96,22 +159,49 @@ public struct QWDecisionHTTPQuestion: Codable, Sendable {
         self.maxBoxes = maxBoxes
         self.jsonPath = jsonPath
         self.chain = chain
+        self.alwaysEmitBox = alwaysEmitBox
+    }
+
+    public var usesOpenAIDialect: Bool {
+        if choices != nil || levels != nil { return true }
+        let raw = (type ?? kind ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return raw == "predicate"
     }
 
     public func toDecisionQuestion(
         fallbackName: String,
-        defaultScoreReadout: QWScoreReadout
+        defaultScoreReadout: QWScoreReadout,
+        defaultAlwaysEmitBox: Bool = false,
+        assetPlaceholders: [String] = []
     ) throws -> QWDecisionQuestion {
+        try toDecisionQuestionWithMeta(
+            fallbackName: fallbackName,
+            defaultScoreReadout: defaultScoreReadout,
+            defaultAlwaysEmitBox: defaultAlwaysEmitBox,
+            assetPlaceholders: assetPlaceholders
+        ).0
+    }
+
+    func toDecisionQuestionWithMeta(
+        fallbackName: String,
+        defaultScoreReadout: QWScoreReadout,
+        defaultAlwaysEmitBox: Bool = false,
+        assetPlaceholders: [String] = []
+    ) throws -> (QWDecisionQuestion, QWDecisionQuestionWireMeta) {
         let resolvedName = (name?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName
-        let parsedCriteria = try parseCriteria()
+        let (parsedCriteria, scoreLegend) = try parseCriteria(assetPlaceholders: assetPlaceholders)
         let rawKind = (kind ?? type ?? (parsedCriteria.isEmpty ? "noul" : "choice"))
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let (mappedKind, inferredReadKind) = try Self.mapKind(rawKind)
         let explicitRead = readKind.flatMap { QWReadKind(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
         let resolvedReadout = try parseScoreReadout(scoreReadout) ?? defaultScoreReadout
-        let resolvedPrompt = instructions ?? question ?? prompt ?? ""
-        return QWDecisionQuestion(
+
+        let rawInstText = Self.renderJSONText(instructions)
+        let rawPrompt = rawInstText ?? question ?? prompt ?? ""
+        let resolvedPrompt = QWDecisionHTTPRequest.stripAssetPlaceholders(rawPrompt, placeholders: assetPlaceholders)
+
+        let q = QWDecisionQuestion(
             name: resolvedName,
             kind: mappedKind,
             instructions: resolvedPrompt,
@@ -126,52 +216,103 @@ public struct QWDecisionHTTPQuestion: Codable, Sendable {
             estimateStep: estimateStep ?? stepValue,
             maxBoxes: maxBoxes,
             jsonPath: jsonPath,
-            chain: chain
+            chain: chain,
+            alwaysEmitBox: alwaysEmitBox ?? defaultAlwaysEmitBox
         )
+        let meta = QWDecisionQuestionWireMeta(name: resolvedName, incomingType: rawKind, scoreLegend: scoreLegend)
+        return (q, meta)
     }
 
-    private func parseCriteria() throws -> [QWDecisionCriterion] {
+    private static func renderJSONText(_ value: QWJson?) -> String? {
+        guard let value else { return nil }
+        switch value {
+        case .undefined, .null: return nil
+        case .string(let s): return s
+        default: return value.tojson
+        }
+    }
+
+    private func parseCriteria(assetPlaceholders: [String]) throws -> ([QWDecisionCriterion], [String: QWJson]) {
+        func clean(_ s: String?) -> String? {
+            guard let s else { return nil }
+            let stripped = QWDecisionHTTPRequest.stripAssetPlaceholders(s, placeholders: assetPlaceholders)
+            return stripped.isEmpty ? nil : stripped
+        }
+
+        if let choices, !choices.isEmpty {
+            let crit = choices.compactMap { item -> QWDecisionCriterion? in
+                guard let key = (item.value ?? item.label), !key.isEmpty else { return nil }
+                return QWDecisionCriterion(key: key, description: clean(item.description))
+            }
+            return (crit, [:])
+        }
+        if let levels, !levels.isEmpty {
+            var legend: [String: QWJson] = [:]
+            let crit = levels.enumerated().map { idx, item -> QWDecisionCriterion in
+                let key = item.label ?? "\(idx)"
+                if let desc = item.description {
+                    legend["\(idx)"] = .string(desc)
+                } else {
+                    legend["\(idx)"] = .string(key)
+                }
+                return QWDecisionCriterion(key: key, description: clean(item.description))
+            }
+            return (crit, legend)
+        }
         if let criteria {
             switch criteria {
             case .object(let pairs):
-                return pairs.map { key, val in
-                    let desc: String? = switch val {
+                let crit = pairs.map { key, val -> QWDecisionCriterion in
+                    let rawDesc: String? = switch val {
                     case .null, .undefined: nil
                     case .string(let s): s.isEmpty ? nil : s
                     default: val.tojson
                     }
-                    return QWDecisionCriterion(key: key, description: desc)
+                    return QWDecisionCriterion(key: key, description: clean(rawDesc))
                 }
+                return (crit, [:])
             case .array(let arr):
-                return arr.compactMap { item in
+                var legend: [String: QWJson] = [:]
+                var crit: [QWDecisionCriterion] = []
+                for (idx, item) in arr.enumerated() {
                     switch item {
                     case .string(let s):
-                        return QWDecisionCriterion(key: s)
+                        legend["\(idx)"] = .string(s)
+                        crit.append(QWDecisionCriterion(key: clean(s) ?? s, description: clean(s)))
                     case .object:
                         if case .string(let k) = item.get("key") {
                             let d: String? = {
                                 if case .string(let ds) = item.get("description") { return ds }
                                 return nil
                             }()
-                            return QWDecisionCriterion(key: k, description: d)
+                            legend["\(idx)"] = item
+                            crit.append(QWDecisionCriterion(key: k, description: clean(d)))
+                        } else {
+                            let j = item.tojson
+                            legend["\(idx)"] = item
+                            crit.append(QWDecisionCriterion(key: j, description: clean(j)))
                         }
-                        return QWDecisionCriterion(key: item.tojson)
                     case .null, .undefined:
-                        return nil
+                        break
                     default:
-                        return QWDecisionCriterion(key: item.stringified)
+                        legend["\(idx)"] = item
+                        let s = item.stringified
+                        crit.append(QWDecisionCriterion(key: s, description: clean(s)))
                     }
                 }
+                return (crit, legend)
             case .null, .undefined:
                 break
             default:
-                throw QWDecisionError.invalidQuestion("criteria must be a JSON object or string array")
+                throw QWDecisionError.invalidQuestion("criteria must be a JSON object or array")
             }
         }
         if let list = options ?? labels {
-            return list.map { QWDecisionCriterion(key: $0) }
+            var legend: [String: QWJson] = [:]
+            for (idx, s) in list.enumerated() { legend["\(idx)"] = .string(s) }
+            return (list.map { QWDecisionCriterion(key: $0) }, legend)
         }
-        return []
+        return ([], [:])
     }
 
     private func parseScoreReadout(_ raw: String?) throws -> QWScoreReadout? {
@@ -202,12 +343,14 @@ public struct QWDecisionHTTPQuestion: Codable, Sendable {
     }
 }
 
-/// Canonical `POST /v1/decisions` and `POST /v1/systemone` request payload.
+/// Canonical decision request supporting `/v1/decisions`, `/v1/systemone`, and OpenAI Decisions.
 public struct QWDecisionHTTPRequest: Codable, Sendable {
     public let model: String?
     public let state: QWJson?
     public let context: QWJson?
+    public let input: QWJson?
     public let questions: QWJson
+    public let assets: [String: QWDecisionHTTPAsset]?
     public let truncation: String?
     public let contextBudget: Int?
     public let systemPrompt: String?
@@ -215,16 +358,25 @@ public struct QWDecisionHTTPRequest: Codable, Sendable {
     public let chain: String?
     public let scoreReadout: String?
     public let images: [String]?
+    public let alwaysEmitBox: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case model, state, context, questions, truncation, chain, images
+        case model, state, context, input, questions, assets, truncation, chain, images
         case contextBudget = "context_budget"
         case systemPrompt = "system_prompt"
         case stateStyle = "state_style"
         case scoreReadout = "score_readout"
+        case alwaysEmitBox = "always_emit_box"
     }
 
     public func toDecisionRequest() throws -> QWDecisionRequest {
+        try prepareExecution().request
+    }
+
+    public func prepareExecution(
+        defaults: QWDecisionRequestDefaults = QWDecisionRequestDefaults(),
+        multipartParts: [String: Data] = [:]
+    ) throws -> QWDecisionPreparedHTTPInput {
         let defaultReadout: QWScoreReadout
         if let raw = scoreReadout?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
            !raw.isEmpty {
@@ -233,7 +385,7 @@ public struct QWDecisionHTTPRequest: Codable, Sendable {
             }
             defaultReadout = parsed
         } else {
-            defaultReadout = .mean
+            defaultReadout = defaults.scoreReadout
         }
 
         let truncationPolicy: QWTruncationPolicy?
@@ -244,13 +396,38 @@ public struct QWDecisionHTTPRequest: Codable, Sendable {
             }
             truncationPolicy = parsed
         } else {
-            truncationPolicy = nil
+            truncationPolicy = defaults.truncation
         }
 
-        let parsedQuestions = try Self.decodeQuestions(questions, defaultScoreReadout: defaultReadout)
-        let parsedState = try Self.decodeState(state ?? context)
-        let decodedImages = try Self.decodeHTTPImages(images)
-        return QWDecisionRequest(
+        var collectedImages = try Self.decodeHTTPImages(images)
+        let rawState = input ?? state ?? context
+        let orderedAssetKeys = try Self.resolveAssets(
+            assets,
+            rawState: rawState,
+            rawQuestions: questions,
+            multipartParts: multipartParts,
+            into: &collectedImages
+        )
+        let defaultBoxEmit = alwaysEmitBox ?? defaults.alwaysEmitBox
+        let (parsedQuestions, questionMeta, questionUsesOpenAI) = try Self.decodeQuestionsWithMeta(
+            questions,
+            defaultScoreReadout: defaultReadout,
+            defaultAlwaysEmitBox: defaultBoxEmit,
+            assetPlaceholders: orderedAssetKeys
+        )
+        let parsedState = try Self.decodeState(
+            rawState,
+            assetPlaceholders: orderedAssetKeys,
+            imagesOut: &collectedImages
+        )
+
+        guard collectedImages.count <= QWImageDecodePolicy.defaultMaxImagesPerTurn else {
+            throw QWDecisionError.invalidQuestion(
+                "Too many images in decision request (\(collectedImages.count)); maximum is \(QWImageDecodePolicy.defaultMaxImagesPerTurn)"
+            )
+        }
+
+        let domainReq = QWDecisionRequest(
             state: parsedState,
             questions: parsedQuestions,
             truncation: truncationPolicy,
@@ -258,8 +435,73 @@ public struct QWDecisionHTTPRequest: Codable, Sendable {
             systemPrompt: systemPrompt,
             stateStyle: stateStyle ?? "json_only",
             chain: chain ?? "default",
-            images: decodedImages
+            images: collectedImages
         )
+        return QWDecisionPreparedHTTPInput(
+            request: domainReq,
+            questionMeta: questionMeta,
+            isOpenAIDialect: (input != nil) || questionUsesOpenAI,
+            preferredModel: model
+        )
+    }
+
+    private static func resolveAssets(
+        _ assets: [String: QWDecisionHTTPAsset]?,
+        rawState: QWJson?,
+        rawQuestions: QWJson,
+        multipartParts: [String: Data],
+        into imagesOut: inout [Data]
+    ) throws -> [String] {
+        guard let assets, !assets.isEmpty else { return [] }
+        let searchBlob = (rawState?.tojson ?? "") + "\n" + rawQuestions.tojson
+        let ordered = assets.sorted { lhs, rhs in
+            if let li = partNumber(lhs.value.part), let ri = partNumber(rhs.value.part), li != ri {
+                return li < ri
+            }
+            let lPos = searchBlob.range(of: lhs.key)?.lowerBound
+            let rPos = searchBlob.range(of: rhs.key)?.lowerBound
+            switch (lPos, rPos) {
+            case let (a?, b?) where a != b: return a < b
+            case (.some, .none): return true
+            case (.none, .some): return false
+            default: return lhs.key < rhs.key
+            }
+        }
+        for (key, asset) in ordered {
+            if let part = asset.part, !part.isEmpty {
+                guard let partData = multipartParts[part], !partData.isEmpty else {
+                    throw QWDecisionError.invalidQuestion("missing multipart part '\(part)' for asset '\(key)'")
+                }
+                imagesOut.append(partData)
+            } else if let b64 = asset.dataBase64, !b64.isEmpty {
+                let data: Data
+                if b64.hasPrefix("data:") {
+                    data = try resolveSingleImageURL(b64)
+                } else if let decoded = Data(base64Encoded: b64, options: .ignoreUnknownCharacters), !decoded.isEmpty {
+                    data = decoded
+                } else {
+                    throw QWDecisionError.invalidQuestion("invalid base64 data in asset '\(key)'")
+                }
+                imagesOut.append(data)
+            } else {
+                throw QWDecisionError.invalidQuestion("asset '\(key)' requires 'part' or 'data_base64'")
+            }
+        }
+        return ordered.map(\.key)
+    }
+
+    private static func partNumber(_ part: String?) -> Int? {
+        guard let part, let dash = part.lastIndex(of: "-") else { return nil }
+        return Int(part[part.index(after: dash)...])
+    }
+
+    static func stripAssetPlaceholders(_ text: String, placeholders: [String]) -> String {
+        guard !placeholders.isEmpty, !text.isEmpty else { return text }
+        var out = text
+        for key in placeholders where !key.isEmpty {
+            out = out.replacingOccurrences(of: key, with: "")
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func decodeHTTPImages(_ raw: [String]?) throws -> [Data] {
@@ -269,60 +511,205 @@ public struct QWDecisionHTTPRequest: Codable, Sendable {
                 "Too many images in decision request (\(raw.count)); maximum is \(QWImageDecodePolicy.defaultMaxImagesPerTurn)"
             )
         }
-        return try raw.map { source in
-            let data: Data
-            do {
-                data = try QWImageDecoder.resolveSourceData(urlOrDataUri: source, policy: .serverDefault)
-            } catch let imgErr as QWImageDecoderError {
-                throw QWDecisionError.invalidQuestion(imgErr.description)
-            }
-            guard !data.isEmpty else {
-                throw QWDecisionError.invalidQuestion("Decoded HTTP image payload is empty")
-            }
-            return data
+        return try raw.map(resolveSingleImageURL)
+    }
+
+    private static func resolveSingleImageURL(_ source: String) throws -> Data {
+        let data: Data
+        do {
+            data = try QWImageDecoder.resolveSourceData(urlOrDataUri: source, policy: .serverDefault)
+        } catch let imgErr as QWImageDecoderError {
+            throw QWDecisionError.invalidQuestion(imgErr.description)
         }
+        guard !data.isEmpty else {
+            throw QWDecisionError.invalidQuestion("Decoded HTTP image payload is empty")
+        }
+        return data
     }
 
     static func decodeState(_ raw: QWJson?) throws -> QWDecisionState {
+        var ignored: [Data] = []
+        return try decodeState(raw, assetPlaceholders: [], imagesOut: &ignored)
+    }
+
+    static func decodeState(
+        _ raw: QWJson?,
+        assetPlaceholders: [String],
+        imagesOut: inout [Data]
+    ) throws -> QWDecisionState {
         guard let raw else { return .empty }
         switch raw {
         case .undefined, .null:
             return .empty
         case .string(let s):
-            return .text(s)
+            let cleaned = stripAssetPlaceholders(s, placeholders: assetPlaceholders)
+            return (!assetPlaceholders.isEmpty && cleaned.isEmpty) ? .empty : .text(assetPlaceholders.isEmpty ? s : cleaned)
+        case .array(let items):
+            if let extracted = try extractMessagesState(items, assetPlaceholders: assetPlaceholders, imagesOut: &imagesOut) {
+                return extracted
+            }
+            return try sanitizedJSONState(raw, assetPlaceholders: assetPlaceholders)
         case .object:
+            if case .array(let messages) = raw.get("messages"),
+               let extracted = try extractMessagesState(messages, assetPlaceholders: assetPlaceholders, imagesOut: &imagesOut) {
+                return extracted
+            }
+            if case .string(let imgSource) = raw.get("image") {
+                imagesOut.append(try resolveSingleImageURL(imgSource))
+                if case .string(let txt) = raw.get("text") {
+                    let cleaned = stripAssetPlaceholders(txt, placeholders: assetPlaceholders)
+                    return cleaned.isEmpty ? .empty : .text(cleaned)
+                }
+                return .empty
+            }
             if case .string(let kind) = raw.get("type") {
                 switch kind.lowercased() {
                 case "text":
-                    if case .string(let txt) = raw.get("text") { return .text(txt) }
+                    if case .string(let txt) = raw.get("text") {
+                        let cleaned = stripAssetPlaceholders(txt, placeholders: assetPlaceholders)
+                        return (!assetPlaceholders.isEmpty && cleaned.isEmpty) ? .empty : .text(cleaned)
+                    }
                 case "json":
                     let payload = raw.get("json")
-                    if !payload.isUndefined { return .json(Data(payload.tojson.utf8)) }
+                    if !payload.isUndefined {
+                        return try sanitizedJSONState(payload, assetPlaceholders: assetPlaceholders)
+                    }
                 default:
                     break
                 }
             }
-            return .json(Data(raw.tojson.utf8))
+            return try sanitizedJSONState(raw, assetPlaceholders: assetPlaceholders)
         default:
             return .json(Data(raw.tojson.utf8))
         }
+    }
+
+    private static func sanitizedJSONState(_ json: QWJson, assetPlaceholders: [String]) throws -> QWDecisionState {
+        if assetPlaceholders.isEmpty {
+            return .json(Data(json.tojson.utf8))
+        }
+        let cleaned = stripPlaceholdersFromJSON(json, placeholders: assetPlaceholders)
+        if isEffectivelyEmptyJSON(cleaned) { return .empty }
+        return .json(Data(cleaned.tojson.utf8))
+    }
+
+    private static func stripPlaceholdersFromJSON(_ json: QWJson, placeholders: [String]) -> QWJson {
+        switch json {
+        case .string(let s):
+            return .string(stripAssetPlaceholders(s, placeholders: placeholders))
+        case .array(let arr):
+            return .array(arr.map { stripPlaceholdersFromJSON($0, placeholders: placeholders) })
+        case .object(let pairs):
+            return .object(pairs.map { ($0.0, stripPlaceholdersFromJSON($0.1, placeholders: placeholders)) })
+        default:
+            return json
+        }
+    }
+
+    private static func isEffectivelyEmptyJSON(_ json: QWJson) -> Bool {
+        switch json {
+        case .undefined, .null: return true
+        case .string(let s): return s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .array(let arr): return arr.allSatisfy(isEffectivelyEmptyJSON)
+        case .object(let pairs): return pairs.allSatisfy { isEffectivelyEmptyJSON($0.1) }
+        default: return false
+        }
+    }
+
+    private static func extractMessagesState(
+        _ messages: [QWJson],
+        assetPlaceholders: [String],
+        imagesOut: inout [Data]
+    ) throws -> QWDecisionState? {
+        guard !messages.isEmpty,
+              messages.allSatisfy({
+                  if case .object = $0 { return $0.get("content") != .undefined }
+                  return false
+              }) else {
+            return nil
+        }
+        var chunks: [String] = []
+        for msg in messages {
+            let content = msg.get("content")
+            if case .string(let s) = content {
+                let c = stripAssetPlaceholders(s, placeholders: assetPlaceholders)
+                if !c.isEmpty { chunks.append(c) }
+            } else if case .array(let parts) = content {
+                for part in parts {
+                    let pType: String = {
+                        if case .string(let t) = part.get("type") { return t.lowercased() }
+                        return ""
+                    }()
+                    if pType == "text" || pType == "input_text", case .string(let txt) = part.get("text") {
+                        let c = stripAssetPlaceholders(txt, placeholders: assetPlaceholders)
+                        if !c.isEmpty { chunks.append(c) }
+                    } else if pType == "image_url" || pType == "input_image" {
+                        let imgVal = part.get("image_url")
+                        if case .string(let urlStr) = imgVal {
+                            imagesOut.append(try resolveSingleImageURL(urlStr))
+                        } else if case .object = imgVal, case .string(let urlStr) = imgVal.get("url") {
+                            imagesOut.append(try resolveSingleImageURL(urlStr))
+                        }
+                    }
+                }
+            }
+        }
+        return chunks.isEmpty ? .empty : .text(chunks.joined(separator: "\n"))
     }
 
     static func decodeQuestions(
         _ raw: QWJson,
         defaultScoreReadout: QWScoreReadout
     ) throws -> [QWDecisionQuestion] {
+        try decodeQuestionsWithMeta(
+            raw,
+            defaultScoreReadout: defaultScoreReadout,
+            defaultAlwaysEmitBox: false,
+            assetPlaceholders: []
+        ).0
+    }
+
+    private static func decodeQuestionsWithMeta(
+        _ raw: QWJson,
+        defaultScoreReadout: QWScoreReadout,
+        defaultAlwaysEmitBox: Bool,
+        assetPlaceholders: [String]
+    ) throws -> ([QWDecisionQuestion], [QWDecisionQuestionWireMeta], Bool) {
         switch raw {
         case .array(let items):
-            return try items.enumerated().map { idx, item in
+            var questions: [QWDecisionQuestion] = []
+            var metas: [QWDecisionQuestionWireMeta] = []
+            var anyOpenAI = false
+            for (idx, item) in items.enumerated() {
                 let dto = try QWServerRequestDecoder.decode(QWDecisionHTTPQuestion.self, from: Data(item.tojson.utf8))
-                return try dto.toDecisionQuestion(fallbackName: "q\(idx)", defaultScoreReadout: defaultScoreReadout)
+                if dto.usesOpenAIDialect { anyOpenAI = true }
+                let (q, m) = try dto.toDecisionQuestionWithMeta(
+                    fallbackName: "q\(idx)",
+                    defaultScoreReadout: defaultScoreReadout,
+                    defaultAlwaysEmitBox: defaultAlwaysEmitBox,
+                    assetPlaceholders: assetPlaceholders
+                )
+                questions.append(q)
+                metas.append(m)
             }
+            return (questions, metas, anyOpenAI)
         case .object(let pairs):
-            return try pairs.map { key, val in
+            var questions: [QWDecisionQuestion] = []
+            var metas: [QWDecisionQuestionWireMeta] = []
+            var anyOpenAI = false
+            for (key, val) in pairs {
                 let dto = try QWServerRequestDecoder.decode(QWDecisionHTTPQuestion.self, from: Data(val.tojson.utf8))
-                return try dto.toDecisionQuestion(fallbackName: key, defaultScoreReadout: defaultScoreReadout)
+                if dto.usesOpenAIDialect { anyOpenAI = true }
+                let (q, m) = try dto.toDecisionQuestionWithMeta(
+                    fallbackName: key,
+                    defaultScoreReadout: defaultScoreReadout,
+                    defaultAlwaysEmitBox: defaultAlwaysEmitBox,
+                    assetPlaceholders: assetPlaceholders
+                )
+                questions.append(q)
+                metas.append(m)
             }
+            return (questions, metas, anyOpenAI)
         default:
             throw QWDecisionError.invalidQuestion("questions must be an array or keyed object")
         }
@@ -335,247 +722,5 @@ public struct QWDecisionBatchHTTPRequest: Codable, Sendable {
 
     public var resolvedItems: [QWDecisionHTTPRequest] {
         items ?? requests ?? []
-    }
-}
-
-public struct QWDecisionHTTPResponse: Codable, Sendable {
-    public let answers: [QWDecisionAnswer]
-    public let usage: QWDecisionUsage
-    public let chain: String
-    public let model: String
-    public let backend: String
-
-    public init(envelope: QWDecisionExecutionEnvelope) {
-        self.answers = envelope.response.answers
-        self.usage = envelope.response.usage
-        self.chain = envelope.response.chain
-        self.model = envelope.modelName
-        self.backend = envelope.backendKind
-    }
-}
-
-public struct QWDecisionBatchHTTPResponse: Codable, Sendable {
-    public let results: [QWDecisionHTTPResponse]
-}
-
-/// Wire payload for `POST /v1/laya` enforcing the 60,000-character rail (`ADR-008`).
-public struct QWLayaHTTPRequest: Codable, Sendable {
-    public static let maxContextCharacters = 60_000
-
-    public let model: String?
-    public let context: QWJson?
-    public let state: QWJson?
-    public let question: String?
-    public let instructions: String?
-    public let kind: String?
-    public let mode: String?
-    public let command: String?
-    public let options: [String]?
-    public let labels: [String]?
-    public let criteria: QWJson?
-    public let questions: QWJson?
-    public let chain: String?
-    public let guardMode: Bool?
-    public let scoreReadout: String?
-    public let images: [String]?
-
-    enum CodingKeys: String, CodingKey {
-        case model, context, state, question, instructions, kind, mode, command
-        case options, labels, criteria, questions, chain, images
-        case guardMode = "guard"
-        case scoreReadout = "score_readout"
-    }
-
-    public func toDecisionRequest() throws -> QWDecisionRequest {
-        let resolvedState: QWDecisionState
-        if let cmd = command, state == nil, context == nil {
-            resolvedState = .text("About to execute command: \(cmd)")
-        } else {
-            resolvedState = try QWDecisionHTTPRequest.decodeState(state ?? context)
-        }
-
-        let charCount: Int = switch resolvedState {
-        case .empty: 0
-        case .text(let s): s.count
-        case .json(let d): String(decoding: d, as: UTF8.self).count
-        }
-        guard charCount <= Self.maxContextCharacters else {
-            throw QWDecisionError.invalidQuestion(
-                "state length \(charCount) exceeds \(Self.maxContextCharacters)-character Laya rail"
-            )
-        }
-
-        let readout: QWScoreReadout
-        if let rawR = scoreReadout?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !rawR.isEmpty {
-            guard let parsed = QWScoreReadout(rawValue: rawR) else {
-                throw QWDecisionError.invalidQuestion("unsupported score_readout '\(rawR)'")
-            }
-            readout = parsed
-        } else {
-            readout = .mean
-        }
-
-        let qList: [QWDecisionQuestion]
-        if let questions, !questions.isUndefined, questions != .null {
-            qList = try QWDecisionHTTPRequest.decodeQuestions(questions, defaultScoreReadout: readout)
-        } else if guardMode == true || mode?.lowercased() == "guard" || (command != nil && question == nil && instructions == nil) {
-            let guardOptions = options ?? ["allow", "confirm", "deny"]
-            let guardCriteria = [
-                "allow": "safe to run without operator confirmation",
-                "confirm": "potentially risky, ask operator before executing",
-                "deny": "destructive or policy-violating command",
-            ]
-            let criteria = guardOptions.map { key in
-                QWDecisionCriterion(key: key, description: guardCriteria[key])
-            }
-            let promptText = question ?? instructions ?? "How should the harness treat this command?"
-            qList = [QWDecisionQuestion(
-                name: "guard",
-                kind: .choice,
-                instructions: promptText,
-                criteria: criteria,
-                chain: chain ?? "guardrail"
-            )]
-        } else {
-            let promptText = question ?? instructions ?? ""
-            guard !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw QWDecisionError.invalidQuestion("Laya request requires 'question', 'questions', or 'command'")
-            }
-            let single = QWDecisionHTTPQuestion(
-                name: "answer",
-                kind: kind,
-                instructions: promptText,
-                criteria: criteria,
-                options: options,
-                labels: labels,
-                scoreReadout: scoreReadout,
-                chain: chain
-            )
-            qList = [try single.toDecisionQuestion(fallbackName: "answer", defaultScoreReadout: readout)]
-        }
-
-        let decodedImages = try QWDecisionHTTPRequest.decodeHTTPImages(images)
-        return QWDecisionRequest(
-            state: resolvedState,
-            questions: qList,
-            truncation: nil,
-            chain: chain ?? "default",
-            images: decodedImages
-        )
-    }
-}
-
-public struct QWLayaHTTPResponse: Codable, Sendable {
-    public let answer: QWJson
-    public let decision: String?
-    public let confidence: Double
-    public let probabilities: [String: Double]
-    public let probs: [QWDecisionProbability]
-    public let answers: [String: QWDecisionAnswer]
-    public let usage: QWDecisionUsage
-    public let chain: String
-    public let model: String
-    public let backend: String
-
-    public init(envelope: QWDecisionExecutionEnvelope) {
-        let primary = envelope.response.answers.first
-        let probPairs = primary?.probs ?? []
-        var probDict: [String: Double] = [:]
-        for p in probPairs { probDict[p.key] = p.value }
-
-        let summaryValue: QWJson
-        let decisionLabel: String?
-        if let primary {
-            switch primary.kind {
-            case .noul:
-                let b = primary.noul ?? false
-                summaryValue = .bool(b)
-                decisionLabel = b ? "yes" : "no"
-            case .choice, .multiChoice:
-                if let c = primary.choice {
-                    summaryValue = .string(c)
-                    decisionLabel = c
-                } else {
-                    summaryValue = .array(primary.selectedChoices.map { .string($0) })
-                    decisionLabel = primary.selectedChoices.first
-                }
-            case .score:
-                let val = primary.score ?? 0
-                summaryValue = .double(val)
-                decisionLabel = nil
-            case .estimate:
-                let val = primary.estimate ?? 0
-                summaryValue = .double(val)
-                decisionLabel = nil
-            case .read:
-                if let num = primary.number {
-                    summaryValue = .double(num)
-                } else {
-                    summaryValue = .string(primary.date ?? primary.text ?? "")
-                }
-                decisionLabel = primary.text ?? primary.date
-            case .box, .boxes:
-                summaryValue = .string("\(primary.boxes.count) box(es)")
-                decisionLabel = primary.boxes.isEmpty ? "none" : "detected"
-            }
-        } else {
-            summaryValue = .null
-            decisionLabel = nil
-        }
-
-        var keyed: [String: QWDecisionAnswer] = [:]
-        for ans in envelope.response.answers { keyed[ans.name] = ans }
-
-        self.answer = summaryValue
-        self.decision = decisionLabel
-        self.confidence = primary?.confidence ?? 0
-        self.probabilities = probDict
-        self.probs = probPairs
-        self.answers = keyed
-        self.usage = envelope.response.usage
-        self.chain = envelope.response.chain
-        self.model = envelope.modelName
-        self.backend = envelope.backendKind
-    }
-}
-
-public struct QWDecisionLoadHTTPRequest: Codable, Sendable {
-    public let packPath: String?
-    public let model: String?
-    public let computeUnit: String?
-    public let loadVision: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case model
-        case packPath = "pack_path"
-        case computeUnit = "compute_unit"
-        case loadVision = "load_vision"
-    }
-}
-
-public struct QWDecisionErrorPayload: Codable, Sendable {
-    public struct Detail: Codable, Sendable {
-        public let message: String
-        public let type: String
-        public let code: Int
-        public let allowedLabels: [String]?
-
-        enum CodingKeys: String, CodingKey {
-            case message, type, code
-            case allowedLabels = "allowed_labels"
-        }
-    }
-
-    public let error: Detail
-    public let allowedLabels: [String]?
-
-    enum CodingKeys: String, CodingKey {
-        case error
-        case allowedLabels = "allowed_labels"
-    }
-
-    public init(message: String, type: String = "invalid_request_error", code: Int, allowedLabels: [String]? = nil) {
-        self.error = Detail(message: message, type: type, code: code, allowedLabels: allowedLabels)
-        self.allowedLabels = allowedLabels
     }
 }

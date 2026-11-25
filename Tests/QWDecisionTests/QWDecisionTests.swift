@@ -536,4 +536,159 @@ final class QWDecisionTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(ans.answers[3].estimate), 4.0, accuracy: 0.2)
         XCTAssertEqual(ans.answers[4].presence.count, 2)
     }
+
+    func testNonASCIICharSpanAlignmentAndAlwaysEmitBox() async throws {
+        let tok = try makeChatMLNumberTokenizer()
+        let idNo = try XCTUnwrap(tok.singleTokenId(forText: "no"))
+        let idYes = try XCTUnwrap(tok.singleTokenId(forText: "yes"))
+        let cfg = QWDecisionModelConfig(
+            framing: .turnVerbalizer(
+                codesPerOption: 2, numbers: true, packSet: true,
+                maxSetSize: 16, colonSlots: true, stateSeparator: "\n\n",
+                assistantLead: "<think></think>", chatML: true
+            ),
+            topology: .packedSet(maxSetSize: 16),
+            head: .vocabVerbalizer(vocabSize: 128000, tieEmbeddings: true, sparseGatherThreshold: 256),
+            hasStatePointer: true,
+            hasGridReadout: true,
+            usesNumbersThousandthsGrid: true,
+            boxEdgesMode: "median",
+            defaultScoreReadout: "mean"
+        )
+        let prefixText = "caf\u{00E9} \u{1F600}:"
+        let targetText = "Alice Smith"
+        let rawState = prefixText + targetText
+        let built = try QWSequenceFramingEngine.buildBatch(
+            request: QWDecisionRequest(
+                state: .text(rawState),
+                questions: [
+                    QWDecisionQuestion(name: "extract", kind: .read, instructions: "Who?", readKind: .text),
+                    QWDecisionQuestion(name: "box_strict", kind: .box, instructions: "Locate A", alwaysEmitBox: false),
+                    QWDecisionQuestion(name: "box_best", kind: .box, instructions: "Locate B", alwaysEmitBox: true),
+                ]
+            ),
+            config: cfg, tokenizer: tok, maxContextLength: 2048
+        )
+        let readBinding = built.questionBindings[0]
+        let nonZeroSpans = readBinding.pointerTokenSpans.compactMap { $0 }
+        XCTAssertTrue(nonZeroSpans.contains { $0.utf8Range != $0.utf16Range || $0.utf8Range != $0.scalarRange })
+
+        let targetRange = try XCTUnwrap(rawState.range(of: targetText))
+        let targetStartByte = rawState[..<targetRange.lowerBound].utf8.count
+        let targetEndByte = targetStartByte + targetText.utf8.count
+        let ptrS = try XCTUnwrap(readBinding.pointerTokenSpans.enumerated().first { idx, sp in
+            idx > 0 && sp != nil && sp!.utf8Range.lowerBound >= targetStartByte
+        }?.offset)
+        let ptrE = try XCTUnwrap(readBinding.pointerTokenSpans.enumerated().last { idx, sp in
+            idx > 0 && sp != nil && sp!.utf8Range.upperBound <= targetEndByte
+        }?.offset)
+
+        let backend = QWSyntheticDecisionBackend(decisionConfig: cfg) { req in
+            var outs: [QWDecisionSlotOutput] = []
+            var edgeIdx = 0
+            for s in req.slots {
+                if s.isPointerSlot {
+                    let t = req.sequences[0].pointerValidMask.count
+                    var sLogits = [Float](repeating: -20.0, count: t)
+                    var eLogits = [Float](repeating: -20.0, count: t)
+                    sLogits[0] = -6.0
+                    sLogits[ptrS] = 6.0
+                    eLogits[ptrE] = 6.0
+                    outs.append(QWDecisionSlotOutput(pointerStartLogits: sLogits, pointerEndLogits: eLogits))
+                } else if s.candidateTokenGroups.count == 2 {
+                    outs.append(QWDecisionSlotOutput(tokenLogits: [idNo: 6.0, idYes: -6.0]))
+                } else {
+                    let peak = [200, 600, 150, 550][edgeIdx % 4]
+                    edgeIdx += 1
+                    var map: [Int: Float] = [:]
+                    for (i, grp) in s.candidateTokenGroups.enumerated() { map[grp[0]] = (i == peak) ? 8.0 : -8.0 }
+                    outs.append(QWDecisionSlotOutput(tokenLogits: map))
+                }
+            }
+            return QWDecisionBackendOutput(slotOutputs: outs, promptTokens: req.sequences[0].tokenIds.count)
+        }
+
+        let res = try await QWDecisionRunner(tokenizer: tok, backend: backend).decide(
+            QWDecisionRequest(state: .text(rawState), questions: built.questionBindings.map(\.question))
+        )
+        XCTAssertEqual(res.answers[0].text, targetText)
+        XCTAssertEqual(res.answers[0].span, targetStartByte..<targetEndByte)
+        let expectedCharLo = prefixText.unicodeScalars.count
+        let expectedCharHi = expectedCharLo + targetText.unicodeScalars.count
+        XCTAssertEqual(res.answers[0].charSpan, expectedCharLo..<expectedCharHi)
+        XCTAssertNotEqual(res.answers[0].span, res.answers[0].charSpan)
+
+        XCTAssertEqual(res.answers[1].found, false)
+        XCTAssertTrue(res.answers[1].boxes.isEmpty)
+
+        XCTAssertEqual(res.answers[2].found, false)
+        XCTAssertEqual(res.answers[2].boxes.count, 1)
+    }
+
+    func testDecideBatchMatchesSequentialDecide() async throws {
+        let tok = try makeChatMLNumberTokenizer()
+        let idNo = try XCTUnwrap(tok.singleTokenId(forText: "no"))
+        let idYes = try XCTUnwrap(tok.singleTokenId(forText: "yes"))
+        let idA = try XCTUnwrap(tok.singleTokenId(forText: "A"))
+        let idB = try XCTUnwrap(tok.singleTokenId(forText: "B"))
+        let id0 = try XCTUnwrap(tok.singleTokenId(forText: "0"))
+        let id1 = try XCTUnwrap(tok.singleTokenId(forText: "1"))
+        let id2 = try XCTUnwrap(tok.singleTokenId(forText: "2"))
+        let cfg = QWDecisionModelConfig(
+            framing: .turnVerbalizer(
+                codesPerOption: 2, numbers: true, packSet: true,
+                maxSetSize: 16, colonSlots: true, stateSeparator: "\n\n",
+                assistantLead: "<think></think>", chatML: true
+            ),
+            topology: .packedSet(maxSetSize: 16),
+            head: .vocabVerbalizer(vocabSize: 128000, tieEmbeddings: true, sparseGatherThreshold: 256),
+            hasStatePointer: true,
+            hasGridReadout: true,
+            usesNumbersThousandthsGrid: true,
+            boxEdgesMode: "median",
+            defaultScoreReadout: "mean"
+        )
+        let backend = QWSyntheticDecisionBackend(decisionConfig: cfg) { req in
+            let outs = req.slots.map { slot -> QWDecisionSlotOutput in
+                if slot.isPointerSlot {
+                    let t = req.sequences[slot.sequenceIndex].tokenIds.count
+                    var s = [Float](repeating: -8.0, count: t)
+                    var e = [Float](repeating: -8.0, count: t)
+                    if t > 5 { s[t - 4] = 4.0; e[t - 2] = 4.0 }
+                    return QWDecisionSlotOutput(pointerStartLogits: s, pointerEndLogits: e)
+                }
+                if slot.candidateTokenGroups.count == 2 {
+                    return QWDecisionSlotOutput(tokenLogits: [idNo: 0.2, idYes: 2.2])
+                }
+                if slot.candidateTokenGroups.count == 3 {
+                    return QWDecisionSlotOutput(tokenLogits: [id0: 0.1, id1: 0.5, id2: 2.0])
+                }
+                return QWDecisionSlotOutput(tokenLogits: [idA: 0.3, idB: 2.1])
+            }
+            return QWDecisionBackendOutput(slotOutputs: outs, promptTokens: req.sequences.reduce(0) { $0 + $1.tokenIds.count })
+        }
+        let runner = QWDecisionRunner(tokenizer: tok, backend: backend)
+        let requests = [
+            QWDecisionRequest(state: .text("Approve invoice #1"), questions: [QWDecisionQuestion(name: "ok", kind: .noul, instructions: "Ok?")]),
+            QWDecisionRequest(state: .text("Pick tier"), questions: [
+                QWDecisionQuestion(name: "tier", kind: .choice, instructions: "Tier?", criteria: [QWDecisionCriterion(key: "a"), QWDecisionCriterion(key: "b")]),
+                QWDecisionQuestion(name: "urg", kind: .score, instructions: "Urg?", criteria: [QWDecisionCriterion(key: "low"), QWDecisionCriterion(key: "med"), QWDecisionCriterion(key: "hi")]),
+            ]),
+        ]
+        let batched = try await runner.decideBatch(requests)
+        XCTAssertEqual(batched.count, 2)
+        for (idx, req) in requests.enumerated() {
+            let single = try await runner.decide(req)
+            XCTAssertEqual(batched[idx].answers.count, single.answers.count)
+            for (bAns, sAns) in zip(batched[idx].answers, single.answers) {
+                XCTAssertEqual(bAns.name, sAns.name)
+                XCTAssertEqual(bAns.kind, sAns.kind)
+                XCTAssertEqual(bAns.noul, sAns.noul)
+                XCTAssertEqual(bAns.choice, sAns.choice)
+                if let bs = bAns.score, let ss = sAns.score {
+                    XCTAssertEqual(bs, ss, accuracy: 1e-9)
+                }
+            }
+        }
+    }
 }

@@ -46,6 +46,9 @@ public enum QWServerConfigurationResolver {
         cliLoadVision: Bool? = nil, cliStreamNgrams: Bool? = nil,
         cliMemoryPolicy: String? = nil, cliOSReserveGiB: Double? = nil,
         cliResidentExpertsPerLayer: Int? = nil, cliMoESpecBudget: Int? = nil,
+        cliDecisionModelPackPath: String? = nil, cliDecisionComputeUnit: String? = nil,
+        cliDecisionLoadVision: Bool? = nil, cliDecisionDefaultScoreReadout: String? = nil,
+        cliDecisionDefaultTruncation: String? = nil, cliDecisionAlwaysEmitBox: Bool? = nil,
         cliIgnoreProfile: Bool = false,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> QWResolvedServerConfig {
@@ -114,12 +117,21 @@ public enum QWServerConfigurationResolver {
             return ""
         }()
 
+        let resolvedCatalogEntry: QWModelCatalogEntry? = (!resolvedPack.isEmpty && FileManager.default.fileExists(atPath: resolvedPack))
+            ? QWModelCatalog.classify(name: ConfigNameHelper.name(for: resolvedPack), path: resolvedPack)
+            : nil
+        let isStandaloneDecisionTarget = resolvedCatalogEntry?.isDecisionCapable == true
         let modelDescriptor: QWModelDescriptor?
         let modelDefaults: QWModelGenerationDefaults?
         if !resolvedPack.isEmpty, FileManager.default.fileExists(atPath: resolvedPack) {
-            let assets = try QWModelRuntimeAssets.load(packPath: resolvedPack)
-            modelDescriptor = assets.descriptor
-            modelDefaults = assets.generationDefaults
+            if resolvedCatalogEntry?.isCoreAIBundle == true {
+                modelDescriptor = nil
+                modelDefaults = nil
+            } else {
+                let assets = try QWModelRuntimeAssets.load(packPath: resolvedPack)
+                modelDescriptor = assets.descriptor
+                modelDefaults = assets.generationDefaults
+            }
         } else {
             modelDescriptor = nil
             modelDefaults = nil
@@ -212,6 +224,12 @@ public enum QWServerConfigurationResolver {
                         case "lsaClusterBlock": effective.lsaClusterBlock = rawFileSettings.lsaClusterBlock
                         case "lsaSidecarPath": effective.lsaSidecarPath = rawFileSettings.lsaSidecarPath
                         case "lsaCrossLoopReuse": effective.lsaCrossLoopReuse = rawFileSettings.lsaCrossLoopReuse
+                        case "decisionModelPackPath": effective.decisionModelPackPath = rawFileSettings.decisionModelPackPath
+                        case "decisionComputeUnit": effective.decisionComputeUnit = rawFileSettings.decisionComputeUnit
+                        case "decisionLoadVision": effective.decisionLoadVision = rawFileSettings.decisionLoadVision
+                        case "decisionDefaultScoreReadout": effective.decisionDefaultScoreReadout = rawFileSettings.decisionDefaultScoreReadout
+                        case "decisionDefaultTruncation": effective.decisionDefaultTruncation = rawFileSettings.decisionDefaultTruncation
+                        case "decisionAlwaysEmitBox": effective.decisionAlwaysEmitBox = rawFileSettings.decisionAlwaysEmitBox
                         default: break
                         }
                     }
@@ -471,12 +489,32 @@ public enum QWServerConfigurationResolver {
             cliMTPDraftStrategy: cliMTPDraftStrategy, cliMTPQuadraticSeeding: cliMTPQuadraticSeeding,
             cliLoadVision: cliLoadVision, cliMemoryPolicy: cliMemoryPolicy,
             cliOSReserveGiB: cliOSReserveGiB, cliResidentExpertsPerLayer: cliResidentExpertsPerLayer,
-            cliMoESpecBudget: cliMoESpecBudget, cliStreamNgrams: cliStreamNgrams)
+            cliMoESpecBudget: cliMoESpecBudget, cliStreamNgrams: cliStreamNgrams,
+            cliDecisionModelPackPath: cliDecisionModelPackPath,
+            cliDecisionComputeUnit: cliDecisionComputeUnit,
+            cliDecisionLoadVision: cliDecisionLoadVision,
+            cliDecisionDefaultScoreReadout: cliDecisionDefaultScoreReadout,
+            cliDecisionDefaultTruncation: cliDecisionDefaultTruncation,
+            cliDecisionAlwaysEmitBox: cliDecisionAlwaysEmitBox)
+        let finalModelPackPath: String
+        let finalDecisionModelPackPath: String
+        if isStandaloneDecisionTarget {
+            finalModelPackPath = ""
+            if extra.decisionModelPackPath.isEmpty {
+                finalDecisionModelPackPath = resolvedPack
+                sources["decisionModelPackPath"] = sources["pack"] ?? "auto-decision"
+            } else {
+                finalDecisionModelPackPath = extra.decisionModelPackPath
+            }
+        } else {
+            finalModelPackPath = resolvedPack
+            finalDecisionModelPackPath = extra.decisionModelPackPath
+        }
         var resolvedConfig = QWResolvedServerConfig(
             host: resolvedHost, port: resolvedPort,
             apiKey: resolvedApiKey, corsAllowedOrigins: resolvedCorsAllowedOrigins,
             allowLocalImagePaths: resolvedAllowLocalImagePaths, allowRemoteImageURLs: resolvedAllowRemoteImageURLs,
-            modelPackPath: resolvedPack,
+            modelPackPath: finalModelPackPath,
             modelName: resolvedModelName, modelAlias: resolvedModelAlias,
             maxContext: resolvedMaxContext, kvMode: resolvedKVMode,
             ropeScalingType: extra.ropeType, ropeScalingFactor: extra.ropeFactor,
@@ -500,9 +538,22 @@ public enum QWServerConfigurationResolver {
             warmRAMLimitGB: extra.warmRAM, ssdCacheEnabled: extra.ssdCacheEnabled,
             ssdCacheLimitGB: extra.ssdCache, cacheDir: extra.cacheDir,
             logDir: extra.logDir, logFileName: extra.logFile,
-            logLevel: extra.logLevel, lazy: extra.lazy, loadVision: extra.loadVision, sourceSummary: sources
+            logLevel: extra.logLevel, lazy: extra.lazy, loadVision: extra.loadVision,
+            decisionModelPackPath: finalDecisionModelPackPath,
+            decisionComputeUnit: extra.decisionComputeUnit,
+            decisionLoadVision: extra.decisionLoadVision,
+            decisionDefaultScoreReadout: extra.decisionDefaultScoreReadout,
+            decisionDefaultTruncation: extra.decisionDefaultTruncation,
+            decisionAlwaysEmitBox: extra.decisionAlwaysEmitBox,
+            sourceSummary: sources
         )
         resolvedConfig.engineTuning = extra.tuning
         return resolvedConfig
+    }
+}
+
+private enum ConfigNameHelper {
+    static func name(for path: String) -> String {
+        QWModelRoot.canonicalModelName(for: URL(fileURLWithPath: path))
     }
 }

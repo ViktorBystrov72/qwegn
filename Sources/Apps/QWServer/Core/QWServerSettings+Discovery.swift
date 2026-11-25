@@ -211,7 +211,11 @@ extension QWServerSettings {
                                    nativeWindow: e.nativeWindow, supported: e.supported, reason: e.reason,
                                    capabilities: caps.sorted(),
                                    maxSpeculativeDrafts: e.maxSpeculativeDrafts,
-                                   hasLSASidecar: e.hasLSASidecar, lsaSidecarPath: e.lsaSidecarPath)
+                                   hasLSASidecar: e.hasLSASidecar, lsaSidecarPath: e.lsaSidecarPath,
+                                   isDecisionCapable: e.isDecisionCapable,
+                                   isCoreAIBundle: e.isCoreAIBundle,
+                                   decisionArchetype: e.decisionArchetype,
+                                   hasVision: caps.contains(QWKnobCapability.vision.rawValue))
         }
     }
 

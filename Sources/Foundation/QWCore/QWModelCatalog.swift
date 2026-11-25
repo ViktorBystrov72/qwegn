@@ -332,7 +332,7 @@ public enum QWModelCatalog {
         return nil
     }
 
-    private static func describeDecisionArchetype(
+    public static func describeDecisionArchetype(
         _ config: QWDecisionModelConfig?,
         isCoreAI: Bool
     ) -> String? {

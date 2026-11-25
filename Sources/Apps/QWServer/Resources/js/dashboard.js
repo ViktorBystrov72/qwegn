@@ -633,6 +633,7 @@ function renderDisconnected() {
   renderRecentRequestsTable();
   updateStatusIndicators(null, null, null);
   if (typeof syncChatHeaderWithDashboard === "function") syncChatHeaderWithDashboard();
+  if (typeof renderDecisionTelemetryCard === "function") renderDecisionTelemetryCard(null);
 }
 
 function renderDashboard(model) {
@@ -651,6 +652,7 @@ function renderDashboard(model) {
   renderActions(model);
   renderRecentRequestsTable();
   if (typeof syncChatHeaderWithDashboard === "function") syncChatHeaderWithDashboard();
+  if (typeof renderDecisionTelemetryCard === "function") renderDecisionTelemetryCard(model);
   if (typeof updateDecisionSidecarPanel === "function") updateDecisionSidecarPanel(model);
 }
 

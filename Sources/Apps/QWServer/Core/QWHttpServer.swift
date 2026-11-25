@@ -304,7 +304,7 @@ public final class QWHttpServer: @unchecked Sendable {
         guard let allowed = QWHttpSecurity.resolvedAllowedOrigin(origin, allowlist: corsAllowedOrigins) else {
             return ""
         }
-        return "Access-Control-Allow-Origin: \(allowed)\r\nVary: Origin\r\n"
+        return "Access-Control-Allow-Origin: \(allowed)\r\nAccess-Control-Expose-Headers: x-request-id, x-session-id, x-qwegn-decision-route\r\nVary: Origin\r\n"
     }
 
     private func receiveNextChunk(
@@ -383,7 +383,7 @@ public final class QWHttpServer: @unchecked Sendable {
             corsHeader += corsHeaderLines(for: connection)
             corsHeader += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
             corsHeader += "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, x-request-id, x-session-id\r\n"
-            corsHeader += "Access-Control-Expose-Headers: x-request-id, x-session-id\r\n"
+            corsHeader += "Access-Control-Expose-Headers: x-request-id, x-session-id, x-qwegn-decision-route\r\n"
             corsHeader += "Access-Control-Max-Age: 86400\r\n"
             corsHeader += "Content-Length: 0\r\nConnection: close\r\n\r\n"
             let id = ObjectIdentifier(connection)
@@ -567,16 +567,16 @@ public final class QWHttpServer: @unchecked Sendable {
                     self.handleEngineInfoRoute(connection: connection)
 
                 case ("POST", "/v1/decisions"):
-                    await self.handleDecisionRoute(connection: connection, body: body)
+                    await self.handleDecisionRoute(connection: connection, headers: headers, body: body)
 
                 case ("POST", "/v1/decisions/batch"):
-                    await self.handleDecisionBatchRoute(connection: connection, body: body)
+                    await self.handleDecisionBatchRoute(connection: connection, headers: headers, body: body)
 
                 case ("POST", "/v1/systemone"):
-                    await self.handleDecisionRoute(connection: connection, body: body)
+                    await self.handleSystemOneRoute(connection: connection, headers: headers, body: body)
 
                 case ("POST", "/v1/systemone/batch"):
-                    await self.handleDecisionBatchRoute(connection: connection, body: body)
+                    await self.handleSystemOneBatchRoute(connection: connection, headers: headers, body: body)
 
                 case ("POST", "/v1/laya"):
                     await self.handleLayaRoute(connection: connection, body: body)

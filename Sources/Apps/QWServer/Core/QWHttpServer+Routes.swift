@@ -184,7 +184,10 @@ extension QWHttpServer {
             decisionSidecarComputeUnit: sidecar.loaded ? sidecar.computeUnit : nil,
             decisionSidecarBytes: sidecar.loaded ? sidecar.estimatedBytes : nil,
             decisionSidecarTotalRequests: sidecar.loaded ? sidecar.totalRequests : nil,
-            decisionSidecarMeanLatencyMs: sidecar.loaded ? sidecar.meanLatencyMs : nil)
+            decisionSidecarMeanLatencyMs: sidecar.loaded ? sidecar.meanLatencyMs : nil,
+            decisionSidecarVision: sidecar.loaded ? sidecar.visionEnabled : nil,
+            decisionSidecarArchetype: sidecar.loaded ? sidecar.archetype : nil,
+            decisionSidecarPromptTokens: sidecar.loaded ? sidecar.totalPromptTokens : nil)
     }
 
     /// A response whose dates are ISO-8601 instants, so a client in any
@@ -278,6 +281,11 @@ extension QWHttpServer {
         "/v1/laya", "/v1/decisions/model/load", "/mcp",
     ]
 
+    private static let multipartAllowedPostRoutes: Set<String> = [
+        "/v1/decisions", "/v1/decisions/batch",
+        "/v1/systemone", "/v1/systemone/batch",
+    ]
+
     func validateMutationRequest(
         connection: NWConnection,
         method: String,
@@ -304,7 +312,8 @@ extension QWHttpServer {
         if !QWHttpSecurity.isValidMutationOrigin(
             headers: headers,
             allowlist: corsAllowedOrigins,
-            requireJSONContentType: requireJSON
+            requireJSONContentType: requireJSON,
+            allowMultipartContentType: Self.multipartAllowedPostRoutes.contains(cleanPath)
         ) {
             let err = ServerErrorPayload(
                 message: "Unsupported Media Type: Content-Type must be application/json",
@@ -472,37 +481,54 @@ extension QWHttpServer {
         session.finish(doneMarker: true)
     }
 
-    private func catalogModelEntries() -> [(id: String, loaded: Bool, path: String?)] {
+    private func catalogModelEntries() -> [(id: String, loaded: Bool, path: String?, isDecision: Bool)] {
         let modelName = actor.getModelName()
         let isLoaded = actor.isLoaded()
+        let sidecar = actor.decisionSidecarStatus()
         let settings = QWSettingsManager.shared.loadSettings()
         var seen = Set<String>()
-        var entries: [(id: String, loaded: Bool, path: String?)] = []
-        func appendIfNew(id: String, loaded: Bool, path: String?) {
+        var entries: [(id: String, loaded: Bool, path: String?, isDecision: Bool)] = []
+        func appendIfNew(id: String, loaded: Bool, path: String?, isDecision: Bool) {
             guard !id.isEmpty, seen.insert(id).inserted else { return }
-            entries.append((id: id, loaded: loaded, path: path))
+            entries.append((id: id, loaded: loaded, path: path, isDecision: isDecision))
+        }
+        if sidecar.loaded, let sidecarName = sidecar.modelName {
+            appendIfNew(id: sidecarName, loaded: true, path: sidecar.packPath, isDecision: true)
         }
         let activeAlias = settings.alias(for: modelName)
         if !activeAlias.isEmpty {
-            appendIfNew(id: activeAlias, loaded: isLoaded, path: settings.modelPackPath)
+            appendIfNew(id: activeAlias, loaded: isLoaded, path: settings.modelPackPath, isDecision: false)
         }
-        appendIfNew(id: modelName, loaded: isLoaded, path: settings.modelPackPath)
-        for disc in QWServerSettings.scanModelsDirectory() where !disc.packPath.isEmpty && disc.supported {
-            let loadedHere = isLoaded && disc.name == modelName
+        appendIfNew(id: modelName, loaded: isLoaded, path: settings.modelPackPath, isDecision: false)
+        for disc in QWServerSettings.scanModelsDirectory()
+        where !disc.packPath.isEmpty && (disc.supported || disc.isDecisionCapable) {
+            let loadedHere = (isLoaded && disc.name == modelName) || (sidecar.loaded && disc.name == sidecar.modelName)
             let alias = settings.alias(for: disc.name)
             if !alias.isEmpty {
-                appendIfNew(id: alias, loaded: loadedHere, path: disc.packPath)
+                appendIfNew(id: alias, loaded: loadedHere, path: disc.packPath, isDecision: disc.isDecisionCapable)
             }
-            appendIfNew(id: disc.name, loaded: loadedHere, path: disc.packPath)
+            appendIfNew(id: disc.name, loaded: loadedHere, path: disc.packPath, isDecision: disc.isDecisionCapable)
         }
         return entries
     }
 
     func handleModelsListRoute(connection: NWConnection) {
-        let models = catalogModelEntries().map {
+        let catalog = catalogModelEntries()
+        let models = catalog.map {
             ModelObject(id: $0.id, loaded: $0.loaded, created: QWModelDiskStats.modifiedUnix(of: $0.path))
         }
-        sendJsonResponse(connection, status: 200, object: ModelListResponse(models: models))
+        let metadata = catalog.map { item in
+            let created = QWModelDiskStats.modifiedUnix(of: item.path)
+            let desc = item.isDecision
+                ? "Single-pass decision model (\(item.id)) supporting /v1/systemone and /v1/decisions."
+                : "Qwegn Engine model '\(item.id)'."
+            return TypeSafeModelMetadata(
+                name: item.id,
+                description: desc,
+                releaseDate: ModelListResponse.formatReleaseDate(unix: created)
+            )
+        }
+        sendJsonResponse(connection, status: 200, object: ModelListResponse(models: models, metadata: metadata))
     }
 
     func handleDiscoveredModelsRoute(connection: NWConnection) {
@@ -522,19 +548,24 @@ extension QWHttpServer {
     func handleGetModelRoute(connection: NWConnection, requestedId: String) {
         let modelName = actor.getModelName()
         let isLoaded = actor.isLoaded()
+        let sidecar = actor.decisionSidecarStatus()
         let settings = QWSettingsManager.shared.loadSettings()
         let activeAlias = settings.alias(for: modelName)
         let displayModel = activeAlias.isEmpty ? modelName : activeAlias
         let resolvedPath: String?
         let loaded: Bool
-        if requestedId.isEmpty || requestedId == modelName || requestedId == activeAlias {
+        if sidecar.loaded, let scName = sidecar.modelName,
+           requestedId == scName || (!activeAlias.isEmpty && requestedId == activeAlias && !isLoaded) {
+            resolvedPath = sidecar.packPath
+            loaded = true
+        } else if requestedId.isEmpty || requestedId == modelName || requestedId == activeAlias {
             resolvedPath = settings.modelPackPath
-            loaded = isLoaded
+            loaded = isLoaded || (sidecar.loaded && sidecar.modelName == modelName)
         } else if let disc = QWServerSettings.scanModelsDirectory().first(where: {
             $0.name == requestedId || settings.alias(for: $0.name) == requestedId
-        }), disc.supported {
+        }), disc.supported || disc.isDecisionCapable {
             resolvedPath = disc.packPath
-            loaded = isLoaded && disc.name == modelName
+            loaded = (isLoaded && disc.name == modelName) || (sidecar.loaded && disc.name == sidecar.modelName)
         } else {
             let err = ServerErrorPayload(
                 message: "The model '\(requestedId)' does not exist.",
@@ -659,6 +690,11 @@ extension QWHttpServer {
                     )
                 }
             }
+            await actor.updateDecisionDefaults(
+                scoreReadout: newSettings.decisionDefaultScoreReadout,
+                truncation: newSettings.decisionDefaultTruncation,
+                alwaysEmitBox: newSettings.decisionAlwaysEmitBox
+            )
             sendJsonResponse(connection, status: 200, object: ["status": "ok", "message": "Settings saved successfully"])
         } catch {
             let err = ServerErrorPayload(message: "Failed to parse or save settings: \(error.localizedDescription)", code: 400)
@@ -686,12 +722,20 @@ extension QWHttpServer {
     func handleHealthRoute(connection: NWConnection) throws {
         let engineState = actor.engineState()
         let modelName = actor.getModelName()
+        let sidecar = actor.decisionSidecarStatus()
+        let standaloneDecision = !engineState.isLoaded && sidecar.loaded
+        let resolvedModel = standaloneDecision ? (sidecar.modelName ?? modelName) : modelName
+        let resolvedLoaded = engineState.isLoaded || sidecar.loaded
+        let resolvedStatus = standaloneDecision ? QWEngineLifecyclePhase.loaded.rawValue : engineState.lifecycle.phase.rawValue
+        let resolvedLifecycle = standaloneDecision
+            ? QWEngineLifecycleInfo(phase: .loaded, since: Date(), model: resolvedModel, detail: "Decision engine loaded")
+            : engineState.lifecycle
         let health = QWHealthResponse(
-            status: engineState.lifecycle.phase.rawValue,
+            status: resolvedStatus,
             engine: "qwegine",
-            model: modelName,
-            loaded: engineState.isLoaded,
-            lifecycle: engineState.lifecycle
+            model: resolvedModel,
+            loaded: resolvedLoaded,
+            lifecycle: resolvedLifecycle
         )
         let data = try JSONEncoder().encode(health)
         sendRawData(connection, status: 200, contentType: "application/json", data: data)

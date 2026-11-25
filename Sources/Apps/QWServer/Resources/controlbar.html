@@ -170,6 +170,8 @@
           </div>
         </div>
 
+        <article id="decision-telemetry-card" class="card-panel" hidden></article>
+
         <!-- Zone 3 + 4 Grid -->
         <div class="monitor-grid-2">
           <!-- Zone 3: Velocity, Multi-Horizon & 60-Turn Trace -->
@@ -360,6 +362,7 @@
             <div class="chat-header-right">
               <span id="chat-model-badge" class="knob-pill mono" title="Resident model">—</span>
               <span id="chat-vision-badge" class="knob-pill mono" title="Vision tower status">—</span>
+              <button id="chat-sidecar-badge" type="button" class="knob-pill chat-sidecar-pill mono" onclick="switchTab('decisions')" title="Decision Sidecar status" hidden>Sidecar: —</button>
               <button id="chat-mempack-badge" type="button" class="knob-pill chat-mempack-pill mono" onclick="toggleChatDrawer('system')" title="Codebase &amp; Knowledge Memory Pack (.qwcache)">MemPack: —</button>
               <span id="chat-preset-badge" class="knob-pill mono" title="Active system prompt preset">Server Default</span>
               <button id="chat-toggle-system-btn" type="button" class="btn btn-sm" onclick="toggleChatDrawer('system')" aria-expanded="false">System Prompt</button>
@@ -452,6 +455,7 @@
                 <label for="chat-param-effort">Reasoning Effort</label>
                 <select id="chat-param-effort" name="chat-param-effort" class="select select-sm" onchange="updateChatParam('reasoningEffort', this.value, 'string')">
                   <option value="inherit">Server Default</option>
+                  <option value="auto">Auto (Decision Sidecar)</option>
                   <option value="xhigh">Extra High (xhigh)</option>
                   <option value="high">High</option>
                   <option value="medium">Medium</option>
@@ -760,6 +764,7 @@
   <script src="/ui/js/chat-presets.js" defer></script>
   <script src="/ui/js/chat-media.js" defer></script>
   <script src="/ui/js/chat.js" defer></script>
+  <script src="/ui/js/decisions-views.js" defer></script>
   <script src="/ui/js/decisions.js" defer></script>
   <script src="/ui/js/actions.js" defer></script>
   <script src="/ui/js/settings.js" defer></script>

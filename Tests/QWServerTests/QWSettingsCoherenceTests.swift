@@ -14,6 +14,7 @@ private extension QWSettingsCoherence {
         "telemetryPollIntervalMs", "runAtStartup", "autoStartServer",
         "coolingPolicy", "updateCheckSchedule",
         "decisionModelPackPath", "decisionComputeUnit", "decisionLoadVision",
+        "decisionDefaultScoreReadout", "decisionDefaultTruncation", "decisionAlwaysEmitBox",
     ]
 }
 
@@ -115,7 +116,8 @@ final class QWSettingsCoherenceTests: XCTestCase {
         for key in ["modelAlias", "modelAliases", "loadVision", "logDir", "logFileName",
                     "telemetryPollIntervalMs", "runAtStartup", "autoStartServer", "coolingPolicy",
                     "updateCheckSchedule", "decisionModelPackPath", "decisionComputeUnit",
-                    "decisionLoadVision"] {
+                    "decisionLoadVision", "decisionDefaultScoreReadout", "decisionDefaultTruncation",
+                    "decisionAlwaysEmitBox"] {
             XCTAssertFalse(QWSettingsCoherence.needsServerRestart(key),
                            "\(key) is read when it is needed")
         }
@@ -124,6 +126,9 @@ final class QWSettingsCoherenceTests: XCTestCase {
         XCTAssertNotNil(QWSettingsCoherence.effectNote(for: "decisionModelPackPath"))
         XCTAssertNotNil(QWSettingsCoherence.effectNote(for: "decisionComputeUnit"))
         XCTAssertNotNil(QWSettingsCoherence.effectNote(for: "decisionLoadVision"))
+        XCTAssertNotNil(QWSettingsCoherence.effectNote(for: "decisionDefaultScoreReadout"))
+        XCTAssertNotNil(QWSettingsCoherence.effectNote(for: "decisionDefaultTruncation"))
+        XCTAssertNotNil(QWSettingsCoherence.effectNote(for: "decisionAlwaysEmitBox"))
     }
 
     func testTheSettingsWindowOffersLoadVisionInPlaceWithoutRestart() throws {

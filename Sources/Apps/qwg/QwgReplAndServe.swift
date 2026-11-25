@@ -510,6 +510,12 @@ struct Serve: AsyncParsableCommand {
             cliLoadVision: knobs.loadVision, cliStreamNgrams: knobs.streamNgrams,
             cliMemoryPolicy: knobs.memoryPolicy, cliOSReserveGiB: knobs.osReserve,
             cliResidentExpertsPerLayer: knobs.residentExpertsPerLayer, cliMoESpecBudget: knobs.moeSpecBudget,
+            cliDecisionModelPackPath: knobs.decisionModel,
+            cliDecisionComputeUnit: knobs.decisionComputeUnit,
+            cliDecisionLoadVision: knobs.decisionLoadVision,
+            cliDecisionDefaultScoreReadout: knobs.decisionScoreReadout,
+            cliDecisionDefaultTruncation: knobs.decisionTruncation,
+            cliDecisionAlwaysEmitBox: knobs.decisionAlwaysEmitBox,
             cliIgnoreProfile: noProfile
         )
         let isDFlash2 = ["dflash2", "dflash", "dspine"].contains(resolved.mtpBackend?.lowercased() ?? "")
@@ -601,6 +607,12 @@ struct Serve: AsyncParsableCommand {
             loadVision: resolved.loadVision,
             allowLocalImagePaths: resolved.allowLocalImagePaths,
             allowRemoteImageURLs: resolved.allowRemoteImageURLs,
+            decisionModelPackPath: resolved.decisionModelPackPath,
+            decisionComputeUnit: resolved.decisionComputeUnit,
+            decisionLoadVision: resolved.decisionLoadVision,
+            decisionDefaultScoreReadout: resolved.decisionDefaultScoreReadout,
+            decisionDefaultTruncation: resolved.decisionDefaultTruncation,
+            decisionAlwaysEmitBox: resolved.decisionAlwaysEmitBox,
             sourceSummary: resolved.sourceSummary
         )
         actorConfig.engineTuning = resolved.engineTuning
@@ -621,19 +633,31 @@ struct Serve: AsyncParsableCommand {
             } catch {
                 logger.log(.warn, "Failed to mount --repo '\(trimmedRepo)' at startup: \(error)")
             }
-        } else if resolved.modelPackPath.isEmpty {
+        } else if resolved.modelPackPath.isEmpty && resolved.decisionModelPackPath.isEmpty {
             logger.log(.warn, "No model pack specified. Starting server in idle lifecycle mode (select model via settings or API).")
         } else if !resolved.lazy {
-            logger.log(.info, "Eager loading enabled: preloading model...")
             do {
-                _ = try await actor.loadExplicit()
+                if !resolved.modelPackPath.isEmpty {
+                    logger.log(.info, "Eager loading enabled: preloading primary model...")
+                    _ = try await actor.loadExplicit()
+                }
+                if !resolved.decisionModelPackPath.isEmpty {
+                    logger.log(.info, "Eager loading enabled: preloading decision model '\(resolved.decisionModelPackPath)'...")
+                    let unit = QWDecisionComputeUnit(rawValue: resolved.decisionComputeUnit.lowercased()) ?? .auto
+                    _ = try await actor.loadDecisionSidecar(
+                        packPath: resolved.decisionModelPackPath,
+                        computeUnit: unit,
+                        loadVision: resolved.decisionLoadVision
+                    )
+                }
             } catch {
                 QWEngineInstanceLock.releaseEngineLock()
                 FileHandle.standardError.write("qwg serve: failed to eager load model: \(error)\n".data(using: .utf8)!)
                 throw ExitCode(1)
             }
         } else {
-            logger.log(.info, "Lazy loading active: model '\(resolved.modelName)' will load on first inference request.")
+            let label = resolved.modelPackPath.isEmpty ? resolved.decisionModelPackPath : resolved.modelName
+            logger.log(.info, "Lazy loading active: model '\(label)' will load on first request.")
         }
 
         let server = QWHttpServer(

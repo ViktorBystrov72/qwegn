@@ -57,13 +57,16 @@ extension QWHttpServer {
         }
 
         let rawReq = req
-        let effectiveReq = await resolveAutoReasoningEffortIfNeeded(rawReq)
+        let (effectiveReq, decisionRoute) = await resolveAutoReasoningEffortIfNeeded(rawReq)
 
         let returnModelName = resolveReplyModelName(requested: effectiveReq.model, strictNotFound: false) ?? actor.getModelName()
         let reqId = effectiveReq.effectiveRequestId ?? "chatcmpl-\(UUID().uuidString.prefix(12))"
         var resolvedHeaders = ["x-request-id: \(reqId)"]
         if let sid = effectiveReq.effectiveSessionId {
             resolvedHeaders.append("x-session-id: \(sid)")
+        }
+        if let decisionRoute {
+            resolvedHeaders.append("X-Qwegn-Decision-Route: \(decisionRoute)")
         }
         let extraHeaders = resolvedHeaders
 
@@ -242,7 +245,9 @@ extension QWHttpServer {
         }
     }
 
-    private func resolveAutoReasoningEffortIfNeeded(_ req: ChatCompletionRequest) async -> ChatCompletionRequest {
+    private func resolveAutoReasoningEffortIfNeeded(
+        _ req: ChatCompletionRequest
+    ) async -> (request: ChatCompletionRequest, decisionRoute: String?) {
         guard QWChatPolicyResolver.isAutoReasoningEffort(req.rawReasoningEffort),
               actor.isDecisionSidecarLoaded(),
               req.enableThinking != false,
@@ -250,7 +255,7 @@ extension QWHttpServer {
               req.chatTemplateKwargs?.enableThinking != false,
               let promptText = req.messages.last(where: { $0.role.lowercased() == "user" })?.extractTextContent(),
               !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return req
+            return (req, nil)
         }
         let complexityReq = QWDecisionRequest(
             state: .text(promptText),
@@ -271,9 +276,10 @@ extension QWHttpServer {
               let answer = env.response.answers.first,
               let tier = answer.choice,
               let resolved = QWChatPolicyResolver.resolveAutoReasoningEffort(tier: tier, confidence: answer.confidence) else {
-            return req
+            return (req, nil)
         }
-        return req.withResolvedReasoningEffort(resolved)
+        let route = "\(tier)->\(resolved) (\(String(format: "%.2f", answer.confidence)))"
+        return (req.withResolvedReasoningEffort(resolved), route)
     }
 
     func sendChatError(_ connection: NWConnection, error: any Error, path: String) {

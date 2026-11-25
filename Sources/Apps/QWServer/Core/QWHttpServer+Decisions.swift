@@ -7,35 +7,137 @@ import QWDecision
 import QWEngine
 
 extension QWHttpServer {
-    func handleDecisionRoute(connection: NWConnection, body: Data) async {
+    private func resolveRequestDefaults(forceAlwaysEmitBox: Bool) -> QWDecisionRequestDefaults {
+        let cfg = actor.getConfig()
+        let readout = QWScoreReadout(rawValue: cfg.decisionDefaultScoreReadout.lowercased()) ?? .mean
+        let truncation = QWTruncationPolicy(rawValue: cfg.decisionDefaultTruncation.lowercased())
+        return QWDecisionRequestDefaults(
+            scoreReadout: readout,
+            truncation: truncation,
+            alwaysEmitBox: forceAlwaysEmitBox ? true : cfg.decisionAlwaysEmitBox
+        )
+    }
+
+    private func decodeHTTPRequestPayload(
+        headers: [String: String],
+        body: Data,
+        forceAlwaysEmitBox: Bool
+    ) throws -> QWDecisionPreparedHTTPInput {
+        let defaults = resolveRequestDefaults(forceAlwaysEmitBox: forceAlwaysEmitBox)
+        if QWHttpSecurity.isMultipartFormDataContentType(headers) {
+            let multi = try QWDecisionMultipartParser.parse(headers: headers, body: body)
+            let httpReq = try QWServerRequestDecoder.decode(QWDecisionHTTPRequest.self, from: multi.jsonBody)
+            return try httpReq.prepareExecution(defaults: defaults, multipartParts: multi.namedParts)
+        }
+        let httpReq = try QWServerRequestDecoder.decode(QWDecisionHTTPRequest.self, from: body)
+        return try httpReq.prepareExecution(defaults: defaults, multipartParts: [:])
+    }
+
+    private func decodeHTTPBatchPayloads(
+        headers: [String: String],
+        body: Data,
+        forceAlwaysEmitBox: Bool
+    ) throws -> [QWDecisionPreparedHTTPInput] {
+        let defaults = resolveRequestDefaults(forceAlwaysEmitBox: forceAlwaysEmitBox)
+        let batchReq: QWDecisionBatchHTTPRequest
+        let parts: [String: Data]
+        if QWHttpSecurity.isMultipartFormDataContentType(headers) {
+            let multi = try QWDecisionMultipartParser.parse(headers: headers, body: body)
+            batchReq = try QWServerRequestDecoder.decode(QWDecisionBatchHTTPRequest.self, from: multi.jsonBody)
+            parts = multi.namedParts
+        } else {
+            batchReq = try QWServerRequestDecoder.decode(QWDecisionBatchHTTPRequest.self, from: body)
+            parts = [:]
+        }
+        let items = batchReq.resolvedItems
+        guard !items.isEmpty else {
+            throw QWDecisionError.invalidQuestion("batch request requires non-empty 'items'")
+        }
+        return try items.map { try $0.prepareExecution(defaults: defaults, multipartParts: parts) }
+    }
+
+    func handleDecisionRoute(connection: NWConnection, headers: [String: String], body: Data) async {
         do {
-            let httpReq = try QWServerRequestDecoder.decode(QWDecisionHTTPRequest.self, from: body)
-            let domainReq = try httpReq.toDecisionRequest()
-            let envelope = try await actor.decide(domainReq, preferredModel: httpReq.model)
-            sendJsonResponse(connection, status: 200, object: QWDecisionHTTPResponse(envelope: envelope))
+            let prepared = try decodeHTTPRequestPayload(headers: headers, body: body, forceAlwaysEmitBox: false)
+            let envelope = try await actor.decide(prepared.request, preferredModel: prepared.preferredModel)
+            if prepared.isOpenAIDialect {
+                sendJsonResponse(
+                    connection, status: 200,
+                    object: QWOpenAIDecisionHTTPResponse(envelope: envelope, meta: prepared.questionMeta)
+                )
+            } else {
+                sendJsonResponse(connection, status: 200, object: QWDecisionHTTPResponse(envelope: envelope))
+            }
         } catch {
             sendDecisionError(connection, error: error)
         }
     }
 
-    func handleDecisionBatchRoute(connection: NWConnection, body: Data) async {
+    func handleDecisionBatchRoute(connection: NWConnection, headers: [String: String], body: Data) async {
         do {
-            let batchReq = try QWServerRequestDecoder.decode(QWDecisionBatchHTTPRequest.self, from: body)
-            let items = batchReq.resolvedItems
-            guard !items.isEmpty else {
-                throw QWDecisionError.invalidQuestion("batch request requires non-empty 'items'")
-            }
-            var results: [QWDecisionHTTPResponse] = []
-            results.reserveCapacity(items.count)
-            for item in items {
-                let domainReq = try item.toDecisionRequest()
-                let envelope = try await actor.decide(domainReq, preferredModel: item.model)
-                results.append(QWDecisionHTTPResponse(envelope: envelope))
+            let preparedItems = try decodeHTTPBatchPayloads(headers: headers, body: body, forceAlwaysEmitBox: false)
+            let envelopes = try await executeCoalescedBatch(preparedItems)
+            let results = envelopes.enumerated().map { idx, env -> QWDecisionHTTPResponse in
+                _ = idx
+                return QWDecisionHTTPResponse(envelope: env)
             }
             sendJsonResponse(connection, status: 200, object: QWDecisionBatchHTTPResponse(results: results))
         } catch {
             sendDecisionError(connection, error: error)
         }
+    }
+
+    func handleSystemOneRoute(connection: NWConnection, headers: [String: String], body: Data) async {
+        do {
+            let prepared = try decodeHTTPRequestPayload(headers: headers, body: body, forceAlwaysEmitBox: true)
+            let envelope = try await actor.decide(prepared.request, preferredModel: prepared.preferredModel)
+            sendJsonResponse(
+                connection, status: 200,
+                object: QWSystemOneHTTPResponse(envelope: envelope, meta: prepared.questionMeta)
+            )
+        } catch {
+            sendDecisionError(connection, error: error)
+        }
+    }
+
+    func handleSystemOneBatchRoute(connection: NWConnection, headers: [String: String], body: Data) async {
+        do {
+            let preparedItems = try decodeHTTPBatchPayloads(headers: headers, body: body, forceAlwaysEmitBox: true)
+            let envelopes = try await executeCoalescedBatch(preparedItems)
+            let results = zip(envelopes, preparedItems).map { env, prep in
+                QWSystemOneHTTPResponse(envelope: env, meta: prep.questionMeta)
+            }
+            sendJsonResponse(connection, status: 200, object: QWSystemOneBatchHTTPResponse(results: results))
+        } catch {
+            sendDecisionError(connection, error: error)
+        }
+    }
+
+    private func executeCoalescedBatch(
+        _ preparedItems: [QWDecisionPreparedHTTPInput]
+    ) async throws -> [QWDecisionExecutionEnvelope] {
+        guard !preparedItems.isEmpty else { return [] }
+        let distinctModels = Set(preparedItems.map { ($0.preferredModel ?? "").trimmingCharacters(in: .whitespacesAndNewlines) })
+        if distinctModels.count <= 1 {
+            return try await actor.decideBatch(
+                preparedItems.map(\.request),
+                preferredModel: preparedItems[0].preferredModel
+            )
+        }
+        var out: [QWDecisionExecutionEnvelope] = []
+        out.reserveCapacity(preparedItems.count)
+        var start = 0
+        while start < preparedItems.count {
+            let modelKey = preparedItems[start].preferredModel
+            var end = start + 1
+            while end < preparedItems.count && preparedItems[end].preferredModel == modelKey {
+                end += 1
+            }
+            let sliceReqs = preparedItems[start..<end].map(\.request)
+            out.append(contentsOf: try await actor.decideBatch(sliceReqs, preferredModel: modelKey))
+            start = end
+        }
+        return out
     }
 
     func handleLayaRoute(connection: NWConnection, body: Data) async {

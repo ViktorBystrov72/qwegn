@@ -395,6 +395,21 @@ public struct SettingsView: View {
             }
 
             settingsGroup(title: "Decision Sidecar (Dual-Slot)", icon: "bolt.circle") {
+                let decisionModels = discoveredModels.filter { $0.isDecisionCapable && $0.supported }
+                if !decisionModels.isEmpty {
+                    formRow(label: "Installed Sidecar:", key: "decisionModelPackPath") {
+                        Picker("", selection: $draftSettings.decisionModelPackPath) {
+                            Text("Custom / Disabled").tag("")
+                            ForEach(decisionModels) { m in
+                                Text(m.name).tag(m.packPath)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+
                 VStack(alignment: .leading, spacing: 4) {
                     SettingsRowLabel(text: "Decision Model Pack / .aimodel:", key: "decisionModelPackPath")
                     TextField("~/.qwg/models/<decision-pack> or .aimodel", text: $draftSettings.decisionModelPackPath)
@@ -421,6 +436,36 @@ public struct SettingsView: View {
                     "Load Decision Vision Tower",
                     key: "decisionLoadVision",
                     isOn: $draftSettings.decisionLoadVision
+                )
+
+                formRow(label: "Score Readout:", key: "decisionDefaultScoreReadout") {
+                    Picker("", selection: $draftSettings.decisionDefaultScoreReadout) {
+                        Text("Mean").tag("mean")
+                        Text("Mode (MAP)").tag("mode")
+                        Text("Median").tag("median")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: .infinity)
+                }
+
+                formRow(label: "Truncation Policy:", key: "decisionDefaultTruncation") {
+                    Picker("", selection: $draftSettings.decisionDefaultTruncation) {
+                        Text("Auto State").tag("auto_state")
+                        Text("Strict Error").tag("error")
+                        Text("Head").tag("head")
+                        Text("Tail").tag("tail")
+                        Text("Middle").tag("middle")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                settingsToggleRow(
+                    "Always Emit Box (Best-Effort)",
+                    key: "decisionAlwaysEmitBox",
+                    isOn: $draftSettings.decisionAlwaysEmitBox
                 )
             }
 

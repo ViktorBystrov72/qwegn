@@ -255,13 +255,82 @@ final class QWDecisionServerTests: XCTestCase {
         XCTAssertEqual((batchJson["results"] as? [[String: Any]])?.count, 2)
 
         let (sysCode, sysJson, _) = try await post("/v1/systemone", json: [
-            "context": "Allow read-only git status",
+            "model": "mock-d1-2b",
+            "state": ["messages": [["role": "user", "content": [["type": "text", "text": "Allow read-only git status"]]]]],
             "questions": [
                 "safe": ["type": "noul", "instructions": "Is command safe?"],
+                "severity": ["type": "score", "instructions": "Urgency?", "criteria": ["Can wait", "Today", "Immediate"]],
+                "bbox": ["type": "box", "instructions": "Locate badge"],
             ],
         ])
         XCTAssertEqual(sysCode, 200)
-        XCTAssertEqual((sysJson["answers"] as? [[String: Any]])?.count, 1)
+        let sysAnswers = try XCTUnwrap(sysJson["answers"] as? [String: Any])
+        let safeAns = try XCTUnwrap(sysAnswers["safe"] as? [String: Any])
+        XCTAssertEqual(safeAns["type"] as? String, "noul")
+        XCTAssertGreaterThan(try XCTUnwrap(safeAns["noul"] as? Double), 0.5)
+        let scoreAns = try XCTUnwrap(sysAnswers["severity"] as? [String: Any])
+        XCTAssertEqual(scoreAns["type"] as? String, "score")
+        let legend = try XCTUnwrap(scoreAns["legend"] as? [String: Any])
+        XCTAssertEqual(legend["0"] as? String, "Can wait")
+        let boxAns = try XCTUnwrap(sysAnswers["bbox"] as? [String: Any])
+        XCTAssertEqual(boxAns["type"] as? String, "box")
+        XCTAssertNotNil(boxAns["box"] as? [String: Any])
+        let sysUsage = try XCTUnwrap(sysJson["usage"] as? [String: Any])
+        XCTAssertNotNil(sysUsage["input_tokens"])
+
+        // 3b. TypeSafe GET /v1/models metadata + multipart /v1/systemone + OpenAI /v1/decisions dialect.
+        let (modelsData, modelsResp) = try await URLSession.shared.data(from: baseURL.appendingPathComponent("/v1/models"))
+        XCTAssertEqual((modelsResp as? HTTPURLResponse)?.statusCode, 200)
+        let modelsJson = try XCTUnwrap(JSONSerialization.jsonObject(with: modelsData) as? [String: Any])
+        let tsModels = try XCTUnwrap(modelsJson["models"] as? [[String: Any]])
+        XCTAssertTrue(tsModels.contains { ($0["name"] as? String) == "mock-d1-2b" && ($0["release_date"] as? String) != nil })
+
+        let boundary = "qwg-test-boundary-123"
+        let assetRef = "asset-uuid-1"
+        let multiReqObj: [String: Any] = [
+            "model": "mock-d1-2b",
+            "state": assetRef,
+            "assets": [assetRef: ["type": "image", "part": "asset-0"]],
+            "questions": ["has_badge": ["type": "noul", "instructions": "Inspect image"]],
+        ]
+        let multiReqData = try JSONSerialization.data(withJSONObject: multiReqObj)
+        let fakePNG = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01])
+        var multiBody = Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"request\"\r\nContent-Type: application/json\r\n\r\n".utf8)
+        multiBody.append(multiReqData)
+        multiBody.append(Data("\r\n--\(boundary)\r\nContent-Disposition: form-data; name=\"asset-0\"; filename=\"asset-0\"\r\nContent-Type: image/png\r\n\r\n".utf8))
+        multiBody.append(fakePNG)
+        multiBody.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        var multiURLReq = URLRequest(url: baseURL.appendingPathComponent("/v1/systemone"))
+        multiURLReq.httpMethod = "POST"
+        multiURLReq.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        multiURLReq.httpBody = multiBody
+        let (multiRespData, multiResp) = try await URLSession.shared.data(for: multiURLReq)
+        XCTAssertEqual((multiResp as? HTTPURLResponse)?.statusCode, 200)
+        let multiJson = try XCTUnwrap(JSONSerialization.jsonObject(with: multiRespData) as? [String: Any])
+        XCTAssertEqual(((multiJson["answers"] as? [String: Any])?["has_badge"] as? [String: Any])?["type"] as? String, "noul")
+
+        let (oaiCode, oaiJson, _) = try await post("/v1/decisions", json: [
+            "model": "mock-d1-2b",
+            "input": [["role": "user", "type": "message", "content": [["type": "input_text", "text": "Refund approved."]]]],
+            "questions": [
+                ["name": "valid", "type": "predicate", "instructions": "Valid?"],
+                ["name": "route", "type": "choice", "instructions": "Route?", "choices": [["value": "A", "description": "a"], ["value": "B", "description": "b"], ["value": "C", "description": "c"]]],
+            ],
+        ])
+        XCTAssertEqual(oaiCode, 200)
+        let oaiAnswers = try XCTUnwrap(oaiJson["answers"] as? [[String: Any]])
+        XCTAssertEqual(oaiAnswers.count, 2)
+        XCTAssertEqual(oaiAnswers[0]["type"] as? String, "predicate")
+        XCTAssertNotNil(oaiAnswers[0]["probability"] as? Double)
+        XCTAssertEqual(oaiAnswers[1]["type"] as? String, "choice")
+        XCTAssertEqual((oaiAnswers[1]["probabilities"] as? [[String: Any]])?.count, 3)
+
+        let (healthData, healthResp) = try await URLSession.shared.data(from: baseURL.appendingPathComponent("/health"))
+        XCTAssertEqual((healthResp as? HTTPURLResponse)?.statusCode, 200)
+        let healthJson = try XCTUnwrap(JSONSerialization.jsonObject(with: healthData) as? [String: Any])
+        XCTAssertEqual(healthJson["loaded"] as? Bool, true)
+        XCTAssertEqual(healthJson["status"] as? String, "loaded")
+        XCTAssertEqual(healthJson["model"] as? String, "mock-d1-2b")
 
         let (sysBatchCode, sysBatchJson, _) = try await post("/v1/systemone/batch", json: [
             "items": [
@@ -449,5 +518,31 @@ final class QWDecisionServerTests: XCTestCase {
         let missingPath = tmpDir.appendingPathComponent("missing-pack").path
         XCTAssertEqual(QWEngineLifecycleActor.estimateDecisionSidecarBytes(at: missingPath), 256 << 20)
         XCTAssertEqual(QWEngineLifecycleActor.estimateDecisionSidecarBytes(at: siblingURL.path), 1 << 20)
+    }
+
+    func testEstimateDecisionSidecarBytesVisionToggleDifference() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("qwg-st-uma-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let weightBytes = Data(count: 1 << 20)
+        let visBytes = Data(count: 2 << 20)
+        var blob = Data()
+        let header: [String: Any] = [
+            "model.embed_tokens.weight": ["dtype": "BF16", "shape": [1024, 512], "data_offsets": [0, weightBytes.count]],
+            "model.vision_tower.patch.weight": ["dtype": "BF16", "shape": [1024, 1024], "data_offsets": [weightBytes.count, weightBytes.count + visBytes.count]],
+        ]
+        let hdrData = try JSONSerialization.data(withJSONObject: header)
+        var hdrLen = UInt64(hdrData.count).littleEndian
+        blob.append(Data(bytes: &hdrLen, count: 8))
+        blob.append(hdrData)
+        blob.append(weightBytes)
+        blob.append(visBytes)
+        try blob.write(to: dir.appendingPathComponent("model.safetensors"))
+
+        let withVis = QWEngineLifecycleActor.estimateDecisionSidecarBytes(at: dir.path, loadVision: true)
+        let noVis = QWEngineLifecycleActor.estimateDecisionSidecarBytes(at: dir.path, loadVision: false)
+        XCTAssertGreaterThan(withVis, noVis)
+        XCTAssertEqual(withVis - noVis, 2 << 20, accuracy: 4096)
     }
 }

@@ -24,6 +24,9 @@ public struct QWDecisionSidecarStatus: Codable, Sendable, Equatable {
     public let supportedKinds: [String]
     public let allowedLabels: [String]?
     public let failureDetail: String?
+    public let visionEnabled: Bool?
+    public let archetype: String?
+    public let totalPromptTokens: Int
 
     enum CodingKeys: String, CodingKey {
         case status, loaded
@@ -39,6 +42,9 @@ public struct QWDecisionSidecarStatus: Codable, Sendable, Equatable {
         case supportedKinds = "supported_kinds"
         case allowedLabels = "allowed_labels"
         case failureDetail = "failure_detail"
+        case visionEnabled = "vision_enabled"
+        case archetype
+        case totalPromptTokens = "total_prompt_tokens"
     }
 
     public init(
@@ -55,7 +61,10 @@ public struct QWDecisionSidecarStatus: Codable, Sendable, Equatable {
         lastLatencyMs: Double? = nil,
         supportedKinds: [String] = [],
         allowedLabels: [String]? = nil,
-        failureDetail: String? = nil
+        failureDetail: String? = nil,
+        visionEnabled: Bool? = nil,
+        archetype: String? = nil,
+        totalPromptTokens: Int = 0
     ) {
         self.status = status
         self.loaded = loaded
@@ -71,6 +80,9 @@ public struct QWDecisionSidecarStatus: Codable, Sendable, Equatable {
         self.supportedKinds = supportedKinds
         self.allowedLabels = allowedLabels
         self.failureDetail = failureDetail
+        self.visionEnabled = visionEnabled
+        self.archetype = archetype
+        self.totalPromptTokens = totalPromptTokens
     }
 }
 
@@ -84,6 +96,8 @@ public struct QWLoadedDecisionSidecar: Sendable {
     public let estimatedBytes: UInt64
     public let supportedKinds: [String]
     public let allowedLabels: [String]?
+    public let visionEnabled: Bool?
+    public let archetype: String?
 
     public init(
         runner: QWDecisionRunner,
@@ -93,7 +107,9 @@ public struct QWLoadedDecisionSidecar: Sendable {
         computeUnit: String,
         estimatedBytes: UInt64,
         supportedKinds: [String] = QWDecisionKind.allCases.map(\.rawValue),
-        allowedLabels: [String]? = nil
+        allowedLabels: [String]? = nil,
+        visionEnabled: Bool? = nil,
+        archetype: String? = nil
     ) {
         self.runner = runner
         self.modelName = modelName
@@ -103,6 +119,8 @@ public struct QWLoadedDecisionSidecar: Sendable {
         self.estimatedBytes = estimatedBytes
         self.supportedKinds = supportedKinds
         self.allowedLabels = allowedLabels
+        self.visionEnabled = visionEnabled
+        self.archetype = archetype
     }
 }
 
@@ -148,6 +166,11 @@ final class QWDecisionSidecarStatusBox: @unchecked Sendable {
 
     func setLoaded(_ sidecar: QWLoadedDecisionSidecar) {
         lock.withLock {
+            let resolvedArchetype = sidecar.archetype
+                ?? QWModelCatalog.describeDecisionArchetype(
+                    sidecar.runner.backend.decisionConfig,
+                    isCoreAI: sidecar.backendKind.hasPrefix("coreai")
+                )
             snapshot = QWDecisionSidecarStatus(
                 status: "loaded",
                 loaded: true,
@@ -162,7 +185,10 @@ final class QWDecisionSidecarStatusBox: @unchecked Sendable {
                 lastLatencyMs: nil,
                 supportedKinds: sidecar.supportedKinds,
                 allowedLabels: sidecar.allowedLabels,
-                failureDetail: nil
+                failureDetail: nil,
+                visionEnabled: sidecar.visionEnabled,
+                archetype: resolvedArchetype,
+                totalPromptTokens: 0
             )
             cumulativeLatencyMs = 0
         }
@@ -187,7 +213,7 @@ final class QWDecisionSidecarStatusBox: @unchecked Sendable {
         }
     }
 
-    func recordSuccess(latencyMs: Double) {
+    func recordSuccess(latencyMs: Double, promptTokens: Int = 0) {
         lock.withLock {
             guard snapshot.loaded else { return }
             let count = snapshot.totalRequests + 1
@@ -208,7 +234,10 @@ final class QWDecisionSidecarStatusBox: @unchecked Sendable {
                 lastLatencyMs: roundedLast,
                 supportedKinds: snapshot.supportedKinds,
                 allowedLabels: snapshot.allowedLabels,
-                failureDetail: nil
+                failureDetail: nil,
+                visionEnabled: snapshot.visionEnabled,
+                archetype: snapshot.archetype,
+                totalPromptTokens: snapshot.totalPromptTokens + max(0, promptTokens)
             )
         }
     }
@@ -245,7 +274,7 @@ extension QWEngineLifecycleActor {
         let expanded = (trimmed as NSString).expandingTildeInPath
         let resolvedName = Config.derivePackName(from: expanded)
 
-        let estimatedSidecarBytes = Self.estimateDecisionSidecarBytes(at: expanded)
+        let estimatedSidecarBytes = Self.estimateDecisionSidecarBytes(at: expanded, loadVision: loadVision)
         let primaryWiredBytes = Int(Self.deviceAllocatedBytes())
         let admission = QWResidencyAdmission.admitDecisionSidecar(
             primaryWiredBytes: primaryWiredBytes,
@@ -274,6 +303,17 @@ extension QWEngineLifecycleActor {
         }
     }
 
+    /// Updates live decision request defaults on the actor config without restarting the engine.
+    public func updateDecisionDefaults(
+        scoreReadout: String,
+        truncation: String,
+        alwaysEmitBox: Bool
+    ) {
+        config.decisionDefaultScoreReadout = scoreReadout
+        config.decisionDefaultTruncation = truncation
+        config.decisionAlwaysEmitBox = alwaysEmitBox
+    }
+
     /// Unloads the decision sidecar without restarting or resetting the primary LLM.
     @discardableResult
     public func unloadDecisionSidecar() async -> QWDecisionSidecarStatus {
@@ -287,10 +327,18 @@ extension QWEngineLifecycleActor {
         _ request: QWDecisionRequest,
         preferredModel: String? = nil
     ) async throws -> QWDecisionExecutionEnvelope {
+        if decisionSidecar == nil && !config.decisionModelPackPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let unit = QWDecisionComputeUnit(rawValue: config.decisionComputeUnit.lowercased()) ?? .auto
+            _ = try await loadDecisionSidecar(
+                packPath: config.decisionModelPackPath,
+                computeUnit: unit,
+                loadVision: config.decisionLoadVision
+            )
+        }
         let requested = preferredModel?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let sidecar = decisionSidecar, Self.matchesSidecar(requested: requested, sidecar: sidecar) {
             let resp = try await sidecar.runner.decide(request)
-            decisionStatusBox.recordSuccess(latencyMs: resp.usage.latencyMs)
+            decisionStatusBox.recordSuccess(latencyMs: resp.usage.latencyMs, promptTokens: resp.usage.promptTokens)
             return QWDecisionExecutionEnvelope(
                 response: resp,
                 modelName: sidecar.modelName,
@@ -315,6 +363,58 @@ extension QWEngineLifecycleActor {
             )
         }
 
+        throw QWDecisionError.backendFailed("no decision sidecar or resident primary model available")
+    }
+
+    /// Evaluates multiple decision requests in a coalesced GPU batch when sharing the active runner.
+    public func decideBatch(
+        _ requests: [QWDecisionRequest],
+        preferredModel: String? = nil
+    ) async throws -> [QWDecisionExecutionEnvelope] {
+        guard !requests.isEmpty else { return [] }
+        if requests.count == 1 {
+            return [try await decide(requests[0], preferredModel: preferredModel)]
+        }
+        if decisionSidecar == nil && !config.decisionModelPackPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let unit = QWDecisionComputeUnit(rawValue: config.decisionComputeUnit.lowercased()) ?? .auto
+            _ = try await loadDecisionSidecar(
+                packPath: config.decisionModelPackPath,
+                computeUnit: unit,
+                loadVision: config.decisionLoadVision
+            )
+        }
+        let requested = preferredModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let sidecar = decisionSidecar, Self.matchesSidecar(requested: requested, sidecar: sidecar) {
+            let resps = try await sidecar.runner.decideBatch(requests)
+            for resp in resps {
+                decisionStatusBox.recordSuccess(latencyMs: resp.usage.latencyMs, promptTokens: resp.usage.promptTokens)
+            }
+            return resps.map { resp in
+                QWDecisionExecutionEnvelope(
+                    response: resp,
+                    modelName: sidecar.modelName,
+                    backendKind: sidecar.backendKind
+                )
+            }
+        }
+        if case .loaded(let primary) = state,
+           let unified = (primary.modelBackend as? QWUnifiedModelBackend)?.engine as? QWEngine {
+            let adapter = QWEngineDecisionAdapter(
+                engine: unified,
+                decisionConfig: primary.descriptor.decisionConfig,
+                gpuTurnArbitrator: nil,
+                isSidecar: false
+            )
+            let runner = QWDecisionRunner(tokenizer: primary.tokenizer, backend: adapter)
+            let resps = try await runner.decideBatch(requests)
+            return resps.map { resp in
+                QWDecisionExecutionEnvelope(
+                    response: resp,
+                    modelName: config.modelName,
+                    backendKind: "metal4_primary_fallback"
+                )
+            }
+        }
         throw QWDecisionError.backendFailed("no decision sidecar or resident primary model available")
     }
 
@@ -346,6 +446,8 @@ extension QWEngineLifecycleActor {
             return nil
         }()
 
+        let archRaw = QWModelCatalog.describeDecisionArchetype(desc?.decisionConfig, isCoreAI: root.kind == .coreAIModel || computeUnit == .ane)
+
         if root.kind == .coreAIModel || computeUnit == .ane {
             let adapter = try await QWCoreAIDecisionAdapter.load(
                 bundleURL: url,
@@ -353,7 +455,7 @@ extension QWEngineLifecycleActor {
                 computeUnit: computeUnit == .auto ? .ane : computeUnit
             )
             let runner = QWDecisionRunner(tokenizer: tokenizer, backend: adapter, calibration: calibration)
-            let estBytes = UInt64(max(0, estimateDecisionSidecarBytes(at: packPath)))
+            let estBytes = UInt64(max(0, estimateDecisionSidecarBytes(at: packPath, loadVision: loadVision)))
             logger.log(.info, "Loaded CoreAI decision sidecar '\(modelName)' (unit=\(adapter.activeComputeUnit), L_max=\(adapter.maxContextLength))")
             return QWLoadedDecisionSidecar(
                 runner: runner,
@@ -362,7 +464,9 @@ extension QWEngineLifecycleActor {
                 backendKind: "coreai_\(adapter.activeComputeUnit)",
                 computeUnit: adapter.activeComputeUnit,
                 estimatedBytes: estBytes,
-                allowedLabels: allowedLabels
+                allowedLabels: allowedLabels,
+                visionEnabled: desc != nil ? ((desc?.visDepth ?? 0) > 0 || desc?.visionTowerConfig != nil ? loadVision : false) : loadVision,
+                archetype: archRaw ?? "coreai"
             )
         }
 
@@ -385,7 +489,7 @@ extension QWEngineLifecycleActor {
                 loadVision: loadVision
             )
             let runner = QWDecisionRunner(tokenizer: tokenizer, backend: backend, calibration: calibration)
-            let estBytes = UInt64(max(0, estimateDecisionSidecarBytes(at: packPath)))
+            let estBytes = UInt64(max(0, estimateDecisionSidecarBytes(at: packPath, loadVision: loadVision)))
             logger.log(.info, "Loaded Metal 4 native decision sidecar '\(modelName)' (L_max=\(backend.maxContextLength), layers=\(desc.numLayers))")
             return QWLoadedDecisionSidecar(
                 runner: runner,
@@ -394,7 +498,9 @@ extension QWEngineLifecycleActor {
                 backendKind: "metal4",
                 computeUnit: "metal",
                 estimatedBytes: estBytes,
-                allowedLabels: allowedLabels
+                allowedLabels: allowedLabels,
+                visionEnabled: hasVision ? loadVision : false,
+                archetype: archRaw
             )
         }
 
@@ -415,7 +521,7 @@ extension QWEngineLifecycleActor {
             loadVision: loadVision
         )
         let runner = QWDecisionRunner(tokenizer: tokenizer, backend: adapter, calibration: calibration)
-        let estBytes = UInt64(max(0, estimateDecisionSidecarBytes(at: packPath)))
+        let estBytes = UInt64(max(0, estimateDecisionSidecarBytes(at: packPath, loadVision: loadVision)))
         logger.log(.info, "Loaded Metal 4 decision sidecar '\(modelName)' (L_max=\(adapter.maxContextLength))")
         return QWLoadedDecisionSidecar(
             runner: runner,
@@ -424,7 +530,9 @@ extension QWEngineLifecycleActor {
             backendKind: "metal4",
             computeUnit: "metal",
             estimatedBytes: estBytes,
-            allowedLabels: allowedLabels
+            allowedLabels: allowedLabels,
+            visionEnabled: hasVision ? loadVision : false,
+            archetype: archRaw
         )
     }
 
@@ -466,11 +574,16 @@ extension QWEngineLifecycleActor {
         return QWCalibrationProfile()
     }
 
-    static func estimateDecisionSidecarBytes(at packPath: String) -> Int {
+    static func estimateDecisionSidecarBytes(at packPath: String, loadVision: Bool = true) -> Int {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: packPath, isDirectory: &isDir) else {
             return 256 << 20
+        }
+        if isDir.boolValue,
+           let exact = QWDecisionPackEngine.estimateResidentBytes(at: packPath, loadVision: loadVision),
+           exact > 0 {
+            return exact
         }
         let url = URL(fileURLWithPath: packPath)
         let root = QWModelRoot(url: url)
@@ -490,6 +603,7 @@ extension QWEngineLifecycleActor {
            let enumerator = fm.enumerator(at: root.directory, includingPropertiesForKeys: [.fileSizeKey]) {
             var total = 0
             for case let fileURL as URL in enumerator {
+                if !loadVision && fileURL.lastPathComponent.lowercased().contains("vision") { continue }
                 if let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize {
                     total += size
                 }

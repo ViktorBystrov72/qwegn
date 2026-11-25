@@ -252,7 +252,7 @@ func explicitValuesCarryOnlyWhatWasSet() throws {
 func theBindingsRefuseWhatTheRegistryRejects() throws {
     #expect(throws: (any Error).self) { try QWGKnobOptions.parse(["--temperature", "5"]) }
     #expect(throws: (any Error).self) { try QWGKnobOptions.parse(["--kv-mode", "auto"]) }
-    #expect(throws: (any Error).self) { try QWGKnobOptions.parse(["--reasoning-effort", "high"]) }
+    #expect(throws: (any Error).self) { try QWGKnobOptions.parse(["--reasoning-effort", "max"]) }
     #expect(throws: (any Error).self) { try QWGKnobOptions.parse(["--max-context", "0"]) }
 }
 
@@ -275,7 +275,7 @@ func theThinkingKnobReadsTheSameEitherWay() throws {
 func anEnumerationIsReadWithoutRegardToCase() throws {
     #expect(try QWGKnobOptions.parse(["--kv-mode", "F16"]).explicitValues["kvMode"] == .string("f16"))
     #expect(try QWGKnobOptions.parse(["--system", "Hello THERE"]).explicitValues["systemPrompt"] == .string("Hello THERE"))
-    #expect(throws: (any Error).self) { try QWGKnobOptions.parse(["--reasoning-effort", "HIGH"]) }
+    #expect(throws: (any Error).self) { try QWGKnobOptions.parse(["--reasoning-effort", "MAX"]) }
 }
 
 // MARK: - The values

@@ -108,6 +108,14 @@ public struct QWDecisionQuestion: Sendable, Hashable, Codable, Equatable {
     public let maxBoxes: Int?
     public let jsonPath: String?
     public let chain: String?
+    public let alwaysEmitBox: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case name, kind, instructions, criteria
+        case abstainBelow, selectThreshold, scoreReadout, readKind, unit
+        case estimateLow, estimateHigh, estimateStep, maxBoxes, jsonPath, chain
+        case alwaysEmitBox
+    }
 
     public init(
         name: String,
@@ -124,7 +132,8 @@ public struct QWDecisionQuestion: Sendable, Hashable, Codable, Equatable {
         estimateStep: Double? = nil,
         maxBoxes: Int? = nil,
         jsonPath: String? = nil,
-        chain: String? = nil
+        chain: String? = nil,
+        alwaysEmitBox: Bool = false
     ) {
         self.name = name
         self.kind = kind
@@ -141,6 +150,27 @@ public struct QWDecisionQuestion: Sendable, Hashable, Codable, Equatable {
         self.maxBoxes = maxBoxes
         self.jsonPath = jsonPath
         self.chain = chain
+        self.alwaysEmitBox = alwaysEmitBox
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.kind = try c.decode(QWDecisionKind.self, forKey: .kind)
+        self.instructions = try c.decode(String.self, forKey: .instructions)
+        self.criteria = try c.decodeIfPresent([QWDecisionCriterion].self, forKey: .criteria) ?? []
+        self.abstainBelow = try c.decodeIfPresent(Double.self, forKey: .abstainBelow)
+        self.selectThreshold = try c.decodeIfPresent(Double.self, forKey: .selectThreshold)
+        self.scoreReadout = try c.decodeIfPresent(QWScoreReadout.self, forKey: .scoreReadout)
+        self.readKind = try c.decodeIfPresent(QWReadKind.self, forKey: .readKind) ?? .text
+        self.unit = try c.decodeIfPresent(String.self, forKey: .unit)
+        self.estimateLow = try c.decodeIfPresent(Double.self, forKey: .estimateLow)
+        self.estimateHigh = try c.decodeIfPresent(Double.self, forKey: .estimateHigh)
+        self.estimateStep = try c.decodeIfPresent(Double.self, forKey: .estimateStep)
+        self.maxBoxes = try c.decodeIfPresent(Int.self, forKey: .maxBoxes)
+        self.jsonPath = try c.decodeIfPresent(String.self, forKey: .jsonPath)
+        self.chain = try c.decodeIfPresent(String.self, forKey: .chain)
+        self.alwaysEmitBox = try c.decodeIfPresent(Bool.self, forKey: .alwaysEmitBox) ?? false
     }
 }
 
@@ -220,6 +250,7 @@ public struct QWDecisionAnswer: Sendable, Hashable, Codable, Equatable {
     public let number: Double?
     public let date: String?
     public let span: Range<Int>?
+    public let charSpan: Range<Int>?
     public let jsonPath: String?
     public let found: Bool?
     public let foundProb: Double?
@@ -246,6 +277,7 @@ public struct QWDecisionAnswer: Sendable, Hashable, Codable, Equatable {
         number: Double? = nil,
         date: String? = nil,
         span: Range<Int>? = nil,
+        charSpan: Range<Int>? = nil,
         jsonPath: String? = nil,
         found: Bool? = nil,
         foundProb: Double? = nil,
@@ -271,6 +303,7 @@ public struct QWDecisionAnswer: Sendable, Hashable, Codable, Equatable {
         self.number = number
         self.date = date
         self.span = span
+        self.charSpan = charSpan
         self.jsonPath = jsonPath
         self.found = found
         self.foundProb = foundProb

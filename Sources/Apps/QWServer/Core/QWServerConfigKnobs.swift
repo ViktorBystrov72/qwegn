@@ -42,6 +42,12 @@ extension QWEngineLifecycleActor.Config {
         out["mtpAdaptiveDepth"] = .bool(mtpAdaptiveDepth)
         out["mtpEntropyThreshold"] = .double(mtpAdaptiveEntropyThreshold)
         out["dflashSelectorTopK"] = .int(dflashSelectorTopK)
+        out["decisionModelPackPath"] = .string(decisionModelPackPath)
+        out["decisionComputeUnit"] = .string(decisionComputeUnit)
+        out["decisionLoadVision"] = .bool(decisionLoadVision)
+        out["decisionDefaultScoreReadout"] = .string(decisionDefaultScoreReadout)
+        out["decisionDefaultTruncation"] = .string(decisionDefaultTruncation)
+        out["decisionAlwaysEmitBox"] = .bool(decisionAlwaysEmitBox)
         // A knob with no value is absent: an engine that does not choose a
         // drafter says nothing about it.
         if let mtpBackend { out["mtpBackend"] = .string(mtpBackend) }

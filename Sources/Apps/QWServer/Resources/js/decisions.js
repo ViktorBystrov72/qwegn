@@ -3,6 +3,12 @@
 let decisionWorkbenchState = {
   initialized: false,
   sidecarStatus: null,
+  dialect: "native",
+  threshold: 0.7,
+  alwaysEmitBox: false,
+  selectedPackPath: "",
+  selectedComputeUnit: "auto",
+  selectedLoadVision: true,
   stateMode: "text",
   stateText: "Patient reports mild fever (38.1 C) for 2 days without chest pain.",
   chain: "default",
@@ -32,13 +38,16 @@ function formatDecisionBytes(bytes) {
 }
 
 function decisionConfidenceRailBadge(conf) {
+  const thRaw = Number(decisionWorkbenchState.threshold);
+  const th = Number.isFinite(thRaw) ? Math.max(0.05, Math.min(0.99, thRaw)) : 0.7;
   if (typeof conf !== "number" || !Number.isFinite(conf)) {
     return `<span class="dec-pill mono">Confidence —</span>`;
   }
   const pct = (conf * 100).toFixed(1);
-  const acting = conf >= 0.7;
+  const acting = conf >= th;
   const cls = acting ? "is-acting" : "is-failopen";
-  const label = acting ? `Acting ≥ 0.70 (${pct}%)` : `Fail-Open < 0.70 (${pct}%)`;
+  const thStr = th.toFixed(2);
+  const label = acting ? `Acting ≥ ${thStr} (${pct}%)` : `Fail-Open < ${thStr} (${pct}%)`;
   return `<span class="dec-pill mono ${cls}">${escapeHtml(label)}</span>`;
 }
 
@@ -117,13 +126,16 @@ function summarizeDecisionAnswerValue(ans) {
   return "—";
 }
 
-function renderDecisionResultsHTML(resp, stateText, imagesList) {
+function renderDecisionResultsHTML(rawResp, stateText, imagesList) {
+  const resp = typeof normalizeDecisionWireResponse === "function" ? normalizeDecisionWireResponse(rawResp) : rawResp;
   if (!resp || !Array.isArray(resp.answers)) {
     return `<div class="panel-sub">Submit a decision query to inspect calibrated distributions, spans, boxes, and confidence rails.</div>`;
   }
   const usage = resp.usage || {};
-  const latText = typeof usage.latencyMs === "number" ? `${usage.latencyMs.toFixed(2)} ms` : (typeof usage.latency_ms === "number" ? `${Number(usage.latency_ms).toFixed(2)} ms` : "—");
-  const tokText = typeof usage.promptTokens === "number" ? `${usage.promptTokens} tok` : (typeof usage.prompt_tokens === "number" ? `${usage.prompt_tokens} tok` : "—");
+  const rawLat = typeof usage.latencyMs === "number" ? usage.latencyMs : (typeof usage.latency_ms === "number" ? Number(usage.latency_ms) : null);
+  const rawTok = typeof usage.promptTokens === "number" ? usage.promptTokens : (typeof usage.input_tokens === "number" ? usage.input_tokens : usage.prompt_tokens);
+  const latText = rawLat !== null ? `${rawLat.toFixed(2)} ms` : "—";
+  const tokText = typeof rawTok === "number" ? `${rawTok} tok` : "—";
   const metaHtml = `<div class="dec-status-meta" style="margin-bottom:8px;">
     <span class="dec-pill mono">Backend: ${escapeHtml(resp.backend || "—")}</span>
     <span class="dec-pill mono">Model: ${escapeHtml(resp.model || "—")}</span>
@@ -225,22 +237,64 @@ function updateDecisionSidecarPanel(model) {
   const bytesVal = (facts && facts.decisionSidecarBytes !== undefined) ? facts.decisionSidecarBytes : (status ? status.estimated_bytes : null);
   const latVal = (facts && facts.decisionSidecarMeanLatencyMs !== undefined) ? facts.decisionSidecarMeanLatencyMs : (status ? status.mean_latency_ms : null);
   const reqVal = (facts && facts.decisionSidecarTotalRequests !== undefined) ? facts.decisionSidecarTotalRequests : (status ? status.total_requests : null);
+  const visVal = (facts && facts.decisionSidecarVision !== undefined) ? facts.decisionSidecarVision : (status ? status.vision_enabled : undefined);
   const latStr = typeof latVal === "number" && Number.isFinite(latVal) ? `${latVal.toFixed(1)} ms` : "—";
   const reqStr = typeof reqVal === "number" && Number.isFinite(reqVal) ? String(reqVal) : "—";
+  const visStr = visVal === true ? "Vision" : (visVal === false ? "Text-Only" : "");
+  const modelsList = typeof discoveredModelsList !== "undefined" ? discoveredModelsList : [];
+  const loaderHtml = typeof renderDecisionLoaderControlsHTML === "function"
+    ? renderDecisionLoaderControlsHTML(decisionWorkbenchState, modelsList)
+    : "";
 
   strip.innerHTML = `
     <div class="dec-status-meta">
       <span class="dot ${loaded ? "dot-active" : "dot-idle"}"></span>
-      <strong class="mono">${escapeHtml(loaded ? modelName : "Decision Sidecar Unloaded (falls back to primary when compatible)")}</strong>
+      <strong class="mono">${escapeHtml(loaded ? modelName : "Decision Sidecar Unloaded (select a pack to hot-load)")}</strong>
       ${loaded ? `<span class="dec-pill mono">${escapeHtml(backend)}</span>` : ""}
+      ${loaded && visStr ? `<span class="dec-pill mono">${escapeHtml(visStr)}</span>` : ""}
       ${loaded ? `<span class="dec-pill mono">Mem: ${escapeHtml(formatDecisionBytes(bytesVal))}</span>` : ""}
       ${loaded ? `<span class="dec-pill mono">Mean: ${escapeHtml(latStr)}</span>` : ""}
       ${loaded ? `<span class="dec-pill mono">Calls: ${escapeHtml(reqStr)}</span>` : ""}
     </div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;">
-      <button type="button" class="btn btn-sm" onclick="refreshDecisionSidecarStatus()">Refresh</button>
-      ${loaded ? `<button type="button" class="btn btn-sm btn-danger" onclick="unloadDecisionSidecarFromWeb()">Unload Sidecar</button>` : ""}
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+      ${loaderHtml}
+      <button type="button" class="btn btn-sm dec-ctrl-btn" onclick="refreshDecisionSidecarStatus()">Refresh</button>
+      ${loaded ? `<button type="button" class="btn btn-sm btn-danger dec-ctrl-btn" onclick="unloadDecisionSidecarFromWeb()">Unload Sidecar</button>` : ""}
     </div>`;
+}
+
+async function loadDecisionSidecarFromWeb(packPath, computeUnit, loadVision) {
+  const pathVal = String(packPath || "").trim();
+  if (!pathVal) {
+    showToast("Select or enter a decision pack path first.", true);
+    return;
+  }
+  try {
+    const res = await fetch(`${API_BASE}/v1/decisions/model/load`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pack_path: pathVal,
+        compute_unit: computeUnit || decisionWorkbenchState.selectedComputeUnit || "auto",
+        load_vision: loadVision !== undefined ? Boolean(loadVision) : Boolean(decisionWorkbenchState.selectedLoadVision)
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((data.error && data.error.message) || data.message || `HTTP ${res.status}`);
+    decisionWorkbenchState.sidecarStatus = data;
+    decisionWorkbenchState.selectedPackPath = pathVal;
+    showToast(`Loaded decision sidecar: ${data.model_name || pathVal}.`);
+    updateDecisionSidecarPanel(typeof publishedModel !== "undefined" ? publishedModel : null);
+    if (typeof fetchDashboard === "function") fetchDashboard();
+  } catch (err) {
+    showToast("Sidecar load failed: " + err.message, true);
+  }
+}
+
+function loadDecisionSidecarFromSelect() {
+  const sel = document.getElementById("dec-loader-pack");
+  const p = (sel && sel.value) || decisionWorkbenchState.selectedPackPath;
+  loadDecisionSidecarFromWeb(p, decisionWorkbenchState.selectedComputeUnit, decisionWorkbenchState.selectedLoadVision);
 }
 
 async function refreshDecisionSidecarStatus() {
@@ -250,7 +304,7 @@ async function refreshDecisionSidecarStatus() {
       decisionWorkbenchState.sidecarStatus = await res.json();
     }
   } catch (_) {}
-  updateDecisionSidecarPanel(publishedModel);
+  updateDecisionSidecarPanel(typeof publishedModel !== "undefined" ? publishedModel : null);
 }
 
 async function unloadDecisionSidecarFromWeb() {
@@ -259,7 +313,7 @@ async function unloadDecisionSidecarFromWeb() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     decisionWorkbenchState.sidecarStatus = await res.json();
     showToast("Decision sidecar unloaded.");
-    updateDecisionSidecarPanel(publishedModel);
+    updateDecisionSidecarPanel(typeof publishedModel !== "undefined" ? publishedModel : null);
     if (typeof fetchDashboard === "function") fetchDashboard();
   } catch (err) {
     showToast("Unload failed: " + err.message, true);
@@ -313,40 +367,59 @@ function clearDecisionImages() {
 function refreshDecisionSnippetsDOM() {
   const host = document.getElementById("dec-snippets-host");
   if (!host) return;
-  const payload = buildDecisionRequestPayload(decisionWorkbenchState);
-  const sn = buildDecisionSnippets(payload, API_BASE);
+  const reqObj = typeof buildDecisionDialectRequest === "function"
+    ? buildDecisionDialectRequest(decisionWorkbenchState)
+    : { endpoint: "/v1/decisions", body: buildDecisionRequestPayload(decisionWorkbenchState) };
+  const sn = buildDecisionSnippets(reqObj.body, API_BASE);
+  const activeCurl = `curl -sS ${API_BASE}${reqObj.endpoint} \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(reqObj.body, null, 2)}'`;
+  decisionWorkbenchState.lastCurlSnippet = activeCurl;
   host.innerHTML = `
-    <div class="panel-sub mono">POST /v1/decisions &amp; /v1/systemone</div>
-    <pre class="dec-snippet-pre">${escapeHtml(sn.curlDecisions)}</pre>
+    <div class="dec-status-strip" style="margin-bottom:6px;">
+      <span class="panel-sub mono">POST ${escapeHtml(reqObj.endpoint)} (${escapeHtml(decisionWorkbenchState.dialect || "native")})</span>
+      <button type="button" class="btn btn-sm dec-ctrl-btn" onclick="copyDecisionText(decisionWorkbenchState.lastCurlSnippet, 'curl request')">Copy curl</button>
+    </div>
+    <pre class="dec-snippet-pre">${escapeHtml(activeCurl)}</pre>
     <div class="panel-sub mono" style="margin-top:8px;">OpenAI/System-1 Alias &amp; Hermes MCP</div>
     <pre class="dec-snippet-pre">${escapeHtml(sn.curlSystemOne)}\n\n# Register MCP server:\n${escapeHtml(sn.hermesMcp)}</pre>`;
 }
 
+function applyDecisionPreset(presetId) {
+  if (typeof DECISION_WORKBENCH_PRESETS === "undefined") return;
+  const found = DECISION_WORKBENCH_PRESETS.find((p) => p.id === presetId);
+  if (!found) return;
+  decisionWorkbenchState.stateMode = "text";
+  decisionWorkbenchState.stateText = found.stateText;
+  decisionWorkbenchState.images = (found.images || []).slice();
+  decisionWorkbenchState.threshold = typeof found.threshold === "number" ? found.threshold : 0.7;
+  decisionWorkbenchState.alwaysEmitBox = Boolean(found.alwaysEmitBox);
+  decisionWorkbenchState.questions = found.questions.map((q) => Object.assign({}, q));
+  decisionWorkbenchState.lastResponse = null;
+  renderDecisionWorkbench();
+}
+
+function openDecisionsWithPrefill(text, images) {
+  decisionWorkbenchState.stateMode = "text";
+  if (typeof text === "string" && text.trim()) decisionWorkbenchState.stateText = text;
+  if (Array.isArray(images)) decisionWorkbenchState.images = images.slice(0, 4);
+  decisionWorkbenchState.initialized = true;
+  if (typeof switchTab === "function") switchTab("decisions");
+  renderDecisionWorkbench();
+}
+
 async function runDecisionWorkbench(mode) {
-  const endpoint = mode === "laya" ? "/v1/laya" : "/v1/decisions";
-  decisionWorkbenchState.lastEndpoint = endpoint;
+  if (mode && mode !== "decisions") decisionWorkbenchState.dialect = mode;
+  else if (mode === "decisions" && decisionWorkbenchState.dialect === "laya") decisionWorkbenchState.dialect = "native";
+  const reqObj = typeof buildDecisionDialectRequest === "function"
+    ? buildDecisionDialectRequest(decisionWorkbenchState)
+    : { endpoint: "/v1/decisions", body: buildDecisionRequestPayload(decisionWorkbenchState) };
+  decisionWorkbenchState.lastEndpoint = reqObj.endpoint;
   const resHost = document.getElementById("dec-results-host");
-  if (resHost) resHost.innerHTML = `<div class="panel-sub mono">Evaluating ${escapeHtml(endpoint)}…</div>`;
+  if (resHost) resHost.innerHTML = `<div class="panel-sub mono">Evaluating ${escapeHtml(reqObj.endpoint)}…</div>`;
   try {
-    let bodyObj;
-    if (mode === "laya") {
-      const q0 = decisionWorkbenchState.questions[0] || { kind: "noul", instructions: "", options: "" };
-      const opts = String(q0.options || "").split(",").map((x) => x.trim()).filter(Boolean);
-      bodyObj = {
-        state: decisionWorkbenchState.stateText,
-        question: q0.instructions,
-        kind: q0.kind,
-        chain: decisionWorkbenchState.chain
-      };
-      if (opts.length) bodyObj.options = opts;
-      if (decisionWorkbenchState.images.length) bodyObj.images = decisionWorkbenchState.images;
-    } else {
-      bodyObj = buildDecisionRequestPayload(decisionWorkbenchState);
-    }
-    const res = await fetch(`${API_BASE}${endpoint}`, {
+    const res = await fetch(`${API_BASE}${reqObj.endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(bodyObj)
+      body: JSON.stringify(reqObj.body)
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -373,57 +446,88 @@ function renderDecisionWorkbench() {
     const showEst = q.kind === "estimate";
     return `<div class="dec-q-card">
       <div class="dec-q-row">
-        <input class="input mono select-sm" value="${escapeHtml(q.name)}" placeholder="name" oninput="handleDecisionQuestionField(${idx}, 'name', this.value)" />
-        <select class="select select-sm" onchange="handleDecisionQuestionField(${idx}, 'kind', this.value)">
+        <input class="input mono select-sm" aria-label="Question name" value="${escapeHtml(q.name)}" placeholder="name" oninput="handleDecisionQuestionField(${idx}, 'name', this.value)" />
+        <select class="select select-sm" aria-label="Question kind" onchange="handleDecisionQuestionField(${idx}, 'kind', this.value)">
           ${["noul", "choice", "multiple", "score", "read", "estimate", "box", "boxes"].map((k) =>
             `<option value="${k}" ${q.kind === k ? "selected" : ""}>${k}</option>`
           ).join("")}
         </select>
-        ${st.questions.length > 1 ? `<button type="button" class="btn btn-sm" onclick="removeDecisionQuestionRow(${idx})">Remove</button>` : ""}
+        ${st.questions.length > 1 ? `<button type="button" class="btn btn-sm dec-ctrl-btn" onclick="removeDecisionQuestionRow(${idx})">Remove</button>` : ""}
       </div>
-      <input class="input" value="${escapeHtml(q.instructions)}" placeholder="Decision question instructions…" oninput="handleDecisionQuestionField(${idx}, 'instructions', this.value)" />
-      ${showOpts ? `<input class="input mono" value="${escapeHtml(q.options)}" placeholder="Comma-separated options/labels…" oninput="handleDecisionQuestionField(${idx}, 'options', this.value)" />` : ""}
+      <input class="input" aria-label="Question instructions" value="${escapeHtml(q.instructions)}" placeholder="Decision question instructions…" oninput="handleDecisionQuestionField(${idx}, 'instructions', this.value)" />
+      ${showOpts ? `<input class="input mono" aria-label="Comma-separated options" value="${escapeHtml(q.options)}" placeholder="Comma-separated options/labels…" oninput="handleDecisionQuestionField(${idx}, 'options', this.value)" />` : ""}
       ${showEst ? `<div class="dec-q-row">
-        <input class="input mono select-sm" type="number" value="${escapeHtml(q.minVal)}" placeholder="min" oninput="handleDecisionQuestionField(${idx}, 'minVal', this.value)" />
-        <input class="input mono select-sm" type="number" value="${escapeHtml(q.maxVal)}" placeholder="max" oninput="handleDecisionQuestionField(${idx}, 'maxVal', this.value)" />
+        <input class="input mono select-sm" aria-label="Minimum value" type="number" value="${escapeHtml(q.minVal)}" placeholder="min" oninput="handleDecisionQuestionField(${idx}, 'minVal', this.value)" />
+        <input class="input mono select-sm" aria-label="Maximum value" type="number" value="${escapeHtml(q.maxVal)}" placeholder="max" oninput="handleDecisionQuestionField(${idx}, 'maxVal', this.value)" />
       </div>` : ""}
     </div>`;
   }).join("");
 
-  const thumbs = st.images.map((uri) => `<img class="dec-thumb" src="${escapeHtml(uri)}" alt="Attached image" />`).join("");
+  const presetsHtml = typeof DECISION_WORKBENCH_PRESETS !== "undefined"
+    ? DECISION_WORKBENCH_PRESETS.map((p) => `<button type="button" class="chip-btn dec-ctrl-btn" onclick="applyDecisionPreset('${escapeHtml(p.id)}')">${escapeHtml(p.label)}</button>`).join("")
+    : "";
+  const dialects = [
+    ["native", "Qwegn (/v1/decisions)"],
+    ["systemone", "SystemOne (/v1/systemone)"],
+    ["openai", "OpenAI Dialect"],
+    ["laya", "Laya (/v1/laya)"]
+  ];
+  const dialectBtns = dialects.map(([id, lbl]) =>
+    `<button type="button" class="chip-btn dec-ctrl-btn ${st.dialect === id ? "is-active" : ""}" onclick="decisionWorkbenchState.dialect='${id}';renderDecisionWorkbench()">${escapeHtml(lbl)}</button>`
+  ).join("");
+  const thumbs = st.images.map((uri) => `<img class="dec-thumb" width="64" height="64" src="${escapeHtml(uri)}" alt="Attached image" />`).join("");
+  const runLabel = st.dialect === "systemone" ? "Evaluate (/v1/systemone)"
+    : (st.dialect === "laya" ? "Ask Laya (/v1/laya)"
+    : (st.dialect === "openai" ? "Evaluate (OpenAI Dialect)" : "Evaluate (/v1/decisions)"));
+
   host.innerHTML = `<div class="dec-shell">
     <article class="card-panel"><div id="dec-sidecar-banner" class="dec-status-strip"></div></article>
     <div class="dec-grid">
       <article class="card-panel dec-col">
         <div class="panel-head"><h2 class="panel-title">State, Images &amp; Questions</h2>
-          <button type="button" class="btn btn-sm" onclick="addDecisionQuestionRow()">+ Question</button>
+          <button type="button" class="btn btn-sm dec-ctrl-btn" onclick="addDecisionQuestionRow()">+ Question</button>
         </div>
+        ${presetsHtml ? `<div class="dec-preset-row" aria-label="Decision presets">${presetsHtml}</div>` : ""}
+        <div class="dec-dialect-row" aria-label="Wire API dialect">${dialectBtns}</div>
         <div class="dec-q-row">
-          <select class="select select-sm" onchange="decisionWorkbenchState.stateMode=this.value;refreshDecisionSnippetsDOM()">
+          <select class="select select-sm" aria-label="State mode" onchange="decisionWorkbenchState.stateMode=this.value;refreshDecisionSnippetsDOM()">
             <option value="text" ${st.stateMode === "text" ? "selected" : ""}>State: Text</option>
             <option value="json" ${st.stateMode === "json" ? "selected" : ""}>State: JSON</option>
           </select>
-          <input class="input mono select-sm" value="${escapeHtml(st.chain)}" placeholder="chain (default)" oninput="decisionWorkbenchState.chain=this.value;refreshDecisionSnippetsDOM()" />
-          <select class="select select-sm" onchange="decisionWorkbenchState.truncation=this.value;refreshDecisionSnippetsDOM()">
+          <select class="select select-sm" aria-label="Score readout" onchange="decisionWorkbenchState.scoreReadout=this.value;refreshDecisionSnippetsDOM()">
+            ${["mean", "mode", "median"].map((r) => `<option value="${r}" ${st.scoreReadout === r ? "selected" : ""}>Readout: ${r}</option>`).join("")}
+          </select>
+          <input class="input mono select-sm" aria-label="Decision chain" value="${escapeHtml(st.chain)}" placeholder="chain (default)" oninput="decisionWorkbenchState.chain=this.value;refreshDecisionSnippetsDOM()" />
+          <select class="select select-sm" aria-label="Truncation policy" onchange="decisionWorkbenchState.truncation=this.value;refreshDecisionSnippetsDOM()">
             ${["auto_state", "error", "head", "tail", "middle"].map((p) => `<option value="${p}" ${st.truncation === p ? "selected" : ""}>${p}</option>`).join("")}
           </select>
         </div>
-        <textarea class="input mono" rows="4" oninput="decisionWorkbenchState.stateText=this.value;refreshDecisionSnippetsDOM()">${escapeHtml(st.stateText)}</textarea>
+        <div class="dec-q-row">
+          <label class="chat-inline-check"><span class="panel-sub mono">Fail-Open ≥</span>
+            <input id="dec-threshold-input" class="input mono select-sm" type="number" step="0.05" min="0.05" max="0.99" aria-label="Confidence threshold" value="${Number(st.threshold || 0.7).toFixed(2)}" oninput="decisionWorkbenchState.threshold=parseFloat(this.value)||0.7;renderDecisionWorkbench()" />
+          </label>
+          <label class="chat-inline-check">
+            <input type="checkbox" ${st.alwaysEmitBox ? "checked" : ""} onchange="decisionWorkbenchState.alwaysEmitBox=this.checked;refreshDecisionSnippetsDOM()" />
+            <span class="panel-sub">always_emit_box</span>
+          </label>
+        </div>
+        <textarea class="input mono" rows="4" aria-label="Decision state text" oninput="decisionWorkbenchState.stateText=this.value;refreshDecisionSnippetsDOM()">${escapeHtml(st.stateText)}</textarea>
         <div class="dec-q-row">
           <input id="dec-image-input" type="file" accept="image/*" multiple hidden onchange="handleDecisionImagesChange(event)" />
-          <button type="button" class="btn btn-sm" onclick="document.getElementById('dec-image-input')?.click()">Attach Image</button>
-          ${st.images.length ? `<button type="button" class="btn btn-sm" onclick="clearDecisionImages()">Clear Images (${st.images.length})</button>` : `<span class="panel-sub">Optional vision input (LFM3-VL / SigLIP2 / Qwen-VL)</span>`}
+          <button type="button" class="btn btn-sm dec-ctrl-btn" onclick="document.getElementById('dec-image-input')?.click()">Attach Image</button>
+          ${st.images.length ? `<button type="button" class="btn btn-sm dec-ctrl-btn" onclick="clearDecisionImages()">Clear Images (${st.images.length})</button>` : `<span class="panel-sub">Optional vision input (LFM3-VL / SigLIP2 / Qwen-VL)</span>`}
         </div>
         ${thumbs ? `<div class="dec-img-thumbs">${thumbs}</div>` : ""}
         ${qCards}
         <div class="dec-q-row">
-          <button type="button" class="btn btn-primary btn-sm" onclick="runDecisionWorkbench('decisions')">Evaluate (/v1/decisions)</button>
-          <button type="button" class="btn btn-sm" onclick="runDecisionWorkbench('laya')">Laya Ask (/v1/laya)</button>
+          <button id="dec-evaluate-btn" type="button" class="btn btn-primary btn-sm dec-ctrl-btn" onclick="runDecisionWorkbench('${escapeHtml(st.dialect || "native")}')">${escapeHtml(runLabel)}</button>
         </div>
       </article>
       <div class="dec-col">
         <article class="card-panel">
-          <div class="panel-head"><h2 class="panel-title">Calibrated Output</h2></div>
+          <div class="panel-head"><h2 class="panel-title">Calibrated Output</h2>
+            <button type="button" class="btn btn-sm dec-ctrl-btn" onclick="copyDecisionText(decisionWorkbenchState.lastResponse ? JSON.stringify(decisionWorkbenchState.lastResponse, null, 2) : '', 'JSON response')">Copy JSON</button>
+          </div>
           <div id="dec-results-host">${renderDecisionResultsHTML(st.lastResponse, st.stateText, st.images)}</div>
         </article>
         <article class="card-panel">
@@ -433,7 +537,7 @@ function renderDecisionWorkbench() {
       </div>
     </div>
   </div>`;
-  updateDecisionSidecarPanel(publishedModel);
+  updateDecisionSidecarPanel(typeof publishedModel !== "undefined" ? publishedModel : null);
   refreshDecisionSnippetsDOM();
 }
 
@@ -441,6 +545,12 @@ function onDecisionsTabActivated() {
   if (!decisionWorkbenchState.initialized) {
     decisionWorkbenchState.initialized = true;
     renderDecisionWorkbench();
+  }
+  if (typeof loadDiscoveredModels === "function" && (typeof discoveredModelsList === "undefined" || !discoveredModelsList || !discoveredModelsList.length)) {
+    const p = loadDiscoveredModels();
+    if (p && typeof p.then === "function") {
+      p.then(() => updateDecisionSidecarPanel(typeof publishedModel !== "undefined" ? publishedModel : null));
+    }
   }
   refreshDecisionSidecarStatus();
 }

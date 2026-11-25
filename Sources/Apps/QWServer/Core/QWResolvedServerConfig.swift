@@ -32,6 +32,12 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
     public var logDir: String, logFileName: String, logLevel: String
     public var lazy: Bool, sourceSummary: [String: String]
     public var loadVision: Bool = false
+    public var decisionModelPackPath: String = ""
+    public var decisionComputeUnit: String = "auto"
+    public var decisionLoadVision: Bool = true
+    public var decisionDefaultScoreReadout: String = "mean"
+    public var decisionDefaultTruncation: String = "error"
+    public var decisionAlwaysEmitBox: Bool = false
     /// Engine tuning from the settings/profile; `QW_*` env vars overlay it in the engine.
     public var engineTuning: QWEngineTuning = .default
 
@@ -60,7 +66,11 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
         lsaCrossLoopReuse: Bool = false, lsaLoopShareStride: Int = 0,
         warmRAMLimitGB: Double = 4.0, ssdCacheEnabled: Bool = false, ssdCacheLimitGB: Double = 10.0, cacheDir: String = "~/.qwg/cache",
         logDir: String = "~/.qwg/logs", logFileName: String = "qwg.log", logLevel: String = "info",
-        lazy: Bool = true, loadVision: Bool = false, sourceSummary: [String: String] = [:]
+        lazy: Bool = true, loadVision: Bool = false,
+        decisionModelPackPath: String = "", decisionComputeUnit: String = "auto",
+        decisionLoadVision: Bool = true, decisionDefaultScoreReadout: String = "mean",
+        decisionDefaultTruncation: String = "error", decisionAlwaysEmitBox: Bool = false,
+        sourceSummary: [String: String] = [:]
     ) {
         self.host = host; self.port = port
         self.apiKey = apiKey; self.corsAllowedOrigins = corsAllowedOrigins
@@ -85,7 +95,11 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
         self.lsaCrossLoopReuse = lsaCrossLoopReuse; self.lsaLoopShareStride = lsaLoopShareStride
         self.warmRAMLimitGB = warmRAMLimitGB; self.ssdCacheEnabled = ssdCacheEnabled; self.ssdCacheLimitGB = ssdCacheLimitGB; self.cacheDir = cacheDir
         self.logDir = logDir; self.logFileName = logFileName; self.logLevel = logLevel
-        self.lazy = lazy; self.loadVision = loadVision; self.sourceSummary = sourceSummary
+        self.lazy = lazy; self.loadVision = loadVision
+        self.decisionModelPackPath = decisionModelPackPath; self.decisionComputeUnit = decisionComputeUnit
+        self.decisionLoadVision = decisionLoadVision; self.decisionDefaultScoreReadout = decisionDefaultScoreReadout
+        self.decisionDefaultTruncation = decisionDefaultTruncation; self.decisionAlwaysEmitBox = decisionAlwaysEmitBox
+        self.sourceSummary = sourceSummary
     }
 
     /// Cohesive sampling parameters view resolved for the server.

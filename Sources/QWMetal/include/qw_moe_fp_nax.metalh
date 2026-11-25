@@ -91,12 +91,14 @@ METAL_FUNC void qwg_moe_stage_b_k32(
     }
 }
 
-/// Fast cooperative-B BF16 BM=64 BK=32 NAX GEMM for M>=48 prefill when X is BF16 and K%32==0.
-METAL_FUNC void qwg_gemm_bf16_nax_bm64_fast(
+/// Fast cooperative SRAM-staged BF16 NAX GEMM (BM=32/64, BK=32) for BF16 or F16 activations (K%32==0).
+template <int BM, bool IN_F16>
+METAL_FUNC void qwg_gemm_bf16_nax_coop_fast(
     device const bfloat* W, device const bfloat* xBF16,
     device bfloat* yBF16, device float* yF32, constant QWGemmFPBF16Params& p,
-    threadgroup ushort4* bShU4, uint2 tg, uint lid, uint simd_gid) {
-    constexpr short BM = 64, BN = 64, SK = 32, WM = 2, WN = 2;
+    threadgroup ushort4* aShU4, threadgroup ushort4* bShU4,
+    uint2 tg, uint lid, uint simd_gid) {
+    constexpr short BN = 64, SK = 32, WM = 2, WN = 2;
     constexpr short SM = BM / WM, SN = BN / WN, TM = SM / 16, TN = SN / 16, TK = SK / 16;
     const uint tgM0 = tg.y * uint(BM), tgN0 = tg.x * uint(BN);
     if (tgM0 >= p.M || tgN0 >= p.N) return;
@@ -106,17 +108,24 @@ METAL_FUNC void qwg_gemm_bf16_nax_bm64_fast(
     const short sgp_sm = short(min(int(SM), max(0, int(p.M) - int(m0))));
     const short sgp_sn = short(min(int(SN), max(0, int(p.N) - int(n0))));
     const bool sgActive = (sgp_sm > 0 && sgp_sn > 0);
-    const bool alignedM = (sgp_sm == SM);
     const bool vec16W = ((p.K & 7u) == 0u) && ((size_t(W) & 15u) == 0u);
+    const bool vec16X = ((p.strideX & 7u) == 0u) && ((size_t(xBF16) & 15u) == 0u);
 
     NAXTile<float, TM, TN> Dtile;
     Dtile.clear();
-    const device bfloat* xRowPtr = xBF16 + size_t(min(m0, p.M - 1u)) * p.strideX;
+
     const uint bRow = tgN0 + (lid >> 1u);
     const uint bColOff = (lid & 1u) * 16u;
     const bool validBRow = (bRow < p.N);
     const device bfloat* wStageRow = W + size_t(validBRow ? bRow : tgN0) * p.K;
-    threadgroup ushort4* dst = bShU4 + size_t(lid >> 1u) * 9u + size_t(lid & 1u) * 4u;
+    threadgroup ushort4* bDst = bShU4 + size_t(lid >> 1u) * 9u + size_t(lid & 1u) * 4u;
+
+    const uint aLocalRow = (BM == 64) ? (lid >> 1u) : (lid >> 2u);
+    const uint aColOff = (BM == 64) ? ((lid & 1u) * 16u) : ((lid & 3u) * 8u);
+    const uint aRow = tgM0 + aLocalRow;
+    const bool validARow = (aRow < p.M);
+    const device ushort* xStageRow = ((device const ushort*)xBF16) + size_t(validARow ? aRow : tgM0) * p.strideX;
+    threadgroup ushort4* aDst = aShU4 + size_t(aLocalRow) * 9u + size_t(aColOff >> 2u);
 
     STEEL_PRAGMA_NO_UNROLL
     for (uint k0 = 0u; k0 < p.K; k0 += uint(SK)) {
@@ -124,25 +133,80 @@ METAL_FUNC void qwg_gemm_bf16_nax_bm64_fast(
             if (vec16W) {
                 const uint4 u0 = *(device const uint4*)(wStageRow + k0 + bColOff);
                 const uint4 u1 = *(device const uint4*)(wStageRow + k0 + bColOff + 8u);
-                dst[0] = ushort4(ushort(u0.x), ushort(u0.x >> 16u), ushort(u0.y), ushort(u0.y >> 16u));
-                dst[1] = ushort4(ushort(u0.z), ushort(u0.z >> 16u), ushort(u0.w), ushort(u0.w >> 16u));
-                dst[2] = ushort4(ushort(u1.x), ushort(u1.x >> 16u), ushort(u1.y), ushort(u1.y >> 16u));
-                dst[3] = ushort4(ushort(u1.z), ushort(u1.z >> 16u), ushort(u1.w), ushort(u1.w >> 16u));
+                bDst[0] = ushort4(ushort(u0.x), ushort(u0.x >> 16u), ushort(u0.y), ushort(u0.y >> 16u));
+                bDst[1] = ushort4(ushort(u0.z), ushort(u0.z >> 16u), ushort(u0.w), ushort(u0.w >> 16u));
+                bDst[2] = ushort4(ushort(u1.x), ushort(u1.x >> 16u), ushort(u1.y), ushort(u1.y >> 16u));
+                bDst[3] = ushort4(ushort(u1.z), ushort(u1.z >> 16u), ushort(u1.w), ushort(u1.w >> 16u));
             } else {
                 const device ushort4* wp = (device const ushort4*)(wStageRow + k0 + bColOff);
-                dst[0] = wp[0]; dst[1] = wp[1]; dst[2] = wp[2]; dst[3] = wp[3];
+                bDst[0] = wp[0]; bDst[1] = wp[1]; bDst[2] = wp[2]; bDst[3] = wp[3];
             }
         } else {
-            dst[0] = ushort4(0); dst[1] = ushort4(0); dst[2] = ushort4(0); dst[3] = ushort4(0);
+            bDst[0] = ushort4(0); bDst[1] = ushort4(0); bDst[2] = ushort4(0); bDst[3] = ushort4(0);
         }
-        NAXTile<bfloat, TM, TK> Atile;
-        if (sgActive) {
-            if (alignedM) Atile.load(xRowPtr + k0, int(p.strideX));
-            else Atile.load_rows(xRowPtr + k0, int(p.strideX), sgp_sm);
+
+        if (validARow) {
+            if constexpr (BM == 64) {
+                const uint4 u0 = vec16X
+                    ? *(device const uint4*)(xStageRow + k0 + aColOff)
+                    : uint4(((device const uint*)(xStageRow + k0 + aColOff))[0],
+                            ((device const uint*)(xStageRow + k0 + aColOff))[1],
+                            ((device const uint*)(xStageRow + k0 + aColOff))[2],
+                            ((device const uint*)(xStageRow + k0 + aColOff))[3]);
+                const uint4 u1 = vec16X
+                    ? *(device const uint4*)(xStageRow + k0 + aColOff + 8u)
+                    : uint4(((device const uint*)(xStageRow + k0 + aColOff + 8u))[0],
+                            ((device const uint*)(xStageRow + k0 + aColOff + 8u))[1],
+                            ((device const uint*)(xStageRow + k0 + aColOff + 8u))[2],
+                            ((device const uint*)(xStageRow + k0 + aColOff + 8u))[3]);
+                ushort4 s0 = ushort4(ushort(u0.x), ushort(u0.x >> 16u), ushort(u0.y), ushort(u0.y >> 16u));
+                ushort4 s1 = ushort4(ushort(u0.z), ushort(u0.z >> 16u), ushort(u0.w), ushort(u0.w >> 16u));
+                ushort4 s2 = ushort4(ushort(u1.x), ushort(u1.x >> 16u), ushort(u1.y), ushort(u1.y >> 16u));
+                ushort4 s3 = ushort4(ushort(u1.z), ushort(u1.z >> 16u), ushort(u1.w), ushort(u1.w >> 16u));
+                if constexpr (IN_F16) {
+                    s0 = ushort4(as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s0.x)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s0.y)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s0.z)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s0.w)))));
+                    s1 = ushort4(as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s1.x)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s1.y)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s1.z)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s1.w)))));
+                    s2 = ushort4(as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s2.x)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s2.y)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s2.z)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s2.w)))));
+                    s3 = ushort4(as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s3.x)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s3.y)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s3.z)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s3.w)))));
+                }
+                aDst[0] = s0; aDst[1] = s1; aDst[2] = s2; aDst[3] = s3;
+            } else {
+                const device ushort4* xp = (device const ushort4*)(xStageRow + k0 + aColOff);
+                ushort4 s0 = xp[0], s1 = xp[1];
+                if constexpr (IN_F16) {
+                    s0 = ushort4(as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s0.x)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s0.y)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s0.z)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s0.w)))));
+                    s1 = ushort4(as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s1.x)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s1.y)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s1.z)))),
+                                 as_type<ushort>(qwg_fp_bf16(float(as_type<half>(s1.w)))));
+                }
+                aDst[0] = s0; aDst[1] = s1;
+            }
+        } else {
+            aDst[0] = ushort4(0); aDst[1] = ushort4(0);
+            if constexpr (BM == 64) { aDst[2] = ushort4(0); aDst[3] = ushort4(0); }
         }
+
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sgActive) {
+            NAXTile<bfloat, TM, TK> Atile;
             NAXTile<bfloat, TN, TK> Btile;
+            Atile.template load<bfloat, 36, 1>((threadgroup const bfloat*)(aShU4 + size_t(sgM * SM) * 9u));
             Btile.template load<bfloat, 36, 1>((threadgroup const bfloat*)(bShU4 + size_t(sgN * SN) * 9u));
             tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
         }
@@ -152,6 +216,8 @@ METAL_FUNC void qwg_gemm_bf16_nax_bm64_fast(
     if (!sgActive) return;
     const short2 sc = BaseNAXFrag::get_coord();
     const bool fastStoreBF = (p.addResidual == 0u) && (p.softcap == 0.0f) && (p.outIsF32 == 0u)
+        && ((p.strideY & 3u) == 0u) && ((size_t(yBF16) & 7u) == 0u);
+    const bool fastStoreF16 = (p.addResidual == 0u) && (p.softcap == 0.0f) && (p.outIsF32 == 2u)
         && ((p.strideY & 3u) == 0u) && ((size_t(yBF16) & 7u) == 0u);
     const_for_loop<0, TM, 1>([&](auto mm) {
         const_for_loop<0, TN, 1>([&](auto nn) {
@@ -167,6 +233,9 @@ METAL_FUNC void qwg_gemm_bf16_nax_bm64_fast(
                         as_type<ushort>(qwg_fp_bf16(df[i * 4 + 1])),
                         as_type<ushort>(qwg_fp_bf16(df[i * 4 + 2])),
                         as_type<ushort>(qwg_fp_bf16(df[i * 4 + 3])));
+                } else if (fastStoreF16 && gc0 + 4u <= p.N) {
+                    *(device ushort4*)(((device half*)yBF16) + size_t(gr) * p.strideY + gc0) = as_type<ushort4>(half4(
+                        half(df[i * 4 + 0]), half(df[i * 4 + 1]), half(df[i * 4 + 2]), half(df[i * 4 + 3])));
                 } else {
                     STEEL_PRAGMA_UNROLL
                     for (short j = 0; j < 4; ++j) {

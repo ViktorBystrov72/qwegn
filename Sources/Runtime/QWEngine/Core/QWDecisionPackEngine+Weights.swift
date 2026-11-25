@@ -483,4 +483,60 @@ enum QWDecisionWeightLoader {
         bits = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
         return UInt16(truncatingIfNeeded: bits >> 16)
     }
+
+    static func isVisionOrMediaTensorName(_ name: String) -> Bool {
+        let low = name.lowercased()
+        return low.contains("vision") || low.contains("visual")
+            || low.contains("patch_embed") || low.contains("multi_modal_projector")
+            || low.hasPrefix("vis_") || low.contains("projector.")
+            || low.contains("mm_projector") || low.contains("audio")
+    }
+
+    static func estimateResidentBytes(root: QWModelRoot, descriptor: QWModelDescriptor?, loadVision: Bool) -> Int? {
+        let hasVision = (descriptor?.visDepth ?? 0) > 0 || descriptor?.visionTowerConfig != nil
+        let isTied = descriptor?.tieWordEmbeddings ?? false
+        var total = 0
+        var visBytes = 0
+        switch root.kind {
+        case .qwp1:
+            guard let descriptor, let pack = try? QWQuant.Pack(url: root.weights, descriptor: descriptor) else { return nil }
+            for (name, entry) in pack.tensors {
+                if isTied && (name == "lm_head.weight" || name == "model.lm_head.weight") { continue }
+                let isVis = isVisionOrMediaTensorName(name)
+                if isVis && !loadVision { continue }
+                guard let layout = PlaneLayout.resolve(entry), let rawBytes = layout.byteCount(entry) else { continue }
+                let loadedBytes = (entry.rawOff != nil && entry.kind == "f32") ? (rawBytes / 2) : rawBytes
+                let aligned = max(64, qwAlignUp(loadedBytes, 64))
+                total += aligned
+                if isVis { visBytes += aligned }
+            }
+        case .safetensorsSingle, .safetensorsSharded:
+            guard let st = try? QWSafeTensorsContainer(url: root.weights, onlyTensors: nil) else { return nil }
+            for (name, tensor) in st.tensors {
+                if isTied && (name == "lm_head.weight" || name == "model.lm_head.weight") { continue }
+                let isVis = isVisionOrMediaTensorName(name)
+                if isVis && !loadVision { continue }
+                let loadedBytes = (tensor.dtype == .f32) ? (tensor.byteLength / 2) : tensor.byteLength
+                let aligned = max(64, qwAlignUp(loadedBytes, 64))
+                total += aligned
+                if isVis { visBytes += aligned }
+            }
+        default:
+            return nil
+        }
+        guard total > 0 else { return nil }
+        let runtimeOverhead = (96 << 20) + ((loadVision && hasVision) ? (visBytes + (48 << 20)) : 0)
+        return total + runtimeOverhead
+    }
+}
+
+extension QWDecisionPackEngine {
+    public static func estimateResidentBytes(at packPath: String, loadVision: Bool) -> Int? {
+        let root = QWModelRoot(url: URL(fileURLWithPath: packPath))
+        let desc: QWModelDescriptor? = {
+            guard let cfgURL = root.configURL, let data = try? Data(contentsOf: cfgURL) else { return nil }
+            return try? QWModelDescriptor.decode(configJSON: data)
+        }()
+        return QWDecisionWeightLoader.estimateResidentBytes(root: root, descriptor: desc, loadVision: loadVision)
+    }
 }

@@ -218,6 +218,18 @@ extension CupertinoTelemetryView {
                 guard bytes > 0 else { return nil }
                 return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)
             }
+            let archLabel: String? = facts.decisionSidecarArchetype.flatMap { raw -> String? in
+                switch raw {
+                case "verbalizer", "causal_verbalizer": return "Verbalizer"
+                case "optionMarkers": return "Markers"
+                case "optionMarkers+CoreAI": return "Markers ANE"
+                case "verbalizer+CoreAI": return "Verbalizer ANE"
+                case "sequencePair", "pooled_classifier", "encoder_pointer": return "CrossEncoder"
+                default: return raw.isEmpty ? nil : raw
+                }
+            }
+            let visionLabel: String? = facts.decisionSidecarVision.map { $0 ? "Vision" : "Text-Only" }
+            let tokensText: String? = facts.decisionSidecarPromptTokens.flatMap { $0 > 0 ? "\($0) tok" : nil }
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .center, spacing: 8) {
@@ -268,6 +280,28 @@ extension CupertinoTelemetryView {
                     Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+                if visionLabel != nil || archLabel != nil || tokensText != nil {
+                    HStack(spacing: 5) {
+                        if let visionLabel {
+                            factPill(
+                                visionLabel,
+                                tint: facts.decisionSidecarVision == true ? TelemetryTheme.cool : TelemetryTheme.neutral
+                            )
+                            .fixedSize(horizontal: true, vertical: false)
+                        }
+                        if let archLabel {
+                            factPill(archLabel, tint: TelemetryTheme.neutral)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        if let tokensText {
+                            factPill(tokensText, tint: TelemetryTheme.neutral)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)

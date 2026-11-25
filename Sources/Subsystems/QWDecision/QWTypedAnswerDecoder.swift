@@ -477,6 +477,8 @@ public enum QWTypedAnswerDecoder {
             parsedNum = parseReadNumber(extractedText)
         }
         let parsedDate: String? = bound.question.readKind == .date ? extractedText : nil
+        let charLo = String(decoding: origBytes[0..<sLo], as: UTF8.self).unicodeScalars.count
+        let charLen = String(decoding: origBytes[sLo..<sHi], as: UTF8.self).unicodeScalars.count
         return QWDecisionAnswer(
             name: bound.question.name,
             kind: .read,
@@ -485,6 +487,7 @@ public enum QWTypedAnswerDecoder {
             number: parsedNum,
             date: parsedDate,
             span: sLo..<sHi,
+            charSpan: charLo..<(charLo + charLen),
             jsonPath: matchedPath,
             found: true,
             foundProb: calFound
@@ -575,7 +578,8 @@ public enum QWTypedAnswerDecoder {
             presence.append(below)
         }
         for (blkIdx, below) in presence.enumerated() {
-            if below < 0.5 {
+            let emitFallback = !isMany && bound.question.alwaysEmitBox
+            if below < 0.5 && !emitFallback {
                 if isMany { break }
                 return QWDecisionAnswer(name: bound.question.name, kind: .box, confidence: 0.0, found: false, foundProb: below)
             }
@@ -620,11 +624,12 @@ public enum QWTypedAnswerDecoder {
             }
         }
         let atLeast = isMany && !boxes.isEmpty && boxes.count == presence.count
+        let anyFound = presence.contains(where: { $0 >= 0.5 })
         return QWDecisionAnswer(
             name: bound.question.name,
             kind: bound.question.kind,
             confidence: boxes.first?.confidence ?? 0.0,
-            found: !boxes.isEmpty,
+            found: isMany ? !boxes.isEmpty : anyFound,
             foundProb: presence.first,
             boxes: boxes,
             atLeast: atLeast,

@@ -343,20 +343,42 @@ function renderSettingsForm(s) {
           <option value="q4" ${activeKV === "q4" ? "selected" : ""}>Q4_0</option>
         </select>
       </div>
-      <div class="form-field"><label>Decision Sidecar Model Pack (Dual-Slot)</label>
+      <div class="form-field"><label for="settings-decision-pack">Decision Sidecar Model Pack (Dual-Slot)</label>
         <input id="settings-decision-pack" class="input mono" data-setting="decisionModelPackPath" value="${escapeHtml(s.decisionModelPackPath || "")}" placeholder="~/.qwg/models/&lt;decision-pack&gt; or .aimodel (empty = disabled)" />
       </div>
-      <div class="form-field"><label>Decision Sidecar Compute Unit</label>
+      <div class="form-field"><label for="settings-decision-unit">Decision Sidecar Compute Unit</label>
         <select id="settings-decision-unit" class="select" data-setting="decisionComputeUnit">
           <option value="auto" ${(s.decisionComputeUnit || "auto") === "auto" ? "selected" : ""}>Auto (ANE / Metal 4)</option>
           <option value="metal" ${s.decisionComputeUnit === "metal" ? "selected" : ""}>Metal 4 GPU</option>
           <option value="ane" ${s.decisionComputeUnit === "ane" ? "selected" : ""}>Apple Neural Engine (ANE)</option>
         </select>
       </div>
-      <div class="form-field"><label>Load Decision Vision Tower</label>
+      <div class="form-field"><label for="settings-decision-vision">Load Decision Vision Tower</label>
         <select id="settings-decision-vision" class="select" data-setting-bool="decisionLoadVision">
           <option value="true" ${s.decisionLoadVision !== false ? "selected" : ""}>Enabled</option>
           <option value="false" ${s.decisionLoadVision === false ? "selected" : ""}>Disabled</option>
+        </select>
+      </div>
+      <div class="form-field"><label for="settings-decision-readout">Decision Score Readout</label>
+        <select id="settings-decision-readout" class="select" data-setting="decisionDefaultScoreReadout">
+          <option value="mean" ${(s.decisionDefaultScoreReadout || "mean") === "mean" ? "selected" : ""}>Mean (Calibrated)</option>
+          <option value="mode" ${s.decisionDefaultScoreReadout === "mode" ? "selected" : ""}>Mode (MAP)</option>
+          <option value="median" ${s.decisionDefaultScoreReadout === "median" ? "selected" : ""}>Median</option>
+        </select>
+      </div>
+      <div class="form-field"><label for="settings-decision-truncation">Decision Truncation Policy</label>
+        <select id="settings-decision-truncation" class="select" data-setting="decisionDefaultTruncation">
+          <option value="auto_state" ${(s.decisionDefaultTruncation || "auto_state") === "auto_state" ? "selected" : ""}>Auto State (Preserve Question)</option>
+          <option value="error" ${s.decisionDefaultTruncation === "error" ? "selected" : ""}>Strict Error</option>
+          <option value="head" ${s.decisionDefaultTruncation === "head" ? "selected" : ""}>Keep Head</option>
+          <option value="tail" ${s.decisionDefaultTruncation === "tail" ? "selected" : ""}>Keep Tail</option>
+          <option value="middle" ${s.decisionDefaultTruncation === "middle" ? "selected" : ""}>Keep Head &amp; Tail</option>
+        </select>
+      </div>
+      <div class="form-field"><label for="settings-decision-always-box">Always Emit Best-Effort Box</label>
+        <select id="settings-decision-always-box" class="select" data-setting-bool="decisionAlwaysEmitBox">
+          <option value="false" ${s.decisionAlwaysEmitBox !== true ? "selected" : ""}>Confidence-Gated (Default)</option>
+          <option value="true" ${s.decisionAlwaysEmitBox === true ? "selected" : ""}>Always Emit Box Coordinates</option>
         </select>
       </div>
     </div>

@@ -148,6 +148,9 @@ public enum QWSettingsCoherence {
         "decisionModelPackPath": "Decision sidecar model pack",
         "decisionComputeUnit": "Decision sidecar compute unit",
         "decisionLoadVision": "Load decision vision tower",
+        "decisionDefaultScoreReadout": "Decision score readout",
+        "decisionDefaultTruncation": "Decision truncation policy",
+        "decisionAlwaysEmitBox": "Always emit box coordinates",
         "keepServerRunningAfterQuit": "Keep server running after quit",
     ]
 
@@ -166,6 +169,9 @@ public enum QWSettingsCoherence {
         "decisionModelPackPath": "Hot-loads or unloads the co-resident System-1 decision sidecar without restarting the primary LLM.",
         "decisionComputeUnit": "Selects auto, metal, or ane execution for the decision sidecar.",
         "decisionLoadVision": "Controls whether the decision sidecar loads multimodal vision weights.",
+        "decisionDefaultScoreReadout": "Default score aggregation readout (mean, median, or argmax) applied immediately to decision requests without an override.",
+        "decisionDefaultTruncation": "Default context truncation policy applied immediately to decision requests without an explicit policy.",
+        "decisionAlwaysEmitBox": "When enabled, always decodes best-effort box coordinates even below the presence threshold.",
     ]
 
     /// One canonical text per setting key, so two revisions can be

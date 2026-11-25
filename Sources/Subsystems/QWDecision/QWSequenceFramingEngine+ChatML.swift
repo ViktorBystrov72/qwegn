@@ -218,7 +218,21 @@ extension QWSequenceFramingEngine {
         }
         let fullBytes = Array(firstFull.utf8)
         let stateStart = headPrefixUTF8Count
-        let stateStop = stateStart + escapedState.escaped.utf8.count
+        let stateStop = min(fullBytes.count, stateStart + escapedState.escaped.utf8.count)
+        let stateByteCount = max(0, stateStop - stateStart)
+        var utf16Prefix = [Int](repeating: 0, count: stateByteCount + 1)
+        var scalarPrefix = [Int](repeating: 0, count: stateByteCount + 1)
+        var u16Acc = 0
+        var scAcc = 0
+        for off in 0..<stateByteCount {
+            let b = fullBytes[stateStart + off]
+            if (b & 0xC0) != 0x80 {
+                scAcc += 1
+                u16Acc += (b >= 0xF0) ? 2 : 1
+            }
+            utf16Prefix[off + 1] = u16Acc
+            scalarPrefix[off + 1] = scAcc
+        }
         var spansOut: [QWTokenSpan?] = []
         var maskOut: [Bool] = []
         spansOut.reserveCapacity(firstEncoded.spans.count)
@@ -241,12 +255,13 @@ extension QWSequenceFramingEngine {
                 if prefixSlice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    suffixSlice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    !innerSlice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let escRange = (lo - stateStart)..<(hi - stateStart)
+                    let escLo = lo - stateStart
+                    let escHi = hi - stateStart
                     matched = QWTokenSpan(
                         tokenId: tokSpan.tokenId,
-                        utf8Range: escRange,
-                        utf16Range: escRange,
-                        scalarRange: escRange
+                        utf8Range: escLo..<escHi,
+                        utf16Range: utf16Prefix[escLo]..<utf16Prefix[escHi],
+                        scalarRange: scalarPrefix[escLo]..<scalarPrefix[escHi]
                     )
                 }
             }

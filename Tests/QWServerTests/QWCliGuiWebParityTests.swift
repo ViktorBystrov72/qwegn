@@ -50,6 +50,12 @@ final class QWCliGuiWebParityTests: XCTestCase {
         "mtpEntropyThreshold": ["mtpEntropyThreshold"],
         "dflashDraftPackPath": ["dflashDraftPackPath"],
         "dflashSelectorTopK": ["dflashSelectorTopK"],
+        "decisionModelPackPath": ["decisionModelPackPath"],
+        "decisionComputeUnit": ["decisionComputeUnit"],
+        "decisionLoadVision": ["decisionLoadVision"],
+        "decisionDefaultScoreReadout": ["decisionDefaultScoreReadout"],
+        "decisionDefaultTruncation": ["decisionDefaultTruncation"],
+        "decisionAlwaysEmitBox": ["decisionAlwaysEmitBox"],
     ]
 
     func testAllCLIKnobsAndEngineTuningAreExposedInGUIAndWebUI() throws {

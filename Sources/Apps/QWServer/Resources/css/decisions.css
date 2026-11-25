@@ -179,3 +179,68 @@
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+.dec-preset-row,
+.dec-dialect-row,
+.dec-loader-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.dec-loader-bar .select {
+  max-width: 240px;
+  min-width: 0;
+}
+
+.dec-tel-facts {
+  margin-top: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+@media (max-width: 960px) {
+  .dec-tel-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.dec-tel-facts .fact-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.dec-pill,
+.dec-prob-head {
+  font-variant-numeric: tabular-nums;
+}
+
+.dec-ctrl-btn:focus-visible,
+.chat-sidecar-pill:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.chat-sidecar-pill {
+  cursor: pointer;
+  border-color: rgba(63, 185, 80, 0.35);
+  background: var(--active-soft);
+  color: var(--active);
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-route-badge {
+  border-color: rgba(56, 139, 253, 0.35);
+  background: var(--accent-soft);
+  color: var(--cool);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dec-ctrl-btn,
+  .chat-sidecar-pill,
+  .bar-fg {
+    transition: none !important;
+    animation: none !important;
+  }
+}

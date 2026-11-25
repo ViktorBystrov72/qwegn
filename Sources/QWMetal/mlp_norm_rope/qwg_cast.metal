@@ -21,3 +21,16 @@ kernel void qwg_cast_f32_to_f16(device const float* x [[buffer(0)]],
     for (uint i = 0; i < 8; i++) o.v[i] = half(xr[i]);
     y[u] = *(thread uint4*)&o;
 }
+
+kernel void qwg_cast_f16_to_f32(device const uint4* x [[buffer(0)]],
+                                device float* y       [[buffer(1)]],
+                                constant uint& nF8    [[buffer(2)]],
+                                uint tg [[threadgroup_position_in_grid]],
+                                uint ti [[thread_index_in_threadgroup]]) {
+    uint u = tg * 256u + ti;
+    if (u >= nF8) return;
+    const uint4 packed = x[u];
+    const H8 h = *(thread const H8*)&packed;
+    device float* yr = y + (size_t)u * 8u;
+    for (uint i = 0; i < 8; i++) yr[i] = float(h.v[i]);
+}

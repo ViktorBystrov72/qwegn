@@ -196,6 +196,17 @@ function syncChatHeaderWithDashboard() {
     const caps = modelObj && Array.isArray(modelObj.capabilities) ? modelObj.capabilities : [];
     chatEl("chat-vision-badge").textContent = (!connected || !modelObj) ? "Vision: —" : (caps.includes("vision") ? "Vision: Ready" : "Text-Only");
   }
+  const sidecarEl = chatEl("chat-sidecar-badge");
+  if (sidecarEl) {
+    const facts = modelObj && modelObj.facts ? modelObj.facts : null;
+    if (connected && facts && facts.decisionSidecarLoaded) {
+      const lat = typeof facts.decisionSidecarMeanLatencyMs === "number" ? ` · ${facts.decisionSidecarMeanLatencyMs.toFixed(1)}ms` : "";
+      sidecarEl.hidden = false;
+      sidecarEl.textContent = `Sidecar: ${facts.decisionSidecarModel || "Ready"}${lat}`;
+    } else {
+      sidecarEl.hidden = true;
+    }
+  }
   const session = getActiveChatSession();
   if (chatEl("chat-preset-badge")) {
     const matched = getAllSystemPresets().find((p) => p.id === session.presetId);
@@ -429,6 +440,7 @@ function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
     if (!msg.isStreaming && msg.content && isJsonMode) btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="format-json-turn" data-msg-id="${escapeHtml(msg.id)}">Format JSON</button>`);
     btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="toggle-raw-turn" data-msg-id="${escapeHtml(msg.id)}">${msg.isRaw ? "Rendered" : "Raw"}</button>`);
   }
+  if (!msg.isStreaming && msg.content) btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="send-to-decisions" data-msg-id="${escapeHtml(msg.id)}">Decisions →</button>`);
   btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="copy-turn" data-msg-id="${escapeHtml(msg.id)}">Copy</button>`);
   btns.push(`<button type="button" class="chat-turn-btn" data-chat-action="delete-turn" data-msg-id="${escapeHtml(msg.id)}" aria-label="Delete turn">×</button>`);
 
@@ -437,6 +449,9 @@ function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
     const jv = validateJsonTurnContent(msg.content);
     jsonBadgeHtml = `<span class="knob-pill chat-json-badge ${jv.valid ? "is-valid" : "is-invalid"}" title="${escapeHtml(jv.valid ? "Strict JSON verified" : (jv.reason || "Invalid JSON"))}">${jv.valid ? "JSON Valid" : "JSON Invalid"}</span>`;
   }
+  const routeBadgeHtml = isAssistant && msg.decisionRoute
+    ? `<span class="knob-pill mono chat-route-badge" title="Auto reasoning effort tier routed by Decision Sidecar">${escapeHtml(msg.decisionRoute)}</span>`
+    : "";
 
   let bodyHtml = "";
   if (chatState.editingMsgId === msg.id) {
@@ -460,7 +475,7 @@ function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
   }
   const roleClass = isUser ? "chat-turn-user" : (isTool ? "chat-turn-tool" : "chat-turn-assistant");
   return `<article id="chat-turn-${escapeHtml(msg.id)}" class="chat-turn ${roleClass}">
-    <div class="chat-turn-head"><div class="chat-turn-role"><span>${escapeHtml(roleLabel)}</span>${jsonBadgeHtml}${formatChatTurnMetrics(msg)}</div><div class="chat-turn-actions">${btns.join("")}</div></div>
+    <div class="chat-turn-head"><div class="chat-turn-role"><span>${escapeHtml(roleLabel)}</span>${jsonBadgeHtml}${routeBadgeHtml}${formatChatTurnMetrics(msg)}</div><div class="chat-turn-actions">${btns.join("")}</div></div>
     <div class="chat-turn-body">${bodyHtml}</div></article>`;
 }
 function updateStreamingChatTurn(msg, answeredToolCallIds) {
@@ -693,7 +708,9 @@ async function executeChatCompletion(session, opts) {
       method: "POST", headers: reqHeaders, body: JSON.stringify(payload), signal: controller ? controller.signal : undefined
     });
     const echoedReqId = res.headers && typeof res.headers.get === "function" ? res.headers.get("x-request-id") : "";
+    const routeHdr = res.headers && typeof res.headers.get === "function" ? res.headers.get("x-qwegn-decision-route") : "";
     assistantMsg.requestId = echoedReqId || reqId;
+    if (routeHdr) assistantMsg.decisionRoute = routeHdr;
     if (!res.ok) { const errBody = await res.json().catch(() => ({})); throw new Error((errBody.error && errBody.error.message) || errBody.message || `HTTP ${res.status}`); }
     if (payload.stream && res.body && typeof res.body.getReader === "function") await readChatSSEStream(res, assistantMsg, startedAt, acc);
     else {
@@ -731,6 +748,12 @@ function handleChatActionClick(e) {
     "format-json-turn": () => formatJsonChatTurn(id),
     "toggle-raw-turn": () => toggleChatTurnRaw(id),
     "copy-turn": () => copyChatTurnContent(id),
+    "send-to-decisions": () => {
+      const m = getActiveChatSession().messages.find((x) => x.id === id);
+      if (m && typeof openDecisionsWithPrefill === "function") {
+        openDecisionsWithPrefill(m.content || "", (m.images || []).map((i) => i.dataUrl).filter(Boolean));
+      }
+    },
     "delete-turn": () => deleteChatTurn(id),
     "save-edit-turn": () => saveAndResendChatTurn(id),
     "cancel-edit-turn": () => cancelEditChatTurn(),

@@ -28,12 +28,21 @@ private struct QWSigmoidGateMetalParams {
 public final class QWDecisionTopologyAttn: @unchecked Sendable {
     private let hal: QWHal
     private let psoPrefill: any MTLComputePipelineState
+    private let psoPrefillNAX64: (any MTLComputePipelineState)?
+    private let psoPrefillNAX128: (any MTLComputePipelineState)?
     private let psoSigmoidGate: any MTLComputePipelineState
 
     public init(hal: QWHal) throws {
         self.hal = hal
         self.psoPrefill = try hal.pipeline("qwg_attn_topology_prefill_f16")
         self.psoSigmoidGate = try hal.pipeline("qwg_attn_headwise_sigmoid_gate_f16")
+        if hal.caps.isMetal4TensorCapable {
+            self.psoPrefillNAX64 = try hal.pipeline("qwg_attn_topology_prefill_nax_d64")
+            self.psoPrefillNAX128 = try hal.pipeline("qwg_attn_topology_prefill_nax_d128")
+        } else {
+            self.psoPrefillNAX64 = nil
+            self.psoPrefillNAX128 = nil
+        }
     }
 
     public static func topologyCode(for topology: QWDecisionModelConfig.AttentionTopology) -> UInt32 {
@@ -61,7 +70,8 @@ public final class QWDecisionTopologyAttn: @unchecked Sendable {
         stateEndPos: Int = 0,
         mediaPrefixLen: Int = 0,
         slidingWindow: Int = 0,
-        scale: Float? = nil
+        scale: Float? = nil,
+        forceScalar: Bool = false
     ) throws {
         guard seqLen > 0, qHeads > 0, kvHeads > 0, headDim > 0, headDim <= 256,
               qHeads % kvHeads == 0, slidingWindow >= 0,
@@ -91,6 +101,30 @@ public final class QWDecisionTopologyAttn: @unchecked Sendable {
             slidingWindow: UInt32(max(0, slidingWindow)),
             scale: scale ?? (1.0 / sqrtf(Float(headDim)))
         )
+        let naxPSO: (any MTLComputePipelineState)?
+        if forceScalar {
+            naxPSO = nil
+        } else {
+            switch headDim {
+            case 64: naxPSO = psoPrefillNAX64
+            case 128: naxPSO = psoPrefillNAX128
+            default: naxPSO = nil
+            }
+        }
+        if let naxPSO {
+            enc.setComputePipelineState(naxPSO)
+            q.bind(enc, index: 0)
+            k.bind(enc, index: 1)
+            v.bind(enc, index: 2)
+            groupIds.bind(enc, index: 3)
+            out.bind(enc, index: 4)
+            enc.setBytes(&params, length: MemoryLayout<QWTopoAttnMetalParams>.stride, index: 5)
+            enc.dispatchThreadgroups(
+                MTLSize(width: qHeads, height: (seqLen + 31) / 32, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+            )
+            return
+        }
         enc.setComputePipelineState(psoPrefill)
         q.bind(enc, index: 0)
         k.bind(enc, index: 1)

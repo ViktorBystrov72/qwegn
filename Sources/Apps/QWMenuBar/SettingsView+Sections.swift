@@ -92,6 +92,7 @@ extension SettingsView {
                         Text("Auto (Decision Sidecar)").tag("auto")
                         Text("Low").tag("low")
                         Text("Medium").tag("medium")
+                        Text("High").tag("high")
                         Text("Extra High (Default)").tag("xhigh")
                     }
                     .labelsHidden()
