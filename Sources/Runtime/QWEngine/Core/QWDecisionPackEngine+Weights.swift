@@ -285,11 +285,16 @@ enum QWDecisionWeightLoader {
                   t1.byteLength == nEach * k * 2, t3.byteLength == nEach * k * 2 else { return nil }
             let totalBytes = (2 * nEach) * k * 2
             let buf = try allocSharedBuffer(bytes: totalBytes, hal: hal, buffers: &buffers)
-            try st.withBytes(of: w1Name) { (r1: UnsafeRawBufferPointer) in
-                if let p1 = r1.baseAddress { memcpy(buf.contents(), p1, t1.byteLength) }
-            }
-            try st.withBytes(of: w3Name) { (r3: UnsafeRawBufferPointer) in
-                if let p3 = r3.baseAddress { memcpy(buf.contents().advanced(by: t1.byteLength), p3, t3.byteLength) }
+            let dst = buf.contents()
+            try withExtendedLifetime(buf) {
+                try st.withBytes(of: w1Name) { (r1: UnsafeRawBufferPointer) in
+                    if let p1 = r1.baseAddress { dst.copyMemory(from: p1, byteCount: t1.byteLength) }
+                }
+                try st.withBytes(of: w3Name) { (r3: UnsafeRawBufferPointer) in
+                    if let p3 = r3.baseAddress {
+                        dst.advanced(by: t1.byteLength).copyMemory(from: p3, byteCount: t3.byteLength)
+                    }
+                }
             }
             let slice = QWFPBufferSlice(buffer: buf, offset: 0, bytes: totalBytes)
             return .bf16(QWGemmFP.BF16Bank(weights: slice, n: 2 * nEach, k: k))
@@ -305,8 +310,15 @@ enum QWDecisionWeightLoader {
                       b1 == nEach * k * 2, b3 == nEach * k * 2 else { return nil }
                 let totalBytes = b1 + b3
                 let buf = try allocSharedBuffer(bytes: totalBytes, hal: hal, buffers: &buffers)
-                _ = try pack.withRawPointer(at: o1, byteCount: b1) { (p1: UnsafeRawPointer) in memcpy(buf.contents(), p1, b1) }
-                _ = try pack.withRawPointer(at: o3, byteCount: b3) { (p3: UnsafeRawPointer) in memcpy(buf.contents().advanced(by: b1), p3, b3) }
+                let dst = buf.contents()
+                try withExtendedLifetime(buf) {
+                    try pack.withRawPointer(at: o1, byteCount: b1) { (p1: UnsafeRawPointer) in
+                        dst.copyMemory(from: p1, byteCount: b1)
+                    }
+                    try pack.withRawPointer(at: o3, byteCount: b3) { (p3: UnsafeRawPointer) in
+                        dst.advanced(by: b1).copyMemory(from: p3, byteCount: b3)
+                    }
+                }
                 let slice = QWFPBufferSlice(buffer: buf, offset: 0, bytes: totalBytes)
                 return .bf16(QWGemmFP.BF16Bank(weights: slice, n: 2 * nEach, k: k))
             }
@@ -315,8 +327,15 @@ enum QWDecisionWeightLoader {
             }
             let totalBytes = b1 + b3
             let buf = try allocSharedBuffer(bytes: totalBytes, hal: hal, buffers: &buffers)
-            _ = try pack.withRawPointer(at: o1, byteCount: b1) { (p1: UnsafeRawPointer) in memcpy(buf.contents(), p1, b1) }
-            _ = try pack.withRawPointer(at: o3, byteCount: b3) { (p3: UnsafeRawPointer) in memcpy(buf.contents().advanced(by: b1), p3, b3) }
+            let dst = buf.contents()
+            try withExtendedLifetime(buf) {
+                try pack.withRawPointer(at: o1, byteCount: b1) { (p1: UnsafeRawPointer) in
+                    dst.copyMemory(from: p1, byteCount: b1)
+                }
+                try pack.withRawPointer(at: o3, byteCount: b3) { (p3: UnsafeRawPointer) in
+                    dst.advanced(by: b1).copyMemory(from: p3, byteCount: b3)
+                }
+            }
             let tv = QWTensorValue(region: QWMRegion(buffer: buf, base: 0, length: buf.length), offset: 0, shape: QWTensorShape([totalBytes / 2], .f16))
             guard let view = QWWeightView(blocks: tv, n: 2 * nEach, k: k, containerKind: k1) else { return nil }
             return .quant(view)
@@ -331,8 +350,11 @@ enum QWDecisionWeightLoader {
             if e.rawOff == nil, let kind = containerKind(from: e),
                let layout = PlaneLayout.resolve(e), let off = layout.offset(e), let bytes = layout.byteCount(e) {
                 let buf = try allocSharedBuffer(bytes: bytes, hal: hal, buffers: &buffers)
-                try pack.withRawPointer(at: off, byteCount: bytes) { (ptr: UnsafeRawPointer) in
-                    if bytes > 0 { memcpy(buf.contents(), ptr, bytes) }
+                let dst = buf.contents()
+                try withExtendedLifetime(buf) {
+                    try pack.withRawPointer(at: off, byteCount: bytes) { (ptr: UnsafeRawPointer) in
+                        if bytes > 0 { dst.copyMemory(from: ptr, byteCount: bytes) }
+                    }
                 }
                 let tv = QWTensorValue(region: QWMRegion(buffer: buf, base: 0, length: buf.length), offset: 0, shape: QWTensorShape([bytes / 2], .f16))
                 guard let view = QWWeightView(blocks: tv, n: n, k: k, containerKind: kind) else {
@@ -351,12 +373,15 @@ enum QWDecisionWeightLoader {
         let count = rows * cols
         let byteLen = count * 2
         let buf = try allocSharedBuffer(bytes: byteLen, hal: hal, buffers: &buffers)
+        let dst = buf.contents()
         switch source {
         case .safetensors(let st):
             guard let t = st.tensor(name) else { throw QWDecisionError.backendFailed("missing SafeTensors tensor: \(name)") }
-            try st.withBytes(of: name) { (raw: UnsafeRawBufferPointer) in
-                guard let src = raw.baseAddress else { return }
-                convertToBF16(src: src, srcDtype: t.dtype.rawValue, count: count, expectedSrcBytes: t.byteLength, dst: buf.contents())
+            try withExtendedLifetime(buf) {
+                try st.withBytes(of: name) { (raw: UnsafeRawBufferPointer) in
+                    guard let src = raw.baseAddress else { return }
+                    convertToBF16(src: src, srcDtype: t.dtype.rawValue, count: count, expectedSrcBytes: t.byteLength, dst: dst)
+                }
             }
         case .qwp(let pack):
             let e = try pack.entry(name)
@@ -364,13 +389,15 @@ enum QWDecisionWeightLoader {
                 throw QWDecisionError.backendFailed("invalid QWP1 layout for \(name)")
             }
             if e.rawOff != nil {
-                try pack.withRawPointer(at: off, byteCount: bytes) { (src: UnsafeRawPointer) in
-                    convertToBF16(src: src, srcDtype: e.kind ?? "bf16", count: count, expectedSrcBytes: bytes, dst: buf.contents())
+                try withExtendedLifetime(buf) {
+                    try pack.withRawPointer(at: off, byteCount: bytes) { (src: UnsafeRawPointer) in
+                        convertToBF16(src: src, srcDtype: e.kind ?? "bf16", count: count, expectedSrcBytes: bytes, dst: dst)
+                    }
                 }
             } else {
                 let f32 = try pack.dequantQ4g(name)
-                let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
-                for i in 0..<min(count, f32.count) { dst[i] = f32ToBF16(f32[i]) }
+                let bf16Dst = dst.assumingMemoryBound(to: UInt16.self)
+                for i in 0..<min(count, f32.count) { bf16Dst[i] = f32ToBF16(f32[i]) }
             }
         }
         return QWTensorValue(region: QWMRegion(buffer: buf, base: 0, length: buf.length), offset: 0, shape: QWTensorShape([rows, cols], .bf16))

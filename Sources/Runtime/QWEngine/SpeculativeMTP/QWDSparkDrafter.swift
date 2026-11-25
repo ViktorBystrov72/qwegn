@@ -36,9 +36,12 @@ final class QWDSparkDrafter: @unchecked Sendable {
 
         func restoreSnapshot(_ data: Data) -> Bool {
             guard data.count == ringBytes else { return false }
-            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                guard let base = raw.baseAddress else { return }
-                ringBuffer.contents().copyMemory(from: base, byteCount: ringBytes)
+            let ringDst = ringBuffer.contents()
+            withExtendedLifetime(ringBuffer) {
+                data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    guard let base = raw.baseAddress else { return }
+                    ringDst.copyMemory(from: base, byteCount: ringBytes)
+                }
             }
             return true
         }

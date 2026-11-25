@@ -436,4 +436,18 @@ final class QWDecisionServerTests: XCTestCase {
             }
         }
     }
+
+    func testEstimateDecisionSidecarBytesDoesNotCrawlParentDirectoryForMissingPath() throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwg-sidecar-est-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let siblingURL = tmpDir.appendingPathComponent("sibling.bin")
+        try Data(repeating: 0xAA, count: 1 << 20).write(to: siblingURL)
+
+        let missingPath = tmpDir.appendingPathComponent("missing-pack").path
+        XCTAssertEqual(QWEngineLifecycleActor.estimateDecisionSidecarBytes(at: missingPath), 256 << 20)
+        XCTAssertEqual(QWEngineLifecycleActor.estimateDecisionSidecarBytes(at: siblingURL.path), 1 << 20)
+    }
 }

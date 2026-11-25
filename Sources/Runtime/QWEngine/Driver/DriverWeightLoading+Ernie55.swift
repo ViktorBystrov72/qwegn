@@ -541,9 +541,12 @@ extension QWEngineDriver.WeightLoader {
             throw QWAllocError.outOfSpace(region: "flashindexer-bias", asked: biasBytes, free: 0)
         }
         biasBuf.label = "flashindexer-bias-\(blk)"
-        biasFloats.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            if let src = raw.baseAddress {
-                biasBuf.contents().copyMemory(from: src, byteCount: biasFloats.count * 4)
+        let biasDst = biasBuf.contents()
+        withExtendedLifetime(biasBuf) {
+            biasFloats.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                if let src = raw.baseAddress {
+                    biasDst.copyMemory(from: src, byteCount: biasFloats.count * 4)
+                }
             }
         }
         let biasTensor = QWTensorValue(

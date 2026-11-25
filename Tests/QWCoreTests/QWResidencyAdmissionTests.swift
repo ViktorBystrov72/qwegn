@@ -123,6 +123,37 @@ final class QWResidencyAdmissionTests: XCTestCase {
             snapshot: contended128.capture()
         ))
     }
+
+    func testDecisionSidecarAdmissionOnSmallHostEnforcesLargeAndAllowsTinyFixture() {
+        let smallHost = QWDeviceMemorySnapshot(physicalBytes: 7 * GiB, reclaimableBytes: 2 * GiB)
+        let tiny = QWResidencyAdmission.admitDecisionSidecar(
+            primaryWiredBytes: 0,
+            sidecarEstimateBytes: 256 * MiB,
+            requestedWarmCacheBytes: 1 * GiB,
+            requestedSessions: 4,
+            snapshot: smallHost
+        )
+        XCTAssertTrue(tiny.admitted)
+
+        let large = QWResidencyAdmission.admitDecisionSidecar(
+            primaryWiredBytes: 0,
+            sidecarEstimateBytes: 2 * GiB,
+            requestedWarmCacheBytes: 1 * GiB,
+            requestedSessions: 4,
+            snapshot: smallHost
+        )
+        XCTAssertFalse(large.admitted)
+
+        let explicitReserveRefused = QWResidencyAdmission.admitDecisionSidecar(
+            primaryWiredBytes: 0,
+            sidecarEstimateBytes: 256 * MiB,
+            requestedWarmCacheBytes: 1 * GiB,
+            requestedSessions: 4,
+            osReserveGiB: 8.0,
+            snapshot: smallHost
+        )
+        XCTAssertFalse(explicitReserveRefused.admitted)
+    }
 }
 
 private struct QWSyntheticDeviceMemorySnapshot: QWDeviceMemorySnapshotSource, Equatable {

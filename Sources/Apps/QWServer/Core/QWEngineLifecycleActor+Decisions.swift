@@ -467,8 +467,15 @@ extension QWEngineLifecycleActor {
     }
 
     static func estimateDecisionSidecarBytes(at packPath: String) -> Int {
-        let root = QWModelRoot(url: URL(fileURLWithPath: packPath))
-        if let cfgURL = root.configURL,
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: packPath, isDirectory: &isDir) else {
+            return 256 << 20
+        }
+        let url = URL(fileURLWithPath: packPath)
+        let root = QWModelRoot(url: url)
+        if (isDir.boolValue || root.kind != nil),
+           let cfgURL = root.configURL,
            let cfgData = try? Data(contentsOf: cfgURL),
            let desc = try? QWModelDescriptor.decode(configJSON: cfgData) {
             let est = QWEngine.estimateContextMemory(
@@ -479,8 +486,8 @@ extension QWEngineLifecycleActor {
             )
             if est.requiredBytes > 0 { return est.requiredBytes }
         }
-        let fm = FileManager.default
-        if let enumerator = fm.enumerator(at: root.directory, includingPropertiesForKeys: [.fileSizeKey]) {
+        if isDir.boolValue,
+           let enumerator = fm.enumerator(at: root.directory, includingPropertiesForKeys: [.fileSizeKey]) {
             var total = 0
             for case let fileURL as URL in enumerator {
                 if let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize {
@@ -488,6 +495,10 @@ extension QWEngineLifecycleActor {
                 }
             }
             if total > 0 { return total }
+        } else if !isDir.boolValue,
+                  let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+                  size > 0 {
+            return size
         }
         return 256 << 20
     }
