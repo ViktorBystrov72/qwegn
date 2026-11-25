@@ -386,6 +386,7 @@ final class QWInkling2Weights: @unchecked Sendable {
 
         let _ = loadVision
         let hasVis = st.tensor("vision_tower.embeddings.patch_embedding.weight") != nil
+            || st.tensor("model.visual.embeddings.patch_embedding.weight") != nil
         self.init(
             embedTokens: embedTokens,
             embedNorm: embedNorm,

@@ -237,6 +237,7 @@ public struct AnthropicMessagesRequest: Decodable, Sendable {
 
         var textParts: [String] = []
         var imageUrls: [String] = []
+        var videoSpecs: [QWVideoInputSpec] = []
         var reasoningParts: [String] = []
         var toolCalls: [ToolCall] = []
         var toolResults: [ChatMessage] = []
@@ -257,6 +258,19 @@ public struct AnthropicMessagesRequest: Decodable, Sendable {
                     imageUrls.append("data:\(mediaType);base64,\(data)")
                 } else if case .string(let url) = src.get("url"), !url.isEmpty {
                     imageUrls.append(url)
+                }
+            case "video":
+                let src = block.get("source")
+                let fps = QWSchemaMetadataCoercion.strictDouble(block.get("fps"))
+                let maxFrames = QWSchemaMetadataCoercion.strictInt(block.get("max_frames"))
+                if case .string(let data) = src.get("data"), !data.isEmpty {
+                    let mediaType: String
+                    if case .string(let mt) = src.get("media_type") { mediaType = mt } else { mediaType = "video/mp4" }
+                    videoSpecs.append(QWVideoInputSpec(
+                        url: "data:\(mediaType);base64,\(data)", fps: fps, maxFrames: maxFrames
+                    ))
+                } else if case .string(let url) = src.get("url"), !url.isEmpty {
+                    videoSpecs.append(QWVideoInputSpec(url: url, fps: fps, maxFrames: maxFrames))
                 }
             case "tool_use":
                 let id: String
@@ -281,10 +295,11 @@ public struct AnthropicMessagesRequest: Decodable, Sendable {
 
         var out: [ChatMessage] = toolResults
         let joinedText = textParts.joined(separator: "")
-        if !imageUrls.isEmpty {
+        if !imageUrls.isEmpty || !videoSpecs.isEmpty {
             var parts: [ChatMessageContent.Part] = []
             if !joinedText.isEmpty { parts.append(.text(joinedText)) }
             for url in imageUrls { parts.append(.imageUrl(url)) }
+            for vid in videoSpecs { parts.append(.videoUrl(vid)) }
             out.append(ChatMessage(role: role, content: ChatMessageContent(parts: parts)))
         } else if !toolCalls.isEmpty || !joinedText.isEmpty || !reasoningParts.isEmpty || out.isEmpty {
             let msgContent: ChatMessageContent? = (!joinedText.isEmpty || toolCalls.isEmpty)

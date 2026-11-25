@@ -73,6 +73,79 @@ public enum QWResidencyAdmission {
         public var totalFixedBytes: Int { weightsBytes + pleResidentBytes + fixedScratchBytes }
     }
 
+    public struct DecisionSidecarAdmission: Sendable, Equatable {
+        public let admitted: Bool
+        public let primaryWiredBytes: Int
+        public let sidecarEstimateBytes: Int
+        public let availableBytes: Int
+        public let warmCache: WarmCacheAdmission
+        public let reason: String?
+
+        public init(
+            admitted: Bool,
+            primaryWiredBytes: Int,
+            sidecarEstimateBytes: Int,
+            availableBytes: Int,
+            warmCache: WarmCacheAdmission,
+            reason: String?
+        ) {
+            self.admitted = admitted
+            self.primaryWiredBytes = primaryWiredBytes
+            self.sidecarEstimateBytes = sidecarEstimateBytes
+            self.availableBytes = availableBytes
+            self.warmCache = warmCache
+            self.reason = reason
+        }
+    }
+
+    /// Verifies that co-resident primary model + System-1 decision sidecar fit within available UMA,
+    /// clamping warm RAM prefix caches first and refusing before allocation if fixed memory exceeds budget.
+    public static func admitDecisionSidecar(
+        primaryWiredBytes: Int,
+        sidecarEstimateBytes: Int,
+        requestedWarmCacheBytes: Int,
+        requestedSessions: Int,
+        osReserveGiB: Double? = nil,
+        snapshot: QWDeviceMemorySnapshot = QWLiveDeviceMemorySnapshotSource().capture()
+    ) -> DecisionSidecarAdmission {
+        let pBytes = max(0, primaryWiredBytes)
+        let sBytes = max(0, sidecarEstimateBytes)
+        let avail = availableBytes(snapshot: snapshot, osReserveGiB: osReserveGiB)
+        let combined = pBytes + sBytes
+        guard combined <= avail else {
+            let zeroWarm = WarmCacheAdmission(
+                requestedWarmBytes: max(0, requestedWarmCacheBytes),
+                admittedWarmBytes: 0,
+                maxConcurrentSessions: 1,
+                clamped: true
+            )
+            return DecisionSidecarAdmission(
+                admitted: false,
+                primaryWiredBytes: pBytes,
+                sidecarEstimateBytes: sBytes,
+                availableBytes: avail,
+                warmCache: zeroWarm,
+                reason: "decision sidecar (\(sBytes) B) + primary (\(pBytes) B) exceeds available UMA (\(avail) B)"
+            )
+        }
+        let warm = clampWarmCache(
+            requestedWarmBytes: requestedWarmCacheBytes,
+            requestedSessions: requestedSessions,
+            wiredEngineBytes: combined,
+            osReserveGiB: osReserveGiB,
+            measuredAfterWire: false,
+            snapshot: snapshot
+        )
+        return DecisionSidecarAdmission(
+            admitted: true,
+            primaryWiredBytes: pBytes,
+            sidecarEstimateBytes: sBytes,
+            availableBytes: avail,
+            warmCache: warm,
+            reason: nil
+        )
+    }
+
     /// Computes available UMA bytes from a snapshot after subtracting the OS reserve.
     public static func availableBytes(snapshot: QWDeviceMemorySnapshot, osReserveGiB: Double? = nil) -> Int {
         let reserve: Int

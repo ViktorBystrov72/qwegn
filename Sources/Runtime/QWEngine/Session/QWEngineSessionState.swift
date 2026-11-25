@@ -21,6 +21,8 @@ public struct QWEngineSessionSnapshot: Sendable {
     let dflashKData: Data?
     let dflashVData: Data?
     let dflashCacheOffset: Int
+    let dsparkRingData: Data?
+    let dsparkCacheOffset: Int
     let sparseStateData: Data?
     let stochastic: QWStochasticState?
 
@@ -29,6 +31,7 @@ public struct QWEngineSessionSnapshot: Sendable {
          kvWritten: Int, mtpKVWritten: Int?, recData: Data, ringData: Data,
          trunkHiddenData: Data?, trunkHiddenValid: Bool,
          dflashKData: Data? = nil, dflashVData: Data? = nil, dflashCacheOffset: Int = 0,
+         dsparkRingData: Data? = nil, dsparkCacheOffset: Int = 0,
          sparseStateData: Data? = nil,
          stochastic: QWStochasticState? = nil) {
         self.source = source
@@ -47,6 +50,8 @@ public struct QWEngineSessionSnapshot: Sendable {
         self.dflashKData = dflashKData
         self.dflashVData = dflashVData
         self.dflashCacheOffset = dflashCacheOffset
+        self.dsparkRingData = dsparkRingData
+        self.dsparkCacheOffset = dsparkCacheOffset
         self.sparseStateData = sparseStateData
         self.stochastic = stochastic
     }
@@ -77,6 +82,8 @@ enum QWEngineSessionState {
                 Data(bytes: $0.vSlab.region.pointer.advanced(by: $0.vSlab.offset), count: $0.vSlab.bytes)
             },
             dflashCacheOffset: session.dflashCacheOffset,
+            dsparkRingData: session.dsparkSlot?.snapshotData(),
+            dsparkCacheOffset: session.dsparkCacheOffset,
             sparseStateData: sparseStateData,
             stochastic: try session.stochastic?.frozenState())
     }
@@ -160,6 +167,11 @@ enum QWEngineSessionState {
             }
         }
         session.dflashCacheOffset = snapshot.dflashCacheOffset
+        if let dsSlot = session.dsparkSlot, let rData = snapshot.dsparkRingData, dsSlot.restoreSnapshot(rData) {
+            session.dsparkCacheOffset = snapshot.dsparkCacheOffset
+        } else {
+            session.dsparkCacheOffset = 0
+        }
         session.trunkHiddenValid = snapshot.trunkHiddenValid
     }
 

@@ -404,6 +404,8 @@ extension QWLSASidecar {
         case .safetensorsSingle, .safetensorsSharded:
             let container = try QWSafeTensorsContainer(url: loc.weights)
             return try synthesizeFromSafeTensors(container: container, descriptor: descriptor, indexDim: indexDim)
+        case .coreAIModel:
+            throw QWLSASidecarError.svdFailed("LSA sidecar synthesis is not supported for CoreAI .aimodel bundles")
         }
     }
 

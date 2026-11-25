@@ -77,31 +77,39 @@ public enum QWToolCallParser {
                              startsInThinking: Bool = false,
                              truncated: Bool = false,
                              allowToolCalls: Bool = true,
-                             allowReasoningTags: Bool = true) -> ParseResult {
+                             allowReasoningTags: Bool = true,
+                             allowInk2Markers: Bool = false,
+                             toolEnvelopes: [QWToolCallEnvelope] = QWToolCallEnvelope.knownEnvelopes,
+                             thinkTags: [(open: String, close: String)] = QWChatStreamParser.defaultThinkTags) -> ParseResult {
         let parser = QWChatStreamParser(
             startsInReasoning: startsInThinking && allowReasoningTags,
             allowToolCalls: allowToolCalls,
-            allowReasoningTags: allowReasoningTags
+            allowReasoningTags: allowReasoningTags,
+            allowInk2Markers: allowInk2Markers,
+            toolEnvelopes: toolEnvelopes,
+            thinkTags: thinkTags
         )
         _ = parser.feed(text)
         _ = parser.finish()
         return parser.result(tools: allowToolCalls ? tools : nil, truncated: truncated)
     }
 
-    /// Splits accumulated `<tool_call>` segments into calls. A segment without its closing
-    /// tag is reported through `incomplete` and only returned as a call when `dropIncomplete`
-    /// is false.
-    static func parseToolSegments(_ text: String, tools: [QWJson]?, dropIncomplete: Bool)
-        -> (calls: [ToolCall], incomplete: Bool) {
+    /// Splits accumulated tool-envelope segments into calls and flags unterminated segments.
+    static func parseToolSegments(
+        _ text: String,
+        tools: [QWJson]?,
+        dropIncomplete: Bool,
+        envelopes: [QWToolCallEnvelope] = QWToolCallEnvelope.knownEnvelopes
+    ) -> (calls: [ToolCall], incomplete: Bool) {
         let schemas = ToolSchemas(tools)
         var calls: [ToolCall] = []
         var incomplete = false
         var rest = Substring(text)
-        while let open = rest.range(of: "<tool_call>") {
-            let afterOpen = rest[open.upperBound...]
+        while let hit = earliestToolSegmentOpen(in: rest, envelopes: envelopes) {
+            let afterOpen = rest[hit.range.upperBound...]
             let inner: Substring
             let closed: Bool
-            if let close = matchingToolCallClose(in: afterOpen) {
+            if let close = matchingToolCallClose(in: afterOpen, envelope: hit.envelope) {
                 inner = afterOpen[..<close.lowerBound]
                 rest = afterOpen[close.upperBound...]
                 closed = true
@@ -115,98 +123,12 @@ public enum QWToolCallParser {
                 if dropIncomplete { continue }
             }
             let trimmed = inner.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let call = parseSingleToolCall(inner: trimmed, schemas: schemas) {
-                calls.append(call)
-            }
+            calls.append(contentsOf: parseToolSegmentCalls(inner: trimmed, schemas: schemas))
         }
         return (calls, incomplete)
     }
 
-    static func firstCompleteToolCallEnd(in text: String) -> String.Index? {
-        guard let open = text.range(of: "<tool_call>") else { return nil }
-        return matchingToolCallClose(in: text[open.upperBound...])?.upperBound
-    }
-
-    static func isBalancedToolPayload(_ raw: Substring) -> Bool {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
-            var depth = 0
-            var inString = false
-            var escaped = false
-            let lastIdx = trimmed.index(before: trimmed.endIndex)
-            for idx in trimmed.indices {
-                let ch = trimmed[idx]
-                if inString {
-                    if escaped {
-                        escaped = false
-                    } else if ch == "\\" {
-                        escaped = true
-                    } else if ch == "\"" {
-                        inString = false
-                    }
-                    continue
-                }
-                if ch == "\"" {
-                    inString = true
-                } else if ch == "{" {
-                    depth += 1
-                } else if ch == "}" {
-                    depth -= 1
-                    if depth < 0 { return false }
-                    if depth == 0 && idx < lastIdx { return false }
-                }
-            }
-            return !inString && depth == 0
-        }
-        if trimmed.hasPrefix("<function=") && trimmed.hasSuffix("</function>") {
-            return trimmed.components(separatedBy: "<function=").count == 2
-                && trimmed.components(separatedBy: "</function>").count == 2
-                && trimmed.components(separatedBy: "<parameter=").count
-                    == trimmed.components(separatedBy: "</parameter>").count
-        }
-        return false
-    }
-
-    static func hasUnclosedLiteralContainer(_ raw: Substring) -> Bool {
-        let trimmed = raw.drop(while: { $0.isWhitespace })
-        if trimmed.hasPrefix("{") {
-            var depth = 0, inString = false, escaped = false
-            for ch in trimmed {
-                if inString {
-                    if escaped { escaped = false } else if ch == "\\" { escaped = true } else if ch == "\"" { inString = false }
-                    continue
-                }
-                if ch == "\"" { inString = true } else if ch == "{" { depth += 1 } else if ch == "}" { depth -= 1 }
-            }
-            return inString || depth > 0
-        }
-        if trimmed.hasPrefix("<function=") {
-            return trimmed.components(separatedBy: "<parameter=").count > trimmed.components(separatedBy: "</parameter>").count
-        }
-        return false
-    }
-
-    static func matchingToolCallClose(in afterOpen: Substring) -> Range<String.Index>? {
-        var searchFrom = afterOpen.startIndex
-        while let close = afterOpen[searchFrom...].range(of: "</tool_call>") {
-            let prefix = afterOpen[..<close.lowerBound]
-            if isBalancedToolPayload(prefix) {
-                return close
-            }
-            let tail = afterOpen[close.upperBound...].drop(while: { $0.isWhitespace })
-            guard let nextClose = tail.range(of: "</tool_call>") else { return close }
-            if !hasUnclosedLiteralContainer(prefix) {
-                if tail.hasPrefix("<tool_call>") { return close }
-                if let nextOpen = tail.range(of: "<tool_call>"), nextOpen.lowerBound < nextClose.lowerBound {
-                    return close
-                }
-            }
-            searchFrom = close.upperBound
-        }
-        return nil
-    }
-
-    private static func parseSingleToolCall(inner: String, schemas: ToolSchemas) -> ToolCall? {
+    static func parseSingleToolCall(inner: String, schemas: ToolSchemas) -> ToolCall? {
         // Format A: JSON format inside <tool_call>
         if inner.hasPrefix("{") && inner.hasSuffix("}") {
             if let data = inner.data(using: .utf8),
@@ -371,7 +293,7 @@ public enum QWToolCallParser {
         return out
     }
 
-    private static func findBoundaryCloseTag(
+    static func findBoundaryCloseTag(
         in body: String,
         from valStart: String.Index,
         closeTag: String,
@@ -395,7 +317,7 @@ public enum QWToolCallParser {
         return nil
     }
 
-    private static func jsonLiteral(_ string: String) -> String {
+    static func jsonLiteral(_ string: String) -> String {
         if let d = try? JSONSerialization.data(withJSONObject: string, options: [.fragmentsAllowed, .withoutEscapingSlashes]),
            let s = String(data: d, encoding: .utf8) {
             return s
@@ -406,7 +328,7 @@ public enum QWToolCallParser {
     /// Converts a raw parameter body into a JSON value. When the tool schema declares the
     /// parameter as a string the body is NEVER interpreted: file contents that happen to be
     /// valid JSON (package.json, a bare number, ...) must reach the tool unchanged.
-    private static func jsonValue(_ raw: String, type: ToolSchemas.ParamType) -> String {
+    static func jsonValue(_ raw: String, type: ToolSchemas.ParamType) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         switch type {
         case .string:
@@ -541,13 +463,19 @@ public final class QWChatStreamParser: @unchecked Sendable {
 
     private enum Mode { case reasoning, content, toolCall }
 
-    private static let thinkOpenTags = ["<think>", "<ernie:think>"]
-    private static let thinkCloseTags = ["</think>", "</ernie:think>"]
-    private static let toolOpen = "<tool_call>"
+    public static let defaultThinkTags: [(open: String, close: String)] = [
+        ("<think>", "</think>"),
+        ("<ernie:think>", "</ernie:think>"),
+    ]
 
     private var mode: Mode
     let allowToolCalls: Bool
     private var allowReasoningTags: Bool
+    private var allowInk2Markers: Bool
+    private let toolEnvelopes: [QWToolCallEnvelope]
+    private let toolOpenTags: [String]
+    private let thinkOpenTags: [String]
+    private let thinkCloseTags: [String]
     var buffer = ""
     private var leadingPending = true
     private var contentEmitted = false
@@ -560,15 +488,26 @@ public final class QWChatStreamParser: @unchecked Sendable {
     public private(set) var content = ""
     public private(set) var toolText = ""
 
-    public init(startsInReasoning: Bool, allowToolCalls: Bool = true, allowReasoningTags: Bool = true) {
+    public init(startsInReasoning: Bool,
+                allowToolCalls: Bool = true,
+                allowReasoningTags: Bool = true,
+                allowInk2Markers: Bool = false,
+                toolEnvelopes: [QWToolCallEnvelope] = QWToolCallEnvelope.knownEnvelopes,
+                thinkTags: [(open: String, close: String)] = QWChatStreamParser.defaultThinkTags) {
         self.mode = (startsInReasoning && allowReasoningTags) ? .reasoning : .content
         self.allowToolCalls = allowToolCalls
         self.allowReasoningTags = allowReasoningTags
+        self.allowInk2Markers = allowInk2Markers
+        self.toolEnvelopes = toolEnvelopes
+        self.toolOpenTags = toolEnvelopes.map(\.openTag)
+        self.thinkOpenTags = thinkTags.map(\.open)
+        self.thinkCloseTags = thinkTags.map(\.close)
     }
 
-    public func setStartsInReasoning(_ startsInReasoning: Bool, allowReasoningTags: Bool? = nil) {
+    public func setStartsInReasoning(_ startsInReasoning: Bool, allowReasoningTags: Bool? = nil, allowInk2Markers: Bool? = nil) {
         guard buffer.isEmpty && reasoning.isEmpty && content.isEmpty && toolText.isEmpty else { return }
         if let allowReasoningTags { self.allowReasoningTags = allowReasoningTags }
+        if let allowInk2Markers { self.allowInk2Markers = allowInk2Markers }
         mode = (startsInReasoning && self.allowReasoningTags) ? .reasoning : .content
     }
 
@@ -635,7 +574,8 @@ public final class QWChatStreamParser: @unchecked Sendable {
                 _ = drainInk2(final: final, out: &out)
                 return out
             }
-            if let inkMatch = Self.earliestTagMatch(in: buffer, tags: QWToolCallParser.ink2AllMarkers) {
+            let inkTags = allowInk2Markers ? QWToolCallParser.ink2AllMarkers : []
+            if allowInk2Markers, let inkMatch = Self.earliestTagMatch(in: buffer, tags: QWToolCallParser.ink2AllMarkers) {
                 if inkMatch.range.lowerBound > buffer.startIndex {
                     let target: Mode = (mode == .reasoning) ? .reasoning : .content
                     emit(buffer[..<inkMatch.range.lowerBound], as: target, into: &out)
@@ -647,14 +587,14 @@ public final class QWChatStreamParser: @unchecked Sendable {
             }
             switch mode {
             case .toolCall:
-                if buffer.hasPrefix(Self.toolOpen) {
-                    let afterOpen = buffer.dropFirst(Self.toolOpen.count)
-                    if let close = QWToolCallParser.matchingToolCallClose(in: afterOpen) {
+                if let env = toolEnvelopes.first(where: { buffer.hasPrefix($0.openTag) }) {
+                    let afterOpen = buffer.dropFirst(env.openTag.count)
+                    if let close = QWToolCallParser.matchingToolCallClose(in: afterOpen, envelope: env) {
                         let inner = afterOpen[..<close.lowerBound]
-                        let isClosed = QWToolCallParser.isBalancedToolPayload(inner)
-                            || (!QWToolCallParser.hasUnclosedLiteralContainer(inner)
-                                && (final || !afterOpen[close.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
-                        if isClosed {
+                        let balanced = QWToolCallParser.isBalancedToolPayload(inner)
+                        let unclosed = QWToolCallParser.hasUnclosedLiteralContainer(inner)
+                        let hasTail = !afterOpen[close.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        if balanced || (!unclosed && (final || hasTail)) {
                             toolText += String(buffer[..<close.upperBound])
                             buffer = String(afterOpen[close.upperBound...])
                             mode = .content
@@ -672,17 +612,17 @@ public final class QWChatStreamParser: @unchecked Sendable {
             case .reasoning:
                 if leadingPending {
                     buffer = String(buffer.drop(while: { $0.isWhitespace }))
-                    if !final && Self.heldSuffix(buffer, tags: QWToolCallParser.ink2AllMarkers) >= 2 { return out }
-                    if let openTag = Self.thinkOpenTags.first(where: { buffer.hasPrefix($0) }) {
+                    if !final && allowInk2Markers && Self.heldSuffix(buffer, tags: inkTags) >= 2 { return out }
+                    if let openTag = thinkOpenTags.first(where: { buffer.hasPrefix($0) }) {
                         buffer.removeFirst(openTag.count)
                         continue
                     }
                     if buffer.isEmpty { return out }
-                    if !final && Self.thinkOpenTags.contains(where: { $0.hasPrefix(buffer) }) { return out }
+                    if !final && thinkOpenTags.contains(where: { $0.hasPrefix(buffer) }) { return out }
                     leadingPending = false
                 }
-                let close = Self.earliestTagRange(in: buffer, tags: Self.thinkCloseTags)
-                let tool = allowToolCalls ? buffer.range(of: Self.toolOpen) : nil
+                let close = Self.earliestTagRange(in: buffer, tags: thinkCloseTags)
+                let tool = allowToolCalls ? Self.earliestTagRange(in: buffer, tags: toolOpenTags) : nil
                 if let close, tool.map({ close.lowerBound < $0.lowerBound }) ?? true {
                     emit(buffer[..<close.lowerBound], as: .reasoning, into: &out)
                     buffer = String(buffer[close.upperBound...])
@@ -696,7 +636,7 @@ public final class QWChatStreamParser: @unchecked Sendable {
                     mode = .toolCall
                     continue
                 }
-                let activeTags = (allowToolCalls ? (Self.thinkCloseTags + [Self.toolOpen]) : Self.thinkCloseTags) + QWToolCallParser.ink2AllMarkers
+                let activeTags = (allowToolCalls ? (thinkCloseTags + toolOpenTags) : thinkCloseTags) + inkTags
                 let hold = final ? 0 : Self.heldSuffix(buffer, tags: activeTags)
                 let cut = buffer.index(buffer.endIndex, offsetBy: -hold)
                 emit(buffer[..<cut], as: .reasoning, into: &out)
@@ -708,14 +648,14 @@ public final class QWChatStreamParser: @unchecked Sendable {
                     if allowReasoningTags && !contentEmitted {
                         if let nonWS = buffer.firstIndex(where: { !$0.isWhitespace }) {
                             let afterWS = buffer[nonWS...]
-                            if let openTag = Self.thinkOpenTags.first(where: { afterWS.hasPrefix($0) }) {
+                            if let openTag = thinkOpenTags.first(where: { afterWS.hasPrefix($0) }) {
                                 buffer = String(afterWS.dropFirst(openTag.count))
                                 mode = .reasoning
                                 leadingPending = true
                                 continue
                             }
-                            if !final && (Self.thinkOpenTags.contains(where: { $0.hasPrefix(afterWS) })
-                                || Self.heldSuffix(String(afterWS), tags: QWToolCallParser.ink2AllMarkers) >= 2) {
+                            if !final && (thinkOpenTags.contains(where: { $0.hasPrefix(afterWS) })
+                                || (allowInk2Markers && Self.heldSuffix(String(afterWS), tags: inkTags) >= 2)) {
                                 return out
                             }
                             leadingPending = false
@@ -728,13 +668,13 @@ public final class QWChatStreamParser: @unchecked Sendable {
                         leadingPending = false
                     }
                 }
-                if allowToolCalls, let tool = buffer.range(of: Self.toolOpen) {
+                if allowToolCalls, let tool = Self.earliestTagRange(in: buffer, tags: toolOpenTags) {
                     emit(buffer[..<tool.lowerBound], as: .content, into: &out)
                     buffer = String(buffer[tool.lowerBound...])
                     mode = .toolCall
                     continue
                 }
-                let activeTags = (allowToolCalls ? [Self.toolOpen] : []) + QWToolCallParser.ink2AllMarkers
+                let activeTags = (allowToolCalls ? toolOpenTags : []) + inkTags
                 let hold = final ? 0 : Self.heldSuffix(buffer, tags: activeTags)
                 let cut = buffer.index(buffer.endIndex, offsetBy: -hold)
                 emit(buffer[..<cut], as: .content, into: &out)
@@ -747,7 +687,7 @@ public final class QWChatStreamParser: @unchecked Sendable {
     /// Final structured result. Call after `finish()`.
     public func result(tools: [QWJson]?, truncated: Bool) -> QWToolCallParser.ParseResult {
         var (calls, _) = allowToolCalls
-            ? QWToolCallParser.parseToolSegments(toolText, tools: tools, dropIncomplete: truncated)
+            ? QWToolCallParser.parseToolSegments(toolText, tools: tools, dropIncomplete: truncated, envelopes: toolEnvelopes)
             : ([], false)
         if allowToolCalls {
             let inkCalls = QWToolCallParser.parseInk2ToolPayloads(

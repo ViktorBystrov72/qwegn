@@ -142,8 +142,8 @@ def audit_release(release: Path, checkpoint: Path | None = None,
             f"(stale provenance)")
     qr = prov.get("quant_recorded")
     valid_qr = isinstance(qr, str) and (
-        qr in ("hq4_g32_m5", "q4g", "hq8_hq4_hybrid_v1")
-        or qr.startswith(("hq4_", "hq6_", "hq8_", "dense_hq", "shvq", "dense_shvq"))
+        qr in ("bf16", "hq4_g32_m5", "q4g", "hq8_hq4_hybrid_v1")
+        or qr.startswith(("hq4_", "hq6_", "hq8_", "dense_hq", "shvq", "dense_shvq", "decision_"))
     )
     if not valid_qr:
         raise ValueError(

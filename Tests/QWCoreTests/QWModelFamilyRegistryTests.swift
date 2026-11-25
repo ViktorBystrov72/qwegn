@@ -82,11 +82,18 @@ final class QWModelFamilyRegistryTests: XCTestCase {
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "bailing_moe_v3")?.family, .bailingMoeV3)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "bailing_moe_v3_vl")?.family, .bailingMoeV3)
         XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "bailing_moe_v3_text")?.family, .bailingMoeV3)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "lfm2")?.family, .lfm2)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "lfm2_vl")?.family, .lfm2)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "lfm3")?.family, .lfm3)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "lfm3_vl")?.family, .lfm3)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "d1_omni")?.family, .lfm2Encoder)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "lfm2_encoder")?.family, .lfm2Encoder)
+        XCTAssertEqual(QWModelFamilyRegistry.shared.spec(forModelType: "modernbert")?.family, .modernBert)
 
         let expected: Set<QWModelDescriptor.Family> = [
             .qwen38Dense, .qwen38MoE, .qwen38FlashNext, .senseNovaLoop, .glm5Next,
             .ernie55MoE, .maxwellMoE, .qwen3Dense, .qwen3MoE, .qwen2Dense, .llamaDense, .mistralDense,
-            .inkling2Loop, .bailingMoeV3,
+            .inkling2Loop, .bailingMoeV3, .lfm2, .lfm3, .lfm2Encoder, .modernBert,
         ]
         XCTAssertEqual(Set(QWModelDescriptor.Family.allCases), expected)
     }

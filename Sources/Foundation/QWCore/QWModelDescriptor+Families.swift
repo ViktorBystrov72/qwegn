@@ -66,6 +66,12 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
     public let defaultSpecialTokens: QWModelSpecialTokens?
     public let defaultVisionMean: [Float]
     public let defaultVisionStd: [Float]
+    public let defaultRole: QWModelRole
+    public let defaultHeadDimFromHidden: Bool
+    public let defaultPartialRotaryOne: Bool
+    public let allowsAutoMap: Bool
+    public let allowsOptionalEosTokenId: Bool
+    public let usesLayerNormByDefault: Bool
 
     public init(
         modelType: String,
@@ -90,7 +96,13 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
         defaultBailingVideoRope: Bool = false,
         defaultSpecialTokens: QWModelSpecialTokens? = nil,
         defaultVisionMean: [Float] = [0.5, 0.5, 0.5],
-        defaultVisionStd: [Float] = [0.5, 0.5, 0.5]
+        defaultVisionStd: [Float] = [0.5, 0.5, 0.5],
+        defaultRole: QWModelRole = .causalLM,
+        defaultHeadDimFromHidden: Bool = false,
+        defaultPartialRotaryOne: Bool = false,
+        allowsAutoMap: Bool = false,
+        allowsOptionalEosTokenId: Bool = false,
+        usesLayerNormByDefault: Bool = false
     ) {
         self.modelType = modelType
         self.family = family
@@ -119,6 +131,12 @@ public struct QWModelFamilySpec: Sendable, Hashable, Equatable {
         self.defaultSpecialTokens = defaultSpecialTokens
         self.defaultVisionMean = defaultVisionMean
         self.defaultVisionStd = defaultVisionStd
+        self.defaultRole = defaultRole
+        self.defaultHeadDimFromHidden = defaultHeadDimFromHidden
+        self.defaultPartialRotaryOne = defaultPartialRotaryOne
+        self.allowsAutoMap = allowsAutoMap
+        self.allowsOptionalEosTokenId = allowsOptionalEosTokenId
+        self.usesLayerNormByDefault = usesLayerNormByDefault
     }
 }
 
@@ -332,6 +350,127 @@ public final class QWModelFamilyRegistry: @unchecked Sendable {
             modelType: "mistral", family: .mistralDense, defaultAttnOutputGate: false,
             defaultHasQKNorm: false, defaultAllFullAttention: true, defaultNormTopKProb: false,
             isOfficialSupported: false
+        ),
+        // LFM2 / LFM3 / LFM2-Encoder / ModernBERT decision & hybrid encoder families.
+        QWModelFamilySpec(
+            modelType: "lfm2", family: .lfm2, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultHeadDimFromHidden: true,
+            defaultPartialRotaryOne: true, allowsAutoMap: true
+        ),
+        QWModelFamilySpec(
+            modelType: "lfm2_text", family: .lfm2, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultHeadDimFromHidden: true,
+            defaultPartialRotaryOne: true, allowsAutoMap: true
+        ),
+        QWModelFamilySpec(
+            modelType: "lfm2_vl", family: .lfm2, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultHeadDimFromHidden: true,
+            defaultPartialRotaryOne: true, allowsAutoMap: true
+        ),
+        QWModelFamilySpec(
+            modelType: "lfm3", family: .lfm3, defaultAttnOutputGate: true,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: true, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultHeadDimFromHidden: true,
+            defaultPartialRotaryOne: true, allowsAutoMap: true
+        ),
+        QWModelFamilySpec(
+            modelType: "lfm3_text", family: .lfm3, defaultAttnOutputGate: true,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: true, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultHeadDimFromHidden: true,
+            defaultPartialRotaryOne: true, allowsAutoMap: true
+        ),
+        QWModelFamilySpec(
+            modelType: "lfm3_vl", family: .lfm3, defaultAttnOutputGate: true,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: true, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultHeadDimFromHidden: true,
+            defaultPartialRotaryOne: true, allowsAutoMap: true
+        ),
+        QWModelFamilySpec(
+            modelType: "d1_omni", family: .lfm2Encoder, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultRole: .decisionEncoder,
+            defaultHeadDimFromHidden: true, defaultPartialRotaryOne: true,
+            allowsAutoMap: true, allowsOptionalEosTokenId: true
+        ),
+        QWModelFamilySpec(
+            modelType: "lfm2_encoder", family: .lfm2Encoder, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultRole: .decisionEncoder,
+            defaultHeadDimFromHidden: true, defaultPartialRotaryOne: true,
+            allowsAutoMap: true, allowsOptionalEosTokenId: true
+        ),
+        QWModelFamilySpec(
+            modelType: "modernbert", family: .modernBert, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultRole: .decisionEncoder,
+            defaultHeadDimFromHidden: true, defaultPartialRotaryOne: true,
+            allowsAutoMap: true, allowsOptionalEosTokenId: true, usesLayerNormByDefault: true
+        ),
+        QWModelFamilySpec(
+            modelType: "bert", family: .modernBert, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultRole: .decisionEncoder,
+            defaultHeadDimFromHidden: true, defaultPartialRotaryOne: true,
+            allowsAutoMap: true, allowsOptionalEosTokenId: true, usesLayerNormByDefault: true
+        ),
+        QWModelFamilySpec(
+            modelType: "roberta", family: .modernBert, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultRole: .decisionEncoder,
+            defaultHeadDimFromHidden: true, defaultPartialRotaryOne: true,
+            allowsAutoMap: true, allowsOptionalEosTokenId: true, usesLayerNormByDefault: true
+        ),
+        QWModelFamilySpec(
+            modelType: "deberta", family: .modernBert, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultRole: .decisionEncoder,
+            defaultHeadDimFromHidden: true, defaultPartialRotaryOne: true,
+            allowsAutoMap: true, allowsOptionalEosTokenId: true, usesLayerNormByDefault: true
+        ),
+        QWModelFamilySpec(
+            modelType: "deberta-v2", family: .modernBert, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultRole: .decisionEncoder,
+            defaultHeadDimFromHidden: true, defaultPartialRotaryOne: true,
+            allowsAutoMap: true, allowsOptionalEosTokenId: true, usesLayerNormByDefault: true
+        ),
+        QWModelFamilySpec(
+            modelType: "xlm-roberta", family: .modernBert, defaultAttnOutputGate: false,
+            usesPlusOneRMSNorm: false, usesQwenChatTemplateIds: false,
+            defaultHasQKNorm: false, defaultAllFullAttention: false, defaultNormTopKProb: false,
+            disallowsMoEConfig: true, maxSpeculativeDrafts: 0, supportsExpertStreaming: false,
+            isOfficialSupported: true, defaultRole: .decisionEncoder,
+            defaultHeadDimFromHidden: true, defaultPartialRotaryOne: true,
+            allowsAutoMap: true, allowsOptionalEosTokenId: true, usesLayerNormByDefault: true
         ),
     ]
 

@@ -52,6 +52,8 @@ public final class QWCacheDiskManager: @unchecked Sendable {
         public var dflashKBytes: Int? = nil
         public var dflashVBytes: Int? = nil
         public var dflashCacheOffset: Int? = nil
+        public var dsparkRingBytes: Int? = nil
+        public var dsparkCacheOffset: Int? = nil
     }
 
     public struct DiskHit: Sendable {

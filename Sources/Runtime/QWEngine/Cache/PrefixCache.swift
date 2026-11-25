@@ -198,11 +198,25 @@ extension QWEngineDriver {
             let lookupTokens = QWVisualSpan.saltedCacheTokens(
                 prompt: prompt, visualSpans: activeVisualSpans, vocab: geometry.vocab
             )
-            let located = try QWPrefixCacheCoordinator.lookupTwoTier(
+            var located = try QWPrefixCacheCoordinator.lookupTwoTier(
                 lookupTokens: lookupTokens, policyKey: policyKey, store: store,
                 diskManager: cacheDiskManager, onEvent: onCacheEvent,
                 restoreFromDisk: { try restorePrefixFromDisk($0, store: store) }
             )
+            if QWRadixKVGate.isEnabled, canSlicePureAttentionPages, mode != .naive,
+               let donorHit = try store.lookupDeepestSharedPageDonor(
+                   tokens: lookupTokens,
+                   mode: policyKey,
+                   minExclusiveTokens: located?.hit.tokenCount ?? 0
+               ),
+               let sliced = try slicePureAttentionCachedPrefix(
+                   donorHit.donor, toPageAlignedTokens: donorHit.pageAlignedTokens
+               ) {
+                located = (
+                    hit: QWEnginePrefixStore.Hit(value: sliced, tokenCount: donorHit.pageAlignedTokens),
+                    tier: QWPrefixCacheTier.warmRAM.rawValue
+                )
+            }
             guard let located else {
                 onCacheEvent?(.miss(totalTokens: prompt.count))
                 return (try admitSession(promptTokens: prompt.count), nil, 0, nil)
@@ -247,12 +261,14 @@ extension QWEngineDriver {
         admission.releaseSlot(GdnSlot(recSlab: session.recSlab, ringSlab: session.ringSlab,
                                     rec: session.rec, ring: session.ring,
                                     trunkHidden: session.trunkHidden,
-                                    dflashSlot: session.dflashSlot))
+                                    dflashSlot: session.dflashSlot,
+                                    dsparkSlot: session.dsparkSlot))
     }
 
     func retainCachedPrompt(_ session: QWEngineSession, prompt: [Int], mode: GDNPrefillMode,
                                     first: Int, store: QWEnginePrefixStore<QWEngineCachedPrefix>,
-                                    permit: QWGenerationPermit, isSharedBase: Bool = false) throws -> Bool {
+                                    permit: QWGenerationPermit, isSharedBase: Bool = false,
+                                    pinToSlot: Bool = true) throws -> Bool {
         try withFlightPermit(permit) {
             guard session.stochastic == nil else {
                 throw QWEngineDriverError.state("lookup cache accepts only unconditioned prompt state")
@@ -265,20 +281,27 @@ extension QWEngineDriver {
             let keyBytes = try store.keyBytes(tokens: cacheTokens, mode: policyKey)
             let stateBytes = session.recSlab.bytes + session.ringSlab.bytes + (session.trunkHidden?.bytes ?? 0) +
                 activeSparseIndexerStateBytes(position: session.position) +
-                (session.dflashSlot.map { $0.kSlab.bytes + $0.vSlab.bytes } ?? 0)
+                (session.dflashSlot.map { $0.kSlab.bytes + $0.vSlab.bytes } ?? 0) +
+                (session.dsparkSlot?.ringBytes ?? 0)
             let sharedBaseHit = isSharedBase ? nil : store.sharedBasePrefix(matching: cacheTokens, mode: policyKey)
             let trunkWritten = kvCache.written(session.kv)
             let mtpWritten = session.mtpKV.flatMap { mtpCache?.written($0) } ?? 0
             let trunkKVBytes = kvCache.sharedPrefixBytes(tokenCount: trunkWritten)
             let mtpKVBytes = mtpCache?.sharedPrefixBytes(tokenCount: mtpWritten) ?? 0
-            let sharedKVBytes = (sharedBaseHit?.value.prefix.trunk.memoryBytes ?? 0)
+            let pinnedBaseKVBytes = (sharedBaseHit?.value.prefix.trunk.memoryBytes ?? 0)
                 + (sharedBaseHit?.value.prefix.mtp?.memoryBytes ?? 0)
+            let sharedKVBytes = QWRadixKVGate.isEnabled ? (trunkKVBytes + mtpKVBytes) : pinnedBaseKVBytes
             let incrementalKVBytes = QWTwoTierPrefixCache.incrementalCharge(
                 fullBytes: trunkKVBytes + mtpKVBytes, sharedBaseBytes: sharedKVBytes
             )
             let charge = stateBytes + incrementalKVBytes + sc.logits.bytes
-            guard keyBytes <= store.byteLimit, charge <= (store.byteLimit - keyBytes) else {
-                onCacheEvent?(.skippedOversize(tokens: cacheTokens.count, charge: charge + keyBytes, warmLimitBytes: store.byteLimit))
+            let minRequiredBytes = stateBytes
+                + QWTwoTierPrefixCache.incrementalCharge(fullBytes: trunkKVBytes + mtpKVBytes, sharedBaseBytes: pinnedBaseKVBytes)
+                + sc.logits.bytes + keyBytes
+            guard keyBytes <= store.byteLimit,
+                  charge <= (store.byteLimit - keyBytes),
+                  (!QWRadixKVGate.isEnabled || minRequiredBytes <= store.byteLimit) else {
+                onCacheEvent?(.skippedOversize(tokens: cacheTokens.count, charge: max(charge + keyBytes, minRequiredBytes), warmLimitBytes: store.byteLimit))
                 return false
             }
             let prefix = try QWEngineSessionState.captureSharedPrefix(
@@ -288,16 +311,23 @@ extension QWEngineDriver {
             )
             let value = QWEngineCachedPrefix(prefix: prefix, nextToken: first,
                 logits: Data(bytes: sc.logits.region.pointer.advanced(by: sc.logits.offset), count: sc.logits.bytes))
-            let actualPayloadCharge = QWTwoTierPrefixCache.incrementalCharge(fullBytes: value.memoryBytes, sharedBaseBytes: sharedKVBytes)
+            let actualPayloadCharge = QWRadixKVGate.isEnabled
+                ? value.memoryBytes
+                : QWTwoTierPrefixCache.incrementalCharge(fullBytes: value.memoryBytes, sharedBaseBytes: sharedKVBytes)
+            let beforeStoreBytes = store.chargedBytes
             let inserted = try store.insert(tokens: cacheTokens, mode: policyKey, value: value,
-                                            payloadBytes: actualPayloadCharge, allowsSuffix: mode != .naive, isSharedBase: isSharedBase)
+                                            payloadBytes: actualPayloadCharge, allowsSuffix: mode != .naive,
+                                            isSharedBase: isSharedBase, pinToSlot: pinToSlot)
             if inserted {
+                let reportedCharge = QWRadixKVGate.isEnabled
+                    ? max(keyBytes + stateBytes + sc.logits.bytes, store.chargedBytes - beforeStoreBytes)
+                    : (actualPayloadCharge + keyBytes)
                 QWPrefixCacheCoordinator.spillEntryIfEligible(
                     diskManager: cacheDiskManager, isSharedBase: isSharedBase,
                     warmHasSharedBase: store.hasSharedBase, tokens: cacheTokens, mode: policyKey,
                     value: value, kvCache: kvCache, mtpCache: mtpCache, allowsSuffix: mode != .naive
                 )
-                onCacheEvent?(.retained(tokens: cacheTokens.count, chargedBytes: actualPayloadCharge + keyBytes, storeTotalBytes: store.chargedBytes, warmLimitBytes: store.byteLimit))
+                onCacheEvent?(.retained(tokens: cacheTokens.count, chargedBytes: reportedCharge, storeTotalBytes: store.chargedBytes, warmLimitBytes: store.byteLimit))
             }
             return inserted
         }
@@ -356,10 +386,17 @@ extension QWEngineDriver {
                                   retainPrefixLength: Int? = nil,
                                   onToken: ((Int) -> Bool)? = nil,
                                   inspectCompleted: ((QWEngineSession) throws -> Void)? = nil) throws -> [Int] {
-        try generateCached(prompt: prompt, maxNew: maxNew, stopIds: stopIds, speculative: speculative,
-                           retainPrefixLength: retainPrefixLength, onToken: onToken,
-                           inspectCompleted: inspectCompleted,
-                           stochastic: QWStochasticSession(geometry: geometry, config: config))
+        var normConfig = config
+        normConfig.uniformVersion = .upper24
+        if normConfig.temperature <= 0 {
+            normConfig.temperature = 1
+            normConfig.topK = 1
+            normConfig.topP = 1
+        }
+        return try generateCached(prompt: prompt, maxNew: maxNew, stopIds: stopIds, speculative: speculative,
+                                  retainPrefixLength: retainPrefixLength, onToken: onToken,
+                                  inspectCompleted: inspectCompleted,
+                                  stochastic: QWStochasticSession(geometry: geometry, config: normConfig))
     }
 
     func generateCached(prompt: [Int], maxNew: Int, stopIds: Set<Int>, speculative: Bool,
@@ -408,12 +445,18 @@ extension QWEngineDriver {
                     onProgress: activePrefillProgress, permit: permit
                 )
                 let firstVis = activeVisualSpans.map(\.tokenOffset).min() ?? prompt.count
+                let policyKeyForRetain = prefixPolicyKey(mode: mode)
+                let periodicInterval = (QWRadixKVGate.isEnabled && !canSlicePureAttentionPages && mode != .naive)
+                    ? 4096 : 0
                 let retainPoints = QWTwoTierPrefixCache.computeRetainPoints(
                     explicitRetainLength: retainPrefixLength,
                     matchedTokens: loaded.matched,
                     firstVisualTokenOffset: firstVis,
                     promptCount: prompt.count,
-                    sharedBranchPrefixLength: store.sharedBranchPrefixLength(for: Array(prompt.prefix(firstVis)))
+                    sharedBranchPrefixLength: store.sharedBranchPrefixLength(
+                        for: Array(prompt.prefix(firstVis)), mode: policyKeyForRetain
+                    ),
+                    periodicCheckpointInterval: periodicInterval
                 )
                 let prefillStart = Date()
                 if !retainPoints.isEmpty {
@@ -523,7 +566,7 @@ extension QWEngineDriver {
                 backoff: .armed(position: session.position, drafts: mtpDrafts),
                 canSpeculate: {
                     self.canRunSpeculativeRound(session)
-                        && (self.activeConstraint?.constraint.isUnconstrainedNow ?? true)
+                        && self.canSpeculateActiveConstraint
                 })
             try awaitCommitAndCheck(session, context: "during generation")
             let snap = QWPrefixCacheCoordinator.buildMetricsSnapshot(

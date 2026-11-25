@@ -42,4 +42,31 @@ struct QwgReplVisionTests {
         #expect(accepted.accepted)
         #expect(accepted.nextPending == "/tmp/photo.png")
     }
+
+    @Test("Repl refuses --video with --no-load-vision and handles /video slash command")
+    func replRejectsVideoWithNoLoadVisionAndHandlesSlashVideo() throws {
+        #expect(throws: (any Error).self) {
+            _ = try Repl.parse(["--no-load-vision", "--video", "/tmp/clip.mp4", "dummy-model"])
+        }
+        #expect(throws: (any Error).self) {
+            try Repl.validateVideoOption(video: "/tmp/clip.mp4", allowVision: false)
+        }
+        #expect(throws: Never.self) {
+            try Repl.validateVideoOption(video: nil, allowVision: false)
+            _ = try Repl.parse(["--video", "/tmp/clip.mp4", "dummy-model"])
+        }
+
+        let rejected = Repl.resolveSlashVideoCommand(
+            arg: "/tmp/clip.mp4", hasVisionController: false, currentPending: nil
+        )
+        #expect(!rejected.accepted)
+        #expect(rejected.nextPending == nil)
+        #expect(rejected.notice.contains("--no-load-vision"))
+
+        let accepted = Repl.resolveSlashVideoCommand(
+            arg: "/tmp/clip.mp4", hasVisionController: true, currentPending: nil
+        )
+        #expect(accepted.accepted)
+        #expect(accepted.nextPending == "/tmp/clip.mp4")
+    }
 }

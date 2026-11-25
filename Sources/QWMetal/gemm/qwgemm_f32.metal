@@ -53,13 +53,13 @@ kernel void qwg_gemv_q4g_f32_v4(device const Block_HQ4_G32* blocks [[buffer(0)]]
                                 uint  tid  [[thread_index_in_threadgroup]],
                                 uint  sg   [[simdgroup_index_in_threadgroup]],
                                 uint  lane [[thread_index_in_simdgroup]]) {
-    threadgroup float tgC[4 * 32];
+    threadgroup float tgC[8 * 32];
     threadgroup QWEmptyTgLut tgLut;
     const QWGemmF32V4Params p = { N, K, epi, scale };
     qwg_gemv_f32_v4_body<QWQuantHQ4>(blocks, x, y, p, tg, tid, sg, lane, tgC, tgLut);
 }
 
-// GEMV + in-kernel block argmax epilogue for LM-head T=1..4 greedy decoding.
+// GEMV + in-kernel block argmax epilogue for LM-head T=1..8 greedy decoding.
 kernel void qwg_gemv_q4g_f32_v4_am(device const Block_HQ4_G32* blocks [[buffer(0)]],
                                    device const float*         x      [[buffer(1)]],
                                    device float*               y      [[buffer(2)]],
@@ -73,7 +73,7 @@ kernel void qwg_gemv_q4g_f32_v4_am(device const Block_HQ4_G32* blocks [[buffer(0
                                    uint  tid  [[thread_index_in_threadgroup]],
                                    uint  sg   [[simdgroup_index_in_threadgroup]],
                                    uint  lane [[thread_index_in_simdgroup]]) {
-    threadgroup uint bHi[16], bLo[16];
+    threadgroup uint bHi[32], bLo[32];
     threadgroup QWEmptyTgLut tgLut;
     const QWGemmF32V4Params p = { N, K, epi, scale };
     qwg_gemv_f32_v4_am_body<QWQuantHQ4>(blocks, x, y, keysHi, keysLo, p, tg, tid, sg, lane, bHi, bLo, tgLut);

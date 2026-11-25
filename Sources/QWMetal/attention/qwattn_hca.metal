@@ -263,47 +263,59 @@ kernel void qwg_hca_compress_blocks(
     }
 }
 
-// 3a. Per-head weightless Q RMSNorm + GPT-J YaRN RoPE in-place on qUpGate.
-// Grid: (qHeads, T, 1), Threadgroup: (256, 1, 1).
+// 3a. Per-head weightless Q RMSNorm + GPT-J YaRN RoPE in-place on qUpGate (warp-per-head half4).
+// Grid: ((qHeads + 7) / 8, T, 1), Threadgroup: (256, 1, 1).
 kernel void qwg_hca_q_prep(
     device half*           qUpGate [[buffer(0)]],
     device const float*    invFreq [[buffer(1)]],
     constant HCAQPrepParams& p     [[buffer(2)]],
     uint2                  tg      [[threadgroup_position_in_grid]],
-    uint                   tid     [[thread_index_in_threadgroup]],
     uint                   sg      [[simdgroup_index_in_threadgroup]],
     uint                   lane    [[thread_index_in_simdgroup]]
 ) {
-    const uint h = tg.x, t = tg.y;
+    const uint h = tg.x * 8u + sg, t = tg.y;
     if (h >= p.qHeads || t >= p.T) return;
-    threadgroup float sgScratch[8];
 
     device half* qh = qUpGate + (size_t)t * p.qUpStride + (size_t)h * p.headDim;
+    const float posF = float(p.pos0 + t);
+    if ((p.headDim & 3u) == 0u && (p.nopeDim & 3u) == 0u) {
+        float sq = 0.0f;
+        for (uint d = lane * 4u; d < p.headDim; d += 128u) {
+            const float4 v = float4(*(device const half4*)(qh + d));
+            sq += dot(v, v);
+        }
+        const float invRms = rsqrt(simd_sum(sq) / float(p.headDim) + p.rmsEps);
+        for (uint d = lane * 4u; d < p.headDim; d += 128u) {
+            float4 v = float4(*(device const half4*)(qh + d)) * invRms;
+            if (d >= p.nopeDim) {
+                const uint pA = (d - p.nopeDim) >> 1u;
+                const float angA = posF * invFreq[pA];
+                const float cA = cos(angA) * p.mscale, sA = sin(angA) * p.mscale;
+                const float angB = posF * invFreq[pA + 1u];
+                const float cB = cos(angB) * p.mscale, sB = sin(angB) * p.mscale;
+                v = float4(v.x * cA - v.y * sA, v.y * cA + v.x * sA,
+                           v.z * cB - v.w * sB, v.w * cB + v.z * sB);
+            }
+            *(device half4*)(qh + d) = half4(v);
+        }
+        return;
+    }
+
     float sq = 0.0f;
-    for (uint d = tid; d < p.headDim; d += 256u) {
+    for (uint d = lane; d < p.headDim; d += 32u) {
         const float v = float(qh[d]);
         sq = fma(v, v, sq);
     }
-    sq = simd_sum(sq);
-    if (lane == 0u) sgScratch[sg] = sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        float s = (lane < 8u) ? sgScratch[lane] : 0.0f;
-        s = simd_sum(s);
-        if (lane == 0u) sgScratch[0] = rsqrt(s / float(p.headDim) + p.rmsEps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float invRms = sgScratch[0];
-
-    for (uint d = tid; d < p.nopeDim; d += 256u) {
+    const float invRms = rsqrt(simd_sum(sq) / float(p.headDim) + p.rmsEps);
+    for (uint d = lane; d < p.nopeDim; d += 32u) {
         qh[d] = half(float(qh[d]) * invRms);
     }
     const uint halfRope = p.ropeDim >> 1u;
-    if (tid < halfRope) {
-        const uint base = p.nopeDim + 2u * tid;
+    for (uint i = lane; i < halfRope; i += 32u) {
+        const uint base = p.nopeDim + 2u * i;
         const float even = float(qh[base]) * invRms;
         const float odd = float(qh[base + 1u]) * invRms;
-        const float ang = float(p.pos0 + t) * invFreq[tid];
+        const float ang = posF * invFreq[i];
         const float c = cos(ang) * p.mscale, s = sin(ang) * p.mscale;
         qh[base] = half(even * c - odd * s);
         qh[base + 1u] = half(odd * c + even * s);

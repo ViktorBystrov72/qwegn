@@ -695,22 +695,24 @@ METAL_FUNC void qwg_mla_proj_uv_impl(
         return;
     }
 
-    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    const uint uvRow = h * (p.nopeDim + p.vHeadDim) + p.nopeDim + r;
-    for (uint c = 0u; c < p.kvLoraRank; ++c) {
-        const float w = qwg_mla_read_weight<SUB2>(kvBBlocks, uvRow, c,
-                                                  p.kvLoraRank, p.bits, p.group, inc);
-        #pragma unroll
-        for (uint m = 0u; m < 8u; ++m) {
-            if (m < validM) {
-                acc[m] = fma(float(shU[m][c]), w, acc[m]);
+    for (uint d = r; d < p.vHeadDim; d += 256u) {
+        float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        const uint uvRow = h * (p.nopeDim + p.vHeadDim) + p.nopeDim + d;
+        for (uint c = 0u; c < p.kvLoraRank; ++c) {
+            const float w = qwg_mla_read_weight<SUB2>(kvBBlocks, uvRow, c,
+                                                      p.kvLoraRank, p.bits, p.group, inc);
+            #pragma unroll
+            for (uint m = 0u; m < 8u; ++m) {
+                if (m < validM) {
+                    acc[m] = fma(float(shU[m][c]), w, acc[m]);
+                }
             }
         }
-    }
 
-    for (uint m = 0u; m < validM; ++m) {
-        const float rot = skipFwht ? acc[m] : qwg_fwht32_lane_f32(acc[m], lane);
-        attOut[(size_t)(tBase + m) * outStride + h * p.vHeadDim + r] = half(rot);
+        for (uint m = 0u; m < validM; ++m) {
+            const float rot = skipFwht ? acc[m] : qwg_fwht32_lane_f32(acc[m], lane);
+            attOut[(size_t)(tBase + m) * outStride + h * p.vHeadDim + d] = half(rot);
+        }
     }
 }
 

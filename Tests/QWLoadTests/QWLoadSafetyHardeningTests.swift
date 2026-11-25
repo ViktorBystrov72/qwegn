@@ -90,4 +90,47 @@ final class QWLoadSafetyHardeningTests: XCTestCase {
         XCTAssertEqual(QWCheckpointTensorLoader.normGammaShift(normGammaIsPlusOne: false, isMLXCheckpoint: false), 1.0)
         XCTAssertEqual(QWCheckpointTensorLoader.normGammaShift(normGammaIsPlusOne: false, isMLXCheckpoint: true), 1.0)
     }
+
+    func testPreserveBF16DecisionWeightsPolicyAndPlaneNames() {
+        let decCfg = QWDecisionModelConfig.synthesizedVerbalizer(vocabSize: 32000)
+        var smallCaps = QWModelDescriptor.qwen38_27b.capabilities
+        smallCaps.insert(.decision)
+        let smallDesc = QWModelDescriptor(
+            family: QWModelDescriptor.qwen38_27b.family,
+            modelType: "lfm3_vl",
+            capabilities: smallCaps,
+            hidden: 1024, vocab: 32000, denseIntermediate: 2816, numLayers: 16,
+            layerTypes: Array(repeating: "full_attention", count: 16),
+            fullAttentionInterval: 1, rmsEps: 1e-6, maxPositionEmbeddings: 4096,
+            qHeads: 8, kvHeads: 4, headDim: 128, attnOutputGate: false,
+            partialRotaryFactor: 1.0, ropeTheta: 10000,
+            indexerHeads: nil, indexerKvHeads: nil, indexerHeadDim: nil,
+            indexerBudget: nil, indexerCompressRatio: nil,
+            numExperts: nil, expertsPerTok: nil, moeIntermediate: nil,
+            sharedExpertIntermediate: nil, expertGateType: nil,
+            hcCount: nil, hcLowrank: nil,
+            gdnQKHeads: 0, gdnVHeads: 0, gdnHeadDim: 0, gdnQKVChannels: 0, gdnZChannels: 0, gdnConvKernel: 0,
+            pleLayerIds: nil, pleEmbedDim: nil, pleConvKernel: nil,
+            ngramSize: nil, headsPerNgram: nil, ngramVocabSizeBase: nil,
+            makeNgramVocabDivisibleBy: nil, splitNgramParts: nil,
+            mtpLayers: 0, mtpUseDedicatedEmbeddings: false, eosTokenId: 2,
+            decisionConfig: decCfg
+        )
+        let smallPolicy = LoadPolicy(descriptor: smallDesc, env: [:])
+        XCTAssertTrue(smallPolicy.preserveBF16DecisionWeights)
+        XCTAssertEqual(smallPolicy.preferredSafetensorsPrecision, "bf16")
+
+        let forcedHQ4 = LoadPolicy(descriptor: smallDesc, env: ["QW_DECISION_FORCE_HQ4": "1"])
+        XCTAssertFalse(forcedHQ4.preserveBF16DecisionWeights)
+        XCTAssertEqual(forcedHQ4.preferredSafetensorsPrecision, "hq4_g32")
+
+        let nonDecision = LoadPolicy(descriptor: .qwen38_27b, env: [:])
+        XCTAssertFalse(nonDecision.preserveBF16DecisionWeights)
+        XCTAssertEqual(nonDecision.preferredSafetensorsPrecision, "hq4_g32")
+
+        XCTAssertTrue(PlaneLayout.isRawDecisionPlaneName("model.layers.0.short_conv.conv.weight"))
+        XCTAssertTrue(PlaneLayout.isRawDecisionPlaneName("marker_head.mlp.0.weight"))
+        XCTAssertTrue(PlaneLayout.isRawDecisionPlaneName("classifier.weight"))
+        XCTAssertFalse(PlaneLayout.isRawDecisionPlaneName("model.layers.0.self_attn.q_proj.weight"))
+    }
 }

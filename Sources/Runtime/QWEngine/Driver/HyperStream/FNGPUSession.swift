@@ -143,9 +143,10 @@ public struct FNGPUSessionData {
     public var topLogprobsCount: Int
     /// Collected per-token log-probabilities in generation order.
     public var tokenLogprobs: [QWTokenLogprob] = []
-    /// The request's token constraint (structured output). A constrained
-    /// session never speculates: drafts are not grammar-verified.
+    /// Request-local token constraint verified row-by-row on speculative and serial steps.
     public var constraint: (any QWTokenConstraint)?
+    /// Deferred `constraint.accept` count for speculative trailing tokens queued in `pendingTokens`.
+    var pendingConstraintAcceptCount: Int = 0
     /// Optional shared base prefix length (e.g. system prompt + tool definitions)
     /// to checkpoint into the prefix cache before branching into the session turn.
     public var retainPrefixLength: Int?
@@ -426,7 +427,10 @@ extension QWHyperStreamRuntime {
     /// logits pick the same token on either engine.
     func sampleFromHead(argmaxToken: Int, seenTokens: Set<Int>, seenTokenList: [Int],
                         sampler: QWSampler, row: Int = 0,
-                        constraint: (any QWTokenConstraint)? = nil) throws -> Int {
+                        constraint: (any QWTokenConstraint)? = nil,
+                        draftToken: Int? = nil,
+                        relaxedMargin: Float = 0,
+                        relaxedMinProb: Float = 0) throws -> Int {
         guard let constraint else {
             return try unconstrainedSample(argmaxToken: argmaxToken, seenTokens: seenTokens,
                                            seenTokenList: seenTokenList,
@@ -434,16 +438,26 @@ extension QWHyperStreamRuntime {
         }
         let token: Int
         if try constraint.writeAllowedTokens(into: &sampler.allowedScratch) {
-            if sampler.config.isGreedy && sampler.config.repetitionPenalty == 1.0
+            let repList = sampler.config.repetitionPenalty == 1.0 ? [] : seenTokenList
+            let rawLogits = arena.cpuPointer(of: head.logits)
+                .assumingMemoryBound(to: Float.self)
+                .advanced(by: row * vocab)
+            let rowBuf = UnsafeBufferPointer(start: rawLogits, count: vocab)
+            let strictToken: Int
+            if sampler.config.isGreedy && repList.isEmpty
                 && QWTokenMaskScratch.sortedTokens(sampler.allowedScratch, contains: argmaxToken) {
-                token = argmaxToken
+                strictToken = argmaxToken
             } else {
-                let rawLogits = arena.cpuPointer(of: head.logits)
-                    .assumingMemoryBound(to: Float.self)
-                    .advanced(by: row * vocab)
-                token = try sampler.constrainedTokenFromScratch(
-                    logits: UnsafeBufferPointer(start: rawLogits, count: vocab),
-                    repetitionHistory: sampler.config.repetitionPenalty == 1.0 ? [] : seenTokenList)
+                strictToken = try sampler.constrainedTokenFromScratch(
+                    logits: rowBuf, repetitionHistory: repList)
+            }
+            if sampler.config.isGreedy, let draftTok = draftToken, draftTok != strictToken, relaxedMargin > 0,
+               sampler.clearsConstrainedVariationalGateFromScratch(
+                   logits: rowBuf, draftToken: draftTok, targetToken: strictToken,
+                   repetitionHistory: repList, margin: relaxedMargin, minProbability: relaxedMinProb) {
+                token = draftTok
+            } else {
+                token = strictToken
             }
         } else {
             token = try unconstrainedSample(argmaxToken: argmaxToken, seenTokens: seenTokens,
@@ -491,10 +505,15 @@ extension QWHyperStreamRuntime {
             for d in drafts { residentKVHistory.append(Int64(d)) }
         }
         highWaterPos = max(highWaterPos, session.history.count)
+        let isUnconstrained = session.constraint?.isUnconstrainedNow ?? true
+        let canSpecConstrained = session.constraint.map {
+            $0.isUnconstrainedNow || (QWConstrainedSpeculationGate.isEnabled && $0.allowsSpeculation)
+        } ?? true
         let stepT0 = Date()
         _ = try vStack.forwardRows(history: session.history, embedTable: embedTable, head: head,
                                     readStream: false, verifyAllRows: true, mtp: stepMTP,
-                                    activeRows: activeRows, relaxedMargin: session.relaxedMargin,
+                                    activeRows: activeRows,
+                                    relaxedMargin: isUnconstrained ? session.relaxedMargin : 0,
                                     relaxedRows: session.mtpSourcedDrafts + 1,
                                     relaxedMinProb: session.relaxedMinProb)
         let verifyMs = Date().timeIntervalSince(stepT0) * 1000.0
@@ -504,28 +523,41 @@ extension QWHyperStreamRuntime {
         let v = head.argmaxTokens(count: activeRows)
         let mTok = stepMTP?.mtpHead.argmaxToken() ?? session.mtpDraft
         session.specProposals += dCount
+        let rowMargin: Float = (!isUnconstrained && !session.periodicDrafts) ? session.relaxedMargin : 0
+        let probeClone = session.constraint?.makeSpeculativeProbe()
+        let roundConstraint = probeClone ?? session.constraint
         let resolution = try QWSpeculativeTokenResolver.resolveVerifiedRound(
             drafts: drafts,
             targetArgmaxes: v,
             vocabulary: vocab,
             isGreedy: session.sampler.config.isGreedy,
-            isUnconstrainedNow: { session.constraint?.isUnconstrainedNow ?? true },
-            boundaryToken: session.constraint?.speculationBoundaryToken,
+            isUnconstrainedNow: { roundConstraint?.isUnconstrainedNow ?? true },
+            boundaryToken: roundConstraint?.speculationBoundaryToken,
+            canSpeculateConstrained: canSpecConstrained,
             isRepetitionBlocked: { session.seenTokens.contains($0) },
-            acceptConstrained: { try session.constraint?.accept($0) },
+            acceptConstrained: { try roundConstraint?.accept($0) },
             sampleRow: { row, argmaxTok in
                 try sampleFromHead(argmaxToken: argmaxTok, seenTokens: session.seenTokens,
                                    seenTokenList: session.seenTokenList,
                                    sampler: session.sampler, row: row,
-                                   constraint: session.constraint)
+                                   constraint: roundConstraint,
+                                   draftToken: row < dCount ? drafts[row] : nil,
+                                   relaxedMargin: row < session.mtpSourcedDrafts ? rowMargin : 0,
+                                   relaxedMinProb: session.relaxedMinProb)
             },
             onCommittedToken: { committedTok in
                 if trackRep { session.recordSeenToken(committedTok, vocab: vocab) }
             }
         )
         let tok0 = resolution.firstToken
+        if probeClone != nil {
+            try session.constraint?.accept(tok0)
+        }
         if !resolution.trailingTokens.isEmpty {
             session.pendingTokens.append(contentsOf: resolution.trailingTokens)
+            if probeClone != nil {
+                session.pendingConstraintAcceptCount += resolution.trailingTokens.count
+            }
         }
         let accepted = resolution.acceptedDrafts
         if resolution.rollbackCount > 0 {
@@ -616,6 +648,16 @@ extension QWHyperStreamRuntime {
 
     /// Drafts 1..3 tokens using MTP or the unified context-copy drafter (`QWContextCopyDrafter`).
     func draftsFor(_ session: inout FNGPUSessionData, mtp: FNGPUMTP) -> ([Int], FNGPUMTP?) {
+        let maxD = min(session.maxDrafts, FNGPUSessionData.draftCapacity)
+        if maxD > 0, QWConstrainedSpeculationGate.isEnabled,
+           let constraint = session.constraint, !constraint.isUnconstrainedNow {
+            let canonical = constraint.proposeCanonicalDrafts(maxCount: maxD)
+            if !canonical.isEmpty {
+                session.mtpSourcedDrafts = 0
+                session.periodicDrafts = true
+                return (canonical, mtp)
+            }
+        }
         let proposal = QWContextCopyDrafter.proposeDrafts(
             history: session.history,
             mode: session.draftMode,

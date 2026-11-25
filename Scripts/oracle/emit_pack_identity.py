@@ -12,6 +12,8 @@ language-dependent text printing: Swift prints 1e-6 as "0.000001", Python as
 "1e-06" — both wrong for a cross-language digest.
 Usage: python3 Scripts/oracle/emit_pack_identity.py [config.json] [out.json]
 """
+from __future__ import annotations
+
 import hashlib, json, struct, sys
 from pathlib import Path
 
@@ -42,16 +44,16 @@ def geo_v2(tc: dict, parent_mt: str | None = None) -> str:
         raw_layer_types = ["full_attention"] * num_layers
     layer_kinds = "".join(
         "F" if t in ("full_attention", "deepseek_sparse_attention")
-        else ("C" if t == "compressed_attention" else "L")
+        else ("C" if t == "compressed_attention" else ("S" if t == "sliding_attention" else "L"))
         for t in raw_layer_types
     )
     if tc.get("full_attention_interval") is not None:
         fa_interval = tc["full_attention_interval"]
     elif tc.get("layer_group_size") is not None:
         fa_interval = int(tc["layer_group_size"])
-    elif "F" in layer_kinds:
-        cand = layer_kinds.index("F") + 1
-        fa_indices = [i for i, ch in enumerate(layer_kinds) if ch == "F"]
+    elif any(ch in ("F", "S") for ch in layer_kinds):
+        fa_indices = [i for i, ch in enumerate(layer_kinds) if ch in ("F", "S")]
+        cand = fa_indices[0] + 1
         fa_interval = cand if all((i + 1) % cand == 0 for i in fa_indices) else 0
     else:
         fa_interval = 1
@@ -59,12 +61,27 @@ def geo_v2(tc: dict, parent_mt: str | None = None) -> str:
         (tc.get("qk_nope_head_dim") or 0) + (tc.get("qk_rope_head_dim") or 0)
     ) or (tc["hidden_size"] // tc["num_attention_heads"])
     rope_params = tc.get("rope_parameters") or {}
+    fa_rope = rope_params.get("full_attention") or {}
+    sa_rope = rope_params.get("sliding_attention") or {}
     rot_f = tc.get("partial_rotary_factor")
+    if rot_f is None:
+        rot_f = rope_params.get("partial_rotary_factor")
+    if rot_f is None:
+        rot_f = fa_rope.get("partial_rotary_factor")
+    if rot_f is None:
+        rot_f = sa_rope.get("partial_rotary_factor")
     if rot_f is None:
         rot_f = tc.get("rotary_percent")
     if rot_f is None:
-        rot_f = rope_params.get("partial_rotary_factor", 1.0)
-    theta = tc.get("rope_theta") or rope_params.get("rope_theta") or 10000.0
+        rot_f = 1.0
+    theta = (
+        tc.get("rope_theta")
+        or rope_params.get("rope_theta")
+        or fa_rope.get("rope_theta")
+        or tc.get("global_rope_theta")
+        or tc.get("local_rope_theta")
+        or 10000.0
+    )
     if "attn_output_gate" in tc and tc["attn_output_gate"] is not None:
         gate_on = bool(tc["attn_output_gate"])
     elif "use_gated_attn" in tc and tc["use_gated_attn"] is not None:
@@ -73,10 +90,13 @@ def geo_v2(tc: dict, parent_mt: str | None = None) -> str:
         gran = (tc.get("gated_attention_proj_granularity_type") or "").lower()
         gate_on = (tc.get("output_gate_type") is not None
                    or gran in ("head_wise", "element_wise")
-                   or mt in ("qwen3_5", "qwen3_5_text", "qwen4_exp", "qwen4_exp_text"))
+                   or mt in (
+                       "qwen3_5", "qwen3_5_text", "qwen4_exp", "qwen4_exp_text",
+                       "lfm3", "lfm3_text", "lfm3_vl",
+                   ))
     qgate = 1 if gate_on else 0
     lin_cfg = tc.get("linear_attn_config") or {}
-    has_lin = "L" in layer_kinds
+    has_lin = any(t == "linear_attention" for t in raw_layer_types)
     lin_kv = tc.get("num_kv_heads_for_linear_attn")
     def_lin_qk = lin_kv if (lin_kv is not None and lin_kv > 0) else tc["num_attention_heads"]
     gdn_qk = (tc.get("linear_num_key_heads") or lin_cfg.get("num_heads") or def_lin_qk) if has_lin else 0
@@ -88,6 +108,11 @@ def geo_v2(tc: dict, parent_mt: str | None = None) -> str:
         mtp_layers = tc.get("num_nextn_predict_layers")
     if mtp_layers is None:
         mtp_layers = tc.get("mtp_num_layers", 0) or 0
+    kv_heads = tc.get("num_key_value_heads", tc["num_attention_heads"])
+    eos_raw = tc.get("eos_token_id", 0)
+    eos_id = eos_raw[0] if isinstance(eos_raw, list) else eos_raw
+    norm_eps = tc.get("rms_norm_eps") or tc.get("norm_eps") or tc.get("layer_norm_eps") or 1e-5
+    max_pos = tc.get("max_position_embeddings", 8192)
     fields = [
         f"model_type={mt}",
         f"hidden={tc['hidden_size']}",
@@ -96,16 +121,16 @@ def geo_v2(tc: dict, parent_mt: str | None = None) -> str:
         f"layer_kinds={layer_kinds}",
         f"fa_interval={fa_interval}",
         f"q={tc['num_attention_heads']}",
-        f"kv={tc['num_key_value_heads']}",
+        f"kv={kv_heads}",
         f"hd={hd}",
         f"qgate={qgate}",
         f"rot_f={f64hex(rot_f)}",
         f"theta={f64hex(theta)}",
         f"gdn={gdn_qk},{gdn_v},{gdn_hd},{gdn_ck}",
         f"mtp={mtp_layers},{1 if tc.get('mtp_use_dedicated_embeddings') else 0}",
-        f"eos={tc['eos_token_id'][0] if isinstance(tc['eos_token_id'], list) else tc['eos_token_id']}",
-        f"rms={f32hex(tc['rms_norm_eps'])}",
-        f"maxpos={tc['max_position_embeddings']}",
+        f"eos={eos_id}",
+        f"rms={f32hex(norm_eps)}",
+        f"maxpos={max_pos}",
     ]
     z = lambda k: tc.get(k) if tc.get(k) is not None else 0
     idx_heads = tc.get("indexer_n_heads") if tc.get("indexer_n_heads") is not None else (tc.get("index_n_heads") or 0)
@@ -176,6 +201,13 @@ MODEL_ID = {
     "qwen2": "qwen2-dense",
     "llama": "llama-dense",
     "mistral": "mistral-dense",
+    "lfm2": "lfm2",
+    "lfm3": "lfm3",
+    "lfm3_vl": "lfm3_vl",
+    "lfm2_encoder": "lfm2_encoder",
+    "d1_omni": "d1_omni",
+    "modernbert": "modernbert",
+    "deberta_v2": "deberta_v2",
 }
 
 def main() -> int:

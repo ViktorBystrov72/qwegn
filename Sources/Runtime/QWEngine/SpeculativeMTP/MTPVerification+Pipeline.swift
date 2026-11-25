@@ -35,10 +35,16 @@ extension QWEngineDriver {
     ) throws -> AsyncNeuralDraftPlan? {
         let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
         let (extraPending, previousToken) = pendingHistoryContext(session: session, pending: pending)
-        if resolvedStrategy != .mtp,
-           let chosen = tryZeroCostContextDrafts(
-               session: session, pending: pending, extraPending: extraPending,
-               previousToken: previousToken, count: count, strategy: resolvedStrategy) {
+        if let chosen = proposeCanonicalOrFilteredDrafts(
+            constraint: activeConstraint?.constraint,
+            maxCount: count,
+            fallbackCandidates: {
+                resolvedStrategy != .mtp ? tryZeroCostContextDrafts(
+                    session: session, pending: pending, extraPending: extraPending,
+                    previousToken: previousToken, count: count, strategy: resolvedStrategy
+                ) : nil
+            }
+        ), !chosen.isEmpty {
             return .pld(chosen)
         }
         let neuralCount: Int

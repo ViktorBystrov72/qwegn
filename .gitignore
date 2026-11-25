@@ -42,6 +42,7 @@ models/
 !/specs/04-hal-memory-and-metal-ceilings.md
 !/specs/05-http-server-security-and-streaming.md
 !/specs/06-menubar-and-webui-parity.md
+!/specs/07-decision-models-and-apis.md
 /docs/*
 /.hermes/
 /handoff.md

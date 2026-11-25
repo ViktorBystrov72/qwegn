@@ -1,6 +1,7 @@
-// QWEnginePrefixStore.swift — Driver prefix store backed by the unified QWSlotPinnedLRUStore.
+// QWEnginePrefixStore.swift — Driver prefix store backed by QWSlotPinnedLRUStore + QWRadixPrefixTree.
 import Foundation
 import QWCore
+import QWKV
 
 final class QWEnginePrefixStore<Value: Sendable> {
     struct Key: Hashable, Sendable {
@@ -15,14 +16,19 @@ final class QWEnginePrefixStore<Value: Sendable> {
     static var defaultMaxSlots: Int { QWSlotPinnedLRUStore<Key, Value>.defaultMaxSlots }
     let vocab: Int
     private let core: QWSlotPinnedLRUStore<Key, Value>
+    private let radixTree = QWRadixPrefixTree<Key>(pageTokens: QWKVCache.pageTokens)
+    private let pageLedger = QWPrefixPageLedger<Key>()
+    private let extractPhysicalPages: (@Sendable (Value) -> Set<QWPrefixPhysicalPage>)?
     var onEvict: ((Key, Value, Bool) -> Void)?
 
     init(byteLimit: Int, entryLimit: Int = 16, vocab: Int,
-         maxSlots: Int = QWEnginePrefixStore.defaultMaxSlots) throws {
+         maxSlots: Int = QWEnginePrefixStore.defaultMaxSlots,
+         extractPhysicalPages: (@Sendable (Value) -> Set<QWPrefixPhysicalPage>)? = nil) throws {
         guard byteLimit > 0, entryLimit > 0, vocab > 0 else {
             throw QWEngineDriverError.state("prefix store limits must be positive")
         }
         self.vocab = vocab
+        self.extractPhysicalPages = extractPhysicalPages
         let store = QWSlotPinnedLRUStore<Key, Value>(
             byteLimit: byteLimit,
             entryLimit: entryLimit,
@@ -30,6 +36,10 @@ final class QWEnginePrefixStore<Value: Sendable> {
             rootPrefixTokenCount: 64
         )
         self.core = store
+        store.onRemove = { [weak self] key in
+            self?.radixTree.remove(key: key)
+            self?.pageLedger.remove(key: key)
+        }
         store.onEvict = { [weak self] key, entry in
             self?.onEvict?(key, entry.value, entry.allowsSuffix)
         }
@@ -39,7 +49,12 @@ final class QWEnginePrefixStore<Value: Sendable> {
     var byteLimit: Int { core.byteLimit }
     var entryLimit: Int { core.entryLimit }
     var count: Int { core.count }
-    var chargedBytes: Int { core.chargedBytes }
+    var chargedBytes: Int {
+        if QWRadixKVGate.isEnabled && extractPhysicalPages != nil {
+            return core.chargedBytes + pageLedger.uniqueBytes
+        }
+        return core.chargedBytes
+    }
     var evictions: Int { core.evictions }
     var hasSharedBase: Bool { core.hasSharedBase }
 
@@ -61,8 +76,18 @@ final class QWEnginePrefixStore<Value: Sendable> {
         return Hit(value: entry.value, tokenCount: best.tokens.count)
     }
 
-    func sharedBranchPrefixLength(for tokens: [Int]) -> Int? {
-        core.sharedBranchPrefixLength(for: tokens.map(Int64.init))
+    func sharedBranchPrefixLength(for tokens: [Int], mode: String? = nil) -> Int? {
+        let slotBranch = core.sharedBranchPrefixLength(for: tokens.map(Int64.init))
+        guard QWRadixKVGate.isEnabled, let mode else { return slotBranch }
+        let radixBranch = radixTree.longestBranchPrefixLength(
+            tokens: tokens, mode: mode, minTokens: core.rootPrefixTokenCount
+        )
+        switch (slotBranch, radixBranch) {
+        case (let a?, let b?): return max(a, b)
+        case (let a?, nil): return a
+        case (nil, let b?): return b
+        case (nil, nil): return nil
+        }
     }
 
     func ensureByteLimit(atLeast minimumBytes: Int) {
@@ -73,10 +98,28 @@ final class QWEnginePrefixStore<Value: Sendable> {
         core.removeSharedBaseEntries()
     }
 
+    func projectedIncrementalPageBytes(for value: Value, tokens: [Int], mode: String) -> Int? {
+        guard QWRadixKVGate.isEnabled, let extract = extractPhysicalPages else { return nil }
+        let pages = extract(value)
+        let key = Key(tokens: tokens, mode: mode)
+        let projected = pageLedger.projectedUniqueBytes(adding: pages, replacing: key)
+        return max(0, projected - pageLedger.uniqueBytes)
+    }
+
     func lookup(tokens: [Int], mode: String) throws -> Hit? {
         try validate(tokens, mode: mode)
-        let exact = Key(tokens: tokens, mode: mode)
         let base = Self.baseMode(of: mode)
+        if QWRadixKVGate.isEnabled,
+           let radixHit = radixTree.lookupLongestCheckpoint(
+               tokens: tokens,
+               mode: mode,
+               fallbackSharedBaseMode: base != mode ? base : nil,
+               allowExact: true
+           ),
+           let entry = core.value(for: radixHit.key, touchOnHit: true) {
+            return Hit(value: entry.value, tokenCount: radixHit.matchedTokens)
+        }
+        let exact = Key(tokens: tokens, mode: mode)
         let saltedBase = base != mode ? Key(tokens: tokens, mode: base) : nil
         let queryRootHash: UInt64? = tokens.count >= 64
             ? QWPrefixHash.fnv1a64(tokens: Array(tokens.prefix(64)), mode: mode)
@@ -101,20 +144,101 @@ final class QWEnginePrefixStore<Value: Sendable> {
         return hit.map { Hit(value: $0.value, tokenCount: $0.matchedTokens) }
     }
 
+    func lookupDeepestSharedPageDonor(
+        tokens: [Int],
+        mode: String,
+        minExclusiveTokens: Int = 0
+    ) throws -> (donor: Value, pageAlignedTokens: Int)? {
+        try validate(tokens, mode: mode)
+        guard QWRadixKVGate.isEnabled else { return nil }
+        let base = Self.baseMode(of: mode)
+        guard let match = radixTree.lookupDeepestSharedPage(
+            tokens: tokens,
+            mode: mode,
+            fallbackSharedBaseMode: base != mode ? base : nil,
+            minExclusiveTokens: minExclusiveTokens
+        ),
+              let entry = core.value(for: match.donorKey, touchOnHit: true) else {
+            return nil
+        }
+        return (entry.value, match.pageAlignedTokens)
+    }
+
     /// Oversized valid entries are not retained. The caller records that result.
     @discardableResult
     func insert(tokens: [Int], mode: String, value: Value, payloadBytes: Int,
-                allowsSuffix: Bool = false, isSharedBase: Bool = false) throws -> Bool {
+                allowsSuffix: Bool = false, isSharedBase: Bool = false, pinToSlot: Bool = true) throws -> Bool {
         let keyBytes = try keyBytes(tokens: tokens, mode: mode)
         guard payloadBytes >= 0 else {
             throw QWEngineDriverError.state("invalid prefix payload charge")
         }
-        guard keyBytes <= byteLimit, payloadBytes <= byteLimit - keyBytes else { return false }
-        let charge = payloadBytes + keyBytes
         let key = Key(tokens: tokens, mode: mode)
         let history64 = tokens.map(Int64.init)
         let rootHash = QWPrefixHash.fnv1a64(tokens: Array(tokens.prefix(64)), mode: mode)
-        return QWTwoTierPrefixCache.storeWithSlotPinning(
+
+        if QWRadixKVGate.isEnabled, let extract = extractPhysicalPages {
+            let pages = extract(value)
+            let ownPageBytes = QWPrefixPageLedger<Key>.totalBytes(of: pages)
+            let fixedPayloadBytes = max(0, payloadBytes - ownPageBytes)
+            guard keyBytes <= byteLimit, fixedPayloadBytes <= byteLimit - keyBytes else { return false }
+            let coreCharge = fixedPayloadBytes + keyBytes
+            while core.count > 0 {
+                let projectedPages = pageLedger.projectedUniqueBytes(adding: pages, replacing: key)
+                let priorFixed = core.value(for: key, touchOnHit: false)?.charge ?? 0
+                let totalAfter = (core.chargedBytes - priorFixed) + coreCharge + projectedPages
+                if totalAfter <= byteLimit { break }
+                if !core.evictOldest() { break }
+            }
+            let projectedPages = pageLedger.projectedUniqueBytes(adding: pages, replacing: key)
+            let priorFixed = core.value(for: key, touchOnHit: false)?.charge ?? 0
+            guard (core.chargedBytes - priorFixed) + coreCharge + projectedPages <= byteLimit else {
+                return false
+            }
+            let stored: Bool
+            if !pinToSlot && !isSharedBase {
+                stored = core.store(
+                    key: key, value: value, charge: coreCharge, tokenCount: tokens.count,
+                    allowsSuffix: allowsSuffix, slot: nil, rootHash: rootHash,
+                    history: history64, isSharedBase: false, isBranchCheckpoint: true
+                )
+            } else {
+                stored = QWTwoTierPrefixCache.storeWithSlotPinning(
+                    in: core,
+                    key: key,
+                    value: value,
+                    charge: coreCharge,
+                    tokenCount: tokens.count,
+                    allowsSuffix: allowsSuffix,
+                    rootHash: rootHash,
+                    history: history64,
+                    isSharedBase: isSharedBase
+                ) { cand, _ in
+                    cand.mode == key.mode && key.tokens.starts(with: cand.tokens)
+                }
+            }
+            if stored {
+                pageLedger.insert(key: key, pages: pages)
+                radixTree.insert(
+                    key: key, tokens: tokens, mode: mode,
+                    allowsSuffix: allowsSuffix, isSharedBase: isSharedBase
+                )
+                while core.count > 1 && (core.chargedBytes + pageLedger.uniqueBytes > byteLimit) {
+                    if !core.evictOldest() { break }
+                }
+            }
+            return stored
+        }
+
+        guard keyBytes <= byteLimit, payloadBytes <= byteLimit - keyBytes else { return false }
+        let charge = payloadBytes + keyBytes
+        if !pinToSlot && !isSharedBase {
+            return core.store(
+                key: key, value: value, charge: charge, tokenCount: tokens.count,
+                allowsSuffix: allowsSuffix, slot: nil, rootHash: rootHash,
+                history: history64, isSharedBase: false, isBranchCheckpoint: true
+            )
+        }
+        let stored = QWTwoTierPrefixCache.storeWithSlotPinning(
             in: core,
             key: key,
             value: value,
@@ -127,6 +251,7 @@ final class QWEnginePrefixStore<Value: Sendable> {
         ) { cand, _ in
             cand.mode == key.mode && key.tokens.starts(with: cand.tokens)
         }
+        return stored
     }
 
     func isProtectedLastKey(_ key: Key, excludingSlot: Int? = nil) -> Bool {

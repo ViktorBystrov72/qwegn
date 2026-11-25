@@ -327,27 +327,40 @@ extension QWEngineDriver {
             }
             return QWWeightFormatChoice(
                 format: .nativeAffine(bits: bits, groupSize: groupSize), declineReason: nil)
+        case .coreAIModel:
+            throw QWEngineDriverError.badConfig(
+                "CoreAI .aimodel bundles run via QWCoreAIDecisionAdapter, not Metal DriverConfig")
         case .qwp1, nil:
             if let pack {
-                var denseSpec: (bits: Int, group: Int, incumbent: Bool, shvq: Bool)?
-                var expSpec: (bits: Int, group: Int, incumbent: Bool, shvq: Bool)?
-                var expDownSpec: (bits: Int, group: Int, incumbent: Bool, shvq: Bool)?
+                typealias FormatSpec = (bits: Int, group: Int, incumbent: Bool, shvq: Bool)
+                typealias FormatEntry = (name: String, spec: FormatSpec)
+                var denseBest: FormatEntry?
+                var denseAuxFallback: FormatEntry?
+                var expBest: FormatEntry?
+                var expDownBest: FormatEntry?
+                // Track the lexicographically smallest name per bucket so SipHash order
+                // cannot let auxiliary tensors (e.g. hq8 lm_head) override trunk format.
                 for (name, entry) in pack.tensors where entry.hq4Off != nil {
-                    let spec = (bits: entry.hqBits, group: entry.hqGroup,
-                                incumbent: entry.isIncumbentHQ4, shvq: entry.isSHVQ)
+                    let spec: FormatSpec = (bits: entry.hqBits, group: entry.hqGroup,
+                                            incumbent: entry.isIncumbentHQ4, shvq: entry.isSHVQ)
                     if entry.shape.count == 3 || (name.contains(".experts.") && !name.contains("shared_expert")) {
                         if name.contains("down_proj") || name.contains(".w2.") {
-                            if expDownSpec == nil { expDownSpec = spec }
-                        } else {
-                            if expSpec == nil { expSpec = spec }
+                            if expDownBest.map({ name < $0.name }) ?? true { expDownBest = (name, spec) }
+                        } else if expBest.map({ name < $0.name }) ?? true {
+                            expBest = (name, spec)
                         }
                     } else if entry.shape.count == 2 {
-                        if denseSpec == nil { denseSpec = spec }
+                        if Self.isAuxiliary2DTensor(name) {
+                            if denseAuxFallback.map({ name < $0.name }) ?? true { denseAuxFallback = (name, spec) }
+                        } else if denseBest.map({ name < $0.name }) ?? true {
+                            denseBest = (name, spec)
+                        }
                     }
                 }
-                let d = denseSpec ?? (bits: 4, group: 32, incumbent: true, shvq: false)
-                let e = expSpec ?? expDownSpec ?? d
-                let ed = expDownSpec ?? e
+                let d = (denseBest ?? denseAuxFallback)?.spec
+                    ?? (bits: 4, group: 32, incumbent: true, shvq: false)
+                let e = expBest?.spec ?? expDownBest?.spec ?? d
+                let ed = expDownBest?.spec ?? e
                 if !(d.incumbent && e.incumbent && ed.incumbent) {
                     return QWWeightFormatChoice(
                         format: .hqBlock(bits: d.bits, groupSize: d.group,
@@ -364,6 +377,15 @@ extension QWEngineDriver {
                 format: .hq4G32,
                 declineReason: "the engine's own pack holds the incumbent's container")
         }
+    }
+
+    private static func isAuxiliary2DTensor(_ name: String) -> Bool {
+        name == "lm_head.weight"
+            || name.hasSuffix(".lm_head.weight")
+            || name.contains("embed_tokens")
+            || name.contains("vision_tower.")
+            || name.contains(".visual.")
+            || name.hasPrefix("visual.")
     }
 
     /// The container alone, for the callers that only need to dispatch.

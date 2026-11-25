@@ -37,6 +37,9 @@ public final class QWEngineSession: @unchecked Sendable {
     public internal(set) var dflashCacheOffset: Int = 0
     var dflashPolicy: QWDFlashAdaptivePolicy
     var dflashRoundStartNs: UInt64?
+    let dsparkSlot: QWDSparkDrafter.SessionSlot?
+    public internal(set) var dsparkCacheOffset: Int = 0
+    var dsparkRoundStartNs: UInt64?
     var trunkHiddenValid = false
     /// finishSession idempotence witness (static-analysis H1): the driver
     /// checks-and-sets it under the flight lock, so a double finish can
@@ -53,14 +56,31 @@ public final class QWEngineSession: @unchecked Sendable {
     var attnKVViews: [(k: QWKVLayerView, v: QWKVLayerView)] = []
     var mtpKVViews: [(k: QWKVLayerView, v: QWKVLayerView)] = []
     var mropeTurnPositions: [Int32]?
+    var mropeTurnTableBuffer: (any MTLBuffer)?
     var mropeTurnStartPos: Int = 0
     var mropeTurnTokenCount: Int = 0
     public var mtpPhysicalRows: Int { roundRecord.mtpPhysicalRows }
 
     func clearTurnMRoPE() {
         mropeTurnPositions = nil
+        mropeTurnTableBuffer = nil
         mropeTurnStartPos = 0
         mropeTurnTokenCount = 0
+    }
+
+    func mropeTurnTableSlice(pos: Int, count: Int, rotaryDims: Int) -> QWTensorValue? {
+        guard let buf = mropeTurnTableBuffer, mropeTurnTokenCount > 0, count > 0, rotaryDims > 0,
+              pos >= mropeTurnStartPos, pos + count <= mropeTurnStartPos + mropeTurnTokenCount else {
+            return nil
+        }
+        let byteOffset = (pos - mropeTurnStartPos) * rotaryDims * MemoryLayout<Float>.stride
+        let byteCount = count * rotaryDims * MemoryLayout<Float>.stride
+        guard byteOffset >= 0, byteOffset + byteCount <= buf.length else { return nil }
+        return QWTensorValue(
+            region: QWMRegion(buffer: buf, base: 0, length: buf.length),
+            offset: byteOffset,
+            shape: QWTensorShape([count, rotaryDims], .f32)
+        )
     }
 
     func mropeSlice(pos: Int, count: Int, mropeLayout: QWModelDescriptor.MRoPELayout) -> [Int32]? {
@@ -91,11 +111,13 @@ public final class QWEngineSession: @unchecked Sendable {
     init(kv: QWKVHandle, mtpKV: QWKVHandle? = nil, rec: [QWTensorValue],
          ring: [QWTensorValue], recSlab: QWTensorValue, ringSlab: QWTensorValue,
          trunkHidden: QWTensorValue? = nil, dflashSlot: QWDFlashSessionSlot? = nil,
+         dsparkSlot: QWDSparkDrafter.SessionSlot? = nil,
          isSparseMoE: Bool = false) {
         self.kv = kv; self.mtpKV = mtpKV; self.rec = rec; self.ring = ring
         self.recSlab = recSlab; self.ringSlab = ringSlab
         self.trunkHidden = trunkHidden
         self.dflashSlot = dflashSlot
+        self.dsparkSlot = dsparkSlot
         self.dflashPolicy = QWDFlashAdaptivePolicy(isSparseMoE: isSparseMoE)
         self.roundRecord = QWRoundRecord()
     }

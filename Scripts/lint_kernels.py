@@ -24,6 +24,8 @@ import gen_kernel_inventory
 ROOT = Path(__file__).resolve().parent.parent
 METALLIB = ROOT / "Sources" / "QWMetal" / "kernel.metallib"
 PREFIXES = ("qwg_", "qwfn_", "qwm_", "qws_", "qwc_", "qwh_", "qwr_")
+# Public MCP tool names that share the qwg_ prefix are not Metal kernels.
+NON_KERNEL_LITERALS = {"qwg_decide"}
 # Names that are library objects rather than dispatch targets.
 AIR_NOISE = re.compile(r"(llvm\.|air\.|_Z|MTL_|__tensorops|metal18|cooperative)")
 
@@ -133,6 +135,8 @@ def prod_swift_refs() -> tuple[dict[str, list[str]], set[str]]:
             continue
         text = strip_comments(path.read_text(encoding="utf-8", errors="ignore"))
         for name in lit.findall(text):
+            if name in NON_KERNEL_LITERALS:
+                continue
             if name.startswith(PREFIXES):
                 refs.setdefault(name, []).append(str(path.relative_to(ROOT)))
         for pre in interp.findall(text):
@@ -150,6 +154,8 @@ def swift_refs() -> tuple[dict[str, list[str]], set[str]]:
         for path in (ROOT / base).rglob("*.swift"):
             text = strip_comments(path.read_text(encoding="utf-8", errors="ignore"))
             for name in lit.findall(text):
+                if name in NON_KERNEL_LITERALS:
+                    continue
                 if name.startswith(PREFIXES):
                     refs.setdefault(name, []).append(str(path.relative_to(ROOT)))
     return refs, dynamic

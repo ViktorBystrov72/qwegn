@@ -9,11 +9,18 @@ public struct ChatMessageContent: Codable, Sendable {
     public enum Part: Codable, Sendable {
         case text(String)
         case imageUrl(String)
+        case videoUrl(QWVideoInputSpec)
 
         enum CodingKeys: String, CodingKey {
             case type
             case text
             case imageUrl = "image_url"
+            case videoUrl = "video_url"
+            case video
+            case url
+            case fps
+            case maxFrames = "max_frames"
+            case maxPixels = "max_pixels"
         }
 
         enum ImageUrlKeys: String, CodingKey {
@@ -22,14 +29,63 @@ public struct ChatMessageContent: Codable, Sendable {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            let type = try container.decode(String.self, forKey: .type)
-            if type == "text" {
-                let text = try container.decode(String.self, forKey: .text)
+            let type = try container.decode(String.self, forKey: .type).lowercased()
+            if type == "text" || type == "input_text" || type == "output_text" {
+                let text = (try? container.decode(String.self, forKey: .text)) ?? ""
                 self = .text(text)
-            } else if type == "image_url" {
-                let imgContainer = try container.nestedContainer(keyedBy: ImageUrlKeys.self, forKey: .imageUrl)
-                let url = try imgContainer.decode(String.self, forKey: .url)
-                self = .imageUrl(url)
+            } else if type == "image_url" || type == "input_image" {
+                if let direct = try? container.decode(String.self, forKey: .imageUrl) {
+                    self = .imageUrl(direct)
+                } else {
+                    let imgContainer = try container.nestedContainer(keyedBy: ImageUrlKeys.self, forKey: .imageUrl)
+                    let url = try imgContainer.decode(String.self, forKey: .url)
+                    self = .imageUrl(url)
+                }
+            } else if type == "video_url" || type == "input_video" {
+                let topFps = try container.decodeIfPresent(Double.self, forKey: .fps)
+                let topFrames = try container.decodeIfPresent(Int.self, forKey: .maxFrames)
+                let topPixels = try container.decodeIfPresent(Int.self, forKey: .maxPixels)
+                if let spec = try? container.decode(QWVideoInputSpec.self, forKey: .videoUrl) {
+                    self = .videoUrl(QWVideoInputSpec(
+                        url: spec.url,
+                        fps: spec.fps ?? topFps,
+                        maxFrames: spec.maxFrames ?? topFrames,
+                        maxPixels: spec.maxPixels ?? topPixels
+                    ))
+                } else if let direct = try? container.decode(String.self, forKey: .videoUrl) {
+                    self = .videoUrl(QWVideoInputSpec(
+                        url: direct, fps: topFps, maxFrames: topFrames, maxPixels: topPixels
+                    ))
+                } else if let fallbackURL = try? container.decode(String.self, forKey: .url) {
+                    self = .videoUrl(QWVideoInputSpec(
+                        url: fallbackURL, fps: topFps, maxFrames: topFrames, maxPixels: topPixels
+                    ))
+                } else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .videoUrl, in: container, debugDescription: "video_url requires a url string or object"
+                    )
+                }
+            } else if type == "video" {
+                let topFps = try container.decodeIfPresent(Double.self, forKey: .fps)
+                let topFrames = try container.decodeIfPresent(Int.self, forKey: .maxFrames)
+                let topPixels = try container.decodeIfPresent(Int.self, forKey: .maxPixels)
+                if let spec = try? container.decode(QWVideoInputSpec.self, forKey: .video) {
+                    self = .videoUrl(QWVideoInputSpec(
+                        url: spec.url,
+                        fps: spec.fps ?? topFps,
+                        maxFrames: spec.maxFrames ?? topFrames,
+                        maxPixels: spec.maxPixels ?? topPixels
+                    ))
+                } else if let direct = (try? container.decode(String.self, forKey: .video))
+                    ?? (try? container.decode(String.self, forKey: .url)) {
+                    self = .videoUrl(QWVideoInputSpec(
+                        url: direct, fps: topFps, maxFrames: topFrames, maxPixels: topPixels
+                    ))
+                } else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .video, in: container, debugDescription: "video part requires a url or video string"
+                    )
+                }
             } else {
                 self = .text("")
             }
@@ -45,6 +101,9 @@ public struct ChatMessageContent: Codable, Sendable {
                 try container.encode("image_url", forKey: .type)
                 var imgContainer = container.nestedContainer(keyedBy: ImageUrlKeys.self, forKey: .imageUrl)
                 try imgContainer.encode(u, forKey: .url)
+            case .videoUrl(let v):
+                try container.encode("video_url", forKey: .type)
+                try container.encode(v, forKey: .videoUrl)
             }
         }
     }
@@ -102,13 +161,19 @@ public struct ChatMessageContent: Codable, Sendable {
         return ""
     }
 
-    /// Content string formatted for chat-template rendering, inserting `<|vision_start|><|image_pad|><|vision_end|>`
-    /// for each `image_url` part when the text does not already include explicit `<|image_pad|>` markers.
+    /// Content string formatted for chat-template rendering, inserting canonical `<|vision_start|>...<|vision_end|>`
+    /// markers for `image_url` and `video_url` parts when the text does not already include explicit media markers.
     public var templateTextValue: String {
         if let rawText { return rawText }
         guard let parts else { return "" }
         let plainText = textValue
-        if plainText.contains("<|image_pad|>") { return plainText }
+        let hasImageParts = !imageUrls.isEmpty
+        let hasVideoParts = !videoInputs.isEmpty
+        let explicitImg = !hasImageParts || plainText.contains("<|image_pad|>") || plainText.contains("<|image|>")
+        let explicitVid = !hasVideoParts || plainText.contains("<|video_pad|>") || plainText.contains("<|video|>")
+        if explicitImg && explicitVid && (hasImageParts || hasVideoParts) {
+            return plainText
+        }
         var res = ""
         for p in parts {
             switch p {
@@ -117,6 +182,8 @@ public struct ChatMessageContent: Codable, Sendable {
                 res += t
             case .imageUrl:
                 res += "<|vision_start|><|image_pad|><|vision_end|>"
+            case .videoUrl:
+                res += "<|vision_start|><|video_pad|><|vision_end|>"
             }
         }
         return res
@@ -131,6 +198,17 @@ public struct ChatMessageContent: Codable, Sendable {
             }
         }
         return urls
+    }
+
+    public var videoInputs: [QWVideoInputSpec] {
+        guard let parts else { return [] }
+        var items: [QWVideoInputSpec] = []
+        for p in parts {
+            if case .videoUrl(let v) = p {
+                items.append(v)
+            }
+        }
+        return items
     }
 }
 

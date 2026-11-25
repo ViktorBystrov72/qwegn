@@ -1,0 +1,208 @@
+// qw_moe_compact_shvq_fast.metalh — Compact SHVQ bucket kernels
+// with 64-weight group specialization for decode and speculative verify (T<=16).
+#pragma once
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include "qw_quant_traits_shvq.metalh"
+#include "qw_moe_f32_common.metalh"
+using namespace metal;
+
+template <typename Traits>
+METAL_FUNC void qwg_moe_compact_shvq_gateup_12(
+    typename Traits::WeightPtr a0, size_t st1, size_t st2, size_t st3,
+    device const float* x0, device const float* x1, uint mCount, uint nSlices, uint rows, uint hl,
+    threadgroup const typename Traits::TgLut& tgLut, thread float4 (&accM)[4]) {
+    if (rows == 0u) return;
+    for (uint s = hl; s < nSlices; s += 16u) {
+        const uint col = s << 5u;
+        typename Traits::WeightPtr gp = Traits::group_ptr(a0, s);
+        const uint byteInGroup = Traits::byte_in_group(s);
+        if (mCount == 1u) {
+            typename Traits::ActSlice a;
+            Traits::load_act_f32(x0 + col, a);
+            accM[0].x = Traits::slice_dot_acc(gp, byteInGroup, a, tgLut, accM[0].x);
+            accM[0].y = Traits::slice_dot_acc(gp + st1, byteInGroup, a, tgLut, accM[0].y);
+            accM[0].z = Traits::slice_dot_acc(gp + st2, byteInGroup, a, tgLut, accM[0].z);
+            accM[0].w = Traits::slice_dot_acc(gp + st3, byteInGroup, a, tgLut, accM[0].w);
+        } else {
+            typename Traits::ActSlice a0x, a1x;
+            Traits::load_act_f32(x0 + col, a0x);
+            Traits::load_act_f32(x1 + col, a1x);
+            const float2 d0 = Traits::slice_dot2_acc(gp, byteInGroup, a0x, a1x, tgLut, float2(accM[0].x, accM[1].x));
+            const float2 d1 = Traits::slice_dot2_acc(gp + st1, byteInGroup, a0x, a1x, tgLut, float2(accM[0].y, accM[1].y));
+            const float2 d2 = Traits::slice_dot2_acc(gp + st2, byteInGroup, a0x, a1x, tgLut, float2(accM[0].z, accM[1].z));
+            const float2 d3 = Traits::slice_dot2_acc(gp + st3, byteInGroup, a0x, a1x, tgLut, float2(accM[0].w, accM[1].w));
+            accM[0] = float4(d0.x, d1.x, d2.x, d3.x);
+            accM[1] = float4(d0.y, d1.y, d2.y, d3.y);
+        }
+    }
+}
+
+template <typename Traits, typename Params, bool HAS_SOFTCAP = false>
+METAL_FUNC void qwg_moe_compact_shvq_gateup_impl(
+    typename Traits::WeightPtr w, device const float* x,
+    device const int32_t* expertOff, device const int32_t* activeExperts,
+    device const uint* activeArgs, device const int32_t* sortedTok,
+    device const int32_t* sortedPairIdx, device float* actOut,
+    typename Traits::WeightPtr coldW, constant Params& p,
+    uint2 tg, uint tid, uint sgi, uint lane,
+    threadgroup float* tgAct, threadgroup typename Traits::TgLut& tgLut) {
+    if (tg.y >= activeArgs[0]) return;
+    const uint rawExpert = uint(activeExperts[tg.y]);
+    if (rawExpert >= p.numExperts) return;
+    const int off = expertOff[rawExpert];
+    const int cnt = expertOff[rawExpert + 1] - off;
+    if (cnt <= 0) return;
+    const uint I = p.N >> 1u;
+    const uint rBase = tg.x * 32u;
+    if (rBase >= I) return;
+    if constexpr (Traits::has_tg_lut()) {
+        tgLut.load(tid, 256u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        (void)tid;
+    }
+    const bool isCold = (p.residentE > 0u) && (rawExpert >= p.residentE);
+    const uint expert = isCold ? (rawExpert - p.residentE) : rawExpert;
+    typename Traits::WeightPtr wSrc = isCold ? coldW : w;
+    const uint r0 = rBase + sgi * 4u;
+    const uint upHalf = lane >> 4u, hl = lane & 15u, nSlices = p.K >> 5u;
+    const size_t rowStride = Traits::row_stride(p.K);
+    const size_t eBase = size_t(expert) * p.N + (upHalf != 0u ? I : 0u);
+    const uint rows = (r0 < I) ? min(4u, I - r0) : 0u;
+    typename Traits::WeightPtr a0 = Traits::row_ptr(wSrc, eBase + (rows != 0u ? r0 : 0u), rowStride);
+    const size_t st1 = rows > 1u ? rowStride : 0u;
+    const size_t st2 = rows > 2u ? 2u * rowStride : 0u;
+    const size_t st3 = rows > 3u ? 3u * rowStride : 0u;
+    const bool applyFwht = (p.flags & 1u) != 0u;
+    const bool sortedOut = (p.flags & 2u) != 0u;
+    const float2 softcaps = float2(p.gateCap, p.upCap);
+    if constexpr (!HAS_SOFTCAP) (void)softcaps;
+
+    for (uint base = 0u; base < uint(cnt); base += 4u) {
+        const uint mCount = min(4u, uint(cnt) - base);
+        uint tokIds[4], pairSlots[4];
+        for (uint m = 0u; m < mCount; ++m) {
+            const uint idx = uint(off) + base + m;
+            tokIds[m] = uint(sortedTok[idx]);
+            pairSlots[m] = sortedOut ? idx : uint(sortedPairIdx[idx]);
+        }
+        float4 accM[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
+        if (mCount <= 2u) {
+            qwg_moe_compact_shvq_gateup_12<Traits>(
+                a0, st1, st2, st3,
+                x + size_t(tokIds[0]) * p.K,
+                x + size_t(tokIds[mCount > 1u ? 1u : 0u]) * p.K,
+                mCount, nSlices, rows, hl, tgLut, accM);
+        } else {
+            for (uint s = hl; rows != 0u && s < nSlices; s += 16u) {
+                const uint col = s << 5u;
+                typename Traits::WeightPtr gp = Traits::group_ptr(a0, s);
+                const uint byteInGroup = Traits::byte_in_group(s);
+                device const float* xsCol[4];
+                #pragma unroll
+                for (uint m = 0u; m < 4u; ++m) xsCol[m] = (m < mCount) ? (x + size_t(tokIds[m]) * p.K + col) : x;
+                const float4 d0 = Traits::slice_dot_m4_acc(gp, byteInGroup, xsCol, mCount, tgLut, float4(accM[0].x, accM[1].x, accM[2].x, accM[3].x));
+                const float4 d1 = Traits::slice_dot_m4_acc(gp + st1, byteInGroup, xsCol, mCount, tgLut, float4(accM[0].y, accM[1].y, accM[2].y, accM[3].y));
+                const float4 d2 = Traits::slice_dot_m4_acc(gp + st2, byteInGroup, xsCol, mCount, tgLut, float4(accM[0].z, accM[1].z, accM[2].z, accM[3].z));
+                const float4 d3 = Traits::slice_dot_m4_acc(gp + st3, byteInGroup, xsCol, mCount, tgLut, float4(accM[0].w, accM[1].w, accM[2].w, accM[3].w));
+                accM[0] = float4(d0.x, d1.x, d2.x, d3.x); accM[1] = float4(d0.y, d1.y, d2.y, d3.y);
+                accM[2] = float4(d0.z, d1.z, d2.z, d3.z); accM[3] = float4(d0.w, d1.w, d2.w, d3.w);
+            }
+        }
+        for (uint m = 0u; m < mCount; ++m) {
+            accM[m] = qwg_simd_reduce_down<16u>(accM[m]);
+            const float4 uAcc = simd_shuffle_down(accM[m], 16);
+            if (lane == 0u) {
+                const uint c = m * 32u + sgi * 4u;
+                if constexpr (HAS_SOFTCAP) {
+                    tgAct[c + 0u] = rows > 0u ? qwg_moe_softcap_swiglu_val(accM[m].x, uAcc.x, softcaps) : 0.0f;
+                    tgAct[c + 1u] = rows > 1u ? qwg_moe_softcap_swiglu_val(accM[m].y, uAcc.y, softcaps) : 0.0f;
+                    tgAct[c + 2u] = rows > 2u ? qwg_moe_softcap_swiglu_val(accM[m].z, uAcc.z, softcaps) : 0.0f;
+                    tgAct[c + 3u] = rows > 3u ? qwg_moe_softcap_swiglu_val(accM[m].w, uAcc.w, softcaps) : 0.0f;
+                } else {
+                    tgAct[c + 0u] = rows > 0u ? qwg_swiglu_mul(accM[m].x, uAcc.x) : 0.0f;
+                    tgAct[c + 1u] = rows > 1u ? qwg_swiglu_mul(accM[m].y, uAcc.y) : 0.0f;
+                    tgAct[c + 2u] = rows > 2u ? qwg_swiglu_mul(accM[m].z, uAcc.z) : 0.0f;
+                    tgAct[c + 3u] = rows > 3u ? qwg_swiglu_mul(accM[m].w, uAcc.w) : 0.0f;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgi < mCount) {
+            const float act = (rBase + lane < I) ? tgAct[sgi * 32u + lane] : 0.0f;
+            const float v = applyFwht ? qwg_fwht32_lane_f32(act, lane) : act;
+            if (rBase + lane < I) actOut[size_t(pairSlots[sgi]) * I + rBase + lane] = v;
+        }
+        if (base + 4u < uint(cnt)) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+template <typename Traits, typename Params>
+METAL_FUNC void qwg_moe_compact_shvq_down_impl(
+    typename Traits::WeightPtr wBytes, device const float* x,
+    device const int32_t* expertOff, device const int32_t* activeExperts,
+    device const uint* activeArgs, device const int32_t* sortedPairIdx,
+    device float* dnSlotOut, typename Traits::WeightPtr coldWBytes,
+    constant Params& p, uint2 tg, uint tid, uint sgi, uint lane,
+    threadgroup typename Traits::TgLut& tgLut) {
+    if (tg.y >= activeArgs[0]) return;
+    const uint rawExpert = uint(activeExperts[tg.y]);
+    if (rawExpert >= p.numExperts) return;
+    const int off = expertOff[rawExpert];
+    const int cnt = expertOff[rawExpert + 1] - off;
+    if (cnt <= 0) return;
+    if (tg.x * 32u >= p.N) return;
+    if constexpr (Traits::has_tg_lut()) {
+        tgLut.load(tid, 256u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        (void)tid;
+    }
+    const bool sortedOut = (p.flags & 2u) != 0u;
+    const uint r0 = (tg.x * 8u + sgi) * 4u;
+    const uint rowsLeft = (r0 < p.N) ? (p.N - r0) : 0u;
+    if (rowsLeft == 0u) return;
+    const bool isCold = (p.residentE > 0u) && (rawExpert >= p.residentE);
+    const uint wExp = isCold ? (rawExpert - p.residentE) : rawExpert;
+    typename Traits::WeightPtr wSrc = isCold ? coldWBytes : wBytes;
+    const uint nSlices = p.K >> 5u;
+
+    for (uint base = 0u; base < uint(cnt); base += 4u) {
+        const uint mCount = min(4u, uint(cnt) - base);
+        if (mCount == 1u) {
+            const uint idxA = uint(off) + base;
+            const uint slotA = sortedOut ? idxA : uint(sortedPairIdx[idxA]);
+            const float4 vx0 = qwg_moe_down_rows4_1x<Traits>(
+                wSrc, x + size_t(slotA) * p.K, wExp, r0, rowsLeft, p.N, p.K, nSlices, lane, tgLut);
+            if (lane == 0u) qwg_moe_write_route4(dnSlotOut, slotA, p.N, r0, rowsLeft, vx0);
+        } else if (mCount == 2u) {
+            const uint idxA = uint(off) + base, idxB = idxA + 1u;
+            const uint slotA = sortedOut ? idxA : uint(sortedPairIdx[idxA]);
+            const uint slotB = sortedOut ? idxB : uint(sortedPairIdx[idxB]);
+            float4 vx0, vx1;
+            qwg_moe_down_rows4_2x<Traits, true>(
+                wSrc, x + size_t(slotA) * p.K, x + size_t(slotB) * p.K,
+                wExp, r0, rowsLeft, p.N, p.K, nSlices, lane, tgLut, vx0, vx1);
+            if (lane == 0u) {
+                qwg_moe_write_route4(dnSlotOut, slotA, p.N, r0, rowsLeft, vx0);
+                qwg_moe_write_route4(dnSlotOut, slotB, p.N, r0, rowsLeft, vx1);
+            }
+        } else {
+            device const float* xs[4];
+            uint slots[4];
+            for (uint m = 0u; m < mCount; ++m) {
+                const uint idx = uint(off) + base + m;
+                slots[m] = sortedOut ? idx : uint(sortedPairIdx[idx]);
+                xs[m] = x + size_t(slots[m]) * p.K;
+            }
+            float4 vx[4];
+            qwg_moe_down_rows4_m4<Traits>(wSrc, xs, mCount, wExp, r0, rowsLeft, p.N, p.K, nSlices, lane, tgLut, vx);
+            if (lane == 0u) {
+                for (uint m = 0u; m < mCount; ++m) {
+                    qwg_moe_write_route4(dnSlotOut, slots[m], p.N, r0, rowsLeft, vx[m]);
+                }
+            }
+        }
+    }
+}

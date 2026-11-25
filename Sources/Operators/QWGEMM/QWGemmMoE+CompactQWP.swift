@@ -27,6 +27,14 @@ extension QWGemm {
             return hasSoftcap ? "qwg_moe_compact_aq4_g64_gateup_f32_sc" : "qwg_moe_compact_aq4_g64_gateup_f32"
         case .nativeAffine(8, 32), .rotatedHQ(8, 32):
             return hasSoftcap ? "qwg_moe_compact_aq8_g32_gateup_f32_sc" : "qwg_moe_compact_aq8_g32_gateup_f32"
+        case .shvq(1, 32):
+            return hasSoftcap ? "qwg_moe_compact_shvq1_g32_gateup_f32_sc" : "qwg_moe_compact_shvq1_g32_gateup_f32"
+        case .shvq(1, 64):
+            return hasSoftcap ? "qwg_moe_compact_shvq1_g64_gateup_f32_sc" : "qwg_moe_compact_shvq1_g64_gateup_f32"
+        case .shvq(15, 32):
+            return hasSoftcap ? "qwg_moe_compact_shvq15_g32_gateup_f32_sc" : "qwg_moe_compact_shvq15_g32_gateup_f32"
+        case .shvq(15, 64):
+            return hasSoftcap ? "qwg_moe_compact_shvq15_g64_gateup_f32_sc" : "qwg_moe_compact_shvq15_g64_gateup_f32"
         case .shvq(2, 32):
             return hasSoftcap ? "qwg_moe_compact_shvq2_g32_gateup_f32_sc" : "qwg_moe_compact_shvq2_g32_gateup_f32"
         case .shvq(2, 64):
@@ -53,6 +61,10 @@ extension QWGemm {
         case .nativeAffine(4, 32), .rotatedHQ(4, 32): return "qwg_moe_compact_aq4_g32_down_f32"
         case .nativeAffine(4, 64), .rotatedHQ(4, 64): return "qwg_moe_compact_aq4_g64_down_f32"
         case .nativeAffine(8, 32), .rotatedHQ(8, 32): return "qwg_moe_compact_aq8_g32_down_f32"
+        case .shvq(1, 32):                       return "qwg_moe_compact_shvq1_g32_down_f32"
+        case .shvq(1, 64):                       return "qwg_moe_compact_shvq1_g64_down_f32"
+        case .shvq(15, 32):                      return "qwg_moe_compact_shvq15_g32_down_f32"
+        case .shvq(15, 64):                      return "qwg_moe_compact_shvq15_g64_down_f32"
         case .shvq(2, 32):                       return "qwg_moe_compact_shvq2_g32_down_f32"
         case .shvq(2, 64):                       return "qwg_moe_compact_shvq2_g64_down_f32"
         case .shvq(2, 128):                      return "qwg_moe_compact_shvq2_g128_down_f32"
@@ -162,7 +174,7 @@ extension QWGemm {
         }
 
         let bucketPlan = QWGemmFP.MoEActiveBucketPlan(
-            experts: experts, intermediate: intermediate, hidden: hidden, downTileRows: 16)
+            experts: experts, intermediate: intermediate, hidden: hidden, downTileRows: 32)
         try encodeMoEGroupAndActiveBuckets(
             enc, hal: hal, ids: ids, expertOff: expertOff,
             activeExperts: activeExperts, activeIndirect: activeIndirect,
@@ -201,7 +213,7 @@ extension QWGemm {
         enc.dispatchThreadgroups(
             indirectBuffer: indBuf,
             indirectBufferOffset: indBase + QWGemmFP.MoEActiveBucketPlan.downIndirectByteOffset,
-            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         barrier()
 
         try encodeMoEDownReduceCombineF32(

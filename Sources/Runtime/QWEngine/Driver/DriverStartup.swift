@@ -32,15 +32,17 @@ extension QWEngineDriver {
         let verifyHeadQ4Enabled: Bool
         let headIsQ4g: Bool
         let headFormat: QWWeightFormat?
+        let moeRouterIsBF16: Bool
         let requestedMTPDrafts: Int
         let dflashDraftPackPath: String
         let dflashSelectorTopK: Int?
+        let dsparkConfidenceSchedule: Bool
         let environment: [String: String]
         let isHyperStream: Bool
         let isInkling2: Bool
         let targetDescriptor: QWModelDescriptor?
 
-        func resolvingHead(isQ4g: Bool, format: QWWeightFormat?) throws -> StartupConfig {
+        func resolvingHead(isQ4g: Bool, format: QWWeightFormat?, moeRouterIsBF16: Bool = false) throws -> StartupConfig {
             let maxDrafts = 15
             let resolvedDraftHead = try QWEngineDriver.resolveMTPFlag(
                 name: "QW_MTP_DRAFT_HEAD",
@@ -65,9 +67,11 @@ extension QWEngineDriver {
                 verifyHeadQ4Enabled: verifyHeadQ4Enabled,
                 headIsQ4g: isQ4g,
                 headFormat: format,
+                moeRouterIsBF16: moeRouterIsBF16,
                 requestedMTPDrafts: requestedMTPDrafts,
                 dflashDraftPackPath: dflashDraftPackPath,
                 dflashSelectorTopK: dflashSelectorTopK,
+                dsparkConfidenceSchedule: dsparkConfidenceSchedule,
                 environment: environment,
                 isHyperStream: isHyperStream,
                 isInkling2: isInkling2,
@@ -85,14 +89,15 @@ extension QWEngineDriver {
                               mtpDraftStrategy: String = "hybrid",
                               mtpQuadraticSeeding: Bool = true,
                               dflashDraftPackPath: String? = nil,
-                              dflashSelectorTopK: Int? = nil)
+                              dflashSelectorTopK: Int? = nil,
+                              dsparkConfidenceSchedule: Bool? = nil)
         throws -> StartupConfig {
         var evictionResolved = prefillScratchEviction
         guard FileManager.default.fileExists(atPath: packPath) else {
             throw QWEngineDriverError.packMissing(packPath)
         }
         // L1: resolve the backend and draft budget BEFORE any pack read, HAL, or arena work.
-        let mtpBackendResolved: QWMTPBackend
+        var mtpBackendResolved: QWMTPBackend
         do {
             mtpBackendResolved = try QWMTPBackend.resolveSelection(mtpBackend, drafts: mtpDrafts)
         } catch QWEngineError.badMTPDrafts(let d) {
@@ -208,6 +213,35 @@ extension QWEngineDriver {
             }
             return QWDFlashConfig.defaultPackPath(for: targetDescriptor)
         }()
+        if mtpBackend == nil && mtpDrafts > 0 && targetDescriptor?.dsparkConfig != nil
+            && QWModelDescriptor.DSparkConfig.resolvePackURL(near: packPath) != nil {
+            mtpBackendResolved = .dspark
+        }
+        let resolvedDSparkPackPath: String? = {
+            if let envPath = environment["QW_DSPARK_DRAFT_PACK"]?.trimmingCharacters(in: .whitespacesAndNewlines), !envPath.isEmpty {
+                return envPath
+            }
+            if let explicit = dflashDraftPackPath?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty,
+               explicit.hasSuffix("dspark.qwp") {
+                return explicit
+            }
+            return QWModelDescriptor.DSparkConfig.resolvePackURL(near: packPath)?.path
+        }()
+        if mtpBackendResolved == .dspark && mtpDrafts > 0 {
+            guard targetDescriptor?.dsparkConfig != nil else {
+                throw QWEngineDriverError.unsupportedModel("DSpark backend requires dspark_* capabilities in config.json")
+            }
+            guard let dsPath = resolvedDSparkPackPath, FileManager.default.fileExists(atPath: dsPath) else {
+                throw QWEngineDriverError.packMissing(resolvedDSparkPackPath ?? "dspark.qwp")
+            }
+        }
+        let resolvedDSparkConfidenceSchedule: Bool = {
+            if let explicit = dsparkConfidenceSchedule { return explicit }
+            if let envConf = environment["QW_DSPARK_CONFIDENCE_SCHEDULE"] {
+                return ["1", "true", "yes"].contains(envConf.lowercased())
+            }
+            return targetDescriptor?.dsparkConfig?.enableConfidenceHead ?? false
+        }()
         let resolvedDFlashTopK: Int? = {
             if let dflashSelectorTopK { return dflashSelectorTopK }
             if let envTopK = environment["QW_DFLASH_TOP_K"], let val = Int(envTopK) { return val }
@@ -247,9 +281,11 @@ extension QWEngineDriver {
             verifyHeadQ4Enabled: verifyHeadQ4Enabled,
             headIsQ4g: headIsQ4g,
             headFormat: nil,
+            moeRouterIsBF16: false,
             requestedMTPDrafts: mtpDrafts,
-            dflashDraftPackPath: resolvedDFlashPackPath,
+            dflashDraftPackPath: (mtpBackendResolved == .dspark ? (resolvedDSparkPackPath ?? resolvedDFlashPackPath) : resolvedDFlashPackPath),
             dflashSelectorTopK: resolvedDFlashTopK,
+            dsparkConfidenceSchedule: resolvedDSparkConfidenceSchedule,
             environment: environment,
             isHyperStream: isHyperStream,
             isInkling2: isInkling2,

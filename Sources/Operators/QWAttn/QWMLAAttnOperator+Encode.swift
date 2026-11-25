@@ -8,6 +8,95 @@ import QWGEMM
 import QWKV
 
 extension QWMLAAttnOperator {
+    private func supportsKVBLQuant(_ absP: AbsorbParams) -> (supported: Bool, isSub2SHVQ: Bool, isF16: Bool) {
+        let inc = absP.isIncumbent & 0xFF
+        let isSub2SHVQ = inc == 2 && (absP.bits == 1 || absP.bits == 15)
+        let isF16 = (inc == 3 || absP.bits == 16)
+        let pow2Group = absP.group >= 32 && (absP.group & (absP.group - 1)) == 0 && (kvLoraRank % Int(absP.group) == 0)
+        let quantOK = pow2Group && (
+            inc == 1
+            || (inc == 2 && (isSub2SHVQ || (absP.bits >= 2 && absP.bits <= 4)))
+            || (inc == 0 && (absP.bits == 2 || absP.bits == 3 || absP.bits == 4 || absP.bits == 6 || absP.bits == 8))
+        )
+        return (quantOK, isSub2SHVQ, isF16)
+    }
+
+    @discardableResult
+    internal func encodeAbsorbQ(_ enc: any MTLComputeCommandEncoder,
+                                kvBProj: QWWeightView,
+                                absP: inout AbsorbParams,
+                                rows: Int,
+                                mTiles: Int) -> Bool {
+        let (quantOK, isSub2SHVQ, isF16) = supportsKVBLQuant(absP)
+        let naxProjAvail = hal.caps.isMetal4TensorCapable && sparseAttnMMAEnabled && projNAXEnabled && rows >= 16
+        let naxPSO = isSub2SHVQ ? psoAbsorbQNAXSub2 : psoAbsorbQNAX
+        let absorbNAX = naxProjAvail && naxPSO != nil
+            && kvLoraRank >= 32 && (kvLoraRank % 32 == 0)
+            && nopeDim > 0 && (nopeDim % 4 == 0)
+            && (isF16 || quantOK)
+        let absorbMMA = !absorbNAX && sparseAttnMMAEnabled && rows >= 16 && quantOK
+            && nopeDim >= 32 && (nopeDim % 32 == 0) && kvLoraRank == 512
+        if let naxPSO, absorbNAX {
+            enc.setComputePipelineState(naxPSO)
+        } else {
+            enc.setComputePipelineState(absorbMMA ? (isSub2SHVQ ? psoAbsorbQMMASub2 : psoAbsorbQMMA)
+                                                  : (isSub2SHVQ ? psoAbsorbQSub2 : psoAbsorbQ))
+        }
+        mlaQFullScratch.bind(enc, index: 0)
+        kvBProj.blocks.bind(enc, index: 1)
+        qAbsScratch.bind(enc, index: 2)
+        enc.setBytes(&absP, length: MemoryLayout<AbsorbParams>.stride, index: 3)
+        if absorbNAX {
+            enc.dispatchThreadgroups(MTLSize(width: (kvLoraRank + 63) / 64, height: (rows + 63) / 64, depth: qHeads),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        } else if absorbMMA {
+            enc.dispatchThreadgroups(MTLSize(width: qHeads, height: (rows + 31) / 32, depth: kvLoraRank / 128),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        } else {
+            enc.dispatchThreadgroups(MTLSize(width: qHeads, height: mTiles, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 512, height: 1, depth: 1))
+        }
+        return absorbNAX || absorbMMA
+    }
+
+    internal func encodeProjUV(_ enc: any MTLComputeCommandEncoder,
+                               kvBProj: QWWeightView,
+                               dst: QWTensorValue,
+                               absP: inout AbsorbParams,
+                               absorbMMA: Bool,
+                               rows: Int,
+                               mTiles: Int) {
+        let (quantOK, isSub2SHVQ, isF16) = supportsKVBLQuant(absP)
+        let skipFwht = (absP.isIncumbent & 0x10000) != 0
+        let naxProjAvail = hal.caps.isMetal4TensorCapable && sparseAttnMMAEnabled && projNAXEnabled && rows >= 16
+        let naxPSO = isSub2SHVQ ? psoProjUVNAXSub2 : psoProjUVNAX
+        let projUVNAX = naxProjAvail && naxPSO != nil
+            && kvLoraRank >= 32 && (kvLoraRank % 32 == 0)
+            && vHeadDim >= 32 && (skipFwht ? (vHeadDim % 4 == 0) : (vHeadDim % 32 == 0))
+            && (isF16 || quantOK)
+        let projUVMMA = !projUVNAX && absorbMMA && !isF16 && vHeadDim >= 128 && (vHeadDim % 128) == 0 && vHeadDim <= 256
+        if let naxPSO, projUVNAX {
+            enc.setComputePipelineState(naxPSO)
+        } else {
+            enc.setComputePipelineState(projUVMMA ? (isSub2SHVQ ? psoProjUVMMASub2 : psoProjUVMMA)
+                                                  : (isSub2SHVQ ? psoProjUVSub2 : psoProjUV))
+        }
+        uLatScratch.bind(enc, index: 0)
+        kvBProj.blocks.bind(enc, index: 1)
+        dst.bind(enc, index: 2)
+        enc.setBytes(&absP, length: MemoryLayout<AbsorbParams>.stride, index: 3)
+        if projUVNAX {
+            enc.dispatchThreadgroups(MTLSize(width: (vHeadDim + 63) / 64, height: (rows + 63) / 64, depth: qHeads),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        } else if projUVMMA {
+            enc.dispatchThreadgroups(MTLSize(width: qHeads, height: (rows + 31) / 32, depth: vHeadDim / 128),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        } else {
+            enc.dispatchThreadgroups(MTLSize(width: qHeads, height: mTiles, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+    }
+
     public func indexerStateBytes(position: Int) -> Int {
         if isDecoupledDSA {
             return layers.count * position * (idxDim + ropeDim) * 2
@@ -262,10 +351,15 @@ extension QWMLAAttnOperator {
         encodeIndexerSelection(enc, ls: ls, pos0: pos0, rows: rows,
                                probeClusters: Self.emeansProbeClusters, windowBlocks: 0)
 
-        let isIncumbent: UInt32 = switch mlaW.kvBProj.containerKind {
-        case .incumbentHQ4G32: 1
-        case .shvq: 2
-        case .rotatedHQ, .nativeAffine: 0
+        let isIncumbent: UInt32
+        if mlaW.kvBProj.bits == 16 {
+            isIncumbent = 3
+        } else {
+            switch mlaW.kvBProj.containerKind {
+            case .incumbentHQ4G32: isIncumbent = 1
+            case .shvq: isIncumbent = 2
+            case .rotatedHQ, .nativeAffine: isIncumbent = 0
+            }
         }
         var absP = AbsorbParams(
             T: UInt32(rows),
@@ -274,8 +368,8 @@ extension QWMLAAttnOperator {
             vHeadDim: UInt32(vHeadDim),
             kvLoraRank: UInt32(kvLoraRank),
             qFullStride: UInt32(qFullStride),
-            bits: UInt32(mlaW.kvBProj.containerKind.bits),
-            group: UInt32(mlaW.kvBProj.containerKind.groupSize),
+            bits: UInt32(mlaW.kvBProj.bits),
+            group: UInt32(mlaW.kvBProj.groupSize),
             isIncumbent: isIncumbent
         )
         let mTiles = (rows + 7) / 8

@@ -14,12 +14,15 @@ struct QWEnginePrefixState: Sendable {
     let dflashKData: Data?
     let dflashVData: Data?
     let dflashCacheOffset: Int
+    let dsparkRingData: Data?
+    let dsparkCacheOffset: Int
     /// MLA indexer pools and open-block ring rows (operator-owned, not in the slabs).
     let mlaIndexerData: Data?
 
     init(position: Int, generated: Int, roundRecord: QWRoundRecord, recData: Data, ringData: Data,
          trunkHiddenData: Data?, trunkHiddenValid: Bool, stochastic: QWStochasticState? = nil,
          dflashKData: Data? = nil, dflashVData: Data? = nil, dflashCacheOffset: Int = 0,
+         dsparkRingData: Data? = nil, dsparkCacheOffset: Int = 0,
          mlaIndexerData: Data? = nil) {
         self.position = position
         self.generated = generated
@@ -32,6 +35,8 @@ struct QWEnginePrefixState: Sendable {
         self.dflashKData = dflashKData
         self.dflashVData = dflashVData
         self.dflashCacheOffset = dflashCacheOffset
+        self.dsparkRingData = dsparkRingData
+        self.dsparkCacheOffset = dsparkCacheOffset
         self.mlaIndexerData = mlaIndexerData
     }
 
@@ -47,12 +52,14 @@ struct QWEnginePrefixState: Sendable {
         dflashKData = snapshot.dflashKData
         dflashVData = snapshot.dflashVData
         dflashCacheOffset = snapshot.dflashCacheOffset
+        dsparkRingData = snapshot.dsparkRingData
+        dsparkCacheOffset = snapshot.dsparkCacheOffset
         self.mlaIndexerData = mlaIndexerData
     }
 
     var memoryBytes: Int {
         recData.count + ringData.count + (trunkHiddenData?.count ?? 0) + (mlaIndexerData?.count ?? 0) +
-            (dflashKData?.count ?? 0) + (dflashVData?.count ?? 0)
+            (dflashKData?.count ?? 0) + (dflashVData?.count ?? 0) + (dsparkRingData?.count ?? 0)
     }
 
     func validateDestination(_ session: QWEngineSession, requiresRoundMetadata: Bool) throws {
@@ -137,11 +144,20 @@ struct QWEnginePrefixState: Sendable {
                 memset(vDst, 0, dSlot.vSlab.bytes)
             }
         }
+        var restoredDSparkOffset = 0
+        if let dsSlot = session.dsparkSlot {
+            if let rData = dsparkRingData, dsparkCacheOffset > 0, dsSlot.restoreSnapshot(rData) {
+                restoredDSparkOffset = dsparkCacheOffset
+            } else {
+                memset(dsSlot.ringBuffer.contents(), 0, dsSlot.ringBytes)
+            }
+        }
         session.position = position
         session.generated = generated
         session.roundRecord = roundRecord
         session.trunkHiddenValid = trunkHiddenValid
         session.dflashCacheOffset = restoredDFlashOffset
+        session.dsparkCacheOffset = restoredDSparkOffset
         session.stochastic = owner
     }
 }

@@ -11,10 +11,12 @@ public enum QWWeightArenaSizing: String, Sendable {
 struct QWWeightAllocationPlan {
     let shapes: [QWTensorShape]
     let bytes: Int
+    let moeRouterIsBF16: Bool
 
     init(geometry: QWModelGeometry, ropeRows: Int, mtpDrafts: Int = 0, headQ4g: Bool = false,
          maxMTPDrafts: Int = 15, format: QWWeightFormat = .hq4G32,
-         headFormat: QWWeightFormat? = nil) throws {
+         headFormat: QWWeightFormat? = nil, moeRouterIsBF16: Bool = false) throws {
+        self.moeRouterIsBF16 = moeRouterIsBF16
         guard ropeRows > 0, ropeRows <= Int.max / 256 - 1 else {
             throw QWEngineDriverError.state("invalid RoPE row count: \(ropeRows)")
         }
@@ -50,7 +52,8 @@ struct QWWeightAllocationPlan {
             let coldE = max(0, geometry.numExperts - resE)
             let outDim = geometry.moeRoutedDim
             let routerRows = geometry.moeSplitFeatureRouting ? (2 * geometry.numExperts) : geometry.numExperts
-            tensor(routerRows * h, .f32)
+            let routerDtype: QWDType = (moeRouterIsBF16 && coldE == 0) ? .bf16 : .f32
+            tensor(routerRows * h, routerDtype)
             if geometry.hasBiasCorrectedRouter {
                 tensor(geometry.numExperts, .f32)
             }
@@ -336,8 +339,8 @@ struct QWWeightAllocationPlan {
         }
         var total = 0
         for shape in requests {
-            let (rawBytes, productOverflow) = shape.elementCount.multipliedReportingOverflow(
-                by: shape.dtype == .f16 ? 2 : 4)
+            let elemBytes = (shape.dtype == .f16 || shape.dtype == .bf16) ? 2 : 4
+            let (rawBytes, productOverflow) = shape.elementCount.multipliedReportingOverflow(by: elemBytes)
             let (padded, paddingOverflow) = rawBytes.addingReportingOverflow(255)
             let (next, totalOverflow) = total.addingReportingOverflow(padded & ~255)
             guard !productOverflow, !paddingOverflow, !totalOverflow else {

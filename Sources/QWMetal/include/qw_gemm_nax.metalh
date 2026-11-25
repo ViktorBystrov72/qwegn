@@ -83,16 +83,11 @@ METAL_FUNC void qwg_aq_frag8(device const char* gp, uint bitOffset,
         lo = half4(w0.x, w1.x, w2.x, w3.x);
         hi = half4(w0.y, w1.y, w2.y, w3.y);
     } else {
-        const ushort2 rLo = as_type<ushort2>(*(device const uint*)(p + byteOff));
-        const ushort2 rHi = as_type<ushort2>(*(device const uint*)(p + byteOff + 16u));
-        const half2 cLoXZ = as_type<half2>((rLo & ushort2(0x00FFu)) | ushort2(0x6400u)) + kBias;
-        const half2 cLoYW = as_type<half2>((rLo >> 8u) | ushort2(0x6400u)) + kBias;
-        const half2 cHiXZ = as_type<half2>((rHi & ushort2(0x00FFu)) | ushort2(0x6400u)) + kBias;
-        const half2 cHiYW = as_type<half2>((rHi >> 8u) | ushort2(0x6400u)) + kBias;
-        const half2 wLoXZ = fma(cLoXZ, s2, b2), wLoYW = fma(cLoYW, s2, b2);
-        const half2 wHiXZ = fma(cHiXZ, s2, b2), wHiYW = fma(cHiYW, s2, b2);
-        lo = half4(wLoXZ.x, wLoYW.x, wLoXZ.y, wLoYW.y);
-        hi = half4(wHiXZ.x, wHiYW.x, wHiXZ.y, wHiYW.y);
+        (void)s2; (void)b2; (void)kBias;
+        const half4 cLo = half4(as_type<uchar4>(*(device const uint*)(p + byteOff)));
+        const half4 cHi = half4(as_type<uchar4>(*(device const uint*)(p + byteOff + 16u)));
+        lo = fma(cLo, half4(sb.x), half4(sb.y));
+        hi = fma(cHi, half4(sb.x), half4(sb.y));
     }
 }
 
@@ -486,13 +481,13 @@ METAL_FUNC void qwg_moe_nax_split_f32_body(device const char* w, device const ha
     const uint residentE = p.experts >> 16u;
     const bool isCold = (residentE > 0u) && (e >= residentE);
     if (((tileBlock & 0x40u) != 0u && isCold) || ((tileBlock & 0x80u) != 0u && !isCold)) return;
+    int bm; uint tidY;
+    qw_moe_decode_tile(tileR[t], rowCount, int(tileBlock & 0x3Fu), bm, tidY);
     const size_t rowBytes = qwg_nax_row_bytes<AQ_BITS, AQ_GROUP, IS_SHVQ>(p);
     const uint wExp = isCold ? (e - residentE) : e;
     device const char* we = (isCold ? coldW : w) + size_t(wExp) * size_t(p.n) * rowBytes;
     device const half* xhe = xh + size_t(rowBase) * size_t(p.k);
     device const half* xle = xl + size_t(rowBase) * size_t(p.k);
-    int bm; uint tidY;
-    qw_moe_decode_tile(tileR[t], rowCount, int(tileBlock & 0x3Fu), bm, tidY);
     const uint3 tid = uint3(tg.x, tidY, 0);
     const uint mode = (bm == 16) ? 1u : ((bm == 32) ? 2u : 0u);
     if ((tileBlock & 0x80000000u) != 0u) {

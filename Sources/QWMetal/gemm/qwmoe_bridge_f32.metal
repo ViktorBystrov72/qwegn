@@ -42,11 +42,13 @@ kernel void qwg_moe_bridge_f16_to_f32(device const half* xRot    [[buffer(0)]],
     // that emits an f16 hi/lo pair) and recombining the pair into f32 — no
     // third copy of the butterfly in the tree.
     const bool skipRot32 = (H & 0x80000000u) != 0u;
-    const uint realH = H & 0x7FFFFFFFu;
+    const bool plainF16 = (H & 0x40000000u) != 0u;
+    const uint realH = H & 0x3FFFFFFFu;
     const uint hiddenU4 = realH >> 3;             // uint4 groups per row (8 halves each)
     device const uint4* xr = (device const uint4*)xRot + (size_t)tg * hiddenU4;
     device float* rot32 = xRot32 + (size_t)tg * realH;
     device float* plain32 = xPlain32 + (size_t)tg * realH;
+    device half* plain16 = (device half*)xPlain32 + (size_t)tg * realH;
     // One threadgroup per row, 32 threads — the same lane geometry the
     // norm kernel's butterfly uses, so the 4-lane groups line up.
     for (uint u = tg2.x * 32u + ti; u < hiddenU4; u += 32u * ng2.x) {
@@ -60,8 +62,12 @@ kernel void qwg_moe_bridge_f16_to_f32(device const half* xRot    [[buffer(0)]],
         half hi[8], lo[8];
         if (QW_FWHT_ROTATED) {
             fwht32_f32_to_split_h8(f, hi, lo, ti);    // the WHT is its own inverse
-            for (int i = 0; i < 8; i++) {
-                plain32[u * 8u + i] = float(hi[i]) + float(lo[i]);
+            if (plainF16) {
+                ((device uint4*)plain16)[u] = *(thread uint4*)hi;
+            } else {
+                for (int i = 0; i < 8; i++) {
+                    plain32[u * 8u + i] = float(hi[i]) + float(lo[i]);
+                }
             }
         } else {
             // The STANDARD basis: there is nothing to un-rotate, because the
@@ -71,8 +77,12 @@ kernel void qwg_moe_bridge_f16_to_f32(device const half* xRot    [[buffer(0)]],
             // keep the f32 value: the helper's standard path would split it
             // into an f16 hi/lo pair and back, and the router's copy must be
             // the number it started from.
-            for (int i = 0; i < 8; i++) {
-                plain32[u * 8u + i] = f[i];
+            if (plainF16) {
+                ((device uint4*)plain16)[u] = w;
+            } else {
+                for (int i = 0; i < 8; i++) {
+                    plain32[u * 8u + i] = f[i];
+                }
             }
         }
     }

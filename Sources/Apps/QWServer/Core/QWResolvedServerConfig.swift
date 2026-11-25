@@ -22,6 +22,7 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
     public var mtpRelaxedMargin: Double, mtpRelaxedMinProb: Double, mtpDraftStrategy: String, mtpQuadraticSeeding: Bool
     public var mtpAdaptiveDepth: Bool, mtpEntropyThreshold: Double
     public var dflashDraftPackPath: String, dflashSelectorTopK: Int
+    public var dsparkConfidenceSchedule: Bool? = nil
     public var gdnPrefill: String, evictPrefillScratch: String, prefillChunkSize: Int
     public var maxConcurrentSessions: Int
     public var lsaMode: String, lsaBudget: Int, lsaClusterBlock: Int, lsaSidecarPath: String
@@ -50,6 +51,7 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
         mtpDraftStrategy: String = "hybrid", mtpQuadraticSeeding: Bool = true,
         mtpAdaptiveDepth: Bool = false, mtpEntropyThreshold: Double = 0.7,
         dflashDraftPackPath: String = "", dflashSelectorTopK: Int = 16,
+        dsparkConfidenceSchedule: Bool? = nil,
         gdnPrefill: String = "chunked", evictPrefillScratch: String = "auto",
         prefillChunkSize: Int = QWPrefillLimits.chunkRows,
         maxConcurrentSessions: Int = 8,
@@ -74,6 +76,7 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
         self.mtpRelaxedMargin = mtpRelaxedMargin; self.mtpRelaxedMinProb = mtpRelaxedMinProb; self.mtpDraftStrategy = mtpDraftStrategy; self.mtpQuadraticSeeding = mtpQuadraticSeeding
         self.mtpAdaptiveDepth = mtpAdaptiveDepth; self.mtpEntropyThreshold = mtpEntropyThreshold
         self.dflashDraftPackPath = dflashDraftPackPath; self.dflashSelectorTopK = dflashSelectorTopK
+        self.dsparkConfidenceSchedule = dsparkConfidenceSchedule
         self.gdnPrefill = gdnPrefill; self.evictPrefillScratch = evictPrefillScratch
         self.prefillChunkSize = prefillChunkSize
         self.maxConcurrentSessions = max(1, min(16, maxConcurrentSessions))
@@ -96,7 +99,8 @@ public struct QWResolvedServerConfig: Sendable, Equatable {
         QWSpeculativeParameters(enabled: speculativeDecodingEnabled, mtpDrafts: mtpDrafts, mtpBackend: mtpBackend,
                                 mtpRelaxedMargin: mtpRelaxedMargin, mtpRelaxedMinProb: mtpRelaxedMinProb,
                                 mtpDraftStrategy: mtpDraftStrategy, mtpQuadraticSeeding: mtpQuadraticSeeding,
-                                adaptiveDepth: mtpAdaptiveDepth, entropyThreshold: mtpEntropyThreshold)
+                                adaptiveDepth: mtpAdaptiveDepth, entropyThreshold: mtpEntropyThreshold,
+                                dsparkConfidenceSchedule: dsparkConfidenceSchedule)
     }
 
     /// Cohesive Latent Sparse Attention configuration resolved for the server.

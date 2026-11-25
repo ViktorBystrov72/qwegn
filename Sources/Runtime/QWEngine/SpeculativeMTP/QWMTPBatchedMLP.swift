@@ -1,3 +1,4 @@
+import Foundation
 import Metal
 import QWAlloc
 import QWCore
@@ -20,6 +21,8 @@ struct QWMTPBatchedMLP {
     /// From this many rows the 4-bit G32 kernels compute two weight rows per simdgroup,
     /// so each activation load serves both; below it the one-row kernels are faster.
     static let rowPairedMinimumRows = 4
+    static let verifyAqNaxEnabled = ProcessInfo.processInfo.environment["QW_VERIFY_AQ_NAX"] != "0"
+    var verifyAqNaxEnabled = Self.verifyAqNaxEnabled
 
     static func usesQ4GMKernel(_ weight: QWWeightView) -> Bool {
         weight.isIncumbentContainer || (!weight.isSHVQ && weight.bits == 4 && weight.groupSize == 32)
@@ -141,6 +144,39 @@ struct QWMTPBatchedMLP {
             throw QWEngineDriverError.state("unsupported batched trunk projection")
         }
         guard Self.usesQ4GMKernel(weight) else {
+            if verifyAqNaxEnabled,
+               hal.caps.isMetal4TensorCapable,
+               count >= 12,
+               (2...rows).contains(count),
+               !weight.isSHVQ,
+               weight.n % 64 == 0,
+               weight.k % 64 == 0,
+               QWGemmAQ.naxF32KernelName(bits: weight.bits, group: weight.groupSize, isSHVQ: false) != nil,
+               input.shape.dtype == .f16,
+               input.shape.dims.count == 1,
+               input.shape.dims[0] == count * weight.k,
+               output.shape.dtype == .f16,
+               output.shape.dims.count == 1,
+               output.shape.dims[0] >= count * weight.n {
+                let activeOutput = QWTensorValue(
+                    region: output.region,
+                    offset: output.offset,
+                    shape: QWTensorShape([count * weight.n], .f16)
+                )
+                if valid(input, alignment: 8),
+                   valid(activeOutput, alignment: 2),
+                   valid(weight.blocks, alignment: 4),
+                   !overlaps(activeOutput, input),
+                   !overlaps(activeOutput, weight.blocks) {
+                    enc.memoryBarrier(scope: .buffers)
+                    try QWGemm.encodeNaxF32(
+                        enc, hal: hal, weight: weight,
+                        x16: input, y16: input, y32: activeOutput, rows: count
+                    )
+                    enc.memoryBarrier(scope: .buffers)
+                    return
+                }
+            }
             try encodeAQGemvRows(enc, input: input, weight: weight, output: output,
                                  n: weight.n, k: weight.k, activeRows: count)
             return
@@ -232,13 +268,14 @@ struct QWMTPBatchedMLP {
 
     func encodeGateUp(_ enc: any MTLComputeCommandEncoder, input: QWTensorValue,
                       weight: QWWeightView, output: QWTensorValue,
-                      activeRows: Int? = nil, fuseFwht32: Bool = false) throws {
+                      activeRows: Int? = nil, fuseFwht32: Bool = false,
+                      swigluClamp: QWSwiGLUClampSpec? = nil) throws {
         let count = activeRows ?? rows
         let useFwht = fuseFwht32 && geometry.intermediate > 0 && (geometry.intermediate % 32 == 0)
         guard Self.usesQ4GMKernel(weight) else {
             try encodeAQGateUpRows(enc, input: input, weight: weight, output: output,
                                    n: 2 * geometry.intermediate, k: geometry.hidden,
-                                   activeRows: count, fuseFwht32: useFwht)
+                                   activeRows: count, fuseFwht32: useFwht, swigluClamp: swigluClamp)
             return
         }
         if count > 8 && count <= rows,
@@ -252,13 +289,13 @@ struct QWMTPBatchedMLP {
             let out0 = output.slice(byteOffset: 0, count: c0 * geometry.intermediate)
             let in1 = input.slice(byteOffset: c0 * geometry.hidden * 2, count: c1 * geometry.hidden)
             let out1 = output.slice(byteOffset: c0 * geometry.intermediate * 2, count: c1 * geometry.intermediate)
-            try encodeGateUp(enc, input: in0, weight: weight, output: out0, activeRows: c0, fuseFwht32: fuseFwht32)
-            try encodeGateUp(enc, input: in1, weight: weight, output: out1, activeRows: c1, fuseFwht32: fuseFwht32)
+            try encodeGateUp(enc, input: in0, weight: weight, output: out0, activeRows: c0, fuseFwht32: fuseFwht32, swigluClamp: swigluClamp)
+            try encodeGateUp(enc, input: in1, weight: weight, output: out1, activeRows: c1, fuseFwht32: fuseFwht32, swigluClamp: swigluClamp)
             return
         }
         let isAQ4 = !weight.isIncumbentContainer
         let rowPaired = !useFwht && Self.usesRowPairs(weight, activeRows: count)
-        let pipeline = try pipelineGateUp(count: count, useFwht: useFwht, rowPaired: rowPaired, isAQ4: isAQ4)
+        let pipeline = try pipelineGateUp(count: count, useFwht: useFwht, rowPaired: rowPaired, isAQ4: isAQ4, swigluClamp: swigluClamp)
         try encode(enc, input: input, weight: weight, output: output, pipeline: pipeline,
                    n: 2 * geometry.intermediate, k: geometry.hidden, paired: true,
                    fwht32: useFwht, activeRows: count, rowPaired: rowPaired)
@@ -346,7 +383,8 @@ struct QWMTPBatchedMLP {
 
     private func encodeAQGateUpRows(_ enc: any MTLComputeCommandEncoder, input: QWTensorValue,
                                     weight: QWWeightView, output: QWTensorValue,
-                                    n: Int, k: Int, activeRows: Int, fuseFwht32: Bool) throws {
+                                    n: Int, k: Int, activeRows: Int, fuseFwht32: Bool,
+                                    swigluClamp: QWSwiGLUClampSpec? = nil) throws {
         guard (2...rows).contains(activeRows) else {
             throw QWEngineDriverError.state("batched MLP active row count is invalid")
         }
@@ -364,7 +402,7 @@ struct QWMTPBatchedMLP {
                                                            isSHVQ: weight.isSHVQ) else {
             throw QWEngineDriverError.state("no AQ silu_pair kernel for \(weight.bits)-bit group \(weight.groupSize)")
         }
-        let pso = try hal.pipeline(kernelName)
+        let pso = try hal.pipeline(kernelName, swigluClamp: swigluClamp)
         enc.memoryBarrier(scope: .buffers)
         enc.setComputePipelineState(pso)
         weight.blocks.bind(enc, index: 0)
@@ -426,11 +464,12 @@ struct QWMTPBatchedMLP {
         enc.memoryBarrier(scope: .buffers)
     }
 
-    private func pipelineGateUp(count: Int, useFwht: Bool, rowPaired: Bool, isAQ4: Bool) throws -> any MTLComputePipelineState {
-        if isAQ4 {
+    private func pipelineGateUp(count: Int, useFwht: Bool, rowPaired: Bool, isAQ4: Bool,
+                                swigluClamp: QWSwiGLUClampSpec? = nil) throws -> any MTLComputePipelineState {
+        if isAQ4 || swigluClamp != nil {
             let name = useFwht ? "qwm_mlp_gate_up_fwht32_m\(count)"
                 : (rowPaired ? "qwm_mlp_gate_up_rp_m\(count)" : "qwm_mlp_gate_up_m\(count)")
-            return try hal.pipeline(name, isAQ4: true)
+            return try hal.pipeline(name, isAQ4: isAQ4, swigluClamp: swigluClamp)
         }
         guard let pipeline = (useFwht ? gateUpFwht32[count] : (rowPaired ? gateUpRowPaired : gateUp)[count]) else {
             throw QWEngineDriverError.state("unsupported batched MLP active row count")

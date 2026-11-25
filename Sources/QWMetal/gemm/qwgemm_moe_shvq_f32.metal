@@ -2,7 +2,6 @@
 // kernels for SHVQ{1,15,2,3,4}_G{32,64,128,256}.
 #include <metal_stdlib>
 #include <metal_simdgroup>
-#define QW_SHVQ_ROUTED_DIRECT_LUT 1
 #include "qw_quant_traits_shvq.metalh"
 #include "qw_moe_f32_common.metalh"
 using namespace metal;

@@ -4,6 +4,7 @@
 import Foundation
 import Network
 import QWCore
+import QWDecision
 import QWEngine
 import QWVision
 
@@ -55,17 +56,20 @@ extension QWHttpServer {
             return
         }
 
-        let returnModelName = resolveReplyModelName(requested: req.model, strictNotFound: false) ?? actor.getModelName()
-        let reqId = req.effectiveRequestId ?? "chatcmpl-\(UUID().uuidString.prefix(12))"
+        let rawReq = req
+        let effectiveReq = await resolveAutoReasoningEffortIfNeeded(rawReq)
+
+        let returnModelName = resolveReplyModelName(requested: effectiveReq.model, strictNotFound: false) ?? actor.getModelName()
+        let reqId = effectiveReq.effectiveRequestId ?? "chatcmpl-\(UUID().uuidString.prefix(12))"
         var resolvedHeaders = ["x-request-id: \(reqId)"]
-        if let sid = req.effectiveSessionId {
+        if let sid = effectiveReq.effectiveSessionId {
             resolvedHeaders.append("x-session-id: \(sid)")
         }
         let extraHeaders = resolvedHeaders
 
         let serverConfig = actor.getConfig()
         let streamPolicy = QWChatPolicyResolver.resolveStreamPolicy(
-            for: req,
+            for: effectiveReq,
             defaultEnableThinking: serverConfig.enableThinking,
             defaultMaxTokens: serverConfig.maxTokens,
             modelMaxLength: serverConfig.modelMaxLength,
@@ -73,7 +77,7 @@ extension QWHttpServer {
         )
         let shouldStop = generationShouldStop(for: connection)
 
-        if req.isStreaming {
+        if effectiveReq.isStreaming {
             let session = makeSSESession(for: connection, format: .sse, extraHeaders: extraHeaders)
             defer { session.stopAll() }
             @Sendable func sendChunk(_ chunk: ChatCompletionChunk) {
@@ -83,7 +87,8 @@ extension QWHttpServer {
             let streamParser = QWChatStreamParser(
                 startsInReasoning: streamPolicy.shouldThink,
                 allowToolCalls: streamPolicy.allowToolCalls,
-                allowReasoningTags: streamPolicy.allowReasoningTags
+                allowReasoningTags: streamPolicy.allowReasoningTags,
+                allowInk2Markers: actor.isInkling2Template() && (!streamPolicy.isJsonResponseFormat || streamPolicy.shouldThink)
             )
 
             final class StreamLogprobBox: @unchecked Sendable {
@@ -100,11 +105,11 @@ extension QWHttpServer {
             let result: ChatCompletionExecutionResult
             do {
                 result = try await actor.handleChatCompletion(
-                    request: req,
+                    request: effectiveReq,
                     onStreamReady: { [weak self] in
                         guard let self else { return }
                         let readyPolicy = QWChatPolicyResolver.resolveStreamPolicy(
-                            for: req,
+                            for: effectiveReq,
                             defaultEnableThinking: serverConfig.enableThinking,
                             defaultMaxTokens: serverConfig.maxTokens,
                             modelMaxLength: serverConfig.modelMaxLength,
@@ -112,7 +117,8 @@ extension QWHttpServer {
                         )
                         streamParser.setStartsInReasoning(
                             readyPolicy.shouldThink,
-                            allowReasoningTags: readyPolicy.allowReasoningTags
+                            allowReasoningTags: readyPolicy.allowReasoningTags,
+                            allowInk2Markers: self.actor.isInkling2Template() && (!readyPolicy.isJsonResponseFormat || readyPolicy.shouldThink)
                         )
                         session.begin()
                         sendChunk(ChatCompletionChunk(id: reqId, model: returnModelName, role: "assistant"))
@@ -135,7 +141,7 @@ extension QWHttpServer {
                             }
                         }
                     },
-                    onTokenLogprob: (req.logprobs == true) ? { lp in
+                    onTokenLogprob: (effectiveReq.logprobs == true) ? { lp in
                         lpBox.pending.append(lp)
                     } : nil,
                     shouldStop: shouldStop
@@ -172,12 +178,12 @@ extension QWHttpServer {
             }
 
             let parsed = streamParser.result(
-                tools: streamPolicy.allowToolCalls ? req.tools : nil,
+                tools: streamPolicy.allowToolCalls ? effectiveReq.tools : nil,
                 truncated: result.truncated
             )
             let effectiveCalls = QWChatPolicyResolver.capToolCalls(
                 parsed.toolCalls,
-                parallelToolCalls: req.parallelToolCalls
+                parallelToolCalls: effectiveReq.parallelToolCalls
             )
             if let toolCalls = effectiveCalls {
                 for (idx, call) in toolCalls.enumerated() {
@@ -199,7 +205,7 @@ extension QWHttpServer {
         } else {
             let result: ChatCompletionExecutionResult
             do {
-                result = try await actor.handleChatCompletion(request: req, onToken: nil, shouldStop: shouldStop)
+                result = try await actor.handleChatCompletion(request: effectiveReq, onToken: nil, shouldStop: shouldStop)
             } catch {
                 if shouldStop() { return }
                 sendChatError(connection, error: error, path: "/v1/chat/completions")
@@ -208,15 +214,16 @@ extension QWHttpServer {
             guard !shouldStop() else { return }
             let parsed = QWToolCallParser.parse(
                 text: result.content,
-                tools: req.tools,
+                tools: effectiveReq.tools,
                 startsInThinking: result.startsInThinking,
                 truncated: result.truncated,
                 allowToolCalls: streamPolicy.allowToolCalls,
-                allowReasoningTags: !streamPolicy.isJsonResponseFormat || result.startsInThinking
+                allowReasoningTags: !streamPolicy.isJsonResponseFormat || result.startsInThinking,
+                allowInk2Markers: actor.isInkling2Template() && (!streamPolicy.isJsonResponseFormat || result.startsInThinking)
             )
             let effectiveCalls = QWChatPolicyResolver.capToolCalls(
                 parsed.toolCalls,
-                parallelToolCalls: req.parallelToolCalls
+                parallelToolCalls: effectiveReq.parallelToolCalls
             )
             let resp = ChatCompletionResponse(
                 id: reqId,
@@ -233,6 +240,40 @@ extension QWHttpServer {
             )
             sendJsonResponse(connection, status: 200, object: resp, extraHeaders: extraHeaders)
         }
+    }
+
+    private func resolveAutoReasoningEffortIfNeeded(_ req: ChatCompletionRequest) async -> ChatCompletionRequest {
+        guard QWChatPolicyResolver.isAutoReasoningEffort(req.rawReasoningEffort),
+              actor.isDecisionSidecarLoaded(),
+              req.enableThinking != false,
+              req.reasoning?.enabled != false,
+              req.chatTemplateKwargs?.enableThinking != false,
+              let promptText = req.messages.last(where: { $0.role.lowercased() == "user" })?.extractTextContent(),
+              !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return req
+        }
+        let complexityReq = QWDecisionRequest(
+            state: .text(promptText),
+            questions: [
+                QWDecisionQuestion(
+                    name: "complexity",
+                    kind: .choice,
+                    instructions: "How much reasoning effort does this request require before answering?",
+                    criteria: [
+                        QWDecisionCriterion(key: "trivial", description: "direct fact lookup or trivial rewrite"),
+                        QWDecisionCriterion(key: "moderate", description: "single-step explanation or routine coding"),
+                        QWDecisionCriterion(key: "deep", description: "multi-step planning, debugging, or complex reasoning"),
+                    ]
+                ),
+            ]
+        )
+        guard let env = try? await actor.decide(complexityReq),
+              let answer = env.response.answers.first,
+              let tier = answer.choice,
+              let resolved = QWChatPolicyResolver.resolveAutoReasoningEffort(tier: tier, confidence: answer.confidence) else {
+            return req
+        }
+        return req.withResolvedReasoningEffort(resolved)
     }
 
     func sendChatError(_ connection: NWConnection, error: any Error, path: String) {

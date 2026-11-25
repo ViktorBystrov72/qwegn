@@ -149,6 +149,81 @@ METAL_FUNC void qwg_gemv_v4_rows4_dispatch(typename Traits::WeightPtr w, device 
     }
 }
 
+template <typename Traits, uint MAX_M>
+METAL_FUNC void qwg_gemv_f32_v4_multi_body(typename Traits::WeightPtr w,
+                                           device const float* x, device float* y,
+                                           QWGemmF32V4Params p, uint ep, uint M,
+                                           bool multi, uint mN, bool halves,
+                                           uint3 tg, uint sg, uint lane,
+                                           threadgroup float* tgC,
+                                           threadgroup typename Traits::TgLut& tgLut) {
+    if (ep == 3u) {
+        const uint rowBase = tg.x * 32u;
+        for (uint pass = 0u; pass < 2u; ++pass) {
+            const uint row0 = rowBase + pass * 16u + sg * 4u;
+            float4 acc[MAX_M];
+            #pragma unroll
+            for (uint m = 0u; m < MAX_M; ++m) acc[m] = float4(0.0f);
+            if (row0 < p.N) {
+                if constexpr (MAX_M == 4u) qwg_gemv_v4_rows4_dispatch<Traits, 32u>(w, x, M, row0, p.N, p.K, tg.y, lane, acc, tgLut);
+                else                       Traits::template rows4_m8_f32<32u>(w, x, M, row0, p.N, p.K, lane, acc, tgLut);
+            }
+            if (lane == 0u) {
+                for (uint m = 0u; m < mN; ++m) {
+                    const float o[4] = { acc[m].x, acc[m].y, acc[m].z, acc[m].w };
+                    for (uint r = 0u; r < 4u; ++r) {
+                        const uint col = pass * 16u + sg * 4u + r;
+                        const float v = (rowBase + col < p.N) ? o[r] : 0.0f;
+                        const float z = v / p.scale;
+                        tgC[m * 32u + col] = z / (1.0f + exp(-z));
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint m = sg; m < mN; m += 4u) {
+            const float v = qwg_fwht32_lane_f32(tgC[m * 32u + lane], lane);
+            const uint row = rowBase + lane;
+            const size_t outRow = multi ? size_t(m) : size_t(tg.y);
+            if (row < p.N) y[outRow * p.N + row] = v;
+        }
+        return;
+    }
+    if (halves) {
+        const uint hl = lane & 15u;
+        const uint row0 = (tg.x * 4u + sg) * 8u + (lane >> 4u) * 4u;
+        if (row0 >= p.N) return;
+        float4 acc[MAX_M];
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) acc[m] = float4(0.0f);
+        if constexpr (MAX_M == 4u) qwg_gemv_v4_rows4_dispatch<Traits, 16u>(w, x, M, row0, p.N, p.K, tg.y, hl, acc, tgLut);
+        else                       Traits::template rows4_m8_f32<16u>(w, x, M, row0, p.N, p.K, hl, acc, tgLut);
+        if (hl != 0u) return;
+        for (uint m = 0u; m < mN; ++m) {
+            qwg_gemv_f32_store4(y + size_t(multi ? m : tg.y) * p.N, row0, p.N, ep, p.scale, acc[m]);
+        }
+        return;
+    }
+    const uint row0 = (tg.x * 4u + sg) * 4u;
+    if (row0 >= p.N) return;
+    if (multi) {
+        float4 acc[MAX_M];
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) acc[m] = float4(0.0f);
+        if constexpr (MAX_M == 4u) qwg_gemv_v4_rows4_dispatch<Traits, 32u>(w, x, M, row0, p.N, p.K, tg.y, lane, acc, tgLut);
+        else                       Traits::template rows4_m8_f32<32u>(w, x, M, row0, p.N, p.K, lane, acc, tgLut);
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint m = 0u; m < MAX_M; ++m) {
+                if (m < M) qwg_gemv_f32_store4(y + size_t(m) * p.N, row0, p.N, ep, p.scale, acc[m]);
+            }
+        }
+        return;
+    }
+    const float4 acc = Traits::template rows4_f32<32u>(w, x + (size_t)tg.y * p.K, row0, p.N, p.K, lane, tgLut);
+    if (lane == 0u) qwg_gemv_f32_store4(y + size_t(tg.y) * p.N, row0, p.N, ep, p.scale, acc);
+}
+
 template <typename Traits>
 METAL_FUNC void qwg_gemv_f32_v4_body(typename Traits::WeightPtr w,
                                      device const float* x,
@@ -166,62 +241,47 @@ METAL_FUNC void qwg_gemv_f32_v4_body(typename Traits::WeightPtr w,
         tgLut.load(tid, 128u);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    const bool multi = M > 1u && M <= 4u;
+    const bool multi = M > 1u && M <= 8u;
     const uint mN = multi ? M : 1u;
-    if (ep == 3u) {
-        const uint rowBase = tg.x * 32u;
-        for (uint pass = 0u; pass < 2u; ++pass) {
-            const uint row0 = rowBase + pass * 16u + sg * 4u;
-            float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
-            if (row0 < p.N) qwg_gemv_v4_rows4_dispatch<Traits, 32u>(w, x, M, row0, p.N, p.K, tg.y, lane, acc, tgLut);
-            if (lane == 0u) {
-                for (uint m = 0u; m < mN; ++m) {
-                    const float o[4] = { acc[m].x, acc[m].y, acc[m].z, acc[m].w };
-                    for (uint r = 0u; r < 4u; ++r) {
-                        const uint col = pass * 16u + sg * 4u + r;
-                        const float v = (rowBase + col < p.N) ? o[r] : 0.0f;
-                        const float z = v / p.scale;
-                        tgC[m * 32u + col] = z / (1.0f + exp(-z));
-                    }
-                }
+    if (multi && M > 4u) {
+        qwg_gemv_f32_v4_multi_body<Traits, 8u>(w, x, y, p, ep, M, true, mN, halves, tg, sg, lane, tgC, tgLut);
+    } else {
+        qwg_gemv_f32_v4_multi_body<Traits, 4u>(w, x, y, p, ep, M, multi, mN, halves, tg, sg, lane, tgC, tgLut);
+    }
+}
+
+template <typename Traits, uint MAX_M>
+METAL_FUNC void qwg_gemv_f32_v4_am_multi_impl(typename Traits::WeightPtr w, device const float* x,
+                                              device float* y, device uint* keysHi, device uint* keysLo,
+                                              QWGemmF32V4Params p, uint ep, uint M, uint row0, uint slots,
+                                              uint3 tg, uint tid, uint sg, uint lane,
+                                              threadgroup uint* bHi, threadgroup uint* bLo,
+                                              threadgroup typename Traits::TgLut& tgLut) {
+    float4 acc[MAX_M];
+    #pragma unroll
+    for (uint m = 0u; m < MAX_M; ++m) acc[m] = float4(0.0f);
+    if (row0 < p.N) {
+        if constexpr (MAX_M == 4u) qwg_gemv_v4_rows4_dispatch<Traits, 32u>(w, x, M, row0, p.N, p.K, 0u, lane, acc, tgLut);
+        else                       Traits::template rows4_m8_f32<32u>(w, x, M, row0, p.N, p.K, lane, acc, tgLut);
+    }
+    if (lane == 0u) {
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) {
+            if (m < M) {
+                uint bh, bl;
+                qwg_gemv_am_fold4(acc[m], row0, p.N, ep, p.scale, y + size_t(m) * p.N, bh, bl);
+                bHi[m * 4u + sg] = bh;
+                bLo[m * 4u + sg] = bl;
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg < mN) {
-            const float v = qwg_fwht32_lane_f32(tgC[sg * 32u + lane], lane);
-            const uint row = rowBase + lane;
-            const size_t outRow = multi ? size_t(sg) : size_t(tg.y);
-            if (row < p.N) y[outRow * p.N + row] = v;
-        }
-        return;
     }
-    if (halves) {
-        const uint hl = lane & 15u;
-        const uint row0 = (tg.x * 4u + sg) * 8u + (lane >> 4u) * 4u;
-        if (row0 >= p.N) return;
-        float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
-        qwg_gemv_v4_rows4_dispatch<Traits, 16u>(w, x, M, row0, p.N, p.K, tg.y, hl, acc, tgLut);
-        if (hl != 0u) return;
-        for (uint m = 0u; m < mN; ++m) {
-            qwg_gemv_f32_store4(y + size_t(multi ? m : tg.y) * p.N, row0, p.N, ep, p.scale, acc[m]);
-        }
-        return;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint m = tid; m < M; m += 128u) {
+        uint bh, bl;
+        qwg_gemv_am_reduce4(bHi, bLo, m * 4u, bh, bl);
+        keysHi[m * slots + tg.x] = bh;
+        keysLo[m * slots + tg.x] = bl;
     }
-    const uint row0 = (tg.x * 4u + sg) * 4u;
-    if (row0 >= p.N) return;
-    if (multi) {
-        float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
-        qwg_gemv_v4_rows4_dispatch<Traits, 32u>(w, x, M, row0, p.N, p.K, tg.y, lane, acc, tgLut);
-        if (lane == 0u) {
-            #pragma unroll
-            for (uint m = 0u; m < 4u; ++m) {
-                if (m < M) qwg_gemv_f32_store4(y + size_t(m) * p.N, row0, p.N, ep, p.scale, acc[m]);
-            }
-        }
-        return;
-    }
-    const float4 acc = Traits::template rows4_f32<32u>(w, x + (size_t)tg.y * p.K, row0, p.N, p.K, lane, tgLut);
-    if (lane == 0u) qwg_gemv_f32_store4(y + size_t(tg.y) * p.N, row0, p.N, ep, p.scale, acc);
 }
 
 template <typename Traits>
@@ -244,26 +304,11 @@ METAL_FUNC void qwg_gemv_f32_v4_am_body(typename Traits::WeightPtr w,
     const uint row0 = (tg.x * 4u + sg) * 4u;
     const uint slots = (p.N + 15u) >> 4u;
     if (M > 1u && M <= 4u) {
-        float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
-        if (row0 < p.N) qwg_gemv_v4_rows4_dispatch<Traits, 32u>(w, x, M, row0, p.N, p.K, 0u, lane, acc, tgLut);
-        if (lane == 0u) {
-            #pragma unroll
-            for (uint m = 0u; m < 4u; ++m) {
-                if (m < M) {
-                    uint bh, bl;
-                    qwg_gemv_am_fold4(acc[m], row0, p.N, ep, p.scale, y + size_t(m) * p.N, bh, bl);
-                    bHi[m * 4u + sg] = bh;
-                    bLo[m * 4u + sg] = bl;
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < M) {
-            uint bh, bl;
-            qwg_gemv_am_reduce4(bHi, bLo, tid * 4u, bh, bl);
-            keysHi[tid * slots + tg.x] = bh;
-            keysLo[tid * slots + tg.x] = bl;
-        }
+        qwg_gemv_f32_v4_am_multi_impl<Traits, 4u>(w, x, y, keysHi, keysLo, p, ep, M, row0, slots, tg, tid, sg, lane, bHi, bLo, tgLut);
+        return;
+    }
+    if (M > 4u && M <= 8u) {
+        qwg_gemv_f32_v4_am_multi_impl<Traits, 8u>(w, x, y, keysHi, keysLo, p, ep, M, row0, slots, tg, tid, sg, lane, bHi, bLo, tgLut);
         return;
     }
     const float4 acc = (row0 < p.N)

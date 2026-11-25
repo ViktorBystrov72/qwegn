@@ -5,6 +5,12 @@ import QWCore
 import QWHead
 
 extension QWInkling2Runtime {
+    static func canSpeculate(constraint: (any QWTokenConstraint)?) -> Bool {
+        guard let constraint else { return true }
+        if constraint.isUnconstrainedNow { return true }
+        return QWConstrainedSpeculationGate.isEnabled && constraint.allowsSpeculation
+    }
+
     func activeMoESpecBudget(verifyRows: Int) -> Int {
         guard verifyRows > 1, geometry.numExperts > 0, geometry.expertsPerTok > 0 else { return 0 }
         if let raw = ProcessInfo.processInfo.environment["QW_MOE_SPEC_EXPERT_BUDGET"] {
@@ -47,6 +53,8 @@ extension QWInkling2Runtime {
         requestedDrafts: Int,
         allowPLD: Bool = true,
         sampler: QWSampler,
+        constraint: (any QWTokenConstraint)? = nil,
+        allowedScratch: inout [Int],
         effectiveMargin: Float,
         minLogProb: Float,
         promptTokens: [Int],
@@ -69,6 +77,7 @@ extension QWInkling2Runtime {
         let usePenalty = sampler.config.repetitionPenalty != 1.0
         var penScratch = (sampler.config.isGreedy && usePenalty) ? [Float](repeating: 0, count: V) : []
         var stats = SpeculativeStats()
+        let minProbFloor: Float = minLogProb == -.infinity ? 0 : Float(exp(Double(minLogProb)))
 
         session.tokenRecycler.reset()
         session.tokenRecycler.ingestSequence(promptTokens)
@@ -156,8 +165,64 @@ extension QWInkling2Runtime {
             return (rep, false)
         }
 
-        func sampleRow(_ r: Int, draft: Int?) throws -> (tok: Int, accepted: Bool) {
+        var pendingWasPLD = false
+
+        func proposeConstrainedOrPLD(maxCount: Int, allowRecycler: Bool) -> [Int] {
+            guard maxCount > 0 else { return [] }
+            if let constraint, !constraint.isUnconstrainedNow, QWConstrainedSpeculationGate.isEnabled {
+                let canonical = constraint.proposeCanonicalDrafts(maxCount: maxCount)
+                if !canonical.isEmpty { return canonical }
+            }
+            guard allowPLD else { return [] }
+            let raw = makePLDDrafts(history: history, maxCount: maxCount, allowRecyclerFallback: allowRecycler)
+            guard !raw.isEmpty else { return [] }
+            guard let constraint, !constraint.isUnconstrainedNow else { return raw }
+            guard let probe = constraint.makeSpeculativeProbe() else { return [] }
+            var filtered: [Int] = []
+            filtered.reserveCapacity(raw.count)
+            for tok in raw {
+                guard (try? probe.accept(tok)) != nil else { break }
+                filtered.append(tok)
+            }
+            return filtered
+        }
+
+        func sampleRow(_ r: Int, draft: Int?, rowMargin: Float) throws -> (tok: Int, accepted: Bool) {
             let rowPtr = logitsPtr.advanced(by: r * V)
+            let rowBuf = UnsafeBufferPointer(start: rowPtr, count: V)
+            let repHist = (usePenalty && !penaltyHistory.isEmpty) ? penaltyHistory : []
+            if let constraint, try constraint.writeAllowedTokens(into: &allowedScratch) {
+                if sampler.config.isGreedy {
+                    let strictTok = try allowedScratch.withUnsafeBufferPointer { buf in
+                        try sampler.constrainedToken(logits: rowBuf, allowed: buf, repetitionHistory: repHist)
+                    }
+                    guard let draft, (0..<V).contains(draft) else { return (strictTok, false) }
+                    if draft == strictTok { return (strictTok, true) }
+                    if rowMargin > 0 {
+                        let passes = allowedScratch.withUnsafeBufferPointer { buf in
+                            sampler.clearsConstrainedVariationalGate(
+                                logits: rowBuf, allowed: buf, draftToken: draft, targetToken: strictTok,
+                                repetitionHistory: repHist, margin: rowMargin, minProbability: minProbFloor
+                            )
+                        }
+                        if passes { return (draft, true) }
+                    }
+                    return (strictTok, false)
+                }
+                let dist = try allowedScratch.withUnsafeBufferPointer { buf in
+                    try sampler.constrainedDistribution(logits: rowBuf, allowed: buf, repetitionHistory: repHist)
+                }
+                guard let draft, (0..<V).contains(draft) else {
+                    return (try dist.sampleToken(uniform: nextUniform(), version: sampler.config.uniformVersion), false)
+                }
+                let pTarget = Self.lookupProb(dist: dist, token: draft)
+                let acceptProb = rowMargin > 0 ? min(1.0, pTarget * exp(Double(rowMargin))) : pTarget
+                if nextUniform() < acceptProb {
+                    return (draft, true)
+                }
+                let rep = Self.sampleResidual(dist: dist, exclude: draft, excludeProb: pTarget, uniform: nextUniform())
+                return (rep, false)
+            }
             if sampler.config.isGreedy {
                 return try resolveGreedy(rowPtr: rowPtr, draft: draft)
             }
@@ -165,14 +230,11 @@ extension QWInkling2Runtime {
         }
 
         var pendingDrafts: [Int]?
-        var pendingWasPLD = false
         var lowYieldStreak = 0
         var cooldownSteps = 0
 
         let initMax = maxVerifyDrafts(cap: pldCap)
-        let initPld = allowPLD
-            ? makePLDDrafts(history: history, maxCount: initMax, allowRecyclerFallback: dspark == nil)
-            : []
+        let initPld = proposeConstrainedOrPLD(maxCount: initMax, allowRecycler: dspark == nil)
         if !initPld.isEmpty {
             pendingDrafts = initPld
             pendingWasPLD = true
@@ -191,9 +253,9 @@ extension QWInkling2Runtime {
             let roundStart = clock.now
             let anchor = generated[generated.count - 1]
 
-            if pendingDrafts == nil && allowPLD {
+            if pendingDrafts == nil {
                 let singleMax = maxVerifyDrafts(cap: pldCap)
-                let pldNow = makePLDDrafts(history: history, maxCount: singleMax, allowRecyclerFallback: dspark == nil)
+                let pldNow = proposeConstrainedOrPLD(maxCount: singleMax, allowRecycler: dspark == nil)
                 if !pldNow.isEmpty {
                     pendingDrafts = pldNow
                     pendingWasPLD = true
@@ -211,7 +273,7 @@ extension QWInkling2Runtime {
                     try ds.ingestContextTaps(count: 1, posOffset: pos, rowStride: 1, profiler: profiler)
                 }
                 pos += 1
-                let (tok, _) = try sampleRow(0, draft: nil)
+                let (tok, _) = try sampleRow(0, draft: nil, rowMargin: 0)
                 stepMs.append(elapsedSeconds(roundStart.duration(to: clock.now)) * 1000.0)
                 if stopIDs.contains(tok) {
                     stepCounts.append(0)
@@ -219,6 +281,7 @@ extension QWInkling2Runtime {
                     onStopToken?(tok)
                     return (stats, true)
                 }
+                try constraint?.accept(tok)
                 let p2 = history.count >= 2 ? history[history.count - 2] : nil
                 session.tokenRecycler.recordTransition(previous: p2, current: history[history.count - 1], next: tok)
                 history.append(tok)
@@ -231,7 +294,12 @@ extension QWInkling2Runtime {
                 stepCounts.append(1)
                 if onToken?(tok) == false { return (stats, true) }
                 if cooldownSteps > 0 { cooldownSteps -= 1 }
-                if let ds = dspark, cooldownSteps == 0, generated.count < effectiveMaxNew {
+                let nextInit = proposeConstrainedOrPLD(
+                    maxCount: maxVerifyDrafts(cap: pldCap), allowRecycler: dspark == nil)
+                if !nextInit.isEmpty {
+                    pendingDrafts = nextInit
+                    pendingWasPLD = true
+                } else if let ds = dspark, cooldownSteps == 0, generated.count < effectiveMaxNew {
                     let cnt = maxVerifyDrafts(cap: linCap)
                     if cnt > 0 {
                         let d = try ds.draftBlock(anchor: tok, count: cnt, profiler: profiler)
@@ -240,6 +308,7 @@ extension QWInkling2Runtime {
                 }
                 continue
             }
+            let usedPLDThisRound = pendingWasPLD
             pendingDrafts = nil
 
             verifyTokens.removeAll(keepingCapacity: true)
@@ -264,16 +333,18 @@ extension QWInkling2Runtime {
             var emitted = 0
             var stopped = false
             var cancelled = false
+            let roundMargin: Float = usedPLDThisRound ? 0 : effectiveMargin
 
             for r in 0..<B {
                 let targetDraft = r < drafts.count ? drafts[r] : nil
-                let (tok, didAccept) = try sampleRow(r, draft: targetDraft)
+                let (tok, didAccept) = try sampleRow(r, draft: targetDraft, rowMargin: roundMargin)
                 if stopIDs.contains(tok) {
                     stopTokenID = tok
                     onStopToken?(tok)
                     stopped = true
                     break
                 }
+                try constraint?.accept(tok)
                 let prev2 = history.count >= 2 ? history[history.count - 2] : nil
                 session.tokenRecycler.recordTransition(previous: prev2, current: history[history.count - 1], next: tok)
                 history.append(tok)
@@ -302,15 +373,15 @@ extension QWInkling2Runtime {
             let oldPos = pos
             let kept = 1 + accepted
             pos += kept
-            if dspark != nil && !explicitTreeEnv && !pendingWasPLD {
+            if dspark != nil && !explicitTreeEnv && !usedPLDThisRound {
                 if accepted == 0 { lowYieldStreak += 1 } else { lowYieldStreak = 0 }
                 if lowYieldStreak >= 2 { cooldownSteps = 3; lowYieldStreak = 0 }
             }
 
             let continueSpec = !stopped && !cancelled && generated.count < effectiveMaxNew
             if let ds = dspark {
-                let pldNext = (continueSpec && allowPLD)
-                    ? makePLDDrafts(history: history, maxCount: maxVerifyDrafts(cap: pldCap), allowRecyclerFallback: false)
+                let pldNext = continueSpec
+                    ? proposeConstrainedOrPLD(maxCount: maxVerifyDrafts(cap: pldCap), allowRecycler: false)
                     : []
                 let inCooldown = !explicitTreeEnv && continueSpec && pldNext.isEmpty && cooldownSteps > 0
                 let nextDCount = (continueSpec && pldNext.isEmpty && !inCooldown)

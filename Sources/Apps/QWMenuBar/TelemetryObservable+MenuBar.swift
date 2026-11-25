@@ -59,4 +59,22 @@ extension TelemetryObservable {
             enabledMenuBarMetrics.remove(metric)
         }
     }
+
+    public func unloadDecisionSidecar() {
+        guard let req = authorizedRequest(path: "/v1/decisions/model/unload", method: "POST", timeoutInterval: 15.0) else { return }
+        Task {
+            do {
+                let (data, res) = try await URLSession.shared.data(for: req)
+                guard let http = res as? HTTPURLResponse, http.statusCode == 200 else {
+                    let code = (res as? HTTPURLResponse)?.statusCode ?? 0
+                    self.fail("Sidecar unload failed (HTTP \(code)): \(Self.responseDetail(data))")
+                    return
+                }
+                self.fetchDashboard()
+                QWServerLogger.shared.log(.info, "Decision sidecar unloaded via API.")
+            } catch {
+                self.fail("Sidecar unload failed: \(error.localizedDescription)")
+            }
+        }
+    }
 }

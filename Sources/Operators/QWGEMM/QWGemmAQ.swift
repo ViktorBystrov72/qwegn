@@ -135,6 +135,17 @@ public enum QWGemmAQ {
         return isSHVQ ? "qwg_moe_nax_split_shvq\(bits)_g\(group)_f32" : "qwg_moe_nax_split_aq\(bits)_g\(group)_f32"
     }
 
+    /// The fused grouped-MoE NAX gate_up + SwiGLU + FWHT-32 kernel for a `(bits, group)` pair.
+    public static func moeNaxSwigluKernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
+        guard group == 32 || group == 64 else { return nil }
+        if isSHVQ {
+            guard QWSHVQBlock.isSupported(bits: bits, group: group) else { return nil }
+            return "qwg_moe_nax_swiglu_shvq\(bits)_g\(group)"
+        }
+        guard bits == 4 || bits == 8, QWAQBlock.isBlockSupported(bits: bits, group: group) else { return nil }
+        return "qwg_moe_nax_swiglu_aq\(bits)_g\(group)"
+    }
+
     public static func hcUpMixH32F32KernelName(bits: Int, group: Int, isSHVQ: Bool = false) -> String? {
         guard isSupported(bits: bits, group: group, isSHVQ: isSHVQ) else { return nil }
         return isSHVQ ? "qwg_hc_up_mix_h32_shvq\(bits)_g\(group)_f32" : "qwg_hc_up_mix_h32_aq\(bits)_g\(group)_f32"
@@ -438,5 +449,114 @@ public enum QWGemmAQ {
         keysLo.bind(enc, index: 7)
         enc.dispatchThreadgroups(MTLSize(width: slots, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+}
+
+extension QWGemm {
+    public static func moeNaxSwigluKernelName(for bank: QWWeightView) -> String? {
+        bank.isIncumbentContainer
+            ? "qwg_moe_nax_swiglu_q4g"
+            : QWGemmAQ.moeNaxSwigluKernelName(bits: bank.bits, group: bank.groupSize, isSHVQ: bank.isSHVQ)
+    }
+
+    public static func supportsMoEGateUpNaxSwiglu(_ bank: QWWeightView) -> Bool {
+        moeNaxSwigluKernelName(for: bank) != nil
+    }
+
+    /// Fused grouped-MoE NAX gate_up + SwiGLU + FWHT-32 emitting rotated FP16 directly into `out16`.
+    public static func encodeMoEGateUpNaxSwiglu(
+        _ enc: any MTLComputeCommandEncoder, hal: QWHal, xe: QWTensorValue,
+        bank: QWWeightView, expertOff: QWTensorValue, tileE: QWTensorValue,
+        tileR: QWTensorValue, tileCount: QWTensorValue, out16: QWTensorValue,
+        intermediate: Int, tilePlan: MoETilePlan,
+        sortedTok: QWTensorValue? = nil,
+        coldBank: QWWeightView? = nil,
+        tileFilter: MoETileFilter = .all,
+        swigluClamp: QWSwiGLUClampSpec? = nil
+    ) throws {
+        precondition(intermediate > 0 && intermediate % 32 == 0 && bank.k % 64 == 0,
+                     "NAX MoE SwiGLU needs I multiple of 32 and K multiple of 64")
+        let rowsPerExpert = 2 * intermediate
+        guard tileCount.shape.elementCount >= 4 + tilePlan.guSlices * 3 else {
+            throw QWGemmError.badShape("moe gateup swiglu nax: tileCount buffer too small for indirect slices")
+        }
+        if let cg = coldBank, cg.containerKind != bank.containerKind || cg.k != bank.k {
+            throw QWGemmError.badWeights("moe gateup swiglu nax coldBank container/k mismatch")
+        }
+        guard let kernelName = moeNaxSwigluKernelName(for: bank) else {
+            throw QWGemmError.badWeights("no moe nax swiglu kernel for \(bank.formatName)")
+        }
+        let residentE = bank.n / rowsPerExpert
+        let coldE = (coldBank?.n ?? 0) / rowsPerExpert
+        let experts = residentE + coldE
+        let packedExperts = coldBank != nil
+            ? ((UInt32(residentE & 0xFFFF) << 16) | UInt32(experts & 0xFFFF))
+            : UInt32(experts)
+        let colTiles = intermediate / 32
+        let grp = QWNaxGroupedParams(experts: packedExperts, n: UInt32(rowsPerExpert), k: UInt32(bank.k),
+                                     blocksPerRow: UInt32(bank.k / max(1, bank.groupSize)),
+                                     rowTiles: 0, colTiles: UInt32(colTiles))
+        enc.setComputePipelineState(try hal.pipeline(kernelName, swigluClamp: swigluClamp))
+        enc.bindTensors(bank.blocks, xe, out16, expertOff, tileE, tileR, tileCount, startIndex: 0)
+        enc.setPod(grp, index: 7)
+        enc.bindTensors(sortedTok ?? tileE, startIndex: 9)
+        enc.setUInt32s(sortedTok != nil ? 1 : 0, startIndex: 10)
+        (coldBank ?? bank).blocks.bind(enc, index: 11)
+        dispatchTileChunks(enc, indirectBuffer: tileCount.region.buffer,
+                           baseByteOffset: tileCount.region.base + tileCount.offset + 16,
+                           colTiles: colTiles, maxTiles: tilePlan.maxTiles,
+                           flags: tileFilter.rawValue, flagsIndex: 8)
+    }
+
+    public static func denseSwiGLUNaxKernelName(for weight: QWWeightView) -> String? {
+        weight.isIncumbentContainer
+            ? "qwg_gemm_q4g_h16_swiglu"
+            : QWGemmAQ.swigluGemmKernelName(bits: weight.bits, group: weight.groupSize, isSHVQ: weight.isSHVQ)
+    }
+
+    public static func supportsDenseSwiGLUNax(_ weight: QWWeightView) -> Bool {
+        denseSwiGLUNaxKernelName(for: weight) != nil
+    }
+
+    /// Fused dense NAX gate_up + SwiGLU + FWHT-32 emitting rotated FP16 directly into `out16`.
+    public static func encodeDenseSwiGLUNax(
+        _ enc: any MTLComputeCommandEncoder, hal: QWHal,
+        weight: QWWeightView, x16: QWTensorValue, out16: QWTensorValue,
+        rows: Int, intermediate: Int,
+        xStride: Int? = nil, yStride: Int? = nil,
+        swigluClamp: QWSwiGLUClampSpec? = nil
+    ) throws {
+        guard rows > 0, intermediate > 0, intermediate % 32 == 0,
+              weight.k > 0, weight.k % 64 == 0, weight.n == 2 * intermediate else {
+            throw QWGemmError.badShape(
+                "dense swiglu nax invalid shape M=\(rows) I=\(intermediate) w=(\(weight.n)x\(weight.k))")
+        }
+        guard x16.shape.dtype == .f16, out16.shape.dtype == .f16 else {
+            throw QWGemmError.badShape("dense swiglu nax requires f16 input and output")
+        }
+        guard let kernelName = denseSwiGLUNaxKernelName(for: weight) else {
+            throw QWGemmError.badWeights("no dense swiglu nax kernel for \(weight.formatName)")
+        }
+        enc.setComputePipelineState(try hal.pipeline(kernelName, swigluClamp: swigluClamp))
+        enc.bindTensors(weight.blocks, x16, out16, startIndex: 0)
+        let xs = xStride ?? weight.k, ys = yStride ?? intermediate
+        let useSmallTile = hal.caps.isMetal4TensorCapable
+        let chunk = naxRowChunk(rows: rows, k: weight.k)
+        var r0 = 0
+        while r0 < rows {
+            let r = min(chunk, rows - r0)
+            let use64 = useSmallTile && r <= 16 && (intermediate & 63) == 0
+            let bm = useSmallTile ? (use64 ? 16 : (r <= 32 ? 32 : 64)) : 64
+            let bn = use64 ? 64 : 32
+            let modeBits = useSmallTile ? (use64 ? 0x2000_0000 : (r <= 32 ? 0x4000_0000 : 0)) : 0
+            if r0 > 0 {
+                x16.slice(byteOffset: r0 * xs * 2, count: r * xs).bind(enc, index: 1)
+                out16.slice(byteOffset: r0 * ys * 2, count: r * ys).bind(enc, index: 2)
+            }
+            enc.setUInt32s(r | modeBits, intermediate, weight.k, xs, ys, startIndex: 3)
+            enc.dispatchThreadgroups(MTLSize(width: intermediate / bn, height: (r + bm - 1) / bm, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            r0 += r
+        }
     }
 }

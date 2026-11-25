@@ -3,7 +3,7 @@
 #pragma once
 #include <metal_stdlib>
 
-// Row block of an expert with c rows: 16 for c <= 16, 32 for c <= 32, else 64.
+// Row block of an expert with c rows: 16, 32, or 64.
 inline int qw_moe_tile_block(int c, int forced) {
     if (forced > 0) return forced;
     return c <= 16 ? 16 : (c <= 32 ? 32 : 64);
@@ -29,6 +29,6 @@ inline void qw_moe_decode_tile(int packed, int rowCount, int forced,
     if (code == 1u) { bm = 16; tidY = uint(packed) & 0xFFFFFFu; return; }
     if (code == 2u) { bm = 32; tidY = uint(packed) & 0xFFFFFFu; return; }
     if (code == 3u) { bm = 64; tidY = uint(packed) & 0xFFFFFFu; return; }
-    bm = qw_moe_tile_block(rowCount, 0);
+    bm = rowCount <= 16 ? 16 : (rowCount <= 32 ? 32 : 64);
     tidY = uint(packed);
 }

@@ -53,6 +53,7 @@ final class QWChatStreamingUXTests: XCTestCase {
         for rel in [
             "Sources/Apps/QWServer/Resources/js/markdown.js",
             "Sources/Apps/QWServer/Resources/js/chat-presets.js",
+            "Sources/Apps/QWServer/Resources/js/chat-media.js",
             "Sources/Apps/QWServer/Resources/js/chat.js",
         ] {
             ctx.evaluateScript(try read(rel))
@@ -231,6 +232,7 @@ final class QWChatStreamingUXTests: XCTestCase {
             "Sources/Apps/QWServer/Resources/js/dashboard.js",
             "Sources/Apps/QWServer/Resources/js/markdown.js",
             "Sources/Apps/QWServer/Resources/js/chat-presets.js",
+            "Sources/Apps/QWServer/Resources/js/chat-media.js",
             "Sources/Apps/QWServer/Resources/js/chat.js",
             "Sources/Apps/QWServer/Resources/js/actions.js",
             "Sources/Apps/QWServer/Resources/js/settings.js",

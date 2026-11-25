@@ -589,7 +589,7 @@ extension QWInkling2Weights {
         }
 
         let _ = loadVision
-        let hasVis = pack.tensors.keys.contains { $0.contains("vision_tower.") }
+        let hasVis = pack.tensors.keys.contains { $0.contains("vision_tower.") || $0.contains("visual.") }
         self.init(
             embedTokens: embedTokens,
             embedNorm: embedNorm,

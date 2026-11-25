@@ -58,6 +58,8 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
     public let qResidScratch: QWTensorValue
     public let mlaQFullScratch: QWTensorValue
     public let idxWeightsScratch: QWTensorValue
+    public let flashQSelScratch: QWTensorValue
+    public let flashWSelScratch: QWTensorValue
     public let qAbsScratch: QWTensorValue
     public let uLatScratch: QWTensorValue
     public let yVhaScratch: QWTensorValue
@@ -77,10 +79,13 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
     internal let psoGateWeightsProj: any MTLComputePipelineState
     internal let psoQRopeIdxPrep: any MTLComputePipelineState
     internal let psoIndexerScoreSelect: any MTLComputePipelineState
+    internal let psoFlashIndexerSelectHeads: any MTLComputePipelineState
     internal let psoAbsorbQ: any MTLComputePipelineState
     internal let psoAbsorbQSub2: any MTLComputePipelineState
     internal let psoAbsorbQMMA: any MTLComputePipelineState
     internal let psoAbsorbQMMASub2: any MTLComputePipelineState
+    internal let psoAbsorbQNAX: (any MTLComputePipelineState)?
+    internal let psoAbsorbQNAXSub2: (any MTLComputePipelineState)?
     internal let psoSparseAttn: any MTLComputePipelineState
     internal let psoSparseAttnMMA: any MTLComputePipelineState
     internal let psoDSASparseAttn: any MTLComputePipelineState
@@ -88,6 +93,8 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
     internal let psoIndexerSplit: (score: any MTLComputePipelineState, select: any MTLComputePipelineState)?
     internal let psoSparseAttnNAX: (any MTLComputePipelineState)?
     internal let psoDSASparseAttnNAX: (any MTLComputePipelineState)?
+    internal let psoDSASparseAttnNAXH32: (any MTLComputePipelineState)?
+    internal let psoDSASparseAttnNAXH64: (any MTLComputePipelineState)?
     internal let psoSparseAttnNAXH32: (any MTLComputePipelineState)?
     internal let psoSparseAttnSplit: (attend: any MTLComputePipelineState, combine: any MTLComputePipelineState)?
     internal let psoDSASparseAttnSplit: (attend: any MTLComputePipelineState, combine: any MTLComputePipelineState)?
@@ -96,11 +103,16 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
     internal let partOScratch: QWTensorValue
     internal let partMLScratch: QWTensorValue
     public var sparseAttnMMAEnabled = ProcessInfo.processInfo.environment["QW_MLA_ATTN_MMA"] != "0"
+    public var dsaSharedMode = ProcessInfo.processInfo.environment["QW_MLA_DSA_SHARED"]?.lowercased() ?? "h64"
+    public var projNAXEnabled = ProcessInfo.processInfo.environment["QW_MLA_PROJ_NAX"] != "0"
+    public var flashIndexerEnabled = ProcessInfo.processInfo.environment["QW_MLA_FLASHINDEXER"] != "0"
     public var emeansCoarseEnabled: Bool
     internal let psoProjUV: any MTLComputePipelineState
     internal let psoProjUVSub2: any MTLComputePipelineState
     internal let psoProjUVMMA: any MTLComputePipelineState
     internal let psoProjUVMMASub2: any MTLComputePipelineState
+    internal let psoProjUVNAX: (any MTLComputePipelineState)?
+    internal let psoProjUVNAXSub2: (any MTLComputePipelineState)?
     internal let psoVHAGateRot: any MTLComputePipelineState
     internal let psoHeadGateProj: any MTLComputePipelineState
     internal let coarsePipeline: QWCoarseSelectionPipeline?
@@ -155,6 +167,16 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
         var topKPools: UInt32
         var listStride: UInt32
         var scoreStride: UInt32
+    }
+
+    internal struct FlashIndexerParams {
+        var T: UInt32
+        var hidden: UInt32
+        var fullIdxHeads: UInt32
+        var selHeads: UInt32
+        var idxDim: UInt32
+        var qChannels: UInt32
+        var qFullStride: UInt32
     }
 
     internal struct AbsorbParams {
@@ -363,10 +385,15 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
         self.psoGateWeightsProj = try hal.pipeline("qwg_mla_gate_weights_proj")
         self.psoQRopeIdxPrep = try hal.pipeline("qwg_mla_q_rope_idx_prep")
         self.psoIndexerScoreSelect = try hal.pipeline("qwg_mla_indexer_score_select")
+        self.psoFlashIndexerSelectHeads = try hal.pipeline("qwg_mla_flashindexer_select_heads")
         self.psoAbsorbQ = try hal.pipeline("qwg_mla_absorb_q")
         self.psoAbsorbQSub2 = try hal.pipeline("qwg_mla_absorb_q_sub2")
         self.psoAbsorbQMMA = try hal.pipeline("qwg_mla_absorb_q_mma")
         self.psoAbsorbQMMASub2 = try hal.pipeline("qwg_mla_absorb_q_mma_sub2")
+        let naxOK = hal.caps.isMetal4TensorCapable
+            && ProcessInfo.processInfo.environment["QW_MLA_ATTN_NAX"] != "0"
+        self.psoAbsorbQNAX = hal.caps.isMetal4TensorCapable ? try hal.pipeline("qwg_mla_absorb_q_nax") : nil
+        self.psoAbsorbQNAXSub2 = hal.caps.isMetal4TensorCapable ? try hal.pipeline("qwg_mla_absorb_q_nax_sub2") : nil
         self.psoSparseAttn = try hal.pipeline("qwg_mla_sparse_attn")
         self.psoSparseAttnMMA = try hal.pipeline("qwg_mla_sparse_attn_mma")
         self.psoDSASparseAttn = try hal.pipeline("qwg_mla_dsa_sparse_attn")
@@ -374,10 +401,10 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
         self.psoIndexerSplit = self.hasIndexer && (self.idxHeads == 32 || self.idxHeads == 64) && self.idxDim == 128
             && ProcessInfo.processInfo.environment["QW_MLA_IDX_SPLIT"] != "0"
             ? (try hal.pipeline("qwg_mla_indexer_score_mma"), try hal.pipeline("qwg_mla_indexer_select")) : nil
-        let naxOK = hal.caps.isMetal4TensorCapable
-            && ProcessInfo.processInfo.environment["QW_MLA_ATTN_NAX"] != "0"
         self.psoSparseAttnNAX = naxOK ? try hal.pipeline("qwg_mla_sparse_attn_nax") : nil
         self.psoDSASparseAttnNAX = naxOK ? try hal.pipeline("qwg_mla_dsa_sparse_attn_nax") : nil
+        self.psoDSASparseAttnNAXH32 = naxOK ? try hal.pipeline("qwg_mla_dsa_sparse_attn_nax_h32") : nil
+        self.psoDSASparseAttnNAXH64 = naxOK ? try hal.pipeline("qwg_mla_dsa_sparse_attn_nax_h64") : nil
         self.psoSparseAttnNAXH32 = naxOK ? try hal.pipeline("qwg_mla_sparse_attn_nax_h32") : nil
         let splits = Int(ProcessInfo.processInfo.environment["QW_MLA_ATTN_SPLIT"] ?? "") ?? 16
         self.attnSplits = (naxOK && self.kvLoraRank == 512) ? max(0, min(64, splits)) : 0
@@ -389,6 +416,8 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
         self.psoProjUVSub2 = try hal.pipeline("qwg_mla_proj_uv_sub2")
         self.psoProjUVMMA = try hal.pipeline("qwg_mla_proj_uv_mma")
         self.psoProjUVMMASub2 = try hal.pipeline("qwg_mla_proj_uv_mma_sub2")
+        self.psoProjUVNAX = hal.caps.isMetal4TensorCapable ? try hal.pipeline("qwg_mla_proj_uv_nax") : nil
+        self.psoProjUVNAXSub2 = hal.caps.isMetal4TensorCapable ? try hal.pipeline("qwg_mla_proj_uv_nax_sub2") : nil
         self.psoVHAGateRot = try hal.pipeline("qwg_mla_vha_gate_rot")
         self.psoHeadGateProj = try hal.pipeline("qwg_mla_head_gate_proj")
 
@@ -436,6 +465,9 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
         let qResidOff = reserve(self.qLoraRank > 0 ? maxT * self.qLoraRank * 2 : 0)
         let qFullOff = reserve(maxT * self.qFullStride * 2)
         let idxWOff = reserve(self.hasIndexer ? maxT * self.idxHeads * 4 : 0)
+        let hasFlashScratch = self.hasIndexer && self.idxHeads > Self.flashIndexerSelHeads
+        let flashQSelOff = reserve(hasFlashScratch ? maxT * Self.flashIndexerSelHeads * self.idxDim * 2 : 0)
+        let flashWSelOff = reserve(hasFlashScratch ? maxT * Self.flashIndexerSelHeads * 4 : 0)
         let qAbsOff = reserve(maxT * self.qHeads * self.kvLoraRank * 2)
         let uLatOff = reserve(maxT * self.qHeads * self.kvLoraRank * 2)
         let yVhaNeeded = dsa || self.outputGateMode != .none || geometry.attnOutputGate || (mla?.useVHA == true)
@@ -522,6 +554,8 @@ public final class QWMLAAttnOperator: @unchecked Sendable {
         self.qResidScratch = QWTensorValue(region: reg, offset: qResidOff, shape: QWTensorShape([maxT, qResidCols], .f16))
         self.mlaQFullScratch = QWTensorValue(region: reg, offset: qFullOff, shape: QWTensorShape([maxT, self.qFullStride], .f16))
         self.idxWeightsScratch = QWTensorValue(region: reg, offset: idxWOff, shape: QWTensorShape([maxT, max(1, self.idxHeads)], .f32))
+        self.flashQSelScratch = QWTensorValue(region: reg, offset: flashQSelOff, shape: QWTensorShape([maxT, Self.flashIndexerSelHeads * max(1, self.idxDim)], .f16))
+        self.flashWSelScratch = QWTensorValue(region: reg, offset: flashWSelOff, shape: QWTensorShape([maxT, Self.flashIndexerSelHeads], .f32))
         self.qAbsScratch = QWTensorValue(region: reg, offset: qAbsOff, shape: QWTensorShape([maxT, self.qHeads * self.kvLoraRank], .f16))
         self.uLatScratch = QWTensorValue(region: reg, offset: uLatOff, shape: QWTensorShape([maxT, self.qHeads * self.kvLoraRank], .f16))
         self.yVhaScratch = QWTensorValue(region: reg, offset: yVhaOff, shape: QWTensorShape([yVhaNeeded ? maxT : 1, self.qHeads * self.vHeadDim], .f16))

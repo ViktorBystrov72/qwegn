@@ -134,6 +134,9 @@ extension QWEngineDriver {
                 appendUnique(slot.vSlab.region.buffer)
             }
         }
+        if let ds = dsparkDrafter {
+            for b in ds.activeBuffers { appendUnique(b) }
+        }
         if let echo = echoDrafter { appendUnique(echo.region.buffer) }
         if let ew = echoWeights {
             for b in ew.residentBuffers { appendUnique(b) }
@@ -162,6 +165,8 @@ extension QWEngineDriver {
                 if let qb = a.qkvBias { appendUnique(qb.region.buffer) }
                 if let ob = a.oBias { appendUnique(ob.region.buffer) }
                 if let q = a.mbsa?.qkvIdxProj { appendUnique(q.blocks.region.buffer) }
+                if let fg = a.mla?.flashGateW { appendUnique(fg.region.buffer) }
+                if let fb = a.mla?.flashBias { appendUnique(fb.region.buffer) }
             }
             if let hc = lw.hca {
                 if let f = hc.wFusedIn { appendUnique(f.blocks.region.buffer) }
@@ -220,6 +225,9 @@ extension QWEngineDriver {
                 useUnique(slot.vSlab.region.buffer, usage: [.read, .write])
             }
         }
+        if let ds = dsparkDrafter {
+            for b in ds.activeBuffers { useUnique(b, usage: [.read, .write]) }
+        }
         if let echo = echoDrafter { useUnique(echo.region.buffer, usage: [.read, .write]) }
         if let ew = echoWeights {
             for b in ew.residentBuffers { useUnique(b, usage: .read) }
@@ -248,6 +256,8 @@ extension QWEngineDriver {
                 if let qb = a.qkvBias { useUnique(qb.region.buffer, usage: .read) }
                 if let ob = a.oBias { useUnique(ob.region.buffer, usage: .read) }
                 if let q = a.mbsa?.qkvIdxProj { useUnique(q.blocks.region.buffer, usage: .read) }
+                if let fg = a.mla?.flashGateW { useUnique(fg.region.buffer, usage: .read) }
+                if let fb = a.mla?.flashBias { useUnique(fb.region.buffer, usage: .read) }
             }
             if let hc = lw.hca {
                 if let f = hc.wFusedIn { useUnique(f.blocks.region.buffer, usage: .read) }

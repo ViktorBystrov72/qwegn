@@ -305,12 +305,20 @@ public enum FNGPUDFlash {
         let maxCap = max(1, min(min(session.maxDrafts, dflashCap), engine.activeCapacity - prevCount - 2))
         let stepT0 = Date(), trackRep = session.sampler.config.repetitionPenalty != 1.0
         let isUnconstrained = session.constraint?.isUnconstrainedNow ?? true, isGreedy = session.sampler.config.isGreedy
+        let canSpecConstrained = session.constraint.map {
+            $0.isUnconstrainedNow || (QWConstrainedSpeculationGate.isEnabled && $0.allowsSpeculation)
+        } ?? true
         let allowPLD = isUnconstrained && isGreedy && session.seenTokens.isEmpty && !session.sampler.config.hasExplicitSeed
         let preCtx = consumePendingContextUpdate(&session, slot: dSlot)
-        var drafts = allowPLD
-            ? selectHybridBypassDrafts(history: session.history, pendingToken: token,
-                                       mode: session.draftMode, maxDrafts: maxCap, recycler: session.tokenRecycler)
+        let canonical = (!isUnconstrained && QWConstrainedSpeculationGate.isEnabled)
+            ? (session.constraint?.proposeCanonicalDrafts(maxCount: maxCap) ?? [])
             : []
+        var drafts = !canonical.isEmpty
+            ? canonical
+            : (allowPLD
+                ? selectHybridBypassDrafts(history: session.history, pendingToken: token,
+                                           mode: session.draftMode, maxDrafts: maxCap, recycler: session.tokenRecycler)
+                : [])
         let usedPLD = !drafts.isEmpty
         var proposals: [QWMTPGumbelProposal] = [], draftGPUMs = 0.0
         let stream: QWMTPRandomStream? = (!usedPLD && !isGreedy) ? QWMTPRandomStream(cloning: try session.ensureDFlashStreamState()) : nil
@@ -353,7 +361,8 @@ public enum FNGPUDFlash {
         session.specProposals += dCount
         let (tok0, accepted) = try resolveVerifiedTokens(
             engine, session: &session, drafts: drafts, proposals: proposals, stream: stream,
-            prevCount: prevCount, prevBefore: prevBefore, trackRep: trackRep, verifyMargin: margin)
+            prevCount: prevCount, prevBefore: prevBefore, trackRep: trackRep,
+            verifyMargin: margin, usedPLD: usedPLD, canSpecConstrained: canSpecConstrained)
         if accepted < dCount {
             let rejected = dCount - accepted
             session.history.removeLast(rejected)
@@ -374,20 +383,39 @@ public enum FNGPUDFlash {
     private static func resolveVerifiedTokens(
         _ engine: QWHyperStreamRuntime, session: inout FNGPUSessionData,
         drafts: [Int], proposals: [QWMTPGumbelProposal], stream: QWMTPRandomStream?,
-        prevCount: Int, prevBefore: Int?, trackRep: Bool, verifyMargin: Float
+        prevCount: Int, prevBefore: Int?, trackRep: Bool, verifyMargin: Float,
+        usedPLD: Bool, canSpecConstrained: Bool
     ) throws -> (tok0: Int, accepted: Int) {
         let dCount = drafts.count
-        if !proposals.isEmpty, let stream, (session.constraint?.isUnconstrainedNow ?? true) {
+        let startUnconstrained = session.constraint?.isUnconstrainedNow ?? true
+        let probe = (!startUnconstrained && canSpecConstrained) ? session.constraint?.makeSpeculativeProbe() : nil
+        if !proposals.isEmpty, let stream, (startUnconstrained || probe != nil) {
             let logitsPtr = engine.arena.cpuPointer(of: engine.head.logits).assumingMemoryBound(to: Float.self)
             var targets: [QWSamplingDistribution] = []
+            var probeAlive = true
             for row in 0..<(1 + dCount) {
+                if !probeAlive, let fallback = targets.last {
+                    targets.append(fallback)
+                    continue
+                }
                 let rowPtr = UnsafeBufferPointer(start: logitsPtr.advanced(by: row * engine.vocab), count: engine.vocab)
                 let rep = trackRep
                     ? FNGPUSessionData.loopRepetitionTokens(
                         in: Array((session.recentGeneratedTokens + drafts.prefix(row))
                             .suffix(FNGPUSessionData.repetitionPenaltyWindow)))
                     : []
-                targets.append(try session.sampler.distribution(logits: rowPtr, repetitionHistory: rep))
+                if let probe, try probe.writeAllowedTokens(into: &session.sampler.allowedScratch) {
+                    targets.append(try session.sampler.constrainedDistributionFromScratch(
+                        logits: rowPtr, repetitionHistory: rep))
+                    if row < dCount, (try? probe.accept(drafts[row])) == nil {
+                        probeAlive = false
+                    }
+                } else {
+                    targets.append(try session.sampler.distribution(logits: rowPtr, repetitionHistory: rep))
+                    if let probe, row < dCount, (try? probe.accept(drafts[row])) == nil {
+                        probeAlive = false
+                    }
+                }
             }
             let res = session.relaxedMargin > 0
                 ? try stream.resolveRelaxedGumbelRound(proposals: proposals, targetDistributions: targets,
@@ -397,11 +425,13 @@ public enum FNGPUDFlash {
             let boundaryTok = session.constraint?.speculationBoundaryToken
             var committedAccepted = res.accepted
             var finalTok = res.finalToken
-            if let constraint = session.constraint {
+            let commitProbe = session.constraint?.makeSpeculativeProbe()
+            let commitConstraint = commitProbe ?? session.constraint
+            if let constraint = commitConstraint {
                 for idx in 0..<res.accepted {
                     let tok = drafts[idx]
                     try constraint.accept(tok)
-                    if tok == boundaryTok || !constraint.isUnconstrainedNow {
+                    if !canSpecConstrained && (tok == boundaryTok || !constraint.isUnconstrainedNow) {
                         committedAccepted = idx
                         finalTok = tok
                         break
@@ -412,39 +442,53 @@ public enum FNGPUDFlash {
                 }
             }
             if committedAccepted == 0 {
+                if commitProbe != nil { try session.constraint?.accept(finalTok) }
                 if trackRep { session.recordSeenToken(finalTok, vocab: engine.vocab) }
                 return (finalTok, 0)
             }
             let tok0 = drafts[0]
+            if commitProbe != nil { try session.constraint?.accept(tok0) }
             if trackRep { session.recordSeenToken(tok0, vocab: engine.vocab) }
             for i in 1..<committedAccepted {
                 session.pendingTokens.append(drafts[i]); if trackRep { session.recordSeenToken(drafts[i], vocab: engine.vocab) }
             }
             session.pendingTokens.append(finalTok)
+            if commitProbe != nil { session.pendingConstraintAcceptCount += committedAccepted }
             if trackRep { session.recordSeenToken(finalTok, vocab: engine.vocab) }
             return (tok0, committedAccepted)
         }
         let v = engine.head.argmaxTokens(count: 1 + dCount)
-        if verifyMargin == 0 && session.sampler.config.isGreedy && (session.constraint?.isUnconstrainedNow ?? true) {
+        if verifyMargin == 0 && session.sampler.config.isGreedy && startUnconstrained {
             for row in (0..<(1 + dCount)).reversed() {
                 let prev = (row == 0) ? prevBefore : Int(session.history[prevCount + row - 1])
                 session.tokenRecycler.recordTransition(previous: prev, current: Int(session.history[prevCount + row]), next: v[row])
             }
         }
         var tok0 = 0, accepted = 0
-        let boundaryTok = session.constraint?.speculationBoundaryToken
+        let greedyProbe = session.constraint?.makeSpeculativeProbe()
+        let roundConstraint = greedyProbe ?? session.constraint
+        let boundaryTok = roundConstraint?.speculationBoundaryToken
+        let rowMargin: Float = (!usedPLD && !startUnconstrained && session.sampler.config.isGreedy)
+            ? session.relaxedMargin : 0
+        let prevPendingCount = session.pendingTokens.count
         for r in 0..<dCount {
             let draftTok = drafts[r], sampled: Int
-            if v[r] == draftTok && session.sampler.config.isGreedy && !session.seenTokens.contains(draftTok) && (session.constraint?.isUnconstrainedNow ?? true) {
-                try session.constraint?.accept(draftTok); sampled = draftTok
+            let rowUnconstrained = roundConstraint?.isUnconstrainedNow ?? true
+            if v[r] == draftTok && session.sampler.config.isGreedy && !session.seenTokens.contains(draftTok) && rowUnconstrained {
+                try roundConstraint?.accept(draftTok); sampled = draftTok
             } else {
-                sampled = try engine.sampleFromHead(argmaxToken: v[r], seenTokens: session.seenTokens,
-                                                    seenTokenList: session.seenTokenList,
-                                                    sampler: session.sampler, row: r, constraint: session.constraint)
+                sampled = try engine.sampleFromHead(
+                    argmaxToken: v[r], seenTokens: session.seenTokens,
+                    seenTokenList: session.seenTokenList,
+                    sampler: session.sampler, row: r, constraint: roundConstraint,
+                    draftToken: draftTok, relaxedMargin: rowMargin,
+                    relaxedMinProb: session.relaxedMinProb)
             }
             if r == 0 { tok0 = sampled } else { session.pendingTokens.append(sampled) }
-            let hitBoundary = (boundaryTok != nil && sampled == boundaryTok) || !(session.constraint?.isUnconstrainedNow ?? true)
-            if sampled == draftTok && v[r] == draftTok && !hitBoundary {
+            let hitBoundary = !canSpecConstrained
+                && ((boundaryTok != nil && sampled == boundaryTok) || !(roundConstraint?.isUnconstrainedNow ?? true))
+            let matchesTarget = canSpecConstrained ? (sampled == draftTok) : (sampled == draftTok && v[r] == draftTok)
+            if matchesTarget && !hitBoundary {
                 accepted += 1; if trackRep { session.recordSeenToken(draftTok, vocab: engine.vocab) }
             } else {
                 if trackRep { session.recordSeenToken(sampled, vocab: engine.vocab) }; break
@@ -453,9 +497,13 @@ public enum FNGPUDFlash {
         if accepted == dCount {
             let bonus = try engine.sampleFromHead(argmaxToken: v[dCount], seenTokens: session.seenTokens,
                                                   seenTokenList: session.seenTokenList,
-                                                  sampler: session.sampler, row: dCount, constraint: session.constraint)
+                                                  sampler: session.sampler, row: dCount, constraint: roundConstraint)
             if trackRep { session.recordSeenToken(bonus, vocab: engine.vocab) }
             session.pendingTokens.append(bonus)
+        }
+        if greedyProbe != nil {
+            try session.constraint?.accept(tok0)
+            session.pendingConstraintAcceptCount += (session.pendingTokens.count - prevPendingCount)
         }
         return (tok0, accepted)
     }

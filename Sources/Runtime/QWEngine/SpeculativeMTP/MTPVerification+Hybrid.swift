@@ -142,13 +142,19 @@ extension QWEngineDriver {
         table: QWMTPEmbeddingTable
     ) throws -> AsyncNeuralDraftPlan {
         let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
-        if resolvedStrategy != .mtp {
-            let cand = selectDFlashPLDCandidates(
-                session: session, pending: pending, count: count, resolvedStrategy: resolvedStrategy)
-            if !cand.isEmpty {
-                session.dflashRoundStartNs = nil
-                return .pld(cand)
+        if let cand = proposeCanonicalOrFilteredDrafts(
+            constraint: activeConstraint?.constraint,
+            maxCount: count,
+            fallbackCandidates: {
+                guard resolvedStrategy != .mtp else { return nil }
+                let raw = selectDFlashPLDCandidates(
+                    session: session, pending: pending, count: count, resolvedStrategy: resolvedStrategy
+                )
+                return raw.isEmpty ? nil : raw
             }
+        ), !cand.isEmpty {
+            session.dflashRoundStartNs = nil
+            return .pld(cand)
         }
         let canAdapt = resolvedStrategy != .mtp
         let activeCount = canAdapt ? session.dflashPolicy.selectDraftCount(maxDrafts: count) : count
@@ -190,19 +196,23 @@ extension QWEngineDriver {
         draftCompleted: ((any MTLCommandBuffer) throws -> Void)?
     ) throws -> MTPRoundProposal {
         let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
-        let canUsePLD = ((owner == nil || owner?.config.isGreedy == true)
-            && (activeConstraint?.constraint.isUnconstrainedNow ?? true)
-            && !mtpStageProfiling && resolvedStrategy != .mtp)
+        let canUseCanonical = (owner == nil || owner?.config.isGreedy == true) && !mtpStageProfiling
+        let canUsePLD = canUseCanonical && resolvedStrategy != .mtp
         let canAdapt = (!mtpStageProfiling && resolvedStrategy != .mtp)
-        if canUsePLD {
-            let cand = selectDFlashPLDCandidates(
-                session: session, pending: pending, count: count, resolvedStrategy: resolvedStrategy)
-            if !cand.isEmpty {
-                lastRoundUsedPLD = true
-                mtpDraftProposals += cand.count
-                session.dflashRoundStartNs = nil
-                return MTPRoundProposal(drafts: cand, proposals: [], draftedPairs: cand.count)
-            }
+        if canUseCanonical,
+           let cand = proposeCanonicalOrFilteredDrafts(
+               constraint: activeConstraint?.constraint,
+               maxCount: count,
+               fallbackCandidates: {
+                   canUsePLD ? selectDFlashPLDCandidates(
+                       session: session, pending: pending, count: count, resolvedStrategy: resolvedStrategy
+                   ) : nil
+               }),
+           !cand.isEmpty {
+            lastRoundUsedPLD = true
+            mtpDraftProposals += cand.count
+            session.dflashRoundStartNs = nil
+            return MTPRoundProposal(drafts: cand, proposals: [], draftedPairs: cand.count)
         }
         let activeCount = canAdapt ? session.dflashPolicy.selectDraftCount(maxDrafts: count) : count
         session.dflashRoundStartNs = canAdapt ? DispatchTime.now().uptimeNanoseconds : nil
@@ -245,7 +255,7 @@ extension QWEngineDriver {
     }
 
     var isWeightFreeSpeculation: Bool {
-        verifyWindow != nil && mtpDraftEncoder == nil && echoDrafter == nil && dflashDrafter == nil
+        verifyWindow != nil && mtpDraftEncoder == nil && echoDrafter == nil && dflashDrafter == nil && dsparkDrafter == nil
     }
 
     func proposeWeightFreeDrafts(session: QWEngineSession, pending: Int, count: Int) -> [Int]? {
@@ -358,12 +368,19 @@ extension QWEngineDriver {
         let effectiveCount = adaptiveDraftCount(count: count, defaultTrunkBits: defaultTrunkBits)
         let resolvedStrategy = (try? QWDraftStrategy.resolve(mtpDraftStrategy)) ?? .hybrid
         let (extraPending, previousToken) = pendingHistoryContext(session: session, pending: pending)
-        if (owner == nil || owner?.config.isGreedy == true)
-            && (activeConstraint?.constraint.isUnconstrainedNow ?? true)
-            && !mtpStageProfiling && resolvedStrategy != .mtp,
-           let chosen = tryZeroCostContextDrafts(
-               session: session, pending: pending, extraPending: extraPending,
-               previousToken: previousToken, count: count, strategy: resolvedStrategy) {
+        let canUseCanonical = (owner == nil || owner?.config.isGreedy == true) && !mtpStageProfiling
+        let canUseContextPLD = canUseCanonical && resolvedStrategy != .mtp
+        if canUseCanonical,
+           let chosen = proposeCanonicalOrFilteredDrafts(
+               constraint: activeConstraint?.constraint,
+               maxCount: count,
+               fallbackCandidates: {
+                   canUseContextPLD ? tryZeroCostContextDrafts(
+                       session: session, pending: pending, extraPending: extraPending,
+                       previousToken: previousToken, count: count, strategy: resolvedStrategy
+                   ) : nil
+               }),
+           !chosen.isEmpty {
             lastRoundUsedPLD = true
             lastDraftedPairs = 0
             mtpDraftProposals += chosen.count
@@ -589,7 +606,7 @@ extension QWEngineDriver {
                     enc, mtpWeights: mw, embeddings: embSlice, hidden: trunkSlice,
                     previous: prevHidden, pos: startPos, tStart: 0,
                     pairs: rows, cacheRows: startCacheRow, views: views,
-                    mropePositions: seedMRoPE)
+                    mropePositions: seedMRoPE, mropeDelta: session.roundRecord.mropeDelta)
             } else {
                 try QWMTPPromptSeeder.encode(enc, draft: draft, embeddings: embSlice, trunkHidden: trunkSlice,
                                              previousHidden: prevHidden, position: startPos,
@@ -625,7 +642,7 @@ extension QWEngineDriver {
         let pairRewind: UInt64
         if let mtpCache, let handle = session.mtpKV {
             pairRewind = try mtpCache.rollbackGeneration(handle)
-        } else if isWeightFreeSpeculation || dflashDrafter != nil {
+        } else if isWeightFreeSpeculation || dflashDrafter != nil || dsparkDrafter != nil {
             pairRewind = 0
         } else {
             throw QWEngineDriverError.state("greedy round pair cache is absent")

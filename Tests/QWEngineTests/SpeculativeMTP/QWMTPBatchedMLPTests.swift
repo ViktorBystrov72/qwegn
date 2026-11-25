@@ -340,7 +340,8 @@ final class QWMTPBatchedMLPTests: XCTestCase {
         let rawBlocks = try tensor(fullData)
         let arena = try QWArena(hal: hal, weights: 256, activations: 16 << 20, kv: 256, gdnStates: 256)
         let alloc = arena.activationsRegion()
-        let batch = try QWMTPBatchedMLP(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 8)
+        var batch = try QWMTPBatchedMLP(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 8)
+        batch.verifyAqNaxEnabled = false
         let trunk = try QWMTPBatchedTrunk(geometry: QWTestGeometry.g27, hal: hal, allocator: alloc, rows: 8)
         let vals = (0..<(8 * geom.hidden)).map { Float16(Float(($0 * 17 + 11) % 61 - 30) / 32) }
         let input8 = try tensor(vals.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in Data(raw) })
@@ -505,7 +506,7 @@ final class QWMTPBatchedMLPTests: XCTestCase {
         """.data(using: .utf8)!
         let geom = QWModelGeometry(descriptor: try QWModelDescriptor.decode(configJSON: cfg))
         let hal = try QWHal(geometry: geom)
-        let mbsaIdxCols = (geom.kvHeads + 1) * geom.headDim
+        let mbsaIdxCols = geom.mbsaIdxCols
         let rows = 2
         let arena = try QWArena(hal: hal, weights: 256, activations: 8 << 20, kv: 256, gdnStates: 256)
         let alloc = arena.activationsRegion()
@@ -534,6 +535,86 @@ final class QWMTPBatchedMLPTests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
         XCTAssertEqual(cb.status, .completed)
+    }
+
+    func testAQ8ProjectionNAXBM16ParityAcrossRows() throws {
+        let cfg = """
+        {
+          "architectures": ["MaxwellMoeForCausalLM"], "model_type": "maxwell_moe",
+          "hidden_size": 256, "intermediate_size": 512, "vocab_size": 2048,
+          "num_hidden_layers": 1, "num_experts": 0, "num_attention_heads": 4,
+          "num_key_value_heads": 2, "attention_head_size": 64, "qk_layernorm": true,
+          "attention_variant": "block_sparse_gqa", "block_sparse_gqa_indexer_n_heads": 4,
+          "block_sparse_gqa_indexer_head_dim": 64, "block_sparse_gqa_block_size": 64,
+          "block_sparse_gqa_prefix_window_size": 128, "block_sparse_gqa_local_window_size": 128,
+          "block_sparse_gqa_num_remote_blocks": 8, "enable_hyper_connections": true,
+          "num_residual_streams": 4, "mhc_sinkhorn_iterations": 20,
+          "rms_norm_eps": 1e-6, "rope_theta": 20000000, "max_position_embeddings": 8192, "eos_token_id": 2
+        }
+        """.data(using: .utf8)!
+        let geom = QWModelGeometry(descriptor: try QWModelDescriptor.decode(configJSON: cfg))
+        let hal = try QWHal(geometry: geom)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable, "AQ8 NAX BM=16 requires Metal 4")
+        let n = geom.mbsaIdxCols, k = geom.hidden, maxRows = 16
+        XCTAssertEqual(n % 64, 0); XCTAssertEqual(k % 64, 0)
+        let arena = try QWArena(hal: hal, weights: 256, activations: 8 << 20, kv: 256, gdnStates: 256)
+        let alloc = arena.activationsRegion()
+        var batch = try QWMTPBatchedMLP(geometry: geom, hal: hal, allocator: alloc, rows: maxRows)
+        let rowBytes = (k / 32) * 36
+        let blkBuf = try XCTUnwrap(hal.device.makeBuffer(length: n * rowBytes, options: .storageModeShared))
+        let ptr = blkBuf.contents().assumingMemoryBound(to: UInt8.self)
+        var rng: UInt64 = 0x51A7_9921_CAFE_BEEF
+        for r in 0..<n {
+            for g in 0..<(k / 32) {
+                let gp = ptr.advanced(by: r * rowBytes + g * 36)
+                let sc = Float16(0.002 + Float((r + g) % 5) * 0.0005)
+                UnsafeMutableRawPointer(gp).storeBytes(of: sc.bitPattern, as: UInt16.self)
+                UnsafeMutableRawPointer(gp.advanced(by: 2)).storeBytes(of: Float16(-127.5 * Float(sc)).bitPattern, as: UInt16.self)
+                for b in 4..<36 { rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27; gp[b] = UInt8(truncatingIfNeeded: rng >> 8) }
+            }
+        }
+        let blkVal = QWTensorValue(region: QWMRegion(buffer: blkBuf, base: 0, length: n * rowBytes), offset: 0, shape: QWTensorShape([n * rowBytes / 2], .f16))
+        let aq8W = try XCTUnwrap(QWWeightView(blocks: blkVal, n: n, k: k, bits: 8, groupSize: 32, isRotated: true, isIncumbentContainer: false, isSHVQ: false))
+        let xAll = try alloc.allocate(QWTensorShape([maxRows * k], .f16))
+        let yRef = try alloc.allocate(QWTensorShape([maxRows * n], .f16))
+        let yNax = try alloc.allocate(QWTensorShape([maxRows * n], .f16))
+        arena.write(xAll, from: (0..<(maxRows * k)).map { Float16(sin(Float($0) * 0.013) * 0.25) })
+        // Rows <= 11 must stay bit-exact on scalar AQ GEMV even when verifyAqNaxEnabled is true.
+        do {
+            let x8 = xAll.slice(byteOffset: 0, count: 8 * k)
+            let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+            let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
+            do {
+                batch.verifyAqNaxEnabled = false
+                try batch.encodeProjection(enc, input: x8, weight: aq8W, output: yRef, activeRows: 8)
+                batch.verifyAqNaxEnabled = true
+                try batch.encodeProjection(enc, input: x8, weight: aq8W, output: yNax, activeRows: 8)
+            } catch { enc.endEncoding(); throw error }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            XCTAssertEqual(cb.status, .completed)
+            XCTAssertEqual(
+                Data(bytes: yRef.region.pointer.advanced(by: yRef.offset), count: 8 * n * 2),
+                Data(bytes: yNax.region.pointer.advanced(by: yNax.offset), count: 8 * n * 2),
+                "rows == 8 must stay on scalar encodeAQGemvRows")
+        }
+        for activeRows in [12, 16] {
+            let xIn = xAll.slice(byteOffset: 0, count: activeRows * k)
+            let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+            let enc = try XCTUnwrap(cb.makeComputeCommandEncoder())
+            do {
+                batch.verifyAqNaxEnabled = false
+                try batch.encodeProjection(enc, input: xIn, weight: aq8W, output: yRef, activeRows: activeRows)
+                batch.verifyAqNaxEnabled = true
+                try batch.encodeProjection(enc, input: xIn, weight: aq8W, output: yNax, activeRows: activeRows)
+            } catch { enc.endEncoding(); throw error }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            XCTAssertEqual(cb.status, .completed)
+            let a = arena.read(yRef, as: Float16.self, count: activeRows * n)
+            let b = arena.read(yNax, as: Float16.self, count: activeRows * n)
+            var maxDiff: Float = 0
+            for i in 0..<a.count { maxDiff = max(maxDiff, abs(Float(a[i]) - Float(b[i]))) }
+            XCTAssertLessThan(maxDiff, 2e-2, "QWMTPBatchedMLP AQ8 BM=16 T=\(activeRows) diff=\(maxDiff)")
+        }
     }
 }
 

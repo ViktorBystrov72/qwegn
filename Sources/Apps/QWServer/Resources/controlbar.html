@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/ui/css/base.css" />
   <link rel="stylesheet" href="/ui/css/panels.css" />
   <link rel="stylesheet" href="/ui/css/chat.css" />
+  <link rel="stylesheet" href="/ui/css/decisions.css" />
 </head>
 <body>
   <a href="#main-content" class="skip-link">Skip to dashboard</a>
@@ -58,6 +59,7 @@
       <nav class="nav-tabs" aria-label="Dashboard sections">
         <button id="nav-tab-monitor" type="button" class="tab-btn is-active" onclick="switchTab('monitor')">Monitor</button>
         <button id="nav-tab-chat" type="button" class="tab-btn" onclick="switchTab('chat')">Chat</button>
+        <button id="nav-tab-decisions" type="button" class="tab-btn" onclick="switchTab('decisions')">Decisions</button>
         <button id="nav-tab-models" type="button" class="tab-btn" onclick="switchTab('models')">Models</button>
         <button id="nav-tab-logs" type="button" class="tab-btn" onclick="switchTab('logs')">Live Logs</button>
         <button id="nav-tab-settings" type="button" class="tab-btn" onclick="switchTab('settings')">Settings</button>
@@ -541,8 +543,9 @@
             <textarea id="chat-input" name="chat-input" autocomplete="off" rows="3" class="input chat-composer-input" placeholder="Message resident model… (Enter to send, Shift+Enter for newline)" onkeydown="handleChatInputKeyDown(event)" onpaste="handleChatPaste(event)" oninput="autoResizeChatInput(this)"></textarea>
             <div class="chat-composer-bar">
               <div class="chat-composer-left">
-                <input id="chat-file-input" name="chat-file-input" type="file" accept="image/*" multiple hidden onchange="handleChatFileInputChange(event)" />
-                <button id="chat-attach-btn" type="button" class="btn btn-sm" onclick="triggerChatImagePicker()">Attach Image</button>
+                <input id="chat-file-input" name="chat-file-input" type="file" accept="image/*,video/mp4,video/quicktime,video/x-m4v,video/webm" multiple hidden onchange="handleChatFileInputChange(event)" />
+                <button id="chat-attach-btn" type="button" class="btn btn-sm" onclick="triggerChatImagePicker()">Attach Media</button>
+                <button id="chat-screen-btn" type="button" class="btn btn-sm" onclick="captureChatScreenSnapshot()" title="Capture live screen or window frame">Capture Screen</button>
                 <span id="chat-composer-status" class="panel-sub mono">Ready</span>
               </div>
               <div class="chat-composer-right">
@@ -553,6 +556,11 @@
           </div>
         </div>
       </div>
+    </section>
+
+    <!-- TAB: DECISIONS -->
+    <section id="view-decisions" class="tab-pane hidden">
+      <div id="decisions-workbench-host"></div>
     </section>
 
     <!-- TAB 3: MODELS -->
@@ -750,7 +758,9 @@
   <script src="/ui/js/dashboard.js" defer></script>
   <script src="/ui/js/markdown.js" defer></script>
   <script src="/ui/js/chat-presets.js" defer></script>
+  <script src="/ui/js/chat-media.js" defer></script>
   <script src="/ui/js/chat.js" defer></script>
+  <script src="/ui/js/decisions.js" defer></script>
   <script src="/ui/js/actions.js" defer></script>
   <script src="/ui/js/settings.js" defer></script>
   <script src="/ui/js/updates.js" defer></script>

@@ -410,17 +410,18 @@ public enum QWImageDecoder {
         )
     }
 
-    /// Loads vision on demand when `imageUrls` has uncached images, encodes all images into `QWVisualSpan`s,
-    /// and unloads the vision head when `imageUrls` is empty to free RAM.
+    /// Loads vision on demand when `imageUrls` or `videoInputs` has uncached media, encodes all media into
+    /// `QWVisualSpan`s, and unloads the vision head when both are empty to free RAM.
     public static func prepareMultimodalTurn(
         promptTokens: [Int],
         imageUrls: [String],
+        videoInputs: [QWVideoInputSpec] = [],
         hiddenDim: Int,
         visionBackend: (any QWVisionBackend)?,
         policy: QWImageDecodePolicy = .serverDefault,
         onImageEncoded: ((Int, Int, Int, Int, Double) -> Void)? = nil
     ) async throws -> (tokens: [Int], visualSpans: [QWVisualSpan], loadedOnDemand: Bool, unloadedOnText: Bool) {
-        if imageUrls.isEmpty {
+        if imageUrls.isEmpty && videoInputs.isEmpty {
             if let visionBackend, visionBackend.isLoaded {
                 try visionBackend.prepareForPrompt(hasImages: false)
                 return (promptTokens, [], false, !visionBackend.isLoaded)
@@ -432,12 +433,17 @@ public enum QWImageDecoder {
                 "Too many images in turn (\(imageUrls.count)); maximum is \(QWImageDecodePolicy.defaultMaxImagesPerTurn)"
             )
         }
+        guard videoInputs.count <= QWImageDecodePolicy.defaultMaxVideosPerTurn else {
+            throw QWMultimodalError.badArgument(
+                "Too many videos in turn (\(videoInputs.count)); maximum is \(QWImageDecodePolicy.defaultMaxVideosPerTurn)"
+            )
+        }
         guard let visionBackend else {
             throw QWMultimodalError.badArgument("Model pack does not have an active vision tower")
         }
         guard visionBackend.isVisionEnabled else {
             throw QWMultimodalError.badArgument(
-                "Vision tower is disabled (--no-load-vision). Enable --load-vision to process image inputs."
+                "Vision tower is disabled (--no-load-vision). Enable --load-vision to process multimodal inputs."
             )
         }
         let maxPixels = liveMaxPixels
@@ -445,6 +451,7 @@ public enum QWImageDecoder {
         let wasLoaded = visionBackend.isLoaded
         var loadedNow = false
         var images: [(grid: QWVisionGrid, features: [Float])] = []
+        var videos: [(grid: QWVisionGrid, features: [Float])] = []
         let clock = ContinuousClock()
         for (idx, urlStr) in imageUrls.enumerated() {
             do {
@@ -493,23 +500,44 @@ public enum QWImageDecoder {
                 throw QWMultimodalError.badArgument("\(error)")
             }
         }
+        for (idx, videoIn) in videoInputs.enumerated() {
+            do {
+                let encoded = try await QWVideoDecoder.encodeVideo(
+                    input: videoIn, hiddenDim: hiddenDim, spec: spec, policy: policy,
+                    visionBackend: visionBackend, wasLoadedBeforeTurn: wasLoaded, loadedNow: &loadedNow
+                )
+                videos.append(contentsOf: encoded.videos)
+                images.append(contentsOf: encoded.fallbackImages)
+                if let g = encoded.videos.first?.grid ?? encoded.fallbackImages.first?.grid {
+                    onImageEncoded?(idx + 1, videoInputs.count, g.h, g.w, encoded.encodeMs)
+                }
+            } catch let mmError as QWMultimodalError {
+                throw mmError
+            } catch {
+                throw QWMultimodalError.badArgument("\(error)")
+            }
+        }
         let mmPrompt = try QWMultimodalPrompt(
-            promptTokens: promptTokens, images: images, hiddenDim: hiddenDim, spec: spec
+            promptTokens: promptTokens, images: images, videos: videos, hiddenDim: hiddenDim, spec: spec
         )
         return (mmPrompt.expandedTokens, mmPrompt.visualSpans, loadedNow, false)
     }
 
-    /// Synchronous CLI helper: loads vision on demand for `imagePath`, encodes into `QWVisualSpan`s, and unloads immediately.
+    /// Synchronous CLI helper: loads vision on demand for `imagePath` / `videoInput`, encodes into `QWVisualSpan`s, and unloads immediately.
     public static func prepareOneShotMultimodalTurn(
         promptTokens: [Int],
-        imagePath: String,
+        imagePath: String? = nil,
+        videoInput: QWVideoInputSpec? = nil,
         modelPath: String,
         hiddenDim: Int
     ) throws -> (tokens: [Int], visualSpans: [QWVisualSpan]) {
         let controller = try QWCLIVisionController(modelPath: modelPath)
         let out = try controller.prepareTurn(
-            promptTokens: promptTokens, imagePaths: [imagePath],
-            currentTurnHasImage: true, hiddenDim: hiddenDim
+            promptTokens: promptTokens,
+            imagePaths: imagePath.map { [$0] } ?? [],
+            videoInputs: videoInput.map { [$0] } ?? [],
+            currentTurnHasImage: imagePath != nil || videoInput != nil,
+            hiddenDim: hiddenDim
         )
         controller.unload()
         return out
@@ -562,7 +590,7 @@ public enum QWImageDecoder {
         return (source, orientedW, orientedH, orientation)
     }
 
-    private static func renderRGB(
+    static func renderRGB(
         cgImage: CGImage,
         targetWidth: Int,
         targetHeight: Int,
@@ -660,25 +688,27 @@ public final class QWCLIVisionController: @unchecked Sendable {
         backend.unload()
     }
 
-    /// Encodes `imagePaths` when present, loading vision on demand and unloading when `currentTurnHasImage == false`.
+    /// Encodes `imagePaths` and `videoInputs` when present, loading vision on demand and unloading when `currentTurnHasImage == false`.
     public func prepareTurn(
         promptTokens: [Int],
         imagePaths: [String],
+        videoInputs: [QWVideoInputSpec] = [],
         currentTurnHasImage: Bool,
         hiddenDim: Int
     ) throws -> (tokens: [Int], visualSpans: [QWVisualSpan]) {
-        if imagePaths.isEmpty {
+        if imagePaths.isEmpty && videoInputs.isEmpty {
             try backend.prepareForPrompt(hasImages: false)
             return (promptTokens, [])
         }
         guard backend.isVisionEnabled else {
             throw QWMultimodalError.badArgument(
-                "Vision tower is disabled (--no-load-vision). Enable --load-vision to process image inputs."
+                "Vision tower is disabled (--no-load-vision). Enable --load-vision to process multimodal inputs."
             )
         }
         let maxPixels = QWImageDecoder.liveMaxPixels
         let spec = QWMMSpec(visionConfig: backend.visionConfig, maxPixels: maxPixels)
         var images: [(grid: QWVisionGrid, features: [Float])] = []
+        var videos: [(grid: QWVisionGrid, features: [Float])] = []
         for path in imagePaths {
             if let cached = QWImageDecoder.cachedEncodedImage(
                 urlOrDataUri: path, hiddenDim: hiddenDim, maxPixels: maxPixels, spec: spec, policy: .cliLocal
@@ -715,11 +745,18 @@ public final class QWCLIVisionController: @unchecked Sendable {
             )
             images.append((grid: grid, features: visualTokens))
         }
+        for vid in videoInputs {
+            let encoded = try QWVideoDecoder.encodeVideoSync(
+                input: vid, hiddenDim: hiddenDim, spec: spec, policy: .cliLocal, visionBackend: backend
+            )
+            videos.append(contentsOf: encoded.videos)
+            images.append(contentsOf: encoded.fallbackImages)
+        }
         if !currentTurnHasImage {
             try backend.prepareForPrompt(hasImages: false)
         }
         let mmPrompt = try QWMultimodalPrompt(
-            promptTokens: promptTokens, images: images, hiddenDim: hiddenDim, spec: spec
+            promptTokens: promptTokens, images: images, videos: videos, hiddenDim: hiddenDim, spec: spec
         )
         return (mmPrompt.expandedTokens, mmPrompt.visualSpans)
     }

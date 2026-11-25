@@ -131,7 +131,7 @@ extension QWChatTemplate {
                     if let aName, !aName.isEmpty, aName != fnName {
                         throw QWChatTemplateRenderError.invalid("assistant name \(aName) does not match its tool call \(fnName)")
                     }
-                    let argsObj = try Self.resolveInk2CallArgs(fn.get("arguments"))
+                    let argsObj = try Self.resolveCallArgsDict(fn.get("arguments"))
                     let pairs = argsObj.sorted { $0.key < $1.key }.map { (k, v) in
                         let kj = Self.encodeJSONStringLiteral(k)
                         let vj = Self.encodeCompactSortedJSONValue(v)
@@ -190,7 +190,7 @@ extension QWChatTemplate {
         return ""
     }
 
-    private static func resolveInk2CallArgs(_ raw: QWJson) throws -> [String: QWJson] {
+    static func resolveCallArgsDict(_ raw: QWJson) throws -> [String: QWJson] {
         switch raw {
         case .undefined, .null:
             return [:]
@@ -213,7 +213,7 @@ extension QWChatTemplate {
         }
     }
 
-    private static func foundationObject(from json: QWJson) -> Any {
+    static func foundationObject(from json: QWJson) -> Any {
         switch json {
         case .undefined, .null: return NSNull()
         case .bool(let b): return b
@@ -230,14 +230,14 @@ extension QWChatTemplate {
         }
     }
 
-    private static func encodeJSONStringLiteral(_ s: String) -> String {
+    static func encodeJSONStringLiteral(_ s: String) -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: [s], options: [.withoutEscapingSlashes]),
               let arrStr = String(data: data, encoding: .utf8),
               arrStr.count >= 2 else { return "\"\"" }
         return String(arrStr.dropFirst().dropLast())
     }
 
-    private static func encodeCompactSortedJSONValue(_ json: QWJson) -> String {
+    static func encodeCompactSortedJSONValue(_ json: QWJson) -> String {
         switch json {
         case .string(let s): return encodeJSONStringLiteral(s)
         case .int(let i): return String(i)

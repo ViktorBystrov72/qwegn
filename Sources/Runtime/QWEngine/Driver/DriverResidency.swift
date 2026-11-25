@@ -13,7 +13,9 @@ import QWMTP
 import QWQuant
 
 extension QWEngineDriver {
-    private static let cachedPackFormats = OSAllocatedUnfairLock<[String: (format: QWWeightFormat, headQ4g: Bool, headFormat: QWWeightFormat?)]>(initialState: [:])
+    private static let cachedPackFormats = OSAllocatedUnfairLock<
+        [String: (format: QWWeightFormat, headQ4g: Bool, headFormat: QWWeightFormat?, moeRouterBF16: Bool)]
+    >(initialState: [:])
 
     /// Default OS RAM reserve (GiB) per memory policy when `osReserveGiB` is not explicitly set:
     /// 16 GiB under `.maxResident` and 24 GiB under `.safe` (matching `docs/benchmarks.md`).
@@ -124,11 +126,20 @@ extension QWEngineDriver {
         mtpDrafts: Int,
         isDFlash: Bool,
         isDSpineBackend: Bool,
+        isDSparkBackend: Bool = false,
         selectorTopK: Int? = nil,
-        physicalMemoryBytes: Int?
+        physicalMemoryBytes: Int?,
+        requestedSessions: Int? = nil
     ) -> (weights: Int, scratch: Int) {
         guard isDFlash, mtpDrafts > 0 else { return (0, 0) }
-        let slots = gdnSlotCount(physicalMemoryBytes: physicalMemoryBytes)
+        let slots = min(4, gdnSlotCount(physicalMemoryBytes: physicalMemoryBytes, requestedSessions: requestedSessions))
+        if isDSparkBackend {
+            let fileBytes = draftPackPath.flatMap { path -> Int? in
+                guard !path.isEmpty else { return nil }
+                return (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int)
+            } ?? 640_000_000
+            return (max(256 << 20, fileBytes), (96 << 20) + slots * (4 << 20))
+        }
         let rawPath = draftPackPath?.isEmpty == false ? draftPackPath! : QWDFlashConfig.defaultPackPath(for: descriptor)
         let url = URL(fileURLWithPath: rawPath)
         if !rawPath.isEmpty, FileManager.default.fileExists(atPath: url.path),
@@ -150,13 +161,15 @@ extension QWEngineDriver {
         raw: QWModelGeometry, cfg: StartupConfig, hal: QWHal, format: QWWeightFormat, tuning: QWEngineTuning,
         osReserveGiB: Double?, prefillChunkSize: Int, maxTokens: Int, ropeRows: Int,
         mtpDrafts: Int, mtpWeightDrafts: Int, kvMode: QWKVMode,
-        allowExpertReduction: Bool = true
+        allowExpertReduction: Bool = true,
+        requestedSessions: Int? = nil
     ) throws -> (geometry: QWModelGeometry, prefillChunkSize: Int) {
         try QWScratchArenaBuilder.planResidencyAndChunk(
             raw: raw, cfg: cfg, hal: hal, format: format, tuning: tuning,
             osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize, maxTokens: maxTokens,
             ropeRows: ropeRows, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts,
-            kvMode: kvMode, allowExpertReduction: allowExpertReduction)
+            kvMode: kvMode, allowExpertReduction: allowExpertReduction,
+            requestedSessions: requestedSessions)
     }
 
     /// Predicts the GPU memory footprint (weights, KV cache, activations/GDN scratch) and
@@ -180,9 +193,28 @@ extension QWEngineDriver {
         )
     }
 
-    /// Concurrent GDN state slots sized to host physical RAM (4 on >=32 GiB, 2 on 16 GiB CI VMs).
-    static func gdnSlotCount(physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes()) -> Int {
-        (physicalMemoryBytes ?? 0) >= (32 << 30) ? 4 : 2
+    /// Concurrent GDN/KV session slots sized to host physical RAM (8 on >=64 GiB, 4 on >=32 GiB, 2 on 16 GiB CI VMs).
+    static func gdnSlotCount(
+        physicalMemoryBytes: Int? = QWAdmission.physicalMemoryBytes(),
+        requestedSessions: Int? = nil
+    ) -> Int {
+        let phys = physicalMemoryBytes ?? 0
+        let defaultSlots: Int = if phys >= (64 << 30) {
+            8
+        } else if phys >= (32 << 30) {
+            4
+        } else {
+            2
+        }
+        guard let req = requestedSessions, req > 0 else { return defaultSlots }
+        let cap: Int = if phys >= (64 << 30) {
+            16
+        } else if phys >= (32 << 30) {
+            8
+        } else {
+            2
+        }
+        return max(1, min(cap, req))
     }
 
     static func estimateDriverContextMemory(
@@ -317,7 +349,7 @@ extension QWEngineDriver {
         descriptor: QWModelDescriptor,
         rawGeometry: QWModelGeometry,
         mtpWeightDrafts: Int
-    ) -> (QWWeightFormat, Bool, QWWeightFormat?) {
+    ) -> (QWWeightFormat, Bool, QWWeightFormat?, Bool) {
         if let path = packPath, !path.isEmpty {
             let cacheKey = "\(path)|\(mtpWeightDrafts > 0)|\(descriptor.geometryDigestV2)"
             if let hit = cachedPackFormats.withLock({ $0[cacheKey] }) { return hit }
@@ -332,7 +364,9 @@ extension QWEngineDriver {
                 mtpDrafts: mtpWeightDrafts, pack: pk) {
                 let headSpec = Self.resolveHeadSpec(st: st, pack: pk, trunkFormat: choice.format,
                                                     geometry: rawGeometry)
-                let res = (choice.format, headSpec.isQ4g, headSpec.format)
+                let routerBF16 = Self.resolveMoERouterIsBF16(
+                    pack: pk, geometry: rawGeometry, mtpWeightDrafts: mtpWeightDrafts)
+                let res = (choice.format, headSpec.isQ4g, headSpec.format, routerBF16)
                 cachedPackFormats.withLock { $0[cacheKey] = res }
                 return res
             }
@@ -342,15 +376,15 @@ extension QWEngineDriver {
                     let trunkFmt = QWWeightFormat.nativeAffine(bits: b, groupSize: g)
                     let headSpec = Self.resolveHeadSpec(st: st, pack: nil, trunkFormat: trunkFmt,
                                                         geometry: rawGeometry)
-                    return (trunkFmt, headSpec.isQ4g, headSpec.format)
+                    return (trunkFmt, headSpec.isQ4g, headSpec.format, false)
                 }
-                return (.hq4G32, true, .hq4G32)
+                return (.hq4G32, true, .hq4G32, false)
             }
         }
         if let q = descriptor.quantization, let b = q.bits, let g = q.groupSize,
            QWAQBlock.isSupported(bits: b, group: g) {
-            return (.nativeAffine(bits: b, groupSize: g), false, nil)
+            return (.nativeAffine(bits: b, groupSize: g), false, nil, false)
         }
-        return (.hq4G32, false, nil)
+        return (.hq4G32, false, nil, false)
     }
 }

@@ -41,7 +41,7 @@ public enum QWSettingsCoherence {
         "speculativeDecodingEnabled", "mtpDrafts", "mtpBackend",
         "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding",
         "mtpAdaptiveDepth", "mtpEntropyThreshold",
-        "dflashDraftPackPath", "dflashSelectorTopK",
+        "dflashDraftPackPath", "dflashSelectorTopK", "dsparkConfidenceSchedule",
         "gdnPrefill", "evictPrefillScratch", "prefillChunkSize", "maxConcurrentSessions",
         "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "engineTuning",
         "warmRAMLimitGB", "ssdCacheEnabled", "ssdCacheLimitGB", "cacheDir",
@@ -127,6 +127,7 @@ public enum QWSettingsCoherence {
         "mtpEntropyThreshold": "MTP entropy threshold",
         "dflashDraftPackPath": "Drafter pack path",
         "dflashSelectorTopK": "Drafter selector top-K",
+        "dsparkConfidenceSchedule": "DSpark confidence schedule",
         "gdnPrefill": "GDN prefill mode",
         "evictPrefillScratch": "Scratch eviction",
         "prefillChunkSize": "Prefill chunk size",
@@ -144,6 +145,9 @@ public enum QWSettingsCoherence {
         "logLevel": "Log level",
         "coolingPolicy": "Cooling & fan policy",
         "updateCheckSchedule": "Update check schedule",
+        "decisionModelPackPath": "Decision sidecar model pack",
+        "decisionComputeUnit": "Decision sidecar compute unit",
+        "decisionLoadVision": "Load decision vision tower",
         "keepServerRunningAfterQuit": "Keep server running after quit",
     ]
 
@@ -159,6 +163,9 @@ public enum QWSettingsCoherence {
         "logDir": "Where the app writes its log file.",
         "logFileName": "The app's log file name.",
         "updateCheckSchedule": "Controls how often Qwegn checks GitHub Releases for newer versions (applied immediately).",
+        "decisionModelPackPath": "Hot-loads or unloads the co-resident System-1 decision sidecar without restarting the primary LLM.",
+        "decisionComputeUnit": "Selects auto, metal, or ane execution for the decision sidecar.",
+        "decisionLoadVision": "Controls whether the decision sidecar loads multimodal vision weights.",
     ]
 
     /// One canonical text per setting key, so two revisions can be

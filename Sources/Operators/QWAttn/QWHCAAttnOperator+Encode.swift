@@ -106,7 +106,7 @@ extension QWHCAAttnOperator {
         qUpGateScratch.bind(enc, index: 0)
         invFreqBuf.bind(enc, index: 1)
         enc.setBytes(&qP, length: MemoryLayout<QPrepParams>.stride, index: 2)
-        enc.dispatchThreadgroups(MTLSize(width: qHeads, height: rows, depth: 1),
+        enc.dispatchThreadgroups(MTLSize(width: (qHeads + 7) / 8, height: rows, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
         let maxTotalComp = (pos0 + rows) / compressRatio
@@ -196,14 +196,25 @@ extension QWHCAAttnOperator {
             invMscale: ropeMscale > 0 ? (1.0 / ropeMscale) : 1.0,
             hasVHA: (hcaW.vhaMix != nil ? 1 : 0) | (skipInterFwht ? 0x10000 : 0)
         )
-        enc.setComputePipelineState(psoVhaInvRope)
+        let useVhaNAX = hcaVhaNAXEnabled
+            && rows >= 16
+            && (headDim % 128) == 0
+            && qHeads <= 64
+            && (qHeads % 16) == 0
+            && psoVhaInvRopeNAX != nil
+        if let vhaNaxPSO = psoVhaInvRopeNAX, useVhaNAX {
+            enc.setComputePipelineState(vhaNaxPSO)
+        } else {
+            enc.setComputePipelineState(psoVhaInvRope)
+        }
         attScratch.bind(enc, index: 0)
         (hcaW.vhaMix ?? attScratch).bind(enc, index: 1)
         invFreqBuf.bind(enc, index: 2)
         zVhaScratch.bind(enc, index: 3)
         enc.setBytes(&vhaP, length: MemoryLayout<VhaInvRopeParams>.stride, index: 4)
-        enc.dispatchThreadgroups(MTLSize(width: headDim / 32, height: rows, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.dispatchThreadgroups(
+            MTLSize(width: useVhaNAX ? (headDim / 128) : (headDim / 32), height: rows, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
         mark("hca.grouped_wo_a")
         QWCoarsePoolIndex.barrierIfConcurrent(enc)

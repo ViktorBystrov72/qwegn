@@ -696,4 +696,66 @@ final class QWSettingsTests: XCTestCase {
             4096
         )
     }
+
+    func testNoProfileHonorsCliMTPAndAutoEnablesDSparkDefaults() throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwg-dspark-srv-\(UUID().uuidString)")
+        let assetsDir = tmpDir.appendingPathComponent("assets")
+        try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let dsparkConfigJSON = """
+        {
+          "architectures": ["Ernie5_5_MoeForCausalLM"],
+          "model_type": "ernie5_5_moe",
+          "vocab_size": 1024, "hidden_size": 4096, "intermediate_size": 4096,
+          "num_hidden_layers": 2, "max_position_embeddings": 16384, "rms_norm_eps": 1e-6,
+          "num_attention_heads": 32, "num_key_value_heads": 1, "head_dim": 128,
+          "qk_nope_head_dim": 64, "qk_rope_head_dim": 64, "v_head_dim": 128,
+          "compress_ratios": [4, -2], "default_compress_ratio": 4,
+          "q_lora_rank": 128, "kv_lora_rank": 128,
+          "compress_qk_nope_head_dim": 64, "compress_qk_rope_head_dim": 64,
+          "compress_v_head_dim": 128, "o_groups": 2, "o_lora_rank": 128,
+          "sliding_window": 128, "compress_rope_theta": 160000.0,
+          "rope_theta": 8000000.0, "rotary_percent": 1.0,
+          "first_k_dense_replace": 0, "moe_layer_freq": 1,
+          "n_routed_experts": 512, "num_experts_per_tok": 10,
+          "moe_intermediate_size": 2048, "moe_latent_size": 2048,
+          "n_shared_experts": 1, "tie_word_embeddings": false,
+          "dspark_block_size": 7, "dspark_markov_rank": 64,
+          "dspark_noise_token_id": 3, "dspark_target_layer_ids": [0, 1],
+          "enable_confidence_head": true,
+          "eos_token_id": 2
+        }
+        """
+        try Data(dsparkConfigJSON.utf8).write(to: assetsDir.appendingPathComponent("config.json"))
+        try Data("{}".utf8).write(to: assetsDir.appendingPathComponent("tokenizer.json"))
+        try Data("{% for message in messages %}{{ message.content }}{% endfor %}".utf8)
+            .write(to: assetsDir.appendingPathComponent("chat_template.jinja"))
+        try Data("QWP1".utf8).write(to: tmpDir.appendingPathComponent("model.qwp"))
+        try Data("QWP1".utf8).write(to: tmpDir.appendingPathComponent("dspark.qwp"))
+
+        let auto = try QWServerConfigurationResolver.resolve(
+            cliPack: tmpDir.path, cliIgnoreProfile: true, environment: [:]
+        )
+        XCTAssertTrue(auto.speculativeDecodingEnabled)
+        XCTAssertEqual(auto.mtpBackend, "dspark")
+        XCTAssertEqual(auto.mtpDrafts, 7)
+        XCTAssertEqual(auto.dsparkConfidenceSchedule, true)
+
+        let explicit = try QWServerConfigurationResolver.resolve(
+            cliPack: tmpDir.path, cliMTPDrafts: 7, cliMTPBackend: "dspark",
+            cliIgnoreProfile: true, environment: [:]
+        )
+        XCTAssertTrue(explicit.speculativeDecodingEnabled)
+        XCTAssertEqual(explicit.mtpBackend, "dspark")
+        XCTAssertEqual(explicit.mtpDrafts, 7)
+
+        let disabled = try QWServerConfigurationResolver.resolve(
+            cliPack: tmpDir.path, cliMTPDrafts: 0, cliMTPBackend: "dspark",
+            cliIgnoreProfile: true, environment: [:]
+        )
+        XCTAssertFalse(disabled.speculativeDecodingEnabled)
+        XCTAssertEqual(disabled.mtpDrafts, 0)
+    }
 }

@@ -29,7 +29,8 @@ struct Repl: ParsableCommand {
     @Flag(name: .customLong("reuse-prefix"), inversion: .prefixedNo, help: "Reuse exact consumed-token conversation prefixes (default: on). Disable for fresh whole-history processing; split-prefill logits can differ.") var reusePrefix: Bool = true
     @Flag(name: .customLong("stream"), inversion: .prefixedNo, help: "Stream output while generating (default: on).") var stream: Bool = true
     @Flag(name: .customLong("color"), inversion: .prefixedNo, help: "Colorize thinking output and prompts (default: auto).") var color: Bool?
-    @Option(name: .customLong("dflash-window"), help: "DFlash 2 / DSpine window B in 2...16 (auto-detects dflash2 vs dspine from drafter pack and sets --mtp-drafts B-1).") var dflashWindow: Int? = nil
+    @Option(name: .customLong("dflash-window"), help: "DFlash 2 / DSpine window B in 2...16 (auto-detects dflash2 vs dspine from drafter pack and sets --mtp-drafts B-1).") var dflashWindow: Int?
+    @Flag(name: .customLong("dspark-confidence-schedule"), inversion: .prefixedNo, help: "Enable adaptive confidence-head verification budget for DSpark.") var dsparkConfidenceSchedule: Bool?
     @Option(name: .customLong("repo"), help: "Repository or knowledge directory root containing .qwg/manifest.json to mount as LSA memory.") var repo: String? = nil
     @Flag(name: [.customLong("no-memory-pack"), .customLong("no-memory")], help: "Disable automatic mounting of .qwg/manifest.json memory pack.") var noMemory: Bool = false
     @Flag(name: .customLong("no-profile"), help: "Bypass ~/.qwg/settings.json and per-model knob profiles.") var noProfile: Bool = false
@@ -39,6 +40,7 @@ struct Repl: ParsableCommand {
     func validate() throws {
         try knobs.requireHonoured("qwg repl")
         try Self.validateImageOption(image: image, allowVision: knobs.loadVision ?? true)
+        try Self.validateVideoOption(video: video, allowVision: knobs.loadVision ?? true)
     }
 
     static func validateImageOption(image: String?, allowVision: Bool) throws {
@@ -47,10 +49,17 @@ struct Repl: ParsableCommand {
         }
     }
 
+    static func validateVideoOption(video: String?, allowVision: Bool) throws {
+        if video != nil && !allowVision {
+            throw ValidationError("video input provided but vision loading disabled via --no-load-vision")
+        }
+    }
+
     func run() throws {
         let allowVision = knobs.loadVision ?? true
-        if image != nil && !allowVision {
-            FileHandle.standardError.write("qwg repl: error: image input provided but vision loading disabled via --no-load-vision\n".data(using: .utf8)!)
+        if (image != nil || video != nil) && !allowVision {
+            let kind = video != nil ? "video" : "image"
+            FileHandle.standardError.write("qwg repl: error: \(kind) input provided but vision loading disabled via --no-load-vision\n".data(using: .utf8)!)
             throw ExitCode(2)
         }
         let settings = QWSettingsManager.shared.loadSettings()
@@ -102,7 +111,8 @@ struct Repl: ParsableCommand {
             cacheConfig: (reusePrefix && warmBytes > 0)
                 ? QWCacheConfig(warmByteLimit: warmBytes, ssdByteLimit: ssdBytes,
                                 cacheDirectory: resolvedCacheDirURL, wipeOnStart: false)
-                : nil
+                : nil,
+            dsparkConfidenceSchedule: dsparkConfidenceSchedule
         )
         do {
             try QWEngineInstanceLock.acquireEngineLock()
@@ -151,12 +161,21 @@ struct Repl: ParsableCommand {
         let visionController: QWCLIVisionController? = (allowVision && engine.capabilities.contains(.vision) && runtimeAssets.descriptor.visDepth > 0)
             ? (try? QWCLIVisionController(modelPath: resolvedPack))
             : nil
-        if image != nil && visionController == nil {
-            FileHandle.standardError.write("qwg repl: error: image input provided but this model pack has no active vision tower\n".data(using: .utf8)!)
+        if (image != nil || video != nil) && visionController == nil {
+            let kind = video != nil ? "video" : "image"
+            FileHandle.standardError.write("qwg repl: error: \(kind) input provided but this model pack has no active vision tower\n".data(using: .utf8)!)
             throw ExitCode(2)
         }
         var pendingTurnImage: String? = (visionController != nil) ? image : nil
+        var pendingTurnVideo: String? = (visionController != nil) ? video : nil
         var activeImageHistory: [String] = []
+        var activeVideoHistory: [QWVideoInputSpec] = []
+        var replTempFiles: [URL] = []
+        defer {
+            for url in replTempFiles {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
 
         var history: [QWJson] = []
         if let s = currentSystem, !s.isEmpty {
@@ -189,8 +208,10 @@ struct Repl: ParsableCommand {
                     runtimeAssets: runtimeAssets, cliCfg: cliCfg, showThinking: showThinking,
                     hideThinking: hideThinking, conversation: conversation,
                     visionController: visionController, history: &history,
-                    activeImageHistory: &activeImageHistory, recalledVaultPaths: &recalledVaultPaths,
-                    pendingTurnImage: &pendingTurnImage, activeMemoryPack: &activeMemoryPack,
+                    activeImageHistory: &activeImageHistory, activeVideoHistory: &activeVideoHistory,
+                    recalledVaultPaths: &recalledVaultPaths,
+                    pendingTurnImage: &pendingTurnImage, pendingTurnVideo: &pendingTurnVideo,
+                    replTempFiles: &replTempFiles, activeMemoryPack: &activeMemoryPack,
                     mountedMemoryTokens: &mountedMemoryTokens, currentSystem: &currentSystem,
                     isThinking: &isThinking, displayThinking: &displayThinking,
                     currentReasoningEffort: &currentReasoningEffort,
@@ -200,11 +221,27 @@ struct Repl: ParsableCommand {
             }
 
             let turnImage = pendingTurnImage
+            let turnVideo = pendingTurnVideo
             pendingTurnImage = nil
-            var userContent: String
+            pendingTurnVideo = nil
+            var turnVideos: [QWVideoInputSpec] = []
             if let img = turnImage {
                 activeImageHistory.append(img)
-                userContent = trimmed.contains("<|image_pad|>") ? trimmed : "<|vision_start|><|image_pad|><|vision_end|>" + trimmed
+            }
+            if let vid = turnVideo {
+                let spec = QWVideoInputSpec(url: vid)
+                activeVideoHistory.append(spec)
+                turnVideos.append(spec)
+            }
+            var userContent: String
+            if turnImage != nil || !turnVideos.isEmpty {
+                userContent = QWVideoDecoder.formatPromptWithMedia(
+                    userPrompt: trimmed,
+                    imageCount: turnImage != nil ? 1 : 0,
+                    videoInputs: turnVideos,
+                    tokenizer: tok,
+                    descriptor: runtimeAssets.descriptor
+                )
             } else {
                 userContent = trimmed
             }
@@ -245,9 +282,13 @@ struct Repl: ParsableCommand {
                 while memoryPrefixIds.count + promptIds.count + effectiveMaxNew + 64 > maxCtx && history.count > 2 {
                     let removeIdx = history.first?.get("role").isString("system") == true ? 1 : 0
                     if removeIdx < history.count {
-                        if case .string(let s) = history[removeIdx].get("content"),
-                           s.contains("<|image_pad|>"), !activeImageHistory.isEmpty {
-                            activeImageHistory.removeFirst()
+                        if case .string(let s) = history[removeIdx].get("content") {
+                            if (s.contains("<|image_pad|>") || s.contains("<|image|>")) && !activeImageHistory.isEmpty {
+                                activeImageHistory.removeFirst()
+                            }
+                            if (s.contains("<|video_pad|>") || s.contains("<|video|>")) && !activeVideoHistory.isEmpty {
+                                activeVideoHistory.removeFirst()
+                            }
                         }
                         history.remove(at: removeIdx)
                     }
@@ -258,13 +299,14 @@ struct Repl: ParsableCommand {
                     promptIds = try tok.encode(wire)
                     FileHandle.standardError.write("\(cliColor.systemNotice)[qwg repl: trimmed older context to fit window]\(cliColor.reset)\n".data(using: .utf8)!)
                 }
-                if !activeImageHistory.isEmpty && visionController == nil {
+                if (!activeImageHistory.isEmpty || !activeVideoHistory.isEmpty) && visionController == nil {
                     throw QWMultimodalError.badArgument("Vision tower is disabled or unavailable for this model.")
                 }
                 let mmTurn = try visionController?.prepareTurn(
                     promptTokens: promptIds,
                     imagePaths: activeImageHistory,
-                    currentTurnHasImage: turnImage != nil,
+                    videoInputs: activeVideoHistory,
+                    currentTurnHasImage: turnImage != nil || turnVideo != nil,
                     hiddenDim: runtimeAssets.descriptor.hidden
                 ) ?? (tokens: promptIds, visualSpans: [])
                 promptIds = (mmTurn.visualSpans.isEmpty ? memoryPrefixIds : []) + mmTurn.tokens
@@ -413,6 +455,7 @@ struct Serve: AsyncParsableCommand {
     @Option(name: .customLong("model-name"), help: "Model name reported in /v1/models.") var modelName: String?
     @Option(name: .customLong("model-alias"), help: "Model alias accepted in /v1/chat/completions.") var modelAlias: String?
     @Option(name: .customLong("dflash-window"), help: "DFlash 2 / DSpine window B in 2...16 (auto-detects dflash2 vs dspine from drafter pack and sets --mtp-drafts B-1).") var dflashWindow: Int?
+    @Flag(name: .customLong("dspark-confidence-schedule"), inversion: .prefixedNo, help: "Enable adaptive confidence-head verification budget for DSpark.") var dsparkConfidenceSchedule: Bool?
     @Option(name: .customLong("repo"), help: "Mount a repository/knowledge memory pack (<path>/.qwg/manifest.json) at server startup.") var repo: String? = nil
     @Option(name: .customLong("parent-pid"), help: "Parent process PID to monitor for automatic termination.") var parentPid: Int32? = nil
     @Flag(name: .customLong("no-profile"), help: "Bypass ~/.qwg/settings.json and per-model knob profiles.") var noProfile: Bool = false
@@ -454,6 +497,7 @@ struct Serve: AsyncParsableCommand {
             cliMTPEntropyThreshold: knobs.mtpEntropyThreshold,
             cliDFlashDraftPack: knobs.dflashDraftPack, cliDFlashBlockSize: dflashWindow,
             cliDFlashTopK: knobs.dflashTopK,
+            cliDSparkConfidenceSchedule: dsparkConfidenceSchedule,
             cliGDNPrefill: knobs.gdnPrefill, cliEvictScratch: knobs.evictPrefillScratch,
             cliPrefillChunkSize: knobs.prefillChunkSize,
             cliMaxConcurrentSessions: knobs.maxConcurrentSessions,
@@ -469,6 +513,7 @@ struct Serve: AsyncParsableCommand {
             cliIgnoreProfile: noProfile
         )
         let isDFlash2 = ["dflash2", "dflash", "dspine"].contains(resolved.mtpBackend?.lowercased() ?? "")
+        let isDSpark = resolved.mtpBackend?.lowercased() == "dspark"
         let maxDrafts = 15
         guard resolved.mtpDrafts >= 0 && resolved.mtpDrafts <= maxDrafts else {
             FileHandle.standardError.write("qwg serve: error: --mtp-drafts must be 0...\(maxDrafts) (got \(resolved.mtpDrafts))\n".data(using: .utf8)!)
@@ -493,6 +538,13 @@ struct Serve: AsyncParsableCommand {
                         drafts: resolved.mtpDrafts,
                         selectorTopK: resolved.dflashSelectorTopK
                     )
+                } else if resolved.speculativeDecodingEnabled && isDSpark && resolved.mtpDrafts > 0 {
+                    guard runtimeAssets.descriptor.dsparkConfig != nil else {
+                        throw QWEngineError.unsupportedModel("DSpark requires dspark_* capabilities in config.json")
+                    }
+                    guard QWModelDescriptor.DSparkConfig.resolvePackURL(near: resolved.modelPackPath) != nil else {
+                        throw QWEngineError.packMissing("dspark.qwp")
+                    }
                 }
             } catch {
                 FileHandle.standardError.write("qwg serve: error: \(error)\n".data(using: .utf8)!)
@@ -531,6 +583,7 @@ struct Serve: AsyncParsableCommand {
             mtpAdaptiveEntropyThreshold: resolved.mtpEntropyThreshold,
             dflashDraftPackPath: resolved.dflashDraftPackPath.isEmpty ? nil : resolved.dflashDraftPackPath,
             dflashSelectorTopK: resolved.dflashSelectorTopK,
+            dsparkConfidenceSchedule: resolved.dsparkConfidenceSchedule,
             ropeScalingType: resolved.ropeScalingType,
             ropeScalingFactor: resolved.ropeScalingFactor,
             gdnPrefill: resolved.gdnPrefill,

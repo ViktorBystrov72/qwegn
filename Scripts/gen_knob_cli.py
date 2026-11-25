@@ -109,7 +109,7 @@ CLI_HELP = {
     "systemPrompt": "System prompt text.",
     "speculativeEnabled": "Enable speculative decoding.",
     "mtpDrafts": "MTP speculation depth (0 is serial decode).",
-    "mtpBackend": "MTP execution backend: standard, variational, dflash2 or dspine.",
+    "mtpBackend": "MTP execution backend: standard, variational, dflash2, dspine or dspark.",
     "mtpRelaxedMargin": "Variational MTP relaxed acceptance log-logit margin delta (arXiv:2610.26693).",
     "mtpRelaxedMinProb": "Variational MTP fidelity floor: a relaxed draft also needs target probability >= this (0 disables).",
     "mtpDraftStrategy": "MTP draft proposal strategy: hybrid, neural or ngram.",

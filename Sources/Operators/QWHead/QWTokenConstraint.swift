@@ -30,6 +30,19 @@ public protocol QWTokenConstraint: AnyObject, Sendable {
     /// Writes ascending selectable token IDs into `scratch` (keeping capacity),
     /// returning `false` when unconstrained (`allowedTokens() == nil`).
     func writeAllowedTokens(into scratch: inout [Int]) throws -> Bool
+
+    /// Returns an independent state clone for tentative multi-row speculative verification.
+    func makeSpeculativeProbe() -> (any QWTokenConstraint)?
+
+    /// Proposes up to `maxCount` canonical structural draft tokens without mutating `self`.
+    func proposeCanonicalDrafts(maxCount: Int) -> [Int]
+}
+
+public enum QWConstrainedSpeculationGate {
+    /// Hermetic A/B gate (`QW_CONSTRAINED_SPEC=0` restores serial constrained fallback).
+    public static var isEnabled: Bool {
+        ProcessInfo.processInfo.environment["QW_CONSTRAINED_SPEC"] != "0"
+    }
 }
 
 extension QWTokenConstraint {
@@ -43,6 +56,9 @@ extension QWTokenConstraint {
         scratch.append(contentsOf: allowed)
         return true
     }
+
+    public func makeSpeculativeProbe() -> (any QWTokenConstraint)? { nil }
+    public func proposeCanonicalDrafts(maxCount: Int) -> [Int] { [] }
 }
 
 /// Reusable preallocated scratch buffer and bitset for zero-allocation token masking.

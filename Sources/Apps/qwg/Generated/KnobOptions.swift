@@ -72,8 +72,8 @@ public struct QWGKnobOptions: ParsableArguments {
     @Option(name: [.customLong("mtp-drafts")], help: "MTP speculation depth (0 is serial decode).")
     public var mtpDrafts: Int?
 
-    /// MTP execution backend: standard, variational, dflash2 or dspine.
-    @Option(name: [.customLong("mtp-backend")], help: "MTP execution backend: standard, variational, dflash2 or dspine.", transform: { $0.lowercased() })
+    /// MTP execution backend: standard, variational, dflash2, dspine or dspark.
+    @Option(name: [.customLong("mtp-backend")], help: "MTP execution backend: standard, variational, dflash2, dspine or dspark.", transform: { $0.lowercased() })
     public var mtpBackend: String?
 
     /// Variational MTP relaxed acceptance log-logit margin delta (arXiv:2610.26693).

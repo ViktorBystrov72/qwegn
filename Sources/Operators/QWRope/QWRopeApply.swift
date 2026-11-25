@@ -112,23 +112,27 @@ public final class QWRopeApply: @unchecked Sendable {
     }
 
     /// Fast path for contiguous text positions [positionStart ..< positionStart+count]
-    /// without host-side position array allocation.
+    /// without host-side position array allocation (or custom per-turn 3D MRoPE table slice).
     public func encodeQK(_ enc: any MTLComputeCommandEncoder, hal: QWHal,
                          q: QWTensorValue, k: QWTensorValue,
                          wq: QWTensorValue?, wk: QWTensorValue?,
                          qOut: QWTensorValue, kOut: QWTensorValue,
                          normOut: QWTensorValue? = nil,
                          qkvBias: QWTensorValue? = nil,
-                         positionStart: Int, count: Int) throws {
+                         positionStart: Int, count: Int,
+                         customTable: QWTensorValue? = nil) throws {
         try Self.validateGeometry(geometry)
-        let nrows = tables?.rows ?? (tableTensor.shape.dims.first ?? 0)
         guard count > 0 else { throw QWRopeError.badShape("q/k/weights/positions mismatch: S=\(count)") }
-        guard positionStart >= 0, positionStart + count <= nrows else {
-            throw QWRopeError.posBeyondTable(positionStart + count - 1, nrows)
+        if customTable == nil {
+            let nrows = tables?.rows ?? (tableTensor.shape.dims.first ?? 0)
+            guard positionStart >= 0, positionStart + count <= nrows else {
+                throw QWRopeError.posBeyondTable(positionStart + count - 1, nrows)
+            }
         }
         try encodeQKContiguous(enc, q: q, k: k, wq: wq, wk: wk,
                                qOut: qOut, kOut: kOut, normOut: normOut, qkvBias: qkvBias,
-                               rowBase: positionStart, rows: count)
+                               rowBase: customTable == nil ? positionStart : 0, rows: count,
+                               customTable: customTable)
     }
 
     private func encodeQKContiguous(_ enc: any MTLComputeCommandEncoder,
@@ -137,7 +141,8 @@ public final class QWRopeApply: @unchecked Sendable {
                                     qOut: QWTensorValue, kOut: QWTensorValue,
                                     normOut: QWTensorValue?,
                                     qkvBias: QWTensorValue?,
-                                    rowBase: Int, rows: Int) throws {
+                                    rowBase: Int, rows: Int,
+                                    customTable: QWTensorValue? = nil) throws {
         let qSlot = geometry.qProjOut                             // Q‖gate or Q only
         let kAll = geometry.kvHeads * geometry.headDim
         let S = rows
@@ -184,9 +189,13 @@ public final class QWRopeApply: @unchecked Sendable {
         var eps = geometry.rmsEps
         withUnsafeBytes(of: &flags) { (raw: UnsafeRawBufferPointer) in enc.setBytes(raw.baseAddress!, length: 16, index: Buffer.headU4.rawValue) }
         enc.setBytes(&eps, length: 4, index: Buffer.eps.rawValue)
+        let activeTable = customTable ?? tableTensor
+        if customTable != nil {
+            enc.useResource(activeTable.region.buffer, usage: .read)
+        }
         // fold rowBase into the table bind: +rowBase·width f32 = rowBase·width·4 B
-        enc.setBuffer(tableTensor.region.buffer,
-                      offset: tableTensor.region.base + tableTensor.offset + rowBase * tableWidth * 4,
+        enc.setBuffer(activeTable.region.buffer,
+                      offset: activeTable.region.base + activeTable.offset + rowBase * tableWidth * 4,
                       index: Buffer.table.rawValue)
         enc.dispatchThreadgroups(MTLSize(width: S, height: geometry.qHeads + geometry.kvHeads, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
@@ -201,12 +210,15 @@ public final class QWRopeApply: @unchecked Sendable {
                                 wq: QWTensorValue?, wk: QWTensorValue?,
                                 qkvBias: QWTensorValue? = nil,
                                 positionStart: Int, count: Int,
-                                inRowCols: Int? = nil) throws {
+                                inRowCols: Int? = nil,
+                                customTable: QWTensorValue? = nil) throws {
         try Self.validateGeometry(geometry)
-        let nrows = tables?.rows ?? (tableTensor.shape.dims.first ?? 0)
         guard count > 0 else { throw QWRopeError.badShape("count mismatch: S=\(count)") }
-        guard positionStart >= 0, positionStart + count <= nrows else {
-            throw QWRopeError.posBeyondTable(positionStart + count - 1, nrows)
+        if customTable == nil {
+            let nrows = tables?.rows ?? (tableTensor.shape.dims.first ?? 0)
+            guard positionStart >= 0, positionStart + count <= nrows else {
+                throw QWRopeError.posBeyondTable(positionStart + count - 1, nrows)
+            }
         }
         let S = count
         let totalN = geometry.attnTotalN
@@ -240,8 +252,13 @@ public final class QWRopeApply: @unchecked Sendable {
         else { enc.setBuffer(nullSlab, offset: 0, index: 4) }
         if let w = wk { w.bind(enc, index: 5) }
         else { enc.setBuffer(nullSlab, offset: 0, index: 5) }
-        enc.setBuffer(tableTensor.region.buffer,
-                      offset: tableTensor.region.base + tableTensor.offset + positionStart * tableWidth * 4,
+        let activeTable = customTable ?? tableTensor
+        let tableRowBase = customTable == nil ? positionStart : 0
+        if customTable != nil {
+            enc.useResource(activeTable.region.buffer, usage: .read)
+        }
+        enc.setBuffer(activeTable.region.buffer,
+                      offset: activeTable.region.base + activeTable.offset + tableRowBase * tableWidth * 4,
                       index: 6)
         var eps = geometry.rmsEps
         enc.setBytes(&eps, length: 4, index: 7)

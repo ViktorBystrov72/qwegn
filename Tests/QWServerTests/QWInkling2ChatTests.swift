@@ -99,7 +99,7 @@ final class QWInkling2ChatTests: XCTestCase {
             + "<|message_model|>calc<|content_invoke_tool_json|>{\"name\":\"calc\",\"args\":{\"expr\":\"2+2\"}}<|end_message|>"
             + "<|message_model|><|content_text|>Done.<|end_message|><|content_model_end_sampling|>"
 
-        let parser = QWChatStreamParser(startsInReasoning: true, allowToolCalls: true, allowReasoningTags: true)
+        let parser = QWChatStreamParser(startsInReasoning: true, allowToolCalls: true, allowReasoningTags: true, allowInk2Markers: true)
         var deltas: [QWChatStreamParser.Delta] = []
         var idx = sample.startIndex
         while idx < sample.endIndex {
@@ -126,7 +126,7 @@ final class QWInkling2ChatTests: XCTestCase {
 
     func testStreamParserDropsIncompleteInk2ToolOnTruncation() throws {
         let partial = "<|message_model|><|content_text|>Wait<|end_message|><|message_model|>fn<|content_invoke_tool_json|>{\"name\":\"fn\",\"args\":"
-        let res = QWToolCallParser.parse(text: partial, tools: nil, startsInThinking: false, truncated: true)
+        let res = QWToolCallParser.parse(text: partial, tools: nil, startsInThinking: false, truncated: true, allowInk2Markers: true)
         XCTAssertEqual(res.content, "Wait")
         XCTAssertNil(res.toolCalls)
         XCTAssertEqual(res.finishReason, "length")

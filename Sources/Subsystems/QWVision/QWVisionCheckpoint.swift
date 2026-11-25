@@ -171,22 +171,46 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
     let prefix: String
     public let config: QWVisionConfig
     private var pack: QWQuant.Pack?
-    let packPrefix = "model.visual."
+    let packPrefix: String
+
+    private static let prefixCandidates = [
+        "model.vision_tower.",
+        "vision_tower.vision_model.",
+        "vision_model.",
+        "model.visual.",
+        "vision.",
+        "vision_tower.",
+    ]
 
     private static let externalMergerAliases: [(logical: String, candidates: [String])] = [
-        ("merger.linear_fc1.weight", ["linear_proj.0.weight", "multi_modal_projector.linear_1.weight", "mm_projector.0.weight"]),
-        ("merger.linear_fc1.bias", ["linear_proj.0.bias", "multi_modal_projector.linear_1.bias", "mm_projector.0.bias"]),
-        ("merger.linear_fc2.weight", ["linear_proj.2.weight", "multi_modal_projector.linear_2.weight", "mm_projector.2.weight"]),
-        ("merger.linear_fc2.bias", ["linear_proj.2.bias", "multi_modal_projector.linear_2.bias", "mm_projector.2.bias"]),
+        ("merger.norm.weight", ["model.multi_modal_projector.layer_norm.weight", "multi_modal_projector.layer_norm.weight", "multi_modal_projector.norm.weight", "projector.norm.weight"]),
+        ("merger.norm.bias", ["model.multi_modal_projector.layer_norm.bias", "multi_modal_projector.layer_norm.bias", "multi_modal_projector.norm.bias", "projector.norm.bias"]),
+        ("merger.linear_fc1.weight", ["model.multi_modal_projector.linear_1.weight", "linear_proj.0.weight", "multi_modal_projector.linear_1.weight", "multi_modal_projector.fc1.weight", "projector.fc1.weight", "mm_projector.0.weight"]),
+        ("merger.linear_fc1.bias", ["model.multi_modal_projector.linear_1.bias", "linear_proj.0.bias", "multi_modal_projector.linear_1.bias", "multi_modal_projector.fc1.bias", "projector.fc1.bias", "mm_projector.0.bias"]),
+        ("merger.linear_fc2.weight", ["model.multi_modal_projector.linear_2.weight", "linear_proj.2.weight", "multi_modal_projector.linear_2.weight", "multi_modal_projector.fc2.weight", "projector.fc2.weight", "mm_projector.2.weight"]),
+        ("merger.linear_fc2.bias", ["model.multi_modal_projector.linear_2.bias", "linear_proj.2.bias", "multi_modal_projector.linear_2.bias", "multi_modal_projector.fc2.bias", "projector.fc2.bias", "mm_projector.2.bias"]),
     ]
+
+    private static func detectPrefix(in keys: some Sequence<String>) -> String {
+        let all = Array(keys)
+        return prefixCandidates.first { pfx in all.contains(where: { $0.hasPrefix(pfx) }) } ?? "model.visual."
+    }
 
     public init(pack packPath: String) throws {
         self.dir = packPath
         self.prefix = "vision_tower."
         self.index = [:]
-        self.externalKeys = [:]
         let pk = try QWQuant.Pack(url: URL(fileURLWithPath: packPath))
         self.pack = pk
+        self.packPrefix = Self.detectPrefix(in: pk.tensorNames)
+        let packSet = Set(pk.tensorNames)
+        var ext: [String: (shard: String, fullKey: String)] = [:]
+        for alias in Self.externalMergerAliases where !packSet.contains(self.packPrefix + alias.logical) {
+            if let hit = alias.candidates.first(where: { packSet.contains($0) }) {
+                ext[alias.logical] = ("", hit)
+            }
+        }
+        self.externalKeys = ext
         self.config = QWVisionConfig(descriptor: pk.descriptor)
     }
 
@@ -201,10 +225,9 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
                   let wm = obj["weight_map"] as? [String: String] else {
                 throw QWVisionError.badLayout("malformed vision index json at \(indexPath)")
             }
-            let detected = wm.keys.contains(where: { $0.hasPrefix("model.visual.") })
-                ? "model.visual."
-                : (wm.keys.contains(where: { $0.hasPrefix("vision.") }) ? "vision." : "vision_tower.")
+            let detected = Self.detectPrefix(in: wm.keys)
             self.prefix = detected
+            self.packPrefix = detected
             var v: [String: String] = [:]
             for (k, shard) in wm where k.hasPrefix(detected) { v[String(k.dropFirst(detected.count))] = shard }
             for alias in Self.externalMergerAliases where v[alias.logical] == nil {
@@ -216,10 +239,9 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
             self.externalKeys = ext
         } else {
             let single = try QWSafetensors(path: dir + "/model.safetensors")
-            let detected = single.tensors.keys.contains(where: { $0.hasPrefix("model.visual.") })
-                ? "model.visual."
-                : (single.tensors.keys.contains(where: { $0.hasPrefix("vision.") }) ? "vision." : "vision_tower.")
+            let detected = Self.detectPrefix(in: single.tensors.keys)
             self.prefix = detected
+            self.packPrefix = detected
             var v: [String: String] = [:]
             for k in single.tensors.keys where k.hasPrefix(detected) { v[String(k.dropFirst(detected.count))] = "model.safetensors" }
             for alias in Self.externalMergerAliases where v[alias.logical] == nil {
@@ -269,6 +291,98 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
             return s.shape(resolved.fullKey)
         }
         let posShape = lookupShape("pos_embed.weight")
+        if lookupShape("patchifier.weight") != nil
+            || lookupShape("blocks.0.conv2d.weight") != nil
+            || lookupShape("layers.0.conv2d.weight") != nil
+            || lookupShape("layers.0.conv.spatial_conv.weight") != nil
+            || lookupShape("blocks.0.conv.spatial_conv.weight") != nil {
+            let pfShape = lookupShape("patchifier.weight") ?? lookupShape("patch_embed.proj.weight")
+            let dim = pfShape?.first ?? 1024
+            let chan = pfShape?.dropFirst().reduce(1, *) ?? 768
+            var temporal = 1
+            var patch = max(1, Int(Double(chan / 3).squareRoot().rounded()))
+            if 3 * patch * patch != chan && chan % 6 == 0 {
+                let p2 = max(1, Int(Double(chan / 6).squareRoot().rounded()))
+                if 6 * p2 * p2 == chan {
+                    temporal = 2
+                    patch = p2
+                }
+            }
+            let blockPrefix = (lookupShape("blocks.0.norm1.weight") != nil
+                || lookupShape("blocks.0.operator_norm.weight") != nil) ? "blocks" : "layers"
+            var depth = 0
+            var lTypes: [String] = []
+            var convK = 3
+            var kvH: Int?
+            var mlpInner = dim * 4
+            while lookupShape("\(blockPrefix).\(depth).norm1.weight") != nil
+                    || lookupShape("\(blockPrefix).\(depth).layer_norm1.weight") != nil
+                    || lookupShape("\(blockPrefix).\(depth).operator_norm.weight") != nil {
+                if let cw = lookupShape("\(blockPrefix).\(depth).conv.spatial_conv.weight")
+                    ?? lookupShape("\(blockPrefix).\(depth).conv2d.weight") {
+                    lTypes.append("conv")
+                    if let lastD = cw.last { convK = lastD }
+                } else {
+                    lTypes.append("full_attention")
+                    if kvH == nil, let kw = lookupShape("\(blockPrefix).\(depth).self_attn.k_proj.weight"), kw.count == 2 {
+                        let headsEst = max(1, dim / 64)
+                        kvH = max(1, kw[0] / max(1, dim / headsEst))
+                    }
+                }
+                if let fc1 = lookupShape("\(blockPrefix).\(depth).feed_forward.w1.weight")
+                    ?? lookupShape("\(blockPrefix).\(depth).mlp.fc1.weight")
+                    ?? lookupShape("\(blockPrefix).\(depth).mlp.linear_fc1.weight") {
+                    mlpInner = fc1[0]
+                }
+                depth += 1
+            }
+            let heads = (dim > 0 && dim % 64 == 0) ? (dim / 64) : max(1, dim / 16)
+            let fc1W = lookupShape("merger.linear_fc1.weight")
+            let merged = fc1W?.last ?? (dim * 4)
+            let fc1Mid = fc1W?.first ?? merged
+            let merge = dim > 0 ? max(1, Int(Double(merged / dim).squareRoot().rounded())) : 2
+            let outDim = lookupShape("merger.linear_fc2.weight")?.first ?? dim
+            return QWVisionConfig(
+                dim: dim, heads: heads, headDim: dim / max(1, heads), depth: max(1, depth),
+                mlpInner: mlpInner, patch: patch, temporal: temporal, merge: merge,
+                numPosEmbeds: 0, outDim: outDim, imageTokenId: QWVisionConfig.qwen3VLReference.imageTokenId,
+                videoTokenId: QWVisionConfig.qwen3VLReference.videoTokenId, ropeTheta: 10_000.0,
+                eps: 1e-5, projectorNormEps: 1e-6, architecture: .lfm3VL, projectionHiddenDim: fc1Mid,
+                projectorBias: lookupShape("merger.linear_fc1.bias") != nil,
+                mergerIntermediateDim: (fc1Mid != merged ? fc1Mid : nil),
+                kvHeads: kvH ?? heads, visionLayerTypes: lTypes, convKernelSize: convK
+            )
+        }
+        if index["embeddings.patch_embedding.weight"] != nil
+            && (lookupShape("encoder.layers.0.layer_norm1.weight") != nil
+                || lookupShape("layers.0.layer_norm1.weight") != nil)
+            && lookupShape("embeddings.class_embedding") == nil {
+            let peShape = lookupShape("embeddings.patch_embedding.weight")
+            let posS = lookupShape("embeddings.position_embedding.weight") ?? lookupShape("embeddings.position_embedding")
+            let dim = peShape?.first ?? 1024
+            let chan = peShape?.dropFirst().reduce(1, *) ?? 768
+            let patch = max(1, Int(Double(chan / 3).squareRoot().rounded()))
+            let numPos = posS?.first ?? 256
+            let lPfx = lookupShape("encoder.layers.0.layer_norm1.weight") != nil ? "encoder.layers" : "layers"
+            var depth = 0
+            while lookupShape("\(lPfx).\(depth).layer_norm1.weight") != nil { depth += 1 }
+            let mlpInner = lookupShape("\(lPfx).0.mlp.fc1.weight")?.first ?? (dim * 4)
+            let heads = (dim > 0 && dim % 64 == 0) ? (dim / 64) : max(1, dim / 16)
+            let fc1W = lookupShape("merger.linear_fc1.weight")
+            let merged = fc1W?.last ?? dim
+            let fc1Mid = fc1W?.first ?? merged
+            let merge = dim > 0 ? max(1, Int(Double(merged / dim).squareRoot().rounded())) : 1
+            let outDim = lookupShape("merger.linear_fc2.weight")?.first ?? merged
+            return QWVisionConfig(
+                dim: dim, heads: heads, headDim: dim / max(1, heads), depth: max(1, depth),
+                mlpInner: mlpInner, patch: patch, temporal: 1, merge: merge,
+                numPosEmbeds: numPos, outDim: outDim, imageTokenId: QWVisionConfig.qwen3VLReference.imageTokenId,
+                videoTokenId: QWVisionConfig.qwen3VLReference.videoTokenId, ropeTheta: 10_000.0,
+                eps: 1e-6, architecture: .siglip2, projectionHiddenDim: fc1Mid,
+                projectorBias: lookupShape("merger.linear_fc1.bias") != nil,
+                mergerIntermediateDim: (fc1Mid != merged ? fc1Mid : nil)
+            )
+        }
         if index["embeddings.patch_embedding.weight"] != nil {
             let inkPos = lookupShape("embeddings.position_embedding")
             let inkPE = lookupShape("embeddings.patch_embedding.weight")
@@ -358,7 +472,13 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
 
     public func f32(_ key: String, want: [Int]? = nil) throws -> [Float] {
         if let p = lock.withLock({ pack }) {
-            let f = try p.rawBf16(packPrefix + key)
+            let resolvedKey: String
+            if let ext = externalKeys[key], (try? p.entry(packPrefix + key)) == nil {
+                resolvedKey = ext.fullKey
+            } else {
+                resolvedKey = packPrefix + key
+            }
+            let f = try p.rawBf16(resolvedKey)
             if let w = want, f.count != w.reduce(1, *) {
                 throw QWVisionError.badLayout("\(key): pack \(f.count) ≠ \(w)")
             }
@@ -376,7 +496,11 @@ public final class QWVisionCheckpoint: @unchecked Sendable {
     }
 
     public func shape(_ key: String) -> [Int]? {
-        if let p = lock.withLock({ pack }) { return try? p.entry(packPrefix + key).shape }
+        if let p = lock.withLock({ pack }) {
+            if let direct = try? p.entry(packPrefix + key) { return direct.shape }
+            if let ext = externalKeys[key], let aliasEntry = try? p.entry(ext.fullKey) { return aliasEntry.shape }
+            return nil
+        }
         if let file = index[key] {
             return try? lock.withLock { try shardLocked(file) }.shape(prefix + key)
         }

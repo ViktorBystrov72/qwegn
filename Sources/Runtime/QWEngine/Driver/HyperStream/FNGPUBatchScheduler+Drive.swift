@@ -35,10 +35,23 @@ extension FNGPUBatchScheduler {
                     for s in allActiveSlots { coordinator.job(at: s)?.inBatchMode = true }
                 }
 
+                let hadDecodingPeer = allActiveSlots.contains { slotIdx in
+                    guard !newlyAdmitted.contains(slotIdx), let existing = coordinator.job(at: slotIdx) else {
+                        return false
+                    }
+                    return !existing.isPrefilling
+                }
                 for s in newlyAdmitted {
                     guard let job = coordinator.job(at: s) else { continue }
+                    let hasDecodeNow = hadDecodingPeer || coordinator.activeSlotIndices().contains { idx in
+                        idx != s && coordinator.job(at: idx)?.isPrefilling == false && !newlyAdmitted.contains(idx)
+                    }
                     do {
-                        try prefillAdmittedJob(slot: s, job: job, sCap4: sCap4)
+                        if hasDecodeNow && job.inBatchMode && QWInterleavedPrefillGate.isEnabled {
+                            try beginInterleavedPrefillJob(slot: s, job: job, sCap4: sCap4)
+                        } else {
+                            try prefillAdmittedJob(slot: s, job: job, sCap4: sCap4)
+                        }
                     } catch {
                         finishJob(slot: s, job: job, error: error)
                     }
@@ -71,12 +84,26 @@ extension FNGPUBatchScheduler {
 
             // Single-stream fast path on Slot 0 (full capacity + speculative decoding).
             if activeSlots.count == 1 && activeSlots[0] == 0,
-               let job = coordinator.job(at: 0), !job.inBatchMode {
+               let job = coordinator.job(at: 0), !job.inBatchMode, !job.isPrefilling {
                 stepSingleStreamJob(job)
                 continue
             }
 
-            stepMultiSlotBatch(activeSlots: activeSlots, sCap4: sCap4)
+            let decodingSlots = activeSlots.filter { coordinator.job(at: $0)?.isPrefilling == false }
+            if !decodingSlots.isEmpty {
+                stepMultiSlotBatch(activeSlots: decodingSlots, sCap4: sCap4)
+            }
+            if let pfSlot = activeSlots.first(where: { coordinator.job(at: $0)?.isPrefilling == true }),
+               let pfJob = coordinator.job(at: pfSlot) {
+                let hasDecodingNow = coordinator.activeSlotIndices().contains {
+                    coordinator.job(at: $0)?.isPrefilling == false
+                }
+                do {
+                    try stepInterleavedPrefillSlice(slot: pfSlot, job: pfJob, hasDecodingPeers: hasDecodingNow)
+                } catch {
+                    finishJob(slot: pfSlot, job: pfJob, error: error)
+                }
+            }
         }
     }
 
@@ -283,6 +310,67 @@ extension FNGPUBatchScheduler {
             job.decodeStart = Date()
             if !done && job.generatedTokens.count >= effectiveMaxNew {
                 finishJob(slot: syncSlot, job: job)
+            }
+        }
+    }
+
+    private func beginInterleavedPrefillJob(slot s: Int, job: FNBatchJob, sCap4: Int) throws {
+        activateSlot(s, totalSlots: Self.maxSlots)
+        job.session.useSpec = false
+        let activeCap = min(sCap4, engine.activeCapacity)
+        guard job.prompt.count < activeCap else {
+            throw FNGPUError.contextDoesNotFit(requested: job.prompt.count + 1,
+                                                maxFitting: max(0, activeCap - 1))
+        }
+        let effectiveMaxNew = QWBatchPartitionSelection.clampedMaxNew(
+            requested: job.maxNew, promptCount: job.prompt.count, activeCapacity: activeCap
+        )
+        if !engine.hasPrefixCacheTier {
+            try engine.preparePrefill(forTokenCount: job.prompt.count)
+        }
+        engine.beginSession(&job.session, maxNew: effectiveMaxNew)
+        syncSlotFromEngine(s)
+        job.effectiveMaxNew = effectiveMaxNew
+        job.prefillCursor = 0
+        job.prefillWallAcc = 0
+        job.isPrefilling = true
+    }
+
+    private func stepInterleavedPrefillSlice(slot s: Int, job: FNBatchJob, hasDecodingPeers: Bool) throws {
+        activateSlot(s, totalSlots: Self.maxSlots)
+        job.session.plePrecomputed = false
+        let fullChunk = engine.dynamicPrefillChunkRows(forTotalTokens: job.prompt.count)
+        let configuredSlice = QWInterleavedPrefillGate.sliceTokens
+        let stepRows = hasDecodingPeers && configuredSlice > 0 ? min(configuredSlice, fullChunk) : fullChunk
+        let start = job.prefillCursor
+        let end = min(start + max(1, stepRows), job.prompt.count)
+        let isFirst = (start == 0)
+        let isLast = (end == job.prompt.count)
+        let t0 = Date()
+        let firstTok = try engine.encodePrefillChunk(&job.session, chunk: start..<end, runsHead: isLast)
+        job.prefillWallAcc += Date().timeIntervalSince(t0)
+        if isFirst {
+            onCacheEvaluated?(job.session)
+            if s == 0 { onSlot0CacheEvaluated?(job.session) }
+        }
+        syncSlotFromEngine(s)
+        slotStates[s].highWaterPos = engine.highWaterPos
+        job.prefillCursor = isLast ? end : max(end, min(max(0, job.prompt.count - 1), job.session.prefillPos))
+        guard isLast else { return }
+
+        job.isPrefilling = false
+        job.prefillSeconds = job.prefillWallAcc
+        job.position = job.prompt.count
+        if job.effectiveMaxNew <= 0 {
+            engine.flushPendingPrefixCache(&job.session)
+            job.decodeStart = Date()
+            finishJob(slot: s, job: job)
+        } else {
+            let done = emitAndCheckDone(token: firstTok, slot: s, job: job)
+            engine.flushPendingPrefixCache(&job.session)
+            job.decodeStart = Date()
+            if !done && job.generatedTokens.count >= job.effectiveMaxNew {
+                finishJob(slot: s, job: job)
             }
         }
     }

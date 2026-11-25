@@ -58,6 +58,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
     public var mtpEntropyThreshold: Double
     public var dflashDraftPackPath: String
     public var dflashSelectorTopK: Int
+    public var dsparkConfidenceSchedule: Bool
     public var gdnPrefill: String
     public var evictPrefillScratch: String
     public var prefillChunkSize: Int
@@ -85,6 +86,11 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
 
     // MARK: - Software Updates
     public var updateCheckSchedule: String // "onLaunchAndDaily", "daily", "onLaunch", "manual"
+
+    // MARK: - Decision Sidecar (Dual-Slot ADR-001)
+    public var decisionModelPackPath: String = ""
+    public var decisionComputeUnit: String = "auto"
+    public var decisionLoadVision: Bool = true
 
     public struct DiscoveredModel: Identifiable, Hashable, Codable, Sendable {
         public var id: String { name }
@@ -157,6 +163,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         mtpEntropyThreshold: Double = 0.7,
         dflashDraftPackPath: String = "",
         dflashSelectorTopK: Int = 16,
+        dsparkConfidenceSchedule: Bool = false,
         gdnPrefill: String = "chunked",
         evictPrefillScratch: String = "auto",
         prefillChunkSize: Int = QWPrefillLimits.chunkRows,
@@ -174,7 +181,10 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         logFileName: String = "qwg.log",
         logLevel: String = "info",
         coolingPolicy: String = "auto",
-        updateCheckSchedule: String = QWUpdateCheckSchedule.onLaunchAndDaily.rawValue
+        updateCheckSchedule: String = QWUpdateCheckSchedule.onLaunchAndDaily.rawValue,
+        decisionModelPackPath: String = "",
+        decisionComputeUnit: String = "auto",
+        decisionLoadVision: Bool = true
     ) {
         self.runAtStartup = runAtStartup
         self.autoStartServer = autoStartServer
@@ -221,6 +231,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.mtpEntropyThreshold = mtpEntropyThreshold
         self.dflashDraftPackPath = dflashDraftPackPath
         self.dflashSelectorTopK = dflashSelectorTopK
+        self.dsparkConfidenceSchedule = dsparkConfidenceSchedule
         self.gdnPrefill = gdnPrefill
         self.evictPrefillScratch = evictPrefillScratch
         self.prefillChunkSize = prefillChunkSize
@@ -239,6 +250,9 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.logLevel = logLevel
         self.coolingPolicy = QWCoolingPolicy(rawValue: coolingPolicy)?.rawValue ?? "auto"
         self.updateCheckSchedule = QWUpdateCheckSchedule.resolve(updateCheckSchedule).rawValue
+        self.decisionModelPackPath = decisionModelPackPath
+        self.decisionComputeUnit = decisionComputeUnit
+        self.decisionLoadVision = decisionLoadVision
     }
 
     public init(from decoder: Decoder) throws {
@@ -294,6 +308,7 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.mtpEntropyThreshold = try decodeDouble(forKey: .mtpEntropyThreshold, defaultVal: 0.7)
         self.dflashDraftPackPath = try c.decodeIfPresent(String.self, forKey: .dflashDraftPackPath) ?? ""
         self.dflashSelectorTopK = try c.decodeIfPresent(Int.self, forKey: .dflashSelectorTopK) ?? 16
+        self.dsparkConfidenceSchedule = try c.decodeIfPresent(Bool.self, forKey: .dsparkConfidenceSchedule) ?? false
         self.gdnPrefill = try c.decodeIfPresent(String.self, forKey: .gdnPrefill) ?? "chunked"
         self.evictPrefillScratch = try c.decodeIfPresent(String.self, forKey: .evictPrefillScratch) ?? "auto"
         self.prefillChunkSize = try c.decodeIfPresent(Int.self, forKey: .prefillChunkSize) ?? QWPrefillLimits.chunkRows
@@ -316,6 +331,9 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
         self.coolingPolicy = QWCoolingPolicy(rawValue: rawCooling)?.rawValue ?? "auto"
         let rawSchedule = try c.decodeIfPresent(String.self, forKey: .updateCheckSchedule)
         self.updateCheckSchedule = QWUpdateCheckSchedule.resolve(rawSchedule).rawValue
+        self.decisionModelPackPath = try c.decodeIfPresent(String.self, forKey: .decisionModelPackPath) ?? ""
+        self.decisionComputeUnit = try c.decodeIfPresent(String.self, forKey: .decisionComputeUnit) ?? "auto"
+        self.decisionLoadVision = try c.decodeIfPresent(Bool.self, forKey: .decisionLoadVision) ?? true
     }
 
     /// Full expanded path to the log file
@@ -360,7 +378,8 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
                 adaptiveDepth: mtpAdaptiveDepth,
                 entropyThreshold: mtpEntropyThreshold,
                 dflashDraftPackPath: dflashDraftPackPath.isEmpty ? nil : dflashDraftPackPath,
-                dflashSelectorTopK: dflashSelectorTopK
+                dflashSelectorTopK: dflashSelectorTopK,
+                dsparkConfidenceSchedule: dsparkConfidenceSchedule
             )
         }
         set {
@@ -375,6 +394,9 @@ public struct QWServerSettings: Codable, Sendable, Equatable {
             mtpEntropyThreshold = newValue.entropyThreshold
             dflashDraftPackPath = newValue.dflashDraftPackPath ?? ""
             dflashSelectorTopK = newValue.dflashSelectorTopK
+            if let ds = newValue.dsparkConfidenceSchedule {
+                dsparkConfidenceSchedule = ds
+            }
         }
     }
 

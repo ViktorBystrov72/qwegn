@@ -45,6 +45,7 @@ if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
     --filter QWCoreTests \
     --filter QWQuantTests \
     --filter QWTokenTests \
+    --filter QWDecisionTests \
     --filter QWCliTests \
     --filter QWServerTests \
     --filter QWMenuBarTests \

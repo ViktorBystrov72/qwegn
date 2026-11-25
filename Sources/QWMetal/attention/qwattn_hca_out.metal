@@ -14,6 +14,10 @@
 using namespace metal;
 using namespace mlx::steel;
 
+#if !defined(__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__) || (__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ < 260200)
+#error "Metal 4 NAX kernels require -mmacosx-version-min=26.2 (SDK MPPTensorOpsAvailability)"
+#endif
+
 struct HCAVhaInvRopeParams {
     uint T;
     uint pos0;
@@ -131,6 +135,106 @@ kernel void qwg_hca_vha_invrope(
     }
 }
 
+METAL_FUNC void qw_hca_nax_fwht32_pair(thread float (&e)[4], thread float (&f)[4], uint lane) {
+    float t0 = e[0] + e[1], t1 = e[0] - e[1], t2 = e[2] + e[3], t3 = e[2] - e[3];
+    e[0] = t0 + t2; e[1] = t1 + t3; e[2] = t0 - t2; e[3] = t1 - t3;
+    float u0 = f[0] + f[1], u1 = f[0] - f[1], u2 = f[2] + f[3], u3 = f[2] - f[3];
+    f[0] = u0 + u2; f[1] = u1 + u3; f[2] = u0 - u2; f[3] = u1 - u3;
+    for (short k = 0; k < 4; ++k) { const float s = e[k] + f[k]; f[k] = e[k] - f[k]; e[k] = s; }
+    const float s4 = ((lane & 1u) != 0u) ? -1.0f : 1.0f;
+    const float s8 = ((lane & 8u) != 0u) ? -1.0f : 1.0f;
+    for (short k = 0; k < 4; ++k) {
+        e[k] = s4 * e[k] + simd_shuffle_xor(e[k], ushort(1));
+        f[k] = s4 * f[k] + simd_shuffle_xor(f[k], ushort(1));
+    }
+    for (short k = 0; k < 4; ++k) {
+        e[k] = s8 * e[k] + simd_shuffle_xor(e[k], ushort(8));
+        f[k] = s8 * f[k] + simd_shuffle_xor(f[k], ushort(8));
+    }
+    constexpr float invSqrt32 = 0.1767766952966369f;
+    for (short k = 0; k < 4; ++k) { e[k] *= invSqrt32; f[k] *= invSqrt32; }
+}
+
+// 5b. Apple10+ NAX VHA head mixing + GPT-J Inverse YaRN RoPE + optional H_32 (BLOCK=128).
+// Grid: ((headDim + 127) / 128, T, 1), Threadgroup: (256, 1, 1).
+kernel void qwg_hca_vha_invrope_nax(
+    device const half*         attIn   [[buffer(0)]],
+    device const half*         vhaMix  [[buffer(1)]],
+    device const float*        invFreq [[buffer(2)]],
+    device half*               zOut    [[buffer(3)]],
+    constant HCAVhaInvRopeParams& p    [[buffer(4)]],
+    uint2                      tg      [[threadgroup_position_in_grid]],
+    uint                       sg      [[simdgroup_index_in_threadgroup]],
+    uint                       lane    [[thread_index_in_simdgroup]]
+) {
+    const uint dBase = tg.x * 128u, t = tg.y;
+    if (t >= p.T || dBase >= p.headDim) return;
+    const uint warpH0 = (sg >> 2u) * 32u, warpD0 = dBase + (sg & 3u) * 32u;
+    if (warpH0 >= p.qHeads || warpD0 >= p.headDim) return;
+
+    const short2 sc = BaseNAXFrag::get_coord();
+    const uint d0 = warpD0 + uint(sc.x), d1 = d0 + 16u, rowStride = p.qHeads * p.headDim;
+    device const half* yRow = attIn + (size_t)t * rowStride;
+    device half* zRow = zOut + (size_t)t * rowStride;
+    const bool hasVHA = (p.hasVHA & 1u) != 0u, skipFwht = (p.hasVHA & 0x10000u) != 0u;
+
+    NAXTile<float, 2, 2> Dtile;
+    Dtile.clear();
+    if (hasVHA) {
+        const int sgpH = min(32, int(p.qHeads) - int(warpH0));
+        const int sgpD = min(32, int(p.headDim) - int(warpD0));
+        const bool full = (sgpH == 32 && sgpD == 32);
+        for (uint k0 = 0u; k0 < p.qHeads; k0 += 32u) {
+            NAXTile<half, 2, 2> Atile, Btile;
+            const uint kValid = min(32u, p.qHeads - k0);
+            if (full && kValid == 32u) {
+                Atile.load(vhaMix + warpH0 * p.qHeads + k0, int(p.qHeads));
+                Btile.load(yRow + (size_t)k0 * p.headDim + warpD0, int(p.headDim));
+            } else {
+                Atile.load_safe(vhaMix + warpH0 * p.qHeads + k0, int(p.qHeads), short2(short(kValid), short(sgpH)));
+                Btile.load_safe(yRow + (size_t)k0 * p.headDim + warpD0, int(p.headDim), short2(short(sgpD), short(kValid)));
+            }
+            tile_matmad_nax(Dtile, Atile, metal::false_type{}, Btile, metal::false_type{});
+        }
+    }
+
+    const float posF = float(p.pos0 + t);
+    const uint ropeEnd = p.nopeDim + p.ropeDim;
+    const bool r0a = (d0 >= p.nopeDim && d0 + 1u < ropeEnd), r0b = (d0 + 2u >= p.nopeDim && d0 + 3u < ropeEnd);
+    const bool r1a = (d1 >= p.nopeDim && d1 + 1u < ropeEnd), r1b = (d1 + 2u >= p.nopeDim && d1 + 3u < ropeEnd);
+    float c0a = 1.0f, s0a = 0.0f, c0b = 1.0f, s0b = 0.0f, c1a = 1.0f, s1a = 0.0f, c1b = 1.0f, s1b = 0.0f;
+    if (r0a) { const float a = posF * invFreq[(d0 - p.nopeDim) >> 1u]; c0a = cos(a) * p.invMscale; s0a = sin(a) * p.invMscale; }
+    if (r0b) { const float a = posF * invFreq[(d0 + 2u - p.nopeDim) >> 1u]; c0b = cos(a) * p.invMscale; s0b = sin(a) * p.invMscale; }
+    if (r1a) { const float a = posF * invFreq[(d1 - p.nopeDim) >> 1u]; c1a = cos(a) * p.invMscale; s1a = sin(a) * p.invMscale; }
+    if (r1b) { const float a = posF * invFreq[(d1 + 2u - p.nopeDim) >> 1u]; c1b = cos(a) * p.invMscale; s1b = sin(a) * p.invMscale; }
+
+    STEEL_PRAGMA_UNROLL
+    for (short m = 0; m < 2; ++m) {
+        const thread auto& df0 = Dtile.frag_at(m, 0);
+        const thread auto& df1 = Dtile.frag_at(m, 1);
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 2; ++i) {
+            const uint h = warpH0 + uint(m * 16 + int(sc.y) + i * 8);
+            const bool validH = (h < p.qHeads);
+            float e[4], f[4];
+            if (hasVHA) {
+                for (short k = 0; k < 4; ++k) { e[k] = df0[i * 4 + k]; f[k] = df1[i * 4 + k]; }
+            } else {
+                const half4 h0 = (validH && d0 + 3u < p.headDim) ? *(device const half4*)(yRow + h * p.headDim + d0) : half4(0.0h);
+                const half4 h1 = (validH && d1 + 3u < p.headDim) ? *(device const half4*)(yRow + h * p.headDim + d1) : half4(0.0h);
+                for (short k = 0; k < 4; ++k) { e[k] = float(h0[k]); f[k] = float(h1[k]); }
+            }
+            if (r0a) { const float a = e[0], b = e[1]; e[0] = a * c0a + b * s0a; e[1] = b * c0a - a * s0a; }
+            if (r0b) { const float a = e[2], b = e[3]; e[2] = a * c0b + b * s0b; e[3] = b * c0b - a * s0b; }
+            if (r1a) { const float a = f[0], b = f[1]; f[0] = a * c1a + b * s1a; f[1] = b * c1a - a * s1a; }
+            if (r1b) { const float a = f[2], b = f[3]; f[2] = a * c1b + b * s1b; f[3] = b * c1b - a * s1b; }
+            if (!skipFwht) qw_hca_nax_fwht32_pair(e, f, lane);
+            if (validH && d0 + 3u < p.headDim) *(device half4*)(zRow + h * p.headDim + d0) = half4(half(e[0]), half(e[1]), half(e[2]), half(e[3]));
+            if (validH && d1 + 3u < p.headDim) *(device half4*)(zRow + h * p.headDim + d1) = half4(half(f[0]), half(f[1]), half(f[2]), half(f[3]));
+        }
+    }
+}
+
 template <bool SUB2 = false>
 METAL_FUNC void qw_hca_unpack_wo_a_32(device const char* woABlocks,
                                       uint row, uint col0,
@@ -169,34 +273,18 @@ METAL_FUNC void qw_hca_unpack_wo_a_reg32(device const char* woABlocks,
     qw_mla_unpack_slice32_reg<SUB2>(woABlocks, row, col0, mp, tgLut, wLo, wHi);
 }
 
-METAL_FUNC void qw_hca_accum32_row(thread float& acc,
-                                   thread const float4 (&wLo)[4],
-                                   thread const float4 (&wHi)[4],
-                                   threadgroup const half* xPtr) {
+METAL_FUNC void qw_hca_accum32_row(thread float& acc, thread const float4 (&wLo)[4], thread const float4 (&wHi)[4], threadgroup const half* xPtr) {
     #pragma unroll
     for (uint w = 0u; w < 4u; ++w) {
         const float4 x0 = float4(*(threadgroup const half4*)(xPtr + w * 8u));
         const float4 x1 = float4(*(threadgroup const half4*)(xPtr + w * 8u + 4u));
-        acc = precise::fma(wLo[w].x, x0.x, acc);
-        acc = precise::fma(wLo[w].y, x0.y, acc);
-        acc = precise::fma(wLo[w].z, x0.z, acc);
-        acc = precise::fma(wLo[w].w, x0.w, acc);
-        acc = precise::fma(wHi[w].x, x1.x, acc);
-        acc = precise::fma(wHi[w].y, x1.y, acc);
-        acc = precise::fma(wHi[w].z, x1.z, acc);
-        acc = precise::fma(wHi[w].w, x1.w, acc);
+        for (short c = 0; c < 4; ++c) { acc = precise::fma(wLo[w][c], x0[c], acc); acc = precise::fma(wHi[w][c], x1[c], acc); }
     }
 }
 
-METAL_FUNC void qw_hca_reduce_t(const thread float (&acc)[4],
-                                threadgroup float* shOutRow,
-                                uint sg,
-                                uint lane) {
+METAL_FUNC void qw_hca_reduce_t(const thread float (&acc)[4], threadgroup float* shOutRow, uint sg, uint lane) {
     #pragma unroll
-    for (uint r = 0u; r < 4u; ++r) {
-        const float sum = simd_sum(acc[r]);
-        if (lane == 0u) shOutRow[sg * 4u + r] = sum;
-    }
+    for (uint r = 0u; r < 4u; ++r) { const float sum = simd_sum(acc[r]); if (lane == 0u) shOutRow[sg * 4u + r] = sum; }
 }
 
 // 6a. 3D-batched grouped wo_a GEMV + sigmoid(o_gate) + H_32 exit (decode/verify T <= 15).
@@ -274,23 +362,15 @@ kernel void qwg_hca_grouped_wo_a_gemv(
     device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
     device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
     constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {
-    threadgroup HCAWoAGemvTg st;
-    qw_hca_grouped_wo_a_gemv_body<false>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
-}
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
+) { threadgroup HCAWoAGemvTg st; qw_hca_grouped_wo_a_gemv_body<false>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane); }
 
 kernel void qwg_hca_grouped_wo_a_gemv_sub2(
     device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
     device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
     constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {
-    threadgroup HCAWoAGemvTg st;
-    qw_hca_grouped_wo_a_gemv_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
-}
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
+) { threadgroup HCAWoAGemvTg st; qw_hca_grouped_wo_a_gemv_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane); }
 
 // 6b. 3D-batched grouped wo_a 8x8 MMA + sigmoid(o_gate) + H_32 exit (prefill T >= 16).
 // Grid: (oGroups, (T + 31) / 32, oLoraRank / 128), Threadgroup: (128, 1, 1).
@@ -393,25 +473,15 @@ kernel void qwg_hca_grouped_wo_a_mma(
     device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
     device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
     constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {
-    threadgroup HCAWoATgStage st;
-    threadgroup ShvqMlaTgLut tgLut;
-    qw_hca_grouped_wo_a_mma_body<false>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tgLut, tg, tid, sg, lane);
-}
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
+) { threadgroup HCAWoATgStage st; threadgroup ShvqMlaTgLut tgLut; qw_hca_grouped_wo_a_mma_body<false>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tgLut, tg, tid, sg, lane); }
 
 kernel void qwg_hca_grouped_wo_a_mma_sub2(
     device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
     device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
     constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {
-    threadgroup HCAWoATgStage st;
-    threadgroup ShvqMlaTgLut tgLut;
-    qw_hca_grouped_wo_a_mma_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tgLut, tg, tid, sg, lane);
-}
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
+) { threadgroup HCAWoATgStage st; threadgroup ShvqMlaTgLut tgLut; qw_hca_grouped_wo_a_mma_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tgLut, tg, tid, sg, lane); }
 
 // 6c. Multi-row grouped wo_a GEMV (2 <= T <= 8 verify) reusing woABlocks across all T tokens.
 // Grid: (oLoraRank / 32, oGroups, 1), Threadgroup: (256, 1, 1).
@@ -446,14 +516,8 @@ METAL_FUNC void qw_hca_grouped_wo_a_gemv_mr_body(
     }
 
     const uint baseRow = g * p.oLoraRank + cBase + sg * 4u;
-    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc3[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc5[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc6[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc7[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[8][4];
+    for (uint t = 0u; t < 8u; ++t) for (uint r = 0u; r < 4u; ++r) acc[t][r] = 0.0f;
 
     for (uint kBase = 0u; kBase < p.groupIn; kBase += 1024u) {
         const uint chunkCols = min(1024u, p.groupIn - kBase);
@@ -474,27 +538,13 @@ METAL_FUNC void qw_hca_grouped_wo_a_gemv_mr_body(
             for (uint r = 0u; r < 4u; ++r) {
                 float4 wLo[4], wHi[4];
                 qw_hca_unpack_wo_a_reg32<SUB2>(woABlocks, baseRow + r, col0, p, st.lut, wLo, wHi);
-                qw_hca_accum32_row(acc0[r], wLo, wHi, st.shX[0] + colOff);
-                if (rowsT > 1u) qw_hca_accum32_row(acc1[r], wLo, wHi, st.shX[1] + colOff);
-                if (rowsT > 2u) qw_hca_accum32_row(acc2[r], wLo, wHi, st.shX[2] + colOff);
-                if (rowsT > 3u) qw_hca_accum32_row(acc3[r], wLo, wHi, st.shX[3] + colOff);
-                if (rowsT > 4u) qw_hca_accum32_row(acc4[r], wLo, wHi, st.shX[4] + colOff);
-                if (rowsT > 5u) qw_hca_accum32_row(acc5[r], wLo, wHi, st.shX[5] + colOff);
-                if (rowsT > 6u) qw_hca_accum32_row(acc6[r], wLo, wHi, st.shX[6] + colOff);
-                if (rowsT > 7u) qw_hca_accum32_row(acc7[r], wLo, wHi, st.shX[7] + colOff);
+                for (uint t = 0u; t < rowsT; ++t) qw_hca_accum32_row(acc[t][r], wLo, wHi, st.shX[t] + colOff);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    qw_hca_reduce_t(acc0, st.shOut[0], sg, lane);
-    if (rowsT > 1u) qw_hca_reduce_t(acc1, st.shOut[1], sg, lane);
-    if (rowsT > 2u) qw_hca_reduce_t(acc2, st.shOut[2], sg, lane);
-    if (rowsT > 3u) qw_hca_reduce_t(acc3, st.shOut[3], sg, lane);
-    if (rowsT > 4u) qw_hca_reduce_t(acc4, st.shOut[4], sg, lane);
-    if (rowsT > 5u) qw_hca_reduce_t(acc5, st.shOut[5], sg, lane);
-    if (rowsT > 6u) qw_hca_reduce_t(acc6, st.shOut[6], sg, lane);
-    if (rowsT > 7u) qw_hca_reduce_t(acc7, st.shOut[7], sg, lane);
+    for (uint t = 0u; t < rowsT; ++t) qw_hca_reduce_t(acc[t], st.shOut[t], sg, lane);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (sg < rowsT) {
@@ -527,264 +577,4 @@ kernel void qwg_hca_grouped_wo_a_gemv_mr_sub2(
 ) {
     threadgroup HCAWoAGemvMRTg st;
     qw_hca_grouped_wo_a_gemv_mr_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
-}
-
-// 6d. Apple10+ NAX 3D-batched grouped wo_a + sigmoid(o_gate) + H_32 exit (T >= 16).
-#define HCA_WOA_NAX_OS 32u
-
-template <int MODE, bool SUB2 = false>
-METAL_FUNC void qw_hca_wo_a_nax_run(
-    device const half*          zIn,
-    device const char*          woABlocks,
-    device const half*          qUpGate,
-    device half*                zGatedOut,
-    constant HCAGroupedWoAParams& p,
-    threadgroup float*          osBase,
-    threadgroup const ShvqMlaTgLut& tgLut,
-    uint                        g,
-    uint                        warpT0,
-    uint                        warpC0,
-    int                         sgpSm,
-    uint                        sg,
-    uint                        lane
-) {
-    NAXTile<float, 2, 2> Dtile;
-    Dtile.clear();
-
-    const short2 sc = BaseNAXFrag::get_coord();
-    const uint gShift = ctz(p.group);
-    const uint gMask = p.group - 1u;
-    const uint nGroups = p.groupIn >> gShift;
-
-    size_t rowBytes = 0;
-    uint groupBytes = 0;
-    uint sliceBytes = 0;
-    if constexpr (MODE == 3) {
-        rowBytes = (size_t)p.groupIn * sizeof(half);
-    } else if constexpr (MODE == 1) {
-        rowBytes = (size_t)(p.groupIn >> 5u) * sizeof(Block_HQ4_G32);
-    } else if constexpr (MODE == 2) {
-        groupBytes = qwg_shvq_group_bytes(int(p.bits), int(p.group));
-        sliceBytes = qwg_shvq_slice_bytes(int(p.bits));
-        rowBytes = (size_t)nGroups * groupBytes;
-    } else {
-        groupBytes = 4u + ((p.group * p.bits) >> 3u);
-        rowBytes = (size_t)nGroups * groupBytes;
-    }
-
-    device const char* wRowPtr[4];
-    STEEL_PRAGMA_UNROLL
-    for (short r = 0; r < 2; ++r) {
-        STEEL_PRAGMA_UNROLL
-        for (short i = 0; i < 2; ++i) {
-            const uint wRow = g * p.oLoraRank + warpC0 + uint(r * 16 + int(sc.y) + i * 8);
-            wRowPtr[r * 2 + i] = woABlocks + (size_t)wRow * rowBytes;
-        }
-    }
-
-    const int ldA = int(p.oGroups * p.groupIn);
-    device const half* aBase = zIn + ((size_t)warpT0 * p.oGroups + g) * p.groupIn;
-    const ushort wSub = ushort(sc.x >> 3);
-    const ushort wShift = ushort((sc.x & 4) << 1);
-    const bool alignedM = (sgpSm == 32);
-
-    STEEL_PRAGMA_NO_UNROLL
-    for (uint k0 = 0u; k0 < p.groupIn; k0 += 32u) {
-        NAXTile<half, 2, 2> Atile;
-        NAXTile<half, 2, 2> Btile;
-
-        if (alignedM) {
-            Atile.load(aBase + k0, ldA);
-        } else {
-            Atile.load_safe(aBase + k0, ldA, short2(32, short(sgpSm)));
-        }
-
-        const uint gIdx = k0 >> gShift;
-        const uint inGroup = k0 & gMask;
-        const uint payOff = (MODE == 2) ? ((inGroup >> 5u) * sliceBytes) : 0u;
-        const uint q0 = uint(sc.x) >> 2u;
-        const uint q1 = (uint(sc.x) + 16u) >> 2u;
-
-        STEEL_PRAGMA_UNROLL
-        for (short r = 0; r < 2; ++r) {
-            thread auto& f0 = Btile.frag_at(r, 0);
-            thread auto& f1 = Btile.frag_at(r, 1);
-            STEEL_PRAGMA_UNROLL
-            for (short i = 0; i < 2; ++i) {
-                device const char* rPtr = wRowPtr[r * 2 + i];
-                half4 vLo, vHi;
-                if constexpr (MODE == 3) {
-                    device const half* hPtr = (device const half*)rPtr + k0 + uint(sc.x);
-                    vLo = *(device const half4*)hPtr;
-                    vHi = *(device const half4*)(hPtr + 16u);
-                } else if constexpr (MODE == 1) {
-                    const device Block_HQ4_G32& blk = ((const device Block_HQ4_G32*)rPtr)[k0 >> 5u];
-                    const half2 dm = *(const device half2*)(&blk);
-                    const half2 s2 = half2(dm.x), b2 = half2(dm.y);
-                    const ushort2 raw0 = as_type<ushort2>(blk.qs[wSub]) >> wShift;
-                    const ushort2 raw1 = as_type<ushort2>(blk.qs[2u + wSub]) >> wShift;
-                    const half2 w01 = fma(as_type<half2>((raw0 & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-                    const half2 w23 = fma(as_type<half2>(((raw0 >> 4u) & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-                    const half2 w45 = fma(as_type<half2>((raw1 & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-                    const half2 w67 = fma(as_type<half2>(((raw1 >> 4u) & ushort2(0x000Fu)) | ushort2(0x6400u)), s2, b2);
-                    vLo = half4(w01.x, w01.y, w23.x, w23.y);
-                    vHi = half4(w45.x, w45.y, w67.x, w67.y);
-                } else if constexpr (MODE == 2) {
-                    device const char* gp = rPtr + (size_t)gIdx * groupBytes;
-                    const half shvqScale = *(device const half*)gp;
-                    device const uchar* pay = (device const uchar*)(gp + 2u + payOff);
-                    vLo = qw_mla_shvq_quad4<SUB2>(pay, q0, p.bits, tgLut) * shvqScale;
-                    vHi = qw_mla_shvq_quad4<SUB2>(pay, q1, p.bits, tgLut) * shvqScale;
-                } else if constexpr (MODE == 8) {
-                    device const char* gp = rPtr + (size_t)gIdx * groupBytes;
-                    const half2 sb = *(device const half2*)gp;
-                    const half2 s2 = half2(sb.x), b2 = half2(sb.y), kBias = half2(-1024.0h);
-                    device const uchar* pay = (device const uchar*)(gp + 4u);
-                    const uint byteOff = inGroup + uint(sc.x);
-                    const ushort2 rLo = as_type<ushort2>(*(device const uint*)(pay + byteOff));
-                    const ushort2 rHi = as_type<ushort2>(*(device const uint*)(pay + byteOff + 16u));
-                    const half2 cLoXZ = as_type<half2>((rLo & ushort2(0x00FFu)) | ushort2(0x6400u)) + kBias;
-                    const half2 cLoYW = as_type<half2>((rLo >> 8u) | ushort2(0x6400u)) + kBias;
-                    const half2 cHiXZ = as_type<half2>((rHi & ushort2(0x00FFu)) | ushort2(0x6400u)) + kBias;
-                    const half2 cHiYW = as_type<half2>((rHi >> 8u) | ushort2(0x6400u)) + kBias;
-                    const half2 wLoXZ = fma(cLoXZ, s2, b2), wLoYW = fma(cLoYW, s2, b2);
-                    const half2 wHiXZ = fma(cHiXZ, s2, b2), wHiYW = fma(cHiYW, s2, b2);
-                    vLo = half4(wLoXZ.x, wLoYW.x, wLoXZ.y, wLoYW.y);
-                    vHi = half4(wHiXZ.x, wHiYW.x, wHiXZ.y, wHiYW.y);
-                } else if constexpr (MODE == 4) {
-                    device const char* gp = rPtr + (size_t)gIdx * groupBytes;
-                    const half2 sb = *(device const half2*)gp;
-                    const half2 s2 = half2(sb.x), b2 = half2(sb.y), kBias = half2(-1024.0h);
-                    device const uchar* pay = (device const uchar*)(gp + 4u);
-                    const uint byteOff = (inGroup + uint(sc.x)) >> 1u;
-                    const ushort2 raw = ushort2(*(device const ushort*)(pay + byteOff),
-                                                *(device const ushort*)(pay + byteOff + 8u));
-                    const half2 w0 = fma(as_type<half2>((raw & ushort2(0x000Fu)) | ushort2(0x6400u)) + kBias, s2, b2);
-                    const half2 w1 = fma(as_type<half2>(((raw >> 4u) & ushort2(0x000Fu)) | ushort2(0x6400u)) + kBias, s2, b2);
-                    const half2 w2 = fma(as_type<half2>(((raw >> 8u) & ushort2(0x000Fu)) | ushort2(0x6400u)) + kBias, s2, b2);
-                    const half2 w3 = fma(as_type<half2>((raw >> 12u) | ushort2(0x6400u)) + kBias, s2, b2);
-                    vLo = half4(w0.x, w1.x, w2.x, w3.x);
-                    vHi = half4(w0.y, w1.y, w2.y, w3.y);
-                } else {
-                    device const char* gp = rPtr + (size_t)gIdx * groupBytes;
-                    const float scAQ = float(*(device const half*)gp);
-                    const float biAQ = float(*(device const half*)(gp + 2u));
-                    device const uchar* pay = (device const uchar*)(gp + 4u);
-                    const int bitsI = int(p.bits);
-                    const int b0 = int(inGroup + uint(sc.x));
-                    vLo = half4(
-                        half(fma(float(qwg_aq_read_bits(pay, bitsI, b0 + 0)), scAQ, biAQ)),
-                        half(fma(float(qwg_aq_read_bits(pay, bitsI, b0 + 1)), scAQ, biAQ)),
-                        half(fma(float(qwg_aq_read_bits(pay, bitsI, b0 + 2)), scAQ, biAQ)),
-                        half(fma(float(qwg_aq_read_bits(pay, bitsI, b0 + 3)), scAQ, biAQ)));
-                    vHi = half4(
-                        half(fma(float(qwg_aq_read_bits(pay, bitsI, b0 + 16)), scAQ, biAQ)),
-                        half(fma(float(qwg_aq_read_bits(pay, bitsI, b0 + 17)), scAQ, biAQ)),
-                        half(fma(float(qwg_aq_read_bits(pay, bitsI, b0 + 18)), scAQ, biAQ)),
-                        half(fma(float(qwg_aq_read_bits(pay, bitsI, b0 + 19)), scAQ, biAQ)));
-                }
-                f0[i * 4 + 0] = vLo.x; f0[i * 4 + 1] = vLo.y; f0[i * 4 + 2] = vLo.z; f0[i * 4 + 3] = vLo.w;
-                f1[i * 4 + 0] = vHi.x; f1[i * 4 + 1] = vHi.y; f1[i * 4 + 2] = vHi.z; f1[i * 4 + 3] = vHi.w;
-            }
-        }
-
-        tile_matmad_nax(Dtile, Atile, metal::false_type{}, Btile, metal::true_type{});
-    }
-
-    if constexpr (MODE == 2) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    threadgroup float* osWarp = osBase + sg * (32u * HCA_WOA_NAX_OS);
-    Dtile.store<float, HCA_WOA_NAX_OS, 1>(osWarp);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
-    const bool skipFwht = (p.isIncumbent & 0x10000u) != 0u;
-    const uint validRows = uint(sgpSm);
-    const uint outStride = p.oGroups * p.oLoraRank;
-    const uint globalCol = g * p.oLoraRank + warpC0 + lane;
-    for (uint m = 0u; m < validRows; ++m) {
-        const float raw = osWarp[m * HCA_WOA_NAX_OS + lane];
-        const float gate = float(qUpGate[(size_t)(warpT0 + m) * p.qUpStride + p.oGateOffset + globalCol]);
-        const float gated = raw / (1.0f + exp(-gate));
-        zGatedOut[(size_t)(warpT0 + m) * outStride + globalCol] =
-            half(skipFwht ? gated : qwg_fwht32_lane_f32(gated, lane));
-    }
-}
-
-union HCAWoANaxTg {
-    ShvqMlaTgLut tgLut;
-    float os[4][32u * HCA_WOA_NAX_OS];
-};
-
-template <bool SUB2>
-METAL_FUNC void qw_hca_grouped_wo_a_nax_body(
-    device const half* zIn, device const char* woABlocks,
-    device const half* qUpGate, device half* zGatedOut,
-    constant HCAGroupedWoAParams& p, threadgroup HCAWoANaxTg& st,
-    uint3 tg, uint tid, uint sg, uint lane
-) {
-    const uint cBase = tg.x * 64u, tBase = tg.y * 64u, g = tg.z;
-    if (g >= p.oGroups || tBase >= p.T || cBase >= p.oLoraRank) return;
-
-    const uint inc = p.isIncumbent & 0xFFu;
-    if (inc == 2u && qw_mla_load_shvq_lut<SUB2>(st.tgLut, p.bits, tid, 128u)) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const uint wm = sg >> 1u, wn = sg & 1u;
-    const uint warpT0 = tBase + wm * 32u, warpC0 = cBase + wn * 32u;
-    const int sgpSm = min(32, int(p.T) - int(warpT0));
-
-    if (inc == 2u) {
-        if (sgpSm <= 0 || warpC0 >= p.oLoraRank) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            return;
-        }
-        qw_hca_wo_a_nax_run<2, SUB2>(zIn, woABlocks, qUpGate, zGatedOut, p,
-                                     &st.os[0][0], st.tgLut, g, warpT0, warpC0, sgpSm, sg, lane);
-        return;
-    }
-
-    if (sgpSm <= 0 || warpC0 >= p.oLoraRank) return;
-
-    if (inc == 3u) {
-        qw_hca_wo_a_nax_run<3>(zIn, woABlocks, qUpGate, zGatedOut, p,
-                               &st.os[0][0], st.tgLut, g, warpT0, warpC0, sgpSm, sg, lane);
-    } else if (inc == 1u) {
-        qw_hca_wo_a_nax_run<1>(zIn, woABlocks, qUpGate, zGatedOut, p,
-                               &st.os[0][0], st.tgLut, g, warpT0, warpC0, sgpSm, sg, lane);
-    } else if (p.bits == 8u) {
-        qw_hca_wo_a_nax_run<8>(zIn, woABlocks, qUpGate, zGatedOut, p,
-                               &st.os[0][0], st.tgLut, g, warpT0, warpC0, sgpSm, sg, lane);
-    } else if (p.bits == 4u) {
-        qw_hca_wo_a_nax_run<4>(zIn, woABlocks, qUpGate, zGatedOut, p,
-                               &st.os[0][0], st.tgLut, g, warpT0, warpC0, sgpSm, sg, lane);
-    } else {
-        qw_hca_wo_a_nax_run<0>(zIn, woABlocks, qUpGate, zGatedOut, p,
-                               &st.os[0][0], st.tgLut, g, warpT0, warpC0, sgpSm, sg, lane);
-    }
-}
-
-// Grid: (oLoraRank / 64, (T + 63) / 64, oGroups), Threadgroup: (128, 1, 1).
-kernel void qwg_hca_grouped_wo_a_nax(
-    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
-    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
-    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {
-    threadgroup HCAWoANaxTg st;
-    qw_hca_grouped_wo_a_nax_body<false>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
-}
-
-kernel void qwg_hca_grouped_wo_a_nax_sub2(
-    device const half* zIn [[buffer(0)]], device const char* woABlocks [[buffer(1)]],
-    device const half* qUpGate [[buffer(2)]], device half* zGatedOut [[buffer(3)]],
-    constant HCAGroupedWoAParams& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {
-    threadgroup HCAWoANaxTg st;
-    qw_hca_grouped_wo_a_nax_body<true>(zIn, woABlocks, qUpGate, zGatedOut, p, st, tg, tid, sg, lane);
 }

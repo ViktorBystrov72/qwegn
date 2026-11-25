@@ -88,25 +88,31 @@ extension QWGemm {
         }
     }
 
-    /// Router logits for T rows: y[t, e] = x[t] . W[e], f32 or bf16 weights and f32 activations, tiled over tokens and experts.
+    /// Router logits for T rows: y[t, e] = x[t] . W[e], f32 or bf16 weights and f32/f16 activations, tiled over tokens and experts.
     public static func encodeFnRouterGemm(_ enc: any MTLComputeCommandEncoder, hal: QWHal, weight: QWTensorValue,
                                           x: QWTensorValue, y: QWTensorValue, rows: Int, n: Int, k: Int,
                                           shGateWeight: QWTensorValue? = nil,
                                           shGateOut: QWTensorValue? = nil) throws {
         precondition(k % 32 == 0, "router GEMM needs K % 32 == 0")
         let hasShGate = (shGateWeight != nil && shGateOut != nil) ? 1 : 0
-        // NAX path: bf16 W exact, f32 X as three bf16 terms; ~3x the simdgroup kernel at prefill sizes.
-        if hal.caps.isMetal4TensorCapable && weight.shape.dtype == .bf16 && n % 64 == 0 && rows >= 128 {
-            enc.setComputePipelineState(try hal.pipeline("qwg_router_nax"))
+        // NAX path: bf16 or f32 W (split into bf16 hi+lo), f32 or f16 X; ~3x the simdgroup kernel at prefill sizes.
+        if hal.caps.isMetal4TensorCapable,
+           weight.shape.dtype == .bf16 || weight.shape.dtype == .f32,
+           x.shape.dtype == .f32 || x.shape.dtype == .f16,
+           n % 64 == 0 && rows >= 64 {
+            let kernelName = weight.shape.dtype == .f32 ? "qwg_router_nax_f32" : "qwg_router_nax"
+            let flags = hasShGate | (x.shape.dtype == .f16 ? 2 : 0)
+            enc.setComputePipelineState(try hal.pipeline(kernelName))
             enc.bindTensors(weight, x, y, startIndex: 0)
             enc.setUInt32s(rows, n, k, startIndex: 3)
             (shGateWeight ?? weight).bind(enc, index: 7)
             (shGateOut ?? y).bind(enc, index: 8)
-            enc.setUInt32s(hasShGate, startIndex: 9)
+            enc.setUInt32s(flags, startIndex: 9)
             enc.dispatchThreadgroups(MTLSize(width: n / 64 + hasShGate, height: (rows + 63) / 64, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
             return
         }
+        precondition(x.shape.dtype == .f32, "qwg_router_gemm requires f32 activations")
         enc.setComputePipelineState(try hal.pipeline("qwg_router_gemm"))
         enc.bindTensors(weight, x, y, startIndex: 0)
         let weightMode = (weight.shape.dtype == .bf16) ? 1 : (weight.shape.dtype == .f16 ? 2 : 0)

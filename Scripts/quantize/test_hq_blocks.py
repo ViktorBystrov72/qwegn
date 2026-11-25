@@ -15,8 +15,12 @@ from hq_blocks import (
     hq_block_bytes,
     quant_hq_blocks,
     dequant_hq_blocks,
+    dequant_mxfp4_blockwise,
+    dequant_with_scale_inv,
+    unpacked_safetensors_shape,
+    validate_source_quant_config,
 )
-from pack import pack_file
+from pack import pack_file, quantize_model
 from verify import audit_pack, read_header
 
 
@@ -106,6 +110,83 @@ class HQBlocksTests(unittest.TestCase):
             hdr, _ = read_header(qwp_path)
             self.assertEqual(hdr["tensors"]["model.layers.0.dense.weight"]["hq"], {"bits": 8, "group": 64})
             self.assertEqual(hdr["tensors"]["model.layers.0.mlp.experts.down_proj"]["hq"], {"bits": 4, "group": 64})
+
+    def test_dequant_mxfp4_blockwise_exact_and_nan_rejection(self) -> None:
+        import torch
+        e2m1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+        # Pack all 16 nibble combinations across 16 bytes -> 32 elements on row 0, and negative bytes (-128..127) on row 1.
+        row0_bytes = [((2 * j + 1) << 4) | (2 * j) for j in range(8)] * 2
+        row1_bytes = [0x8F, 0xF8, 0x70, 0x07, 0xAB, 0xCD, 0xEF, 0x12] * 2
+        packed_u8 = torch.tensor([row0_bytes, row1_bytes], dtype=torch.uint8)
+        packed_i8 = packed_u8.view(torch.int8)
+        scales_u8 = torch.tensor([[127], [128]], dtype=torch.uint8)  # 2^0=1.0, 2^1=2.0
+        scales_e8 = scales_u8.view(torch.float8_e8m0fnu)
+
+        out = dequant_mxfp4_blockwise(packed_i8, scales_e8)
+        self.assertEqual(tuple(out.shape), (2, 32))
+        self.assertEqual(out.dtype, torch.float32)
+        for j in range(16):
+            self.assertEqual(float(out[0, j]), e2m1[j])
+        self.assertEqual(float(out[1, 0]), e2m1[0xF] * 2.0)
+        self.assertEqual(float(out[1, 1]), e2m1[0x8] * 2.0)
+
+        out_dispatch = dequant_with_scale_inv(packed_i8.unsqueeze(0), scales_e8.unsqueeze(0))
+        self.assertEqual(tuple(out_dispatch.shape), (1, 2, 32))
+        self.assertTrue(torch.equal(out_dispatch[0], out))
+
+        nan_scales = torch.tensor([[127], [255]], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+        with self.assertRaises(ValueError):
+            dequant_mxfp4_blockwise(packed_i8, nan_scales)
+
+    def test_validate_source_quant_config_and_unpacked_shapes(self) -> None:
+        self.assertEqual(validate_source_quant_config({}), 128)
+        self.assertEqual(validate_source_quant_config({"quantization_config": {"quant_method": "fp8", "weight_block_size": [64, 64]}}), 64)
+        self.assertEqual(validate_source_quant_config({"text_config": {"quantization_config": {"quant_method": "mxfp4"}}}), 128)
+        for bad in ({}, {"quant_method": "gptq"}, {"quant_method": "awq"}):
+            with self.assertRaisesRegex(ValueError, "already quantized"):
+                validate_source_quant_config({"quantization_config": bad})
+        self.assertEqual(unpacked_safetensors_shape([8, 32], "I8", [8, 2], "F8_E8M0"), [8, 64])
+        self.assertEqual(unpacked_safetensors_shape([2, 4, 16], "U8", [2, 4, 1], "U8"), [2, 4, 32])
+        self.assertEqual(unpacked_safetensors_shape([8, 64], "F8_E4M3", [1, 1], "F32"), [8, 64])
+        self.assertEqual(unpacked_safetensors_shape([64], "BF16", None, None), [64])
+
+    def test_generic_pack_quantize_model_pure_mxfp4_two_shards(self) -> None:
+        import json
+        import torch
+        from safetensors.torch import save_file
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "hf_mxfp4"
+            dst = Path(tmp) / "out_mxfp4"
+            src.mkdir()
+            (src / "tokenizer.json").write_text("{}")
+            (src / "config.json").write_text(json.dumps({
+                "model_type": "generic_test_moe",
+                "quantization_config": {"quant_method": "mxfp4"},
+            }))
+            q_w = torch.randint(-128, 128, (8, 32), dtype=torch.int8)
+            q_s = torch.full((8, 2), 126, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+            exp_w = torch.randint(-128, 128, (2, 4, 32), dtype=torch.int8)
+            exp_s = torch.full((2, 4, 2), 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+            norm = torch.ones((64,), dtype=torch.bfloat16)
+            save_file({
+                "model.layers.0.self_attn.q_proj.weight": q_w,
+                "model.layers.0.mlp.experts.gate_up_proj.weight": exp_w,
+                "model.layers.0.input_layernorm.weight": norm,
+            }, str(src / "model-00001-of-00002.safetensors"))
+            save_file({
+                "model.layers.0.self_attn.q_proj.weight_scale_inv": q_s,
+                "model.layers.0.mlp.experts.gate_up_proj.weight_scale_inv": exp_s,
+            }, str(src / "model-00002-of-00002.safetensors"))
+            quantize_model(src, dst)
+            hdr, _ = read_header(dst / "model.qwp")
+            self.assertEqual(hdr["tensors"]["model.layers.0.self_attn.q_proj.weight"]["shape"], [8, 64])
+            self.assertEqual(hdr["tensors"]["model.layers.0.mlp.experts.gate_up_proj.weight"]["shape"], [2, 4, 64])
+            ok, msg = audit_pack(dst / "model.qwp", expected_shapes={
+                "model.layers.0.self_attn.q_proj.weight": [8, 64],
+                "model.layers.0.mlp.experts.gate_up_proj.weight": [2, 4, 64],
+                "model.layers.0.input_layernorm.weight": [64],
+            })
+            self.assertTrue(ok, msg)
 
 
 if __name__ == "__main__":

@@ -516,4 +516,56 @@ public struct ChatCompletionRequest: Codable, Sendable {
         }
         return list
     }
+
+    /// Extracts all video input specifications present in user messages.
+    public func extractVideoInputs() -> [QWVideoInputSpec] {
+        var list: [QWVideoInputSpec] = []
+        for msg in messages {
+            if let vids = msg.content?.videoInputs {
+                list.append(contentsOf: vids)
+            }
+        }
+        return list
+    }
+
+    /// Returns a copy of this request with an explicit resolved reasoning effort tier (`off|low|xhigh`).
+    public func withResolvedReasoningEffort(_ resolved: String) -> ChatCompletionRequest {
+        ChatCompletionRequest(
+            model: model,
+            messages: messages,
+            tools: tools,
+            toolChoice: toolChoice,
+            parallelToolCalls: parallelToolCalls,
+            responseFormat: responseFormat,
+            logprobs: logprobs,
+            topLogprobs: topLogprobs,
+            n: n,
+            continueFinalMessage: continueFinalMessage,
+            addGenerationPrompt: addGenerationPrompt,
+            stream: stream,
+            maxTokens: maxTokens,
+            maxCompletionTokens: maxCompletionTokens,
+            minTokens: minTokens,
+            ignoreEos: ignoreEos,
+            temperature: temperature,
+            topP: topP,
+            topK: topK,
+            repetitionPenalty: repetitionPenalty,
+            seed: seed,
+            stop: stop,
+            enableThinking: resolved == "off" ? false : true,
+            reasoningEffort: resolved,
+            reasoning: nil,
+            reasoningBudget: reasoningBudget,
+            chatTemplateKwargs: nil,
+            metadata: metadata,
+            user: user,
+            sessionId: sessionId,
+            promptCacheKey: promptCacheKey,
+            cacheSalt: cacheSalt,
+            cachePrompt: cachePrompt,
+            store: store,
+            httpHeaders: httpHeaders
+        )
+    }
 }

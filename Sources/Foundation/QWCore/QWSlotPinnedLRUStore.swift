@@ -199,8 +199,10 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
     private var _slotRootHash: [Int: UInt64] = [:]
     private var _slotLastTouch: [Int: UInt64] = [:]
     private var _sharedBaseKeys: Set<Key> = []
+    private var _sharedBranchKeys: Set<Key> = []
     private var touchCounter: UInt64 = 0
     private var _onEvict: ((Key, StoredEntry) -> Void)?
+    private var _onRemove: ((Key) -> Void)?
 
     public var maxSlots: Int { lock.withLock { _maxSlots } }
     public var byteLimit: Int { lock.withLock { _byteLimit } }
@@ -213,6 +215,10 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
     public var onEvict: ((Key, StoredEntry) -> Void)? {
         get { lock.withLock { _onEvict } }
         set { lock.withLock { _onEvict = newValue } }
+    }
+    public var onRemove: ((Key) -> Void)? {
+        get { lock.withLock { _onRemove } }
+        set { lock.withLock { _onRemove = newValue } }
     }
 
     public init(byteLimit: Int, entryLimit: Int = Int.max,
@@ -381,6 +387,7 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
                 if key == keepBaseKey || isSharedBaseKeyLocked(key) { continue }
                 if _keySlot[key] == clampedSlot { forgetLocked(key); continue }
                 guard !isProtectedLastKeyLocked(key, excludingSlot: clampedSlot),
+                      !_sharedBranchKeys.contains(key),
                       _keySlot[key] == nil,
                       let entry = _entries[key],
                       entry.tokenCount > 0, entry.tokenCount < history.count,
@@ -447,7 +454,8 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
         slot: Int? = nil,
         rootHash: UInt64? = nil,
         history: [Int64]? = nil,
-        isSharedBase: Bool = false
+        isSharedBase: Bool = false,
+        isBranchCheckpoint: Bool = false
     ) -> Bool {
         let (stored, evicted, cb) = lock.withLock { () -> (Bool, [(Key, StoredEntry)], ((Key, StoredEntry) -> Void)?) in
             guard _byteLimit > 0, charge <= _byteLimit else { return (false, [], nil) }
@@ -462,6 +470,9 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
             if isSharedBase {
                 _sharedBaseKeys.insert(key)
                 return (true, evicted, _onEvict)
+            }
+            if isBranchCheckpoint {
+                _sharedBranchKeys.insert(key)
             }
             if let slot {
                 let clampedSlot = max(0, min(_maxSlots - 1, slot))
@@ -515,12 +526,17 @@ public final class QWSlotPinnedLRUStore<Key: Hashable & Sendable, Value: Sendabl
     }
 
     private func forgetLocked(_ key: Key) {
-        if let entry = _entries.removeValue(forKey: key) { _chargedBytes -= entry.charge }
+        let removed = _entries.removeValue(forKey: key)
+        if let entry = removed { _chargedBytes -= entry.charge }
         _order.removeAll { $0 == key }
         _sharedBaseKeys.remove(key)
+        _sharedBranchKeys.remove(key)
         if let s = _keySlot.removeValue(forKey: key) {
             if _slotLastKey[s] == key { _slotLastKey.removeValue(forKey: s) }
             if _slotBaseKey[s] == key { _slotBaseKey.removeValue(forKey: s) }
+        }
+        if removed != nil {
+            _onRemove?(key)
         }
     }
 

@@ -696,6 +696,7 @@ final class QWServerSecurityHardeningTests: XCTestCase {
             "Sources/Apps/QWServer/Resources/js/actions.js",
             "Sources/Apps/QWServer/Resources/js/settings.js",
             "Sources/Apps/QWServer/Resources/js/chat-presets.js",
+            "Sources/Apps/QWServer/Resources/js/chat-media.js",
             "Sources/Apps/QWServer/Resources/js/chat.js"
         ]
         let ctx = try XCTUnwrap(JSContext())
@@ -750,7 +751,7 @@ final class QWServerSecurityHardeningTests: XCTestCase {
           });
           var memHtml = elements["mempack-artifacts-list"].innerHTML;
           chatState.sessions = [{ id: xssPayload, title: xssPayload, presetId: "server-default", messages: [
-            { id: xssPayload, role: "assistant", content: "```swift\\nlet x = 1\\n```", toolCalls: [{ id: xssPayload, function: { name: xssPayload, arguments: "{}" } }], images: [{ dataUrl: "javascript:alert(1)", name: "x" }] }
+            { id: xssPayload, role: "assistant", content: "```swift\\nlet x = 1\\n```", toolCalls: [{ id: xssPayload, function: { name: xssPayload, arguments: "{}" } }], images: [{ dataUrl: "javascript:alert(1)", name: "x" }], videos: [{ dataUrl: "javascript:alert(1)", name: "v" }] }
           ], updatedAt: 1 }];
           chatState.activeSessionId = xssPayload;
           renderChatSessionList();

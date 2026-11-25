@@ -274,18 +274,28 @@ extension QWMLAAttnOperator {
                                          pos0: Int,
                                          rows: Int,
                                          probeClusters: Int,
-                                         windowBlocks: Int) {
+                                         windowBlocks: Int,
+                                         qFullOverride: QWTensorValue? = nil,
+                                         idxWeightsOverride: QWTensorValue? = nil,
+                                         activeIdxHeads: Int? = nil,
+                                         activeQChannels: Int? = nil) {
         let tg256 = MTLSize(width: 256, height: 1, depth: 1)
+        let selQFull = qFullOverride ?? mlaQFullScratch
+        let selIdxW = idxWeightsOverride ?? idxWeightsScratch
+        let effIdxHeads = activeIdxHeads ?? idxHeads
+        let effQChannels = activeQChannels ?? qChannels
+        let effQFullStride = effQChannels + effIdxHeads * idxDim
+        let effSplit = (effIdxHeads == 32 || effIdxHeads == 64) ? psoIndexerSplit : nil
         let packedIdxHeads: UInt32 = (poolShift == 2 && windowBlocks == 0)
-            ? UInt32(idxHeads)
-            : (UInt32(idxHeads & 0xFF) | 0x1000 | (UInt32(poolShift & 0xF) << 8) | (UInt32(windowBlocks) << 16))
+            ? UInt32(effIdxHeads)
+            : (UInt32(effIdxHeads & 0xFF) | 0x1000 | (UInt32(poolShift & 0xF) << 8) | (UInt32(windowBlocks) << 16))
         var rowStart = 0
         while rowStart < rows {
             let batchRows = min(selectBatchRows, rows - rowStart)
-            let qFullSub = mlaQFullScratch.slice(byteOffset: rowStart * qFullStride * 2,
-                                                 count: batchRows * qFullStride, dtype: .f16)
-            let idxWSub = idxWeightsScratch.slice(byteOffset: rowStart * idxHeads * 4,
-                                                  count: batchRows * idxHeads, dtype: .f32)
+            let qFullSub = selQFull.slice(byteOffset: rowStart * effQFullStride * 2,
+                                          count: batchRows * effQFullStride, dtype: .f16)
+            let idxWSub = selIdxW.slice(byteOffset: rowStart * effIdxHeads * 4,
+                                        count: batchRows * effIdxHeads, dtype: .f32)
             let listSub = blockListScratch.slice(byteOffset: rowStart * listStride * 4,
                                                  count: batchRows * listStride, dtype: .i32)
             let countSub = blockCountScratch.slice(byteOffset: rowStart * 4,
@@ -305,7 +315,7 @@ extension QWMLAAttnOperator {
                         budgetBlocks: topKPools, windowBlocks: windowBlocks, hasSink: false,
                         writeCount: true, listStride: listStride, rowStep: 1, maxRow: batchRows,
                         clusterStride: cScratch.clusterStride, probeClusters: probeClusters,
-                        candCap: cScratch.candCap, qChannels: qChannels, idxHeads: idxHeads,
+                        candCap: cScratch.candCap, qChannels: effQChannels, idxHeads: effIdxHeads,
                         poolShift: poolShift)
                     let plen = MemoryLayout<QWCoarsePoolIndex.SelectParams>.stride
                     enc.setComputePipelineState(mlaCoarse.scoreCoarse)
@@ -361,7 +371,7 @@ extension QWMLAAttnOperator {
                 var idxP = IndexerParams(
                     T: UInt32(batchRows),
                     pos0: UInt32(pos0 + rowStart),
-                    qChannels: UInt32(qChannels),
+                    qChannels: UInt32(effQChannels),
                     idxHeads: packedIdxHeads,
                     idxDim: UInt32(idxDim),
                     topKPools: UInt32(topKPools),
@@ -375,7 +385,7 @@ extension QWMLAAttnOperator {
                 listSub.bind(enc, index: 4)
                 countSub.bind(enc, index: 5)
                 enc.setBytes(&idxP, length: MemoryLayout<IndexerParams>.stride, index: 6)
-                if let split = psoIndexerSplit {
+                if let split = effSplit {
                     let midPools = maxPools - windowBlocks
                     enc.setComputePipelineState(split.score)
                     enc.dispatchThreadgroups(MTLSize(width: (midPools + 63) / 64, height: batchRows, depth: 1),
@@ -391,7 +401,7 @@ extension QWMLAAttnOperator {
                 var idxP = IndexerParams(
                     T: UInt32(batchRows),
                     pos0: UInt32(pos0 + rowStart),
-                    qChannels: UInt32(qChannels),
+                    qChannels: UInt32(effQChannels),
                     idxHeads: packedIdxHeads,
                     idxDim: UInt32(idxDim),
                     topKPools: UInt32(topKPools),
@@ -405,67 +415,11 @@ extension QWMLAAttnOperator {
                 listSub.bind(enc, index: 4)
                 countSub.bind(enc, index: 5)
                 enc.setBytes(&idxP, length: MemoryLayout<IndexerParams>.stride, index: 6)
-                enc.setComputePipelineState(psoIndexerSplit?.select ?? psoIndexerScoreSelect)
+                enc.setComputePipelineState(effSplit?.select ?? psoIndexerScoreSelect)
                 enc.dispatchThreadgroups(MTLSize(width: batchRows, height: 1, depth: 1), threadsPerThreadgroup: tg256)
                 QWCoarsePoolIndex.barrierIfConcurrent(enc)
             }
             rowStart += batchRows
-        }
-    }
-
-    @discardableResult
-    internal func encodeAbsorbQ(_ enc: any MTLComputeCommandEncoder,
-                                kvBProj: QWWeightView,
-                                absP: inout AbsorbParams,
-                                rows: Int,
-                                mTiles: Int) -> Bool {
-        let inc = absP.isIncumbent & 0xFF
-        let isSub2SHVQ = inc == 2 && (absP.bits == 1 || absP.bits == 15)
-        let weightSupported = absP.group >= 32 && (absP.group % 32 == 0) && (kvLoraRank % Int(absP.group) == 0) && (
-            inc == 1
-            || (inc == 2 && (isSub2SHVQ || (absP.bits >= 2 && absP.bits <= 4)))
-            || (inc == 0 && (absP.bits == 2 || absP.bits == 3 || absP.bits == 4 || absP.bits == 6 || absP.bits == 8))
-        )
-        let absorbMMA = sparseAttnMMAEnabled && rows >= 16 && weightSupported
-            && nopeDim >= 32 && (nopeDim % 32 == 0) && kvLoraRank == 512
-        enc.setComputePipelineState(absorbMMA ? (isSub2SHVQ ? psoAbsorbQMMASub2 : psoAbsorbQMMA)
-                                              : (isSub2SHVQ ? psoAbsorbQSub2 : psoAbsorbQ))
-        mlaQFullScratch.bind(enc, index: 0)
-        kvBProj.blocks.bind(enc, index: 1)
-        qAbsScratch.bind(enc, index: 2)
-        enc.setBytes(&absP, length: MemoryLayout<AbsorbParams>.stride, index: 3)
-        if absorbMMA {
-            enc.dispatchThreadgroups(MTLSize(width: qHeads, height: (rows + 31) / 32, depth: kvLoraRank / 128),
-                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-        } else {
-            enc.dispatchThreadgroups(MTLSize(width: qHeads, height: mTiles, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 512, height: 1, depth: 1))
-        }
-        return absorbMMA
-    }
-
-    internal func encodeProjUV(_ enc: any MTLComputeCommandEncoder,
-                               kvBProj: QWWeightView,
-                               dst: QWTensorValue,
-                               absP: inout AbsorbParams,
-                               absorbMMA: Bool,
-                               rows: Int,
-                               mTiles: Int) {
-        let inc = absP.isIncumbent & 0xFF
-        let isSub2SHVQ = inc == 2 && (absP.bits == 1 || absP.bits == 15)
-        let projUVMMA = absorbMMA && vHeadDim >= 128 && (vHeadDim % 128) == 0 && vHeadDim <= 256
-        enc.setComputePipelineState(projUVMMA ? (isSub2SHVQ ? psoProjUVMMASub2 : psoProjUVMMA)
-                                              : (isSub2SHVQ ? psoProjUVSub2 : psoProjUV))
-        uLatScratch.bind(enc, index: 0)
-        kvBProj.blocks.bind(enc, index: 1)
-        dst.bind(enc, index: 2)
-        enc.setBytes(&absP, length: MemoryLayout<AbsorbParams>.stride, index: 3)
-        if projUVMMA {
-            enc.dispatchThreadgroups(MTLSize(width: qHeads, height: (rows + 31) / 32, depth: vHeadDim / 128),
-                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-        } else {
-            enc.dispatchThreadgroups(MTLSize(width: qHeads, height: mTiles, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
     }
 
@@ -534,13 +488,56 @@ extension QWMLAAttnOperator {
         // 1. Exact dense bypass at seqLen <= topK + windowTokens (or O(1)-SRAM dense stream when !hasIndexer).
         mark("mla.score_select")
         if hasIndexer, pos0 + rows > topKPools + windowTokens {
-            encodeIndexerSelection(enc, ls: ls, pos0: pos0, rows: rows,
-                                   probeClusters: Self.dsaEmeansProbeClusters,
-                                   windowBlocks: windowTokens)
+            let useFlashIndexer = flashIndexerEnabled
+                && rows >= 16
+                && idxHeads > Self.flashIndexerSelHeads
+                && idxHeads <= 64
+                && geometry.hidden > 0
+            if useFlashIndexer,
+               let gateW = mlaW.flashGateW,
+               let bias = mlaW.flashBias,
+               let ln1 {
+                enc.useResource(gateW.region.buffer, usage: .read)
+                enc.useResource(bias.region.buffer, usage: .read)
+                var fiP = FlashIndexerParams(
+                    T: UInt32(rows),
+                    hidden: UInt32(geometry.hidden),
+                    fullIdxHeads: UInt32(idxHeads),
+                    selHeads: UInt32(Self.flashIndexerSelHeads),
+                    idxDim: UInt32(idxDim),
+                    qChannels: UInt32(qChannels),
+                    qFullStride: UInt32(qFullStride)
+                )
+                enc.setComputePipelineState(psoFlashIndexerSelectHeads)
+                ln1.bind(enc, index: 0)
+                gateW.bind(enc, index: 1)
+                bias.bind(enc, index: 2)
+                idxWeightsScratch.bind(enc, index: 3)
+                mlaQFullScratch.bind(enc, index: 4)
+                flashQSelScratch.bind(enc, index: 5)
+                flashWSelScratch.bind(enc, index: 6)
+                enc.setBytes(&fiP, length: MemoryLayout<FlashIndexerParams>.stride, index: 7)
+                enc.dispatchThreadgroups(MTLSize(width: (rows + 31) / 32, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                QWCoarsePoolIndex.barrierIfConcurrent(enc)
+                encodeIndexerSelection(enc, ls: ls, pos0: pos0, rows: rows,
+                                       probeClusters: Self.dsaEmeansProbeClusters,
+                                       windowBlocks: windowTokens,
+                                       qFullOverride: flashQSelScratch,
+                                       idxWeightsOverride: flashWSelScratch,
+                                       activeIdxHeads: Self.flashIndexerSelHeads,
+                                       activeQChannels: 0)
+            } else {
+                encodeIndexerSelection(enc, ls: ls, pos0: pos0, rows: rows,
+                                       probeClusters: Self.dsaEmeansProbeClusters,
+                                       windowBlocks: windowTokens)
+            }
         }
 
         // 2. Absorb W_{UK, h} into q_nope -> qAbs [rows, qHeads, kvLoraRank]
-        let baseInc: UInt32 = mlaW.kvBProj.isIncumbentContainer ? 1 : (mlaW.kvBProj.isSHVQ ? 2 : 0)
+        let baseInc: UInt32 = mlaW.kvBProj.bits == 16
+            ? 3
+            : (mlaW.kvBProj.isIncumbentContainer ? 1 : (mlaW.kvBProj.isSHVQ ? 2 : 0))
         let hasInlineOrFlagGate = mlaW.hasOGate
             || outputGateMode == .elementWiseFromQLora
             || (geometry.mlaConfig == nil && geometry.attnOutputGate)
@@ -588,7 +585,13 @@ extension QWMLAAttnOperator {
             && (naxAvail || supportsMMARopeDim)
         let split = (sparseAttnMMAEnabled && !useMMA && attnP.kvMode <= 2 && rows <= Self.splitMaxRows
             && qHeads % 16 == 0 && kvLoraRank == 512 && supportsNAXRopeDim) ? psoDSASparseAttnSplit : nil
-        enc.setComputePipelineState(split?.attend ?? (useMMA ? (naxAvail ? psoDSASparseAttnNAX! : psoDSASparseAttnMMA) : psoDSASparseAttn))
+        let allowShared = dsaSharedMode != "0" && dsaSharedMode != "h16"
+        let useH64 = (split == nil) && useMMA && naxAvail && allowShared && dsaSharedMode != "h32"
+            && qHeads % 64 == 0 && psoDSASparseAttnNAXH64 != nil
+        let useH32 = (split == nil) && useMMA && naxAvail && allowShared && !useH64
+            && qHeads % 32 == 0 && psoDSASparseAttnNAXH32 != nil
+        let dsaNaxPSO = useH64 ? psoDSASparseAttnNAXH64 : (useH32 ? psoDSASparseAttnNAXH32 : psoDSASparseAttnNAX)
+        enc.setComputePipelineState(split?.attend ?? (useMMA ? (naxAvail ? dsaNaxPSO! : psoDSASparseAttnMMA) : psoDSASparseAttn))
         qAbsScratch.bind(enc, index: 0)
         kv.k.pool.bindTo(enc, index: 1)
         kv.v.pool.bindTo(enc, index: 2)
@@ -619,8 +622,16 @@ extension QWMLAAttnOperator {
             mlaQFullScratch.bind(enc, index: 8)
             kPe.bind(enc, index: 9)
             sinkTensor.bind(enc, index: 10)
-            enc.dispatchThreadgroups(MTLSize(width: rows, height: qHeads / 16, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            if useH64 {
+                enc.dispatchThreadgroups(MTLSize(width: rows, height: qHeads / 64, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 512, height: 1, depth: 1))
+            } else if useH32 {
+                enc.dispatchThreadgroups(MTLSize(width: rows, height: qHeads / 32, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            } else {
+                enc.dispatchThreadgroups(MTLSize(width: rows, height: qHeads / 16, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            }
         } else {
             mlaQFullScratch.bind(enc, index: 8)
             kPe.bind(enc, index: 9)

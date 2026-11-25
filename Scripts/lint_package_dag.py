@@ -8,6 +8,7 @@ LAYERS = {
     "QWCore": 0.0, "QWMetalCounterSupport": 0.0,
     "QWSMCHelper": 0.5,
     "QWHAL": 1.0, "QWQuant": 1.0, "QWToken": 1.0,
+    "QWDecision": 1.5,
     "QWAlloc": 2.0, "QWLoad": 2.5, "QWRope": 2.5,
     "QWGEMM": 3.0, "QWKV": 3.0,
     "QWNorm": 4.0, "QWAttn": 4.0, "QWGDN": 4.0, "QWMLP": 4.0, "QWHyperPLE": 4.0, "QWVision": 4.0,
@@ -17,7 +18,7 @@ LAYERS = {
     "m1": 8.0, "QWMenuBarUI": 8.5, "qwg-menu": 9.0,
 }
 TEST_MAX_LAYER = {
-    "QWCoreTests": 0.0, "QWTokenTests": 1.0,
+    "QWCoreTests": 0.0, "QWTokenTests": 1.0, "QWDecisionTests": 1.5,
     "QWLoadTests": 2.5, "QWEngineTests": 7.0,
 }
 BANNED_TARGETS = {"QWState"}

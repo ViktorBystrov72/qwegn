@@ -38,9 +38,10 @@ public final class QWPrefixCacheCoordinator: @unchecked Sendable {
         if tiers.isEnabled {
             self.warmStore = try QWEnginePrefixStore<QWEngineCachedPrefix>(
                 byteLimit: tiers.warmByteLimit,
-                entryLimit: max(config.entryLimit, config.maxConcurrentSessions * 2),
+                entryLimit: max(config.entryLimit, config.maxConcurrentSessions * 4, 32),
                 vocab: vocab,
-                maxSlots: config.maxConcurrentSessions
+                maxSlots: config.maxConcurrentSessions,
+                extractPhysicalPages: { QWPrefixPageLedger<QWEnginePrefixStore<QWEngineCachedPrefix>.Key>.extractUniquePages(from: $0) }
             )
             self.diskManager = tiers.ssdByteLimit > 0 ? QWCacheDiskManager(config: config) : nil
         } else {

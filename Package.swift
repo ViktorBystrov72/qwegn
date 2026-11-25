@@ -24,7 +24,8 @@ let targetPaths: [String: String] = [
     "QWMLP": "Sources/Operators/QWMLP",
     "QWHyperPLE": "Sources/Operators/QWHyperPLE",
     "QWHead": "Sources/Operators/QWHead",
-    // Subsystems (L4–L6)
+    // Subsystems (L1.5, L4–L6)
+    "QWDecision": "Sources/Subsystems/QWDecision",
     "QWMTP": "Sources/Subsystems/QWMTP",
     "QWToken": "Sources/Subsystems/QWToken",
     "QWVision": "Sources/Subsystems/QWVision",
@@ -62,7 +63,7 @@ let components: [(String, String)] = [
     ("QWMLP", "QWMLPTests"), ("QWHead", "QWHeadTests"), ("QWMTP", "QWMTPTests"),
     ("QWLoad", "QWLoadTests"),
     ("QWEngine", "QWEngineTests"),
-    ("QWToken", "QWTokenTests"), ("QWMM", "QWMMTests"),
+    ("QWToken", "QWTokenTests"), ("QWDecision", "QWDecisionTests"), ("QWMM", "QWMMTests"),
     // C22: CLI logic as a library (the executable is a thin parser shell).
     ("QWCli", "QWCliTests"),
     ("QWServer", "QWServerTests"),
@@ -79,6 +80,8 @@ var targets: [Target] = [
     // it sits above HAL/Alloc (spec 07: tables + ONE apply kernel for C08/C09/C16).
     T("QWRope", ["QWCore", "QWHAL", "QWAlloc"]),
     T("QWToken", ["QWCore"]),
+    // Layer 1.5 — pure-host decision framing, calibration, and typed decoding (zero Metal).
+    T("QWDecision", ["QWCore", "QWToken"]),
     // Layer 2
     T("QWAlloc", ["QWCore", "QWHAL", "QWQuant"]),
     // LOAD-PATH DRY (2026-10-17): the one pack→memory mover both engines use.
@@ -105,14 +108,14 @@ var targets: [Target] = [
     T("QWEngine", ["QWCore", "QWHAL", "QWAlloc", "QWGEMM", "QWNorm", "QWRope",
                    "QWKV", "QWAttn", "QWGDN", "QWMLP", "QWHyperPLE", "QWHead", "QWMTP",
                    "QWQuant", "QWVision", "QWMM", "QWMetalCounterSupport",
-                   "QWLoad"]),
+                   "QWLoad", "QWDecision"]),
     // Layer 0.5 — Shared AppleSMC IOKit client & LaunchDaemon helper protocol (zero engine deps).
     T("QWSMCHelper"),
     // Layer 7.5 — C22 CLI logic (library; needs pack format, KV types, geometry).
-    T("QWCli", ["QWCore", "QWQuant", "QWKV"]),
+    T("QWCli", ["QWCore", "QWQuant", "QWKV", "QWDecision"]),
     // Layer 7.8 — Server logic (library; HTTP 1.1 + SSE + OpenAI/Ollama schemas + lifecycle actor).
     .target(name: "QWServer",
-            dependencies: ["QWCore", "QWHAL", "QWQuant", "QWKV", "QWToken", "QWVision", "QWMM",
+            dependencies: ["QWCore", "QWHAL", "QWQuant", "QWKV", "QWToken", "QWDecision", "QWVision", "QWMM",
                            "QWMTP", "QWEngine", "QWCli", "QWHead", "QWSMCHelper",
                            .product(name: "Jinja", package: "swift-jinja")],
             path: targetPaths["QWServer"],
@@ -125,7 +128,7 @@ var targets: [Target] = [
             swiftSettings: swiftWarningsAsErrors),
     // Layer 8 — CLI & minimal privileged SMC fan helper daemon.
     .executableTarget(name: "qwg",
-                      dependencies: ["QWCore", "QWMTP", "QWEngine", "QWToken", "QWCli", "QWKV", "QWServer", "QWSMCHelper",
+                      dependencies: ["QWCore", "QWMTP", "QWEngine", "QWToken", "QWDecision", "QWCli", "QWKV", "QWServer", "QWSMCHelper",
                                      .product(name: "ArgumentParser", package: "swift-argument-parser")],
                       path: targetPaths["qwg"],
                       swiftSettings: swiftWarningsAsErrors),
@@ -163,6 +166,7 @@ for (mod, test) in components {
     // QWRopeTests reads f16 via the C04 converter; QWRope's own closure has no
     // QWQuant (rope math is quant-free by design) → test-only edge.
     if mod == "QWRope" || mod == "QWAttn" || mod == "QWGDN" { deps.append(.byName(name: "QWQuant")) }
+    if mod == "QWDecision" { deps.append(contentsOf: [.byName(name: "QWCore"), .byName(name: "QWToken")]) }
     // QWKVTests drives arenas/HAL directly (page accounting, table mirrors).
     // QWMMTests parses golden JSON via the C17 value model.
     if mod == "QWMM" { deps.append(contentsOf: [.byName(name: "QWToken"), .byName(name: "QWVision")]) }
@@ -172,7 +176,7 @@ for (mod, test) in components {
             .byName(name: "QWCore"), .byName(name: "QWHAL"), .byName(name: "QWAlloc"),
             .byName(name: "QWQuant"), .byName(name: "QWKV"), .byName(name: "QWRope"),
             .byName(name: "QWAttn"), .byName(name: "QWGDN"),
-            .byName(name: "QWMM"), .byName(name: "QWToken"),
+            .byName(name: "QWMM"), .byName(name: "QWToken"), .byName(name: "QWDecision"),
             .byName(name: "QWGEMM"), .byName(name: "QWHyperPLE"), .byName(name: "QWVision"),
         ])
     }
@@ -191,10 +195,11 @@ for (mod, test) in components {
         deps.append(.byName(name: "qwg"))
         deps.append(.byName(name: "m1"))
         deps.append(.byName(name: "QWEngine"))
+        deps.append(.byName(name: "QWDecision"))
         deps.append(.byName(name: "QWServer"))
         deps.append(.product(name: "ArgumentParser", package: "swift-argument-parser"))
     }
-    if mod == "QWServer" { deps.append(contentsOf: [.byName(name: "QWEngine"), .byName(name: "QWToken"), .byName(name: "QWMM"), .byName(name: "QWVision"), .byName(name: "QWCli"), .byName(name: "QWSMCHelper")]) }
+    if mod == "QWServer" { deps.append(contentsOf: [.byName(name: "QWEngine"), .byName(name: "QWToken"), .byName(name: "QWDecision"), .byName(name: "QWMM"), .byName(name: "QWVision"), .byName(name: "QWCli"), .byName(name: "QWSMCHelper")]) }
     if mod == "QWMenuBarUI" { deps.append(.byName(name: "QWServer")) }
     // Fixture dirs are read from the SOURCE tree via #filePath — declaring
     // them as resources would copy (and duplicate) big golden blobs, so

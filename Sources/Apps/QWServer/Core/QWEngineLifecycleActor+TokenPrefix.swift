@@ -265,11 +265,11 @@ extension QWEngineLifecycleActor {
     }
 
     nonisolated public func validateRequestCapabilities(_ request: ChatCompletionRequest) throws {
-        guard !request.extractImageUrls().isEmpty else { return }
+        guard !request.extractImageUrls().isEmpty || !request.extractVideoInputs().isEmpty else { return }
         let cfg = statusBox.getConfig()
         guard cfg.loadVision else {
             throw QWMultimodalError.badArgument(
-                "Vision tower is disabled (--no-load-vision). Enable --load-vision to process image inputs."
+                "Vision tower is disabled (--no-load-vision). Enable --load-vision to process multimodal inputs."
             )
         }
         let state = statusBox.engineState()

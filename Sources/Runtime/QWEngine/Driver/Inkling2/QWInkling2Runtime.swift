@@ -590,10 +590,10 @@ final class QWInkling2Runtime: @unchecked Sendable {
             let isNgramOnly = (strategy == "ngram")
             let allowPLD = (strategy != "mtp")
             let targetDrafts = min(15, max(requestedMtpDrafts, request.speculative.mtpDrafts))
-            let wantsSpec = request.speculative.enabled
-                && targetDrafts > 0
-                && !request.collectLogprobs && request.constraint == nil
-            let useDSparkSpec = wantsSpec && !isNgramOnly && dsparkActive && dspark != nil && activeMtpDrafts > 0
+            let wantsSpec = request.speculative.enabled && targetDrafts > 0
+                && !request.collectLogprobs && Self.canSpeculate(constraint: request.constraint)
+            let useDSparkSpec = wantsSpec && request.constraint == nil && !isNgramOnly
+                && dsparkActive && dspark != nil && activeMtpDrafts > 0
                 && sampler.config.isGreedy && !usePenalty && specMarg.margin == 0
 
             if effectiveMaxNew > 0 {
@@ -652,7 +652,7 @@ final class QWInkling2Runtime: @unchecked Sendable {
                             if reqDrafts > 0 {
                                 let specRes = try runFlexibleSpeculativeDecode(
                                     dspark: activeDS, requestedDrafts: reqDrafts, allowPLD: allowPLD,
-                                    sampler: sampler,
+                                    sampler: sampler, constraint: request.constraint, allowedScratch: &allowedScratch,
                                     effectiveMargin: specMarg.margin, minLogProb: specMarg.minLogProb,
                                     promptTokens: request.prompt, pos: &pos, effectiveMaxNew: effectiveMaxNew,
                                     stopIDs: request.stopIDs, generated: &generated,

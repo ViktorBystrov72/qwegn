@@ -43,8 +43,21 @@ extension QWEngineDriver {
     func encodeMTPSeeding(_ cb: any MTLCommandBuffer, session: QWEngineSession,
                                   embeddings: QWTensorValue, hidden: QWTensorValue,
                                   count: Int, cacheRows: Int,
-                                  dflashCapture: QWDFlashConfig.PrefillCaptureSlice? = nil) throws {
+                                  dflashCapture: QWDFlashConfig.PrefillCaptureSlice? = nil,
+                                  dsparkCapture: QWDSparkDrafter.PrefillCaptureSlice? = nil) throws {
         if isWeightFreeSpeculation { return }
+        if dsparkDrafter != nil {
+            if let dsparkDrafter, let dsSlot = session.dsparkSlot {
+                if let cap = dsparkCapture {
+                    try dsparkDrafter.encodeContextIngestCB(
+                        cb, driver: self, slot: dsSlot, pos0: cap.ctxStartPos, rows: cap.captureRows)
+                } else if count == 1 {
+                    try dsparkDrafter.encodeContextIngestCB(
+                        cb, driver: self, slot: dsSlot, pos0: session.position, rows: 1)
+                }
+            }
+            return
+        }
         if dflashDrafter != nil {
             if let dflashDrafter, let dSlot = session.dflashSlot, let cap = dflashCapture {
                 try dflashDrafter.encodeContextUpdate(
@@ -74,10 +87,16 @@ extension QWEngineDriver {
                 let seedMRoPE = mlaOperator.flatMap {
                     session.mropeSlice(pos: pos, count: pairs, mropeLayout: $0.mropeLayout)
                 }
+                let tStart = pos == 0 ? 1 : 0
+                let seedTurnTable = session.mropeTurnTableSlice(
+                    pos: pos + tStart, count: pairs, rotaryDims: geometry.rotaryDims
+                )
                 try encodeBatchedMTPPairSeed(
                     enc, mtpWeights: mtpWeights, embeddings: embeddings, hidden: hidden,
-                    previous: previous, pos: pos, tStart: pos == 0 ? 1 : 0,
-                    pairs: pairs, cacheRows: cacheRows, views: views, mropePositions: seedMRoPE)
+                    previous: previous, pos: pos, tStart: tStart,
+                    pairs: pairs, cacheRows: cacheRows, views: views,
+                    mropePositions: seedMRoPE, mropeDelta: session.roundRecord.mropeDelta,
+                    mropeTurnTable: seedTurnTable)
             } catch {
                 enc.endEncoding()
                 throw error
@@ -112,7 +131,9 @@ extension QWEngineDriver {
         pairs: Int,
         cacheRows: Int,
         views: (k: QWKVLayerView, v: QWKVLayerView),
-        mropePositions: [Int32]? = nil
+        mropePositions: [Int32]? = nil,
+        mropeDelta: Int = 0,
+        mropeTurnTable: QWTensorValue? = nil
     ) throws {
         let H = geometry.hidden
         let concatBuf = prefixRows(psc.guRaw16, rows: pairs, cols: 2 * H, dt: .f16)
@@ -149,7 +170,8 @@ extension QWEngineDriver {
                                           qOut: qOutBuf, kOut: kOutBuf, vOut: vOutBuf,
                                           wq: wq, wk: wkTiled,
                                           qkvBias: mtpWeights.qkvBias,
-                                          positionStart: pos + tStart, count: pairs)
+                                          positionStart: max(0, pos + tStart + mropeDelta), count: pairs,
+                                          customTable: mropeTurnTable)
             encodePagedKVWrite(enc, kv: views, k: kOutBuf, v: vOutBuf, startPos: cacheRows, t: pairs)
         }
     }
@@ -241,6 +263,9 @@ extension QWEngineDriver {
         }
         if dflashDrafter != nil, session.dflashSlot != nil {
             session.dflashCacheOffset = position + count
+        }
+        if dsparkDrafter != nil, session.dsparkSlot != nil {
+            session.dsparkCacheOffset = position + count
         }
         guard let mtpCache, let handle = session.mtpKV else { return }
         let rows = cacheRows + QWMTPPromptSeeder.pairCount(position: position, count: count)

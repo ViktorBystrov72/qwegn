@@ -65,6 +65,10 @@ public final class FNBatchJob: @unchecked Sendable {
     var lastToken: Int = 0
     var position: Int = 0
     var inBatchMode: Bool = false
+    var isPrefilling: Bool = false
+    var prefillCursor: Int = 0
+    var effectiveMaxNew: Int = 0
+    var prefillWallAcc: Double = 0
     let promise = QWBatchJobPromise<FNBatchJobOutput>()
 
     public init(prompt: [Int], maxNew: Int, stopIDs: Set<Int>,

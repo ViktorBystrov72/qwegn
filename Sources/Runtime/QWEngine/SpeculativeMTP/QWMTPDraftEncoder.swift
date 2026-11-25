@@ -308,15 +308,16 @@ final class QWMTPDraftEncoder {
         }
         try project(enc, x: s.ln1, gs: s.gsHidden, w: w.qkvProj,
                     plan: qkvPlan, y32: s.qkv32, y16: s.qkv16)
+        let effectivePos = geometry.mropeLayout != .none1D ? max(0, absolutePosition + mropeDelta) : absolutePosition
         if let qkvBias = w.qkvBias {
             try rope.encodeExtractQK(enc, hal: hal, attnY: s.qkv16,
                                      qOut: s.qRope, kOut: s.kRope, vOut: s.v16,
                                      wq: w.wq, wk: w.wkTiled, qkvBias: qkvBias,
-                                     positionStart: absolutePosition, count: 1)
+                                     positionStart: effectivePos, count: 1)
         } else {
             try rope.encodeQK(enc, hal: hal, q: s.q16, k: s.k16,
                               wq: w.wq, wk: w.wkTiled, qOut: s.qRope, kOut: s.kRope,
-                              positionStart: absolutePosition, count: 1)
+                              positionStart: effectivePos, count: 1)
         }
     }
 

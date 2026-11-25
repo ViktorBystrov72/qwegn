@@ -6,6 +6,7 @@ import Foundation
 import Metal
 import QWCli
 import QWCore
+import QWDecision
 import QWEngine
 import QWHAL
 import QWHead
@@ -68,6 +69,7 @@ public actor QWEngineLifecycleActor {
         var capabilities: [QWKnobCapability]
         var loadedParams: QWEngineParametersInfo?
         var supportsThinkingTags: Bool = true
+        var isInkling2Template: Bool = false
         var lastLoggedSamplingMessage: String?
         var mountedMemoryPack: QWEngineInfoResponse.MountedMemoryPackInfo? = nil
 
@@ -86,6 +88,7 @@ public actor QWEngineLifecycleActor {
             var nextCapabilities: [QWKnobCapability] = []
             var nextParams: QWEngineParametersInfo? = nil
             var nextSupportsThinkingTags = true
+            var nextIsInkling2Template = false
             switch state {
             case .unloaded:
                 nextPhase = .unloaded
@@ -96,6 +99,7 @@ public actor QWEngineLifecycleActor {
                 nextCapabilities = Array(loaded.modelBackend.capabilities)
                 nextParams = loaded.params
                 nextSupportsThinkingTags = loaded.chatTemplate.supportsThinkingTags
+                nextIsInkling2Template = loaded.chatTemplate.isInkling2Template
             case .unloading:
                 nextPhase = .unloading
             case .failed(let message):
@@ -110,6 +114,7 @@ public actor QWEngineLifecycleActor {
             self.capabilities = nextCapabilities
             self.loadedParams = nextParams
             self.supportsThinkingTags = nextSupportsThinkingTags
+            self.isInkling2Template = nextIsInkling2Template
             lock.unlock()
         }
 
@@ -186,6 +191,10 @@ public actor QWEngineLifecycleActor {
             lock.withLock { supportsThinkingTags }
         }
 
+        func getIsInkling2Template() -> Bool {
+            lock.withLock { isInkling2Template }
+        }
+
         func shouldLogSamplingMessage(_ message: String) -> Bool {
             lock.lock()
             defer { lock.unlock() }
@@ -223,6 +232,10 @@ public actor QWEngineLifecycleActor {
     let logger: QWServerLogger
     let backendRegistry: QWModelBackendRegistry
     let load: Load
+    public let gpuTurnArbitrator = QWGPUTurnArbitrator()
+    let decisionLoader: DecisionRunnerLoader
+    var decisionSidecar: QWLoadedDecisionSidecar? = nil
+    let decisionStatusBox = QWDecisionSidecarStatusBox()
     var state: State = .unloaded
     var phaseSince: Date
     let statusBox: StatusSnapshotBox
@@ -476,10 +489,12 @@ public actor QWEngineLifecycleActor {
         config: Config,
         logger: QWServerLogger = .shared,
         configPath: String? = nil,
-        backendRegistry: QWModelBackendRegistry = .shared
+        backendRegistry: QWModelBackendRegistry = .shared,
+        decisionLoader: @escaping DecisionRunnerLoader = QWEngineLifecycleActor.defaultDecisionLoader
     ) {
         self.init(config: config, logger: logger, configPath: configPath,
                   backendRegistry: backendRegistry,
+                  decisionLoader: decisionLoader,
                   load: { config, logger, registry in
                       try Self.performLoad(config: config, logger: logger, backendRegistry: registry)
                   })
@@ -490,6 +505,7 @@ public actor QWEngineLifecycleActor {
         logger: QWServerLogger = .shared,
         configPath: String? = nil,
         backendRegistry: QWModelBackendRegistry = .shared,
+        decisionLoader: @escaping DecisionRunnerLoader = QWEngineLifecycleActor.defaultDecisionLoader,
         load: @escaping Load
     ) {
         let initialSince = Date()
@@ -497,6 +513,7 @@ public actor QWEngineLifecycleActor {
         self.configPath = configPath
         self.logger = logger
         self.backendRegistry = backendRegistry
+        self.decisionLoader = decisionLoader
         self.load = load
         self.phaseSince = initialSince
         self.statusBox = StatusSnapshotBox(config: config, phaseSince: initialSince)
@@ -572,6 +589,7 @@ public actor QWEngineLifecycleActor {
     nonisolated public func getModelName() -> String { statusBox.getModelName() }
     nonisolated public func getConfig() -> Config { statusBox.getConfig() }
     nonisolated public func supportsThinkingTags() -> Bool { statusBox.getSupportsThinkingTags() }
+    nonisolated public func isInkling2Template() -> Bool { statusBox.getIsInkling2Template() }
     nonisolated public func getMountedMemoryPackInfo() -> QWEngineInfoResponse.MountedMemoryPackInfo? {
         statusBox.getMountedMemoryPackInfo()
     }
@@ -623,6 +641,9 @@ public actor QWEngineLifecycleActor {
                     statusBox.resetLoggedSamplingMessage(initialSamplingMsg)
                     if let active = activeMemoryPack {
                         _ = try? result.loaded.modelBackend.mountStandalonePrefixCache(from: active.cacheFileURL)
+                    }
+                    if let unified = (result.loaded.modelBackend as? QWUnifiedModelBackend)?.engine as? QWEngine {
+                        unified.gpuTurnArbitrator = self.gpuTurnArbitrator
                     }
                     transition(to: .loaded(result.loaded), since: result.arrivedAt)
                     return result.loaded

@@ -20,6 +20,8 @@ extension QWMLAAttnOperator {
         public let hasOGate: Bool
         public let oGateF16: QWTensorValue?
         public let oGateProj: QWWeightView?
+        public let flashGateW: QWTensorValue?
+        public let flashBias: QWTensorValue?
 
         public init(qANormW: QWTensorValue,
                     kvANormW: QWTensorValue,
@@ -33,7 +35,9 @@ extension QWMLAAttnOperator {
                     attnSink: QWTensorValue? = nil,
                     hasOGate: Bool = false,
                     oGateF16: QWTensorValue? = nil,
-                    oGateProj: QWWeightView? = nil) {
+                    oGateProj: QWWeightView? = nil,
+                    flashGateW: QWTensorValue? = nil,
+                    flashBias: QWTensorValue? = nil) {
             self.qANormW = qANormW
             self.kvANormW = kvANormW
             self.kNormW = kNormW
@@ -47,6 +51,8 @@ extension QWMLAAttnOperator {
             self.hasOGate = hasOGate
             self.oGateF16 = oGateF16
             self.oGateProj = oGateProj
+            self.flashGateW = flashGateW
+            self.flashBias = flashBias
         }
     }
 
@@ -65,4 +71,5 @@ extension QWMLAAttnOperator {
     public static let dsaEmeansProbeClusters = 480
     public static let dsaEmeansCandCap = 16384
     public static let selectScratchBudgetBytes = 16 << 20
+    public static let flashIndexerSelHeads = 8
 }

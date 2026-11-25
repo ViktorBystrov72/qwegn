@@ -11,6 +11,7 @@ extension QWServerConfigurationResolver {
         let dflashDraftPackPath: String
         let mtpBackend: String?
         let dflashSelectorTopK: Int
+        let dsparkConfidenceSchedule: Bool?
         let gdnPrefill: String
         let evictPrefillScratch: String
         let prefillChunkSize: Int
@@ -45,8 +46,10 @@ extension QWServerConfigurationResolver {
     static func resolveSpeculativeAndTuning(
         fileSettings: QWServerSettings, environment: [String: String], sources: inout [String: String],
         resolvedPack: String, resolvedMaxContext: Int,
+        cliMTPDrafts: Int? = nil,
         cliMTPBackend: String?, cliDFlashDraftPack: String?,
         cliDFlashBlockSize: Int?, cliDFlashTopK: Int?,
+        cliDSparkConfidenceSchedule: Bool? = nil,
         cliGDNPrefill: String?, cliEvictScratch: String?,
         cliPrefillChunkSize: Int?, cliMaxConcurrentSessions: Int?,
         cliLSAMode: String?, cliLSABudget: Int?,
@@ -104,7 +107,29 @@ extension QWServerConfigurationResolver {
                 return QWServerSettings.inferDrafterBackendAndMaxDrafts(packPath: resolvedDFlashDraftPackPath).backend
             }
             if let b = environment["QWG_MTP_BACKEND"], !b.isEmpty { sources["mtpBackend"] = "env"; return b }
+            if !resolvedPack.isEmpty, let desc = targetDescriptor, desc.dsparkConfig != nil,
+               QWModelDescriptor.DSparkConfig.resolvePackURL(near: resolvedPack) != nil,
+               !desc.supportsNativeMTP, fileSettings.mtpBackend == "variational" {
+                sources["mtpBackend"] = "auto (dspark.qwp)"
+                return "dspark"
+            }
             if !fileSettings.mtpBackend.isEmpty { sources["mtpBackend"] = "config-file"; return fileSettings.mtpBackend }
+            return nil
+        }()
+
+        let resolvedDSparkConfidenceSchedule: Bool? = {
+            if let ds = cliDSparkConfidenceSchedule {
+                sources["dsparkConfidenceSchedule"] = "cli"
+                return ds
+            }
+            if let envStr = environment["QWG_DSPARK_CONFIDENCE_SCHEDULE"] ?? environment["QW_DSPARK_CONFIDENCE_SCHEDULE"] {
+                sources["dsparkConfidenceSchedule"] = "env"
+                return ["1", "true", "yes"].contains(envStr.lowercased())
+            }
+            if fileSettings.dsparkConfidenceSchedule {
+                sources["dsparkConfidenceSchedule"] = "config-file"
+                return true
+            }
             return nil
         }()
 
@@ -266,6 +291,18 @@ extension QWServerConfigurationResolver {
         }()
 
         let resolvedSpeculativeEnabled: Bool = {
+            if let d = cliMTPDrafts {
+                sources["speculativeDecodingEnabled"] = "cli (--mtp-drafts)"
+                return d > 0
+            }
+            if let bs = cliDFlashBlockSize, (2...16).contains(bs) {
+                sources["speculativeDecodingEnabled"] = "cli (--dflash-window)"
+                return true
+            }
+            if let b = cliMTPBackend, !b.isEmpty {
+                sources["speculativeDecodingEnabled"] = "cli (--mtp-backend)"
+                return true
+            }
             if let envStr = environment["QWG_SPECULATIVE_DECODING"] ?? environment["QW_SPECULATIVE"] {
                 sources["speculativeDecodingEnabled"] = "env"
                 return envStr == "1" || envStr.lowercased() == "true"
@@ -356,6 +393,7 @@ extension QWServerConfigurationResolver {
             dflashDraftPackPath: resolvedDFlashDraftPackPath,
             mtpBackend: resolvedMTPBackend,
             dflashSelectorTopK: resolvedDFlashSelectorTopK,
+            dsparkConfidenceSchedule: resolvedDSparkConfidenceSchedule,
             gdnPrefill: resolvedGDNPrefill,
             evictPrefillScratch: resolvedEvictScratch,
             prefillChunkSize: resolvedPrefillChunkSize,

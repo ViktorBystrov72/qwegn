@@ -68,6 +68,9 @@ extension QWEngineDriver {
                 memset(dSlot.kSlab.region.pointer.advanced(by: dSlot.kSlab.offset), 0, dSlot.kSlab.bytes)
                 memset(dSlot.vSlab.region.pointer.advanced(by: dSlot.vSlab.offset), 0, dSlot.vSlab.bytes)
             }
+            if let dsSlot = slot.dsparkSlot {
+                memset(dsSlot.ringBuffer.contents(), 0, dsSlot.ringBytes)
+            }
         }
         var trunkHandle: QWKVHandle?, mtpHandle: QWKVHandle?
         do {
@@ -85,6 +88,7 @@ extension QWEngineDriver {
             let s = QWEngineSession(kv: h, mtpKV: mtpH, rec: slot.rec, ring: slot.ring,
                                     recSlab: slot.recSlab, ringSlab: slot.ringSlab,
                                     trunkHidden: slot.trunkHidden, dflashSlot: slot.dflashSlot,
+                                    dsparkSlot: slot.dsparkSlot,
                                     isSparseMoE: geometry.numExperts > 1)
             s.attnKVViews = try kvCache.layerViewsAll(h, layers: attnLayers)
             if let mtpCache, let mtpH {
@@ -103,6 +107,7 @@ extension QWEngineDriver {
                 }
             } else {
                 s.dflashCacheOffset = 0
+                s.dsparkCacheOffset = 0
             }
             return s
         } catch {
@@ -153,7 +158,8 @@ extension QWEngineDriver {
                                     ringSlab: session.ringSlab,
                                     rec: session.rec, ring: session.ring,
                                     trunkHidden: session.trunkHidden,
-                                    dflashSlot: session.dflashSlot))
+                                    dflashSlot: session.dflashSlot,
+                                    dsparkSlot: session.dsparkSlot))
     }
 
     /// Take an exact snapshot of session state (GDN rec + ring slabs, KV cursors, position).

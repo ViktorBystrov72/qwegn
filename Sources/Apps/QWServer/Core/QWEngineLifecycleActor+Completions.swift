@@ -189,7 +189,8 @@ extension QWEngineLifecycleActor {
             cachePrompt: request.effectiveCachePrompt, cacheSalt: request.effectiveCacheSalt
         )
         let imageUrls = request.extractImageUrls()
-        guard !imageUrls.isEmpty else { return encoded.tokens.count }
+        let videoInputs = request.extractVideoInputs()
+        guard !imageUrls.isEmpty || !videoInputs.isEmpty else { return encoded.tokens.count }
         try validateRequestCapabilities(request)
         let policy = QWImageDecodePolicy(
             allowDataURLs: true,
@@ -198,8 +199,12 @@ extension QWEngineLifecycleActor {
         )
         let mmTurn = try await visionCoordinator.withLock {
             try await QWImageDecoder.prepareMultimodalTurn(
-                promptTokens: encoded.tokens, imageUrls: imageUrls,
-                hiddenDim: loaded.descriptor.hidden, visionBackend: loaded.visionBackend, policy: policy
+                promptTokens: encoded.tokens,
+                imageUrls: imageUrls,
+                videoInputs: videoInputs,
+                hiddenDim: loaded.descriptor.hidden,
+                visionBackend: loaded.visionBackend,
+                policy: policy
             )
         }
         return mmTurn.tokens.count

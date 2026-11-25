@@ -548,4 +548,167 @@ final class QWErnie55MoETests: XCTestCase {
             }
         }
     }
+
+    func testLatentMoET8PrefillScratchNaNSentinelAndHQ8AndStandardBasisParity() throws {
+        let H = 256, L = 64, I = 64, ISh = 64, E = 32, K = 4, maxT = 64
+        let fc1Data = makeAQ8G32Bank(n: L, k: H, seedInit: 0x3101)
+        let fc2Data = makeAQ8G32Bank(n: H, k: L, seedInit: 0x3102)
+        let shGUData = makeAQ8G32Bank(n: 2 * ISh, k: H, seedInit: 0x3103)
+        let shDnData = makeAQ8G32Bank(n: H, k: ISh, seedInit: 0x3104)
+        let guData = makeSHVQBank(bits: 15, group: 64, n: E * 2 * I, k: L, seedInit: 0x4101)
+        let dnData = makeSHVQBank(bits: 3, group: 64, n: E * L, k: I, seedInit: 0x4102)
+        let guStdData = makeAQ8G32Bank(n: E * 2 * I, k: L, seedInit: 0x4201)
+        let dnStdData = makeAQ8G32Bank(n: E * L, k: I, seedInit: 0x4202)
+        let routerW: [Float] = (0..<(2 * E * H)).map { i in sin(Float(i + 3) * 0.029) * 0.2 }
+        let routerB: [Float] = (0..<E).map { i in cos(Float(i + 5) * 0.13) * 0.05 }
+        let routeScale: [Float] = (0..<E).map { i in 2.2 + 0.4 * sin(Float(i + 1) * 0.21) }
+        let latGamma16: [Float16] = (0..<L).map { i in Float16(0.1 * sin(Float(i) * 0.17)) }
+        let xVals16: [Float16] = (0..<(maxT * H)).map { i in Float16(sin(Float(i + 7) * 0.06) * 0.35) }
+
+        func verifyConfig(hal: QWHal, T: Int, rotated: Bool, sharedClamp: QWSwiGLUClampSpec?, label: String) throws {
+            let expertGuData = rotated ? guData : guStdData
+            let expertDnData = rotated ? dnData : dnStdData
+            let weightBytes = fc1Data.count + fc2Data.count + shGUData.count + shDnData.count
+                + expertGuData.count + expertDnData.count + (2 << 20)
+            let arena = try QWArena(hal: hal, weights: weightBytes, activations: 16 << 20, kv: 0, gdnStates: 0)
+            let wr = arena.weightsRegion(), ar = arena.activationsRegion()
+            func loadView(_ d: Data, n: Int, k: Int, bits: Int, group: Int, isSHVQ: Bool) throws -> QWWeightView {
+                let b = try wr.allocate(QWTensorShape([(d.count + 1) / 2], .f16))
+                arena.copyIn(b, from: d)
+                return try XCTUnwrap(QWWeightView(blocks: b, n: n, k: k, bits: bits, groupSize: group,
+                                                  isRotated: rotated, isIncumbentContainer: false, isSHVQ: isSHVQ))
+            }
+            let fc1View = try loadView(fc1Data, n: L, k: H, bits: 8, group: 32, isSHVQ: false)
+            let fc2View = try loadView(fc2Data, n: H, k: L, bits: 8, group: 32, isSHVQ: false)
+            let shGUView = try loadView(shGUData, n: 2 * ISh, k: H, bits: 8, group: 32, isSHVQ: false)
+            let shDnView = try loadView(shDnData, n: H, k: ISh, bits: 8, group: 32, isSHVQ: false)
+            let guView = rotated
+                ? try loadView(expertGuData, n: E * 2 * I, k: L, bits: 15, group: 64, isSHVQ: true)
+                : try loadView(expertGuData, n: E * 2 * I, k: L, bits: 8, group: 32, isSHVQ: false)
+            let dnView = rotated
+                ? try loadView(expertDnData, n: E * L, k: I, bits: 3, group: 64, isSHVQ: true)
+                : try loadView(expertDnData, n: E * L, k: I, bits: 8, group: 32, isSHVQ: false)
+
+            let routerTV = try wr.allocate(QWTensorShape([2 * E * H], .f32))
+            let biasTV = try wr.allocate(QWTensorShape([E], .f32))
+            let scaleTV = try wr.allocate(QWTensorShape([E], .f32))
+            let latGammaTV = try wr.allocate(QWTensorShape([L], .f16))
+            arena.write(routerTV, from: routerW)
+            arena.write(biasTV, from: routerB)
+            arena.write(scaleTV, from: routeScale)
+            arena.write(latGammaTV, from: latGamma16)
+
+            let latent = QWMoEOperator.LatentBottleneck(fc1: fc1View, normGamma: latGammaTV, normEps: 1e-6,
+                                                        fc2: fc2View, latentDim: L)
+            let weights = QWMoEOperator.Weights(
+                router: routerTV, routerBias: biasTV, routedScaleParam: scaleTV, splitFeatureRouting: true,
+                gateUp: guView, down: dnView, sharedGateUp: shGUView, sharedDown: shDnView,
+                latent: latent, hidden: H, experts: E, topK: K, intermediate: I, sharedIntermediate: ISh,
+                normTopK: true, reuseExpertsAcrossTokens: true, sharedSwigluClamp: sharedClamp
+            )
+            let tilePlan = QWGemm.MoETilePlan(experts: E, pairs: maxT * K, gateUpRows: 2 * I, downRows: L)
+            let naxX16 = try ar.allocate(QWTensorShape([maxT * (H + ISh)], .f16))
+            let naxY16 = try ar.allocate(QWTensorShape([maxT * (H + ISh)], .f16))
+            let gu16 = try ar.allocate(QWTensorShape([maxT * K * 2 * I], .f16))
+            let dnHi = try ar.allocate(QWTensorShape([maxT * K * I], .f16))
+            let bufB16 = try ar.allocate(QWTensorShape([maxT * L], .f16))
+            let gateTV = try ar.allocate(QWTensorShape([maxT], .f32))
+            arena.write(gateTV, from: [Float](repeating: 1.0, count: maxT))
+            let indInts = QWGemmFP.MoEActiveBucketPlan.indirectBufferBytes / 4
+            let scratch = QWMoEOperator.Scratch(
+                xRot32: try ar.allocate(QWTensorShape([maxT * H], .f32)),
+                xPlain32: try ar.allocate(QWTensorShape([maxT * H], .f32)),
+                logits: try ar.allocate(QWTensorShape([maxT * 2 * E], .f32)),
+                idx: try ar.allocate(QWTensorShape([maxT * K], .i32)),
+                wts: try ar.allocate(QWTensorShape([maxT * K], .f32)),
+                gu32: try ar.allocate(QWTensorShape([maxT * K * 2 * I], .f32)),
+                act32: try ar.allocate(QWTensorShape([maxT * K * I], .f32)),
+                guSh32: try ar.allocate(QWTensorShape([maxT * 2 * ISh], .f32)),
+                actSh32: try ar.allocate(QWTensorShape([maxT * ISh], .f32)),
+                shared: try ar.allocate(QWTensorShape([maxT * H], .f32)),
+                gate: gateTV,
+                expOff: try ar.allocate(QWTensorShape([E + 1], .i32)),
+                sortedPair: try ar.allocate(QWTensorShape([maxT * K], .i32)),
+                sortedTok: try ar.allocate(QWTensorShape([maxT * K], .i32)),
+                invPerm: try ar.allocate(QWTensorShape([maxT * K], .i32)),
+                tileE: try ar.allocate(QWTensorShape([tilePlan.maxTiles], .i32)),
+                tileR: try ar.allocate(QWTensorShape([tilePlan.maxTiles], .i32)),
+                tileCount: try ar.allocate(QWTensorShape([tilePlan.scratchInts], .i32)),
+                gu16: gu16, dnHi: dnHi,
+                dnAcc: try ar.allocate(QWTensorShape([maxT * K * H], .f32)),
+                naxX16: naxX16, naxY16: naxY16,
+                latent: QWMoEOperator.LatentScratch(
+                    bufA32: try ar.allocate(QWTensorShape([maxT * L], .f32)),
+                    bufB32: try ar.allocate(QWTensorShape([maxT * L], .f32)),
+                    bufB16: bufB16
+                ),
+                maxTileWidth: H,
+                activeExperts: try ar.allocate(QWTensorShape([E], .i32)),
+                activeIndirect: try ar.allocate(QWTensorShape([indInts], .i32))
+            )
+            let x16In = try ar.allocate(QWTensorShape([maxT * H], .f16))
+            let refOut = try ar.allocate(QWTensorShape([maxT * H], .f32))
+            let testOut = try ar.allocate(QWTensorShape([maxT * H], .f32))
+            arena.write(x16In, from: xVals16)
+            for t in 0..<T {
+                guard let pair = hal.begin() else { throw XCTSkip("no command buffer") }
+                var enc = pair.1
+                do {
+                    try QWMoEOperator.encodeResident(
+                        &enc, hal: hal, weights: weights, scratch: scratch,
+                        input: .f16Normed(x16In.slice(byteOffset: t * H * 2, count: H, dtype: .f16)),
+                        out32: refOut.slice(byteOffset: t * H * 4, count: H, dtype: .f32),
+                        rows: 1, supportsGroupedNaxPrefill: false, concurrentBarriers: true)
+                } catch {
+                    enc.endEncoding()
+                    throw error
+                }
+                hal.end(pair.0, enc)
+                pair.0.waitUntilCompleted()
+                XCTAssertNil(pair.0.error)
+            }
+            arena.write(naxX16, from: [Float16](repeating: .nan, count: maxT * (H + ISh)))
+            arena.write(naxY16, from: [Float16](repeating: .nan, count: maxT * (H + ISh)))
+            arena.write(gu16, from: [Float16](repeating: .nan, count: maxT * K * 2 * I))
+            arena.write(dnHi, from: [Float16](repeating: .nan, count: maxT * K * I))
+            arena.write(bufB16, from: [Float16](repeating: .nan, count: maxT * L))
+
+            guard let pair = hal.begin() else { throw XCTSkip("no command buffer") }
+            var enc = pair.1
+            do {
+                try QWMoEOperator.encodeResident(
+                    &enc, hal: hal, weights: weights, scratch: scratch,
+                    input: .f16Normed(x16In.slice(byteOffset: 0, count: T * H, dtype: .f16)),
+                    out32: testOut.slice(byteOffset: 0, count: T * H, dtype: .f32),
+                    rows: T, supportsGroupedNaxPrefill: hal.caps.isMetal4TensorCapable, concurrentBarriers: true,
+                    rotateEncoder: { inner in try hal.rotateEncoder(pair.0, &inner) })
+            } catch {
+                enc.endEncoding()
+                throw error
+            }
+            hal.end(pair.0, enc)
+            pair.0.waitUntilCompleted()
+            XCTAssertNil(pair.0.error)
+
+            let ref = arena.read(refOut, as: Float.self, count: T * H)
+            let got = arena.read(testOut, as: Float.self, count: T * H)
+            var diffSq = 0.0, refSq = 0.0
+            for i in 0..<ref.count {
+                XCTAssertFalse(got[i].isNaN, "\(label): NaN output at \(i)")
+                let d = Double(got[i]) - Double(ref[i])
+                diffSq += d * d
+                refSq += Double(ref[i]) * Double(ref[i])
+            }
+            let rel = (diffSq / max(refSq, 1e-30)).squareRoot()
+            XCTAssertLessThan(rel, T <= 8 ? 5e-3 : 8e-3, "\(label) rel error: \(rel)")
+        }
+
+        try verifyConfig(hal: Self.ernieHal, T: 8, rotated: true, sharedClamp: nil, label: "T=8 NaN sentinel unclamped")
+        try verifyConfig(hal: Self.ernieHal, T: 8, rotated: true,
+                         sharedClamp: QWSwiGLUClampSpec(limit: 4.0, postSilu: true), label: "T=8 NaN sentinel clamped")
+        if Self.ernieHal.caps.isMetal4TensorCapable {
+            let stdHal = try QWHal(geometry: Self.ernieGeometry, weightBasis: .standard)
+            try verifyConfig(hal: stdHal, T: 64, rotated: false, sharedClamp: nil, label: "T=64 standard basis + HQ8 fused")
+        }
+    }
 }

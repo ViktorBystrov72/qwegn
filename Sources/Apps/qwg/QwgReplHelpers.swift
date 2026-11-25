@@ -27,8 +27,11 @@ extension Repl {
         visionController: QWCLIVisionController?,
         history: inout [QWJson],
         activeImageHistory: inout [String],
+        activeVideoHistory: inout [QWVideoInputSpec],
         recalledVaultPaths: inout Set<String>,
         pendingTurnImage: inout String?,
+        pendingTurnVideo: inout String?,
+        replTempFiles: inout [URL],
         activeMemoryPack: inout QWResolvedCliMemoryPack?,
         mountedMemoryTokens: inout [Int],
         currentSystem: inout String?,
@@ -46,7 +49,10 @@ extension Repl {
             conversation?.reset()
             history.removeAll()
             activeImageHistory.removeAll()
+            activeVideoHistory.removeAll()
             recalledVaultPaths.removeAll()
+            pendingTurnImage = nil
+            pendingTurnVideo = nil
             visionController?.unload()
             if let s = currentSystem, !s.isEmpty {
                 history.append(.object([("role", .string("system")), ("content", .string(s))]))
@@ -60,12 +66,37 @@ extension Repl {
             pendingTurnImage = outcome.nextPending
             print("\(cliColor.systemNotice)\(outcome.notice)\(cliColor.reset)\n")
             return .continueLoop
+        case "/video":
+            let outcome = Self.resolveSlashVideoCommand(
+                arg: arg, hasVisionController: visionController != nil, currentPending: pendingTurnVideo
+            )
+            pendingTurnVideo = outcome.nextPending
+            print("\(cliColor.systemNotice)\(outcome.notice)\(cliColor.reset)\n")
+            return .continueLoop
+        case "/screen":
+            guard visionController != nil else {
+                print("\(cliColor.systemNotice)[Cannot capture screen: vision is disabled (--no-load-vision) or unsupported by this model.]\(cliColor.reset)\n")
+                return .continueLoop
+            }
+            do {
+                let captured = try QWScreenCaptureHelper.captureActiveDisplayToTempFileSync(
+                    promptForPermissionIfNeeded: true
+                )
+                replTempFiles.append(captured.fileURL)
+                pendingTurnImage = captured.fileURL.path
+                print("\(cliColor.systemNotice)[Captured display \(captured.snapshot.width)x\(captured.snapshot.height) for next turn.]\(cliColor.reset)\n")
+            } catch {
+                print("\(cliColor.systemNotice)[\(error)]\(cliColor.reset)\n")
+            }
+            return .continueLoop
         case "/help", "/h", "/?":
             print("""
             \(cliColor.bold)Commands:\(cliColor.reset)
               /help, /h               Show this help message
               /clear, /reset          Clear conversation history
               /image [path]           Attach an image to the next turn
+              /video [path]           Attach a video (.mp4/.mov/.m4v) to the next turn
+              /screen                 Capture active macOS display for the next turn
               /system [prompt]        View or update system prompt (empty to clear)
               /thinking [on|off]      Toggle or set thinking mode
               /effort [low|med|xhigh] Set reasoning effort
@@ -195,5 +226,21 @@ extension Repl {
         }
         let next = arg.isEmpty ? nil : arg
         return (true, next, "[Next turn image: \(next ?? "none")]")
+    }
+
+    static func resolveSlashVideoCommand(
+        arg: String,
+        hasVisionController: Bool,
+        currentPending: String?
+    ) -> (accepted: Bool, nextPending: String?, notice: String) {
+        guard hasVisionController else {
+            return (
+                false,
+                nil,
+                "[Cannot attach video: vision is disabled (--no-load-vision) or unsupported by this model.]"
+            )
+        }
+        let next = arg.isEmpty ? nil : arg
+        return (true, next, "[Next turn video: \(next ?? "none")]")
     }
 }

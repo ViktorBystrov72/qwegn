@@ -45,6 +45,9 @@ extension QWEngineDriver {
                               runsHead: Bool = true, mode: GDNPrefillMode,
                               permit: QWGenerationPermit?,
                               dflashWindowEnd: Int? = nil) throws -> Int {
+        let arb = gpuTurnArbitrator
+        arb?.acquirePrimaryStepSync()
+        defer { arb?.releasePrimaryStep() }
         let T = count
         guard T > 0, T <= psc.maxChunk, start >= 0, start + T <= tokens.count else {
             throw QWEngineDriverError.state("prefillChunk invalid T=\(T)")
@@ -100,7 +103,7 @@ extension QWEngineDriver {
         if !activeVisualSpans.isEmpty {
             applyVisualSpans(start: pos, count: T, to: psc.x)
         }
-        if let mtpPromptEmbeddings, dflashDrafter == nil {
+        if let mtpPromptEmbeddings, dflashDrafter == nil, dsparkDrafter == nil {
             let src = psc.x.region.buffer.contents().advanced(by: psc.x.region.base + psc.x.offset)
             let dst = mtpPromptEmbeddings.region.buffer.contents().advanced(by: mtpPromptEmbeddings.region.base + mtpPromptEmbeddings.offset)
             memcpy(dst, src, T * H * 2)
@@ -111,6 +114,12 @@ extension QWEngineDriver {
                 startPos: pos, rows: T,
                 windowEnd: dflashWindowEnd ?? (pos + T),
                 maxCacheSize: drafter.config.maxCacheSize)
+        }
+        let dsparkCapture: QWDSparkDrafter.PrefillCaptureSlice? = dsparkDrafter.flatMap { drafter in
+            QWDSparkDrafter.prefillCaptureSlice(
+                startPos: pos, rows: T,
+                windowEnd: dflashWindowEnd ?? (pos + T),
+                slidingWindow: drafter.config.slidingWindow)
         }
 
         for (v, p) in geometry.executionPlan.enumerated() {
@@ -132,6 +141,16 @@ extension QWEngineDriver {
             try layerKernels[p].encodePrefillChunk(QWLayerPrefillContext(
                 driver: self, enc: activeEnc ?? enc, session: session, position: pos, layer: v,
                 weights: lw, rows: T, mode: mode, dflashCapture: dflashCapture))
+            if let dCap = dsparkCapture {
+                let nextP = (v + 1 < geometry.executionPlan.count) ? geometry.executionPlan[v + 1] : nil
+                let tapEnc = activeEnc ?? enc
+                encodeDSparkTargetTapIfNeeded(
+                    tapEnc, physicalLayer: p, nextPhysicalLayer: nextP,
+                    mhcStream: psc.mhcStream, mhcControls: psc.mhcControls,
+                    branchDn16: prefixRows(psc.dn16, rows: T, cols: H, dt: .f16),
+                    residualX16: prefixRows(psc.x, rows: T, cols: H, dt: .f16),
+                    srcRowOffset: dCap.localStart, dstRowOffset: 0, rows: dCap.captureRows)
+            }
         }
         cb = activeCB ?? cb
         enc = activeEnc ?? enc
@@ -147,7 +166,9 @@ extension QWEngineDriver {
             // left the count honest.
         }
 
-        let needsSeedingPass = mtpPromptEmbeddings != nil || (dflashDrafter != nil && dflashCapture != nil)
+        let needsSeedingPass = mtpPromptEmbeddings != nil
+            || (dflashDrafter != nil && dflashCapture != nil)
+            || (dsparkDrafter != nil && dsparkCapture != nil)
         if needsSeedingPass {
             if T >= 1024 {
                 activeEnc = nil
@@ -173,7 +194,8 @@ extension QWEngineDriver {
                                  embeddings: seedEmbeddings,
                                  hidden: seedHidden,
                                  count: T, cacheRows: mtpRows,
-                                 dflashCapture: dflashCapture)
+                                 dflashCapture: dflashCapture,
+                                 dsparkCapture: dsparkCapture)
             cb.commit()
         } else {
             activeEnc = nil
@@ -289,7 +311,8 @@ extension QWEngineDriver {
 
     private func prepareTurnMRoPE(_ session: QWEngineSession, tokensCount: Int) -> Int {
         let initialDelta = session.roundRecord.mropeDelta
-        guard let mla = mlaOperator, mla.mropeLayout != .none1D, tokensCount > 0 else {
+        let layout = mlaOperator?.mropeLayout ?? geometry.mropeLayout
+        guard layout != .none1D, tokensCount > 0 else {
             session.clearTurnMRoPE()
             return initialDelta
         }
@@ -322,12 +345,13 @@ extension QWEngineDriver {
                 merge: max(1, span.spatialMergeSize), posSide: max(1, baseSpec.posSide),
                 imageToken: baseSpec.imageToken, videoToken: baseSpec.videoToken,
                 usesUnfoldedPatchEmbed: baseSpec.usesUnfoldedPatchEmbed,
-                mropeLayout: mla.mropeLayout
+                mropeLayout: layout
             )
             if let grid = try? QWVisionGrid(t: max(1, span.gridT), h: span.gridH, w: span.gridW, spec: spanSpec),
                grid.tokens == segLen {
                 let tokFill = [Int](repeating: 0, count: segLen)
-                blocks.append(span.gridT > 1 ? .video(tokens: tokFill, grid: grid) : .image(tokens: tokFill, grid: grid))
+                let isVid = span.isVideo || span.gridT > 1
+                blocks.append(isVid ? .video(tokens: tokFill, grid: grid) : .image(tokens: tokFill, grid: grid))
             } else {
                 blocks.append(.text([Int](repeating: 0, count: segLen)))
             }
@@ -339,12 +363,23 @@ extension QWEngineDriver {
         let rope = qwMRopePositions(
             blocks: blocks,
             merge: geometry.visMerge > 0 ? geometry.visMerge : nil,
-            layout: mla.mropeLayout,
+            layout: layout,
             initialCursor: startPos + initialDelta
         )
         session.mropeTurnPositions = rope.pos
         session.mropeTurnStartPos = startPos
         session.mropeTurnTokenCount = tokensCount
+        if mlaOperator == nil, let tables = ropeApply.tables,
+           let turnCosSin = try? tables.buildMRoPECosSin(
+               mropePositions: rope.pos, tokenCount: tokensCount, layout: layout
+           ) {
+            session.mropeTurnTableBuffer = turnCosSin.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> (any MTLBuffer)? in
+                guard let base = raw.baseAddress, raw.count > 0 else { return nil }
+                return hal.device.makeBuffer(bytes: base, length: raw.count, options: .storageModeShared)
+            }
+        } else {
+            session.mropeTurnTableBuffer = nil
+        }
         return initialDelta + rope.delta
     }
 

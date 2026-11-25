@@ -16,6 +16,8 @@ extension QWModelDescriptor {
             let beta_slow: Double?
             let mscale: Double?
             let mscale_all_dim: Double?
+            var full_attention: RopeParameters? = nil
+            var sliding_attention: RopeParameters? = nil
         }
         final class RopeScaling: Decodable {
             let type: String?
@@ -29,19 +31,31 @@ extension QWModelDescriptor {
         }
         final class VisionConfig: Decodable {
             let depth: Int?
+            var num_hidden_layers: Int? = nil
             let hidden_size: Int?
             let num_heads: Int?
+            var num_attention_heads: Int? = nil
             let intermediate_size: Int?
             let patch_size: Int?
             let temporal_patch_size: Int?
             let spatial_merge_size: Int?
             let num_position_embeddings: Int?
+            var num_patches: Int? = nil
             let out_hidden_size: Int?
             let image_size: Int?
             let rms_norm_eps: Double?
+            var norm_eps: Double? = nil
+            var layer_norm_eps: Double? = nil
             let hidden_act: String?
             let model_type: String?
             var disable_merger_proj: Bool? = nil
+            var num_key_value_heads: Int? = nil
+            var layer_types: [String]? = nil
+            var conv_kernel_size: Int? = nil
+            var downsample_factor: Int? = nil
+            var out_dim: Int? = nil
+            var rope_theta: Double? = nil
+            var rope_parameters: RopeParameters? = nil
         }
         struct GenerationConfig: Decodable {
             let eos_token_id: JSONIntOrList?
@@ -92,7 +106,26 @@ extension QWModelDescriptor {
             var layer_group_size: Int? = nil
             var compress_ratios: [Int]? = nil
             var full_attention_interval: Int? = nil
-            let rms_norm_eps: Double
+            var rms_norm_eps: Double? = nil
+            var norm_eps: Double? = nil
+            var layer_norm_eps: Double? = nil
+            var block_norm_eps: Double? = nil
+            var norm_bias: Bool? = nil
+            var use_sandwich_norm: Bool? = nil
+            var conv_L_cache: Int? = nil
+            var conv_bias: Bool? = nil
+            var block_auto_adjust_ff_dim: Bool? = nil
+            var block_ffn_dim_multiplier: Double? = nil
+            var block_multiple_of: Int? = nil
+            var global_rope_theta: Double? = nil
+            var local_rope_theta: Double? = nil
+            var local_attention: Int? = nil
+            var global_attn_every_n_layers: Int? = nil
+            var classifier_pooling: String? = nil
+            var id2label: [String: String]? = nil
+            var num_labels: Int? = nil
+            var pad_token_id: Int? = nil
+            var bos_token_id: Int? = nil
             var max_position_embeddings: Int? = nil
             var model_max_length: Int? = nil
             let num_attention_heads: Int
@@ -239,6 +272,14 @@ extension QWModelDescriptor {
             var mtp_num_layers: Int? = nil
             let mtp_use_dedicated_embeddings: Bool?
             var mtp_shared_last_layer: Bool? = nil
+            var dspark_block_size: Int? = nil
+            var dspark_markov_rank: Int? = nil
+            var dspark_noise_token_id: Int? = nil
+            var dspark_target_layer_ids: [Int]? = nil
+            var dspark_num_hidden_layers: Int? = nil
+            var dspark_sliding_window: Int? = nil
+            var dspark_rope_theta: Double? = nil
+            var enable_confidence_head: Bool? = nil
             var multimax: String? = nil
             var tie_word_embeddings: Bool? = nil
             var eos_token_id: JSONIntOrList? = nil
@@ -267,6 +308,25 @@ extension QWModelDescriptor {
         let mrope_section: [Int]?
         let loop_settings: RawLoopSettings?
         let mhc: MHCValue?
+        let max_length: Int?
+        let image_text_length: Int?
+        let audio_text_length: Int?
+        let head_layers: Int?
+        let temperatures: [String: Double]?
+        let pad_token_id: Int?
+        let bos_token_id: Int?
+        let d1_codes: Int?
+        let d1_attention: String?
+        let d1_numbers: Bool?
+        let d1_set_size: Int?
+        let d1_vision_max_pixels: Int?
+        let projector_hidden_size: Int?
+        let projector_layer_norm_eps: Double?
+        let projector_bias: Bool?
+        let auto_map: [String: String]?
+        let id2label: [String: String]?
+        let classifier_pooling: String?
+        let num_labels: Int?
     }
 
 }

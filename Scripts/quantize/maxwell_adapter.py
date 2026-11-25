@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 from ernie55_adapter import ShardReader, _hq_meta
+from hq_blocks import validate_source_quant_config
 from pack import pack_file, sha256, synthesize_base_chat_template
 from shvq import any_block_bytes, format_any_quant_spec, parse_any_quant_spec, quant_any_blocks
 from verify import audit_pack, read_header
@@ -275,6 +276,7 @@ def quantize_maxwell_model(
         raise ValueError(f"no .safetensors under {source}")
     config = json.loads((source / "config.json").read_text())
     tc = config["text_config"] if "text_config" in config else config
+    fp8_block_size = validate_source_quant_config(config)
     if not (source / "tokenizer.json").is_file():
         raise FileNotFoundError(f"required asset missing: {source / 'tokenizer.json'}")
     embedded_tpl = None
@@ -300,7 +302,7 @@ def quantize_maxwell_model(
     else:
         quant_recorded = f"dense_{dense_fmt}__expert_{expert_fmt}__expdown_{expert_down_fmt}"
 
-    reader = ShardReader(source, files)
+    reader = ShardReader(source, files, fp8_block_size=fp8_block_size)
     expected_shapes = build_maxwell_expected_shapes(tc)
 
     sha256_source_hex = None

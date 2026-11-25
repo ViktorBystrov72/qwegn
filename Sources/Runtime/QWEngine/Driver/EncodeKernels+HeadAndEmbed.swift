@@ -31,8 +31,10 @@ extension QWEngineDriver {
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
-    /// QW_MHC_ROWS in qwmhc_rows.metal.
-    static let mhcRouterRowsPerGroup = 4
+    /// Rows per threadgroup in qwmhc_rows.metal (8 for C=4, 4 for C=2).
+    static func mhcRouterRowsPerGroup(streams: Int) -> Int {
+        streams == 4 ? 8 : 4
+    }
 
     func encodeMHCRouterNorm(_ enc: any MTLComputeCommandEncoder,
                              stream: QWTensorValue, w: QWTensorValue, b: QWTensorValue,
@@ -83,7 +85,7 @@ extension QWEngineDriver {
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             return
         }
-        let rowsPSO = rows >= 64 ? psoMHCRouterNormRows : nil
+        let rowsPSO = rows >= 16 ? psoMHCRouterNormRows : nil
         if let rowsPSO { enc.setComputePipelineState(rowsPSO) }
         enc.bindTensors(stream, w, b, gamma, out, controls, startIndex: 0)
         enc.setUInt32s(hidden, startIndex: 6)
@@ -92,9 +94,9 @@ extension QWEngineDriver {
         enc.setBytes(&iterations, length: 4, index: 9)
         (mergeBranchOut ?? out).bind(enc, index: 10)
         if rowsPSO != nil {
+            let rpg = Self.mhcRouterRowsPerGroup(streams: geometry.mhcConfig?.streams ?? 4)
             enc.setUInt32s(rows, startIndex: 11)
-            enc.dispatchThreadgroups(MTLSize(width: (rows + Self.mhcRouterRowsPerGroup - 1) / Self.mhcRouterRowsPerGroup,
-                                             height: 1, depth: 1),
+            enc.dispatchThreadgroups(MTLSize(width: (rows + rpg - 1) / rpg, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             return
         }

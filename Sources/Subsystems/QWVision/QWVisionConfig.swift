@@ -7,10 +7,13 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
     public enum Architecture: String, Sendable, Equatable, Hashable {
         case qwen3VL
         case inkling2
+        case lfm3VL
+        case siglip2
     }
 
     public let dim: Int
     public let heads: Int
+    public let kvHeads: Int
     public let headDim: Int
     public let depth: Int
     public let mlpInner: Int
@@ -23,6 +26,7 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
     public let videoTokenId: Int
     public let ropeTheta: Double
     public let eps: Float
+    public let projectorNormEps: Float
     public let architecture: Architecture
     public let projectionHiddenDim: Int
     public let projectorBias: Bool
@@ -31,6 +35,8 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
     public let imageStd: [Float]
     public let mropeLayout: QWModelDescriptor.MRoPELayout
     public let disableInternalMergerProj: Bool
+    public let visionLayerTypes: [String]
+    public let convKernelSize: Int
 
     public var effectiveMergerIntermediateDim: Int {
         if projectionHiddenDim > 0 { return projectionHiddenDim }
@@ -64,6 +70,7 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
         videoTokenId: Int,
         ropeTheta: Double = 10_000,
         eps: Float = 1e-6,
+        projectorNormEps: Float? = nil,
         architecture: Architecture = .qwen3VL,
         projectionHiddenDim: Int = 0,
         projectorBias: Bool = true,
@@ -71,10 +78,14 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
         imageMean: [Float] = [0.5, 0.5, 0.5],
         imageStd: [Float] = [0.5, 0.5, 0.5],
         mropeLayout: QWModelDescriptor.MRoPELayout = .qwenInterleaved,
-        disableInternalMergerProj: Bool = false
+        disableInternalMergerProj: Bool = false,
+        kvHeads: Int? = nil,
+        visionLayerTypes: [String] = [],
+        convKernelSize: Int = 3
     ) {
         self.dim = dim
         self.heads = heads
+        self.kvHeads = kvHeads ?? heads
         self.headDim = headDim
         self.depth = depth
         self.mlpInner = mlpInner
@@ -87,6 +98,7 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
         self.videoTokenId = videoTokenId
         self.ropeTheta = ropeTheta
         self.eps = eps
+        self.projectorNormEps = projectorNormEps ?? eps
         self.architecture = architecture
         self.projectionHiddenDim = projectionHiddenDim
         self.projectorBias = projectorBias
@@ -95,12 +107,20 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
         self.imageStd = imageStd
         self.mropeLayout = mropeLayout
         self.disableInternalMergerProj = disableInternalMergerProj
+        self.visionLayerTypes = visionLayerTypes
+        self.convKernelSize = convKernelSize
     }
 
     public init(descriptor: QWModelDescriptor) {
         if let vt = descriptor.visionTowerConfig {
             let computedHeadDim = vt.heads > 0 ? vt.hidden / vt.heads : 0
-            let isUnfolded = (vt.patchEmbedKind == .unfoldedPatchProj)
+            let arch: Architecture = switch vt.patchEmbedKind {
+            case .unfoldedPatchProj: .inkling2
+            case .lfmHybridConv: .lfm3VL
+            case .siglip2NaFlex: .siglip2
+            case .conv3d: .qwen3VL
+            }
+            let isFixedTemporal = (vt.patchEmbedKind == .unfoldedPatchProj || vt.patchEmbedKind == .siglip2NaFlex)
             let projH = vt.mergerIntermediateDim ?? (vt.merge * vt.merge * vt.hidden)
             self.init(
                 dim: vt.hidden,
@@ -109,7 +129,7 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
                 depth: vt.depth,
                 mlpInner: vt.intermediate,
                 patch: vt.patch,
-                temporal: isUnfolded ? 1 : vt.temporal,
+                temporal: isFixedTemporal ? 1 : vt.temporal,
                 merge: vt.merge,
                 numPosEmbeds: vt.numPosEmbeds,
                 outDim: vt.outDim,
@@ -117,14 +137,18 @@ public struct QWVisionConfig: Sendable, Equatable, Hashable {
                 videoTokenId: descriptor.videoTokenId,
                 ropeTheta: vt.ropeTheta,
                 eps: vt.normEps,
-                architecture: isUnfolded ? .inkling2 : .qwen3VL,
+                projectorNormEps: vt.projectorNormEps,
+                architecture: arch,
                 projectionHiddenDim: projH,
                 projectorBias: vt.projectorBias,
                 mergerIntermediateDim: vt.mergerIntermediateDim,
                 imageMean: vt.imageMean,
                 imageStd: vt.imageStd,
                 mropeLayout: vt.mropeLayout,
-                disableInternalMergerProj: vt.disableInternalMergerProj
+                disableInternalMergerProj: vt.disableInternalMergerProj,
+                kvHeads: vt.kvHeads ?? vt.heads,
+                visionLayerTypes: vt.layerTypes ?? [],
+                convKernelSize: vt.convKernelSize ?? 3
             )
             return
         }

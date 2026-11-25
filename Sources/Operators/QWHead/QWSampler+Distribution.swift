@@ -341,6 +341,207 @@ extension QWSampler {
         loopRepetitionTokens(in: window[...], into: &out)
         return out
     }
+
+    /// Builds a categorical distribution restricted strictly to `allowedScratch`.
+    public func constrainedDistributionFromScratch(
+        logits: UnsafeBufferPointer<Float>,
+        repetitionHistory: [Int] = []
+    ) throws -> QWSamplingDistribution {
+        try allowedScratch.withUnsafeBufferPointer { buf in
+            try constrainedDistribution(logits: logits, allowed: buf, repetitionHistory: repetitionHistory)
+        }
+    }
+
+    /// Builds a categorical distribution over ascending `allowed` token IDs.
+    public func constrainedDistribution(
+        logits: UnsafeBufferPointer<Float>,
+        allowed: UnsafeBufferPointer<Int>,
+        repetitionHistory: [Int] = []
+    ) throws -> QWSamplingDistribution {
+        let n = logits.count
+        guard n > 0, let logitsBase = logits.baseAddress else { throw QWSamplerError.invalid("empty logit row") }
+        let count = allowed.count
+        guard count > 0, let allowedBase = allowed.baseAddress else { throw QWTokenConstraintError.emptySupport }
+        if config.isGreedy {
+            let best = try constrainedToken(logits: logits, allowed: allowed, repetitionHistory: repetitionHistory)
+            return QWSamplingDistribution(vocabulary: n, ids: [best], weights: [1.0], mass: 1.0, fullMass: 1.0)
+        }
+        let temperature = config.temperature
+        guard temperature.isFinite, temperature > 0, (1 / temperature).isFinite, config.topK > 0,
+              config.topP.isFinite, config.topP > 0, config.topP <= 1 else {
+            throw QWSamplerError.invalid("invalid temperature, top-k or top-p")
+        }
+        let penalty = config.repetitionPenalty
+        guard penalty.isFinite, penalty > 0 else {
+            throw QWSamplerError.invalid("invalid repetition penalty")
+        }
+        if count == 1 {
+            let only = allowedBase[0]
+            guard only >= 0, only < n, logitsBase[only].isFinite else {
+                throw QWSamplerError.invalid("constrained singleton token or logit is invalid")
+            }
+            return QWSamplingDistribution(vocabulary: n, ids: [only], weights: [1.0], mass: 1.0, fullMass: 1.0)
+        }
+        let applyPenalty = penalty != 1 && !repetitionHistory.isEmpty
+        if applyPenalty {
+            maskScratch.clearBitset()
+            maskScratch.ensureVocabularyCapacity(n)
+            for token in repetitionHistory where token >= 0 && token < n {
+                maskScratch.markTokenUnchecked(token)
+            }
+        }
+        defer { if applyPenalty { maskScratch.clearBitset() } }
+        ensureConstrainedScratchCapacity(count: count)
+        var previous = -1
+        for index in 0..<count {
+            let token = allowedBase[index]
+            guard token > previous, token < n else {
+                throw QWSamplerError.invalid("constrained support must be ascending token ids inside the vocabulary")
+            }
+            previous = token
+            var value = logitsBase[token]
+            if applyPenalty, maskScratch.contains(token) {
+                value = value < 0 ? value * penalty : value / penalty
+            }
+            guard value.isFinite else {
+                throw QWSamplerError.invalid("constrained logit is non-finite")
+            }
+            penaltyScratch[index] = value
+        }
+        var maxValue: Float = 0, sumF: Float = 0, negMax: Float = 0
+        var invT = 1 / temperature, bias: Float = 0
+        var nu = Int32(count)
+        let len = vDSP_Length(count)
+        penaltyScratch.withUnsafeMutableBufferPointer { vp in
+            let vPtr = vp.baseAddress!
+            vDSP_maxv(vPtr, 1, &maxValue, len)
+            negMax = -maxValue
+            shiftedScratch.withUnsafeMutableBufferPointer { sp in
+                let sPtr = sp.baseAddress!
+                vDSP_vsadd(vPtr, 1, &negMax, sPtr, 1, len)
+                vDSP_vsmsa(sPtr, 1, &invT, &bias, sPtr, 1, len)
+                eScratch.withUnsafeMutableBufferPointer { ep in
+                    let ePtr = ep.baseAddress!
+                    vvexpf(ePtr, sPtr, &nu)
+                    vDSP_sve(ePtr, 1, &sumF, len)
+                }
+            }
+        }
+        let fullMass = Double(sumF)
+        let eFiniteNonNeg = eScratch.withUnsafeBufferPointer {
+            Self.allFiniteNonNegSIMD(UnsafeBufferPointer(start: $0.baseAddress, count: count), sum: sumF)
+        }
+        guard fullMass.isFinite, fullMass > 0, eFiniteNonNeg else {
+            throw QWSamplerError.invalid("invalid constrained softmax mass")
+        }
+        for i in 0..<count { constrainedWeightsScratch[i] = Double(eScratch[i]) }
+        let k = min(config.topK, count)
+        fillConstrainedTopIndices(count: count, topK: k)
+        let topP = Double(config.topP)
+        var keepCount = 0
+        var cumulative = 0.0
+        for pos in 0..<k {
+            if cumulative >= topP { break }
+            let index = topKScratch[pos]
+            constrainedKeepScratch[keepCount] = index
+            keepCount += 1
+            cumulative += constrainedWeightsScratch[index] / fullMass
+        }
+        constrainedKeepScratch[0..<keepCount].sort()
+        var ids: [Int] = []
+        var weights: [Double] = []
+        ids.reserveCapacity(keepCount)
+        weights.reserveCapacity(keepCount)
+        var mass = 0.0
+        for i in 0..<keepCount {
+            let slot = constrainedKeepScratch[i]
+            let w = constrainedWeightsScratch[slot]
+            ids.append(allowedBase[slot])
+            weights.append(w)
+            mass += w
+        }
+        guard mass.isFinite, mass > 0, !ids.isEmpty else {
+            throw QWSamplerError.invalid("invalid constrained survivor mass")
+        }
+        return QWSamplingDistribution(vocabulary: n, ids: ids, weights: weights, mass: mass, fullMass: fullMass)
+    }
+
+    /// Evaluates variational log-margin and probability floor strictly over `allowedScratch`.
+    public func clearsConstrainedVariationalGateFromScratch(
+        logits: UnsafeBufferPointer<Float>,
+        draftToken: Int,
+        targetToken: Int,
+        repetitionHistory: [Int] = [],
+        margin: Float,
+        minProbability: Float
+    ) -> Bool {
+        guard QWTokenMaskScratch.sortedTokens(allowedScratch, contains: draftToken) else { return false }
+        return allowedScratch.withUnsafeBufferPointer { buf in
+            clearsConstrainedVariationalGate(
+                logits: logits, allowed: buf, draftToken: draftToken, targetToken: targetToken,
+                repetitionHistory: repetitionHistory, margin: margin, minProbability: minProbability)
+        }
+    }
+
+    /// Evaluates variational log-margin and probability floor renormalized over `allowed`.
+    public func clearsConstrainedVariationalGate(
+        logits: UnsafeBufferPointer<Float>,
+        allowed: UnsafeBufferPointer<Int>,
+        draftToken: Int,
+        targetToken: Int,
+        repetitionHistory: [Int] = [],
+        margin: Float,
+        minProbability: Float
+    ) -> Bool {
+        let n = logits.count
+        guard margin > 0, n > 0, let logitsBase = logits.baseAddress,
+              allowed.count > 0, let allowedBase = allowed.baseAddress,
+              (0..<n).contains(draftToken), (0..<n).contains(targetToken) else {
+            return false
+        }
+        var lo = 0, hi = allowed.count - 1, inAllowed = false
+        while lo <= hi {
+            let mid = lo + ((hi - lo) >> 1)
+            let v = allowedBase[mid]
+            if v == draftToken { inAllowed = true; break }
+            if v < draftToken { lo = mid + 1 } else { hi = mid - 1 }
+        }
+        guard inAllowed else { return false }
+        let penalty = config.repetitionPenalty
+        let applyPenalty = penalty.isFinite && penalty > 0 && penalty != 1 && !repetitionHistory.isEmpty
+        if applyPenalty {
+            maskScratch.clearBitset()
+            maskScratch.ensureVocabularyCapacity(n)
+            for token in repetitionHistory where token >= 0 && token < n {
+                maskScratch.markTokenUnchecked(token)
+            }
+        }
+        defer { if applyPenalty { maskScratch.clearBitset() } }
+        @inline(__always) func score(_ tok: Int) -> Float {
+            let raw = logitsBase[tok]
+            if applyPenalty, maskScratch.contains(tok) {
+                return raw < 0 ? raw * penalty : raw / penalty
+            }
+            return raw
+        }
+        let draftScore = score(draftToken)
+        let targetScore = score(targetToken)
+        guard draftScore.isFinite, targetScore.isFinite, draftScore >= targetScore - margin else {
+            return false
+        }
+        guard minProbability > 0 else { return true }
+        guard minProbability < 1 else { return false }
+        var sum = 0.0
+        for idx in 0..<allowed.count {
+            let tok = allowedBase[idx]
+            guard tok >= 0 && tok < n else { continue }
+            let diff = score(tok) - targetScore
+            if diff > -45.0 { sum += exp(Double(diff)) }
+        }
+        guard sum > 0, sum.isFinite else { return false }
+        let logProb = Double(draftScore - targetScore) - log(sum)
+        return logProb >= log(Double(minProbability))
+    }
 }
 
 // (the median-of-medians helpers that lived here are GONE — the bounded

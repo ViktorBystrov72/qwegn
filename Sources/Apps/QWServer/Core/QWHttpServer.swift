@@ -554,6 +554,9 @@ public final class QWHttpServer: @unchecked Sendable {
                         createIfInQwgRoot: true
                     )
 
+                case ("POST", "/v1/vision/screen-capture"), ("POST", "/api/vision/screen-capture"):
+                    await self.handleScreenCaptureRoute(connection: connection, body: body)
+
                 case ("POST", "/v1/engine/restart"), ("POST", "/api/restart"):
                     _ = try await self.actor.restartExplicit()
                     let modelName = self.actor.getModelName()
@@ -562,6 +565,33 @@ public final class QWHttpServer: @unchecked Sendable {
 
                 case ("GET", "/v1/engine/info"), ("GET", "/api/engine/info"):
                     self.handleEngineInfoRoute(connection: connection)
+
+                case ("POST", "/v1/decisions"):
+                    await self.handleDecisionRoute(connection: connection, body: body)
+
+                case ("POST", "/v1/decisions/batch"):
+                    await self.handleDecisionBatchRoute(connection: connection, body: body)
+
+                case ("POST", "/v1/systemone"):
+                    await self.handleDecisionRoute(connection: connection, body: body)
+
+                case ("POST", "/v1/systemone/batch"):
+                    await self.handleDecisionBatchRoute(connection: connection, body: body)
+
+                case ("POST", "/v1/laya"):
+                    await self.handleLayaRoute(connection: connection, body: body)
+
+                case ("POST", "/v1/decisions/model/load"):
+                    await self.handleDecisionLoadRoute(connection: connection, body: body)
+
+                case ("POST", "/v1/decisions/model/unload"):
+                    await self.handleDecisionUnloadRoute(connection: connection)
+
+                case ("GET", "/v1/decisions/status"):
+                    self.handleDecisionStatusRoute(connection: connection)
+
+                case ("POST", "/mcp"):
+                    await self.handleMCPRoute(connection: connection, body: body)
 
                 case ("GET", "/v1/update"), ("GET", "/api/update"):
                     await self.handleUpdateStatusRoute(connection: connection)

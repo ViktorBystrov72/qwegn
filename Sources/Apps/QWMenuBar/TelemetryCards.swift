@@ -203,6 +203,83 @@ extension CupertinoTelemetryView {
         )
     }
 
+    @ViewBuilder
+    var decisionSidecarCard: some View {
+        if let facts = telemetry.dashboard?.facts, facts.decisionSidecarLoaded == true {
+            let sidecarName = facts.decisionSidecarModel ?? "—"
+            let backendLabel: String? = {
+                let raw = (facts.decisionSidecarBackend ?? facts.decisionSidecarComputeUnit ?? "").lowercased()
+                if raw.contains("ane") { return "ANE" }
+                if raw.contains("metal") { return "Metal 4" }
+                return facts.decisionSidecarBackend
+            }()
+            let latText = facts.decisionSidecarMeanLatencyMs.map { String(format: "%.1f ms", $0) } ?? "— ms"
+            let memText = facts.decisionSidecarBytes.flatMap { bytes -> String? in
+                guard bytes > 0 else { return nil }
+                return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .center, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("DECISION SIDECAR")
+                            .font(TelemetryTheme.ui(10, .semibold))
+                            .tracking(0.4)
+                            .foregroundStyle(TelemetryTheme.quiet(increasedContrast: contrast == .increased))
+                        MarqueeText(
+                            text: sidecarName,
+                            fontSize: 12.5,
+                            weight: .semibold,
+                            nsWeight: .semibold,
+                            color: TelemetryTheme.primary(increasedContrast: contrast == .increased)
+                        )
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    lifecycleButton(
+                        title: "Unload",
+                        icon: "eject.fill",
+                        tint: TelemetryTheme.warning,
+                        busy: false,
+                        disabled: !telemetry.isConnected
+                    ) {
+                        telemetry.unloadDecisionSidecar()
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
+                    .help("Unload System-1 decision sidecar")
+                }
+
+                HStack(spacing: 5) {
+                    if let backendLabel, !backendLabel.isEmpty {
+                        factPill(backendLabel, tint: backendLabel == "ANE" ? TelemetryTheme.active : TelemetryTheme.accent)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    factPill(latText, tint: TelemetryTheme.neutral)
+                        .fixedSize(horizontal: true, vertical: false)
+                    if let memText {
+                        factPill(memText, tint: TelemetryTheme.cool)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    if let reqs = facts.decisionSidecarTotalRequests, reqs > 0 {
+                        factPill("\(reqs) req", tint: TelemetryTheme.neutral)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(TelemetryTheme.substrate)
+            .clipShape(.rect(cornerRadius: TelemetryTheme.Radius.large))
+            .overlay(
+                RoundedRectangle(cornerRadius: TelemetryTheme.Radius.large)
+                    .stroke(TelemetryTheme.hairline(increasedContrast: contrast == .increased), lineWidth: 0.75)
+            )
+        }
+    }
+
     private struct TraitPill: Equatable {
         let text: String
         let tint: Color

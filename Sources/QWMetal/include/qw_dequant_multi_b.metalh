@@ -290,6 +290,82 @@ METAL_FUNC void qwg_gemv_aq_rows4_m4_f32(device const char* blocks,
 }
 
 template <int BITS, int GROUP, uint LS = 32u>
+METAL_FUNC void qwg_gemv_aq_rows4_m8_f32(device const char* blocks,
+                                         device const float* x,
+                                         uint M, uint row0, uint N, uint K, uint lane,
+                                         thread float4 (&acc)[8]) {
+    const uint nBlocks = K >> 5u;
+    constexpr uint groupBytes = (GROUP * BITS) / 8 + 4u;
+    constexpr uint slicesPerGroup = uint(GROUP) >> 5u;
+    constexpr uint slicePayloadBytes = 4u * uint(BITS);
+    const uint rowBytes = (K / GROUP) * groupBytes;
+    device const char* r0 = blocks + (size_t)row0 * rowBytes;
+    device const char* rPtr[4] = {
+        r0,
+        (row0 + 1u < N) ? (r0 + rowBytes) : r0,
+        (row0 + 2u < N) ? (r0 + 2u * rowBytes) : r0,
+        (row0 + 3u < N) ? (r0 + 3u * rowBytes) : r0
+    };
+    #pragma unroll
+    for (uint m = 0u; m < 8u; ++m) acc[m] = float4(0.0f);
+    for (uint g = lane; g < nBlocks; g += LS) {
+        const uint col = g << 5u;
+        const size_t groupOff = size_t(g / slicesPerGroup) * groupBytes;
+        const uint byteInGroup = (g & (slicesPerGroup - 1u)) * slicePayloadBytes;
+        float sumX[8];
+        #pragma unroll
+        for (uint m = 0u; m < 8u; ++m) sumX[m] = 0.0f;
+        #pragma unroll
+        for (uint r = 0u; r < 4u; ++r) {
+            device const char* gp = rPtr[r] + groupOff;
+            device const uint* pw = (device const uint*)(gp + 4u + byteInGroup);
+            float raw[8];
+            #pragma unroll
+            for (uint m = 0u; m < 8u; ++m) raw[m] = 0.0f;
+            #pragma unroll
+            for (uint w = 0u; w < 4u; ++w) {
+                float4 cLo, cHi;
+                qwg_aq_unpack_word8_codes<BITS>(pw, w, cLo, cHi);
+                #pragma unroll
+                for (uint m = 0u; m < 8u; ++m) {
+                    if (m < M) {
+                        device const float4* pm = (device const float4*)(x + size_t(m) * K + col + w * 8u);
+                        const float4 xlo = pm[0], xhi = pm[1];
+                        if (r == 0u) {
+                            const float4 s = xlo + xhi;
+                            sumX[m] += (s.x + s.y) + (s.z + s.w);
+                        }
+                        raw[m] += dot(cLo, xlo) + dot(cHi, xhi);
+                    }
+                }
+            }
+            const half2 sb = *(device const half2*)gp;
+            const float sx = float(sb.x), bx = float(sb.y);
+            #pragma unroll
+            for (uint m = 0u; m < 8u; ++m) {
+                if (m < M) {
+                    const float d = fma(fma(-1024.0f, sumX[m], raw[m]), sx, bx * sumX[m]);
+                    if (r == 0u)      acc[m].x += d;
+                    else if (r == 1u) acc[m].y += d;
+                    else if (r == 2u) acc[m].z += d;
+                    else              acc[m].w += d;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (uint m = 0u; m < 8u; ++m) {
+        if (m < M) {
+            if (LS == 32u) acc[m] += simd_shuffle_down(acc[m], 16);
+            acc[m] += simd_shuffle_down(acc[m], 8);
+            acc[m] += simd_shuffle_down(acc[m], 4);
+            acc[m] += simd_shuffle_down(acc[m], 2);
+            acc[m] += simd_shuffle_down(acc[m], 1);
+        }
+    }
+}
+
+template <int BITS, int GROUP, uint LS = 32u>
 METAL_FUNC float4 qwg_gemv_aq_rows4_f32(device const char* blocks,
                                         device const float* x,
                                         uint row0,

@@ -1,0 +1,181 @@
+/* decisions.css — Styles for /ui?tab=decisions workbench. */
+
+.dec-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.dec-status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dec-status-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.dec-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--ink-secondary);
+}
+
+.dec-pill.is-acting {
+  background: var(--active-soft);
+  border-color: rgba(63, 185, 80, 0.35);
+  color: var(--active);
+}
+
+.dec-pill.is-failopen {
+  background: var(--prefill-soft);
+  border-color: rgba(240, 180, 41, 0.38);
+  color: var(--prefill);
+}
+
+.dec-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+@media (max-width: 960px) {
+  .dec-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.dec-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.dec-q-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dec-q-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.dec-q-row > .input,
+.dec-q-row > .select {
+  flex: 1;
+  min-width: 110px;
+}
+
+.dec-prob-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.dec-prob-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.dec-prob-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11.5px;
+  gap: 8px;
+}
+
+.dec-span-preview {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dec-span-mark {
+  background: var(--accent-soft);
+  color: var(--cool);
+  padding: 1px 3px;
+  border-radius: 3px;
+  border: 1px solid rgba(86, 212, 255, 0.4);
+}
+
+.dec-img-thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.dec-thumb {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.dec-box-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.dec-box-stage img {
+  display: block;
+  max-width: 100%;
+  max-height: 280px;
+}
+
+.dec-box-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.dec-snippet-pre {
+  margin: 6px 0 0;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

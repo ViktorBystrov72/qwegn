@@ -343,6 +343,22 @@ function renderSettingsForm(s) {
           <option value="q4" ${activeKV === "q4" ? "selected" : ""}>Q4_0</option>
         </select>
       </div>
+      <div class="form-field"><label>Decision Sidecar Model Pack (Dual-Slot)</label>
+        <input id="settings-decision-pack" class="input mono" data-setting="decisionModelPackPath" value="${escapeHtml(s.decisionModelPackPath || "")}" placeholder="~/.qwg/models/&lt;decision-pack&gt; or .aimodel (empty = disabled)" />
+      </div>
+      <div class="form-field"><label>Decision Sidecar Compute Unit</label>
+        <select id="settings-decision-unit" class="select" data-setting="decisionComputeUnit">
+          <option value="auto" ${(s.decisionComputeUnit || "auto") === "auto" ? "selected" : ""}>Auto (ANE / Metal 4)</option>
+          <option value="metal" ${s.decisionComputeUnit === "metal" ? "selected" : ""}>Metal 4 GPU</option>
+          <option value="ane" ${s.decisionComputeUnit === "ane" ? "selected" : ""}>Apple Neural Engine (ANE)</option>
+        </select>
+      </div>
+      <div class="form-field"><label>Load Decision Vision Tower</label>
+        <select id="settings-decision-vision" class="select" data-setting-bool="decisionLoadVision">
+          <option value="true" ${s.decisionLoadVision !== false ? "selected" : ""}>Enabled</option>
+          <option value="false" ${s.decisionLoadVision === false ? "selected" : ""}>Disabled</option>
+        </select>
+      </div>
     </div>
     <div class="metric-cell" style="padding:14px;">
       <h3 style="margin:0 0 10px;font-size:13px;">Sampling &amp; Reasoning</h3>
@@ -362,6 +378,7 @@ function renderSettingsForm(s) {
       <div class="form-field"><label>Reasoning Effort</label>
         <select class="select" data-setting="reasoningEffort" data-setting-nullable="true">
           <option value="" ${!s.reasoningEffort ? "selected" : ""}>Server Default</option>
+          <option value="auto" ${s.reasoningEffort === "auto" ? "selected" : ""}>Auto (Decision Sidecar)</option>
           <option value="xhigh" ${s.reasoningEffort === "xhigh" ? "selected" : ""}>Extra High (xhigh)</option>
           <option value="high" ${s.reasoningEffort === "high" ? "selected" : ""}>High</option>
           <option value="medium" ${s.reasoningEffort === "medium" ? "selected" : ""}>Medium</option>
@@ -384,6 +401,7 @@ function renderSettingsForm(s) {
           <option value="variational" ${s.mtpBackend === "variational" ? "selected" : ""}>Variational</option>
           <option value="dflash2" ${s.mtpBackend === "dflash2" ? "selected" : ""} ${(s.mtpBackend !== "dflash2" && !dflashAvail) ? "disabled" : ""}>DFlash 2${dflashAvail ? "" : " (No Pack Installed)"}</option>
           <option value="dspine" ${s.mtpBackend === "dspine" ? "selected" : ""} ${(s.mtpBackend !== "dspine" && !dspineAvail) ? "disabled" : ""}>DSpine${dspineAvail ? "" : " (No Pack Installed)"}</option>
+          <option value="dspark" ${s.mtpBackend === "dspark" ? "selected" : ""}>DSpark</option>
         </select>
       </div>
       <div class="form-field"><label>MTP Draft Tokens <span class="restart-tag">[restart]</span></label>

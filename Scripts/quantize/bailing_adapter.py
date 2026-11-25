@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 from ernie55_adapter import ShardReader, _hq_meta
+from hq_blocks import validate_source_quant_config
 from pack import pack_file, sha256, synthesize_base_chat_template
 from shvq import any_block_bytes, format_any_quant_spec, parse_any_quant_spec, quant_any_blocks
 from verify import audit_pack, read_header
@@ -413,14 +414,7 @@ def quantize_bailing_model(
     parent_mt = config.get("model_type")
     mt = tc.get("model_type") or parent_mt or ""
 
-    qcfg = config.get("quantization_config") or tc.get("quantization_config")
-    fp8_block_size = 128
-    if qcfg is not None:
-        if not isinstance(qcfg, dict) or qcfg.get("quant_method") != "fp8":
-            raise ValueError("REFUSED: source is already quantized; use the BF16/FP8 checkpoint")
-        wbs = qcfg.get("weight_block_size")
-        if isinstance(wbs, list) and len(wbs) == 2 and wbs[0] == wbs[1]:
-            fp8_block_size = int(wbs[0])
+    fp8_block_size = validate_source_quant_config(config)
 
     if not (source / "tokenizer.json").is_file():
         raise FileNotFoundError(f"required asset missing: {source / 'tokenizer.json'}")

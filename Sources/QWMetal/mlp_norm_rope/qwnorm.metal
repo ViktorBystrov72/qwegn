@@ -462,3 +462,78 @@ kernel void qwg_add_bias_f16(device uint4* x           [[buffer(0)]],
     xr[u] = *(thread uint4*)&ov;
 }
 
+// Arbitrary-width LayerNorm in FP32 accumulation (no %256 requirement, unrotated).
+kernel void qwg_layernorm_f16(device const half*  x       [[buffer(0)]],
+                              device const half*  gamma   [[buffer(1)]],
+                              device const half*  beta    [[buffer(2)]],
+                              device half*        out     [[buffer(3)]],
+                              constant uint&      hidden  [[buffer(4)]],
+                              constant float&     eps     [[buffer(5)]],
+                              constant uint&      hasBias [[buffer(6)]],
+                              uint tg [[threadgroup_position_in_grid]],
+                              uint ti [[thread_index_in_threadgroup]]) {
+    device const half* xr = x + (size_t)tg * hidden;
+    device half* yr = out + (size_t)tg * hidden;
+    float sum = 0.0f;
+    for (uint i = ti; i < hidden; i += 32u) { sum += float(xr[i]); }
+    float mean = simd_sum(sum) / float(hidden);
+
+    float varAcc = 0.0f;
+    for (uint i = ti; i < hidden; i += 32u) {
+        float d = float(xr[i]) - mean;
+        varAcc += d * d;
+    }
+    float rstd = rsqrt(simd_sum(varAcc) / float(hidden) + eps);
+    for (uint i = ti; i < hidden; i += 32u) {
+        float val = (float(xr[i]) - mean) * rstd * float(gamma[i]);
+        if (hasBias != 0u) { val += float(beta[i]); }
+        yr[i] = half(val);
+    }
+}
+
+// Sandwich post-norm + residual add: residual += rmsnorm(branch, gamma) in FP32.
+kernel void qwg_post_rmsnorm_residual_add_f16(device half*        residual   [[buffer(0)]],
+                                              device const half*  branch     [[buffer(1)]],
+                                              device const half*  gamma      [[buffer(2)]],
+                                              constant uint&      hidden     [[buffer(3)]],
+                                              constant float&     eps        [[buffer(4)]],
+                                              constant float&     unitOffset [[buffer(5)]],
+                                              uint tg [[threadgroup_position_in_grid]],
+                                              uint ti [[thread_index_in_threadgroup]]) {
+    device half* rr = residual + (size_t)tg * hidden;
+    device const half* br = branch + (size_t)tg * hidden;
+    float acc = 0.0f;
+    for (uint i = ti; i < hidden; i += 32u) {
+        float v = float(br[i]);
+        acc += v * v;
+    }
+    float rstd = rsqrt(simd_sum(acc) / float(hidden) + eps);
+    for (uint i = ti; i < hidden; i += 32u) {
+        float normed = float(br[i]) * rstd * (float(gamma[i]) + unitOffset);
+        rr[i] = half(float(rr[i]) + normed);
+    }
+}
+
+// Arbitrary-width unrotated RMSNorm in FP32 accumulation (for QK-norm & non-H32 backbones).
+kernel void qwg_rmsnorm_f16(device const half*  x          [[buffer(0)]],
+                            device const half*  gamma      [[buffer(1)]],
+                            device half*        out        [[buffer(2)]],
+                            constant uint&      hidden     [[buffer(3)]],
+                            constant float&     eps        [[buffer(4)]],
+                            constant float&     unitOffset [[buffer(5)]],
+                            uint tg [[threadgroup_position_in_grid]],
+                            uint ti [[thread_index_in_threadgroup]]) {
+    device const half* xr = x + (size_t)tg * hidden;
+    device half* yr = out + (size_t)tg * hidden;
+    float acc = 0.0f;
+    for (uint i = ti; i < hidden; i += 32u) {
+        float v = float(xr[i]);
+        acc += v * v;
+    }
+    float rstd = rsqrt(simd_sum(acc) / float(hidden) + eps);
+    for (uint i = ti; i < hidden; i += 32u) {
+        yr[i] = half(float(xr[i]) * rstd * (float(gamma[i]) + unitOffset));
+    }
+}
+
+

@@ -256,7 +256,8 @@ extension QWHttpServer {
             let streamParser = QWChatStreamParser(
                 startsInReasoning: policy.shouldThink,
                 allowToolCalls: policy.allowToolCalls,
-                allowReasoningTags: policy.allowReasoningTags
+                allowReasoningTags: policy.allowReasoningTags,
+                allowInk2Markers: actor.isInkling2Template() && (!policy.isJsonResponseFormat || policy.shouldThink)
             )
             let session = makeSSESession(for: connection, format: .ndjson, enableKeepalive: false)
             defer { session.stopAll() }
@@ -291,7 +292,8 @@ extension QWHttpServer {
                         )
                         streamParser.setStartsInReasoning(
                             readyPolicy.shouldThink,
-                            allowReasoningTags: readyPolicy.allowReasoningTags
+                            allowReasoningTags: readyPolicy.allowReasoningTags,
+                            allowInk2Markers: self.actor.isInkling2Template() && (!readyPolicy.isJsonResponseFormat || readyPolicy.shouldThink)
                         )
                         session.begin(startKeepalive: false)
                     },
@@ -352,7 +354,8 @@ extension QWHttpServer {
                 startsInThinking: result.startsInThinking,
                 truncated: result.truncated,
                 allowToolCalls: policy.allowToolCalls,
-                allowReasoningTags: policy.allowReasoningTags
+                allowReasoningTags: policy.allowReasoningTags,
+                allowInk2Markers: actor.isInkling2Template() && (!policy.isJsonResponseFormat || result.startsInThinking)
             )
             let effectiveCalls = QWChatPolicyResolver.capToolCalls(
                 parsed.toolCalls,

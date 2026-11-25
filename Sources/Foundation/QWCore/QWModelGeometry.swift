@@ -151,6 +151,7 @@ public struct QWModelGeometry: Sendable, Equatable {
     public var mtpConfig: QWModelDescriptor.MTPConfig? { descriptor.mtpConfig }
     public var visionTowerConfig: QWModelDescriptor.VisionTowerConfig? { descriptor.visionTowerConfig }
     public var ropeInterleave: Bool { descriptor.ropeInterleave }
+    public var dsparkConfig: QWModelDescriptor.DSparkConfig? { descriptor.dsparkConfig }
     public var mlaHasDirectQ: Bool { mlaConfig?.isDirectQ ?? (qLoraRank <= 0) }
     public var mlaHasIndexer: Bool { mlaConfig?.hasIndexer ?? (indexerHeads > 0) }
     public var hasSubquadraticAttention: Bool {
@@ -289,6 +290,11 @@ public struct QWModelGeometry: Sendable, Equatable {
     public var videoTokenId: Int { descriptor.videoTokenId }
     public var visionStartTokenId: Int { descriptor.visionStartTokenId }
     public var visionEndTokenId: Int { descriptor.visionEndTokenId }
+    public var mropeLayout: QWModelDescriptor.MRoPELayout {
+        mlaConfig?.rope?.mropeLayout
+            ?? descriptor.visionTowerConfig?.mropeLayout
+            ?? (descriptor.hasMropeSection ? .qwenInterleaved : .none1D)
+    }
     public var thinkTokenId: Int { descriptor.specialTokens.thinkTokenId }
     public var endThinkTokenId: Int { descriptor.specialTokens.endThinkTokenId }
 

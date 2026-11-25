@@ -2,11 +2,16 @@
 // Computes out = FWHT32(silu(x @ W_gate^T) * (x @ W_up^T)) directly in threadgroup SRAM.
 
 #pragma once
+#if !defined(__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__) || __ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ < 260200
+#error "Metal 4 NAX SwiGLU kernels require -mmacosx-version-min=26.2"
+#endif
+#include "qw_moe_tile.metalh"
 #include "qw_gemm_nax.metalh"
 #include "qw_weight_basis.metalh"
 
 template <bool ALIGNED_M, int SM, int TM, int TN, int TK, int SK,
-          int AQ_BITS, int AQ_GROUP, bool IS_SHVQ, bool HAS_SHVQ_TG_LUT>
+          int AQ_BITS, int AQ_GROUP, bool IS_SHVQ, bool HAS_SHVQ_TG_LUT,
+          bool GATHER_A = false>
 METAL_FUNC void qmm_t_nax_swiglu_kloop(
     const device char* w,
     const device half* x,
@@ -16,7 +21,10 @@ METAL_FUNC void qmm_t_nax_swiglu_kloop(
     short sgp_sm,
     short2 sc,
     thread NAXTile<float, TM, TN>& Dtile,
-    threadgroup const ushort4* shvqLut16) {
+    threadgroup const ushort4* shvqLut16,
+    int yRowBase = 0,
+    int totalM = 0,
+    const device int32_t* sortedTok = nullptr) {
   const ushort w_sub = ushort(sc.x >> 3);
   const ushort shift = ushort((sc.x & 4) << 1);
   const int K_g = K / 32;
@@ -29,11 +37,43 @@ METAL_FUNC void qmm_t_nax_swiglu_kloop(
   const device char* w_aq_tile =
       (AQ_BITS > 0) ? (w + static_cast<int64_t>(w_row_base) * aqRowBytes) : nullptr;
 
+  const device half* x_rows[TM * 2];
+  if constexpr (GATHER_A) {
+    STEEL_PRAGMA_UNROLL
+    for (short m = 0; m < TM; ++m) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < 2; ++i) {
+        const int r = yRowBase + int(m) * 16 + int(sc.y) + int(i) * 8;
+        const int tok = (r < totalM) ? sortedTok[r] : -1;
+        x_rows[m * 2 + i] = (tok >= 0) ? (x + static_cast<int64_t>(tok) * xStride + int(sc.x)) : nullptr;
+      }
+    }
+  }
+
   STEEL_PRAGMA_NO_UNROLL
   for (int k = 0; k < K; k += SK) {
     NAXTile<half, TM, TK> Atile;
     NAXTile<half, TN, TK> Btile;
-    if constexpr (ALIGNED_M) {
+    if constexpr (GATHER_A) {
+      const_for_loop<0, TM, 1>([&](auto idx_row) {
+        constexpr short m = idx_row.value;
+        thread auto& a0 = Atile.template frag_at<m, 0>();
+        thread auto& a1 = Atile.template frag_at<m, 1>();
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 2; ++i) {
+          const device half* xr = x_rows[m * 2 + i];
+          if (xr != nullptr) {
+            const half4 v0 = *(const device half4*)(xr + k);
+            const half4 v1 = *(const device half4*)(xr + k + 16);
+            a0[i * 4 + 0] = v0.x; a0[i * 4 + 1] = v0.y; a0[i * 4 + 2] = v0.z; a0[i * 4 + 3] = v0.w;
+            a1[i * 4 + 0] = v1.x; a1[i * 4 + 1] = v1.y; a1[i * 4 + 2] = v1.z; a1[i * 4 + 3] = v1.w;
+          } else {
+            a0[i * 4 + 0] = half(0); a0[i * 4 + 1] = half(0); a0[i * 4 + 2] = half(0); a0[i * 4 + 3] = half(0);
+            a1[i * 4 + 0] = half(0); a1[i * 4 + 1] = half(0); a1[i * 4 + 2] = half(0); a1[i * 4 + 3] = half(0);
+          }
+        }
+      });
+    } else if constexpr (ALIGNED_M) {
       Atile.load(x, xStride);
     } else {
       Atile.load_safe(x, xStride, short2(SK, sgp_sm));
@@ -50,7 +90,7 @@ METAL_FUNC void qmm_t_nax_swiglu_kloop(
         aqRowBytes, 0, 0, sc, shvqLut16);
 
     tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
-    x += SK;
+    if constexpr (!GATHER_A) { x += SK; }
     if constexpr (AQ_BITS == 0) { w_tile += 1; }
   }
 }
@@ -85,7 +125,8 @@ METAL_FUNC void qwg_swiglu_store_row8(threadgroup const half* tgGateRow,
 
 template <int BM, int BN_OUT, int WM, int WN,
           int AQ_BITS = 0, int AQ_GROUP = 0,
-          bool IS_SHVQ = false, bool HAS_SHVQ_TG_LUT = false>
+          bool IS_SHVQ = false, bool HAS_SHVQ_TG_LUT = false,
+          bool GATHER_A = false>
 METAL_FUNC void qmm_t_nax_swiglu_impl(
     const device char* w,
     const device half* x,
@@ -100,55 +141,98 @@ METAL_FUNC void qmm_t_nax_swiglu_impl(
     uint simd_gid,
     uint simd_lid,
     threadgroup half* tgGU,
-    threadgroup const ushort4* shvqLut16 = nullptr) {
+    threadgroup const ushort4* shvqLut16 = nullptr,
+    const device int32_t* sortedTok = nullptr) {
   constexpr short SM = BM / WM;
+  constexpr short SN = BN_OUT / (WN >> 1);
   constexpr short SK = 32;
   constexpr short TM = SM / 16;
-  constexpr short TN = 2;
+  constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
 
   const int y_row = int(tid.y) * BM;
   const int y_col = int(tid.x) * BN_OUT;
-  const int isUp = (BN_OUT == 64) ? (int(simd_gid) >> 1) : (int(simd_gid) & 1);
-  const int wm = (BN_OUT == 64) ? 0 : (int(simd_gid) >> 1);
-  const int sub = (BN_OUT == 64) ? ((int(simd_gid) & 1) * 32) : 0;
+  const int isUp = (WN == 4) ? (int(simd_gid) >> 1) : (int(simd_gid) & 1);
+  const int wm = (WN == 4) ? 0 : (int(simd_gid) >> 1);
+  const int sub = (WN == 4) ? ((int(simd_gid) & 1) * int(SN)) : 0;
   const short tm = SM * short(wm);
   const int w_row_base = (isUp != 0 ? I : 0) + y_col + sub;
   threadgroup half* tgDst = tgGU + (isUp * BM + int(tm)) * BN_OUT + sub;
 
   const short sgp_sm = short(min(int(SM), max(0, M - (y_row + int(tm)))));
-  if (sgp_sm > 0) {
-    NAXTile<float, TM, TN> Dtile;
-    Dtile.clear();
-    const device half* xSG = x + static_cast<int64_t>(y_row + int(tm)) * static_cast<int64_t>(xStride);
+  NAXTile<float, TM, TN> Dtile;
+  Dtile.clear();
+  if (wm < WM && sgp_sm > 0) {
+    const int absRowBase = y_row + int(tm);
+    const device half* xSG = GATHER_A ? x : (x + static_cast<int64_t>(absRowBase) * static_cast<int64_t>(xStride));
     const short2 sc = BaseNAXFrag::get_coord();
     if (sgp_sm == SM) {
-      qmm_t_nax_swiglu_kloop<true, SM, TM, TN, TK, SK, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_SHVQ_TG_LUT>(
-          w, xSG, K, xStride, w_row_base, sgp_sm, sc, Dtile, shvqLut16);
+      qmm_t_nax_swiglu_kloop<true, SM, TM, TN, TK, SK, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_SHVQ_TG_LUT, GATHER_A>(
+          w, xSG, K, xStride, w_row_base, sgp_sm, sc, Dtile, shvqLut16, absRowBase, M, sortedTok);
     } else {
-      qmm_t_nax_swiglu_kloop<false, SM, TM, TN, TK, SK, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_SHVQ_TG_LUT>(
-          w, xSG, K, xStride, w_row_base, sgp_sm, sc, Dtile, shvqLut16);
+      qmm_t_nax_swiglu_kloop<false, SM, TM, TN, TK, SK, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_SHVQ_TG_LUT, GATHER_A>(
+          w, xSG, K, xStride, w_row_base, sgp_sm, sc, Dtile, shvqLut16, absRowBase, M, sortedTok);
     }
     Dtile.template store<half, BN_OUT, 1>(tgDst);
   }
-  // Barrier must execute across all 128 threads even when bottom simdgroups have sgp_sm <= 0.
+  const int actualM = min(BM, max(0, M - y_row));
+  // Barrier must execute across all threads even when bottom/unused simdgroups skip NAX.
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  const int actualM = min(BM, max(0, M - y_row));
   threadgroup const half* tgGate = tgGU;
   threadgroup const half* tgUp = tgGU + BM * BN_OUT;
   if constexpr (BN_OUT == 64) {
     const uint col0 = (lid & 7u) * 8u;
-    const int rr = int(lid >> 3u);
-    if (rr < actualM) {
+    constexpr int rowStep = WM * WN * 4;
+    for (int rr = int(lid >> 3u); rr < actualM; rr += rowStep) {
       device half* outRow = out + static_cast<int64_t>(y_row + rr) * static_cast<int64_t>(yStride) + y_col;
       qwg_swiglu_store_row8(tgGate + rr * 64, tgUp + rr * 64, outRow, col0, uint(I), simd_lid);
     }
   } else {
     const uint col0 = (lid & 3u) * 8u;
-    for (int rr = int(lid >> 2u); rr < actualM; rr += 32) {
+    constexpr int rowStep = WM * WN * 8;
+    for (int rr = int(lid >> 2u); rr < actualM; rr += rowStep) {
       device half* outRow = out + static_cast<int64_t>(y_row + rr) * static_cast<int64_t>(yStride) + y_col;
       qwg_swiglu_store_row8(tgGate + rr * 32, tgUp + rr * 32, outRow, col0, uint(I), simd_lid);
     }
+  }
+}
+
+template <int AQ_BITS = 0, int AQ_GROUP = 0, bool IS_SHVQ = false, bool HAS_TG = false>
+METAL_FUNC void qwg_moe_nax_swiglu_body(
+    device const char* w, device const half* x, device half* y,
+    device const int32_t* expertOff, device const int32_t* tileE,
+    device const int32_t* tileR, device const int32_t* tileCount,
+    constant QWGemmGroupedParams& p, uint tileBlock,
+    device const int32_t* sortedTok, uint hasGather,
+    device const char* coldW,
+    uint3 tg, uint lid, uint simd_gid, uint simd_lid,
+    threadgroup half* tgGU,
+    threadgroup const ushort4* tgLut = nullptr) {
+  const uint t = tg.y + ((tileBlock >> 8) & 0x7FFFFFu);
+  if (int(t) >= tileCount[0]) return;
+  const uint e = uint(tileE[t]);
+  const int rowBase = int(expertOff[e]), rowCount = int(expertOff[e + 1]) - rowBase;
+  const uint residentE = p.experts >> 16u;
+  const bool isCold = (residentE > 0u) && (e >= residentE);
+  if (((tileBlock & 0x40u) != 0u && isCold) || ((tileBlock & 0x80u) != 0u && !isCold)) return;
+  int bm; uint tidY;
+  qw_moe_decode_tile(tileR[t], rowCount, int(tileBlock & 0x3Fu), bm, tidY);
+  const size_t rowBytes = qwg_nax_row_bytes<AQ_BITS, AQ_GROUP, IS_SHVQ>(p);
+  const uint wExp = isCold ? (e - residentE) : e;
+  device const char* we = (isCold ? coldW : w) + size_t(wExp) * size_t(p.n) * rowBytes;
+  const int I = int(p.n >> 1u);
+  device half* ye = y + size_t(rowBase) * size_t(I);
+  const uint3 tid = uint3(tg.x, tidY, 0);
+  if (hasGather != 0u) {
+    device const int32_t* st = sortedTok + rowBase;
+    if (bm == 16) qmm_t_nax_swiglu_impl<16, 32, 1, 4, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_TG, true>(we, x, ye, int(p.k), I, rowCount, int(p.k), I, tid, lid, simd_gid, simd_lid, tgGU, tgLut, st);
+    else if (bm == 32) qmm_t_nax_swiglu_impl<32, 32, 2, 2, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_TG, true>(we, x, ye, int(p.k), I, rowCount, int(p.k), I, tid, lid, simd_gid, simd_lid, tgGU, tgLut, st);
+    else qmm_t_nax_swiglu_impl<64, 32, 2, 2, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_TG, true>(we, x, ye, int(p.k), I, rowCount, int(p.k), I, tid, lid, simd_gid, simd_lid, tgGU, tgLut, st);
+  } else {
+    device const half* xe = x + size_t(rowBase) * size_t(p.k);
+    if (bm == 16) qmm_t_nax_swiglu_impl<16, 32, 1, 4, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_TG, false>(we, xe, ye, int(p.k), I, rowCount, int(p.k), I, tid, lid, simd_gid, simd_lid, tgGU, tgLut, nullptr);
+    else if (bm == 32) qmm_t_nax_swiglu_impl<32, 32, 2, 2, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_TG, false>(we, xe, ye, int(p.k), I, rowCount, int(p.k), I, tid, lid, simd_gid, simd_lid, tgGU, tgLut, nullptr);
+    else qmm_t_nax_swiglu_impl<64, 32, 2, 2, AQ_BITS, AQ_GROUP, IS_SHVQ, HAS_TG, false>(we, xe, ye, int(p.k), I, rowCount, int(p.k), I, tid, lid, simd_gid, simd_lid, tgGU, tgLut, nullptr);
   }
 }

@@ -147,14 +147,14 @@ METAL_FUNC void qwg_moe_compact_down_f32_body(
     const int off = expertOff[rawExpert];
     const int cnt = expertOff[rawExpert + 1] - off;
     if (cnt <= 0) return;
-    if (tg.x * 16u >= p.N) return;
+    if (tg.x * 32u >= p.N) return;
     if constexpr (Traits::has_tg_lut()) {
-        tgLut.load(tid, 128u);
+        tgLut.load(tid, 256u);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     } else {
         (void)tid;
     }
-    const uint r0 = (tg.x * 4u + sgi) * 4u;
+    const uint r0 = (tg.x * 8u + sgi) * 4u;
     const uint rowsLeft = (r0 < p.N) ? (p.N - r0) : 0u;
     if (rowsLeft == 0u) return;
     const bool isCold = (p.residentE > 0u) && (rawExpert >= p.residentE);

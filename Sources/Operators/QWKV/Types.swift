@@ -92,6 +92,17 @@ public final class QWKVSharedPrefix: @unchecked Sendable {
         self.memoryBytes = self.pageCount * cache.bytesPerPage
     }
 
+    /// Enumerates live `(cacheID, planeIndex, pageID, bytesPerPage)` physical page references for deduplicated Warm-RAM accounting.
+    public func enumerateLivePhysicalPages(_ body: (ObjectIdentifier, Int, Int32, Int) -> Void) {
+        let cacheID = ObjectIdentifier(cache)
+        let pageBytes = cache.bytesPerPage
+        for (planeIdx, planePages) in pages.enumerated() {
+            for pageID in planePages where pageID >= 0 {
+                body(cacheID, planeIdx, pageID, pageBytes)
+            }
+        }
+    }
+
     deinit { cache.releaseSharedPrefix(self) }
 }
 

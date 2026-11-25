@@ -49,6 +49,8 @@ public struct QWEngineBuildOptions: Sendable {
     public var dflashDraftPackPath: String?
     /// How many candidates the DFlash selector keeps.
     public var dflashSelectorTopK: Int?
+    /// Optional override for DSpark confidence-head dynamic draft budget scheduling.
+    public var dsparkConfidenceSchedule: Bool?
     /// The GDN prefill mode the consumer asked for.
     public var gdnPrefill: String
     /// Latent Sparse Attention (LSA) configuration.
@@ -71,7 +73,9 @@ public struct QWEngineBuildOptions: Sendable {
                 mtpDraftStrategy: String = "hybrid",
                 mtpQuadraticSeeding: Bool = true,
                 ropeYarnFactor: Double? = nil, dflashDraftPackPath: String? = nil,
-                dflashSelectorTopK: Int? = nil, gdnPrefill: String = "chunked",
+                dflashSelectorTopK: Int? = nil,
+                dsparkConfidenceSchedule: Bool? = nil,
+                gdnPrefill: String = "chunked",
                 lsaConfig: QWLSAConfig = QWLSAConfig(),
                 residentExpertsPerLayer: Int? = nil,
                 maxConcurrentSessions: Int? = nil,
@@ -95,6 +99,7 @@ public struct QWEngineBuildOptions: Sendable {
         self.ropeYarnFactor = ropeYarnFactor
         self.dflashDraftPackPath = dflashDraftPackPath
         self.dflashSelectorTopK = dflashSelectorTopK
+        self.dsparkConfidenceSchedule = dsparkConfidenceSchedule
         self.gdnPrefill = gdnPrefill
         self.lsaConfig = lsaConfig
         self.residentExpertsPerLayer = residentExpertsPerLayer ?? tuning.residentExpertsPerLayer

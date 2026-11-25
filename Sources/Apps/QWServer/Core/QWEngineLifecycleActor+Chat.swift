@@ -15,16 +15,19 @@ import QWVision
 
 private final class ChatStreamCapture: @unchecked Sendable {
     private static let endThinkUTF8 = Array("</think>".utf8)
-    private static let endErnieThinkUTF8 = Array("</ernie:think>".utf8)
-    private static let toolOpenUTF8 = Array("<tool_call>".utf8)
-    private static let toolCloseUTF8 = Array("</tool_call>".utf8)
     private static let funcOpenUTF8 = Array("<function=".utf8)
     private static let funcCloseUTF8 = Array("</function>".utf8)
+    private static let invokeOpenUTF8 = Array("<invoke ".utf8)
+    private static let invokeCloseUTF8 = Array("</invoke>".utf8)
 
     private let lock = NSLock()
     let tok: QWTokenizer
     let stopScanner: QWEngineLifecycleActor.IncrementalStopScanner
     let endThinkCloseTag: String
+    let endThinkTargets: [[UInt8]]
+    let toolEnvelopes: [QWToolCallEnvelope]
+    let toolOpenTargets: [[UInt8]]
+    let toolCloseTargets: [[UInt8]]
     var streamDecoder: QWStreamDecoder
     var fullUTF8: [UInt8]
     var emittedUTF8Count = 0
@@ -58,6 +61,7 @@ private final class ChatStreamCapture: @unchecked Sendable {
         startsInThinking: Bool,
         customStops: [String],
         endThinkCloseTag: String,
+        toolCallEnvelope: QWToolCallEnvelope,
         onToken: ((String) -> Void)?,
         onTokenLogprob: ((ChatLogprobTokenEntry) -> Void)?,
         modelBackend: any QWModelBackend
@@ -75,6 +79,14 @@ private final class ChatStreamCapture: @unchecked Sendable {
         ].compactMap { $0 })
         self.stopScanner = QWEngineLifecycleActor.IncrementalStopScanner(stops: customStops)
         self.endThinkCloseTag = endThinkCloseTag
+        let closeBytes = Array(endThinkCloseTag.utf8)
+        self.endThinkTargets = (closeBytes == Self.endThinkUTF8 || closeBytes.isEmpty)
+            ? [Self.endThinkUTF8]
+            : [closeBytes, Self.endThinkUTF8]
+        let envs = (toolCallEnvelope == .standard) ? [.standard] : [toolCallEnvelope, .standard]
+        self.toolEnvelopes = envs
+        self.toolOpenTargets = envs.map { Array($0.openTag.utf8) }
+        self.toolCloseTargets = envs.map { Array($0.closeTag.utf8) }
         self.streamDecoder = QWStreamDecoder(tok)
         let initialBytes = Array(initialPrefix.utf8)
         self.fullUTF8 = initialBytes
@@ -115,16 +127,29 @@ private final class ChatStreamCapture: @unchecked Sendable {
         let prevCount = fullUTF8.count
         fullUTF8.append(contentsOf: piece.utf8)
         jsonTracker.advance(utf8: fullUTF8)
-        if !sawToolCallOpen && Self.containsBytesNearTail(fullUTF8, needle: Self.toolOpenUTF8, prevCount: prevCount) {
+        if !sawToolCallOpen && toolOpenTargets.contains(where: {
+            Self.containsBytesNearTail(fullUTF8, needle: $0, prevCount: prevCount)
+        }) {
             sawToolCallOpen = true
         }
         return prevCount
     }
 
     private func insideOpenToolFunctionLocked() -> Bool {
-        guard let lo = Self.lastOffsetOfBytes(fullUTF8, needle: Self.funcOpenUTF8) else { return false }
-        if let lc = Self.lastOffsetOfBytes(fullUTF8, needle: Self.funcCloseUTF8) { return lo > lc }
-        return true
+        if let lo = Self.lastOffsetOfBytes(fullUTF8, needle: Self.funcOpenUTF8) {
+            if let lc = Self.lastOffsetOfBytes(fullUTF8, needle: Self.funcCloseUTF8) {
+                if lo > lc { return true }
+            } else {
+                return true
+            }
+        }
+        if let lo = Self.lastOffsetOfBytes(fullUTF8, needle: Self.invokeOpenUTF8) {
+            if let lc = Self.lastOffsetOfBytes(fullUTF8, needle: Self.invokeCloseUTF8) {
+                return lo > lc
+            }
+            return true
+        }
+        return false
     }
 
     private func emitAndReturnStringLocked(upTo utf8Limit: Int) -> String? {
@@ -177,7 +202,7 @@ private final class ChatStreamCapture: @unchecked Sendable {
             if userTextContainsImEnd && id == imEndTokenId {
                 let insideOpenJson = isConstrainedJson && (jsonTracker.completedByteOffset == nil)
                 if insideOpenToolFunctionLocked() || insideOpenJson {
-                    piece = "<|im_end|>"
+                    piece = tok.piece(imEndTokenId) ?? "<|im_end|>"
                 } else {
                     stoppedByCustomRule = true
                     return (false, nil)
@@ -208,8 +233,9 @@ private final class ChatStreamCapture: @unchecked Sendable {
                 }
             }
             let prevCount = appendPieceLocked(piece)
-            if inThinking && (Self.containsBytesNearTail(fullUTF8, needle: Self.endThinkUTF8, prevCount: prevCount)
-                || Self.containsBytesNearTail(fullUTF8, needle: Self.endErnieThinkUTF8, prevCount: prevCount)) {
+            if inThinking && endThinkTargets.contains(where: {
+                Self.containsBytesNearTail(fullUTF8, needle: $0, prevCount: prevCount)
+            }) {
                 inThinking = false
             }
 
@@ -229,9 +255,9 @@ private final class ChatStreamCapture: @unchecked Sendable {
                 return (false, emitAndReturnStringLocked(upTo: fullUTF8.count))
             }
             if stopOnSingleTool && sawToolCallOpen
-                && Self.containsBytesNearTail(fullUTF8, needle: Self.toolCloseUTF8, prevCount: prevCount) {
+                && toolCloseTargets.contains(where: { Self.containsBytesNearTail(fullUTF8, needle: $0, prevCount: prevCount) }) {
                 let text = String(decoding: fullUTF8, as: UTF8.self)
-                if let closeEnd = QWToolCallParser.firstCompleteToolCallEnd(in: text) {
+                if let closeEnd = QWToolCallParser.firstCompleteToolCallEnd(in: text, envelopes: toolEnvelopes) {
                     fullUTF8 = Array(text[..<closeEnd].utf8)
                     stoppedByCustomRule = true
                     return (false, emitAndReturnStringLocked(upTo: fullUTF8.count))
@@ -343,6 +369,7 @@ extension QWEngineLifecycleActor {
         let inferStart = Date()
         let tok = loaded.tokenizer
         let imageUrls = request.extractImageUrls()
+        let videoInputs = request.extractVideoInputs()
 
         let prepared = try QWChatTurnPreparer.preparePrompt(
             request: request,
@@ -363,6 +390,7 @@ extension QWEngineLifecycleActor {
         let mmTurn = try await prepareMultimodalInput(
             promptTokens: encodedWire.tokens,
             imageUrls: imageUrls,
+            videoInputs: videoInputs,
             loaded: loaded,
             config: config
         )
@@ -411,14 +439,12 @@ extension QWEngineLifecycleActor {
             clampedMaxNew: maxNew, tokenizer: tok, vocabularySize: loaded.descriptor.vocab,
             supportsTokenConstraints: loaded.modelBackend.supportsTokenConstraints
         )
-        let endThinkCloseTag = (tok.tokenId(for: "</ernie:think>") == prepared.endThinkTokenId)
-            ? "</ernie:think>"
-            : "</think>"
         let capture = ChatStreamCapture(
             tok: tok, isInkling2: loaded.chatTemplate.isInkling2Template,
             initialPrefix: prepared.isConstrainedJson ? "{" : "",
             initialHealUTF8: heal.stripUTF8Count, startsInThinking: prepared.shouldThink,
-            customStops: prepared.customStopStrings, endThinkCloseTag: endThinkCloseTag,
+            customStops: prepared.customStopStrings, endThinkCloseTag: prepared.endThinkCloseTag,
+            toolCallEnvelope: prepared.toolCallEnvelope,
             onToken: onToken, onTokenLogprob: onTokenLogprob, modelBackend: loaded.modelBackend
         )
         let genMaxNew = heal.didPeel ? (maxNew + 1) : maxNew
@@ -530,7 +556,8 @@ extension QWEngineLifecycleActor {
         if let fmtType = request.responseFormatType,
            (fmtType == "json_schema" || fmtType == "json_object"),
            !prepared.shouldThink,
-           (prepared.isConstrainedJson || !fullText.contains("<tool_call>")),
+           (prepared.isConstrainedJson || (!fullText.contains(prepared.toolCallEnvelope.openTag)
+                                           && !fullText.contains(QWToolCallEnvelope.standard.openTag))),
            let startBrace = fullText.firstIndex(of: "{"),
            let endBrace = Self.firstCompleteJsonObjectEnd(in: String(fullText[startBrace...])) {
             let sub = String(fullText[startBrace...])
@@ -565,7 +592,7 @@ extension QWEngineLifecycleActor {
         logger.logRequest(
             method: "POST", path: "/v1/chat/completions", statusCode: 200,
             promptTokens: effectivePromptTokens.count, completionTokens: metrics.tokens.count,
-            imagesCount: imageUrls.count, cacheHitTokens: metrics.cacheHitTokens,
+            imagesCount: imageUrls.count + videoInputs.count, cacheHitTokens: metrics.cacheHitTokens,
             cacheTier: metrics.cacheTier, cacheActive: metrics.cacheActive,
             specSummary: metrics.speculativeSummary,
             ttftMs: ttftMs, decodeTokPerSec: decodeTokPerSec, totalSec: totalDuration
@@ -606,10 +633,11 @@ extension QWEngineLifecycleActor {
     nonisolated private func prepareMultimodalInput(
         promptTokens: [Int],
         imageUrls: [String],
+        videoInputs: [QWVideoInputSpec] = [],
         loaded: LoadedState,
         config: Config
     ) async throws -> (tokens: [Int], visualSpans: [QWVisualSpan], loadedOnDemand: Bool, unloadedOnText: Bool) {
-        if imageUrls.isEmpty && (loaded.visionBackend?.isLoaded != true || config.loadVision) {
+        if imageUrls.isEmpty && videoInputs.isEmpty && (loaded.visionBackend?.isLoaded != true || config.loadVision) {
             return (promptTokens, [], false, false)
         }
         let imagePolicy = QWImageDecodePolicy(
@@ -621,11 +649,12 @@ extension QWEngineLifecycleActor {
             try await QWImageDecoder.prepareMultimodalTurn(
                 promptTokens: promptTokens,
                 imageUrls: imageUrls,
+                videoInputs: videoInputs,
                 hiddenDim: loaded.descriptor.hidden,
                 visionBackend: loaded.visionBackend,
                 policy: imagePolicy,
                 onImageEncoded: { [logger] idx, total, h, w, ms in
-                    logger.log(.info, String(format: "vision_encode_ms=%.1f image=%d/%d patches=%dx%d",
+                    logger.log(.info, String(format: "vision_encode_ms=%.1f media=%d/%d patches=%dx%d",
                                              ms, idx, total, h, w))
                 }
             )

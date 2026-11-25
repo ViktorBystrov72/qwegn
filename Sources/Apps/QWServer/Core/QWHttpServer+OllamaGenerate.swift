@@ -67,21 +67,22 @@ extension QWHttpServer {
 
         let shouldStop = generationShouldStop(for: connection)
         let startedAt = Date()
+        let cfg = actor.getConfig()
+        let policy = QWChatPolicyResolver.resolveStreamPolicy(
+            for: req,
+            defaultEnableThinking: cfg.enableThinking,
+            defaultMaxTokens: cfg.maxTokens,
+            modelMaxLength: cfg.modelMaxLength,
+            supportsThinkingTags: actor.supportsThinkingTags()
+        )
         if req.isStreaming {
             let session = makeSSESession(for: connection, format: .ndjson, enableKeepalive: false)
             defer { session.stopAll() }
-            let cfg = actor.getConfig()
-            let policy = QWChatPolicyResolver.resolveStreamPolicy(
-                for: req,
-                defaultEnableThinking: cfg.enableThinking,
-                defaultMaxTokens: cfg.maxTokens,
-                modelMaxLength: cfg.modelMaxLength,
-                supportsThinkingTags: actor.supportsThinkingTags()
-            )
             let streamParser = QWChatStreamParser(
                 startsInReasoning: policy.shouldThink,
                 allowToolCalls: false,
-                allowReasoningTags: policy.allowReasoningTags
+                allowReasoningTags: policy.allowReasoningTags,
+                allowInk2Markers: actor.isInkling2Template() && (!policy.isJsonResponseFormat || policy.shouldThink)
             )
             let emitChunk: @Sendable (String) -> Void = { text in
                 guard !text.isEmpty else { return }
@@ -106,7 +107,8 @@ extension QWHttpServer {
                         )
                         streamParser.setStartsInReasoning(
                             readyPolicy.shouldThink,
-                            allowReasoningTags: readyPolicy.allowReasoningTags
+                            allowReasoningTags: readyPolicy.allowReasoningTags,
+                            allowInk2Markers: self.actor.isInkling2Template() && (!readyPolicy.isJsonResponseFormat || readyPolicy.shouldThink)
                         )
                         session.begin(startKeepalive: false)
                     },
@@ -159,7 +161,9 @@ extension QWHttpServer {
         let elapsedNs = Int64(Date().timeIntervalSince(startedAt) * 1e9)
         let parsedOut = QWToolCallParser.parse(
             text: result.content, tools: nil, startsInThinking: result.startsInThinking,
-            truncated: result.truncated, allowToolCalls: false
+            truncated: result.truncated, allowToolCalls: false,
+            allowReasoningTags: policy.allowReasoningTags,
+            allowInk2Markers: actor.isInkling2Template() && (!policy.isJsonResponseFormat || result.startsInThinking)
         )
         let resp = OllamaGenerateResponse(
             model: replyModel,

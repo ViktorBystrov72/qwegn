@@ -369,6 +369,8 @@ extension QWModelDescriptor {
         public enum PatchEmbedKind: String, Sendable, Hashable, Codable, Equatable {
             case conv3d
             case unfoldedPatchProj
+            case lfmHybridConv
+            case siglip2NaFlex
         }
 
         public let depth: Int
@@ -389,6 +391,10 @@ extension QWModelDescriptor {
         public let imageMean: [Float]
         public let imageStd: [Float]
         public let disableInternalMergerProj: Bool
+        public let kvHeads: Int?
+        public let layerTypes: [String]?
+        public let convKernelSize: Int?
+        public let projectorNormEps: Float
 
         public init(
             depth: Int,
@@ -408,7 +414,11 @@ extension QWModelDescriptor {
             patchEmbedKind: PatchEmbedKind = .conv3d,
             imageMean: [Float] = [0.5, 0.5, 0.5],
             imageStd: [Float] = [0.5, 0.5, 0.5],
-            disableInternalMergerProj: Bool = false
+            disableInternalMergerProj: Bool = false,
+            kvHeads: Int? = nil,
+            layerTypes: [String]? = nil,
+            convKernelSize: Int? = nil,
+            projectorNormEps: Float = 1e-6
         ) {
             self.depth = depth
             self.hidden = hidden
@@ -428,6 +438,10 @@ extension QWModelDescriptor {
             self.imageMean = imageMean
             self.imageStd = imageStd
             self.disableInternalMergerProj = disableInternalMergerProj
+            self.kvHeads = kvHeads
+            self.layerTypes = layerTypes
+            self.convKernelSize = convKernelSize
+            self.projectorNormEps = projectorNormEps
         }
     }
 
@@ -492,7 +506,10 @@ extension QWModelDescriptor {
             projectorBias: vt.projectorBias, normEps: vt.normEps, ropeTheta: vt.ropeTheta,
             mropeLayout: vt.mropeLayout, patchEmbedKind: vt.patchEmbedKind,
             imageMean: nextMean, imageStd: nextStd,
-            disableInternalMergerProj: vt.disableInternalMergerProj
+            disableInternalMergerProj: vt.disableInternalMergerProj,
+            kvHeads: vt.kvHeads,
+            layerTypes: vt.layerTypes,
+            convKernelSize: vt.convKernelSize
         )
         return QWModelDescriptor(
             family: family, modelType: modelType, capabilities: capabilities,
@@ -540,10 +557,14 @@ extension QWModelDescriptor {
             moeRouterEnableExpertBias: moeRouterEnableExpertBias,
             routedScalingFactorLearnable: routedScalingFactorLearnable,
             multimaxHead: multimaxHead, mtpSharedLastLayer: mtpSharedLastLayer,
-            inkling2Config: inkling2Config, mlaConfig: mlaConfig, kdaConfig: kdaConfig,
+            inkling2Config: inkling2Config, dsparkConfig: dsparkConfig,
+            mlaConfig: mlaConfig, kdaConfig: kdaConfig,
             attentionSinkRelConfig: attentionSinkRelConfig, moeRoutingConfig: moeRoutingConfig,
             swigluClampConfig: swigluClampConfig, mtpConfig: mtpConfig,
-            visionTowerConfig: updatedVT, ropeInterleave: ropeInterleave, role: role
+            visionTowerConfig: updatedVT, ropeInterleave: ropeInterleave, role: role,
+            shortConvConfig: shortConvConfig, normKind: normKind,
+            useSandwichNorm: useSandwichNorm, perKindRoPEConfig: perKindRoPEConfig,
+            attnGateMode: attnGateMode, decisionConfig: decisionConfig
         )
     }
 

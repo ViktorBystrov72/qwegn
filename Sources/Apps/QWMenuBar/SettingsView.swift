@@ -394,6 +394,36 @@ public struct SettingsView: View {
                 }
             }
 
+            settingsGroup(title: "Decision Sidecar (Dual-Slot)", icon: "bolt.circle") {
+                VStack(alignment: .leading, spacing: 4) {
+                    SettingsRowLabel(text: "Decision Model Pack / .aimodel:", key: "decisionModelPackPath")
+                    TextField("~/.qwg/models/<decision-pack> or .aimodel", text: $draftSettings.decisionModelPackPath)
+                        .textFieldStyle(.roundedBorder)
+                    if let note = QWSettingsCoherence.effectNote(for: "decisionModelPackPath") {
+                        Text(note)
+                            .font(TelemetryTheme.ui(11))
+                            .foregroundStyle(TelemetryTheme.quiet(increasedContrast: increasedContrast))
+                    }
+                }
+
+                formRow(label: "Compute Unit:", key: "decisionComputeUnit") {
+                    Picker("", selection: $draftSettings.decisionComputeUnit) {
+                        Text("Auto").tag("auto")
+                        Text("Metal 4").tag("metal")
+                        Text("ANE").tag("ane")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: .infinity)
+                }
+
+                settingsToggleRow(
+                    "Load Decision Vision Tower",
+                    key: "decisionLoadVision",
+                    isOn: $draftSettings.decisionLoadVision
+                )
+            }
+
             settingsGroup(title: "Context & KV Format", icon: "slider.horizontal.3") {
                 ContextLimitSliderRow(
                     maxContext: $draftSettings.maxContext,

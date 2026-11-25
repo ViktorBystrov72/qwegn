@@ -232,6 +232,7 @@ public final class QWEngineDriver: @unchecked Sendable {
                 ropeYarnFactor: Double? = nil,
                 dflashDraftPackPath: String? = nil,
                 dflashSelectorTopK: Int? = nil,
+                dsparkConfidenceSchedule: Bool? = nil,
                 osReserveGiB: Double? = nil,
                 prefillChunkSize: Int = QWPrefillLimits.chunkRows,
                 prewarmDoors: [String] = DenseModule.requiredDoors,
@@ -255,7 +256,8 @@ public final class QWEngineDriver: @unchecked Sendable {
                                           mtpDraftStrategy: mtpDraftStrategy,
                                           mtpQuadraticSeeding: mtpQuadraticSeeding,
                                           dflashDraftPackPath: dflashDraftPackPath,
-                                          dflashSelectorTopK: dflashSelectorTopK)
+                                          dflashSelectorTopK: dflashSelectorTopK,
+                                          dsparkConfidenceSchedule: dsparkConfidenceSchedule)
         if cfg.isHyperStream {
             let resolvedTuning = tuning.overlaid(environment: cfg.environment)
             let evictPrefill: Bool = switch cfg.prefillScratchEviction {
@@ -384,11 +386,13 @@ public final class QWEngineDriver: @unchecked Sendable {
             self.standardState = nil
             return
         }
+        let resolvedSessions = maxConcurrentSessions ?? prefixCacheConfig?.maxConcurrentSessions
+        let resolvedSlotCount = Self.gdnSlotCount(requestedSessions: resolvedSessions)
         let startup = try Self.prepareContainersAndGeometry(
             packPath: packPath, maxTokens: maxTokens, ropeRows: ropeRows, kvMode: kvMode,
             prefillChunkSize: prefillChunkSize, mtpDrafts: mtpDrafts,
             residentExpertsPerLayer: residentExpertsPerLayer, osReserveGiB: osReserveGiB,
-            cfg: cfg, baseTuning: tuning)
+            cfg: cfg, baseTuning: tuning, requestedSessions: resolvedSessions)
         let resolvedCfg = startup.cfg
         let chunkRows = startup.prefillChunkSize
         let geometry = startup.geometry
@@ -440,7 +444,8 @@ public final class QWEngineDriver: @unchecked Sendable {
             weightFormatDeclineReason: startup.weightFormatDeclineReason, tuning: startup.tuning,
             osReserveGiB: startup.osReserveGiB, prefillChunkSize: chunkRows, maxTokens: maxTokens,
             ropeRows: ropeRows, kvMode: kvMode, attnLayerCount: attnL.count, gdnLayerCount: gdnL.count,
-            cfg: resolvedCfg, mtpDrafts: startup.mtpDrafts, mtpWeightDrafts: startup.mtpWeightDrafts)
+            cfg: resolvedCfg, mtpDrafts: startup.mtpDrafts, mtpWeightDrafts: startup.mtpWeightDrafts,
+            requestedSessions: resolvedSessions)
         self.capacityPlan = budget.capacityPlan
         self.capacityLogMessage = budget.capacityLogMessage
         let arenaVal = budget.arena
@@ -458,7 +463,7 @@ public final class QWEngineDriver: @unchecked Sendable {
             throw QWEngineDriverError.packMissing(packPath)
         }
 
-        let hasMTPDrafter = (startup.mtpWeightDrafts > 0 || resolvedCfg.mtpBackend == .dflash2) && startup.mtpDrafts > 0
+        let hasMTPDrafter = (startup.mtpWeightDrafts > 0 || resolvedCfg.mtpBackend == .dflash2 || resolvedCfg.mtpBackend == .dspark) && startup.mtpDrafts > 0
         let embHead = try Self.loadEmbeddingsAndHead(
             loader: &L, pack: startup.pack, stContainer: stContainer, packPath: packPath,
             hal: prelimHal, geometry: geometry, cfg: resolvedCfg,
@@ -539,10 +544,31 @@ public final class QWEngineDriver: @unchecked Sendable {
         let dflash: QWDFlashDrafter? = (resolvedCfg.mtpBackend == .dflash2 && startup.mtpDrafts > 0)
             ? try QWDFlashDrafter(geometry: geometry, hal: prelimHal, packPath: resolvedCfg.dflashDraftPackPath,
                                   drafts: startup.mtpDrafts, selectorTopK: resolvedCfg.dflashSelectorTopK,
-                                  sessionSlotCount: Self.gdnSlotCount()) : nil
+                                  sessionSlotCount: min(4, resolvedSlotCount)) : nil
+        let dspark: QWDSparkDrafter?
+        if resolvedCfg.mtpBackend == .dspark && startup.mtpDrafts > 0, let dsCfg = geometry.dsparkConfig {
+            let dsURL = resolvedCfg.dflashDraftPackPath.isEmpty
+                ? QWModelDescriptor.DSparkConfig.resolvePackURL(near: packPath)
+                : URL(fileURLWithPath: resolvedCfg.dflashDraftPackPath)
+            guard let dsURL, FileManager.default.fileExists(atPath: dsURL.path) else {
+                throw QWEngineDriverError.packMissing(resolvedCfg.dflashDraftPackPath.isEmpty ? "dspark.qwp" : resolvedCfg.dflashDraftPackPath)
+            }
+            let headURL = QWModelDescriptor.DSparkConfig.resolveDraftHeadURL(near: packPath)
+                ?? QWModelDescriptor.DSparkConfig.resolveDraftHeadURL(near: dsURL.path)
+            dspark = try QWDSparkDrafter(
+                geometry: geometry, hal: prelimHal, config: dsCfg,
+                packURL: dsURL, draftHeadURL: headURL,
+                maxPrefillChunk: chunkRows, sessionSlotCount: min(4, resolvedSlotCount),
+                confidenceScheduleEnabled: resolvedCfg.dsparkConfidenceSchedule
+            )
+        } else {
+            dspark = nil
+        }
+        admission.totalSlots = resolvedSlotCount
         admission.freeSlots = try Self.buildGDNSlots(
             gsub: gsub, geometry: geometry, gdnLayerCount: gdnL.count,
-            mtpDrafts: startup.mtpDrafts, dflashDrafter: dflash)
+            mtpDrafts: startup.mtpDrafts, dflashDrafter: dflash, dsparkDrafter: dspark,
+            slotCount: resolvedSlotCount)
 
         let effectiveLSAConfig = (!geometry.usesAnyMLA && geometry.blockSparseGQAConfig == nil)
             ? lsaConfig.resolvingAdaptiveBudget(forMaxContext: budget.effectiveMaxTokens)
@@ -620,6 +646,7 @@ public final class QWEngineDriver: @unchecked Sendable {
             mtpDraftEncoder: mtpRes.mtpDraftEncoder,
             echoDrafter: mtpRes.echoDrafter,
             dflashDrafter: dflash,
+            dsparkDrafter: dspark,
             gdnReplayCheckpoint: mtpRes.gdnReplayCheckpoint,
             mtpPromptEmbeddings: mtpRes.mtpPromptEmbeddings,
             verifyWindow: mtpRes.verifyWindow,
@@ -697,6 +724,13 @@ public final class QWEngineDriver: @unchecked Sendable {
     private var _lastRequestedBackend: String?
     private var _lastPromptTokens: Int = 0
     private var _lastStopToken: Int?
+    private var _gpuTurnArbitrator: QWGPUTurnArbitrator?
+    /// Step-boundary GPU arbitrator assigned on the primary engine so decode/prefill steps
+    /// yield cleanly to queued Metal decision sidecars (`ADR-002`).
+    public var gpuTurnArbitrator: QWGPUTurnArbitrator? {
+        get { statsLock.withLock { _gpuTurnArbitrator } }
+        set { statsLock.withLock { _gpuTurnArbitrator = newValue } }
+    }
     public internal(set) var lastExperimentalGeneration: QWExperimentalGenerationStats? {
         get { statsLock.withLock { _lastExperimentalGeneration } }
         set { statsLock.withLock { _lastExperimentalGeneration = newValue } }

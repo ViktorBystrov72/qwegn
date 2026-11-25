@@ -18,9 +18,9 @@
   1. Per-request `Task` (`routeTask.cancel()`) in `QWHttpServer.dispatchRoute`, and
   2. Lock-free `QWGenerationCancelFlag` (`Synchronization.Atomic<Bool>`), checked inside `QWEngineLifecycleActor+Chat` generation loops and before post-generation response emission across `/v1/chat/completions`, `/v1/messages`, `/api/chat`, and `/api/generate`.
 
-## 4. Image Source & SSRF Policy (`QWImageDecodePolicy`)
-- **`serverDefault`:** Permits `data:image/*;base64` only (`allowLocalImagePaths = false`, `allowRemoteImageURLs = false`); local paths and remote HTTP(S) require explicit server opt-in; CLI uses `QWImageDecodePolicy.cliLocal`.
-- **SSRF IP/DNS/redirect filter:** `validateRemoteURL` rejects non-HTTP(S) schemes, missing hosts, `localhost`, private/loopback/link-local IPv4 & IPv6 literals, and DNS resolutions (`getaddrinfo`) mapping to blocked ranges; downloads are byte-capped (`20 MiB`) and downsampled via `ImageIO` thumbnailing (`maxPixelDimension = 8192`).
+## 4. Image & Video Source & SSRF Policy (`QWImageDecodePolicy`, `QWVideoDecoder`)
+- **`serverDefault`:** Permits `data:image/*;base64` and `data:video/*;base64` only (`allowLocalImagePaths = false`, `allowRemoteImageURLs = false`); local paths and remote HTTP(S) require explicit server opt-in; CLI uses `QWImageDecodePolicy.cliLocal` (`specs/09-native-video-and-screen-vision.md`).
+- **SSRF IP/DNS/redirect filter:** `validateRemoteURL` rejects non-HTTP(S) schemes, missing hosts, `localhost`, private/loopback/link-local IPv4 & IPv6 literals, and DNS resolutions (`getaddrinfo`) mapping to blocked ranges; downloads are byte-capped (`20 MiB` images / `64 MiB` videos) with container magic-byte verification, `0o600` ephemeral temp files, and `ImageIO` / `AVAssetImageGenerator` hardware downsampling (`maxPixelDimension = 8192`).
 
 ## 5. Filesystem Permissions & PID Verification
 - Sensitive config, profile, and PID/lock state directories under `~/.qwg` (`QWPaths`, `QWSettingsManager`, `QWProfileStore`, `QWCli`) enforce restrictive POSIX modes (`0o700` dirs / `0o600` files) and path-traversal canonicalization.
@@ -30,7 +30,9 @@
 - **Multi-protocol routes (`QWHttpServer`, `QWHttpServer+Routes`):**
   - OpenAI: `POST /v1/chat/completions`, `POST /v1/responses` (`GET`/`DELETE /v1/responses/:id`, `previous_response_id` chaining and `background` mode via `QWResponsesStore`), and `POST /v1/completions` (`echo` + finite `logprobs` clamped at `-9999.0` via `QWEngineLifecycleActor+Completions`).
   - Anthropic: `POST /v1/messages` and `POST /v1/messages/count_tokens`.
+  - Decision & System-1 APIs (`specs/07`): `POST /v1/decisions` (+ `/batch`), `POST /v1/systemone` (+ `/batch`), `POST /v1/laya`, `POST /v1/decisions/model/load` & `/unload`, plus stateless Streamable-HTTP `POST /mcp` (`qwg_decide`, `laya_ask`, `laya_guard`, `laya_status`). Opt-in `reasoning.effort = "auto"` triggers a `< 10 ms` complexity check (`confidence >= 0.7` rail) when a sidecar is loaded on thinking templates.
   - Remote tokenizer inspection (vLLM-compatible): `GET /tokenizer_info`, `POST /tokenize`, and `POST /detokenize` (plus `/v1/*` aliases).
+  - Privacy-gated screen snapshot (`QWHttpServer+Vision`, `specs/09-native-video-and-screen-vision.md`): `POST /v1/vision/screen-capture` (strictly loopback-only `403` on non-loopback peers, `CGPreflightScreenCaptureAccess()` preflight without silent TCC modal prompts).
 - **Pre-stream `400` validation & socket latency:** Malformed JSON, empty/oversized inputs, invalid parameter bounds, and unknown `previous_response_id` return structured HTTP `400` JSON errors (`sendJsonResponse`) before emitting SSE `200` headers. Listener `NWProtocolTCP.Options` sets `tcpOptions.noDelay = true` (`TCP_NODELAY`) to avoid Nagle stalls on single-token SSE chunks.
 - **Universal cancellation:** `QWConnectionCancellationHub` + `QWGenerationCancelFlag` propagate client disconnect cancellation across `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/messages`, `/api/chat`, and `/api/generate`.
 

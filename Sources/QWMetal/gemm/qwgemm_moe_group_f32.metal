@@ -85,8 +85,11 @@ kernel void qwg_moe_group_pairs_f32(device const int* selected [[buffer(0)]],
         int myTiles = 0;
         for (uint e = e0; e < e1; ++e) {
             const int c = tgOff[e + 1] - tgOff[e];
-            if (c > 0) myTiles += (c + 63) / 64;
+            if (c > 0) {
+                myTiles += (c + 63) / 64;
+            }
         }
+        const int totalTiles = simd_sum(myTiles);
         int t = simd_prefix_exclusive_sum(myTiles);
         for (uint e = e0; e < e1; ++e) {
             const int c = tgOff[e + 1] - tgOff[e];
@@ -115,7 +118,6 @@ kernel void qwg_moe_group_pairs_f32(device const int* selected [[buffer(0)]],
                 }
             }
         }
-        const int totalTiles = simd_broadcast(t, 31);
         if (lane == 31u) tileCount[0] = totalTiles;
         const uint guCol = (writeTiles >> 1u) & 0x7FFFu;
         const uint dnCol = (writeTiles >> 16u) & 0xFFFFu;

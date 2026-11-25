@@ -85,8 +85,9 @@
         device const char*    coldW     [[buffer(10)]],                                \
         uint3 tg [[threadgroup_position_in_grid]],                                     \
         uint simd_gid [[simdgroup_index_in_threadgroup]]) {                            \
-        qwg_moe_nax_split_f32_body<BITS, GROUP>(w, xh, xl, y32, expertOff, tileE,     \
-            tileR, tileCount, p, tileBlock, coldW, tg, simd_gid);                     \
+        qwg_moe_nax_split_f32_body<BITS, GROUP>(                                       \
+            w, xh, xl, y32, expertOff, tileE, tileR, tileCount,                        \
+            p, tileBlock, coldW, tg, simd_gid);                                        \
     }
 
 #define QW_AQ_BATCHED_SUITE(BITS, GROUP)                                             \

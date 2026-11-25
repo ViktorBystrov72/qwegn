@@ -60,6 +60,7 @@ final class QWDriverStandardState: @unchecked Sendable {
     let mtpDraftEncoder: QWMTPDraftEncoder?
     let echoDrafter: QWEchoDraftEncoder?
     let dflashDrafter: QWDFlashDrafter?
+    let dsparkDrafter: QWDSparkDrafter?
     let gdnReplayCheckpoint: QWGDNReplayCheckpoint?
     let mtpPromptEmbeddings: QWTensorValue?
     let verifyWindow: QWVerifyWindow?
@@ -121,6 +122,7 @@ final class QWDriverStandardState: @unchecked Sendable {
         mtpDraftEncoder: QWMTPDraftEncoder?,
         echoDrafter: QWEchoDraftEncoder?,
         dflashDrafter: QWDFlashDrafter?,
+        dsparkDrafter: QWDSparkDrafter?,
         gdnReplayCheckpoint: QWGDNReplayCheckpoint?,
         mtpPromptEmbeddings: QWTensorValue?,
         verifyWindow: QWVerifyWindow?,
@@ -178,6 +180,7 @@ final class QWDriverStandardState: @unchecked Sendable {
         self.mtpDraftEncoder = mtpDraftEncoder
         self.echoDrafter = echoDrafter
         self.dflashDrafter = dflashDrafter
+        self.dsparkDrafter = dsparkDrafter
         self.gdnReplayCheckpoint = gdnReplayCheckpoint
         self.mtpPromptEmbeddings = mtpPromptEmbeddings
         self.verifyWindow = verifyWindow
@@ -268,6 +271,7 @@ extension QWEngineDriver {
     var mtpDraftEncoder: QWMTPDraftEncoder? { standardState?.mtpDraftEncoder }
     var echoDrafter: QWEchoDraftEncoder? { standardState?.echoDrafter }
     var dflashDrafter: QWDFlashDrafter? { standardState?.dflashDrafter }
+    var dsparkDrafter: QWDSparkDrafter? { standardState?.dsparkDrafter }
     var gdnReplayCheckpoint: QWGDNReplayCheckpoint? { standardState?.gdnReplayCheckpoint }
     var mtpPromptEmbeddings: QWTensorValue? { standardState?.mtpPromptEmbeddings }
     var verifyWindow: QWVerifyWindow? { standardState?.verifyWindow }

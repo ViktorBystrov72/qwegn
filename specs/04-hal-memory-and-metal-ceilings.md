@@ -15,6 +15,7 @@
 ## 3. Unified Memory Discipline & Zero Steady-State Allocations
 - **Host budget (`128 GiB` UMA):** `QWResidencyAdmission` / `QWAdmission` verifies `planned <= available` before loading weights or expanding context/KV arenas; refusals exit non-zero before allocation.
 - **Zero steady-state allocations:** After warmup/pre-allocation (`QWArena`), decode and prefill steady state executes with `0` heap or Metal buffer allocations per step across dense, MoE, GDN, HCA, and MLA/QSA paths.
+- **Dual-slot sidecar admission & GPU preemption (`QWResidencyAdmission.admitDecisionSidecar`, `QWGPUTurnArbitrator`):** When a `decisionModelPackPath` sidecar co-resides alongside a primary model, `admitDecisionSidecar` verifies `primaryWired + sidecarEstimate + warmCache <= availableBytes` (clamping warm caches first, refusing nonzero before allocation). Shared `QWGPUTurnArbitrator` pauses primary Metal prefill/decode chunks cleanly between command-buffer boundaries when a Metal decision sidecar call awaits GPU access; CoreAI ANE (`.aimodel`) sidecars bypass GPU arbitration completely.
 - **Sequential GPU ownership:** Only one heavyweight GPU inference process executes at a time; benchmarks (`Scripts/paired_perf.py`) run strictly sequentially with quiet-GPU preflight checks.
 
 ## 4. Safe `ColdExpertStreamer` Synchronization

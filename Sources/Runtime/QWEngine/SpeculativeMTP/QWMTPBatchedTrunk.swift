@@ -303,7 +303,7 @@ extension QWEngineDriver {
             qOut: qgate, kOut: keys, vOut: values,
             wq: weights.attn!.wq, wk: weights.attn!.wkTiled,
             qkvBias: weights.attn!.qkvBias,
-            positionStart: session.position, count: activeRows,
+            positionStart: max(0, session.position + session.roundRecord.mropeDelta), count: activeRows,
             inRowCols: qkvCols)
         enc.memoryBarrier(scope: .buffers)
         let layerSW = geometry.virtualLayerSlidingWindow(layer)

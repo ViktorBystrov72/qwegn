@@ -132,7 +132,7 @@ public struct QWVisionGrid: Equatable, Sendable {
     public let t: Int, h: Int, w: Int
     public let spec: QWMMSpec
     public init(t: Int, h: Int, w: Int, spec: QWMMSpec = .qwen3VLReference) throws {
-        guard t > 0, h > 0, w > 0, spec.merge > 0, spec.patch > 0, spec.temporal > 0, spec.posSide > 0 else {
+        guard t > 0, h > 0, w > 0, spec.merge > 0, spec.patch > 0, spec.temporal > 0, spec.posSide >= 0 else {
             throw QWGridError.mergeShape(t: t, h: h, w: w)
         }
         guard h % spec.merge == 0, w % spec.merge == 0 else {
@@ -238,6 +238,7 @@ func axisTaps(_ index: Int, size: Int, side: Int) -> (taps: [Int], weights: [Flo
 
 /// Golden-law interpolation table in merge-block order into `side x side` pos_embed.
 public func qwInterpTaps(grid: QWVisionGrid) -> (indices: [Int32], weights: [Float]) {
+    if grid.spec.posSide <= 0 { return ([], []) }
     if grid.spec.isInkling2 { return qwInkling2InterpTaps(grid: grid) }
     let m = grid.spec.merge
     let side = grid.spec.posSide
@@ -527,6 +528,7 @@ public struct QWX0Span: Equatable, Sendable {
 public struct QWX0Plan: Equatable, Sendable {
     public let tokens: [Int]
     public let spans: [QWX0Span]
+    public let visionSpanIsVideo: [Bool]
     public let positions: [Int32]
     public let mropeDelta: Int
     public var rows: Int { spans.reduce(0) { $0 + $1.rowCount } }
@@ -540,6 +542,7 @@ public struct QWX0Plan: Equatable, Sendable {
     ) throws {
         var out: [Int] = []
         var spans: [QWX0Span] = []
+        var visIsVideo: [Bool] = []
         var blocks: [QWMMBlock] = []
         var ii = 0, vi = 0, row = 0
         var textRun: [Int] = []
@@ -556,14 +559,16 @@ public struct QWX0Plan: Equatable, Sendable {
                 flushText()
                 let exp = g.tokens
                 spans.append(QWX0Span(content: .vision(grid: g, patches: g.patches, rows: exp), rowStart: row))
+                visIsVideo.append(false)
                 blocks.append(.image(tokens: Array(repeating: t, count: exp), grid: g))
                 out.append(contentsOf: Array(repeating: t, count: exp)); row += exp
-            } else if t == spec.videoToken {
+            } else if spec.videoToken >= 0 && t == spec.videoToken {
                 guard vi < videos.count else { throw QWGridError.placeholderOverflow }
                 let g = videos[vi]; vi += 1
                 flushText()
                 let exp = g.tokens
                 spans.append(QWX0Span(content: .vision(grid: g, patches: g.patches, rows: exp), rowStart: row))
+                visIsVideo.append(true)
                 blocks.append(.video(tokens: Array(repeating: t, count: exp), grid: g))
                 out.append(contentsOf: Array(repeating: t, count: exp)); row += exp
             } else {
@@ -576,7 +581,11 @@ public struct QWX0Plan: Equatable, Sendable {
         }
         let rope = qwMRopePositions(blocks: blocks, merge: spec.merge, layout: spec.mropeLayout)
         precondition(rope.pos.count == 3 * out.count)
-        self.tokens = out; self.spans = spans; self.positions = rope.pos; self.mropeDelta = rope.delta
+        self.tokens = out
+        self.spans = spans
+        self.visionSpanIsVideo = visIsVideo
+        self.positions = rope.pos
+        self.mropeDelta = rope.delta
     }
 }
 

@@ -21,6 +21,9 @@ extension QWCacheDiskManager {
         let dflashK = dflashActive ? state.dflashKData : nil
         let dflashV = dflashActive ? state.dflashVData : nil
         let dflashOffset = dflashActive ? state.dflashCacheOffset : nil
+        let dsparkActive = state.dsparkCacheOffset > 0 && state.dsparkRingData != nil
+        let dsparkRing = dsparkActive ? state.dsparkRingData : nil
+        let dsparkOffset = dsparkActive ? state.dsparkCacheOffset : nil
 
         let meta = StoredMetadata(
             tokens: tokens,
@@ -44,7 +47,9 @@ extension QWCacheDiskManager {
             mlaIndexerBytes: state.mlaIndexerData?.count,
             dflashKBytes: dflashK?.count,
             dflashVBytes: dflashV?.count,
-            dflashCacheOffset: dflashOffset
+            dflashCacheOffset: dflashOffset,
+            dsparkRingBytes: dsparkRing?.count,
+            dsparkCacheOffset: dsparkOffset
         )
 
         let metaData = try JSONEncoder().encode(meta)
@@ -52,7 +57,7 @@ extension QWCacheDiskManager {
         let headerRawLen = MemoryLayout<UInt64>.size + metaData.count
             + state.recData.count + state.ringData.count + (state.trunkHiddenData?.count ?? 0)
             + (state.mlaIndexerData?.count ?? 0) + (dflashK?.count ?? 0) + (dflashV?.count ?? 0)
-            + logits.count
+            + (dsparkRing?.count ?? 0) + logits.count
         let alignedHeaderLen = Self.alignUp(headerRawLen)
         let kvPayloadBytes = trunkPlaneSizes.reduce(0, +) + mtpPlaneSizes.reduce(0, +)
         let totalPayloadBytes = alignedHeaderLen + kvPayloadBytes
@@ -66,6 +71,7 @@ extension QWCacheDiskManager {
         if let mla = state.mlaIndexerData { headerBuf.append(mla) }
         if let dflashK { headerBuf.append(dflashK) }
         if let dflashV { headerBuf.append(dflashV) }
+        if let dsparkRing { headerBuf.append(dsparkRing) }
         headerBuf.append(logits)
         if headerBuf.count < alignedHeaderLen {
             headerBuf.append(Data(count: alignedHeaderLen - headerBuf.count))
@@ -94,6 +100,7 @@ extension QWCacheDiskManager {
         guard meta.recBytes >= 0, meta.ringBytes >= 0, meta.trunkHiddenBytes >= 0, meta.logitsBytes >= 0,
               (meta.mlaIndexerBytes ?? 0) >= 0,
               (meta.dflashKBytes ?? 0) >= 0, (meta.dflashVBytes ?? 0) >= 0,
+              (meta.dsparkRingBytes ?? 0) >= 0,
               meta.trunkPlaneSizes.allSatisfy({ $0 >= 0 }),
               meta.mtpPlaneSizes.allSatisfy({ $0 >= 0 }) else {
             throw ReadError.invalidHeader
@@ -109,11 +116,14 @@ extension QWCacheDiskManager {
             ? try readSection(io, offset: &offset, length: meta.dflashKBytes ?? 0) : nil
         let dflashVData = (meta.dflashVBytes ?? 0) > 0
             ? try readSection(io, offset: &offset, length: meta.dflashVBytes ?? 0) : nil
+        let dsparkRingData = (meta.dsparkRingBytes ?? 0) > 0
+            ? try readSection(io, offset: &offset, length: meta.dsparkRingBytes ?? 0) : nil
         let logits = try readSection(io, offset: &offset, length: meta.logitsBytes)
         if (meta.formatVersion ?? 1) >= 2 {
             offset = Int64(Self.alignUp(Int(offset)))
         }
         let restoredDFlashValid = (meta.dflashCacheOffset ?? 0) > 0 && dflashKData != nil && dflashVData != nil
+        let restoredDSparkValid = (meta.dsparkCacheOffset ?? 0) > 0 && dsparkRingData != nil
         let state = QWEnginePrefixState(
             position: meta.position,
             generated: meta.generated,
@@ -126,6 +136,8 @@ extension QWCacheDiskManager {
             dflashKData: restoredDFlashValid ? dflashKData : nil,
             dflashVData: restoredDFlashValid ? dflashVData : nil,
             dflashCacheOffset: restoredDFlashValid ? (meta.dflashCacheOffset ?? 0) : 0,
+            dsparkRingData: restoredDSparkValid ? dsparkRingData : nil,
+            dsparkCacheOffset: restoredDSparkValid ? (meta.dsparkCacheOffset ?? 0) : 0,
             mlaIndexerData: mlaIndexerData
         )
         return (state, logits, offset)

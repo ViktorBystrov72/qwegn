@@ -267,3 +267,48 @@ kernel void qwg_extract_rope_qk_general(device const uint4* attnY   [[buffer(0)]
         }
     }
 }
+
+struct QWRopeZeroTailParams {
+    uint seqLen;
+    uint numHeads;
+    uint headDim;
+    uint rotaryDims;
+    uint posOffset;
+    uint zeroTail;
+};
+
+// Half-split RoPE over dims [0..<rotaryDims], copying or zeroing tail [rotaryDims..<headDim].
+kernel void qwg_rope_zero_tail_f16(device const half*          x      [[buffer(0)]],
+                                   device half*                out    [[buffer(1)]],
+                                   device const float*         table  [[buffer(2)]],
+                                   constant QWRopeZeroTailParams& p   [[buffer(3)]],
+                                   uint2 tg [[threadgroup_position_in_grid]],
+                                   uint ti  [[thread_index_in_threadgroup]]) {
+    const uint hIdx = tg.x;
+    const uint s = tg.y;
+    if (hIdx >= p.numHeads || s >= p.seqLen) return;
+
+    const size_t base = ((size_t)s * p.numHeads + hIdx) * p.headDim;
+    device const float* cs = table + (size_t)(p.posOffset + s) * p.rotaryDims;
+    const uint halfR = p.rotaryDims / 2u;
+
+    for (uint d = ti; d < p.headDim; d += 32u) {
+        if (d < halfR) {
+            float x0 = float(x[base + d]);
+            float x1 = float(x[base + d + halfR]);
+            float c = cs[d];
+            float sn = cs[d + halfR];
+            out[base + d] = half(x0 * c - x1 * sn);
+        } else if (d < p.rotaryDims) {
+            uint pair = d - halfR;
+            float x0 = float(x[base + pair]);
+            float x1 = float(x[base + d]);
+            float c = cs[pair];
+            float sn = cs[pair + halfR];
+            out[base + d] = half(x1 * c + x0 * sn);
+        } else {
+            out[base + d] = (p.zeroTail != 0u) ? half(0.0h) : x[base + d];
+        }
+    }
+}
+

@@ -53,7 +53,7 @@ kernel void qwg_gemv_aq##BITS##_g##GROUP##_f32_v4(device const char*  w     [[bu
                                                   uint  tid  [[thread_index_in_threadgroup]], \
                                                   uint  sg   [[simdgroup_index_in_threadgroup]], \
                                                   uint  lane [[thread_index_in_simdgroup]]) { \
-    threadgroup float tgC[4 * 32]; \
+    threadgroup float tgC[8 * 32]; \
     threadgroup QWEmptyTgLut tgLut; \
     const QWGemmF32V4Params p = { N, K, epi, scale }; \
     qwg_gemv_f32_v4_body<QWQuantAQ<BITS, GROUP>>(w, x, y, p, tg, tid, sg, lane, tgC, tgLut); \
@@ -71,7 +71,7 @@ kernel void qwg_gemv_aq##BITS##_g##GROUP##_f32_v4_am(device const char*  w      
                                                      uint  tid  [[thread_index_in_threadgroup]], \
                                                      uint  sg   [[simdgroup_index_in_threadgroup]], \
                                                      uint  lane [[thread_index_in_simdgroup]]) { \
-    threadgroup uint bHi[16], bLo[16]; \
+    threadgroup uint bHi[32], bLo[32]; \
     threadgroup QWEmptyTgLut tgLut; \
     const QWGemmF32V4Params p = { N, K, epi, scale }; \
     qwg_gemv_f32_v4_am_body<QWQuantAQ<BITS, GROUP>>(w, x, y, keysHi, keysLo, p, tg, tid, sg, lane, bHi, bLo, tgLut); \

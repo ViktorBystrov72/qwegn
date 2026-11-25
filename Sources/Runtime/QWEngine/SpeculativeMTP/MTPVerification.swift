@@ -202,8 +202,19 @@ extension QWEngineDriver {
                 if let stageProfiler {
                     let result = try stageProfiler.resolve(
                         totalGpuMicros: QWMTPStageTiming.gpuDurationMs(finalCB) * 1000)
-                    verificationGpuMsByStage = Dictionary(uniqueKeysWithValues:
+                    let byStage = Dictionary(uniqueKeysWithValues:
                         result.gpuMicrosByStage.map { ($0.key.rawValue, $0.value / 1000) })
+                    verificationGpuMsByStage = byStage
+                    if Self.decodeTraceEnabled {
+                        let parts = QWMTPVerificationStage.allCases.compactMap { st -> String? in
+                            guard let ms = byStage[st.rawValue], ms > 0 else { return nil }
+                            return String(format: "%@=%.2fms", st.rawValue, ms)
+                        }.joined(separator: " ")
+                        FileHandle.standardError.write(Data(String(
+                            format: "[verify-stages] pos=%d rows=%d total=%.2fms attr=%.2fms %@\n",
+                            session.position, rowCount,
+                            result.totalGpuMicros / 1000, result.attributedGpuMicros / 1000, parts).utf8))
+                    }
                 }
             } catch {
                 session.stateFailed = true
@@ -407,7 +418,8 @@ extension QWEngineDriver {
                     weight: weights.gu.view,
                     output: activeMlpRows,
                     activeRows: activeRows,
-                    fuseFwht32: fuseFwht)
+                    fuseFwht32: fuseFwht,
+                    swigluClamp: geometry.routedSwiGLUClamp(layer: p))
                 if !fuseFwht && weights.down.isRotated {
                     encodeFwht32Fast(enc, x: activeMlpRows)
                     enc.memoryBarrier(scope: .buffers)
@@ -448,6 +460,13 @@ extension QWEngineDriver {
                 try encodeRMSNormResidualFast(enc, x: mtpBatchedMLP.downRows, gamma: gamma,
                     out: normalized, residual: window.hidden, rows: activeRows)
                 enc.memoryBarrier(scope: .buffers)
+            }
+            if dsparkDrafter != nil {
+                encodeDSparkTargetTapIfNeeded(
+                    enc, physicalLayer: p, nextPhysicalLayer: nextP,
+                    mhcStream: window.mhcStream, mhcControls: window.mhcControls,
+                    branchDn16: mtpBatchedMLP.downRows, residualX16: window.hidden,
+                    srcRowOffset: 0, dstRowOffset: 0, rows: activeRows)
             }
             if let dflashDrafter {
                 let captureIdx = dflashDrafter.usesVirtualLayerCapture ? layer : p

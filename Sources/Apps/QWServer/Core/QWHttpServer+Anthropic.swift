@@ -63,7 +63,8 @@ extension QWHttpServer {
 
             let streamParser = QWChatStreamParser(
                 startsInReasoning: streamPolicy.shouldThink,
-                allowToolCalls: streamPolicy.allowToolCalls
+                allowToolCalls: streamPolicy.allowToolCalls,
+                allowInk2Markers: actor.isInkling2Template() && (!streamPolicy.isJsonResponseFormat || streamPolicy.shouldThink)
             )
 
             final class StreamBlockState: @unchecked Sendable {
@@ -131,7 +132,10 @@ extension QWHttpServer {
                             modelMaxLength: serverConfig.modelMaxLength,
                             supportsThinkingTags: self.actor.supportsThinkingTags()
                         )
-                        streamParser.setStartsInReasoning(readyPolicy.shouldThink)
+                        streamParser.setStartsInReasoning(
+                            readyPolicy.shouldThink,
+                            allowInk2Markers: self.actor.isInkling2Template() && (!readyPolicy.isJsonResponseFormat || readyPolicy.shouldThink)
+                        )
                         session.begin()
                         sendEvent("message_start", [
                             "type": "message_start",
@@ -236,7 +240,8 @@ extension QWHttpServer {
                 tools: req.tools,
                 startsInThinking: result.startsInThinking,
                 truncated: result.truncated,
-                allowToolCalls: streamPolicy.allowToolCalls
+                allowToolCalls: streamPolicy.allowToolCalls,
+                allowInk2Markers: actor.isInkling2Template() && (!streamPolicy.isJsonResponseFormat || result.startsInThinking)
             )
             let effectiveCalls = QWChatPolicyResolver.capToolCalls(
                 parsedResult.toolCalls,

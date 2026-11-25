@@ -92,6 +92,7 @@ extension QWInferenceModule {
         }
         let isNgramStrategy = parameters.mtpDraftStrategy.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "ngram"
         let isDFlashFamily = ["dflash2", "dflash", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "")
+        let isDSparkRequested = parameters.mtpBackend?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "dspark"
         if modelSwitch {
             if isDFlashFamily {
                 let envPack = environment["QW_DFLASH_DRAFT_PACK"]?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -102,6 +103,8 @@ extension QWInferenceModule {
                 if !compatible && (descriptor.hcCount != nil || descriptor.numExperts != nil) {
                     parameters.mtpBackend = "variational"
                 }
+            } else if isDSparkRequested && descriptor.dsparkConfig == nil && (descriptor.hcCount != nil || descriptor.numExperts != nil) {
+                parameters.mtpBackend = "variational"
             }
             let stillDFlash = ["dflash2", "dflash", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "")
             let supportsWeightFreeNgramSwitch = !descriptor.capabilities.contains(.mtp)
@@ -110,8 +113,11 @@ extension QWInferenceModule {
             parameters.mtpDrafts = min(parameters.mtpDrafts, maximum)
         }
         let supportsWeightFreeNgram = Self.capabilities.contains(.speculative) && isNgramStrategy
+        let isDSparkActive = parameters.mtpBackend?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "dspark"
         let supportsMTP = descriptor.capabilities.contains(.mtp)
+            || descriptor.dsparkConfig != nil
             || ["dflash2", "dflash", "dspine"].contains(parameters.mtpBackend?.lowercased() ?? "")
+            || (isDSparkActive && descriptor.dsparkConfig != nil)
             || supportsWeightFreeNgram
         let drafts = parameters.enabled && supportsMTP ? parameters.mtpDrafts : 0
         var backend: QWMTPBackend?

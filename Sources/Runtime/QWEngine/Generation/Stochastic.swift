@@ -131,7 +131,7 @@ extension QWEngineDriver {
                 backoff: .armed(position: session.position, drafts: mtpDrafts),
                 canSpeculate: {
                     self.canRunSpeculativeRound(session)
-                        && (self.activeConstraint?.constraint.isUnconstrainedNow ?? true)
+                        && self.canSpeculateActiveConstraint
                 })
             lastExperimentalGeneration = QWExperimentalGenerationStats(
                 promptTokens: prompt.count, generatedTokens: output.tokens.count,
@@ -198,7 +198,7 @@ extension QWEngineDriver {
             backoff: .armed(position: session.position, drafts: mtpDrafts),
             canSpeculate: {
                 self.canRunSpeculativeRound(session)
-                    && (self.activeConstraint?.constraint.isUnconstrainedNow ?? true)
+                    && self.canSpeculateActiveConstraint
             })
         if let cb = session.lastCommitCB {
             session.lastCommitCB = nil

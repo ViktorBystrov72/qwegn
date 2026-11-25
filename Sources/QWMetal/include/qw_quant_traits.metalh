@@ -98,6 +98,11 @@ struct QWQuantHQ4 {
         return qwg_dot_hq4_block_f32_reg(gp[0], a.lo, a.hi);
     }
 
+    METAL_FUNC static float slice_dot_acc(WeightPtr gp, uint byteInGroup, thread const ActSlice& a,
+                                          threadgroup const TgLut& tgLut, float acc) {
+        return acc + slice_dot(gp, byteInGroup, a, tgLut);
+    }
+
     METAL_FUNC static float2 slice_dot2(WeightPtr gp, uint, thread const ActSlice& a0,
                                         thread const ActSlice& a1, threadgroup const TgLut&) {
         return qwg_dot_hq4_block_f32_reg2(gp[0], a0.lo, a0.hi, a1.lo, a1.hi);
@@ -134,6 +139,13 @@ struct QWQuantHQ4 {
                                         uint row0, uint N, uint K, uint lane,
                                         thread float4 (&acc)[4], threadgroup const TgLut&) {
         qwg_gemv_hq4_rows4_m4_f32<LS>(w, x, M, row0, N, K, lane, acc);
+    }
+
+    template <uint LS = 32u>
+    METAL_FUNC static void rows4_m8_f32(WeightPtr w, device const float* x, uint M,
+                                        uint row0, uint N, uint K, uint lane,
+                                        thread float4 (&acc)[8], threadgroup const TgLut&) {
+        qwg_gemv_hq4_rows4_m8_f32<LS>(w, x, M, row0, N, K, lane, acc);
     }
 
     METAL_FUNC static float row_f32(WeightPtr w, device const float* x, size_t row, uint K,
@@ -187,6 +199,11 @@ struct QWQuantAQ {
         return qwg_aq_slice_dot<BITS>(gp, byteInGroup, a.lo, a.hi, a.sumX);
     }
 
+    METAL_FUNC static float slice_dot_acc(WeightPtr gp, uint byteInGroup, thread const ActSlice& a,
+                                          threadgroup const TgLut& tgLut, float acc) {
+        return acc + slice_dot(gp, byteInGroup, a, tgLut);
+    }
+
     METAL_FUNC static float2 slice_dot2(WeightPtr gp, uint byteInGroup, thread const ActSlice& a0,
                                         thread const ActSlice& a1, threadgroup const TgLut&) {
         return qwg_aq_slice_dot2<BITS>(gp, byteInGroup, a0.lo, a0.hi, a1.lo, a1.hi,
@@ -224,6 +241,13 @@ struct QWQuantAQ {
                                         uint row0, uint N, uint K, uint lane,
                                         thread float4 (&acc)[4], threadgroup const TgLut&) {
         qwg_gemv_aq_rows4_m4_f32<BITS, GROUP, LS>(w, x, M, row0, N, K, lane, acc);
+    }
+
+    template <uint LS = 32u>
+    METAL_FUNC static void rows4_m8_f32(WeightPtr w, device const float* x, uint M,
+                                        uint row0, uint N, uint K, uint lane,
+                                        thread float4 (&acc)[8], threadgroup const TgLut&) {
+        qwg_gemv_aq_rows4_m8_f32<BITS, GROUP, LS>(w, x, M, row0, N, K, lane, acc);
     }
 
     METAL_FUNC static float row_f32(WeightPtr w, device const float* x, size_t row, uint K,

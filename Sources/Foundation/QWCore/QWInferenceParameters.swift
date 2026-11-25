@@ -141,6 +141,7 @@ public struct QWSpeculativeParameters: Codable, Sendable, Equatable {
     public var entropyThreshold: Double
     public var dflashDraftPackPath: String?
     public var dflashSelectorTopK: Int
+    public var dsparkConfidenceSchedule: Bool?
 
     public init(
         enabled: Bool = true,
@@ -153,7 +154,8 @@ public struct QWSpeculativeParameters: Codable, Sendable, Equatable {
         adaptiveDepth: Bool = false,
         entropyThreshold: Double = 0.7,
         dflashDraftPackPath: String? = nil,
-        dflashSelectorTopK: Int = 16
+        dflashSelectorTopK: Int = 16,
+        dsparkConfidenceSchedule: Bool? = nil
     ) {
         self.enabled = enabled
         self.mtpDrafts = mtpDrafts
@@ -167,6 +169,7 @@ public struct QWSpeculativeParameters: Codable, Sendable, Equatable {
         self.entropyThreshold = entropyThreshold
         self.dflashDraftPackPath = dflashDraftPackPath
         self.dflashSelectorTopK = dflashSelectorTopK
+        self.dsparkConfidenceSchedule = dsparkConfidenceSchedule
     }
 
     /// Effective draft count (`0` when speculative decoding is disabled).
@@ -268,6 +271,7 @@ public struct QWVisualSpan: Sendable, Equatable {
     public let gridH: Int
     public let gridW: Int
     public let spatialMergeSize: Int
+    public let isVideo: Bool
 
     public init(
         tokenOffset: Int,
@@ -276,7 +280,8 @@ public struct QWVisualSpan: Sendable, Equatable {
         gridT: Int = 0,
         gridH: Int = 0,
         gridW: Int = 0,
-        spatialMergeSize: Int = 1
+        spatialMergeSize: Int = 1,
+        isVideo: Bool = false
     ) {
         self.tokenOffset = tokenOffset
         self.tokenCount = tokenCount
@@ -285,6 +290,7 @@ public struct QWVisualSpan: Sendable, Equatable {
         self.gridH = gridH
         self.gridW = gridW
         self.spatialMergeSize = spatialMergeSize
+        self.isVideo = isVideo
     }
 
     /// Deterministic 64-bit FNV-1a hash of the visual embedding payload and span geometry.
@@ -293,6 +299,9 @@ public struct QWVisualSpan: Sendable, Equatable {
         let prime: UInt64 = 0x0000_0100_0000_01b3
         h = (h ^ UInt64(bitPattern: Int64(tokenOffset))) &* prime
         h = (h ^ UInt64(bitPattern: Int64(tokenCount))) &* prime
+        if isVideo {
+            h = (h ^ UInt64(bitPattern: Int64(gridT | 0x4000_0000))) &* prime
+        }
         embeddings.withUnsafeBufferPointer { buf in
             for v in buf {
                 h = (h ^ UInt64(v.bitPattern)) &* prime

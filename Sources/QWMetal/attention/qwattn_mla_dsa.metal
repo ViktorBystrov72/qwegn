@@ -618,3 +618,135 @@ kernel void qwg_mla_vha_gate_rot(
         dstRow[h * p.vHeadDim + d] = half(qwg_fwht32_lane_f32(val, lane));
     }
 }
+
+struct MLAFlashIndexerParams {
+    uint T;
+    uint hidden;
+    uint fullIdxHeads;
+    uint selHeads;
+    uint idxDim;
+    uint qChannels;
+    uint qFullStride;
+};
+
+// 5. FlashIndexer head selection: gates = ln1 @ gateW^T, scores = gates + bias, top-K gather.
+// Grid: (ceil(T / 32), 1, 1), Threadgroup: (256, 1, 1).
+kernel void qwg_mla_flashindexer_select_heads(
+    device const half*              ln1        [[buffer(0)]],
+    device const half*              gateW      [[buffer(1)]],
+    device const float*             gateBias   [[buffer(2)]],
+    device const float*             idxWeights [[buffer(3)]],
+    device const half*              mlaQFull   [[buffer(4)]],
+    device half*                    qSelOut    [[buffer(5)]],
+    device float*                   wSelOut    [[buffer(6)]],
+    constant MLAFlashIndexerParams& p          [[buffer(7)]],
+    uint                            tg         [[threadgroup_position_in_grid]],
+    uint                            tid        [[thread_index_in_threadgroup]],
+    uint                            sg         [[simdgroup_index_in_threadgroup]],
+    uint                            lane       [[thread_index_in_simdgroup]]
+) {
+    constexpr uint BM = 32u, BN = 64u, BK = 32u, KSTR = 40u, SSTR = 68u;
+    const uint tBase = tg * BM;
+    if (tBase >= p.T || p.fullIdxHeads > BN) return;
+
+    threadgroup half  shX[BM * KSTR];
+    threadgroup half  shW[BN * KSTR];
+    threadgroup float shS[BM * SSTR];
+
+    simdgroup_float8x8 acc[2][2];
+    for (uint a = 0u; a < 2u; ++a) {
+        for (uint b = 0u; b < 2u; ++b) acc[a][b] = simdgroup_float8x8(0.0f);
+    }
+
+    const uint xRow = tid >> 3u, xC4 = (tid & 7u) * 4u;
+    const uint sgRow = sg >> 2u, sgCol = sg & 3u;
+    for (uint k0 = 0u; k0 < p.hidden; k0 += BK) {
+        half4 xv = half4(0.0h);
+        if (tBase + xRow < p.T && k0 + xC4 < p.hidden) {
+            device const half* xp = ln1 + (size_t)(tBase + xRow) * p.hidden + k0 + xC4;
+            if (k0 + xC4 + 4u <= p.hidden) {
+                xv = *(device const half4*)xp;
+            } else {
+                for (uint c = 0u; c < 4u && (k0 + xC4 + c < p.hidden); ++c) xv[c] = xp[c];
+            }
+        }
+        *(threadgroup half4*)(shX + xRow * KSTR + xC4) = xv;
+
+        for (uint u = 0u; u < 2u; ++u) {
+            const uint wIdx = tid + u * 256u;
+            const uint h = wIdx >> 3u, c4 = (wIdx & 7u) * 4u;
+            half4 wv = half4(0.0h);
+            if (h < p.fullIdxHeads && k0 + c4 < p.hidden) {
+                device const half* wp = gateW + (size_t)h * p.hidden + k0 + c4;
+                if (k0 + c4 + 4u <= p.hidden) {
+                    wv = *(device const half4*)wp;
+                } else {
+                    for (uint c = 0u; c < 4u && (k0 + c4 + c < p.hidden); ++c) wv[c] = wp[c];
+                }
+            }
+            *(threadgroup half4*)(shW + h * KSTR + c4) = wv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint kk = 0u; kk < BK; kk += 8u) {
+            simdgroup_half8x8 af[2], bf[2];
+            for (uint a = 0u; a < 2u; ++a) simdgroup_load(af[a], shX + (sgRow * 16u + a * 8u) * KSTR + kk, KSTR);
+            for (uint b = 0u; b < 2u; ++b) {
+                simdgroup_load(bf[b], shW + (sgCol * 16u + b * 8u) * KSTR + kk, KSTR, ulong2(0, 0), true);
+            }
+            for (uint a = 0u; a < 2u; ++a) {
+                for (uint b = 0u; b < 2u; ++b) simdgroup_multiply_accumulate(acc[a][b], af[a], bf[b], acc[a][b]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint a = 0u; a < 2u; ++a) {
+        for (uint b = 0u; b < 2u; ++b) {
+            simdgroup_store(acc[a][b], shS + (sgRow * 16u + a * 8u) * SSTR + (sgCol * 16u + b * 8u), SSTR);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint h0 = lane, h1 = lane + 32u;
+    const float bias0 = (h0 < p.fullIdxHeads) ? gateBias[h0] : 0.0f;
+    const float bias1 = (h1 < p.fullIdxHeads) ? gateBias[h1] : 0.0f;
+    const uint selK = min(p.selHeads, p.fullIdxHeads);
+    for (uint tLocal = sg; tLocal < BM; tLocal += 8u) {
+        const uint t = tBase + tLocal;
+        if (t >= p.T) break;
+        const float g0 = (h0 < p.fullIdxHeads) ? shS[tLocal * SSTR + h0] : 0.0f;
+        const float g1 = (h1 < p.fullIdxHeads) ? shS[tLocal * SSTR + h1] : 0.0f;
+        float s0 = (h0 < p.fullIdxHeads) ? (g0 + bias0) : -INFINITY;
+        float s1 = (h1 < p.fullIdxHeads) ? (g1 + bias1) : -INFINITY;
+        device const half* qSrcBase = mlaQFull + (size_t)t * p.qFullStride + p.qChannels;
+        device half* qDstBase = qSelOut + (size_t)t * p.selHeads * p.idxDim;
+        for (uint k = 0u; k < selK; ++k) {
+            float candS = (s0 >= s1) ? s0 : s1;
+            uint candH = (s0 >= s1) ? h0 : h1;
+            for (ushort mask = 16; mask > 0; mask >>= 1) {
+                const float oS = simd_shuffle_xor(candS, mask);
+                const uint oH = simd_shuffle_xor(candH, mask);
+                if (oS > candS || (oS == candS && oH < candH)) {
+                    candS = oS;
+                    candH = oH;
+                }
+            }
+            if (lane == 0u) {
+                const float winnerGate = shS[tLocal * SSTR + candH];
+                wSelOut[(size_t)t * p.selHeads + k] = idxWeights[(size_t)t * p.fullIdxHeads + candH] * winnerGate;
+            }
+            device const half* qHeadSrc = qSrcBase + (size_t)candH * p.idxDim;
+            device half* qHeadDst = qDstBase + (size_t)k * p.idxDim;
+            for (uint d4 = lane * 4u; d4 < p.idxDim; d4 += 128u) {
+                *(device half4*)(qHeadDst + d4) = *(device const half4*)(qHeadSrc + d4);
+            }
+            if (h0 == candH) s0 = -INFINITY;
+            if (h1 == candH) s1 = -INFINITY;
+        }
+        if (lane == 0u) {
+            for (uint k = selK; k < p.selHeads; ++k) wSelOut[(size_t)t * p.selHeads + k] = 0.0f;
+        }
+    }
+}

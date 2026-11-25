@@ -4,6 +4,7 @@
 
 import Foundation
 import QWCore
+import QWDecision
 import QWHead
 import QWKV
 import QWQuant
@@ -80,6 +81,24 @@ public final class QWEngine: QWInferenceEngine, @unchecked Sendable {
     public var report: QWEngineReport { underlying.report }
     public var lastTurn: QWGenerationResult? { underlying.lastTurn }
     public var supportsTokenConstraints: Bool { underlying.supportsTokenConstraints }
+    public var gpuTurnArbitrator: QWGPUTurnArbitrator? {
+        get { batchScheduler.gpuTurnArbitrator }
+        set { batchScheduler.gpuTurnArbitrator = newValue }
+    }
+
+    public func evaluateDecisionLogits(
+        tokens: [Int],
+        positions: [Int],
+        candidateTokenIds: [Int],
+        visualSpans: [QWVisualSpan] = []
+    ) throws -> [QWDecisionSlotOutput] {
+        try batchScheduler.evaluateDecisionLogits(
+            tokens: tokens,
+            positions: positions,
+            candidateTokenIds: candidateTokenIds,
+            visualSpans: visualSpans
+        )
+    }
 
     public func makeConversation() -> QWConversation? {
         underlying.makeConversation()

@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/Swift-6.2-orange.svg" alt="Swift 6.2">
   <img src="https://img.shields.io/badge/platform-macOS%2026.2%2B%20(Apple%20Silicon)-lightgrey.svg" alt="macOS 26.2+, Apple Silicon">
   <a href="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml"><img src="https://github.com/qwegnai/qwegn/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.36.0-green.svg" alt="Release v0.36.0"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v0.41.1-green.svg" alt="Release v0.41.1"></a>
   <a href="https://huggingface.co/qwegnai"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-qwegnai-yellow.svg" alt="Hugging Face Models"></a>
 </p>
 
@@ -27,8 +27,8 @@ Requires macOS 26.2+ on Apple Silicon (M5 recommended for Apple10 NAX cooperativ
 - **Zero-Allocation Metal 4 Core**: Direct Metal command encoding, Apple10 NAX cooperative-tensor prefill (up to **`6,462 tok/s`**), up to **98% DRAM GEMV bandwidth**, and **0 heap / Metal-buffer allocations** in steady-state decode.
 - **1M-Token Context Without Retraining**: Training-free Latent Sparse Attention (`Ward-512` & `e-means-4096`) delivers up to **`5,491 / 100.9 tok/s` at 1M tokens** with `3/3` multi-hop needle recall (`16K–1M`). [LSA guide](docs/lsa.md)
 - **321B & 280B MoE on One Mac**: Mixed `HQ` / `AQ` / spherical `SHVQ{1..4}` (`2.52–3.84 bpw`) plus `VQ2`/`VQ4` PLE tables fit `321B` (`100.6 GiB`), `280B` (`81.6 GiB`), and `124B` (`52.2 GiB`) packs 100% UMA-resident, with lock-free NVMe expert streaming for oversized packs. [Quantization guide](docs/quantization.md)
-- **Multi-Engine Speculative Decoding**: Zero-bubble async NextN, MTP, Variational, `DFlash 2`, `DSpine` (`B=2..16`), `DSpark`, `ECHO`, and prompt lookup (`up to 382.8 tok/s` serve decode) with exact verifier fidelity floors. [Tuning & knobs](docs/tuning.md)
-- **Native Metal ViT & Repo Memory (`.qwcache`)**: On-demand FP16 Metal Vision Transformer (`0.81 s`, `0 B` idle RAM via `--load-vision`) and two-tier COW repository memory packs (`qwg index`, up to `74.3×` faster TTFT). [Whitepaper](docs/lsa-codebase-memory-whitepaper.md)
+- **Multi-Engine Speculative Decoding**: Zero-bubble async NextN, MTP, Variational, `DFlash 2`, `DSpine` (`B=2..16`), `DSpark`, `ECHO`, prompt lookup (`up to 382.8 tok/s` serve decode), and lossless grammar-accelerated structured JSON & tool-call speculation (`1.27×–3.18×` speedup). [Tuning & knobs](docs/tuning.md)
+- **Native Metal ViT, Video, Paged Radix KV & Repo Memory (`.qwcache`)**: On-demand FP16 Metal Vision Transformer (`0.43–0.85 s` hardware `AVFoundation` video & `0.81 s` image ViT, unified 3D `MRoPE` / `VideoRoPE`, privacy-gated `ScreenCaptureKit` snapshots, `0 B` idle RAM via `--load-vision`), hybrid-aware `256`-token paged Radix KV cache with `B=1..8` slice-interleaved prefill (`1.72×–2.43×` faster 8-subagent waves, up to `85.4×` lower foreground TTFT), and two-tier COW repository memory packs (`qwg index`, up to `74.3×` faster TTFT). [Whitepaper](docs/lsa-codebase-memory-whitepaper.md)
 - **Drop-In Server & macOS App**: OpenAI (`/v1/chat/completions`, `/v1/responses`, `/v1/completions`), Anthropic (`/v1/messages`), and Ollama-compatible server with `/ui` workbench and native `Qwegn.app` menu bar control (`qwg-menu`).
 
 ## Quick Start
@@ -47,7 +47,7 @@ Pull and run a pre-quantized pack from [`huggingface.co/qwegnai`](https://huggin
 qwg pull qwegnai/Qwen3.8-Flash-Next-hq8g32-hq4g64
 qwg run Qwen3.8-Flash-Next-hq8g32-hq4g64 --prompt "Hello!" --max-tokens 128
 
-# New in v0.36.0: Ling-3.2-air (124B/5.5B KDA+MLA Group-MoE VLM, 52.23 GiB)
+# New in v0.41.1: LiquidAI/d1-2B Metal 4 Decision Pack (qwg decide / /v1/decisions / /mcp) | v0.41.0: ERNIE-5.5 DSpark & NAX/SHVQ
 qwg pull qwegnai/Ling-3.2-air-hq8g32-shvq3g64
 qwg serve Ling-3.2-air-hq8g32-shvq3g64 --context-tokens 65536 --kv-mode q4
 ```
@@ -76,6 +76,7 @@ Official packs are listed with detailed architecture cards and `llmprobe` fideli
 | [`SenseNova-Loop-9B-hq4g32`](https://huggingface.co/qwegnai/SenseNova-Loop-9B-hq4g32) | 56L `2×` looped `F32` mHC + ViT | `HQ4_G32` (`7.4 GiB`) | **2,045 tok/s** | **165.7 tok/s** (`153.0` `B=4`) | `524K` YaRN (`49.4 tok/s` `@1M`) | [Card](docs/models.md#sensenova-loop-9b) |
 | [`Qwen3.8-27B-hq4g32`](https://huggingface.co/qwegnai/Qwen3.8-27B-hq4g32) | 64L dense (`16` GQA + `48` GDN, ViT) | `HQ4_G32` (+ `DSpine`/`DF2`) | **1,043 tok/s** | **154.2 tok/s** DF2 / **148.0** DSpine | `1M` `e-means` (`831 / 36.5 tok/s`) | [Card](docs/models.md#qwen38-27b) |
 | [`ERNIE-5.5-Flash-Base-hq8g32-shvq15g64-shvq3g64`](https://huggingface.co/qwegnai/ERNIE-5.5-Flash-Base-hq8g32-shvq15g64-shvq3g64) | 43L `280B`/`14B` (`37` HCA + `6` MLA-DSA) | `HQ8 + SHVQ15/3` (`81.6 GiB`) | **1,137 tok/s** | **52.7 tok/s** (`ECHO`) | `1M` UMA (`303 / 16.3` `@300K`) | [Card](docs/models.md#ernie-55-flash-base) |
+| [`ERNIE-5.5-Flash-Preview`](https://huggingface.co/qwegnai/ERNIE-5.5-Flash-Preview-hq4g32m5-hq8head-shvq15g64-shvq3g64) ([`HQ8`](https://huggingface.co/qwegnai/ERNIE-5.5-Flash-Preview-hq8g32-shvq15g64-shvq3g64)) | 43L `280B`/`14B` (`chatv2p3`, `DSpark`, `FlashIndexer`) | `HQ4_G32_M5` / `HQ8` + `SHVQ15/3` (`77.9–81.6 GiB` disk) | **1,545 tok/s** *(Track C)* / `1,051` *(Track A)* | **110.6 tok/s** `DSpark` (`89.5` JSON · `81/100` Track A Code) | `16K` `3/3` needle (`60.9` `@65.6K`) | [Card](docs/models.md#ernie-55-flash-preview) |
 | [`GLM-5.3-Flash-shvq4g32-shvq2g64-shvq3g64`](https://huggingface.co/qwegnai/GLM-5.3-Flash-shvq4g32-shvq2g64-shvq3g64) | 45L `321B`/`18B` (`34` KDA + `11` MLA) | `SHVQ4/2/3` (`100.6 GiB`) | **1,014 tok/s** | **54.7 tok/s** (`NextN`) | `1M` UMA (`743 / 45.0` `@242.5K`) | [Card](docs/models.md#glm-53-flash) |
 
 Standard `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5*`, `mistral`, and MLX-formatted checkpoints are also adopted automatically with per-model profiles stored under `~/.qwg/profiles/`.
@@ -158,7 +159,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Licensed 
 @software{qwegn,
   title   = {Qwegn: a from-scratch LLM/VLM inference engine for Apple Silicon},
   author  = {{QwegnAI}},
-  version = {0.36.0},
+  version = {0.41.1},
   year    = {2026},
   url     = {https://github.com/qwegnai/qwegn}
 }

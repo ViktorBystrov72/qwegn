@@ -79,7 +79,11 @@ final class QWDriverBatchSchedulerTests: XCTestCase {
         XCTAssertEqual(QWEngineDriver.gdnSlotCount(physicalMemoryBytes: 16 << 30), 2)
         XCTAssertEqual(QWEngineDriver.gdnSlotCount(physicalMemoryBytes: (32 << 30) - 1), 2)
         XCTAssertEqual(QWEngineDriver.gdnSlotCount(physicalMemoryBytes: 32 << 30), 4)
-        XCTAssertEqual(QWEngineDriver.gdnSlotCount(physicalMemoryBytes: 128 << 30), 4)
+        XCTAssertEqual(QWEngineDriver.gdnSlotCount(physicalMemoryBytes: (64 << 30) - 1), 4)
+        XCTAssertEqual(QWEngineDriver.gdnSlotCount(physicalMemoryBytes: 64 << 30), 8)
+        XCTAssertEqual(QWEngineDriver.gdnSlotCount(physicalMemoryBytes: 128 << 30), 8)
+        XCTAssertEqual(QWEngineDriver.gdnSlotCount(physicalMemoryBytes: 128 << 30, requestedSessions: 12), 12)
+        XCTAssertEqual(QWEngineDriver.gdnSlotCount(physicalMemoryBytes: 128 << 30, requestedSessions: 32), 16)
     }
 
     func testEstimateDriverContextMemoryScalesWithSlotCount() throws {
@@ -115,7 +119,7 @@ final class QWDriverBatchSchedulerTests: XCTestCase {
         let mem128 = QWEngineDriver.estimateDriverContextMemory(
             descriptor: desc, contextTokens: 1024, kvMode: .q4,
             mtpDrafts: 0, physicalMemoryBytes: 128 << 30)
-        let expectedSlotDelta = 2 * geom.gdnLayerCount * (
+        let expectedSlotDelta = 6 * geom.gdnLayerCount * (
             QWSlotGeometry.recElems(geometry: geom) * 4 + QWSlotGeometry.ringElems(geometry: geom) * 2)
         XCTAssertEqual(mem128.scratchAndStateBytes - mem16.scratchAndStateBytes, expectedSlotDelta)
     }

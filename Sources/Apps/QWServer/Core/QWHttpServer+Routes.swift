@@ -98,11 +98,21 @@ extension QWHttpServer {
                 "metrics_stream": "GET /v1/metrics/stream",
                 "logs_stream": "GET /v1/logs/stream",
                 "engine_info": "GET /v1/engine/info",
+                "decisions": "POST /v1/decisions",
+                "decisions_batch": "POST /v1/decisions/batch",
+                "systemone": "POST /v1/systemone",
+                "systemone_batch": "POST /v1/systemone/batch",
+                "laya": "POST /v1/laya",
+                "decisions_load": "POST /v1/decisions/model/load",
+                "decisions_unload": "POST /v1/decisions/model/unload",
+                "decisions_status": "GET /v1/decisions/status",
+                "mcp": "POST /mcp",
                 "memory_inspect": "POST /v1/memory/inspect",
                 "memory_index": "POST /v1/memory/index",
                 "memory_mount": "POST /v1/memory/mount",
                 "memory_unmount": "POST /v1/memory/unmount",
                 "restart": "POST /v1/engine/restart",
+                "screen_capture": "POST /v1/vision/screen-capture",
                 "update": "GET /v1/update",
                 "ui": "GET /ui"
             ]
@@ -151,6 +161,7 @@ extension QWHttpServer {
         }
         let mounted = self.actor.getMountedMemoryPackInfo()
         let currentHW = QWSystemMetricsSampler.shared.current()
+        let sidecar = self.actor.decisionSidecarStatus()
         return QWDashboardFacts(
             quantization: params?.headStorage,
             hostLogicalCores: hw.logicalCores,
@@ -166,7 +177,14 @@ extension QWHttpServer {
             mountedMemoryPackDelta: mounted?.modifiedFileCount,
             mountedMemoryPackKV: mounted?.enforcedKVMode,
             coolingPolicy: QWFanController.shared.currentPolicy.rawValue,
-            fanControlStatus: currentHW.fanControlStatus)
+            fanControlStatus: currentHW.fanControlStatus,
+            decisionSidecarLoaded: sidecar.loaded,
+            decisionSidecarModel: sidecar.loaded ? sidecar.modelName : nil,
+            decisionSidecarBackend: sidecar.loaded ? sidecar.backendKind : nil,
+            decisionSidecarComputeUnit: sidecar.loaded ? sidecar.computeUnit : nil,
+            decisionSidecarBytes: sidecar.loaded ? sidecar.estimatedBytes : nil,
+            decisionSidecarTotalRequests: sidecar.loaded ? sidecar.totalRequests : nil,
+            decisionSidecarMeanLatencyMs: sidecar.loaded ? sidecar.meanLatencyMs : nil)
     }
 
     /// A response whose dates are ISO-8601 instants, so a client in any
@@ -192,7 +210,12 @@ extension QWHttpServer {
     }
 
     func sendRawData(_ connection: NWConnection, status: Int, contentType: String, data: Data, extraHeaders: [String] = []) {
-        var header = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Error")\r\n"
+        let reasonPhrase: String = switch status {
+        case 200: "OK"
+        case 202: "Accepted"
+        default: "Error"
+        }
+        var header = "HTTP/1.1 \(status) \(reasonPhrase)\r\n"
         header += "Content-Type: \(contentType)\r\n"
         header += "Content-Length: \(data.count)\r\n"
         for line in extraHeaders {
@@ -250,6 +273,9 @@ extension QWHttpServer {
         "/v1/memory/index", "/api/memory/index",
         "/v1/memory/mount", "/api/memory/mount",
         "/v1/update/skip", "/api/update/skip",
+        "/v1/decisions", "/v1/decisions/batch",
+        "/v1/systemone", "/v1/systemone/batch",
+        "/v1/laya", "/v1/decisions/model/load", "/mcp",
     ]
 
     func validateMutationRequest(
@@ -616,6 +642,22 @@ extension QWHttpServer {
             Task { await svc.updateSchedule(updatedSchedule) }
             if !modelChanged {
                 try await actor.setVisionLoaded(newSettings.loadVision)
+            }
+            let sidecarChanged = newSettings.decisionModelPackPath != oldSettings.decisionModelPackPath
+                || newSettings.decisionComputeUnit != oldSettings.decisionComputeUnit
+                || newSettings.decisionLoadVision != oldSettings.decisionLoadVision
+            if sidecarChanged {
+                let sidecarPath = newSettings.decisionModelPackPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                if sidecarPath.isEmpty {
+                    _ = await actor.unloadDecisionSidecar()
+                } else {
+                    let unit = QWDecisionComputeUnit(rawValue: newSettings.decisionComputeUnit.lowercased()) ?? .auto
+                    _ = try await actor.loadDecisionSidecar(
+                        packPath: sidecarPath,
+                        computeUnit: unit,
+                        loadVision: newSettings.decisionLoadVision
+                    )
+                }
             }
             sendJsonResponse(connection, status: 200, object: ["status": "ok", "message": "Settings saved successfully"])
         } catch {

@@ -126,6 +126,25 @@ METAL_FUNC void qwg_shvq_frag8_tg(device const char* gp, uint colInGroup,
     const half sc = *(device const half*)gp;
     device const uchar* p = (device const uchar*)(gp + 2);
     const uint q0 = colInGroup >> 2u;
+    if constexpr (BITS == 15) {
+        if ((q0 & 4u) == 0u) {
+            (void)lut16;
+            device const ushort* s = (device const ushort*)(p + 6u * (q0 >> 3u));
+            const uint w0 = uint(s[0]), w1 = uint(s[1]), w2 = uint(s[2]);
+            const uint loBit = q0 & 1u, hiBit = (q0 >> 1u) & 1u;
+            const uint u12Lo = ((w0 | (w1 << 16u)) >> (hiBit ? 12u : 0u)) & 0x0FFFu;
+            const uint u12Hi = ((w1 | (w2 << 16u)) >> (hiBit ? 20u : 8u)) & 0x0FFFu;
+            const char4 cLo = as_type<char4>(kShvqLut15PackedI8[((u12Lo & 0x07FFu) << 1u) + loBit]);
+            const char4 cHi = as_type<char4>(kShvqLut15PackedI8[((u12Hi & 0x07FFu) << 1u) + loBit]);
+            const float scStep = float(sc) * kShvq15StepScaleF32;
+            const uint scBits = as_type<uint>(scStep);
+            const float scLo = as_type<float>(scBits ^ ((u12Lo & 0x0800u) << 20u));
+            const float scHi = as_type<float>(scBits ^ ((u12Hi & 0x0800u) << 20u));
+            lo = half4(float4(cLo) * scLo);
+            hi = half4(float4(cHi) * scHi);
+            return;
+        }
+    }
     lo = qwg_shvq_unpack_quad4_tg<BITS, DIRECT4, HAS_TG_LUT>(p, q0, lut16) * sc;
     hi = qwg_shvq_unpack_quad4_tg<BITS, DIRECT4, HAS_TG_LUT>(p, q0 + 4u, lut16) * sc;
 }
@@ -164,12 +183,22 @@ METAL_FUNC void qwg_shvq_unpack_oct8_tg(device const uchar* p, uint oct,
                                         threadgroup const ShvqTgLut<BITS> &tgLut,
                                         thread half4 &uLo, thread half4 &uHi);
 
-template <int BITS, bool HAS_TG, typename Vec4>
-METAL_FUNC float qwg_shvq_slice_dot_impl(device const char* gp, uint byteInGroup,
-                                         thread const Vec4 (&lo)[4], thread const Vec4 (&hi)[4],
-                                         threadgroup const ShvqTgLut<BITS>* tgLut) {
+template <int BITS>
+METAL_FUNC float qwg_shvq_eff_scale(device const char* gp) {
     const float sc = float(*(device const half*)gp);
-    device const uchar* p = (device const uchar*)(gp + 2 + byteInGroup);
+    if constexpr (BITS == 15) return sc * kShvq15StepScaleF32;
+    else return sc;
+}
+
+template <int BITS, bool HAS_TG, typename Vec4>
+METAL_FUNC float qwg_shvq_unscaled_slice_dot_impl(device const uchar* p,
+                                                  thread const Vec4 (&lo)[4],
+                                                  thread const Vec4 (&hi)[4],
+                                                  threadgroup const ShvqTgLut<BITS>* tgLut) {
+    if constexpr (BITS == 15) {
+        (void)tgLut;
+        return qwg_shvq15_unscaled_slice_dot(p, lo, hi);
+    }
     float acc = 0.0f;
     #pragma unroll
     for (uint w = 0u; w < 4u; ++w) {
@@ -178,16 +207,18 @@ METAL_FUNC float qwg_shvq_slice_dot_impl(device const char* gp, uint byteInGroup
         else                  qwg_shvq_unpack_oct8<BITS>(p, w, uLo, uHi);
         acc += dot(float4(uLo), float4(lo[w])) + dot(float4(uHi), float4(hi[w]));
     }
-    return acc * sc;
+    return acc;
 }
 
 template <int BITS, bool HAS_TG, typename Vec4>
-METAL_FUNC float2 qwg_shvq_slice_dot2_impl(device const char* gp, uint byteInGroup,
-                                           thread const Vec4 (&lo0)[4], thread const Vec4 (&hi0)[4],
-                                           thread const Vec4 (&lo1)[4], thread const Vec4 (&hi1)[4],
-                                           threadgroup const ShvqTgLut<BITS>* tgLut) {
-    const float sc = float(*(device const half*)gp);
-    device const uchar* p = (device const uchar*)(gp + 2 + byteInGroup);
+METAL_FUNC float2 qwg_shvq_unscaled_slice_dot2_impl(device const uchar* p,
+                                                    thread const Vec4 (&lo0)[4], thread const Vec4 (&hi0)[4],
+                                                    thread const Vec4 (&lo1)[4], thread const Vec4 (&hi1)[4],
+                                                    threadgroup const ShvqTgLut<BITS>* tgLut) {
+    if constexpr (BITS == 15) {
+        (void)tgLut;
+        return qwg_shvq15_unscaled_slice_dot2(p, lo0, hi0, lo1, hi1);
+    }
     float2 acc = float2(0.0f);
     #pragma unroll
     for (uint w = 0u; w < 4u; ++w) {
@@ -198,7 +229,24 @@ METAL_FUNC float2 qwg_shvq_slice_dot2_impl(device const char* gp, uint byteInGro
         acc.x += dot(fLo, float4(lo0[w])) + dot(fHi, float4(hi0[w]));
         acc.y += dot(fLo, float4(lo1[w])) + dot(fHi, float4(hi1[w]));
     }
-    return acc * sc;
+    return acc;
+}
+
+template <int BITS, bool HAS_TG, typename Vec4>
+METAL_FUNC float qwg_shvq_slice_dot_impl(device const char* gp, uint byteInGroup,
+                                         thread const Vec4 (&lo)[4], thread const Vec4 (&hi)[4],
+                                         threadgroup const ShvqTgLut<BITS>* tgLut) {
+    return qwg_shvq_unscaled_slice_dot_impl<BITS, HAS_TG>(
+        (device const uchar*)(gp + 2u + byteInGroup), lo, hi, tgLut) * qwg_shvq_eff_scale<BITS>(gp);
+}
+
+template <int BITS, bool HAS_TG, typename Vec4>
+METAL_FUNC float2 qwg_shvq_slice_dot2_impl(device const char* gp, uint byteInGroup,
+                                           thread const Vec4 (&lo0)[4], thread const Vec4 (&hi0)[4],
+                                           thread const Vec4 (&lo1)[4], thread const Vec4 (&hi1)[4],
+                                           threadgroup const ShvqTgLut<BITS>* tgLut) {
+    return qwg_shvq_unscaled_slice_dot2_impl<BITS, HAS_TG>(
+        (device const uchar*)(gp + 2u + byteInGroup), lo0, hi0, lo1, hi1, tgLut) * qwg_shvq_eff_scale<BITS>(gp);
 }
 
 template <int BITS, bool HAS_TG, typename Vec4>
@@ -207,19 +255,10 @@ METAL_FUNC float2 qwg_shvq_slice_dot2_acc_impl(device const char* gp, uint byteI
                                                thread const Vec4 (&lo1)[4], thread const Vec4 (&hi1)[4],
                                                threadgroup const ShvqTgLut<BITS>* tgLut,
                                                float2 acc) {
-    const float sc = float(*(device const half*)gp);
-    device const uchar* p = (device const uchar*)(gp + 2 + byteInGroup);
-    float dm0 = 0.0f, dm1 = 0.0f;
-    #pragma unroll
-    for (uint w = 0u; w < 4u; ++w) {
-        half4 uLo, uHi;
-        if constexpr (HAS_TG) qwg_shvq_unpack_oct8_tg<BITS>(p, w, *tgLut, uLo, uHi);
-        else                  qwg_shvq_unpack_oct8<BITS>(p, w, uLo, uHi);
-        const float4 fLo = float4(uLo), fHi = float4(uHi);
-        dm0 += dot(fLo, float4(lo0[w])) + dot(fHi, float4(hi0[w]));
-        dm1 += dot(fLo, float4(lo1[w])) + dot(fHi, float4(hi1[w]));
-    }
-    return float2(fma(dm0, sc, acc.x), fma(dm1, sc, acc.y));
+    const float sc = qwg_shvq_eff_scale<BITS>(gp);
+    const float2 dm = qwg_shvq_unscaled_slice_dot2_impl<BITS, HAS_TG>(
+        (device const uchar*)(gp + 2u + byteInGroup), lo0, hi0, lo1, hi1, tgLut);
+    return fma(dm, float2(sc), acc);
 }
 
 template <int BITS, typename Vec4>
@@ -383,6 +422,37 @@ METAL_FUNC float2 qwg_shvq_slice_dot2_acc_tg(device const char* gp, uint byteInG
     return qwg_shvq_slice_dot2_acc_impl<BITS, true>(gp, byteInGroup, lo0, hi0, lo1, hi1, &tgLut, acc);
 }
 
+template <int BITS, typename ActT, uint MAX_M>
+METAL_FUNC void qwg_shvq_slice_dot_strided_row(device const char* gp, uint byteInGroup,
+                                               device const ActT* xCol, uint K, uint mRows,
+                                               threadgroup const ShvqTgLut<BITS> &tgLut,
+                                               thread float (&dm)[MAX_M], thread float& scOut) {
+    scOut = float(*(device const half*)gp);
+    device const uchar* p = (device const uchar*)(gp + 2u + byteInGroup);
+    #pragma unroll
+    for (uint m = 0u; m < MAX_M; ++m) dm[m] = 0.0f;
+    #pragma unroll
+    for (uint w = 0u; w < 4u; ++w) {
+        half4 hLo, hHi;
+        qwg_shvq_unpack_oct8_tg<BITS>(p, w, tgLut, hLo, hHi);
+        const float4 fLo = float4(hLo), fHi = float4(hHi);
+        #pragma unroll
+        for (uint m = 0u; m < MAX_M; ++m) {
+            if (m < mRows) {
+                device const ActT* xp = xCol + size_t(m) * K + w * 8u;
+                if constexpr (sizeof(ActT) == 2u) {
+                    const float4 xLo = float4(*(device const half4*)xp);
+                    const float4 xHi = float4(*(device const half4*)(xp + 4u));
+                    dm[m] += dot(fLo, xLo) + dot(fHi, xHi);
+                } else {
+                    device const float4* pm = (device const float4*)xp;
+                    dm[m] += dot(fLo, pm[0]) + dot(fHi, pm[1]);
+                }
+            }
+        }
+    }
+}
+
 template <int BITS, int GROUP, uint ROWS, bool HAS_TG>
 METAL_FUNC float4 qwg_gemv_shvq_rowsN_impl(device const char* blocks,
                                            device const half* x,
@@ -503,32 +573,18 @@ METAL_FUNC void qwg_gemv_shvq_rows4_m_acc(device const char* blocks,
             #pragma unroll
             for (uint r = 0u; r < 4u; ++r) {
                 if (row0 + r < realN) {
-                    device const char* gp = rowBase + size_t(r) * rowBytes + groupOff;
-                    const float sc = float(*(device const half*)gp);
-                    device const uchar* p = (device const uchar*)(gp + 2u + byteInGroup);
-                    float4 wLo[4], wHi[4];
-                    #pragma unroll
-                    for (uint w = 0u; w < 4u; ++w) {
-                        half4 hLo, hHi;
-                        qwg_shvq_unpack_oct8_impl<BITS, true>(p, w, &tgLut, hLo, hHi);
-                        wLo[w] = float4(hLo);
-                        wHi[w] = float4(hHi);
-                    }
+                    float dm[MAX_M];
+                    float sc;
+                    qwg_shvq_slice_dot_strided_row<BITS, half, MAX_M>(
+                        rowBase + size_t(r) * rowBytes + groupOff, byteInGroup,
+                        x + col, K, mRows, tgLut, dm, sc);
                     #pragma unroll
                     for (uint m = 0u; m < MAX_M; ++m) {
                         if (m < mRows) {
-                            device const half* xp = x + size_t(m) * K + col;
-                            float dm = 0.0f;
-                            #pragma unroll
-                            for (uint w = 0u; w < 4u; ++w) {
-                                const float4 xLo = float4(*(device const half4*)(xp + w * 8u));
-                                const float4 xHi = float4(*(device const half4*)(xp + w * 8u + 4u));
-                                dm += dot(wLo[w], xLo) + dot(wHi[w], xHi);
-                            }
-                            if (r == 0u)      acc[m].x = fma(dm, sc, acc[m].x);
-                            else if (r == 1u) acc[m].y = fma(dm, sc, acc[m].y);
-                            else if (r == 2u) acc[m].z = fma(dm, sc, acc[m].z);
-                            else              acc[m].w = fma(dm, sc, acc[m].w);
+                            if (r == 0u)      acc[m].x = fma(dm[m], sc, acc[m].x);
+                            else if (r == 1u) acc[m].y = fma(dm[m], sc, acc[m].y);
+                            else if (r == 2u) acc[m].z = fma(dm[m], sc, acc[m].z);
+                            else              acc[m].w = fma(dm[m], sc, acc[m].w);
                         }
                     }
                 }
@@ -565,30 +621,16 @@ METAL_FUNC void qwg_gemv_shvq_rows2_m16_acc(device const char* blocks,
         #pragma unroll
         for (uint r = 0u; r < 2u; ++r) {
             if (r == 0u || hasR1) {
-                device const char* gp = r0 + size_t(r) * rowBytes + groupOff;
-                const float sc = float(*(device const half*)gp);
-                device const uchar* p = (device const uchar*)(gp + 2u + byteInGroup);
-                float4 wLo[4], wHi[4];
-                #pragma unroll
-                for (uint w = 0u; w < 4u; ++w) {
-                    half4 hLo, hHi;
-                    qwg_shvq_unpack_oct8_impl<BITS, true>(p, w, &tgLut, hLo, hHi);
-                    wLo[w] = float4(hLo);
-                    wHi[w] = float4(hHi);
-                }
+                float dm[16];
+                float sc;
+                qwg_shvq_slice_dot_strided_row<BITS, half, 16u>(
+                    r0 + size_t(r) * rowBytes + groupOff, byteInGroup,
+                    x + col, K, mRows, tgLut, dm, sc);
                 #pragma unroll
                 for (uint m = 0u; m < 16u; ++m) {
                     if (m < mRows) {
-                        device const half* xp = x + size_t(m) * K + col;
-                        float dm = 0.0f;
-                        #pragma unroll
-                        for (uint w = 0u; w < 4u; ++w) {
-                            const float4 xLo = float4(*(device const half4*)(xp + w * 8u));
-                            const float4 xHi = float4(*(device const half4*)(xp + w * 8u + 4u));
-                            dm += dot(wLo[w], xLo) + dot(wHi[w], xHi);
-                        }
-                        if (r == 0u) acc[m].x = fma(dm, sc, acc[m].x);
-                        else         acc[m].y = fma(dm, sc, acc[m].y);
+                        if (r == 0u) acc[m].x = fma(dm[m], sc, acc[m].x);
+                        else         acc[m].y = fma(dm[m], sc, acc[m].y);
                     }
                 }
             }
@@ -680,64 +722,35 @@ METAL_FUNC float4 qwg_gemv_shvq_rows4_f32(device const char* blocks, device cons
         blocks, x, size_t(row0), left, K, lane, LS, &tgLut);
 }
 
-template <int BITS, int GROUP, uint LS, uint PAIRS>
-METAL_FUNC void qwg_gemv_shvq_rows4_m_pairs_f32(device const char* blocks,
-                                                thread device const float* const (&xs)[2 * PAIRS],
-                                                uint row0, uint N, uint K, uint lane,
-                                                thread float4 (&acc)[2 * PAIRS],
-                                                threadgroup const ShvqTgLut<BITS> &tgLut) {
-    const uint nBlocks = K >> 5u;
-    constexpr uint groupBytes = qwg_shvq_group_bytes(BITS, GROUP);
-    constexpr uint slicesPerGroup = uint(GROUP) >> 5u;
-    constexpr uint slicePayloadBytes = qwg_shvq_slice_bytes(BITS);
-    const uint rowBytes = (K / uint(GROUP)) * groupBytes;
-    device const char* r0 = blocks + (size_t)row0 * rowBytes;
-    device const char* r1 = (row0 + 1u < N) ? (r0 + rowBytes) : r0;
-    device const char* r2 = (row0 + 2u < N) ? (r0 + 2u * rowBytes) : r0;
-    device const char* r3 = (row0 + 3u < N) ? (r0 + 3u * rowBytes) : r0;
-    #pragma unroll
-    for (uint m = 0u; m < 2u * PAIRS; ++m) acc[m] = float4(0.0f);
-    for (uint g = lane; g < nBlocks; g += LS) {
-        const uint col = g << 5u;
-        const size_t groupOff = size_t(g / slicesPerGroup) * groupBytes;
-        const uint byteInGroup = (g & (slicesPerGroup - 1u)) * slicePayloadBytes;
-        #pragma unroll
-        for (uint p = 0u; p < PAIRS; ++p) {
-            float4 xlo0[4], xhi0[4], xlo1[4], xhi1[4];
-            qwg_shvq_load_float32(xs[2u * p] + col, xlo0, xhi0);
-            qwg_shvq_load_float32(xs[2u * p + 1u] + col, xlo1, xhi1);
-            const float2 d0 = qwg_shvq_slice_dot2_tg<BITS>(r0 + groupOff, byteInGroup, xlo0, xhi0, xlo1, xhi1, tgLut);
-            const float2 d1 = qwg_shvq_slice_dot2_tg<BITS>(r1 + groupOff, byteInGroup, xlo0, xhi0, xlo1, xhi1, tgLut);
-            const float2 d2 = qwg_shvq_slice_dot2_tg<BITS>(r2 + groupOff, byteInGroup, xlo0, xhi0, xlo1, xhi1, tgLut);
-            const float2 d3 = qwg_shvq_slice_dot2_tg<BITS>(r3 + groupOff, byteInGroup, xlo0, xhi0, xlo1, xhi1, tgLut);
-            acc[2u * p] += float4(d0.x, d1.x, d2.x, d3.x);
-            acc[2u * p + 1u] += float4(d0.y, d1.y, d2.y, d3.y);
-        }
-    }
-    #pragma unroll
-    for (uint m = 0u; m < 2u * PAIRS; ++m) acc[m] = qwg_simd_reduce_down<LS>(acc[m]);
-}
-
 template <int BITS, int GROUP, uint LS = 32u>
 METAL_FUNC void qwg_gemv_shvq_rows4_m2_f32(device const char* blocks,
                                            device const float* x0, device const float* x1,
                                            uint row0, uint N, uint K, uint lane,
                                            thread float4 &acc0, thread float4 &acc1,
                                            threadgroup const ShvqTgLut<BITS> &tgLut) {
-    device const float* const xs[2] = { x0, x1 };
-    float4 acc[2];
-    qwg_gemv_shvq_rows4_m_pairs_f32<BITS, GROUP, LS, 1u>(blocks, xs, row0, N, K, lane, acc, tgLut);
-    acc0 = acc[0];
-    acc1 = acc[1];
-}
-
-template <int BITS, int GROUP, uint LS = 32u>
-METAL_FUNC void qwg_gemv_shvq_rows4_m4_f32(device const char* blocks, device const float* x,
-                                           uint M, uint row0, uint N, uint K, uint lane,
-                                           thread float4 (&acc)[4],
-                                           threadgroup const ShvqTgLut<BITS> &tgLut) {
-    device const float* const xs[4] = { x, x + K, x + 2u * K, x + (size_t)min(3u, M - 1u) * K };
-    qwg_gemv_shvq_rows4_m_pairs_f32<BITS, GROUP, LS, 2u>(blocks, xs, row0, N, K, lane, acc, tgLut);
+    const uint nBlocks = K >> 5u;
+    constexpr uint groupBytes = qwg_shvq_group_bytes(BITS, GROUP);
+    constexpr uint slicesPerGroup = uint(GROUP) >> 5u;
+    const uint rowBytes = (K / uint(GROUP)) * groupBytes;
+    device const char* r0 = blocks + (size_t)row0 * rowBytes;
+    device const char* r1 = (row0 + 1u < N) ? (r0 + rowBytes) : r0;
+    device const char* r2 = (row0 + 2u < N) ? (r0 + 2u * rowBytes) : r0;
+    device const char* r3 = (row0 + 3u < N) ? (r0 + 3u * rowBytes) : r0;
+    acc0 = float4(0.0f); acc1 = float4(0.0f);
+    for (uint g = lane; g < nBlocks; g += LS) {
+        const uint col = g << 5u;
+        const size_t groupOff = size_t(g / slicesPerGroup) * groupBytes;
+        const uint byteInGroup = (g & (slicesPerGroup - 1u)) * qwg_shvq_slice_bytes(BITS);
+        float4 xlo0[4], xhi0[4], xlo1[4], xhi1[4];
+        qwg_shvq_load_float32(x0 + col, xlo0, xhi0);
+        qwg_shvq_load_float32(x1 + col, xlo1, xhi1);
+        const float2 d0 = qwg_shvq_slice_dot2_tg<BITS>(r0 + groupOff, byteInGroup, xlo0, xhi0, xlo1, xhi1, tgLut);
+        const float2 d1 = qwg_shvq_slice_dot2_tg<BITS>(r1 + groupOff, byteInGroup, xlo0, xhi0, xlo1, xhi1, tgLut);
+        const float2 d2 = qwg_shvq_slice_dot2_tg<BITS>(r2 + groupOff, byteInGroup, xlo0, xhi0, xlo1, xhi1, tgLut);
+        const float2 d3 = qwg_shvq_slice_dot2_tg<BITS>(r3 + groupOff, byteInGroup, xlo0, xhi0, xlo1, xhi1, tgLut);
+        acc0 += float4(d0.x, d1.x, d2.x, d3.x); acc1 += float4(d0.y, d1.y, d2.y, d3.y);
+    }
+    acc0 = qwg_simd_reduce_down<LS>(acc0); acc1 = qwg_simd_reduce_down<LS>(acc1);
 }
 
 template <int BITS, int GROUP>

@@ -150,6 +150,7 @@ extension QWHCAAttnOperator {
         } else {
             return
         }
+        let isShvq4 = (baseInc == 2 && bits == 4)
         let isSub2SHVQ = baseInc == 2 && (bits == 1 || bits == 15)
         let woP = GroupedWoAParams(
             T: UInt32(rows),
@@ -162,8 +163,19 @@ extension QWHCAAttnOperator {
             group: group,
             isIncumbent: baseInc | (skipExitRotation ? 0x10000 : 0)
         )
-        let naxPSO = isSub2SHVQ ? psoGroupedWoANAXSub2 : psoGroupedWoANAX
-        let useNax0 = rows >= 16 && naxPSO != nil && (oLoraRank % 64 == 0) && (groupIn % 32 == 0)
+        let naxModePSO: (any MTLComputePipelineState)? = {
+            if baseInc == 1 { return psoGroupedWoANAXHQ4 ?? psoGroupedWoANAX }
+            if baseInc == 0 && bits == 8 { return psoGroupedWoANAXAQ8 ?? psoGroupedWoANAX }
+            if baseInc == 0 && bits == 4 { return psoGroupedWoANAXAQ4 ?? psoGroupedWoANAX }
+            return psoGroupedWoANAX
+        }()
+        let naxPSO = isShvq4 ? psoGroupedWoANAXShvq4
+            : (isSub2SHVQ ? psoGroupedWoANAXSub2 : naxModePSO)
+        let naxT16PSO = isShvq4 ? psoGroupedWoANAXT16Shvq4
+            : (isSub2SHVQ ? psoGroupedWoANAXT16Sub2 : psoGroupedWoANAXT16)
+        let allowNAX = hcaWoANAXEnabled && (naxPSO != nil || naxT16PSO != nil)
+            && (oLoraRank % 64 == 0) && (groupIn % 32 == 0)
+        let useNax0 = allowNAX && rows >= Self.woANaxMinRows
         let useMma0 = !useNax0 && rows >= 16 && (oLoraRank % 128 == 0) && (groupIn % 32 == 0)
         let slcBytes = max(1, (qHeads * headDim + oGroups * oLoraRank) * 2)
         let slcRows = max(64, ((24 << 20) / slcBytes) & ~63)
@@ -173,14 +185,16 @@ extension QWHCAAttnOperator {
         var activeMode = -1
         while rowStart < rows {
             let chunk = min(chunkRows, rows - rowStart)
-            let useNAX = chunk >= 16 && naxPSO != nil && (oLoraRank % 64 == 0) && (groupIn % 32 == 0)
+            let useT16 = chunk <= 16 && naxT16PSO != nil
+            let chosenNaxPSO = useT16 ? naxT16PSO : naxPSO
+            let useNAX = allowNAX && chosenNaxPSO != nil && chunk >= Self.woANaxMinRows
             let useMMA = !useNAX && chunk >= 16 && (oLoraRank % 128 == 0) && (groupIn % 32 == 0)
             let useMR = !useNAX && !useMMA && chunk > 1 && chunk <= 8 && (oLoraRank % 32 == 0) && (groupIn % 32 == 0)
-            let mode = useNAX ? 0 : (useMMA ? 1 : (useMR ? 2 : 3))
+            let mode = useNAX ? (useT16 ? 4 : 0) : (useMMA ? 1 : (useMR ? 2 : 3))
             if mode != activeMode {
                 activeMode = mode
-                if let naxPSO, useNAX {
-                    enc.setComputePipelineState(naxPSO)
+                if let chosenNaxPSO, useNAX {
+                    enc.setComputePipelineState(chosenNaxPSO)
                 } else if useMMA {
                     enc.setComputePipelineState(isSub2SHVQ ? psoGroupedWoAMMASub2 : psoGroupedWoAMMA)
                 } else if useMR {
@@ -207,8 +221,9 @@ extension QWHCAAttnOperator {
             zOutSub.bind(enc, index: 3)
             enc.setBytes(&subP, length: MemoryLayout<GroupedWoAParams>.stride, index: 4)
             if useNAX {
+                let gridH = useT16 ? ((chunk + 15) / 16) : ((chunk + 63) / 64)
                 enc.dispatchThreadgroups(
-                    MTLSize(width: oLoraRank / 64, height: (chunk + 63) / 64, depth: oGroups),
+                    MTLSize(width: oLoraRank / 64, height: gridH, depth: oGroups),
                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
             } else if useMMA {
                 enc.dispatchThreadgroups(

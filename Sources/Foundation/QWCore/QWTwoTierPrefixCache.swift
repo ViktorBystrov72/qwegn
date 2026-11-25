@@ -348,31 +348,65 @@ public enum QWTwoTierPrefixCache {
         max(0, fullBytes - max(0, sharedBaseBytes))
     }
 
-    /// Computes intermediate prompt prefix checkpoints before visual spans and branch forks.
+    /// Computes intermediate prompt prefix checkpoints before visual spans, periodic intervals, and branch forks.
     public static func computeRetainPoints(
         explicitRetainLength: Int?,
         matchedTokens: Int,
         firstVisualTokenOffset: Int,
         promptCount: Int,
-        sharedBranchPrefixLength: Int?
+        sharedBranchPrefixLength: Int?,
+        commonWavePrefixLength: Int? = nil,
+        periodicCheckpointInterval: Int = 0,
+        includeTrailingAutoRetain: Bool = true
     ) -> [Int] {
         let firstVis = min(promptCount, max(0, firstVisualTokenOffset))
-        var retainPoints: [Int] = []
+        guard firstVis > matchedTokens else { return [] }
+        let hasVisualSpan = firstVis < promptCount
+        var candidates: [Int] = []
         if let explicit = explicitRetainLength, explicit > matchedTokens, explicit < firstVis {
-            retainPoints.append(explicit)
+            candidates.append(explicit)
         }
-        let autoBase = retainPoints.last ?? matchedTokens
-        if firstVis >= 64 {
+        if hasVisualSpan, firstVis >= 64 {
+            let preVis = firstVis - 4
+            let curBase = candidates.last ?? matchedTokens
+            if preVis >= 60, preVis > curBase + 4, preVis < firstVis {
+                candidates.append(preVis)
+            }
+        }
+        let branchCheckCeiling = hasVisualSpan ? (candidates.last ?? matchedTokens) : firstVis
+        if let branchLen = sharedBranchPrefixLength,
+           branchLen > matchedTokens,
+           (!hasVisualSpan || (candidates.last ?? matchedTokens) == matchedTokens || (candidates.last ?? matchedTokens) == explicitRetainLength),
+           branchLen < (hasVisualSpan ? firstVis : promptCount),
+           (!hasVisualSpan || branchLen > branchCheckCeiling) {
+            candidates.append(branchLen)
+        }
+        if let waveLen = commonWavePrefixLength, waveLen > matchedTokens, waveLen < firstVis {
+            candidates.append(waveLen)
+        }
+        if periodicCheckpointInterval > 0 {
+            let step = periodicCheckpointInterval
+            var cursor = ((matchedTokens / step) + 1) * step
+            while cursor < firstVis - 64 {
+                let nearExisting = candidates.contains { abs($0 - cursor) < 256 }
+                if !nearExisting {
+                    candidates.append(cursor)
+                }
+                cursor += step
+            }
+        }
+        candidates.sort()
+        var retainPoints: [Int] = []
+        for pt in candidates {
+            if let prev = retainPoints.last, pt <= prev { continue }
+            retainPoints.append(pt)
+        }
+        if !hasVisualSpan && includeTrailingAutoRetain && firstVis >= 64 {
+            let autoBase = retainPoints.last ?? matchedTokens
             let autoRetain = firstVis - 4
             if autoRetain >= 60, autoRetain > autoBase + 4, autoRetain < firstVis {
                 retainPoints.append(autoRetain)
             }
-        }
-        let branchBase = retainPoints.last ?? matchedTokens
-        if branchBase == matchedTokens || branchBase == explicitRetainLength,
-           let branchLen = sharedBranchPrefixLength,
-           branchLen > branchBase, branchLen < firstVis {
-            retainPoints.append(branchLen)
         }
         return retainPoints
     }

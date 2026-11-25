@@ -305,6 +305,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
         appMenu.addItem(.separator())
         appMenu.addItem(makeTargetedItem(title: "Restart Server", action: #selector(menuRestartServer(_:)), keyEquivalent: "r"))
         appMenu.addItem(makeTargetedItem(title: "Open Web UI", action: #selector(menuOpenWebUI(_:)), keyEquivalent: "d"))
+        appMenu.addItem(makeTargetedItem(title: "Capture Screen to Chat…", action: #selector(menuCaptureScreenToChat(_:)), keyEquivalent: ""))
         appMenu.addItem(makeTargetedItem(title: "Show Logs", action: #selector(menuOpenLogs(_:)), keyEquivalent: "l"))
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit Qwegn", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -407,6 +408,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
     @objc private func menuCheckForUpdates(_ sender: Any?) { openUpdatesWindow(triggerCheck: true) }
     @objc private func menuRestartServer(_ sender: Any?) { telemetry.restartServerProcess() }
     @objc private func menuOpenWebUI(_ sender: Any?) { openWebUI() }
+    @objc private func menuCaptureScreenToChat(_ sender: Any?) { captureScreenToChat() }
     @objc private func menuOpenLogs(_ sender: Any?) { openLogsWindow() }
     @objc private func menuCloseFrontWindow(_ sender: Any?) { closeFrontWindow() }
 
@@ -428,6 +430,29 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
     public func openWebUI() {
         popover?.performClose(nil)
         telemetry.openWebDashboard()
+    }
+
+    public func captureScreenToChat() {
+        popover?.performClose(nil)
+        let port = telemetry.serverPortString
+        Task { @MainActor in
+            do {
+                let snap = try await QWScreenCaptureHelper.captureActiveDisplay(promptForPermissionIfNeeded: true)
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setData(snap.pngData, forType: .png)
+                if let url = URL(string: "http://127.0.0.1:\(port)/ui?tab=chat") {
+                    NSWorkspace.shared.open(url)
+                }
+            } catch {
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = "Screen Recording Permission Needed"
+                alert.informativeText = "\(error)"
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+        }
     }
 
     @objc private func togglePopover() {

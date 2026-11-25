@@ -19,7 +19,7 @@ extension QWEngineDriver {
 
     var maxBatchSlots: Int {
         if let ink = inkling2Runtime { return ink.maxBatchSlots }
-        return Self.gdnSlotCount()
+        return admission.totalSlots > 0 ? admission.totalSlots : Self.gdnSlotCount()
     }
 }
 
@@ -135,6 +135,9 @@ extension QWEngineDriver: QWSessionInferenceEngine {
             if mtpBackend == .dflash2 {
                 lines += "dflash drafter pack:     \(dflashDraftPackPath ?? "none") (selector top-k: \(dflashSelectorTopK ?? 16))\n"
             }
+            if mtpBackend == .dspark, let ds = standardState?.dsparkDrafter {
+                lines += "dspark drafter pack:     \(ds.weights.packPath) (confidence schedule: \(ds.schedulerEnabled))\n"
+            }
             if mtpBackend == .variational {
                 lines += "variational margin:      \(String(format: "%.2f", mtpRelaxedMargin)) (min prob: \(String(format: "%.2f", effectiveRelaxedMinProb)), quadratic seeding: \(mtpQuadraticSeeding))\n"
             }
@@ -208,7 +211,7 @@ extension QWEngineDriver: QWSessionInferenceEngine {
         } else if reqBackend == "variational" || reqBackend == "relaxed" || reqBackend == "plm" {
             activeRelaxedMarginOverride = Float(max(0.0, request.speculative.mtpRelaxedMargin))
             mtpRelaxedMinProb = request.speculative.mtpRelaxedMinProb
-        } else if reqBackend == "standard" || reqBackend == "dflash2" || reqBackend == "dspine" {
+        } else if reqBackend == "standard" || reqBackend == "dflash2" || reqBackend == "dspine" || reqBackend == "dspark" {
             activeRelaxedMarginOverride = 0.0
         } else {
             activeRelaxedMarginOverride = nil
@@ -302,9 +305,16 @@ extension QWEngineDriver: QWSessionInferenceEngine {
                     onToken: effectiveOnToken
                 )
         } else {
+            var stochConfig = request.sampling
+            stochConfig.uniformVersion = .upper24
+            if stochConfig.temperature <= 0 {
+                stochConfig.temperature = 1
+                stochConfig.topK = 1
+                stochConfig.topP = 1
+            }
             let session = try makeStochasticSession(
                 promptTokens: request.prompt.count,
-                config: request.sampling
+                config: stochConfig
             )
             defer { finishSession(session) }
             tokens = try generateExperimentalStochastic(

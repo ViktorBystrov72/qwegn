@@ -15,6 +15,8 @@ struct QWEnginePrivatePrefix: Sendable {
     let dflashKData: Data?
     let dflashVData: Data?
     let dflashCacheOffset: Int
+    let dsparkRingData: Data?
+    let dsparkCacheOffset: Int
     let stochastic: QWStochasticState?
     let trunk: QWKVPrivatePrefix
     let mtp: QWKVPrivatePrefix?
@@ -23,6 +25,7 @@ struct QWEnginePrivatePrefix: Sendable {
     init(position: Int, generated: Int, roundRecord: QWRoundRecord,
          recData: Data, ringData: Data, trunkHiddenData: Data?, trunkHiddenValid: Bool,
          dflashKData: Data? = nil, dflashVData: Data? = nil, dflashCacheOffset: Int = 0,
+         dsparkRingData: Data? = nil, dsparkCacheOffset: Int = 0,
          stochastic: QWStochasticState? = nil,
          trunk: QWKVPrivatePrefix, mtp: QWKVPrivatePrefix?, mlaIndexerData: Data? = nil) {
         self.position = position
@@ -35,6 +38,8 @@ struct QWEnginePrivatePrefix: Sendable {
         self.dflashKData = dflashKData
         self.dflashVData = dflashVData
         self.dflashCacheOffset = dflashCacheOffset
+        self.dsparkRingData = dsparkRingData
+        self.dsparkCacheOffset = dsparkCacheOffset
         self.stochastic = stochastic
         self.trunk = trunk
         self.mtp = mtp
@@ -43,7 +48,7 @@ struct QWEnginePrivatePrefix: Sendable {
 
     var memoryBytes: Int {
         recData.count + ringData.count + (trunkHiddenData?.count ?? 0) + (mlaIndexerData?.count ?? 0) +
-            (dflashKData?.count ?? 0) + (dflashVData?.count ?? 0) +
+            (dflashKData?.count ?? 0) + (dflashVData?.count ?? 0) + (dsparkRingData?.count ?? 0) +
             trunk.memoryBytes + (mtp?.memoryBytes ?? 0)
     }
 }
@@ -54,7 +59,8 @@ extension QWEngineSessionState {
                                      mlaIndexerData: Data? = nil) throws -> QWEnginePrivatePrefix {
         try validate(session, cache: cache, mtpCache: mtpCache)
         let stateBytes = session.recSlab.bytes + session.ringSlab.bytes + (session.trunkHidden?.bytes ?? 0) +
-            (mlaIndexerData?.count ?? 0) + (session.dflashSlot.map { $0.kSlab.bytes + $0.vSlab.bytes } ?? 0)
+            (mlaIndexerData?.count ?? 0) + (session.dflashSlot.map { $0.kSlab.bytes + $0.vSlab.bytes } ?? 0) +
+            (session.dsparkSlot?.ringBytes ?? 0)
         guard maxBytes >= stateBytes, session.generated >= 0,
               session.position == cache.written(session.kv),
               session.roundRecord.consumedCount == session.position,
@@ -73,6 +79,7 @@ extension QWEngineSessionState {
             trunkHiddenData: state.trunkHiddenData, trunkHiddenValid: state.trunkHiddenValid,
             dflashKData: state.dflashKData, dflashVData: state.dflashVData,
             dflashCacheOffset: state.dflashCacheOffset,
+            dsparkRingData: state.dsparkRingData, dsparkCacheOffset: state.dsparkCacheOffset,
             stochastic: state.stochastic,
             trunk: trunk, mtp: mtp, mlaIndexerData: mlaIndexerData)
     }
@@ -105,6 +112,7 @@ extension QWEngineSessionState {
             stochastic: prefix.stochastic,
             dflashKData: prefix.dflashKData, dflashVData: prefix.dflashVData,
             dflashCacheOffset: prefix.dflashCacheOffset,
+            dsparkRingData: prefix.dsparkRingData, dsparkCacheOffset: prefix.dsparkCacheOffset,
             mlaIndexerData: prefix.mlaIndexerData)
         let owner = try state.makeStochasticOwner(geometry: geometry)
         do {

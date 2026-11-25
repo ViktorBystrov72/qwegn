@@ -10,6 +10,10 @@
 using namespace metal;
 using namespace mlx::steel;
 
+#if !defined(__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__) || (__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ < 260200)
+#error "Metal 4 NAX kernels require -mmacosx-version-min=26.2 (SDK MPPTensorOpsAvailability)"
+#endif
+
 #define HCA_NAX_BK  32u
 #define HCA_NAX_DIM 512u
 #define HCA_NAX_DSG 128u

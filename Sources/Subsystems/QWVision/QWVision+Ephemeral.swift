@@ -68,6 +68,8 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     private var metalBackend: QWVisionMetalBackend?
     private var residentWeights: QWVisionWeights?
     private var inkling2Weights: QWInkling2VisionWeights?
+    private var lfm3Weights: QWLFM3VisionWeights?
+    private var siglip2Weights: QWSigLIP2VisionWeights?
     private var keepResidentFlag: Bool = false
     private var allowOnDemandFlag: Bool = true
 
@@ -76,7 +78,10 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     }
 
     public var isLoaded: Bool {
-        lock.withLock { metalBackend != nil || residentWeights != nil || inkling2Weights != nil }
+        lock.withLock {
+            metalBackend != nil || residentWeights != nil
+                || inkling2Weights != nil || lfm3Weights != nil || siglip2Weights != nil
+        }
     }
 
     public var keepResident: Bool {
@@ -89,7 +94,8 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
 
     public var isVisionEnabled: Bool {
         lock.withLock {
-            keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil || inkling2Weights != nil
+            keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil
+                || inkling2Weights != nil || lfm3Weights != nil || siglip2Weights != nil
         }
     }
 
@@ -98,6 +104,8 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
             (metalBackend?.residentBytes ?? 0)
                 + (residentWeights?.residentBytes ?? 0)
                 + (inkling2Weights?.residentBytes ?? 0)
+                + (lfm3Weights?.residentBytes ?? 0)
+                + (siglip2Weights?.residentBytes ?? 0)
         }
     }
 
@@ -145,7 +153,7 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
                 ? root.weights.path
                 : root.weights.deletingLastPathComponent().path
             try self.init(source: .directory(dir), keepResident: keepResident, allowOnDemand: allowOnDemand, hal: hal)
-        case nil:
+        case .coreAIModel, nil:
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: modelPath, isDirectory: &isDir), isDir.boolValue {
                 try self.init(source: .directory(modelPath), keepResident: keepResident, allowOnDemand: allowOnDemand, hal: hal)
@@ -174,9 +182,28 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     private static func validate(checkpoint ck: QWVisionCheckpoint) throws {
         defer { ck.releaseBacking() }
         let cfg = ck.config
-        guard cfg.dim > 0, cfg.heads > 0, cfg.headDim * cfg.heads == cfg.dim,
-              cfg.numPosEmbeds > 0, cfg.posSide * cfg.posSide == cfg.numPosEmbeds else {
+        let validPos = cfg.architecture == .lfm3VL || (cfg.numPosEmbeds > 0 && cfg.posSide * cfg.posSide == cfg.numPosEmbeds)
+        guard cfg.dim > 0, cfg.heads > 0, cfg.kvHeads > 0, cfg.heads % cfg.kvHeads == 0,
+              cfg.headDim * cfg.heads == cfg.dim, validPos else {
             throw QWVisionError.badLayout("vision config incomplete or invalid")
+        }
+        if cfg.architecture == .lfm3VL {
+            guard ck.has("patchifier.weight") || ck.has("patch_embed.proj.weight") || ck.has("embeddings.patch_embedding.weight"),
+                  ck.has("blocks.0.norm1.weight") || ck.has("blocks.0.layer_norm1.weight") || ck.has("blocks.0.operator_norm.weight")
+                      || ck.has("layers.0.norm1.weight") || ck.has("layers.0.operator_norm.weight"),
+                  ck.has("merger.linear_fc1.weight"),
+                  ck.has("merger.linear_fc2.weight") else {
+                throw QWVisionError.missingTensor("lfm3_vl vision tensors missing")
+            }
+            return
+        }
+        if cfg.architecture == .siglip2 {
+            guard ck.has("embeddings.patch_embedding.weight"),
+                  ck.has("embeddings.position_embedding.weight") || ck.has("embeddings.position_embedding"),
+                  ck.has("encoder.layers.0.layer_norm1.weight") || ck.has("layers.0.layer_norm1.weight") else {
+                throw QWVisionError.missingTensor("siglip2 vision tensors missing")
+            }
+            return
         }
         if cfg.architecture == .inkling2 {
             guard ck.has("embeddings.patch_embedding.weight"),
@@ -209,15 +236,24 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         }
     }
 
-    private func makeInkling2WeightsLocked() throws -> QWInkling2VisionWeights {
+    private func openCheckpointLocked() throws -> QWVisionCheckpoint {
         switch source {
-        case .pack(let packPath):
-            return try QWInkling2VisionWeights(checkpoint: try QWVisionCheckpoint(pack: packPath))
-        case .directory(let dir):
-            return try QWInkling2VisionWeights(checkpoint: try QWVisionCheckpoint(dir: dir))
-        case .custom:
-            throw QWVisionError.badLayout("custom builder unsupported for inkling2 vision")
+        case .pack(let packPath): return try QWVisionCheckpoint(pack: packPath)
+        case .directory(let dir): return try QWVisionCheckpoint(dir: dir)
+        case .custom: throw QWVisionError.badLayout("custom builder unsupported for \(resolvedConfig.architecture)")
         }
+    }
+
+    private func makeInkling2WeightsLocked() throws -> QWInkling2VisionWeights {
+        try QWInkling2VisionWeights(checkpoint: try openCheckpointLocked())
+    }
+
+    private func makeLFM3WeightsLocked() throws -> QWLFM3VisionWeights {
+        try QWLFM3VisionWeights(checkpoint: try openCheckpointLocked())
+    }
+
+    private func makeSigLIP2WeightsLocked() throws -> QWSigLIP2VisionWeights {
+        try QWSigLIP2VisionWeights(checkpoint: try openCheckpointLocked())
     }
 
     private func loadCPUWeightsFromSource() throws -> QWVisionWeights {
@@ -232,13 +268,26 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     }
 
     private func loadResidentLocked() throws {
-        if metalBackend != nil || residentWeights != nil || inkling2Weights != nil {
+        if metalBackend != nil || residentWeights != nil || inkling2Weights != nil
+            || lfm3Weights != nil || siglip2Weights != nil {
             return
         }
         if resolvedConfig.architecture == .inkling2 {
             let loaded = try makeInkling2WeightsLocked()
             resolvedConfig = loaded.config
             inkling2Weights = loaded
+            return
+        }
+        if resolvedConfig.architecture == .lfm3VL {
+            let loaded = try makeLFM3WeightsLocked()
+            resolvedConfig = loaded.config
+            lfm3Weights = loaded
+            return
+        }
+        if resolvedConfig.architecture == .siglip2 {
+            let loaded = try makeSigLIP2WeightsLocked()
+            resolvedConfig = loaded.config
+            siglip2Weights = loaded
             return
         }
         let forceCPU = ProcessInfo.processInfo.environment["QWG_VISION_CPU"] == "1"
@@ -286,6 +335,8 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
         metalBackend = nil
         residentWeights = nil
         inkling2Weights = nil
+        lfm3Weights = nil
+        siglip2Weights = nil
     }
 
     public func setVisionLoaded(_ loaded: Bool) throws {
@@ -302,7 +353,8 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
     public func prepareForPrompt(hasImages: Bool) throws {
         try lock.withLock {
             if hasImages {
-                guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil || inkling2Weights != nil else {
+                guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil
+                        || inkling2Weights != nil || lfm3Weights != nil || siglip2Weights != nil else {
                     throw QWVisionError.badLayout(
                         "Vision tower is disabled in Model Settings (enable 'Load Vision Tower' in Settings → Model)"
                     )
@@ -334,41 +386,50 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
             case metal(QWVisionMetalBackend)
             case cpu(QWVisionWeights)
             case inkling2(QWInkling2VisionWeights)
+            case lfm3VL(QWLFM3VisionWeights)
+            case siglip2(QWSigLIP2VisionWeights)
         }
         let selection: EngineSelection = try lock.withLock {
-            guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil || inkling2Weights != nil else {
+            guard keepResidentFlag || allowOnDemandFlag || metalBackend != nil || residentWeights != nil
+                    || inkling2Weights != nil || lfm3Weights != nil || siglip2Weights != nil else {
                 throw QWVisionError.badLayout(
                     "Vision tower is disabled in Model Settings (enable 'Load Vision Tower' in Settings → Model)"
                 )
             }
-            if resolvedConfig.architecture == .inkling2 {
-                if inkling2Weights == nil {
-                    inkling2Weights = try makeInkling2WeightsLocked()
-                }
+            switch resolvedConfig.architecture {
+            case .inkling2:
+                if inkling2Weights == nil { inkling2Weights = try makeInkling2WeightsLocked() }
                 guard let iw = inkling2Weights else {
                     throw QWVisionError.badLayout("Inkling-2 vision weights failed to load")
                 }
                 return .inkling2(iw)
-            }
-            if forceCPU {
-                if let existing = residentWeights {
-                    return .cpu(existing)
+            case .lfm3VL:
+                if lfm3Weights == nil { lfm3Weights = try makeLFM3WeightsLocked() }
+                guard let lw = lfm3Weights else {
+                    throw QWVisionError.badLayout("LFM3-VL vision weights failed to load")
                 }
-                let cpuW = try loadCPUWeightsFromSource()
-                resolvedConfig = cpuW.config
-                if metalBackend == nil {
-                    residentWeights = cpuW
+                return .lfm3VL(lw)
+            case .siglip2:
+                if siglip2Weights == nil { siglip2Weights = try makeSigLIP2WeightsLocked() }
+                guard let sw = siglip2Weights else {
+                    throw QWVisionError.badLayout("SigLIP2 vision weights failed to load")
                 }
-                return .cpu(cpuW)
+                return .siglip2(sw)
+            case .qwen3VL:
+                if forceCPU {
+                    if let existing = residentWeights { return .cpu(existing) }
+                    let cpuW = try loadCPUWeightsFromSource()
+                    resolvedConfig = cpuW.config
+                    if metalBackend == nil { residentWeights = cpuW }
+                    return .cpu(cpuW)
+                }
+                try loadResidentLocked()
+                if let metal = metalBackend { return .metal(metal) }
+                guard let weights = residentWeights else {
+                    throw QWVisionError.badLayout("Vision weights failed to load")
+                }
+                return .cpu(weights)
             }
-            try loadResidentLocked()
-            if let metal = metalBackend {
-                return .metal(metal)
-            }
-            guard let weights = residentWeights else {
-                throw QWVisionError.badLayout("Vision weights failed to load")
-            }
-            return .cpu(weights)
         }
         switch selection {
         case .metal(let metal):
@@ -377,6 +438,10 @@ public final class QWVisionOnDemandBackend: QWVisionBackend, @unchecked Sendable
             return QWVisionRef(weights: weights).encode(patches: patches, plan: grid, bins: bins, posIds: posIds)
         case .inkling2(let iw):
             return QWInkling2VisionRef(weights: iw).encode(patches: patches, plan: grid, bins: bins, posIds: posIds)
+        case .lfm3VL(let lw):
+            return QWLFM3VisionRef(weights: lw).encode(patches: patches, plan: grid, posIds: posIds)
+        case .siglip2(let sw):
+            return QWSigLIP2VisionRef(weights: sw).encode(patches: patches, plan: grid, bins: bins)
         }
     }
 

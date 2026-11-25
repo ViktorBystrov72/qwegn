@@ -20,6 +20,112 @@ VALID_GROUPS = (32, 64, 128, 256)
 _HQ_PREFIXES = ("hq2", "hq3", "hq4", "hq6", "hq8")
 
 
+_MXFP4_BYTE_LUT = None
+_UE8M0_LUT = None
+
+
+def _get_mxfp4_luts():
+    global _MXFP4_BYTE_LUT, _UE8M0_LUT
+    if _MXFP4_BYTE_LUT is None:
+        import torch
+        e2m1 = np.array([
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ], dtype=np.float32)
+        idx = np.arange(256, dtype=np.int64)
+        pair = np.stack([e2m1[idx & 0x0F], e2m1[(idx >> 4) & 0x0F]], axis=1)
+        _MXFP4_BYTE_LUT = torch.from_numpy(np.ascontiguousarray(pair))
+        ue = np.empty(256, dtype=np.float32)
+        for b in range(255):
+            ue[b] = np.float32(2.0 ** (b - 127))
+        ue[255] = np.float32("nan")
+        _UE8M0_LUT = torch.from_numpy(ue)
+    return _MXFP4_BYTE_LUT, _UE8M0_LUT
+
+
+# Dequantize OCP MXFP4 (packed I8/U8 E2M1 nibbles + F8_E8M0/U8 [..., N, K//32] scale_inv) to float32.
+def dequant_mxfp4_blockwise(w_packed, scale_inv, block_size: int = 32, device=None):
+    import torch
+    if block_size != 32:
+        raise ValueError(f"MXFP4 requires block_size=32, got {block_size}")
+    w_t = w_packed if isinstance(w_packed, torch.Tensor) else torch.as_tensor(np.asarray(w_packed))
+    s_t = scale_inv if isinstance(scale_inv, torch.Tensor) else torch.as_tensor(np.asarray(scale_inv))
+    if w_t.ndim not in (2, 3):
+        raise ValueError(f"Unsupported MXFP4 tensor rank {w_t.ndim} with shape {tuple(w_t.shape)}")
+    *prefix, n, half_k = w_t.shape
+    k = half_k * 2
+    if k % 32 != 0:
+        raise ValueError(f"MXFP4 inner dimension K={k} must be a multiple of 32")
+    if tuple(s_t.shape) != (*prefix, n, k // 32):
+        raise ValueError(f"MXFP4 scale_inv shape {tuple(s_t.shape)} != expected {(*prefix, n, k // 32)}")
+    if w_t.dtype not in (torch.int8, torch.uint8):
+        raise ValueError(f"MXFP4 weight must be int8 or uint8, got {w_t.dtype}")
+    e8m0_dt = getattr(torch, "float8_e8m0fnu", None)
+    if s_t.dtype not in tuple(d for d in (e8m0_dt, torch.uint8) if d is not None):
+        raise ValueError(f"MXFP4 scale_inv must be float8_e8m0fnu or uint8, got {s_t.dtype}")
+    w_u8 = w_t.detach().cpu().contiguous().view(torch.uint8)
+    s_u8 = s_t.detach().cpu().contiguous().view(torch.uint8)
+    if bool((s_u8 == 255).any()):
+        raise ValueError("MXFP4 scale_inv contains NaN (0xFF E8M0)")
+    byte_lut, ue_lut = _get_mxfp4_luts()
+    if device is not None:
+        dev = torch.device(device)
+        byte_lut = byte_lut.to(dev)
+        ue_lut = ue_lut.to(dev)
+        w_u8 = w_u8.to(dev)
+        s_u8 = s_u8.to(dev)
+    vals = byte_lut[w_u8.to(torch.long)].reshape(*prefix, n, k // 32, 32)
+    sc = ue_lut[s_u8.to(torch.long)].unsqueeze(-1)
+    return (vals * sc).reshape(*prefix, n, k).contiguous()
+
+
+# Dispatch blockwise FP8 or MXFP4 dequantization from paired weight and scale_inv tensors.
+def dequant_with_scale_inv(w, scale_inv, fp8_block_size: int = 128, device=None):
+    import torch
+    w_t = w if isinstance(w, torch.Tensor) else torch.as_tensor(w)
+    s_t = scale_inv if isinstance(scale_inv, torch.Tensor) else torch.as_tensor(scale_inv)
+    e8m0_dt = getattr(torch, "float8_e8m0fnu", None)
+    is_mxfp4 = w_t.dtype in (torch.int8, torch.uint8) and (
+        s_t.dtype == e8m0_dt
+        or (s_t.dtype == torch.uint8 and s_t.ndim == w_t.ndim
+            and s_t.shape[:-1] == w_t.shape[:-1] and s_t.shape[-1] * 16 == w_t.shape[-1])
+    )
+    if is_mxfp4:
+        return dequant_mxfp4_blockwise(w_t, s_t, block_size=32, device=device)
+    return dequant_fp8_blockwise(w_t, s_t, block_size=fp8_block_size, device=device)
+
+
+# Validate HF quantization_config (FP8 / MXFP4 block-scaled sources) and return FP8 block size.
+def validate_source_quant_config(config: dict) -> int:
+    tc = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+    qcfg = config.get("quantization_config")
+    if qcfg is None:
+        qcfg = tc.get("quantization_config")
+    if qcfg is None:
+        return 128
+    if not isinstance(qcfg, dict) or qcfg.get("quant_method") not in ("fp8", "mxfp4"):
+        raise ValueError("REFUSED: source is already quantized; use the original BF16/FP8/MXFP4 checkpoint")
+    wbs = qcfg.get("weight_block_size")
+    if isinstance(wbs, list) and len(wbs) == 2 and wbs[0] == wbs[1]:
+        return int(wbs[0])
+    return 128
+
+
+# Resolve logical [..., N, K] shape for safetensors weights (unpacking MXFP4 4-bit nibble tensors).
+def unpacked_safetensors_shape(w_shape, w_dtype: str, scale_shape=None, scale_dtype: str | None = None) -> list[int]:
+    shape = [int(d) for d in w_shape]
+    if scale_shape is None or len(shape) not in (2, 3) or w_dtype not in ("I8", "U8"):
+        return shape
+    s_shape = [int(d) for d in scale_shape]
+    is_mxfp4 = scale_dtype == "F8_E8M0" or (
+        scale_dtype == "U8"
+        and len(s_shape) == len(shape)
+        and s_shape[:-1] == shape[:-1]
+        and s_shape[-1] * 16 == shape[-1]
+    )
+    return [*shape[:-1], shape[-1] * 2] if is_mxfp4 else shape
+
+
 # Dequantize block-scaled FP8 (e.g. F8_E4M3 + [ceil(N/128), ceil(K/128)] weight_scale_inv) to float32 tensor.
 def dequant_fp8_blockwise(w_fp8, scale_inv, block_size: int = 128, device=None):
     import torch

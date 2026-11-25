@@ -22,6 +22,7 @@ extension QWEngineLifecycleActor {
         public let mtpRelaxedMinProb: Double
         public let mtpAdaptiveDepth: Bool, mtpAdaptiveEntropyThreshold: Double
         public let dflashDraftPackPath: String?, dflashSelectorTopK: Int
+        public let dsparkConfidenceSchedule: Bool?
         public let ropeScalingType: String, ropeScalingFactor: Double
         public let gdnPrefill: String, evictPrefillScratch: String, prefillChunkSize: Int
         public let maxConcurrentSessions: Int
@@ -35,6 +36,9 @@ extension QWEngineLifecycleActor {
         public var loadVision: Bool
         public var allowLocalImagePaths: Bool = false
         public var allowRemoteImageURLs: Bool = false
+        public var decisionModelPackPath: String = ""
+        public var decisionComputeUnit: String = "auto"
+        public var decisionLoadVision: Bool = true
         /// Where each setting came from, by setting key. The provenance
         /// travels with the values, so a reader is told without resolving
         /// the configuration a second time.
@@ -50,6 +54,7 @@ extension QWEngineLifecycleActor {
             mtpDraftStrategy: String = "hybrid", mtpQuadraticSeeding: Bool = true,
             mtpAdaptiveDepth: Bool = false, mtpAdaptiveEntropyThreshold: Double = 0.5,
             dflashDraftPackPath: String? = nil, dflashSelectorTopK: Int = 16,
+            dsparkConfidenceSchedule: Bool? = nil,
             ropeScalingType: String = "none", ropeScalingFactor: Double = 1.0,
             gdnPrefill: String = "regres", evictPrefillScratch: String = "auto",
             prefillChunkSize: Int = QWPrefillLimits.chunkRows, maxConcurrentSessions: Int? = nil,
@@ -62,6 +67,9 @@ extension QWEngineLifecycleActor {
             loadVision: Bool = false,
             allowLocalImagePaths: Bool = false,
             allowRemoteImageURLs: Bool = false,
+            decisionModelPackPath: String = "",
+            decisionComputeUnit: String = "auto",
+            decisionLoadVision: Bool = true,
             sourceSummary: [String: String] = [:]
         ) {
             self.packPath = packPath
@@ -79,6 +87,7 @@ extension QWEngineLifecycleActor {
             self.mtpAdaptiveEntropyThreshold = mtpAdaptiveEntropyThreshold
             self.dflashDraftPackPath = dflashDraftPackPath
             self.dflashSelectorTopK = dflashSelectorTopK
+            self.dsparkConfidenceSchedule = dsparkConfidenceSchedule
             self.ropeScalingType = ropeScalingType
             self.ropeScalingFactor = ropeScalingFactor
             self.gdnPrefill = gdnPrefill
@@ -105,6 +114,9 @@ extension QWEngineLifecycleActor {
             self.loadVision = loadVision
             self.allowLocalImagePaths = allowLocalImagePaths
             self.allowRemoteImageURLs = allowRemoteImageURLs
+            self.decisionModelPackPath = decisionModelPackPath
+            self.decisionComputeUnit = decisionComputeUnit
+            self.decisionLoadVision = decisionLoadVision
             self.sourceSummary = sourceSummary
         }
 
@@ -143,7 +155,8 @@ extension QWEngineLifecycleActor {
                 mtpDraftStrategy: mtpDraftStrategy,
                 mtpQuadraticSeeding: mtpQuadraticSeeding,
                 adaptiveDepth: mtpAdaptiveDepth,
-                entropyThreshold: mtpAdaptiveEntropyThreshold
+                entropyThreshold: mtpAdaptiveEntropyThreshold,
+                dsparkConfidenceSchedule: dsparkConfidenceSchedule
             )
         }
     }

@@ -89,6 +89,20 @@ public struct QWDashboardFacts: Sendable, Codable, Equatable {
     public let coolingPolicy: String?
     /// Active fan control status reported by `QWFanController`.
     public let fanControlStatus: String?
+    /// True when the co-resident System-1 decision sidecar is loaded.
+    public let decisionSidecarLoaded: Bool?
+    /// Resident decision sidecar model name, when loaded.
+    public let decisionSidecarModel: String?
+    /// Decision sidecar execution backend (`metal4` / `coreai_ane`), when loaded.
+    public let decisionSidecarBackend: String?
+    /// Decision sidecar compute unit (`metal` / `ane` / `auto`), when loaded.
+    public let decisionSidecarComputeUnit: String?
+    /// Estimated UMA footprint in bytes for the loaded decision sidecar.
+    public let decisionSidecarBytes: UInt64?
+    /// Cumulative decision requests evaluated by the active sidecar.
+    public let decisionSidecarTotalRequests: Int?
+    /// Mean decision evaluation latency in milliseconds, when measured.
+    public let decisionSidecarMeanLatencyMs: Double?
 
     public init(quantization: String? = nil, hostLogicalCores: Int? = nil,
                 gdnPrefillMode: String? = nil, gpuName: String? = nil,
@@ -100,7 +114,14 @@ public struct QWDashboardFacts: Sendable, Codable, Equatable {
                 mountedMemoryPackDelta: Int? = nil,
                 mountedMemoryPackKV: String? = nil,
                 coolingPolicy: String? = nil,
-                fanControlStatus: String? = nil) {
+                fanControlStatus: String? = nil,
+                decisionSidecarLoaded: Bool? = nil,
+                decisionSidecarModel: String? = nil,
+                decisionSidecarBackend: String? = nil,
+                decisionSidecarComputeUnit: String? = nil,
+                decisionSidecarBytes: UInt64? = nil,
+                decisionSidecarTotalRequests: Int? = nil,
+                decisionSidecarMeanLatencyMs: Double? = nil) {
         self.quantization = quantization
         self.hostLogicalCores = hostLogicalCores
         self.gdnPrefillMode = gdnPrefillMode
@@ -116,6 +137,13 @@ public struct QWDashboardFacts: Sendable, Codable, Equatable {
         self.mountedMemoryPackKV = mountedMemoryPackKV
         self.coolingPolicy = coolingPolicy
         self.fanControlStatus = fanControlStatus
+        self.decisionSidecarLoaded = decisionSidecarLoaded
+        self.decisionSidecarModel = decisionSidecarModel
+        self.decisionSidecarBackend = decisionSidecarBackend
+        self.decisionSidecarComputeUnit = decisionSidecarComputeUnit
+        self.decisionSidecarBytes = decisionSidecarBytes
+        self.decisionSidecarTotalRequests = decisionSidecarTotalRequests
+        self.decisionSidecarMeanLatencyMs = decisionSidecarMeanLatencyMs
     }
 }
 

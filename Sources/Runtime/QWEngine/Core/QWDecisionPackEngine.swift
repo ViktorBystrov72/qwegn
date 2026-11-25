@@ -1,0 +1,318 @@
+// QWDecisionPackEngine.swift — Capability-dispatched native Metal 4 backend for System-1 decision packs.
+
+import CoreGraphics
+import Dispatch
+import Foundation
+import ImageIO
+import QWAlloc
+import QWAttn
+import QWCore
+import QWDecision
+import QWGDN
+import QWHAL
+import QWHead
+import QWMM
+import QWQuant
+import QWVision
+
+/// Executes single-pass System-1 batches natively on Metal 4 for general hybrid/transformer decision packs.
+public final class QWDecisionPackEngine: QWDecisionExecutionBackend, @unchecked Sendable {
+    public let descriptor: QWModelDescriptor
+    public let decisionConfig: QWDecisionModelConfig
+    public let maxContextLength: Int
+    public let gpuTurnArbitrator: QWGPUTurnArbitrator?
+    public let isSidecar: Bool
+    public let visionBackend: (any QWVisionBackend)?
+    public let loadVision: Bool
+
+    let hal: QWHal
+    let weights: QWDecisionPackWeights
+    let shortConv: QWShortConv
+    let topoAttn: QWDecisionTopologyAttn
+    let headOp: QWDecisionHeadOperator
+
+    private static let evalQueue = DispatchQueue(label: "qwegn.decision.pack.metal", qos: .userInteractive)
+    private static let maxImageSourceBytes = 20 * 1024 * 1024
+    private static let maxImageDimension = 16_384
+    private static let maxImageArea: Int64 = 67_108_864
+
+    /// Returns true when `descriptor` and `root` are runnable by the capability-dispatched Metal 4 decision engine.
+    public static func canLoad(descriptor: QWModelDescriptor, root: QWModelRoot) -> Bool {
+        guard let dc = descriptor.decisionConfig else { return false }
+        guard case .vocabVerbalizer = dc.head else { return false }
+        guard root.kind == .qwp1 || root.kind == .safetensorsSingle || root.kind == .safetensorsSharded else { return false }
+        guard descriptor.numLayers > 0, descriptor.layerTypes.count == descriptor.numLayers else { return false }
+        guard (descriptor.numExperts ?? 0) == 0, (descriptor.denseIntermediate ?? 0) > 0, descriptor.activationKind == .silu else {
+            return false
+        }
+        let supported: Set<String> = ["conv", "shortconv", "full_attention", "sliding_attention", "attention"]
+        return descriptor.layerTypes.allSatisfy { supported.contains($0) }
+    }
+
+    public init(
+        packPath: String,
+        descriptor: QWModelDescriptor,
+        gpuTurnArbitrator: QWGPUTurnArbitrator? = nil,
+        isSidecar: Bool = true,
+        visionBackend: (any QWVisionBackend)? = nil,
+        loadVision: Bool = true
+    ) throws {
+        guard let dc = descriptor.decisionConfig else {
+            throw QWDecisionError.backendFailed("missing decisionConfig for native Metal decision pack")
+        }
+        let root = QWModelRoot(url: URL(fileURLWithPath: packPath))
+        let geometry = QWModelGeometry(descriptor: descriptor)
+        let usesRotated = try QWDecisionWeightLoader.probeRotatedBasis(root: root, descriptor: descriptor)
+        let hal = try QWHal(geometry: geometry, weightBasis: usesRotated ? .rotated : .standard)
+        self.hal = hal
+        self.descriptor = descriptor
+        self.decisionConfig = dc
+        self.maxContextLength = max(1, descriptor.maxPositionEmbeddings)
+        self.gpuTurnArbitrator = gpuTurnArbitrator
+        self.isSidecar = isSidecar
+        self.visionBackend = visionBackend
+        self.loadVision = loadVision
+        self.weights = try QWDecisionWeightLoader.load(root: root, descriptor: descriptor, hal: hal)
+        self.shortConv = try QWShortConv(hal: hal)
+        self.topoAttn = try QWDecisionTopologyAttn(hal: hal)
+        self.headOp = try QWDecisionHeadOperator(hal: hal)
+    }
+
+    public func evaluate(_ request: QWDecisionBackendBatchRequest) async throws -> QWDecisionBackendOutput {
+        guard case .vocabVerbalizer = decisionConfig.head else {
+            throw QWDecisionError.backendFailed("unsupported decision head \(decisionConfig.head)")
+        }
+        let t0 = ContinuousClock.now
+        let grouped = request.slots.enumerated().reduce(into: [Int: [(Int, QWDecisionSlotTarget)]]()) { acc, pair in
+            acc[pair.element.sequenceIndex, default: []].append((pair.offset, pair.element))
+        }
+        let sortedSeqs = grouped.keys.sorted()
+        var encodedCache: [Data: (grid: QWVisionGrid, features: [Float])] = [:]
+        var prepared: [PreparedDecisionSeq] = []
+        prepared.reserveCapacity(sortedSeqs.count)
+
+        for seqIdx in sortedSeqs {
+            guard seqIdx >= 0 && seqIdx < request.sequences.count else {
+                throw QWDecisionError.invalidQuestion("sequence index \(seqIdx) out of bounds")
+            }
+            let seq = request.sequences[seqIdx]
+            let entries = grouped[seqIdx] ?? []
+            prepared.append(try await prepareSequence(seq: seq, entries: entries, cache: &encodedCache))
+        }
+
+        let candIds = request.uniqueCandidateTokenIds.isEmpty
+            ? Array(Set(request.slots.flatMap { $0.candidateTokenGroups.flatMap { $0 } })).sorted()
+            : request.uniqueCandidateTokenIds
+        let evalClosure: @Sendable () async throws -> [QWDecisionSlotOutput] = { [self, prepared, candIds] in
+            try await withCheckedThrowingContinuation { continuation in
+                Self.evalQueue.async {
+                    do {
+                        var out = [QWDecisionSlotOutput](repeating: QWDecisionSlotOutput(), count: request.slots.count)
+                        for item in prepared {
+                            let seqRes = try self.executeSequenceOnGPU(item, candidateIds: candIds)
+                            for (slotIdx, val) in seqRes {
+                                out[slotIdx] = val
+                            }
+                        }
+                        continuation.resume(returning: out)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+
+        let slotOutputs: [QWDecisionSlotOutput]
+        if isSidecar, let arb = gpuTurnArbitrator {
+            slotOutputs = try await arb.runHighPrioritySidecar { try await evalClosure() }
+        } else {
+            slotOutputs = try await evalClosure()
+        }
+
+        let elapsed = t0.duration(to: ContinuousClock.now)
+        let latencyMs = Double(elapsed.components.seconds) * 1000.0 + Double(elapsed.components.attoseconds) / 1e15
+        let promptTokens = prepared.reduce(0) { $0 + $1.tokens.count }
+        return QWDecisionBackendOutput(
+            slotOutputs: slotOutputs, promptTokens: promptTokens, latencyMs: (latencyMs * 100.0).rounded() / 100.0
+        )
+    }
+
+    private func prepareSequence(
+        seq: QWDecisionSequenceInput,
+        entries: [(Int, QWDecisionSlotTarget)],
+        cache: inout [Data: (grid: QWVisionGrid, features: [Float])]
+    ) async throws -> PreparedDecisionSeq {
+        let rawPtrLen = seq.pointerValidMask.isEmpty ? max(1, seq.stateEndPosition) : seq.pointerValidMask.count
+        if seq.images.isEmpty {
+            if let vb = visionBackend, vb.isLoaded { try vb.prepareForPrompt(hasImages: false) }
+            let slotTargets = entries.map { (slotIdx: $0.0, pos: $0.1.tokenPosition, endPos: $0.1.pointerEndPosition, isPtr: $0.1.isPointerSlot) }
+            return PreparedDecisionSeq(
+                tokens: seq.tokenIds, visualSpans: [], encodedImages: [],
+                topology: seq.topology, stateEndPos: seq.stateEndPosition, questionSpans: seq.questionSpans,
+                expandedStateLen: min(rawPtrLen, seq.tokenIds.count), origToExpandedPtr: [], origPtrLen: rawPtrLen,
+                slotTargets: slotTargets
+            )
+        }
+        guard loadVision, let vb = visionBackend, vb.isVisionEnabled else {
+            throw QWDecisionError.backendFailed("Vision tower is disabled (--no-load-vision) or unavailable for this model")
+        }
+        try vb.prepareForPrompt(hasImages: true)
+        let visCap = decisionConfig.visionMaxPixels ?? 1_638_400
+        let spec = QWMMSpec(visionConfig: vb.visionConfig, minPixels: 65_536, maxPixels: 16_777_216)
+        var encodedImages: [(grid: QWVisionGrid, features: [Float])] = []
+        encodedImages.reserveCapacity(seq.images.count)
+        for imgData in seq.images {
+            if let cached = cache[imgData] {
+                encodedImages.append(cached)
+            } else {
+                let encoded = try await Self.encodeImage(imgData, capPixelsBudget: visCap, spec: spec, backend: vb)
+                cache[imgData] = encoded
+                encodedImages.append(encoded)
+            }
+        }
+        return try Self.expandMultimodalSequence(
+            seq: seq, entries: entries, encodedImages: encodedImages, spec: spec, hidden: descriptor.hidden, rawPtrLen: rawPtrLen
+        )
+    }
+
+    private static func expandMultimodalSequence(
+        seq: QWDecisionSequenceInput,
+        entries: [(Int, QWDecisionSlotTarget)],
+        encodedImages: [(grid: QWVisionGrid, features: [Float])],
+        spec: QWMMSpec,
+        hidden: Int,
+        rawPtrLen: Int
+    ) throws -> PreparedDecisionSeq {
+        let placeholders = seq.tokenIds.indices.filter { seq.tokenIds[$0] == spec.imageToken }
+        guard placeholders.count == encodedImages.count else {
+            throw QWDecisionError.invalidQuestion("expected \(encodedImages.count) image placeholders, found \(placeholders.count)")
+        }
+        let phSet = Dictionary(uniqueKeysWithValues: placeholders.enumerated().map { ($1, $0) })
+        var expandedTokens: [Int] = []
+        var visualSpans: [QWVisualSpan] = []
+        var origToExp = [Int?](repeating: nil, count: seq.tokenIds.count + 1)
+
+        for i in 0..<seq.tokenIds.count {
+            origToExp[i] = expandedTokens.count
+            if let imgIdx = phSet[i] {
+                let startTok = expandedTokens.count
+                let g = encodedImages[imgIdx].grid
+                let nTok = g.tokens
+                for _ in 0..<nTok { expandedTokens.append(spec.imageToken) }
+                visualSpans.append(QWVisualSpan(
+                    tokenOffset: startTok, tokenCount: nTok, embeddings: encodedImages[imgIdx].features,
+                    gridT: g.t, gridH: g.h, gridW: g.w, spatialMergeSize: spec.merge
+                ))
+            } else {
+                expandedTokens.append(seq.tokenIds[i])
+            }
+        }
+        origToExp[seq.tokenIds.count] = expandedTokens.count
+        _ = hidden
+
+        func mapBoundary(_ origPos: Int) -> Int {
+            let clamped = max(0, min(seq.tokenIds.count, origPos))
+            return origToExp[clamped] ?? expandedTokens.count
+        }
+        let shiftedStateEnd = mapBoundary(seq.stateEndPosition)
+        let shiftedQSpans = seq.questionSpans.map { mapBoundary($0.lowerBound)..<mapBoundary($0.upperBound) }
+        let shiftedSlots = entries.map { (idx, target) -> (Int, Int, Int?, Bool) in
+            let p = mapBoundary(target.tokenPosition)
+            let pe = target.pointerEndPosition.map { mapBoundary($0) }
+            return (idx, p, pe, target.isPointerSlot)
+        }
+        let clampedPtrLen = min(rawPtrLen, seq.tokenIds.count)
+        let expPtrLen = mapBoundary(clampedPtrLen)
+        let ptrMap: [Int?] = (0..<clampedPtrLen).map { origIdx in
+            if !seq.pointerValidMask.isEmpty && !seq.pointerValidMask[origIdx] { return nil }
+            return origToExp[origIdx]
+        }
+        return PreparedDecisionSeq(
+            tokens: expandedTokens, visualSpans: visualSpans, encodedImages: encodedImages,
+            topology: seq.topology, stateEndPos: shiftedStateEnd, questionSpans: shiftedQSpans,
+            expandedStateLen: expPtrLen, origToExpandedPtr: ptrMap, origPtrLen: clampedPtrLen,
+            slotTargets: shiftedSlots
+        )
+    }
+
+    private static func encodeImage(
+        _ data: Data, capPixelsBudget: Int, spec: QWMMSpec, backend: any QWVisionBackend
+    ) async throws -> (grid: QWVisionGrid, features: [Float]) {
+        guard !data.isEmpty, data.count <= maxImageSourceBytes else {
+            throw QWDecisionError.invalidQuestion("Invalid or oversized image buffer (\(data.count) bytes)")
+        }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue, w > 0, h > 0 else {
+            throw QWDecisionError.invalidQuestion("Failed to inspect image header")
+        }
+        let rawOrient = (props[kCGImagePropertyOrientation] as? NSNumber)?.uint32Value ?? 1
+        let orient: UInt32 = (1...8).contains(rawOrient) ? rawOrient : 1
+        let orientW = (5...8).contains(orient) ? h : w
+        let orientH = (5...8).contains(orient) ? w : h
+        let (area, ov) = Int64(orientW).multipliedReportingOverflow(by: Int64(orientH))
+        guard orientW <= maxImageDimension, orientH <= maxImageDimension, !ov, area <= maxImageArea else {
+            throw QWDecisionError.invalidQuestion("Image dimensions \(orientW)x\(orientH) exceed bounds")
+        }
+        // Apply d1 `cap_pixels` before `smartResize(..., maxPixels: 16_777_216)` matching HF processor.
+        var capW = orientW
+        var capH = orientH
+        if Double(orientW) * Double(orientH) > Double(capPixelsBudget) {
+            let scale = (Double(capPixelsBudget) / (Double(orientW) * Double(orientH))).squareRoot()
+            capW = max(1, Int(Double(orientW) * scale))
+            capH = max(1, Int(Double(orientH) * scale))
+        }
+        let resized = try QWMMConfig.smartResize(height: capH, width: capW, maxPixels: spec.maxPixels, spec: spec)
+        let grid = try QWVisionGrid(t: 1, h: resized.h / spec.patch, w: resized.w / spec.patch, spec: spec)
+        guard let full = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw QWDecisionError.invalidQuestion("Failed to decode CGImage")
+        }
+        let rgb = try renderRGB888(cgImage: full, width: resized.w, height: resized.h, orientation: orient)
+        let patches = try qwBuildPatchSlab(imageRGB: rgb, height: resized.h, width: resized.w, grid: grid)
+        let features = try await backend.encode(
+            patches: patches, grid: grid.plan, bins: grid.interpBins, posIds: grid.ropePositions
+        )
+        return (grid, features)
+    }
+
+    private static func renderRGB888(cgImage: CGImage, width: Int, height: Int, orientation: UInt32) throws -> [UInt8] {
+        guard let cs = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw QWDecisionError.backendFailed("Failed to create sRGB colorspace")
+        }
+        var rgba = [UInt8](repeating: 255, count: width * height * 4)
+        let info = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        let drew = rgba.withUnsafeMutableBytes { (ptr: UnsafeMutableRawBufferPointer) -> Bool in
+            guard let ctx = CGContext(
+                data: ptr.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                bytesPerRow: width * 4, space: cs, bitmapInfo: info
+            ) else { return false }
+            ctx.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            let swaps = (5...8).contains(orientation)
+            let w = CGFloat(width), h = CGFloat(height)
+            let tx: CGAffineTransform = switch orientation {
+            case 2: CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w, ty: 0)
+            case 3: CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: w, ty: h)
+            case 4: CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: h)
+            case 5: CGAffineTransform(a: 0, b: -1, c: -1, d: 0, tx: w, ty: h)
+            case 6: CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: h)
+            case 7: CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0)
+            case 8: CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: w, ty: 0)
+            default: .identity
+            }
+            ctx.concatenate(tx)
+            ctx.interpolationQuality = .high
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: swaps ? height : width, height: swaps ? width : height))
+            return true
+        }
+        guard drew else { throw QWDecisionError.backendFailed("CGContext render failed") }
+        var rgb = [UInt8](repeating: 0, count: width * height * 3)
+        for i in 0..<(width * height) {
+            rgb[i * 3 + 0] = rgba[i * 4 + 0]
+            rgb[i * 3 + 1] = rgba[i * 4 + 1]
+            rgb[i * 3 + 2] = rgba[i * 4 + 2]
+        }
+        return rgb
+    }
+}

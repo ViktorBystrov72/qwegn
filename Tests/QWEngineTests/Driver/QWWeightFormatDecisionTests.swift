@@ -3,6 +3,7 @@
 import XCTest
 @testable import QWEngine
 @testable import QWCore
+import QWQuant
 
 final class QWWeightFormatDecisionTests: XCTestCase {
 
@@ -182,6 +183,54 @@ final class QWWeightFormatDecisionTests: XCTestCase {
         XCTAssertTrue(try reason(quantization, dense)!.contains("QW_WEIGHT_FORMAT"))
         unsetenv("QW_WEIGHT_FORMAT")
         XCTAssertTrue(try reason(quantization, dense, pack: true)!.contains("pack"))
+    }
+
+    func testQWP1MixedHeadFormatNeverPollutesDenseSpec() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("qwg-format-mixed-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+
+        let hdrJSON = """
+        {
+          "provenance": {"source": "unit-test"},
+          "tensors": {
+            "lm_head.weight": {"shape": [64, 64], "hq4_off": 64, "hq": {"bits": 8, "group": 32}},
+            "model.layers.0.mlp.gate_proj.weight": {"shape": [64, 64], "hq4_off": 4096},
+            "model.layers.1.mlp.experts.0.gate_proj.weight": {"shape": [64, 64], "hq4_off": 8192, "hq": {"bits": 15, "group": 64, "vq": "shvq1"}},
+            "model.layers.1.mlp.experts.0.down_proj.weight": {"shape": [64, 64], "hq4_off": 12288, "hq": {"bits": 3, "group": 64, "vq": "shvq1"}}
+          }
+        }
+        """
+        let hdrBytes = Data(hdrJSON.utf8)
+        var data = Data("QWP1".utf8)
+        let len = UInt64(hdrBytes.count)
+        for shift in stride(from: 0, to: 64, by: 8) {
+            data.append(UInt8(truncatingIfNeeded: len >> shift))
+        }
+        data.append(Data(count: 64))
+        data.append(hdrBytes)
+        try data.write(to: dir.appendingPathComponent("model.qwp"))
+
+        let geometry = try QWModelGeometry.stubPureMoE()
+        let pack = try QWQuant.Pack(url: dir, descriptor: geometry.descriptor, skipIdentityCheck: true)
+        let root = QWModelRoot(url: dir)
+        for _ in 0..<8 {
+            let choice = try QWEngineDriver.weightFormatChoice(
+                for: root, quantization: nil, geometry: geometry, mtpDrafts: 0, pack: pack)
+            let expected = QWWeightFormat.hqBlock(
+                bits: 4, groupSize: 32,
+                expertBits: 15, expertGroupSize: 64,
+                denseIncumbent: true, expertIncumbent: false,
+                expertDownBits: 3, expertDownGroupSize: 64,
+                expertDownIncumbent: false,
+                denseSHVQ: false, expertSHVQ: true, expertDownSHVQ: true)
+            XCTAssertEqual(choice.format, expected)
+            let headSpec = QWEngineDriver.resolveHeadSpec(
+                st: nil, pack: pack, trunkFormat: choice.format, geometry: geometry)
+            XCTAssertTrue(headSpec.isQ4g)
+            XCTAssertEqual(headSpec.format, .hqBlock(bits: 8, groupSize: 32, denseIncumbent: false, denseSHVQ: false))
+        }
     }
 }
 

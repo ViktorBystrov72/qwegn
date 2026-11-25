@@ -37,10 +37,12 @@ extension QWMoEOperator {
               let xLatent32 = s.xLatent32, let zLatent32 = s.zLatent32 else {
             throw QWGemmError.badShape("group-latent moe requires latentD, latentU, latentLabels, and latent scratch")
         }
+        let useFusedMoE = Self.canFuseMoEGateUpNaxSwiglu(weights: w, intermediate: I)
         let isGroupedNax = T > 8 && supportsGroupedNaxPrefill && hal.caps.isMetal4TensorCapable
             && s.expOff != nil && s.sortedPair != nil && s.sortedTok != nil
             && s.invPerm != nil && s.tileE != nil && s.tileR != nil
-            && s.tileCount != nil && s.gu16 != nil && s.dnHi != nil && s.naxX16 != nil
+            && s.tileCount != nil && (useFusedMoE || s.gu16 != nil)
+            && s.dnHi != nil && s.naxX16 != nil
             && s.xLatent16 != nil && L % 64 == 0 && (NG * L) % 64 == 0 && H % 64 == 0
         let skipRot32 = isGroupedNax && (
             ISh == 0 || (T >= 64 && H % 64 == 0 && (2 * ISh) % 64 == 0)
@@ -53,11 +55,10 @@ extension QWMoEOperator {
         let needsCastXe16: Bool
         switch input {
         case .f16Normed(let x16):
-            try QWGemm.encodeMoEBridgeF16ToF32(enc, hal: hal, x: x16,
-                                               xRot32: s.xRot32, xPlain32: s.xPlain32,
-                                               rows: T, hidden: H, skipRot32: skipRot32)
-            xPlain = s.xPlain32
-            xRot = s.xRot32
+            (xPlain, xRot) = try Self.resolveF16NormedBridgeInputs(
+                enc, hal: hal, x16: x16, scratch: s, router: w.router,
+                rows: T, hidden: H, routerCols: routerCols,
+                isGroupedNax: isGroupedNax, skipRot32: skipRot32)
             xe16ForNax = x16
             shPrecast16 = T >= 64 ? x16 : nil
             needsCastXe16 = false
@@ -73,7 +74,7 @@ extension QWMoEOperator {
            let expOff = s.expOff, let sortedPair = s.sortedPair,
            let sortedTok = s.sortedTok, let invPerm = s.invPerm,
            let tileE = s.tileE, let tileR = s.tileR, let tileCount = s.tileCount,
-           let gu16 = s.gu16, let dnHi = s.dnHi,
+           let dnHi = s.dnHi,
            let naxX16 = s.naxX16, let xLatent16 = s.xLatent16, let xe16 = xe16ForNax {
             if needsCastXe16 {
                 try QWGemm.encodeCast(enc, hal: hal, x32: xRot, y16: naxX16, count: T * H)
@@ -85,16 +86,22 @@ extension QWMoEOperator {
             let shAct16 = canAliasShAct16
                 ? naxX16.slice(byteOffset: T * H * 2, count: T * ISh, dtype: .f16)
                 : nil
+            let useFusedSh = Self.canFuseSharedSwiGLUNax(weights: w, shPrecast16: shPrecast16, shAct16: shAct16)
             let dnAcc16 = s.dnAcc.slice(byteOffset: 0, count: T * max(K, NG) * H, dtype: .f16)
             try QWGemm.encodeFnRouterGemm(enc, hal: hal, weight: w.router, x: xPlain, y: s.logits,
                                           rows: T, n: routerCols, k: H,
                                           shGateWeight: ISh > 0 ? w.sharedGateScalar : nil,
                                           shGateOut: ISh > 0 ? s.gate : nil)
-            if concurrentBarriers, let shGU = w.sharedGateUp, let guSh = s.guSh32, ISh > 0 {
-                let naxY = s.naxY16 ?? naxX16
-                try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shGU, x: xRot, y: guSh,
-                                              naxX16: naxX16, naxY16: naxY, maxTileWidth: s.maxTileWidth,
-                                              rows: T, x16Precast: shPrecast16)
+            if concurrentBarriers, let shGU = w.sharedGateUp, ISh > 0 {
+                if useFusedSh, let x16Sh = shPrecast16, let out16Sh = shAct16 {
+                    try QWGemm.encodeDenseSwiGLUNax(enc, hal: hal, weight: shGU, x16: x16Sh, out16: out16Sh,
+                                                    rows: T, intermediate: ISh)
+                } else if let guSh = s.guSh32 {
+                    let naxY = s.naxY16 ?? naxX16
+                    try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shGU, x: xRot, y: guSh,
+                                                  naxX16: naxX16, naxY16: naxY, maxTileWidth: s.maxTileWidth,
+                                                  rows: T, x16Precast: shPrecast16)
+                }
             }
             barrier()
             try QWGemm.encodeFnMoeRoute(enc, hal: hal, logits: s.logits, idx: s.idx, wts: s.wts,
@@ -103,21 +110,28 @@ extension QWMoEOperator {
                                         latentLabels: latentLabels, groupIds: groupIds, numGroups: NG,
                                         useSigmoid: w.useSigmoidScore, nGroup: w.nGroup,
                                         topkGroup: w.topkGroup, groupTopM: w.groupTopM)
-            if !concurrentBarriers, let shGU = w.sharedGateUp, let shDown = w.sharedDown,
-               let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
-                let shScratch0 = naxX16.slice(byteOffset: 0, count: T * H, dtype: .f16)
-                try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shGU, x: xRot, y: guSh,
-                                              naxX16: shScratch0, naxY16: shScratch0, maxTileWidth: H,
-                                              rows: T, x16Precast: shPrecast16)
-                try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
-                                            intermediate: ISh, act16: shAct16,
-                                            swigluClamp: w.sharedSwigluClamp)
-                let shScratch = shAct16 ?? shScratch0
-                try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shDown, x: actSh, y: s.shared,
-                                              naxX16: shScratch, naxY16: shScratch,
-                                              maxTileWidth: shAct16 != nil ? s.maxTileWidth : 0,
-                                              rows: T, x16Precast: shAct16)
-            } else if concurrentBarriers, let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
+            if !concurrentBarriers, let shGU = w.sharedGateUp, let shDown = w.sharedDown, ISh > 0 {
+                if useFusedSh, let x16Sh = shPrecast16, let out16Sh = shAct16 {
+                    try QWGemm.encodeDenseSwiGLUNax(enc, hal: hal, weight: shGU, x16: x16Sh, out16: out16Sh,
+                                                    rows: T, intermediate: ISh)
+                    try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shDown, x: s.actSh32 ?? s.shared,
+                                                  y: s.shared, naxX16: out16Sh, naxY16: out16Sh,
+                                                  maxTileWidth: s.maxTileWidth, rows: T, x16Precast: out16Sh)
+                } else if let guSh = s.guSh32, let actSh = s.actSh32 {
+                    let shScratch0 = naxX16.slice(byteOffset: 0, count: T * H, dtype: .f16)
+                    try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shGU, x: xRot, y: guSh,
+                                                  naxX16: shScratch0, naxY16: shScratch0, maxTileWidth: H,
+                                                  rows: T, x16Precast: shPrecast16)
+                    try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
+                                                intermediate: ISh, act16: shAct16,
+                                                swigluClamp: w.sharedSwigluClamp)
+                    let shScratch = shAct16 ?? shScratch0
+                    try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shDown, x: actSh, y: s.shared,
+                                                  naxX16: shScratch, naxY16: shScratch,
+                                                  maxTileWidth: shAct16 != nil ? s.maxTileWidth : 0,
+                                                  rows: T, x16Precast: shAct16)
+                }
+            } else if concurrentBarriers, !useFusedSh, let guSh = s.guSh32, let actSh = s.actSh32, ISh > 0 {
                 try QWGemm.encodeSiluMulF32(enc, hal: hal, gu: guSh, act: actSh, rows: T,
                                             intermediate: ISh, act16: shAct16,
                                             swigluClamp: w.sharedSwigluClamp)
@@ -133,7 +147,8 @@ extension QWMoEOperator {
                                               invPerm: invPerm, tileE: tileE, tileR: tileR,
                                               tileCount: tileCount, tilePlan: stage1Plan,
                                               directSlotTok: false)
-            if concurrentBarriers, let shDown = w.sharedDown, let actSh = s.actSh32, ISh > 0 {
+            if concurrentBarriers, let shDown = w.sharedDown, ISh > 0,
+               let actSh = useFusedSh ? (s.actSh32 ?? s.shared) : s.actSh32 {
                 let naxY = s.naxY16 ?? naxX16
                 try QWGemm.encodeDenseProjF32(enc, hal: hal, weight: shDown, x: actSh, y: s.shared,
                                               naxX16: naxX16, naxY16: naxY,
@@ -159,14 +174,11 @@ extension QWMoEOperator {
                                               invPerm: invPerm, tileE: tileE, tileR: tileR,
                                               tileCount: tileCount, tilePlan: tilePlan)
             try rotateEncoder(&enc)
-            try QWGemm.encodeMoEGateUpNax(enc, hal: hal, xe: xLatent16, bank: w.gateUp, expertOff: expOff,
-                                          tileE: tileE, tileR: tileR, tileCount: tileCount,
-                                          gu16: gu16, rowsPerExpert: 2 * I, tilePlan: tilePlan,
-                                          sortedTok: sortedTok, coldBank: w.coldGateUp)
-            barrier()
-            try QWGemm.encodeSiluMulSplitF16(enc, hal: hal, gu: gu16, outHi: dnHi, outLo: dnHi,
-                                             rows: T * K, intermediate: I,
-                                             swigluClamp: w.routedSwigluClamp)
+            try Self.encodeRoutedNaxGateUpAndAct(
+                enc, hal: hal, weights: w, xe: xLatent16, expOff: expOff,
+                tileE: tileE, tileR: tileR, tileCount: tileCount,
+                gu16: s.gu16, dnHi: dnHi, intermediate: I, pairs: T * K,
+                tilePlan: tilePlan, sortedTok: sortedTok, barrier: barrier)
             barrier()
             try QWGemm.encodeMoENaxSplitF32(enc, hal: hal, xHi: dnHi, xLo: dnHi, bank: w.down,
                                             expertOff: expOff, tileE: tileE, tileR: tileR,

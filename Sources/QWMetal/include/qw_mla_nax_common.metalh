@@ -245,14 +245,82 @@ METAL_FUNC void qwg_mla_nax_attend(
     }
 }
 
+template <uint KV_MODE>
+METAL_FUNC void qw_mla_dsa_nax_load_slot(
+    device const half* pool, device const uchar* poolBytes, device const int* table,
+    device const half* kPeCache, uint ropeDim, uint nRopeFrags, uint halfRank,
+    uint poolCol, uint q4Group, uint sg_d, short sn, short f, short i,
+    bool validSlot, uint tokJ,
+    thread mla_hfrag* kfF, thread mla_hfrag* krfR0, thread mla_hfrag* krfR1
+) {
+    if (ropeDim > 0u) {
+        for (short r = 0; r < 2; r++) {
+            const uint col = uint(r) * 64u + sg_d * 16u + uint(sn);
+            if (uint(r) < nRopeFrags && col < ropeDim) {
+                const half4 rv = validSlot
+                    ? *(device const half4*)(kPeCache + (size_t)tokJ * ropeDim + col)
+                    : half4(0.0h);
+                thread mla_hfrag& dst = (r == 0) ? krfR0[f] : krfR1[f];
+                STEEL_PRAGMA_UNROLL
+                for (short j = 0; j < 4; j++) dst[i * 4 + j] = rv[j];
+            }
+        }
+    }
+    if constexpr (KV_MODE == 0u) {
+        device const half* src = nullptr;
+        if (validSlot) {
+            const uint pg = uint(table[tokJ >> 8u]);
+            src = pool + ((size_t)pg * 256u + (tokJ & 255u)) * halfRank + poolCol;
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short d = 0; d < 8; d++) {
+            const half4 v = src ? *(device const half4*)(src + d * 16) : half4(0.0h);
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < 4; j++) kfF[d][i * 4 + j] = v[j];
+        }
+    } else if constexpr (KV_MODE == 1u) {
+        device const char* qRow = nullptr;
+        half rowSc = 0.0h;
+        if (validSlot) {
+            const uint pg = uint(table[tokJ >> 8u]);
+            const uint pageOff = tokJ & 255u;
+            device const uchar* pageBase = poolBytes + (size_t)pg * 66048ul;
+            rowSc = *((device const half*)(pageBase + 65536ul + (size_t)pageOff * 2ul));
+            qRow = (device const char*)(pageBase + (size_t)pageOff * 256ul + poolCol);
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short d = 0; d < 8; d++) {
+            const half4 v = qRow ? (half4(*(device const char4*)(qRow + d * 16)) * rowSc) : half4(0.0h);
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < 4; j++) kfF[d][i * 4 + j] = v[j];
+        }
+    } else {
+        device const uchar* qRow = nullptr;
+        half2 smQ4 = half2(0.0h);
+        if (validSlot) {
+            const uint pg = uint(table[tokJ >> 8u]);
+            const uint pageOff = tokJ & 255u;
+            device const uchar* pageBase = poolBytes + (size_t)pg * 34816ul;
+            smQ4 = *((device const half2*)(pageBase + 32768ul) + (size_t)pageOff * 2ul + q4Group);
+            qRow = pageBase + (size_t)pageOff * 128ul + (poolCol >> 1u);
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short d = 0; d < 8; d++) {
+            const half4 v = qRow ? qwg_mla_nax_dequant_q4(qRow, d, smQ4) : half4(0.0h);
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < 4; j++) kfF[d][i * 4 + j] = v[j];
+        }
+    }
+}
+
 template <bool SPLIT, uint KV_MODE, uint NG>
 METAL_FUNC void qw_mla_dsa_nax_attend(
     device const half* qAbs, device const half* kPool, device const half* vPool,
     device const int* kTable, device const int* vTable, device const int* blockList,
     device half* uLatOut, device float2* partML, constant MLADSASparseAttnParams& p,
     device const half* mlaQFull, device const half* kPeCache, device const float* attnSink,
-    uint t, uint h0, uint z, uint nSplit, uint tid, uint sg_h, uint sg_d, uint lane,
-    threadgroup float* sPart, threadgroup uint* blkIdx
+    uint t, uint h0, uint z, uint nSplit, uint sg_h, uint sg_d, uint lane,
+    threadgroup float* sPart
 ) {
     const uint halfRank = MLA_NAX_RANK / 2u;
     const uint seqLen = p.pos0 + t + 1u;
@@ -261,6 +329,7 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
         ? ((p.windowTokens > 0u && seqLen > p.windowTokens) ? (seqLen - p.windowTokens) : 0u)
         : 0u;
     const uint denseLim = p.topK + p.windowTokens;
+    const bool isDensePrefix = !isDenseStream && (seqLen <= denseLim);
     const uint slots = isDenseStream ? (seqLen - startTok) : min(min(seqLen, denseLim), 2560u);
     const float scale2 = rsqrt(float(p.headDim)) * 1.4426950408889634f;
     uint sBegin = 0u, sEnd = slots;
@@ -270,16 +339,9 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
         sEnd = min(slots, sBegin + chunk);
     }
 
-    const uint nThreads = NG * 128u;
-    if (!isDenseStream) {
-        if (seqLen <= denseLim) {
-            for (uint i = tid; i < slots; i += nThreads) blkIdx[i] = i;
-        } else {
-            device const int* rowList = blockList + (size_t)t * p.listStride;
-            for (uint i = tid; i < slots; i += nThreads) blkIdx[i] = min(uint(max(rowList[i], 0)), seqLen - 1u);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    device const int* rowList = (!isDenseStream && !isDensePrefix)
+        ? (blockList + (size_t)t * p.listStride)
+        : nullptr;
 
     const short2 sc = BaseNAXFrag::get_coord();
     const short sm = sc.y, sn = sc.x;
@@ -335,7 +397,6 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
         }
     }
 
-    uint buf = 0u;
     for (uint s0 = sBegin; s0 < sEnd; s0 += MLA_NAX_BK) {
         mla_hfrag kf[2][8];
         mla_hfrag krf[2][2] = {{mla_hfrag(0.0h), mla_hfrag(0.0h)}, {mla_hfrag(0.0h), mla_hfrag(0.0h)}};
@@ -345,65 +406,14 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
             for (short i = 0; i < 2; i++) {
                 const uint slot = s0 + uint(f * 16 + sm + i * 8);
                 const bool validSlot = (slot < sEnd);
-                const uint tokJ = validSlot ? (isDenseStream ? (startTok + slot) : blkIdx[slot]) : 0u;
-                if (p.ropeDim > 0u) {
-                    STEEL_PRAGMA_UNROLL
-                    for (short r = 0; r < 2; r++) {
-                        const uint col = uint(r) * 64u + sg_d * 16u + uint(sn);
-                        if (uint(r) < nRopeFrags && col < p.ropeDim) {
-                            const half4 rv = validSlot
-                                ? *(device const half4*)(kPeCache + (size_t)tokJ * p.ropeDim + col)
-                                : half4(0.0h);
-                            STEEL_PRAGMA_UNROLL
-                            for (short j = 0; j < 4; j++) krf[r][f][i * 4 + j] = rv[j];
-                        }
-                    }
-                }
-                if constexpr (KV_MODE == 0u) {
-                    device const half* src = nullptr;
-                    if (validSlot) {
-                        const uint pg = uint(table[tokJ >> 8u]);
-                        src = pool + ((size_t)pg * 256u + (tokJ & 255u)) * halfRank + poolCol;
-                    }
-                    STEEL_PRAGMA_UNROLL
-                    for (short d = 0; d < 8; d++) {
-                        const half4 v = src ? *(device const half4*)(src + d * 16) : half4(0.0h);
-                        STEEL_PRAGMA_UNROLL
-                        for (short j = 0; j < 4; j++) kf[f][d][i * 4 + j] = v[j];
-                    }
-                } else if constexpr (KV_MODE == 1u) {
-                    device const char* qRow = nullptr;
-                    half rowSc = 0.0h;
-                    if (validSlot) {
-                        const uint pg = uint(table[tokJ >> 8u]);
-                        const uint pageOff = tokJ & 255u;
-                        device const uchar* pageBase = poolBytes + (size_t)pg * 66048ul;
-                        rowSc = *((device const half*)(pageBase + 65536ul + (size_t)pageOff * 2ul));
-                        qRow = (device const char*)(pageBase + (size_t)pageOff * 256ul + poolCol);
-                    }
-                    STEEL_PRAGMA_UNROLL
-                    for (short d = 0; d < 8; d++) {
-                        const half4 v = qRow ? (half4(*(device const char4*)(qRow + d * 16)) * rowSc) : half4(0.0h);
-                        STEEL_PRAGMA_UNROLL
-                        for (short j = 0; j < 4; j++) kf[f][d][i * 4 + j] = v[j];
-                    }
-                } else {
-                    device const uchar* qRow = nullptr;
-                    half2 smQ4 = half2(0.0h);
-                    if (validSlot) {
-                        const uint pg = uint(table[tokJ >> 8u]);
-                        const uint pageOff = tokJ & 255u;
-                        device const uchar* pageBase = poolBytes + (size_t)pg * 34816ul;
-                        smQ4 = *((device const half2*)(pageBase + 32768ul) + (size_t)pageOff * 2ul + q4Group);
-                        qRow = pageBase + (size_t)pageOff * 128ul + (poolCol >> 1u);
-                    }
-                    STEEL_PRAGMA_UNROLL
-                    for (short d = 0; d < 8; d++) {
-                        const half4 v = qRow ? qwg_mla_nax_dequant_q4(qRow, d, smQ4) : half4(0.0h);
-                        STEEL_PRAGMA_UNROLL
-                        for (short j = 0; j < 4; j++) kf[f][d][i * 4 + j] = v[j];
-                    }
-                }
+                const uint tokJ = validSlot
+                    ? (isDenseStream ? (startTok + slot)
+                                     : (isDensePrefix ? slot : min(uint(max(rowList[slot], 0)), seqLen - 1u)))
+                    : 0u;
+                qw_mla_dsa_nax_load_slot<KV_MODE>(
+                    pool, poolBytes, table, kPeCache, p.ropeDim, nRopeFrags, halfRank,
+                    poolCol, q4Group, sg_d, sn, f, i, validSlot, tokJ,
+                    kf[f], krf[0], krf[1]);
             }
         }
 
@@ -419,12 +429,8 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
                                  krf[r][0], krf[r][1], metal::true_type{});
             }
         }
-        if constexpr (NG == 2u) {
-            if (s0 > sBegin) threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        threadgroup float* part = (NG == 1u)
-            ? (sPart + buf * (4u * 16u * 32u))
-            : (sPart + sg_h * (4u * 16u * 32u));
+        if (s0 > sBegin) threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* part = sPart + sg_h * (4u * 16u * 32u);
         STEEL_PRAGMA_UNROLL
         for (short e = 0; e < 16; e++) part[(sg_d * 16u + uint(e)) * 32u + lane] = s[e >> 3][e & 7];
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -436,7 +442,6 @@ METAL_FUNC void qw_mla_dsa_nax_attend(
             v += part[(48u + uint(e)) * 32u + lane];
             s[e >> 3][e & 7] = v;
         }
-        if constexpr (NG == 1u) buf ^= 1u;
 
         float mnew[2] = {mrow[0], mrow[1]};
         STEEL_PRAGMA_UNROLL

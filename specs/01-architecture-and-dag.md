@@ -5,12 +5,13 @@
 ## 1. Design Law
 Dependencies flow strictly **upward** along numeric layers (`LAYERS[dep] < LAYERS[target]` in `Scripts/lint_package_dag.py`). No target may depend on a sibling at the same layer or on any target in a higher layer. `QWState` is banned as a production target (the C20 reference harness resides solely in `Tests/QWStateTests/`).
 
-## 2. Target Hierarchy (`28` Classified Targets)
+## 2. Target Hierarchy (`29` Classified Targets)
 
 | Layer | Targets | Role & Boundary |
 | :--- | :--- | :--- |
-| **L0.0** | `QWCore`, `QWMetalCounterSupport` | Model descriptor (`QWModelDescriptor`), geometry/capacity planning, checked POSIX I/O (`QWPOSIX`), workspace paths (`QWPaths`), `QWWeightView` / `QWSlotGeometry`, Objective-C Metal counter shim. |
-| **L1.0** | `QWHAL`, `QWQuant`, `QWToken` | Metal 4 HAL (`QWHal`, lock-free PSO snapshot, doors), quantization codecs (`HQ*`, `AQ*`, `SHVQ*`, `QNGRAM`), BPE/Chat tokenizer. |
+| **L0.0** | `QWCore`, `QWMetalCounterSupport` | Model descriptor (`QWModelDescriptor`, `QWDecisionModelConfig`), geometry/capacity planning, `QWGPUTurnArbitrator`, checked POSIX I/O (`QWPOSIX`), workspace paths (`QWPaths`), `QWWeightView` / `QWSlotGeometry`, Objective-C Metal counter shim. |
+| **L1.0** | `QWHAL`, `QWQuant`, `QWToken` | Metal 4 HAL (`QWHal`, lock-free PSO snapshot, doors), quantization codecs (`HQ*`, `AQ*`, `SHVQ*`, `QNGRAM`), BPE/Chat tokenizer + bijective character/UTF-8 offsets. |
+| **L1.5** | `QWDecision` | Deep pure-host decision subsystem (zero Metal deps): sequence framing (`turnVerbalizer`, `optionMarkers`, `sequencePair` + cross-encoder fan-out), multi-source calibration + PAV isotonic/NLL fitter, pointer/grid/4D-Halton box decoders, `QWDecisionExecutionBackend` seam (`specs/07`). |
 | **L2.0** | `QWAlloc` | Buffer/arena allocator (`QWArena`), `QWWeightView` (`L0` contract) over GPU storage. |
 | **L2.5** | `QWLoad`, `QWRope` | Memory-mapped weight/slab loader (`PlaneIO`, `PlaneLayout`, `QWCheckpointTensorLoader` — no `QWGEMM` dependency), RoPE kernels. |
 | **L3.0** | `QWGEMM`, `QWKV` | Matrix multiply / dequant GEMM & GEMV dispatch (`QWDeviceEmbedTable.gather`), KV cache arenas. |
@@ -28,6 +29,7 @@ Dependencies flow strictly **upward** along numeric layers (`LAYERS[dep] < LAYER
 - **Layer-capped test targets (`TEST_MAX_LAYER`):**
   - `QWCoreTests` `<= L0.0`
   - `QWTokenTests` `<= L1.0`
+  - `QWDecisionTests` `<= L1.5`
   - `QWLoadTests` `<= L2.5`
   - `QWEngineTests` `<= L7.0`
 - **Compiler safety:** Every Swift target sets `.swiftLanguageMode(.v6)` and `-warnings-as-errors` in `Package.swift`.

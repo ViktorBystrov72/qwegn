@@ -119,12 +119,13 @@ extension QWHttpServer {
             } else {
                 responsesStore.put(queuedEntry)
             }
+            let bgAllowInk2 = actor.isInkling2Template() && (!streamPolicy.isJsonResponseFormat || streamPolicy.shouldThink)
             let bgTask = Task { [weak self] in
                 guard let self else { return }
                 await self.runBackgroundResponse(
                     template: template, chatReq: chatReq, baseHistory: conversationMessages,
                     hasActiveTools: streamPolicy.hasActiveTools, allowReasoningTags: streamPolicy.allowReasoningTags,
-                    thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
+                    thinkingExplicitlyDisabled: thinkingExplicitlyDisabled, allowInk2Markers: bgAllowInk2
                 )
             }
             responsesStore.attachTask(id: respId, task: bgTask)
@@ -170,7 +171,8 @@ extension QWHttpServer {
         let (finalResource, nextHistory) = OpenAIResponsesMapper.finalizeResponse(
             template: template, req: req, chatReq: chatReq, result: result, baseHistory: conversationMessages,
             hasActiveTools: streamPolicy.hasActiveTools, allowReasoningTags: streamPolicy.allowReasoningTags,
-            thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
+            thinkingExplicitlyDisabled: thinkingExplicitlyDisabled,
+            allowInk2Markers: actor.isInkling2Template()
         )
         if shouldStore {
             responsesStore.put(QWResponsesStore.StoredResponse(resource: finalResource, historyMessages: nextHistory))
@@ -205,7 +207,8 @@ extension QWHttpServer {
         baseHistory: [ChatMessage],
         hasActiveTools: Bool,
         allowReasoningTags: Bool,
-        thinkingExplicitlyDisabled: Bool
+        thinkingExplicitlyDisabled: Bool,
+        allowInk2Markers: Bool
     ) async {
         do {
             let result = try await actor.handleChatCompletion(
@@ -215,7 +218,8 @@ extension QWHttpServer {
             let (finalResource, nextHistory) = OpenAIResponsesMapper.finalizeResponse(
                 template: template, req: template.req, chatReq: chatReq, result: result, baseHistory: baseHistory,
                 hasActiveTools: hasActiveTools, allowReasoningTags: allowReasoningTags,
-                thinkingExplicitlyDisabled: thinkingExplicitlyDisabled
+                thinkingExplicitlyDisabled: thinkingExplicitlyDisabled,
+                allowInk2Markers: allowInk2Markers
             )
             responsesStore.update(id: template.id, resource: finalResource, historyMessages: nextHistory)
         } catch {
@@ -245,7 +249,8 @@ extension QWHttpServer {
         let streamParser = QWChatStreamParser(
             startsInReasoning: streamPolicy.shouldThink,
             allowToolCalls: streamPolicy.allowToolCalls,
-            allowReasoningTags: streamPolicy.allowReasoningTags
+            allowReasoningTags: streamPolicy.allowReasoningTags,
+            allowInk2Markers: actor.isInkling2Template() && (!streamPolicy.isJsonResponseFormat || streamPolicy.shouldThink)
         )
         let session = makeSSESession(for: connection, format: .sse, extraHeaders: extraHeaders)
         let emitter = ResponsesSSECoordinator(session: session, template: template)
@@ -267,7 +272,8 @@ extension QWHttpServer {
                     )
                     streamParser.setStartsInReasoning(
                         readyPolicy.shouldThink,
-                        allowReasoningTags: readyPolicy.allowReasoningTags
+                        allowReasoningTags: readyPolicy.allowReasoningTags,
+                        allowInk2Markers: self.actor.isInkling2Template() && (!readyPolicy.isJsonResponseFormat || readyPolicy.shouldThink)
                     )
                     session.begin()
                     emitter.emitLifecycleEvent(type: "response.created", status: "in_progress")

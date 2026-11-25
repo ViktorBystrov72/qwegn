@@ -387,6 +387,7 @@ public final class QWJSONTokenTable: @unchecked Sendable {
 
     let bytes: [[UInt8]?]
     let vocabulary: Int
+    let hasNewlineTokens: Bool
     /// Every token that keeps a free string in its plain state, ascending.
     let plainStringTokens: [Int]
     let fullTrie: Trie
@@ -402,14 +403,17 @@ public final class QWJSONTokenTable: @unchecked Sendable {
         if table.count < vocabulary { table += [[UInt8]?](repeating: nil, count: vocabulary - table.count) }
         bytes = table
         self.vocabulary = vocabulary
+        var sawNewline = false
         var plain: [Int] = []
         var edge: [Int] = []
         var all: [Int] = []
         for (id, entry) in table.enumerated() {
             guard let b = entry, !b.isEmpty else { continue }
+            if !sawNewline && b.contains(0x0A) { sawNewline = true }
             all.append(id)
             if Self.isPlainStringToken(b) { plain.append(id) } else { edge.append(id) }
         }
+        hasNewlineTokens = sawNewline
         plainStringTokens = plain
         fullTrie = Self.buildTrie(all, bytes: table)
         stringEdgeTrie = Self.buildTrie(edge, bytes: table)
@@ -518,20 +522,24 @@ public final class QWJSONTokenTable: @unchecked Sendable {
 public final class QWStructuredOutputConstraint: QWTokenConstraint, @unchecked Sendable {
     enum Phase { case thinking, choosing, json, free }
 
-    private let table: QWJSONTokenTable
-    private let stopTokens: [Int]
-    private let endThinkToken: Int?
-    private let toolCallToken: Int?
-    private var phase: Phase
-    private(set) var state: QWJState
+    let table: QWJSONTokenTable
+    let stopTokens: [Int]
+    let stopTokenSet: Set<Int>
+    let endThinkToken: Int?
+    let toolCallToken: Int?
+    var phase: Phase
+    var state: QWJState
+    var style = QWJSONFormattingStyle()
     /// Within one plain string the mask cannot change; it is keyed by the open frame.
-    private var plainCache: (frame: QWJFrame?, isKey: Bool, allowed: [Int])?
+    var plainCache: (frame: QWJFrame?, isKey: Bool, allowed: [Int])?
 
     public init(grammar: QWJSONGrammar, table: QWJSONTokenTable, stopTokens: Set<Int>,
                 startsInThinking: Bool = false, endThinkToken: Int? = nil,
                 toolCallToken: Int? = nil) {
         self.table = table
-        self.stopTokens = stopTokens.filter { $0 >= 0 && $0 < table.vocabulary }.sorted()
+        let validStops = stopTokens.filter { $0 >= 0 && $0 < table.vocabulary }.sorted()
+        self.stopTokens = validStops
+        self.stopTokenSet = Set(validStops)
         self.endThinkToken = endThinkToken
         self.toolCallToken = toolCallToken
         self.state = QWJState(root: grammar.root)
@@ -542,10 +550,23 @@ public final class QWStructuredOutputConstraint: QWTokenConstraint, @unchecked S
         }
     }
 
+    init(cloning other: QWStructuredOutputConstraint) {
+        self.table = other.table
+        self.stopTokens = other.stopTokens
+        self.stopTokenSet = other.stopTokenSet
+        self.endThinkToken = other.endThinkToken
+        self.toolCallToken = other.toolCallToken
+        self.phase = other.phase
+        self.state = other.state
+        self.style = other.style
+        self.plainCache = other.plainCache
+    }
+
     /// Feeds text the model is continuing from (an assistant prefill).
     public func consumePrefix(_ text: String) throws {
         guard phase == .json || phase == .choosing else { return }
         for b in text.utf8 {
+            style.observe(byte: b, beforeState: state)
             guard state.step(b) else {
                 throw QWJSONSchemaError("the assistant prefill is not a valid prefix of the requested JSON")
             }
@@ -604,6 +625,7 @@ public final class QWStructuredOutputConstraint: QWTokenConstraint, @unchecked S
                 throw QWTokenConstraintError.rejectedToken(token)
             }
             for b in bytes {
+                style.observe(byte: b, beforeState: state)
                 guard state.step(b) else { throw QWTokenConstraintError.rejectedToken(token) }
             }
             if phase == .choosing && !isAtRootStart { phase = .json }

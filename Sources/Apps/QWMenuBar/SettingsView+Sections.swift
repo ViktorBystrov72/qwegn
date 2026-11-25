@@ -89,6 +89,7 @@ extension SettingsView {
 
                 formRow(label: "Reasoning Effort:", key: "reasoningEffort") {
                     Picker("", selection: $draftSettings.reasoningEffort) {
+                        Text("Auto (Decision Sidecar)").tag("auto")
                         Text("Low").tag("low")
                         Text("Medium").tag("medium")
                         Text("Extra High (Default)").tag("xhigh")

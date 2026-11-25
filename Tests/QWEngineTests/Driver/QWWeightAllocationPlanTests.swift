@@ -243,6 +243,51 @@ final class QWWeightAllocationPlanTests: XCTestCase {
         }
         XCTAssertNoThrow(try plan96.finish(requests: plan96.shapes.count, usedBytes: plan96.bytes))
     }
+
+    func testBF16MoERouterPlanSizesResidentRoutersAsBF16AndColdAsF32() throws {
+        let geoFull = try Self.glm53FlashGeometry(residentExperts: 288)
+        let fmt = QWWeightFormat.hqBlock(
+            bits: 4, groupSize: 32,
+            expertBits: 2, expertGroupSize: 128,
+            denseIncumbent: true, expertIncumbent: false
+        )
+        let f32Full = try QWWeightAllocationPlan(
+            geometry: geoFull, ropeRows: 8192, headQ4g: true, format: fmt, moeRouterIsBF16: false
+        )
+        let bf16Full = try QWWeightAllocationPlan(
+            geometry: geoFull, ropeRows: 8192, headQ4g: true, format: fmt, moeRouterIsBF16: true
+        )
+        let moeLayers = (0..<geoFull.numLayers).filter { geoFull.isMoELayer($0) }.count
+        let routerElems = geoFull.numExperts * geoFull.hidden
+        let expectedSaved = moeLayers * (((routerElems * 4 + 255) & ~255) - ((routerElems * 2 + 255) & ~255))
+        XCTAssertTrue(bf16Full.moeRouterIsBF16)
+        XCTAssertEqual(f32Full.bytes - bf16Full.bytes, expectedSaved)
+        XCTAssertEqual(bf16Full.shapes.filter { $0 == QWTensorShape([routerElems], .bf16) }.count, moeLayers)
+        for (index, shape) in bf16Full.shapes.enumerated() {
+            XCTAssertNoThrow(try bf16Full.check(shape, at: index))
+        }
+        XCTAssertNoThrow(try bf16Full.finish(requests: bf16Full.shapes.count, usedBytes: bf16Full.bytes))
+
+        let geoCold = try Self.glm53FlashGeometry(residentExperts: 216)
+        let bf16Cold = try QWWeightAllocationPlan(
+            geometry: geoCold, ropeRows: 8192, headQ4g: true, format: fmt, moeRouterIsBF16: true
+        )
+        XCTAssertEqual(bf16Cold.shapes.filter { $0 == QWTensorShape([routerElems], .bf16) }.count, 0)
+        XCTAssertEqual(bf16Cold.shapes.filter { $0 == QWTensorShape([routerElems], .f32) }.count, moeLayers)
+    }
+
+    func testMixedHeadFormatSizesHeadIndependentlyFromTrunk() throws {
+        let geo = try Self.geometry27B()
+        let q4Plan = try QWWeightAllocationPlan(geometry: geo, ropeRows: 8192, headQ4g: true, format: .hq4G32)
+        let hq8HeadFmt = QWWeightFormat.hqBlock(bits: 8, groupSize: 32, denseIncumbent: false, denseSHVQ: false)
+        let mixedPlan = try QWWeightAllocationPlan(geometry: geo, ropeRows: 8192, headQ4g: true,
+                                                   format: .hq4G32, headFormat: hq8HeadFmt)
+        let headGroups = geo.vocab * (geo.hidden / 32)
+        XCTAssertEqual(mixedPlan.shapes.first, QWTensorShape([headGroups * 18], .f16))
+        XCTAssertEqual(q4Plan.shapes.dropFirst(), mixedPlan.shapes.dropFirst())
+        let expectedHeadDelta = ((headGroups * 36 + 255) & ~255) - ((headGroups * 20 + 255) & ~255)
+        XCTAssertEqual(mixedPlan.bytes - q4Plan.bytes, expectedHeadDelta)
+    }
 }
 
 private extension QWModelGeometry {

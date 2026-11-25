@@ -37,7 +37,7 @@ public enum QWServerConfigurationResolver {
         cliMTPBackend: String? = nil, cliMTPRelaxedMargin: Double? = nil, cliMTPRelaxedMinProb: Double? = nil,
         cliMTPDraftStrategy: String? = nil, cliMTPQuadraticSeeding: Bool? = nil, cliMTPAdaptiveDepth: Bool? = nil,
         cliMTPEntropyThreshold: Double? = nil, cliDFlashDraftPack: String? = nil, cliDFlashBlockSize: Int? = nil,
-        cliDFlashTopK: Int? = nil, cliGDNPrefill: String? = nil, cliEvictScratch: String? = nil,
+        cliDFlashTopK: Int? = nil, cliDSparkConfidenceSchedule: Bool? = nil, cliGDNPrefill: String? = nil, cliEvictScratch: String? = nil,
         cliPrefillChunkSize: Int? = nil, cliMaxConcurrentSessions: Int? = nil, cliLSAMode: String? = nil,
         cliLSABudget: Int? = nil, cliLSAClusterBlock: Int? = nil, cliLSASidecarPath: String? = nil,
         cliLSACrossLoopReuse: Bool? = nil,
@@ -202,6 +202,7 @@ public enum QWServerConfigurationResolver {
                         case "mtpEntropyThreshold": effective.mtpEntropyThreshold = rawFileSettings.mtpEntropyThreshold
                         case "dflashDraftPackPath": effective.dflashDraftPackPath = rawFileSettings.dflashDraftPackPath
                         case "dflashSelectorTopK": effective.dflashSelectorTopK = rawFileSettings.dflashSelectorTopK
+                        case "dsparkConfidenceSchedule": effective.dsparkConfidenceSchedule = rawFileSettings.dsparkConfidenceSchedule
                         case "gdnPrefill": effective.gdnPrefill = rawFileSettings.gdnPrefill
                         case "evictPrefillScratch": effective.evictPrefillScratch = rawFileSettings.evictPrefillScratch
                         case "prefillChunkSize": effective.prefillChunkSize = rawFileSettings.prefillChunkSize
@@ -453,8 +454,10 @@ public enum QWServerConfigurationResolver {
         let extra = Self.resolveSpeculativeAndTuning(
             fileSettings: fileSettings, environment: environment, sources: &sources,
             resolvedPack: resolvedPack, resolvedMaxContext: resolvedMaxContext,
+            cliMTPDrafts: cliMTPDrafts,
             cliMTPBackend: cliMTPBackend, cliDFlashDraftPack: cliDFlashDraftPack,
             cliDFlashBlockSize: cliDFlashBlockSize, cliDFlashTopK: cliDFlashTopK,
+            cliDSparkConfidenceSchedule: cliDSparkConfidenceSchedule,
             cliGDNPrefill: cliGDNPrefill, cliEvictScratch: cliEvictScratch,
             cliPrefillChunkSize: cliPrefillChunkSize, cliMaxConcurrentSessions: cliMaxConcurrentSessions,
             cliLSAMode: cliLSAMode, cliLSABudget: cliLSABudget,
@@ -486,7 +489,9 @@ public enum QWServerConfigurationResolver {
             mtpRelaxedMargin: extra.mtpRelaxedMargin, mtpRelaxedMinProb: extra.mtpRelaxedMinProb, mtpDraftStrategy: extra.mtpDraftStrategy,
             mtpQuadraticSeeding: extra.mtpQuadraticSeeding, mtpAdaptiveDepth: extra.mtpAdaptiveDepth,
             mtpEntropyThreshold: extra.mtpEntropyThreshold, dflashDraftPackPath: extra.dflashDraftPackPath,
-            dflashSelectorTopK: extra.dflashSelectorTopK, gdnPrefill: extra.gdnPrefill,
+            dflashSelectorTopK: extra.dflashSelectorTopK,
+            dsparkConfidenceSchedule: extra.dsparkConfidenceSchedule,
+            gdnPrefill: extra.gdnPrefill,
             evictPrefillScratch: extra.evictPrefillScratch, prefillChunkSize: extra.prefillChunkSize,
             maxConcurrentSessions: extra.maxConcurrentSessions,
             lsaMode: extra.lsaMode, lsaBudget: extra.lsaBudget,

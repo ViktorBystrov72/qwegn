@@ -40,7 +40,6 @@ extension QWGemm {
         public let dnColTiles: Int
         public let guSlices: Int
         public let dnSlices: Int
-
         public var scratchInts: Int { 4 + (guSlices + dnSlices) * 3 }
         public var downIndirectByteOffset: Int { 16 + guSlices * 12 }
         var packedWriteWord: Int {
@@ -282,13 +281,14 @@ extension QWGemm {
         enc.setPod(grp, index: 8)
         (coldBank ?? bank).blocks.bind(enc, index: 10)
         let tbFlags: UInt32 = ((y32.shape.dtype == .f16) ? 0x8000_0000 : 0) | tileFilter.rawValue
+        let tcBase = tileCount.region.base + tileCount.offset
         dispatchTileChunks(enc, indirectBuffer: tileCount.region.buffer,
-                           baseByteOffset: tileCount.region.base + tileCount.offset + tilePlan.downIndirectByteOffset,
+                           baseByteOffset: tcBase + tilePlan.downIndirectByteOffset,
                            colTiles: colTiles, maxTiles: tilePlan.maxTiles,
                            flags: tbFlags, flagsIndex: 9)
     }
 
-    /// Grouped NAX tiles in <=2560-TG slices using on-device indirect grid counts (`0` empty threadgroups).
+    /// Grouped NAX tiles in bounded-TG indirect slices (`0` empty threadgroups).
     static func dispatchTileChunks(_ enc: any MTLComputeCommandEncoder, indirectBuffer: any MTLBuffer,
                                    baseByteOffset: Int, colTiles: Int, maxTiles: Int,
                                    flags: UInt32, flagsIndex: Int) {
@@ -353,7 +353,8 @@ extension QWGemm {
                                                 x: QWTensorValue, xRot32: QWTensorValue,
                                                 xPlain32: QWTensorValue,
                                                 rows: Int, hidden: Int,
-                                                skipRot32: Bool = false) throws {
+                                                skipRot32: Bool = false,
+                                                plainF16: Bool = false) throws {
         // The dense engine's residual stream is f16 and the MoE operator chain
         // is f32-native, so the chain needs a widening the engine does not
         // have. One pass over the f16 normed hidden produces the two f32
@@ -374,7 +375,8 @@ extension QWGemm {
             throw QWGemmError.badGeometry(
                 "moe bridge: hidden \(hidden) must be a multiple of 256")
         }
-        guard x.shape.dtype == .f16, xRot32.shape.dtype == .f32, xPlain32.shape.dtype == .f32,
+        let plainDtype: QWDType = plainF16 ? .f16 : .f32
+        guard x.shape.dtype == .f16, xRot32.shape.dtype == .f32, xPlain32.shape.dtype == plainDtype,
               x.shape.elementCount >= rows * hidden,
               xRot32.shape.elementCount >= rows * hidden,
               xPlain32.shape.elementCount >= rows * hidden else {
@@ -383,7 +385,7 @@ extension QWGemm {
         }
         enc.setComputePipelineState(try hal.pipeline("qwg_moe_bridge_f16_to_f32"))
         enc.bindTensors(x, xRot32, xPlain32, startIndex: 0)
-        let hPacked = skipRot32 ? (hidden | 0x8000_0000) : hidden
+        let hPacked = hidden | (skipRot32 ? 0x8000_0000 : 0) | (plainF16 ? 0x4000_0000 : 0)
         enc.setUInt32s(hPacked, startIndex: 3)
         // One row: a 32-lane threadgroup per 256 hidden (lane-aligned, bit-identical) so decode is not latency-bound.
         let blocks = rows == 1 ? hidden / 256 : 1

@@ -186,7 +186,8 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
         XCTAssertTrue(freeInner.allowsSpeculation)
         try freeInner.accept(3)
         try freeInner.accept(3)
-        XCTAssertFalse(freeInner.allowsSpeculation, "must block speculation once forcing </think>")
+        XCTAssertFalse(freeInner.isUnconstrainedNow, "must block unconstrained speculation once forcing </think>")
+        XCTAssertTrue(freeInner.allowsSpeculation, "supports lossless constrained speculation once forcing </think>")
         try freeInner.accept(13)
         XCTAssertTrue(freeInner.allowsSpeculation)
 
@@ -195,7 +196,8 @@ final class QWContextErrorAndThinkingBudgetTests: XCTestCase {
             try c.accept(3)
         }
 
-        XCTAssertFalse(c.allowsSpeculation)
+        XCTAssertFalse(c.isUnconstrainedNow)
+        XCTAssertTrue(c.allowsSpeculation)
         XCTAssertEqual(try c.allowedTokens(), [13], "must force </think> once budget exhausted")
 
         try c.accept(13)

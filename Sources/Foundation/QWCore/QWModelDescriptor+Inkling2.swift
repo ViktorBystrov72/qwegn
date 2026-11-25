@@ -336,7 +336,7 @@ extension QWModelDescriptor {
                 headDim: dictInt(mc, "head_dim") ?? (t.head_dim ?? 128),
                 intermediateSize: dictInt(mc, "intermediate_size") ?? (t.hidden_size * 4),
                 maxPositionEmbeddings: dictInt(mc, "max_position_embeddings") ?? 1048576,
-                rmsEps: dictFloat(mc, "rms_norm_eps") ?? Float(t.rms_norm_eps),
+                rmsEps: dictFloat(mc, "rms_norm_eps") ?? Float(t.rms_norm_eps ?? t.norm_eps ?? 1e-6),
                 ropeTheta: dictDouble(mc, "rope_theta") ?? 1000000.0,
                 qBias: dictBool(mc, "q_bias") ?? false,
                 oBias: dictBool(mc, "o_bias") ?? false,
@@ -467,16 +467,27 @@ extension QWModelDescriptor {
         }
         let patch = vc.patch_size ?? 16
         let pos: Int
-        if let explicit = vc.num_position_embeddings {
+        if let explicit = vc.num_position_embeddings ?? vc.num_patches {
             pos = explicit
         } else if let img = vc.image_size, patch > 0 {
             let side = max(1, img / patch)
             pos = side * side
+        } else if (rawVision?["rope_parameters"] as? [String: Any]) != nil || vc.model_type == "lfm3_vl_vision" {
+            // 2D Axial RoPE vision towers (e.g., LFM3-VL) do not use learned absolute pos embeddings.
+            pos = 0
         } else {
             throw DescriptorError.invariant("vision_config missing num_position_embeddings and image_size")
         }
-        return (vc.depth ?? 0, vc.hidden_size ?? 0, vc.num_heads ?? 0, vc.intermediate_size ?? 0,
-                patch, vc.temporal_patch_size ?? 2, vc.spatial_merge_size ?? 2, pos, vc.out_hidden_size ?? hidden)
+        let defaultMerge = (vc.model_type == "siglip2_vision_model" || vc.model_type == "siglip_vision_model") ? 1 : 2
+        let merge = vc.spatial_merge_size ?? vc.downsample_factor ?? defaultMerge
+        let temporalDefault = (vc.model_type == "lfm3_vl_vision" || vc.model_type == "lfm2_vl_vision"
+                               || vc.model_type == "siglip2_vision_model" || vc.model_type == "siglip_vision_model") ? 1 : 2
+        return (vc.depth ?? vc.num_hidden_layers ?? 0,
+                vc.hidden_size ?? 0,
+                vc.num_heads ?? vc.num_attention_heads ?? 0,
+                vc.intermediate_size ?? 0,
+                patch, vc.temporal_patch_size ?? temporalDefault, merge, pos,
+                vc.out_dim ?? vc.out_hidden_size ?? hidden)
     }
 
     internal static func appendInkling2DigestFields(_ d: QWModelDescriptor, into f: inout [String]) {

@@ -112,6 +112,21 @@ public enum OpenAIResponsesMapper {
                     } else if case .string(let u) = p.get("image_url").get("url"), !u.isEmpty {
                         parts.append(.imageUrl(u))
                     }
+                case "input_video", "video_url", "video":
+                    let nested = p.get("video_url").isUndefined ? p.get("video") : p.get("video_url")
+                    let fps = QWSchemaMetadataCoercion.strictDouble(nested.get("fps"))
+                        ?? QWSchemaMetadataCoercion.strictDouble(p.get("fps"))
+                    let maxFrames = QWSchemaMetadataCoercion.strictInt(nested.get("max_frames"))
+                        ?? QWSchemaMetadataCoercion.strictInt(p.get("max_frames"))
+                    let maxPixels = QWSchemaMetadataCoercion.strictInt(nested.get("max_pixels"))
+                        ?? QWSchemaMetadataCoercion.strictInt(p.get("max_pixels"))
+                    if case .string(let u) = nested, !u.isEmpty {
+                        parts.append(.videoUrl(QWVideoInputSpec(url: u, fps: fps, maxFrames: maxFrames, maxPixels: maxPixels)))
+                    } else if case .string(let u) = nested.get("url"), !u.isEmpty {
+                        parts.append(.videoUrl(QWVideoInputSpec(url: u, fps: fps, maxFrames: maxFrames, maxPixels: maxPixels)))
+                    } else if case .string(let u) = p.get("url"), !u.isEmpty {
+                        parts.append(.videoUrl(QWVideoInputSpec(url: u, fps: fps, maxFrames: maxFrames, maxPixels: maxPixels)))
+                    }
                 default:
                     if case .string(let t) = p.get("text") { parts.append(.text(t)) }
                 }
@@ -296,15 +311,19 @@ public enum OpenAIResponsesMapper {
         baseHistory: [ChatMessage],
         hasActiveTools: Bool,
         allowReasoningTags: Bool,
-        thinkingExplicitlyDisabled: Bool
+        thinkingExplicitlyDisabled: Bool,
+        allowInk2Markers: Bool = false
     ) -> (OpenAIResponseResource, [ChatMessage]) {
         let isConstrainedJson = (chatReq.responseFormatType == "json_schema" || chatReq.responseFormatType == "json_object") && !hasActiveTools
         let effectiveStartsInThinking = result.startsInThinking && !thinkingExplicitlyDisabled
         let effectiveAllowTags = allowReasoningTags || ((!isConstrainedJson || effectiveStartsInThinking) && !thinkingExplicitlyDisabled)
+        let effectiveAllowInk2 = allowInk2Markers && (!isConstrainedJson || effectiveStartsInThinking)
         let parsed = QWToolCallParser.parse(
             text: result.content, tools: chatReq.tools,
             startsInThinking: effectiveStartsInThinking,
-            truncated: result.truncated, allowToolCalls: hasActiveTools, allowReasoningTags: effectiveAllowTags
+            truncated: result.truncated, allowToolCalls: hasActiveTools,
+            allowReasoningTags: effectiveAllowTags,
+            allowInk2Markers: effectiveAllowInk2
         )
         let cappedCalls = capToolCalls(
             parsed.toolCalls, parallelToolCalls: req.parallelToolCalls, maxToolCalls: req.maxToolCalls

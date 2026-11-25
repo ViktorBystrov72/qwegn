@@ -4,6 +4,7 @@
 
 import Foundation
 import QWCore
+import QWDecision
 import QWHead
 
 /// Tracks requests rendering chat templates or tokenizing so concurrent bursts coalesce cleanly.
@@ -29,10 +30,10 @@ public enum QWConcurrentBatchTracker {
 
 /// Unified request scheduler over any `QWInferenceEngine`.
 public final class QWBatchScheduler: @unchecked Sendable {
-    public static let maxSlots = FNGPUBatchScheduler.maxSlots
+    public static let maxSlots = 16
 
     private let underlying: any QWInferenceEngine
-    private let driver: QWEngineDriver?
+    let driver: QWEngineDriver?
     private let lock = NSLock()
     private let exclusiveCond = NSCondition()
     private let driverWorker = QWDriverWorkerThread()
@@ -143,6 +144,32 @@ public final class QWBatchScheduler: @unchecked Sendable {
         lock.withLock { activeCount }
     }
 
+    /// Step-boundary GPU arbitrator forwarded to the primary driver (`ADR-002`).
+    public var gpuTurnArbitrator: QWGPUTurnArbitrator? {
+        get { driver?.gpuTurnArbitrator }
+        set { driver?.gpuTurnArbitrator = newValue }
+    }
+
+    /// Evaluates single-pass decision logits at `positions` inside `tokens`.
+    public func evaluateDecisionLogits(
+        tokens: [Int],
+        positions: [Int],
+        candidateTokenIds: [Int],
+        visualSpans: [QWVisualSpan] = []
+    ) throws -> [QWDecisionSlotOutput] {
+        guard let driver else {
+            throw QWDecisionError.backendFailed("decision logit evaluation requires a loaded QWEngineDriver")
+        }
+        return try runExclusive {
+            try driver.evaluateDecisionLogits(
+                tokens: tokens,
+                positions: positions,
+                candidateTokenIds: candidateTokenIds,
+                visualSpans: visualSpans
+            )
+        }
+    }
+
     var peakCoalescedWaveSize: Int {
         lock.withLock { recordedMaxWaveSize }
     }
@@ -189,8 +216,14 @@ public final class QWBatchScheduler: @unchecked Sendable {
             case solo
             case dispatchBatch
         }
+        let canInterleaveSolo = QWInterleavedPrefillGate.isEnabled
+            && driver.inkling2Runtime == nil
+            && driver.hyperRuntime == nil
+            && driver.maxBatchSlots >= 2
+            && driver.gdnPrefillMode != .naive
+            && request.visualSpans.isEmpty
         let decision = lock.withLock { () -> FastDecision in
-            if pendingQueue.count == 1 && pendingQueue[0] === job {
+            if !canInterleaveSolo && pendingQueue.count == 1 && pendingQueue[0] === job {
                 pendingQueue.removeFirst()
                 recordedMaxWaveSize = max(recordedMaxWaveSize, 1)
                 return .solo
@@ -254,8 +287,17 @@ public final class QWBatchScheduler: @unchecked Sendable {
                     return .idle
                 }
                 if pendingQueue.count == 1 {
-                    recordedMaxWaveSize = max(recordedMaxWaveSize, 1)
-                    return .solo(pendingQueue.removeFirst())
+                    let only = pendingQueue[0]
+                    let routeSoloViaBatch = QWInterleavedPrefillGate.isEnabled
+                        && driver?.inkling2Runtime == nil
+                        && driver?.hyperRuntime == nil
+                        && (driver?.maxBatchSlots ?? 0) >= 2
+                        && driver?.gdnPrefillMode != .naive
+                        && only.request.visualSpans.isEmpty
+                    if !routeSoloViaBatch {
+                        recordedMaxWaveSize = max(recordedMaxWaveSize, 1)
+                        return .solo(pendingQueue.removeFirst())
+                    }
                 }
                 let take = min(maxWave, pendingQueue.count)
                 let slice = Array(pendingQueue.prefix(take))
@@ -301,6 +343,7 @@ public final class QWBatchScheduler: @unchecked Sendable {
                             guard n > 0 else { return [] }
                             let polled = Array(self.pendingQueue.prefix(n))
                             self.pendingQueue.removeFirst(n)
+                            self.recordedMaxWaveSize = max(self.recordedMaxWaveSize, 1 + n)
                             return polled
                         }
                     },

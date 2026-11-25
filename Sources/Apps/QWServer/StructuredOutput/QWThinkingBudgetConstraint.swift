@@ -7,7 +7,6 @@ import QWHead
 
 public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sendable {
     private static let endThinkBytes = Array("</think>".utf8)
-    private static let ernieEndThinkBytes = Array("</ernie:think>".utf8)
 
     private let lock = NSLock()
     private let maxThinkingTokens: Int
@@ -17,6 +16,8 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
     private let hasValidEndThink: Bool
     private let forwardEndThinkToInner: Bool
     private let tokenBytes: [[UInt8]?]?
+    private let endThinkCloseBytesList: [[UInt8]]
+    private let recentCap: Int
     private let inner: (any QWTokenConstraint)?
 
     private var inThinking: Bool = true
@@ -32,6 +33,7 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
     public init(
         maxThinkingTokens: Int,
         endThinkTokenId: Int,
+        endThinkCloseTag: String? = nil,
         vocabularySize: Int,
         table: QWJSONTokenTable? = nil,
         tokenBytes: [[UInt8]?]? = nil,
@@ -42,19 +44,97 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
         self.endThinkTokenId = endThinkTokenId
         self.forcedEndThinkAllowed = [endThinkTokenId]
         self.vocabularySize = vocabularySize
-        self.hasValidEndThink = endThinkTokenId >= 0 && endThinkTokenId < vocabularySize
+        let validId = endThinkTokenId >= 0 && endThinkTokenId < vocabularySize
+        self.hasValidEndThink = validId
         self.forwardEndThinkToInner = forwardEndThinkToInner
-        self.tokenBytes = tokenBytes ?? table?.bytes
+        let resolvedBytes = tokenBytes ?? table?.bytes
+        self.tokenBytes = resolvedBytes
+        var targets: [[UInt8]] = [Self.endThinkBytes]
+        if let tag = endThinkCloseTag, !tag.isEmpty {
+            let b = Array(tag.utf8)
+            if !targets.contains(b) { targets.append(b) }
+        } else if validId, let tb = resolvedBytes, endThinkTokenId < tb.count, let bytes = tb[endThinkTokenId],
+                  let s = String(bytes: bytes, encoding: .utf8), s.hasPrefix("</"), s.hasSuffix(">"),
+                  !targets.contains(bytes) {
+            targets.append(bytes)
+        }
+        self.endThinkCloseBytesList = targets
+        let cap = max(64, targets.map(\.count).max() ?? 8)
+        self.recentCap = cap
         self.inner = inner
-        self.recentUTF8.reserveCapacity(128)
+        self.recentUTF8.reserveCapacity(cap * 2)
+    }
+
+    private init(
+        cloning other: QWThinkingBudgetConstraint,
+        inThinking: Bool,
+        thinkingTokens: Int,
+        recentUTF8: [UInt8],
+        innerClone: (any QWTokenConstraint)?
+    ) {
+        self.maxThinkingTokens = other.maxThinkingTokens
+        self.endThinkTokenId = other.endThinkTokenId
+        self.forcedEndThinkAllowed = other.forcedEndThinkAllowed
+        self.vocabularySize = other.vocabularySize
+        self.hasValidEndThink = other.hasValidEndThink
+        self.forwardEndThinkToInner = other.forwardEndThinkToInner
+        self.tokenBytes = other.tokenBytes
+        self.endThinkCloseBytesList = other.endThinkCloseBytesList
+        self.recentCap = other.recentCap
+        self.inner = innerClone
+        self.inThinking = inThinking
+        self.thinkingTokens = thinkingTokens
+        self.recentUTF8 = recentUTF8
     }
 
     public var allowsSpeculation: Bool {
+        if QWConstrainedSpeculationGate.isEnabled {
+            return inner?.allowsSpeculation ?? true
+        }
         let shouldBlock: Bool = lock.withLock {
             inThinking && thinkingTokens >= maxThinkingTokens && hasValidEndThink
         }
         if shouldBlock { return false }
         return inner?.allowsSpeculation ?? true
+    }
+
+    public func makeSpeculativeProbe() -> (any QWTokenConstraint)? {
+        let snap = lock.withLock { (inThinking, thinkingTokens, recentUTF8) }
+        let innerClone: (any QWTokenConstraint)?
+        if let inner {
+            guard let cloned = inner.makeSpeculativeProbe() else { return nil }
+            innerClone = cloned
+        } else {
+            innerClone = nil
+        }
+        return QWThinkingBudgetConstraint(
+            cloning: self,
+            inThinking: snap.0,
+            thinkingTokens: snap.1,
+            recentUTF8: snap.2,
+            innerClone: innerClone
+        )
+    }
+
+    public func proposeCanonicalDrafts(maxCount: Int) -> [Int] {
+        guard QWConstrainedSpeculationGate.isEnabled, maxCount > 0 else { return [] }
+        let decision = currentAllowedDecision()
+        switch decision {
+        case .unconstrained:
+            return []
+        case .forwardInner:
+            return inner?.proposeCanonicalDrafts(maxCount: maxCount) ?? []
+        case .forceEndThink:
+            guard let probe = makeSpeculativeProbe(),
+                  (try? probe.accept(endThinkTokenId)) != nil else {
+                return [endThinkTokenId]
+            }
+            var out = [endThinkTokenId]
+            if maxCount > 1 {
+                out.append(contentsOf: probe.proposeCanonicalDrafts(maxCount: maxCount - 1))
+            }
+            return out
+        }
     }
 
     public var isUnconstrainedNow: Bool {
@@ -130,16 +210,21 @@ public final class QWThinkingBudgetConstraint: QWTokenConstraint, @unchecked Sen
             if let tokenBytes, token >= 0, token < tokenBytes.count, token < vocabularySize,
                let bytes = tokenBytes[token], !bytes.isEmpty {
                 recentUTF8.append(contentsOf: bytes)
-                if recentUTF8.count > 64 {
-                    let drop = recentUTF8.count - 64
+                if recentUTF8.count > recentCap {
+                    let drop = recentUTF8.count - recentCap
                     recentUTF8.withUnsafeMutableBufferPointer { buf in
                         guard let base = buf.baseAddress else { return }
-                        memmove(base, base.advanced(by: drop), 64)
+                        memmove(base, base.advanced(by: drop), recentCap)
                     }
                     recentUTF8.removeLast(drop)
                 }
-                if let matchEnd = Self.endOfSubslice(recentUTF8, Self.endThinkBytes)
-                    ?? Self.endOfSubslice(recentUTF8, Self.ernieEndThinkBytes) {
+                var matchEnd: Int?
+                for target in endThinkCloseBytesList {
+                    if let end = Self.endOfSubslice(recentUTF8, target), matchEnd.map({ end < $0 }) ?? true {
+                        matchEnd = end
+                    }
+                }
+                if let matchEnd {
                     inThinking = false
                     let trailingBytes = Array(recentUTF8[matchEnd...])
                     recentUTF8.removeAll(keepingCapacity: false)

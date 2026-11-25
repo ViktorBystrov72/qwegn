@@ -47,6 +47,9 @@ extension QWEngineDriver {
 
     /// Ordinary single-token forward pass across the 64-layer trunk.
     func forwardStep(_ session: QWEngineSession, token: Int) throws -> Int? {
+        let arb = gpuTurnArbitrator
+        arb?.acquirePrimaryStepSync()
+        defer { arb?.releasePrimaryStep() }
         let tStep0 = Date()
         if let prevCB = session.lastCommitCB {
             session.lastCommitCB = nil
@@ -61,7 +64,7 @@ extension QWEngineDriver {
         guard pos < ropeRows else { throw QWEngineDriverError.posBeyondTable(pos) }
         guard token >= 0, token < geometry.vocab else { throw QWEngineDriverError.badToken(token) }
         try claimMLAIndexerState(session)
-        let seedMTP = (mtpScratch != nil || dflashDrafter != nil) && !session.batchedDecodeTouched
+        let seedMTP = (mtpScratch != nil || dflashDrafter != nil || dsparkDrafter != nil) && !session.batchedDecodeTouched
         let mtpRows = seedMTP ? try prepareMTPSeeding(session, count: 1) : 0
         if session.kv.tokenCapacity <= pos {
             try kvCache.grow(session.kv, to: pos + QWKVCache.pageTokens)
@@ -107,6 +110,14 @@ extension QWEngineDriver {
             // looks the kernel up instead of switching on the kind.
             try layerKernels[p].encodeDecode(QWLayerDecodeContext(
                 driver: self, enc: activeEnc ?? enc, session: session, position: pos, layer: v, weights: lw))
+            if seedMTP && dsparkDrafter != nil {
+                let nextP = (v + 1 < geometry.executionPlan.count) ? geometry.executionPlan[v + 1] : nil
+                encodeDSparkTargetTapIfNeeded(
+                    activeEnc ?? enc, physicalLayer: p, nextPhysicalLayer: nextP,
+                    mhcStream: sc.mhcStream, mhcControls: sc.mhcControls,
+                    branchDn16: sc.dn16, residualX16: sc.x,
+                    srcRowOffset: 0, dstRowOffset: 0, rows: 1)
+            }
         }
         profileStage("head")
         cb = activeCB ?? cb
@@ -114,7 +125,7 @@ extension QWEngineDriver {
 
         try encodeTargetHeadGreedy(enc, x: sc.ln1,
                                    writeLogits: session.stochastic != nil || activeCollectLogprobs || activeConstraint != nil)
-        if seedMTP, (mtpScratch != nil || dflashDrafter != nil) {
+        if seedMTP, (mtpScratch != nil || dflashDrafter != nil || dsparkDrafter != nil) {
             activeEnc = nil
             enc.endEncoding()
             let seedEmbeddings = mtpScratch?.embedding ?? sc.x

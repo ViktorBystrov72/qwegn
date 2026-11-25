@@ -14,6 +14,27 @@ final class QWPrefixHealingConstraint: QWTokenConstraint, @unchecked Sendable {
     var isUnconstrainedNow: Bool { consumed >= prefixBytes.count }
     var speculationBoundaryToken: Int? { nil }
 
+    private init(cloning other: QWPrefixHealingConstraint) {
+        self.prefixBytes = other.prefixBytes
+        self.table = other.table
+        self.completable = other.completable
+        self.consumed = other.consumed
+    }
+
+    func makeSpeculativeProbe() -> (any QWTokenConstraint)? {
+        QWPrefixHealingConstraint(cloning: self)
+    }
+
+    func proposeCanonicalDrafts(maxCount: Int) -> [Int] {
+        guard QWConstrainedSpeculationGate.isEnabled, maxCount > 0, consumed < prefixBytes.count else { return [] }
+        let probe = QWPrefixHealingConstraint(cloning: self)
+        let rem = Array(prefixBytes[consumed...])
+        return table.greedyTokenizePrefix(bytes: rem, maxTokens: maxCount) { tok in
+            guard (try? probe.accept(tok)) != nil else { return false }
+            return true
+        }.tokens
+    }
+
     init(prefixBytes: [UInt8], table: QWJSONTokenTable) {
         self.prefixBytes = prefixBytes
         self.table = table

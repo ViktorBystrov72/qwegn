@@ -350,6 +350,7 @@ extension QWEngineDriver {
         let ring: [QWTensorValue]     // per-GDN-layer views into ringSlab
         let trunkHidden: QWTensorValue?
         var dflashSlot: QWDFlashSessionSlot? = nil
+        var dsparkSlot: QWDSparkDrafter.SessionSlot? = nil
     }
 }
 

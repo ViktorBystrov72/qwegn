@@ -232,6 +232,7 @@ public enum QWSpeculativeTokenResolver {
         isGreedy: Bool,
         isUnconstrainedNow: () -> Bool,
         boundaryToken: Int?,
+        canSpeculateConstrained: Bool = false,
         isRepetitionBlocked: (Int) -> Bool,
         acceptConstrained: (Int) throws -> Void,
         sampleRow: (_ row: Int, _ argmaxToken: Int) throws -> Int,
@@ -252,16 +253,21 @@ public enum QWSpeculativeTokenResolver {
 
         for r in 0..<dCount {
             let draftTok = drafts[r]
+            let wasUnconstrained = isUnconstrainedNow()
             let sampled: Int
-            if targetArgmaxes[r] == draftTok && isGreedy && !isRepetitionBlocked(draftTok) && isUnconstrainedNow() {
+            if targetArgmaxes[r] == draftTok && isGreedy && !isRepetitionBlocked(draftTok) && wasUnconstrained {
                 try acceptConstrained(draftTok)
                 sampled = draftTok
             } else {
                 sampled = try sampleRow(r, targetArgmaxes[r])
             }
             committed.append(sampled)
-            let hitBoundary = (boundaryToken != nil && sampled == boundaryToken) || !isUnconstrainedNow()
-            if sampled == draftTok && targetArgmaxes[r] == draftTok && !hitBoundary {
+            let hitBoundary = !canSpeculateConstrained
+                && ((boundaryToken != nil && sampled == boundaryToken) || !isUnconstrainedNow())
+            let matchesTarget = canSpeculateConstrained
+                ? (sampled == draftTok)
+                : (sampled == draftTok && targetArgmaxes[r] == draftTok)
+            if matchesTarget && !hitBoundary {
                 accepted += 1
                 onCommittedToken(draftTok)
             } else {

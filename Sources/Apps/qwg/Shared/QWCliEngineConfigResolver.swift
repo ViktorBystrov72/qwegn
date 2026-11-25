@@ -220,15 +220,23 @@ struct QWResolvedCliEngineConfig {
                 } else {
                     effectiveMtpDrafts = 0
                 }
+            } else if let dsCfg = runtimeAssets.descriptor.dsparkConfig,
+                      QWModelDescriptor.DSparkConfig.resolvePackURL(near: resolvedPack) != nil {
+                effectiveMtpDrafts = (resolvedBackend == .dspark) ? min(15, dsCfg.maxDrafts) : 0
             } else if !runtimeAssets.descriptor.capabilities.contains(.mtp) {
                 effectiveMtpDrafts = isWeightFreeLoopNgram ? effectivePair.settings.mtpDrafts : 0
             }
         }
+        let dsparkPackPresent = runtimeAssets.descriptor.dsparkConfig != nil
+            && QWModelDescriptor.DSparkConfig.resolvePackURL(near: resolvedPack) != nil
+        let autoSelectDSpark = resolvedBackend == nil && effectiveMtpDrafts > 0 && dsparkPackPresent
         let resolvedBackendForConfig = resolvedBackend
-            ?? (knobs.mtpDrafts == nil && isWeightFreeLoopNgram
-                ? (try? QWMTPBackend.resolve(name: effectivePair.settings.mtpBackend)) : nil)
+            ?? (autoSelectDSpark ? .dspark
+                : (knobs.mtpDrafts == nil && isWeightFreeLoopNgram
+                    ? (try? QWMTPBackend.resolve(name: effectivePair.settings.mtpBackend)) : nil))
         let resolvedBackendNameForConfig = effectiveMtpBackend
-            ?? (knobs.mtpDrafts == nil && isWeightFreeLoopNgram ? effectivePair.settings.mtpBackend : nil)
+            ?? (autoSelectDSpark ? "dspark"
+                : (knobs.mtpDrafts == nil && isWeightFreeLoopNgram ? effectivePair.settings.mtpBackend : nil))
         let profileKV = effectivePair.profile?.values["kvMode"]?.stringValue
             ?? effectivePair.profile?.values["kv_mode"]?.stringValue
         let effectiveKVString = memoryPack?.artifact.kvMode ?? knobs.kvMode ?? profileKV ?? "q4"
@@ -306,7 +314,8 @@ struct QWResolvedCliEngineConfig {
         prefixCacheDirectory: URL?,
         cacheConfig: QWCacheConfig?,
         prefillScratchEviction: QWPrefillScratchEvictionPolicy = .auto,
-        gdnPrefill: String = "chunked"
+        gdnPrefill: String = "chunked",
+        dsparkConfidenceSchedule: Bool? = nil
     ) -> QWEngineBuildOptions {
         var tuning = effectiveSettings.resolvedEngineTuning
         if let rawPolicy = knobs.memoryPolicy, let parsed = QWMemoryPolicy(rawValue: rawPolicy) {
@@ -345,6 +354,7 @@ struct QWResolvedCliEngineConfig {
             dflashDraftPackPath: knobs.dflashDraftPack
                 ?? (effectiveMtpBackend?.lowercased() == "dspine" ? QWDFlashConfig.defaultDSpinePackPath : nil),
             dflashSelectorTopK: knobs.dflashTopK,
+            dsparkConfidenceSchedule: dsparkConfidenceSchedule,
             gdnPrefill: gdnPrefill,
             lsaConfig: lsaConfig,
             residentExpertsPerLayer: resolvedResidentExperts,
@@ -364,7 +374,10 @@ struct QWResolvedCliEngineConfig {
         )
     }
 
-    func makeSpeculativeParameters(knobs: QWGKnobOptions) -> QWSpeculativeParameters {
+    func makeSpeculativeParameters(
+        knobs: QWGKnobOptions,
+        dsparkConfidenceSchedule: Bool? = nil
+    ) -> QWSpeculativeParameters {
         QWSpeculativeParameters(
             enabled: effectiveMtpDrafts > 0,
             mtpDrafts: effectiveMtpDrafts,
@@ -374,7 +387,8 @@ struct QWResolvedCliEngineConfig {
             mtpDraftStrategy: knobs.mtpDraftStrategy ?? effectiveSettings.mtpDraftStrategy,
             mtpQuadraticSeeding: knobs.mtpQuadraticSeeding ?? true,
             adaptiveDepth: knobs.mtpAdaptiveDepth ?? false,
-            entropyThreshold: knobs.mtpEntropyThreshold ?? 0.5
+            entropyThreshold: knobs.mtpEntropyThreshold ?? 0.5,
+            dsparkConfidenceSchedule: dsparkConfidenceSchedule
         )
     }
 }

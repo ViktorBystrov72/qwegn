@@ -12,9 +12,9 @@ import QWKV
 import QWHead
 import QWMTP
 
-/// Preallocated 4-row head output and argmax scratch shared across batched steps.
+/// Preallocated 8-row head output and argmax scratch shared across batched steps.
 final class QWBatchHeadScratch {
-    static let maxBatchRows = 4
+    static let maxBatchRows = 8
     let buffer: any MTLBuffer
     let vocab: Int
     let argmaxSlots: Int
@@ -130,12 +130,12 @@ extension QWEngineDriver {
         }
     }
 
-    private var scLogitsBuffer: UnsafeBufferPointer<Float> {
+    var batchScLogitsBuffer: UnsafeBufferPointer<Float> {
         let ptr = sc.logits.region.pointer.advanced(by: sc.logits.offset).assumingMemoryBound(to: Float.self)
         return UnsafeBufferPointer(start: ptr, count: geometry.vocab)
     }
 
-    /// Executes one batched trunk + LM head step across B=2...4 active sessions in one command buffer.
+    /// Executes one batched trunk + LM head step across B=2...8 active sessions in one command buffer.
     func forwardBatchStep(
         _ sessions: [QWEngineSession], tokens: [Int],
         permit: QWGenerationPermit? = nil, headScratch: QWBatchHeadScratch? = nil,
@@ -143,7 +143,7 @@ extension QWEngineDriver {
     ) throws -> (rawIds: [Int], stepMs: Double, scratch: QWBatchHeadScratch) {
         let B = sessions.count
         guard (2...QWBatchHeadScratch.maxBatchRows).contains(B), tokens.count == B else {
-            throw QWEngineDriverError.state("batched decode requires B=2...4 matching tokens")
+            throw QWEngineDriverError.state("batched decode requires B=2...\(QWBatchHeadScratch.maxBatchRows) matching tokens")
         }
         guard canRunBatchedDecode else {
             throw QWEngineDriverError.state("model geometry/operators require quantum-interleaved batching")
@@ -156,6 +156,9 @@ extension QWEngineDriver {
     private func forwardBatchStepLocked(
         _ sessions: [QWEngineSession], tokens: [Int], headScratch: QWBatchHeadScratch?, greedyOnly: Bool
     ) throws -> (rawIds: [Int], stepMs: Double, scratch: QWBatchHeadScratch) {
+        let arb = gpuTurnArbitrator
+        arb?.acquirePrimaryStepSync()
+        defer { arb?.releasePrimaryStep() }
         let B = sessions.count
         guard verifiedSession == nil else {
             throw QWEngineDriverError.state("resolve pending verification before batched decode")
@@ -294,23 +297,7 @@ extension QWEngineDriver {
         }
     }
 
-    // MARK: - Continuous multi-session scheduler loop
-
-    private struct BatchSlotState {
-        let job: QWBatchScheduledJob
-        let session: QWEngineSession
-        let maxNew: Int
-        let stopIDs: Set<Int>
-        let constraint: (any QWTokenConstraint)?
-        let constraintSampler: QWSampler?
-        let lpSampler: QWSampler?
-        let topKCount: Int
-        let speculativeEnabled: Bool
-        var output: QWBatchSlotOutputState
-        var cacheAnswer: QWCacheAnswer?
-        var logprobs: [QWTokenLogprob] = []
-        var pendingToken: Int
-    }
+    // MARK: - Continuous multi-session scheduler loop (B=1..8 + slice-interleaved prefill)
 
     private func runScheduledBatchLocked(
         initialJobs: [QWBatchScheduledJob],
@@ -320,28 +307,59 @@ extension QWEngineDriver {
         requeueDelayed: ([QWBatchScheduledJob]) -> Void
     ) {
         let scratch = headScratch ?? (try? sharedBatchHeadScratch())
-        var active: [BatchSlotState] = []
+        var active: [QWBatchSlotState] = []
         defer { for slot in active where !slot.session.sessionFinished { finishSession(slot.session) } }
         var wave = QWBatchWaveState()
 
+        func drainActiveCommits() throws {
+            for idx in active.indices {
+                try awaitCommitAndCheck(active[idx].session, context: "before multi-slot batch transition")
+            }
+        }
         func failSlot(at idx: Int, error: any Error) {
             let failed = active.remove(at: idx)
             finishSession(failed.session)
             failed.job.complete(.failure(error))
             wave.clearBlock()
         }
-        func pruneSlots(where predicate: (BatchSlotState) -> Bool) {
+        func completeSlot(at idx: Int) {
+            let slot = active.remove(at: idx)
+            do {
+                try awaitCommitAndCheck(slot.session, context: "before completing batch slot")
+                finishAndCompleteSlot(slot)
+            } catch {
+                finishSession(slot.session)
+                slot.job.complete(.failure(error))
+            }
+            wave.clearBlock()
+        }
+        func pruneSlots(where predicate: (QWBatchSlotState) -> Bool) {
             for b in stride(from: active.count - 1, through: 0, by: -1) where predicate(active[b]) {
-                finishAndCompleteSlot(active.remove(at: b))
-                wave.clearBlock()
+                completeSlot(at: b)
             }
         }
         func admitQueue(_ jobs: [QWBatchScheduledJob]) {
+            guard !jobs.isEmpty else { return }
+            do {
+                try drainActiveCommits()
+            } catch {
+                for b in stride(from: active.count - 1, through: 0, by: -1) { failSlot(at: b, error: error) }
+                for job in jobs { job.complete(.failure(error)) }
+                return
+            }
+            let waveCommonPrefix = Self.commonWavePrefixLength(for: jobs)
+            var waveLeaderUsed = false
             var deferred: [QWBatchScheduledJob] = []
             for job in jobs {
                 if !deferred.isEmpty { deferred.append(job); continue }
+                let hasDecodingPeers = active.contains(where: \.isDecoding)
+                let isLeader = !waveLeaderUsed && job.request.usePrefixCache && job.request.visualSpans.isEmpty
+                if isLeader { waveLeaderUsed = true }
                 do {
-                    if let slot = try admitAndPrefillBatchJob(job, permit: permit) {
+                    if let slot = try admitBatchJobForScheduling(
+                        job, commonWavePrefix: waveCommonPrefix, isWaveLeader: isLeader,
+                        hasDecodingPeers: hasDecodingPeers, permit: permit
+                    ) {
                         if slot.output.finished { finishAndCompleteSlot(slot) } else { active.append(slot) }
                     }
                 } catch let kvErr as QWKVError where !active.isEmpty {
@@ -362,59 +380,111 @@ extension QWEngineDriver {
                 let newlyPolled = pollPending(openSlots)
                 if !newlyPolled.isEmpty { admitQueue(newlyPolled) }
             }
-            pruneSlots { $0.session.position >= ropeRows }
+            pruneSlots { $0.isDecoding && $0.session.position >= ropeRows }
             if active.isEmpty { break }
 
-            let stepIndices = eligibleBatchSlotIndices(
-                slots: active.map { ($0.session.position, $0.maxNew - $0.output.generated.count) },
-                maxRows: QWBatchHeadScratch.maxBatchRows)
-            let useBatched = QWBatchPartitionSelection.shouldRunBatchedStep(
-                stepIndices: stepIndices, activeCount: active.count, roundRobinIndex: wave.roundRobinIndex,
-                canRunBatchedDecode: canRunBatchedDecode,
-                hasSpeculative: stepIndices.contains { canSpeculateSlot(active[$0]) },
-                allowsSpeculativeBatch: geometry.numExperts == 0)
-            if useBatched {
-                let greedyOnly = multimaxParams == nil && stepIndices.allSatisfy { idx in
-                    let slot = active[idx]
-                    return slot.lpSampler == nil && slot.constraint == nil && slot.session.stochastic == nil
-                }
-                let stepResult: (rawIds: [Int], stepMs: Double, scratch: QWBatchHeadScratch)
-                do {
-                    stepResult = try forwardBatchStep(
-                        stepIndices.map { active[$0].session }, tokens: stepIndices.map { active[$0].pendingToken },
-                        permit: permit, headScratch: scratch, greedyOnly: greedyOnly)
-                } catch {
-                    for slotIdx in stepIndices.sorted(by: >) { failSlot(at: slotIdx, error: error) }
-                    continue
-                }
-                var failed: [(Int, any Error)] = []
-                for (batchIdx, slotIdx) in stepIndices.enumerated() {
-                    active[slotIdx].output.markDecodeStartedIfNeeded()
+            let decodingIndices = active.indices.filter { active[$0].isDecoding }
+            if !decodingIndices.isEmpty {
+                let localEligible = eligibleBatchSlotIndices(
+                    slots: decodingIndices.map { idx in
+                        (active[idx].session.position, active[idx].maxNew - active[idx].output.generated.count)
+                    },
+                    maxRows: QWBatchHeadScratch.maxBatchRows
+                )
+                let stepIndices = localEligible.map { decodingIndices[$0] }
+                let decRoundRobin = decodingIndices[wave.roundRobinIndex % decodingIndices.count]
+                let useBatched = QWBatchPartitionSelection.shouldRunBatchedStep(
+                    stepIndices: stepIndices, activeCount: decodingIndices.count, roundRobinIndex: decRoundRobin,
+                    canRunBatchedDecode: canRunBatchedDecode,
+                    hasSpeculative: stepIndices.contains { canSpeculateSlot(active[$0]) },
+                    allowsSpeculativeBatch: geometry.numExperts == 0
+                )
+                if useBatched {
+                    do { try drainActiveCommits() } catch {
+                        for slotIdx in stepIndices.sorted(by: >) { failSlot(at: slotIdx, error: error) }
+                        continue
+                    }
+                    let greedyOnly = multimaxParams == nil && stepIndices.allSatisfy { idx in
+                        let slot = active[idx]
+                        return slot.lpSampler == nil && slot.constraint == nil && slot.session.stochastic == nil
+                    }
+                    let stepResult: (rawIds: [Int], stepMs: Double, scratch: QWBatchHeadScratch)
                     do {
-                        try consumePredictedToken(
-                            slot: &active[slotIdx], rawArgmax: stepResult.rawIds[batchIdx],
-                            logitsTensor: stepResult.scratch.logitRow(batchIdx),
-                            logitBuf: stepResult.scratch.logitBuffer(batchIdx), stepMsValue: stepResult.stepMs)
-                    } catch { failed.append((slotIdx, error)) }
-                }
-                for (slotIdx, slotError) in failed.sorted(by: { $0.0 > $1.0 }) { failSlot(at: slotIdx, error: slotError) }
-                pruneSlots { $0.output.finished }
-                wave.advanceRoundRobin(
-                    stepIndices: stepIndices, activeCount: active.count, mixedShortAndLong: stepIndices.count < active.count)
-            } else {
-                let idx = wave.clampedSlotIndex(activeCount: active.count)
-                let quantum = QWBatchPartitionSelection.serialQuantum(
-                    canRunBatchedDecode: canRunBatchedDecode, activeCount: active.count,
-                    canSpeculateCurrent: canSpeculateSlot(active[idx]))
-                for _ in 0..<quantum where idx < active.count && !active[idx].output.finished {
-                    if active[idx].session.position >= ropeRows { active[idx].output.finished = true; break }
-                    do { try stepSingleSlot(&active[idx], permit: permit) } catch { failSlot(at: idx, error: error); break }
-                }
-                if idx < active.count, active[idx].output.finished {
-                    finishAndCompleteSlot(active.remove(at: idx))
-                    wave.finishSerialSlotRemoved(activeCount: active.count)
+                        stepResult = try forwardBatchStep(
+                            stepIndices.map { active[$0].session }, tokens: stepIndices.map { active[$0].pendingToken },
+                            permit: permit, headScratch: scratch, greedyOnly: greedyOnly)
+                    } catch {
+                        for slotIdx in stepIndices.sorted(by: >) { failSlot(at: slotIdx, error: error) }
+                        continue
+                    }
+                    var failed: [(Int, any Error)] = []
+                    for (batchIdx, slotIdx) in stepIndices.enumerated() {
+                        active[slotIdx].output.markDecodeStartedIfNeeded()
+                        do {
+                            try consumeBatchPredictedToken(
+                                slot: &active[slotIdx], rawArgmax: stepResult.rawIds[batchIdx],
+                                logitsTensor: stepResult.scratch.logitRow(batchIdx),
+                                logitBuf: stepResult.scratch.logitBuffer(batchIdx), stepMsValue: stepResult.stepMs)
+                        } catch { failed.append((slotIdx, error)) }
+                    }
+                    for (slotIdx, slotError) in failed.sorted(by: { $0.0 > $1.0 }) { failSlot(at: slotIdx, error: slotError) }
+                    pruneSlots { $0.output.finished }
+                    wave.advanceRoundRobin(
+                        stepIndices: localEligible, activeCount: decodingIndices.count,
+                        mixedShortAndLong: localEligible.count < decodingIndices.count
+                    )
                 } else {
-                    wave.advanceSerialSlot(activeCount: active.count)
+                    let decPos = wave.roundRobinIndex % decodingIndices.count
+                    let idx = decodingIndices[decPos]
+                    let allowAsyncSolo = (active.count == 1) && (QWBatchAdmissionCounter.preparingCount == 0)
+                    let quantum = QWBatchPartitionSelection.serialQuantum(
+                        canRunBatchedDecode: canRunBatchedDecode, activeCount: decodingIndices.count,
+                        canSpeculateCurrent: canSpeculateSlot(active[idx])
+                    )
+                    if !allowAsyncSolo {
+                        do { try drainActiveCommits() } catch {
+                            failSlot(at: idx, error: error)
+                            continue
+                        }
+                    }
+                    for _ in 0..<quantum where idx < active.count && !active[idx].output.finished {
+                        if active[idx].session.position >= ropeRows { active[idx].output.finished = true; break }
+                        do {
+                            try stepSingleSlot(&active[idx], allowAsyncCommit: allowAsyncSolo, permit: permit)
+                        } catch {
+                            failSlot(at: idx, error: error)
+                            break
+                        }
+                    }
+                    if idx < active.count, active[idx].output.finished {
+                        completeSlot(at: idx)
+                        wave.finishSerialSlotRemoved(activeCount: active.filter(\.isDecoding).count)
+                    } else {
+                        wave.advanceSerialSlot(activeCount: active.filter(\.isDecoding).count)
+                    }
+                }
+            }
+
+            if let pfIdx = active.firstIndex(where: { !$0.isDecoding }) {
+                let hasDecodingNow = active.contains(where: \.isDecoding)
+                    || QWBatchAdmissionCounter.preparingCount > 0
+                do {
+                    try drainActiveCommits()
+                    try stepPrefillingSlot(&active[pfIdx], hasDecodingPeers: hasDecodingNow, permit: permit)
+                    if active[pfIdx].output.finished {
+                        completeSlot(at: pfIdx)
+                    }
+                } catch let kvErr as QWKVError where active.count > 1 {
+                    if case .outOfPages = kvErr {
+                        let delayed = active.remove(at: pfIdx)
+                        finishSession(delayed.session)
+                        wave.markBlocked(freeWatermark: kvCache.freePageCount)
+                        requeueDelayed([delayed.job])
+                    } else {
+                        failSlot(at: pfIdx, error: kvErr)
+                    }
+                } catch {
+                    failSlot(at: pfIdx, error: error)
                 }
             }
         }
@@ -447,131 +517,30 @@ extension QWEngineDriver {
         }
     }
 
-    private func admitAndPrefillBatchJob(
-        _ job: QWBatchScheduledJob,
-        permit: QWGenerationPermit
-    ) throws -> BatchSlotState? {
-        let req = job.request
-        if req.usePrefixCache && !hasPrefixCache {
-            throw QWEngineDriverError.state("the request wants a prefix cache this engine does not have")
-        }
-        guard QWBatchPartitionSelection.validateRequestBounds(
-            prompt: req.prompt, maxNew: req.maxNew, stopIDs: req.stopIDs, vocab: geometry.vocab
-        ) else {
-            throw QWEngineDriverError.state("invalid batch generation request bounds or token IDs")
-        }
-        guard req.prompt.count < ropeRows else {
-            throw QWEngineDriverError.posBeyondTable(req.prompt.count)
-        }
-        let effectiveMaxNew = QWBatchPartitionSelection.clampedMaxNew(
-            requested: req.maxNew, promptCount: req.prompt.count, activeCapacity: ropeRows
-        )
-        if effectiveMaxNew == 0 {
-            job.complete(.success(QWGenerationResult(tokens: [], stepMs: [], stepTokenCounts: [])))
-            return nil
-        }
-
-        let started = Date()
-        let pureGreedy = (req.sampling.isGreedy && req.sampling.repetitionPenalty == 1.0)
-            || (req.constraint != nil && !(req.constraint?.allowsSpeculation ?? false))
-        let stochasticOwner = pureGreedy ? nil : try QWStochasticSession(geometry: geometry, config: req.sampling)
-        let saved = (activeCacheSalt, activeVisualSpans, activeConstraint, activeCollectLogprobs,
-                     activePrefillProgress, activePrefillTotalTokens, activePrefillBasePosition)
-        defer {
-            (activeCacheSalt, activeVisualSpans, activeConstraint, activeCollectLogprobs,
-             activePrefillProgress, activePrefillTotalTokens, activePrefillBasePosition) = saved
-        }
-        (activeCacheSalt, activeVisualSpans, activeConstraint) = (req.cacheSalt, req.visualSpans, nil)
-        activeCollectLogprobs = req.collectLogprobs || req.constraint != nil || stochasticOwner != nil || req.usePrefixCache
-        (activePrefillProgress, activePrefillTotalTokens, activePrefillBasePosition) = (req.onPrefillProgress, nil, 0)
-        if req.collectTimings { prefillTimingLedger.setEnabled(true) }
-        let prefillMark = prefillTimingLedger.values().count
-
-        let session: QWEngineSession
-        var exactHitFirst: Int? = nil
-        var cacheMatched = 0
-        var cacheTier: String? = nil
-        if req.usePrefixCache, let store = prefixStore {
-            let loaded = try prefixPagePressure(store) {
-                try cachedAdmission(prompt: req.prompt, mode: gdnPrefillMode, store: store, permit: permit)
-            }
-            session = loaded.session; exactHitFirst = loaded.first
-            cacheMatched = loaded.matched; cacheTier = loaded.tier
-        } else {
-            session = try maybePrefixPagePressure { try admitSession(promptTokens: req.prompt.count) }
-        }
-
-        do {
-            let unconditionedFirst: Int
-            let prefillElapsed: Double
-            if let cachedFirst = exactHitFirst {
-                unconditionedFirst = cachedFirst
-                prefillElapsed = Date().timeIntervalSince(started)
-                req.onPrefillProgress?(0, 0)
-            } else {
-                try prepareSuffixProgressAndWrites(
-                    session, matched: cacheMatched, promptCount: req.prompt.count,
-                    onProgress: req.onPrefillProgress, permit: permit
-                )
-                let tPrefill = Date()
-                unconditionedFirst = try prefill(session, tokens: Array(req.prompt.dropFirst(cacheMatched)),
-                                                 mode: nil, permit: permit)
-                prefillElapsed = Date().timeIntervalSince(tPrefill)
-                if req.usePrefixCache, let store = prefixStore,
-                   req.visualSpans.isEmpty {
-                    _ = try? retainCachedPrompt(session, prompt: req.prompt, mode: gdnPrefillMode,
-                                                first: unconditionedFirst, store: store, permit: permit)
-                }
-            }
-
-            if let stochasticOwner { session.stochastic = stochasticOwner }
-            let constraintSampler = req.constraint != nil ? QWSampler(config: req.sampling) : nil
-            let lpSampler = req.collectLogprobs ? QWSampler(config: req.sampling) : nil
-            let speculativeEnabled = QWBatchPartitionSelection.canEnableSpeculation(
-                requested: req.speculative.enabled, mtpDrafts: mtpDrafts,
-                collectLogprobs: req.collectLogprobs,
-                allowsSpeculation: req.constraint?.allowsSpeculation ?? true,
-                hasExplicitSeed: req.sampling.hasExplicitSeed, isGreedy: req.sampling.isGreedy)
-            var slot = BatchSlotState(
-                job: job, session: session, maxNew: effectiveMaxNew, stopIDs: req.stopIDs,
-                constraint: req.constraint, constraintSampler: constraintSampler,
-                lpSampler: lpSampler, topKCount: max(0, min(20, req.topLogprobsCount)),
-                speculativeEnabled: speculativeEnabled,
-                output: QWBatchSlotOutputState(
-                    startedAt: started, prefillSeconds: prefillElapsed,
-                    firstTokenSeconds: Date().timeIntervalSince(started),
-                    prefillGPUSeconds: prefillGPUSecondsSince(mark: prefillMark)),
-                cacheAnswer: req.usePrefixCache
-                    ? QWCacheAnswer(hit: cacheMatched > 0, matchedTokens: cacheMatched,
-                                    totalTokens: req.prompt.count, tier: cacheTier) : nil,
-                pendingToken: unconditionedFirst)
-            syncTokenHistoryAndRecycler(session, tokens: req.prompt, promptCount: req.prompt.count)
-            try consumePredictedToken(
-                slot: &slot, rawArgmax: unconditionedFirst,
-                logitsTensor: sc.logits, logitBuf: scLogitsBuffer, stepMsValue: nil)
-            if !slot.output.finished { slot.output.markDecodeStartedIfNeeded() }
-            return slot
-        } catch {
-            finishSession(session)
-            throw error
-        }
-    }
-
-    private func canSpeculateSlot(_ slot: BatchSlotState) -> Bool {
-        QWBatchPartitionSelection.isSlotSpeculatable(
+    private func canSpeculateSlot(_ slot: QWBatchSlotState) -> Bool {
+        slot.isDecoding && QWBatchPartitionSelection.isSlotSpeculatable(
             speculativeEnabled: slot.speculativeEnabled,
             remaining: slot.maxNew - slot.output.generated.count,
             hasLogprobsSampler: slot.lpSampler != nil,
             isUnconstrainedNow: slot.constraint?.isUnconstrainedNow ?? true,
             hasConstraint: slot.constraint != nil,
-            hasConstraintSampler: slot.constraintSampler != nil
-        ) && canRunSpeculativeRound(slot.session)
+            hasConstraintSampler: slot.constraintSampler != nil,
+            canSpeculateConstrained: canSpeculateConstraint(slot.constraint)
+        ) && canRunSpeculativeRound(slot.session, constraintOverride: slot.constraint)
     }
 
-    private func stepSingleSlot(_ slot: inout BatchSlotState, permit: QWGenerationPermit) throws {
+    private func stepSingleSlot(
+        _ slot: inout QWBatchSlotState,
+        allowAsyncCommit: Bool,
+        permit: QWGenerationPermit
+    ) throws {
         slot.output.markDecodeStartedIfNeeded()
-        let saved = (activeConstraint, activeCollectLogprobs)
-        defer { (activeConstraint, activeCollectLogprobs) = saved }
+        let saved = (activeConstraint, activeCollectLogprobs, activeRelaxedMarginOverride, mtpRelaxedMinProb)
+        defer {
+            (activeConstraint, activeCollectLogprobs, activeRelaxedMarginOverride, mtpRelaxedMinProb) = saved
+        }
+        activeRelaxedMarginOverride = slot.relaxedMarginOverride
+        if let minP = slot.relaxedMinProb { mtpRelaxedMinProb = minP }
         let remaining = slot.maxNew - slot.output.generated.count
         if canSpeculateSlot(slot) {
             activeConstraint = slot.constraint.flatMap { c in slot.constraintSampler.map { (c, $0) } }
@@ -579,7 +548,9 @@ extension QWEngineDriver {
             let t0 = Date()
             let decision = try executeSpeculativeRoundStep(
                 slot.session, remaining: remaining, stopIDs: slot.stopIDs,
-                drain: true, store: prefixStore, permit: permit
+                drain: !allowAsyncCommit,
+                waitForStreamCommit: allowAsyncCommit && slot.job.onToken != nil,
+                store: prefixStore, permit: permit
             )
             if let next = decision.pendingToken { slot.pendingToken = next }
             slot.output.recordSpeculativeRound(
@@ -598,14 +569,14 @@ extension QWEngineDriver {
             }
             return id
         }
-        try consumePredictedToken(
+        try consumeBatchPredictedToken(
             slot: &slot, rawArgmax: nextArgmax, logitsTensor: sc.logits,
-            logitBuf: scLogitsBuffer, stepMsValue: Date().timeIntervalSince(t0) * 1000
+            logitBuf: batchScLogitsBuffer, stepMsValue: Date().timeIntervalSince(t0) * 1000
         )
     }
 
     private func selectBatchToken(
-        slot: BatchSlotState, rawArgmax: Int, logitsTensor: QWTensorValue,
+        slot: QWBatchSlotState, rawArgmax: Int, logitsTensor: QWTensorValue,
         logitBuf: UnsafeBufferPointer<Float>, repArr: [Int]
     ) throws -> Int {
         func sampleStochastic(_ owner: QWStochasticSession) throws -> Int {
@@ -632,8 +603,8 @@ extension QWEngineDriver {
         return try slot.session.stochastic.map(sampleStochastic) ?? rawArgmax
     }
 
-    private func consumePredictedToken(
-        slot: inout BatchSlotState, rawArgmax: Int, logitsTensor: QWTensorValue,
+    func consumeBatchPredictedToken(
+        slot: inout QWBatchSlotState, rawArgmax: Int, logitsTensor: QWTensorValue,
         logitBuf: UnsafeBufferPointer<Float>, stepMsValue: Double?
     ) throws {
         let repArr = slot.session.activeRepetitionHistory()
@@ -661,11 +632,43 @@ extension QWEngineDriver {
         slot.output.finishPredictedToken(maxNew: slot.maxNew, accepted: slot.job.onToken?(chosen) ?? true)
     }
 
-    private func finishAndCompleteSlot(_ slot: BatchSlotState) {
+    func finishAndCompleteSlot(_ slot: QWBatchSlotState) {
         finishSession(slot.session)
+        let decodeSec = slot.output.decodeDurationSeconds() ?? 0
         let summary = slot.output.speculativeSummary(
             enabled: slot.speculativeEnabled, proposals: mtpDraftProposals, accepted: mtpDraftAccepted
         )
+        lastPromptTokens = slot.job.request.prompt.count
+        lastStopToken = slot.output.stoppedToken
+        lastRequestedBackend = slot.job.request.speculative.mtpBackend
+        if slot.output.speculativeRounds > 0 {
+            lastGeneration = nil
+            lastExperimentalGeneration = QWExperimentalGenerationStats(
+                promptTokens: slot.job.request.prompt.count,
+                generatedTokens: slot.output.generated.count,
+                prefillSec: slot.output.prefillSeconds,
+                decodeSec: decodeSec,
+                roundMs: slot.output.stepMs,
+                roundTokenCounts: slot.output.stepTokenCounts
+            )
+        } else {
+            lastExperimentalGeneration = nil
+            lastGeneration = QWGenerationStats(
+                promptTokens: slot.job.request.prompt.count,
+                generatedTokens: slot.output.generated.count,
+                prefillSec: slot.output.prefillSeconds,
+                decodeSec: decodeSec,
+                firstTokenSec: slot.output.firstTokenSeconds,
+                stepMs: slot.output.stepMs
+            )
+        }
+        if let cache = slot.cacheAnswer, let store = prefixStore {
+            lastPrefixCacheStats = QWPrefixCacheStats(
+                hit: cache.hit, matchedTokens: cache.matchedTokens,
+                chargedBytes: store.chargedBytes, evictions: store.evictions,
+                skippedOversize: false, tier: cache.tier
+            )
+        }
         slot.job.complete(.success(QWGenerationResult(
             tokens: slot.output.generated, stepMs: slot.output.stepMs,
             stepTokenCounts: slot.output.stepTokenCounts,

@@ -118,7 +118,11 @@ extension QWEngineDriver.WeightLoader {
 
         let rT: QWTensorValue
         if hasTensor(blk + "mlp.gate.weight") {
-            rT = try f32w(blk + "mlp.gate.weight", routerRows * H)
+            if plan.moeRouterIsBF16 && coldE == 0 {
+                rT = try bf16wRaw(blk + "mlp.gate.weight", routerRows * H)
+            } else {
+                rT = try f32w(blk + "mlp.gate.weight", routerRows * H)
+            }
         } else {
             rT = try allocateF32(try readRouterFloats())
         }
@@ -461,17 +465,93 @@ extension QWEngineDriver.WeightLoader {
                 ? (ap + "attn_sink")
                 : (ap + "core_attention.softmax_offset"),
             qHeads) : nil
+        let flashWeights = hasIndexer
+            ? try loadFlashIndexerWeights(blk: blk, ap: ap, idxPfx: idxPfx, idxH: idxH, hidden: h)
+            : nil
 
         let mlaW = QWMLAAttnOperator.LayerWeights(
             qANormW: qANormW, kvANormW: kvANormW, kNormW: kNormW, kNormB: kNormB,
             wGateWeights: wGateWeights, ape: nil, qBProj: qBProj, kvBProj: kvBProj,
-            vhaMix: vhaMix, attnSink: attnSink, hasOGate: hasOGate, oGateF16: oGateF16
+            vhaMix: vhaMix, attnSink: attnSink, hasOGate: hasOGate, oGateF16: oGateF16,
+            flashGateW: flashWeights?.gate, flashBias: flashWeights?.bias
         )
         return QWEngineDriver.AttnW(
             qkvProj: qkvProj, q: qkvSub[0], k: qkvSub[min(1, qkvSub.count - 1)],
             v: qkvSub[qkvSub.count - 1],
             o: o, wq: nil, wkTiled: nil, mla: mlaW
         )
+    }
+
+    private func loadFlashIndexerWeights(
+        blk: String, ap: String, idxPfx: String, idxH: Int, hidden: Int
+    ) throws -> (gate: QWTensorValue, bias: QWTensorValue)? {
+        guard let containerURL = pk?.url ?? st?.url else { return nil }
+        let fiURL = containerURL.deletingLastPathComponent().appendingPathComponent("flashindexer.qwp")
+        guard FileManager.default.fileExists(atPath: fiURL.path) else { return nil }
+        let fiPack = try QWQuant.Pack(url: fiURL, descriptor: geometry.descriptor, skipIdentityCheck: true)
+
+        var prefixes = [idxPfx, ap + "indexer.", ap + "core_attention.indexer."]
+        if let range = blk.range(of: "layers.") {
+            let suffix = String(blk[range.lowerBound...])
+            prefixes.append("model.\(suffix)self_attn.indexer.")
+            prefixes.append("model.\(suffix)self_attn.core_attention.indexer.")
+        }
+        var matched: String?
+        for prefix in prefixes where (try? fiPack.entry(prefix + "linear_gate.weight")) != nil
+            && (try? fiPack.entry(prefix + "flashindexer_bias")) != nil {
+            matched = prefix
+            break
+        }
+        guard let pfx = matched else { return nil }
+
+        let gateName = pfx + "linear_gate.weight"
+        let biasName = pfx + "flashindexer_bias"
+        let readPackFloats: (String, Int) throws -> [Float] = { name, expected in
+            let entry = try fiPack.entry(name)
+            let out = entry.rawOff != nil ? try fiPack.rawBf16(name) : try fiPack.dequantQ4g(name)
+            guard out.count == expected else {
+                throw QWEngineDriverError.weightMissing(name, "shape \(out.count) ≠ \(expected)")
+            }
+            return out
+        }
+
+        var gateFloats = try readPackFloats(gateName, idxH * hidden)
+        if hl.weightBasis.rotatesActivations {
+            Self.fwht32OrthoInPlace(&gateFloats)
+        }
+        let biasFloats = try readPackFloats(biasName, idxH)
+
+        let gateBytes = max(256, (gateFloats.count * 2 + 255) & ~255)
+        guard let gateBuf = hl.device.makeBuffer(length: gateBytes, options: .storageModeShared) else {
+            throw QWAllocError.outOfSpace(region: "flashindexer-gate", asked: gateBytes, free: 0)
+        }
+        gateBuf.label = "flashindexer-gate-\(blk)"
+        let gatePtr = gateBuf.contents().bindMemory(to: Float16.self, capacity: gateFloats.count)
+        for i in 0..<gateFloats.count {
+            gatePtr[i] = Float16(gateFloats[i])
+        }
+        let gateTensor = QWTensorValue(
+            region: QWMRegion(buffer: gateBuf, base: 0, length: gateBytes),
+            offset: 0,
+            shape: QWTensorShape([idxH, hidden], .f16)
+        )
+
+        let biasBytes = max(256, (biasFloats.count * 4 + 255) & ~255)
+        guard let biasBuf = hl.device.makeBuffer(length: biasBytes, options: .storageModeShared) else {
+            throw QWAllocError.outOfSpace(region: "flashindexer-bias", asked: biasBytes, free: 0)
+        }
+        biasBuf.label = "flashindexer-bias-\(blk)"
+        biasFloats.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            if let src = raw.baseAddress {
+                biasBuf.contents().copyMemory(from: src, byteCount: biasFloats.count * 4)
+            }
+        }
+        let biasTensor = QWTensorValue(
+            region: QWMRegion(buffer: biasBuf, base: 0, length: biasBytes),
+            offset: 0,
+            shape: QWTensorShape([idxH], .f32)
+        )
+        return (gateTensor, biasTensor)
     }
 
     mutating func loadDecoupledMLAAttnLayer(

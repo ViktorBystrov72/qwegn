@@ -290,6 +290,7 @@ kernel void qwg_moe_nax_split_f32(device const Block_HQ4_G32* w [[buffer(0)]],
                                   uint3 tg [[threadgroup_position_in_grid]],
                                   uint simd_gid [[simdgroup_index_in_threadgroup]]) {
     (void)xl;
-    qwg_moe_nax_split_f32_body((device const char*)w, xh, xl, y32, expertOff, tileE, tileR, tileCount,
-                               p, tileBlock, (device const char*)coldW, tg, simd_gid);
+    qwg_moe_nax_split_f32_body<0, 0, false, false>(
+        (device const char*)w, xh, xl, y32, expertOff, tileE, tileR, tileCount,
+        p, tileBlock, (device const char*)coldW, tg, simd_gid);
 }

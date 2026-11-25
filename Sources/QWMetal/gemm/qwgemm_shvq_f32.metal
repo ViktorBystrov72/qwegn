@@ -57,7 +57,7 @@ QW_SHVQ_F32_BM32_KERNEL(4, 64)
         uint  tid  [[thread_index_in_threadgroup]],                                   \
         uint  sg   [[simdgroup_index_in_threadgroup]],                                \
         uint  lane [[thread_index_in_simdgroup]]) {                                   \
-        threadgroup float tgC[4 * 32];                                                \
+        threadgroup float tgC[8 * 32];                                                \
         threadgroup ShvqTgLut<BITS> tgLut;                                            \
         const QWGemmF32V4Params p = { N, K, epi, scale };                             \
         qwg_gemv_f32_v4_body<QWQuantSHVQ<BITS, GROUP>>(w, x, y, p, tg, tid, sg, lane, tgC, tgLut); \
@@ -76,7 +76,7 @@ QW_SHVQ_F32_BM32_KERNEL(4, 64)
         uint  tid  [[thread_index_in_threadgroup]],                                   \
         uint  sg   [[simdgroup_index_in_threadgroup]],                                \
         uint  lane [[thread_index_in_simdgroup]]) {                                   \
-        threadgroup uint bHi[16], bLo[16];                                            \
+        threadgroup uint bHi[32], bLo[32];                                            \
         threadgroup ShvqTgLut<BITS> tgLut;                                            \
         const QWGemmF32V4Params p = { N, K, epi, scale };                             \
         qwg_gemv_f32_v4_am_body<QWQuantSHVQ<BITS, GROUP>>(w, x, y, keysHi, keysLo, p, tg, tid, sg, lane, bHi, bLo, tgLut); \

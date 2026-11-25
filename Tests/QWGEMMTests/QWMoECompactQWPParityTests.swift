@@ -29,11 +29,15 @@ final class QWMoECompactQWPParityTests: XCTestCase {
         for r in 0..<rows {
             for g in 0..<groups {
                 var blk = [UInt8](repeating: 0, count: gBytes)
-                let scale = Float16(0.03125 * (1.0 + 0.125 * Float((r + g) % 5))).bitPattern
+                let scaleF = Float16(0.03125 * (1.0 + 0.125 * Float((r + g) % 5)))
+                let scale = scaleF.bitPattern
                 blk[0] = UInt8(scale & 0xFF)
                 blk[1] = UInt8(scale >> 8)
                 if !kind.isSHVQ && gBytes >= 4 {
-                    let minV = Float16(-0.015625 * Float((r * 3 + g) % 4)).bitPattern
+                    let minF: Float16 = (kind == .incumbentHQ4G32)
+                        ? Float16(-1031.5 * Float(scaleF))
+                        : Float16(-0.015625 * Float((r * 3 + g) % 4))
+                    let minV = minF.bitPattern
                     blk[2] = UInt8(minV & 0xFF)
                     blk[3] = UInt8(minV >> 8)
                 }
@@ -217,5 +221,125 @@ final class QWMoECompactQWPParityTests: XCTestCase {
             let bBits = arena.read(yBatched, as: UInt16.self, count: rows * n)
             XCTAssertEqual(bBits, rBits, "0-ULP HQ4 BF16 multi-row mismatch at M=\(rows)")
         }
+    }
+
+    func testCompactQWPDownTileRows32AndSHVQ15Parity() throws {
+        try verifyCompactMatchesT1(
+            kind: .shvq(bits: 15, group: 32), tokens: 4, experts: 6, routes: 4, hidden: 96, intermediate: 64,
+            outDtype: .bf16, gateCap: 6.0, upCap: 5.0, skipShared: false, seedOffset: 30)
+        try verifyCompactMatchesT1(
+            kind: .shvq(bits: 15, group: 64), tokens: 12, experts: 8, routes: 4, hidden: 192, intermediate: 64,
+            outDtype: .f32, gateCap: 0.0, upCap: 0.0, skipShared: true, applyFwht: true, seedOffset: 31)
+        try verifyCompactMatchesT1(
+            kind: .shvq(bits: 3, group: 64), tokens: 8, experts: 6, routes: 4, hidden: 256, intermediate: 128,
+            outDtype: .f16, gateCap: 0.0, upCap: 0.0, skipShared: false, seedOffset: 32)
+        try verifyCompactMatchesT1(
+            kind: .incumbentHQ4G32, tokens: 8, experts: 6, routes: 4, hidden: 256, intermediate: 64,
+            outDtype: .bf16, gateCap: 0.0, upCap: 0.0, skipShared: false, seedOffset: 33)
+        try verifyCompactMatchesT1(
+            kind: .nativeAffine(bits: 4, group: 64), tokens: 6, experts: 6, routes: 4, hidden: 256, intermediate: 64,
+            outDtype: .f16, gateCap: 0.0, upCap: 0.0, skipShared: true, applyFwht: true, seedOffset: 34)
+        try verifyCompactMatchesT1(
+            kind: .nativeAffine(bits: 8, group: 32), tokens: 6, experts: 6, routes: 4, hidden: 256, intermediate: 64,
+            outDtype: .f32, gateCap: 0.0, upCap: 0.0, skipShared: true, applyFwht: true, seedOffset: 35)
+    }
+
+    private func makeFastRepeatedBank(kind: QWWeightView.ContainerKind, experts: Int, rowsPerExpert: Int, k: Int, seedInit: UInt32) -> Data {
+        let expertBytes = rowsPerExpert * kind.rowBytes(k: k)
+        let templateCount = min(experts, 8)
+        let template = makeBank(kind: kind, rows: templateCount * rowsPerExpert, k: k, seedInit: seedInit)
+        var out = Data(count: experts * expertBytes)
+        out.withUnsafeMutableBytes { dstRaw in
+            guard let dst = dstRaw.baseAddress else { return }
+            template.withUnsafeBytes { srcRaw in
+                guard let src = srcRaw.baseAddress else { return }
+                for e in 0..<experts {
+                    memcpy(dst.advanced(by: e * expertBytes), src.advanced(by: (e % templateCount) * expertBytes), expertBytes)
+                }
+            }
+        }
+        return out
+    }
+
+    func testCompactQWPT16LatentPrunedIdsMatchesT1AndHonorsActiveCount() throws {
+        let tokens = 16, experts = 512, routes = 10, hidden = 2048, intermediate = 2048
+        let pairs = tokens * routes
+        let guKind: QWWeightView.ContainerKind = .shvq(bits: 15, group: 64)
+        let dnKind: QWWeightView.ContainerKind = .shvq(bits: 3, group: 64)
+        let guBytes = makeFastRepeatedBank(kind: guKind, experts: experts, rowsPerExpert: 2 * intermediate, k: hidden, seedInit: 0x511)
+        let dnBytes = makeFastRepeatedBank(kind: dnKind, experts: experts, rowsPerExpert: intermediate, k: intermediate, seedInit: 0x522)
+        let actBytes = max(64 << 20, pairs * (hidden + intermediate) * 8)
+        let arena = try QWArena(
+            hal: Self.hal, weights: guBytes.count + dnBytes.count + (2 << 20),
+            activations: actBytes, kv: 0, gdnStates: 0)
+        let wReg = arena.weightsRegion(), act = arena.activationsRegion()
+        let guBuf = try wReg.allocate(QWTensorShape([(guBytes.count + 1) / 2], .f16))
+        let dnBuf = try wReg.allocate(QWTensorShape([(dnBytes.count + 1) / 2], .f16))
+        arena.copyIn(guBuf, from: guBytes)
+        arena.copyIn(dnBuf, from: dnBytes)
+        let gateUp = try XCTUnwrap(QWWeightView(blocks: guBuf, n: experts * 2 * intermediate, k: hidden, containerKind: guKind))
+        let down = try XCTUnwrap(QWWeightView(blocks: dnBuf, n: experts * intermediate, k: intermediate, containerKind: dnKind))
+
+        let xT = try act.allocate(QWTensorShape([tokens * hidden], .f32))
+        let idsT = try act.allocate(QWTensorShape([pairs], .i32))
+        let wtsT = try act.allocate(QWTensorShape([pairs], .f32))
+        let shT = try act.allocate(QWTensorShape([tokens * hidden], .f32))
+        let gT = try act.allocate(QWTensorShape([tokens], .f32))
+        let refActT1 = try act.allocate(QWTensorShape([routes * intermediate], .f32))
+        let refOut32 = try act.allocate(QWTensorShape([tokens * hidden], .f32))
+        let cmpOut32 = try act.allocate(QWTensorShape([tokens * hidden], .f32))
+        let expOff = try act.allocate(QWTensorShape([experts + 1], .i32))
+        let actExp = try act.allocate(QWTensorShape([experts], .i32))
+        let actInd = try act.allocate(QWTensorShape([QWGemmFP.MoEActiveBucketPlan.indirectBufferBytes / 4], .i32))
+        let sPair = try act.allocate(QWTensorShape([pairs], .i32))
+        let sTok = try act.allocate(QWTensorShape([pairs], .i32))
+        let actBuf = try act.allocate(QWTensorShape([pairs * intermediate], .f32))
+        let dnAccBuf = try act.allocate(QWTensorShape([pairs * hidden], .f32))
+
+        // Simulate MoE-Spec budget=36: <=36 unique active experts plus pruned `-1` slots across T=16.
+        let activePool: [Int32] = (0..<32).map { Int32(($0 * 13 + 5) % experts) }
+        var ids = [Int32](repeating: -1, count: pairs)
+        for t in 0..<tokens {
+            for k in 0..<routes where (t + k) % 4 != 0 {
+                ids[t * routes + k] = activePool[(t * 3 + k) % activePool.count]
+            }
+        }
+        arena.write(xT, from: makeFloats(count: tokens * hidden, seedInit: 0x701))
+        arena.write(idsT, from: ids)
+        arena.write(wtsT, from: makeFloats(count: pairs, seedInit: 0x702, scale: 0.4))
+        arena.write(shT, from: [Float](repeating: 0, count: tokens * hidden))
+        arena.write(gT, from: [Float](repeating: 0, count: tokens))
+
+        for t in 0..<tokens {
+            try runStep { enc in
+                try QWGemm.encodeMoEGateUpF32R1(
+                    enc, hal: Self.hal, x: xT.slice(byteOffset: t * hidden * 4, count: hidden, dtype: .f32),
+                    bank: gateUp, ids: idsT.slice(byteOffset: t * routes * 4, count: routes, dtype: .i32),
+                    out: refActT1, rowsPerExpert: 2 * intermediate, routes: routes, tokens: 1,
+                    fuseSiluFwht: true, reuseExpertsAcrossTokens: false)
+                try QWGemm.encodeMoEDownSharedCombineF32(
+                    enc, hal: Self.hal, x: refActT1, bank: down, rowsPerRoute: hidden, routes: routes,
+                    weights: wtsT.slice(byteOffset: t * routes * 4, count: routes, dtype: .f32),
+                    shared: shT.slice(byteOffset: t * hidden * 4, count: hidden, dtype: .f32),
+                    gate: gT.slice(byteOffset: t * 4, count: 1, dtype: .f32),
+                    out: refOut32.slice(byteOffset: t * hidden * 4, count: hidden, dtype: .f32),
+                    ids: idsT.slice(byteOffset: t * routes * 4, count: routes, dtype: .i32), tokens: 1,
+                    reuseExpertsAcrossTokens: false, skipShared: true)
+            }
+        }
+        try runStep { enc in
+            try QWGemm.encodeMoEQWPCompactRoutedCombine(
+                enc, hal: Self.hal, x: xT, gateUp: gateUp, down: down, ids: idsT, weights: wtsT,
+                shared: shT, gate: gT, out: cmpOut32, expertOff: expOff, activeExperts: actExp,
+                activeIndirect: actInd, sortedPairIdx: sPair, sortedTok: sTok,
+                actBuf: actBuf, dnAccBuf: dnAccBuf, hidden: hidden, experts: experts,
+                routes: routes, intermediate: intermediate, tokens: tokens, skipShared: true)
+        }
+        let activeCount = arena.read(actInd, as: UInt32.self, count: 1)[0]
+        XCTAssertGreaterThan(activeCount, 0)
+        XCTAssertLessThanOrEqual(activeCount, 36, "Expected pruned T=16 active experts <= 36, got \(activeCount)")
+        let r32 = arena.read(refOut32, as: UInt32.self, count: tokens * hidden)
+        let c32 = arena.read(cmpOut32, as: UInt32.self, count: tokens * hidden)
+        XCTAssertEqual(c32, r32, "0-ULP mismatch for T=16 E=512 K=10 SHVQ15+SHVQ3 CompactQWP")
     }
 }

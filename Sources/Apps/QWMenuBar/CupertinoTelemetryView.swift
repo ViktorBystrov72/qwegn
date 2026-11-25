@@ -45,6 +45,7 @@ public struct CupertinoTelemetryView: View {
                     headerSection
                     failureBanner
                     loadedWeightsCard
+                    decisionSidecarCard
                     inferenceTelemetryCard
                     memoryAndSystemCard
                     footerDock

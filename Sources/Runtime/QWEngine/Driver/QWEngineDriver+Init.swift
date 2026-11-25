@@ -115,7 +115,8 @@ extension QWEngineDriver {
         packPath: String, maxTokens: Int, ropeRows: Int, kvMode: QWKVMode,
         prefillChunkSize: Int, mtpDrafts requestedMTPDrafts: Int,
         residentExpertsPerLayer: Int?, osReserveGiB explicitOSReserveGiB: Double?,
-        cfg: StartupConfig, baseTuning: QWEngineTuning
+        cfg: StartupConfig, baseTuning: QWEngineTuning,
+        requestedSessions: Int? = nil
     ) throws -> StartupContainers {
         let tuning = baseTuning.overlaid(environment: cfg.environment)
         let osReserveGiB = explicitOSReserveGiB ?? tuning.osReserveGiB
@@ -173,24 +174,27 @@ extension QWEngineDriver {
             hasMTPWeights = false
         }
         let resolvedDraftStrategy = (try? QWDraftStrategy.resolve(cfg.mtpDraftStrategy)) ?? .hybrid
-        let allowWeightFreeMTP = !hasMTPWeights && cfg.mtpBackend != .dflash2 && resolvedDraftStrategy == .ngram
-        let mtpDrafts = (cfg.mtpBackend == .dflash2 || hasMTPWeights)
+        let allowWeightFreeMTP = !hasMTPWeights && cfg.mtpBackend != .dflash2 && cfg.mtpBackend != .dspark && resolvedDraftStrategy == .ngram
+        let mtpDrafts = (cfg.mtpBackend == .dflash2 || cfg.mtpBackend == .dspark || hasMTPWeights)
             ? requestedMTPDrafts
             : (allowWeightFreeMTP ? min(requestedMTPDrafts, 15) : 0)
-        let mtpWeightDrafts = (cfg.mtpBackend == .dflash2) ? 0 : (hasMTPWeights ? mtpDrafts : 0)
+        let mtpWeightDrafts = (cfg.mtpBackend == .dflash2 || cfg.mtpBackend == .dspark) ? 0 : (hasMTPWeights ? mtpDrafts : 0)
         try Self.validateGeometry(rawGeometry, kvMode: kvMode)
         let choice = try Self.weightFormatChoice(for: root, quantization: rawGeometry.descriptor.quantization,
                                                  geometry: rawGeometry, mtpDrafts: mtpWeightDrafts, pack: pack)
         let headSpec = Self.resolveHeadSpec(st: stContainer, pack: pack, trunkFormat: choice.format,
                                             geometry: rawGeometry)
-        let resolvedCfg = try cfg.resolvingHead(isQ4g: headSpec.isQ4g, format: headSpec.format)
+        let moeRouterIsBF16 = Self.resolveMoERouterIsBF16(
+            pack: pack, geometry: rawGeometry, mtpWeightDrafts: mtpWeightDrafts)
+        let resolvedCfg = try cfg.resolvingHead(
+            isQ4g: headSpec.isQ4g, format: headSpec.format, moeRouterIsBF16: moeRouterIsBF16)
         let prelimHal = try QWHal(geometry: rawGeometry, weightBasis: choice.format.basis)
         let allowExpertReduction = (explicitResE == nil && rawGeometry.numExperts > 0)
         let (geometry, plannedChunk) = try Self.planResidencyAndChunk(
             raw: rawGeometry, cfg: resolvedCfg, hal: prelimHal, format: choice.format, tuning: tuning,
             osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize, maxTokens: maxTokens,
             ropeRows: ropeRows, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts, kvMode: kvMode,
-            allowExpertReduction: allowExpertReduction)
+            allowExpertReduction: allowExpertReduction, requestedSessions: requestedSessions)
         return StartupContainers(
             cfg: resolvedCfg,
             tuning: tuning, osReserveGiB: osReserveGiB, geometry: geometry, hal: prelimHal,
@@ -263,7 +267,8 @@ extension QWEngineDriver {
         weightFormatDeclineReason: String?, tuning: QWEngineTuning, osReserveGiB: Double?,
         prefillChunkSize: Int, maxTokens: Int, ropeRows: Int, kvMode: QWKVMode,
         attnLayerCount: Int, gdnLayerCount: Int, cfg: StartupConfig,
-        mtpDrafts: Int, mtpWeightDrafts: Int
+        mtpDrafts: Int, mtpWeightDrafts: Int,
+        requestedSessions: Int? = nil
     ) throws -> ArenaBudgetPlan {
         try QWScratchArenaBuilder.planArenaAndBudget(
             geometry: geometry, hal: hal, weightFormat: weightFormat,
@@ -271,7 +276,8 @@ extension QWEngineDriver {
             osReserveGiB: osReserveGiB, prefillChunkSize: prefillChunkSize,
             maxTokens: maxTokens, ropeRows: ropeRows, kvMode: kvMode,
             attnLayerCount: attnLayerCount, gdnLayerCount: gdnLayerCount,
-            cfg: cfg, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts)
+            cfg: cfg, mtpDrafts: mtpDrafts, mtpWeightDrafts: mtpWeightDrafts,
+            requestedSessions: requestedSessions)
     }
 
     static func loadEmbeddingsAndHead(
@@ -366,12 +372,13 @@ extension QWEngineDriver {
 
     static func buildGDNSlots(
         gsub: QWSubAllocator, geometry: QWModelGeometry, gdnLayerCount: Int,
-        mtpDrafts: Int, dflashDrafter: QWDFlashDrafter?
+        mtpDrafts: Int, dflashDrafter: QWDFlashDrafter?, dsparkDrafter: QWDSparkDrafter? = nil,
+        slotCount: Int? = nil
     ) throws -> [GdnSlot] {
         var slots: [GdnSlot] = []
         let H = geometry.hidden
-        let slotCount = Self.gdnSlotCount()
-        for slotIdx in 0..<slotCount {
+        let resolvedSlotCount = slotCount ?? Self.gdnSlotCount()
+        for slotIdx in 0..<resolvedSlotCount {
             let recSlab = try gsub.allocate(QWTensorShape([max(1, gdnLayerCount * QWSlotGeometry.recElems(geometry: geometry))], .f32))
             let ringSlab = try gsub.allocate(QWTensorShape([max(1, gdnLayerCount * QWSlotGeometry.ringElems(geometry: geometry))], .f16))
             let recViews = Self.slotViews(recSlab, elem: QWSlotGeometry.recElems(geometry: geometry), dt: .f32, layers: gdnLayerCount, geometry: geometry)
@@ -390,10 +397,12 @@ extension QWEngineDriver {
             let trunkHidShape = geometry.usesMultiStreamMTPHidden
                 ? QWTensorShape([geometry.mhcConfig!.streams * H], .f32) : QWTensorShape([H], .f16)
             let dflashSlot = (dflashDrafter.map { slotIdx < $0.sessionSlots.count ? $0.sessionSlots[slotIdx] : nil }) ?? nil
+            let dsparkSlot = (dsparkDrafter.map { slotIdx < $0.sessionSlots.count ? $0.sessionSlots[slotIdx] : nil }) ?? nil
             slots.append(GdnSlot(recSlab: recSlab, ringSlab: ringSlab,
                                  rec: recViews, ring: ringViews,
                                  trunkHidden: mtpDrafts > 0 ? try gsub.allocate(trunkHidShape) : nil,
-                                 dflashSlot: dflashSlot))
+                                 dflashSlot: dflashSlot,
+                                 dsparkSlot: dsparkSlot))
         }
         return slots
     }
@@ -401,12 +410,15 @@ extension QWEngineDriver {
     private static func prewarmBatchedDecodePipelines(
         hal: QWHal, geometry: QWModelGeometry, layersW: [LayerW], headAQ4: Bool, hasMLA: Bool
     ) throws {
-        // Always prewarm B=2..4 batched head pipelines before hal.freezePipelines().
-        for m in 2...4 {
+        // Always prewarm B=2..8 batched head pipelines before hal.freezePipelines().
+        for m in 2...8 {
             _ = try hal.pipeline("qwg_head_f16_m\(m)")
             _ = try hal.pipeline("qwg_head_q4g_m\(m)", isAQ4: headAQ4)
+            _ = try hal.pipeline("qwg_head_q4g_argmax_m\(m)", isAQ4: headAQ4)
+            if m >= 4 {
+                _ = try hal.pipeline("qwg_head_q4g_rp_m\(m)", isAQ4: headAQ4)
+            }
         }
-        _ = try hal.pipeline("qwg_head_q4g_rp_m4", isAQ4: headAQ4)
         guard !hasMLA && geometry.hcaConfig == nil && geometry.hybridMLAConfig == nil
                 && geometry.blockSparseGQAConfig == nil else {
             return
@@ -573,11 +585,6 @@ extension QWEngineDriver {
                 maxSeedRows: maxT, kvMode: kvMode)
         } else {
             echoDrafter = nil
-        }
-        for m in ["m5", "m6", "m7", "m8"] { _ = try hal.pipeline("qwg_head_f16_\(m)") }
-        for m in 5...8 {
-            _ = try hal.pipeline("qwg_head_q4g_m\(m)", isAQ4: headAQ4)
-            _ = try hal.pipeline("qwg_head_q4g_rp_m\(m)", isAQ4: headAQ4)
         }
         return MTPVerificationResources(
             gdnReplayCheckpoint: gdnReplayCheckpoint, verifyWindow: verifyWindow,

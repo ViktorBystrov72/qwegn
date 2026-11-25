@@ -6,6 +6,7 @@ public enum QWModelRole: String, Sendable, Hashable, CaseIterable, Codable {
     case causalLM
     case multimodalConditionalLM
     case speculativeDrafter
+    case decisionEncoder
 }
 
 /// C01/§2 — Immutable model identity + geometry for ANY supported model.
@@ -26,10 +27,14 @@ public struct QWModelDescriptor: Sendable, Hashable {
         case mistralDense = "mistral-dense"
         case inkling2Loop = "inkling2_loop"
         case bailingMoeV3 = "bailing_moe_v3"
+        case lfm2 = "lfm2"
+        case lfm3 = "lfm3"
+        case lfm2Encoder = "lfm2_encoder"
+        case modernBert = "modernbert"
     }
 
     public enum Capability: String, Sendable, Hashable, CaseIterable, Codable {
-        case vision, moe, ple, qsaIndexer, mtp, hyperConnections
+        case vision, moe, ple, qsaIndexer, mtp, hyperConnections, decision
     }
 
     /// Looped block execution configuration (e.g., `SenseNova-Loop-9B-Preview`).
@@ -102,6 +107,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let multimaxHead: Bool
     public let mtpSharedLastLayer: Bool
     public let inkling2Config: Inkling2Config?
+    public let dsparkConfig: DSparkConfig?
 
     public let mlaConfig: MLAConfig?
     public let kdaConfig: KDAConfig?
@@ -111,6 +117,12 @@ public struct QWModelDescriptor: Sendable, Hashable {
     public let mtpConfig: MTPConfig?
     public let visionTowerConfig: VisionTowerConfig?
     public let ropeInterleave: Bool
+    public let shortConvConfig: ShortConvConfig?
+    public let normKind: NormKind?
+    public let useSandwichNorm: Bool
+    public let perKindRoPEConfig: PerKindRoPEConfig?
+    public let attnGateMode: AttnGateMode
+    public let decisionConfig: QWDecisionModelConfig?
 
     public let hidden: Int
     public let vocab: Int
@@ -298,6 +310,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 multimaxHead: Bool = false,
                 mtpSharedLastLayer: Bool = false,
                 inkling2Config: Inkling2Config? = nil,
+                dsparkConfig: DSparkConfig? = nil,
                 mlaConfig: MLAConfig? = nil,
                 kdaConfig: KDAConfig? = nil,
                 attentionSinkRelConfig: AttentionSinkRelConfig? = nil,
@@ -306,10 +319,23 @@ public struct QWModelDescriptor: Sendable, Hashable {
                 mtpConfig: MTPConfig? = nil,
                 visionTowerConfig: VisionTowerConfig? = nil,
                 ropeInterleave: Bool? = nil,
-                role: QWModelRole? = nil) {
+                role: QWModelRole? = nil,
+                shortConvConfig: ShortConvConfig? = nil,
+                normKind: NormKind? = nil,
+                useSandwichNorm: Bool = false,
+                perKindRoPEConfig: PerKindRoPEConfig? = nil,
+                attnGateMode: AttnGateMode? = nil,
+                decisionConfig: QWDecisionModelConfig? = nil) {
         self.family = family; self.modelType = modelType
         self.role = role ?? (capabilities.contains(.vision) ? .multimodalConditionalLM : .causalLM)
+        self.shortConvConfig = shortConvConfig
+        self.normKind = normKind
+        self.useSandwichNorm = useSandwichNorm
+        self.perKindRoPEConfig = perKindRoPEConfig
+        self.attnGateMode = attnGateMode ?? (attnOutputGate ? .packedElementWiseQProj : .none)
+        self.decisionConfig = decisionConfig
         self.inkling2Config = inkling2Config
+        self.dsparkConfig = dsparkConfig
         self.envelopeModelType = envelopeModelType
         self.capabilities = capabilities
         self.loopSettings = loopSettings
@@ -445,6 +471,7 @@ public struct QWModelDescriptor: Sendable, Hashable {
     /// Maximum supported speculative draft depth for this model architecture.
     public var maxSpeculativeDrafts: Int {
         if role == .speculativeDrafter { return 0 }
+        if let ds = dsparkConfig { return ds.maxDrafts }
         if usesMultiStreamHC || hasPLE { return 3 }
         if let spec = QWModelFamilyRegistry.shared.spec(forModelType: modelType) {
             return spec.maxSpeculativeDrafts
@@ -530,11 +557,14 @@ public struct QWModelDescriptor: Sendable, Hashable {
             moeRouterEnableExpertBias: moeRouterEnableExpertBias,
             routedScalingFactorLearnable: routedScalingFactorLearnable,
             multimaxHead: multimaxHead, mtpSharedLastLayer: mtpSharedLastLayer,
-            inkling2Config: inkling2Config,
+            inkling2Config: inkling2Config, dsparkConfig: dsparkConfig,
             mlaConfig: mlaConfig, kdaConfig: kdaConfig, attentionSinkRelConfig: attentionSinkRelConfig,
             moeRoutingConfig: moeRoutingConfig, swigluClampConfig: swigluClampConfig,
             mtpConfig: mtpConfig, visionTowerConfig: visionTowerConfig,
-            ropeInterleave: ropeInterleave, role: role
+            ropeInterleave: ropeInterleave, role: role,
+            shortConvConfig: shortConvConfig, normKind: normKind,
+            useSandwichNorm: useSandwichNorm, perKindRoPEConfig: perKindRoPEConfig,
+            attnGateMode: attnGateMode, decisionConfig: decisionConfig
         )
     }
 

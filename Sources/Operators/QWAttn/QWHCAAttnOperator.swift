@@ -79,6 +79,10 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
     internal let psoAttnNAXPrefill: (any MTLComputePipelineState)?
     internal let psoAttnCombine: any MTLComputePipelineState
     internal let psoVhaInvRope: any MTLComputePipelineState
+    internal let psoVhaInvRopeNAX: (any MTLComputePipelineState)?
+    public var hcaVhaNAXEnabled = ProcessInfo.processInfo.environment["QW_HCA_VHA_NAX"] != "0"
+    public var hcaWoANAXEnabled = ProcessInfo.processInfo.environment["QW_HCA_WOA_NAX"] != "0"
+    internal static let woANaxMinRows = 8
     internal let psoGroupedWoAGemv: any MTLComputePipelineState
     internal let psoGroupedWoAGemvSub2: any MTLComputePipelineState
     internal let psoGroupedWoAGemvMR: any MTLComputePipelineState
@@ -86,7 +90,14 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
     internal let psoGroupedWoAMMA: any MTLComputePipelineState
     internal let psoGroupedWoAMMASub2: any MTLComputePipelineState
     internal let psoGroupedWoANAX: (any MTLComputePipelineState)?
+    internal let psoGroupedWoANAXHQ4: (any MTLComputePipelineState)?
+    internal let psoGroupedWoANAXAQ8: (any MTLComputePipelineState)?
+    internal let psoGroupedWoANAXAQ4: (any MTLComputePipelineState)?
+    internal let psoGroupedWoANAXShvq4: (any MTLComputePipelineState)?
     internal let psoGroupedWoANAXSub2: (any MTLComputePipelineState)?
+    internal let psoGroupedWoANAXT16: (any MTLComputePipelineState)?
+    internal let psoGroupedWoANAXT16Shvq4: (any MTLComputePipelineState)?
+    internal let psoGroupedWoANAXT16Sub2: (any MTLComputePipelineState)?
     internal var coarsePipelines: QWCoarsePoolIndex.Pipelines? { coarsePipeline?.pipelines }
     internal var psoEmeansLsa: QWCoarseSelectionPipeline.EmeansPSOTuple? { coarsePipeline?.emeansTuple }
     internal var clusteredMacros: [Int] {
@@ -280,6 +291,7 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
         self.psoAttnNAXPrefill = hal.caps.isMetal4TensorCapable ? try hal.pipeline("qwg_hca_attn_nax_prefill") : nil
         self.psoAttnCombine = try hal.pipeline("qwg_hca_attn_combine")
         self.psoVhaInvRope = try hal.pipeline("qwg_hca_vha_invrope")
+        self.psoVhaInvRopeNAX = hal.caps.isMetal4TensorCapable ? try hal.pipeline("qwg_hca_vha_invrope_nax") : nil
         self.psoGroupedWoAGemv = try hal.pipeline("qwg_hca_grouped_wo_a_gemv")
         self.psoGroupedWoAGemvSub2 = try hal.pipeline("qwg_hca_grouped_wo_a_gemv_sub2")
         self.psoGroupedWoAGemvMR = try hal.pipeline("qwg_hca_grouped_wo_a_gemv_mr")
@@ -288,8 +300,22 @@ public final class QWHCAAttnOperator: @unchecked Sendable {
         self.psoGroupedWoAMMASub2 = try hal.pipeline("qwg_hca_grouped_wo_a_mma_sub2")
         self.psoGroupedWoANAX = hal.caps.isMetal4TensorCapable
             ? try hal.pipeline("qwg_hca_grouped_wo_a_nax") : nil
+        self.psoGroupedWoANAXHQ4 = hal.caps.isMetal4TensorCapable
+            ? try hal.pipeline("qwg_hca_grouped_wo_a_nax_hq4") : nil
+        self.psoGroupedWoANAXAQ8 = hal.caps.isMetal4TensorCapable
+            ? try hal.pipeline("qwg_hca_grouped_wo_a_nax_aq8") : nil
+        self.psoGroupedWoANAXAQ4 = hal.caps.isMetal4TensorCapable
+            ? try hal.pipeline("qwg_hca_grouped_wo_a_nax_aq4") : nil
+        self.psoGroupedWoANAXShvq4 = hal.caps.isMetal4TensorCapable
+            ? try hal.pipeline("qwg_hca_grouped_wo_a_nax_shvq4") : nil
         self.psoGroupedWoANAXSub2 = hal.caps.isMetal4TensorCapable
             ? try hal.pipeline("qwg_hca_grouped_wo_a_nax_sub2") : nil
+        self.psoGroupedWoANAXT16 = hal.caps.isMetal4TensorCapable
+            ? try hal.pipeline("qwg_hca_grouped_wo_a_nax_t16") : nil
+        self.psoGroupedWoANAXT16Shvq4 = hal.caps.isMetal4TensorCapable
+            ? try hal.pipeline("qwg_hca_grouped_wo_a_nax_t16_shvq4") : nil
+        self.psoGroupedWoANAXT16Sub2 = hal.caps.isMetal4TensorCapable
+            ? try hal.pipeline("qwg_hca_grouped_wo_a_nax_t16_sub2") : nil
 
         let needLsa = (lsaConfig.mode != .off)
             && (self.compressRatio.nonzeroBitCount == 1)

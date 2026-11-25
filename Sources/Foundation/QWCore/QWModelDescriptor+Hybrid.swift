@@ -324,6 +324,7 @@ extension QWModelDescriptor {
         }
         appendInkling2DigestFields(d, into: &f)
         appendCapabilityV3DigestFields(d, into: &f)
+        appendLFMAndDecisionDigestFields(d, into: &f)
         return f
     }
 
@@ -347,7 +348,7 @@ extension QWModelDescriptor {
             if n <= 0 { bad.append("numExperts") }
             if let k = expertsPerTok, k <= 0 || k > n { bad.append("expertsPerTok") }
         }
-        let validKinds: Set<String> = ["full_attention", "linear_attention", "compressed_attention", "sliding_attention"]
+        let validKinds: Set<String> = ["full_attention", "linear_attention", "compressed_attention", "sliding_attention", "conv"]
         if layerTypes.count != numLayers { bad.append("layerTypes.count") }
         if !layerTypes.allSatisfy({ validKinds.contains($0) }) { bad.append("layerTypes") }
         if let swL = layerSlidingWindows, (swL.count != numLayers || swL.contains(where: { $0 < 0 })) {
@@ -399,11 +400,14 @@ extension QWModelDescriptor {
         inv: (Bool, String) throws -> Void
     ) throws {
         let archs = t.architectures ?? env.architectures
+        let allowedSuffixes = ["ForCausalLM", "ForConditionalGeneration", "ForSequenceClassification", "ForDecision"]
         if let archs, !archs.isEmpty,
-           !archs.contains(where: { $0.hasSuffix("ForCausalLM") || $0.hasSuffix("ForConditionalGeneration") }) {
+           !archs.contains(where: { arch in
+               allowedSuffixes.contains(where: { arch.hasSuffix($0) }) || arch.hasPrefix("D1")
+           }) {
             throw DescriptorError.invariant("unsupported architecture '\(archs[0])'")
         }
-        if familySpec.defaultAllFullAttention,
+        if familySpec.defaultAllFullAttention, !familySpec.allowsAutoMap,
            rawKeyPresent(rawText, "auto_map") || rawKeyPresent(rawRoot, "auto_map") {
             throw DescriptorError.invariant("unsupported 'auto_map'")
         }
@@ -568,11 +572,14 @@ extension QWModelDescriptor {
             moeRouterEnableExpertBias: moeRouterEnableExpertBias,
             routedScalingFactorLearnable: routedScalingFactorLearnable,
             multimaxHead: multimaxHead, mtpSharedLastLayer: mtpSharedLastLayer,
-            inkling2Config: inkling2Config,
+            inkling2Config: inkling2Config, dsparkConfig: dsparkConfig,
             mlaConfig: mlaConfig, kdaConfig: kdaConfig, attentionSinkRelConfig: attentionSinkRelConfig,
             moeRoutingConfig: moeRoutingConfig, swigluClampConfig: swigluClampConfig,
             mtpConfig: mtpConfig, visionTowerConfig: visionTowerConfig,
-            ropeInterleave: ropeInterleave, role: role
+            ropeInterleave: ropeInterleave, role: role,
+            shortConvConfig: shortConvConfig, normKind: normKind,
+            useSandwichNorm: useSandwichNorm, perKindRoPEConfig: perKindRoPEConfig,
+            attnGateMode: attnGateMode, decisionConfig: decisionConfig
         )
     }
 }

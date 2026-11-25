@@ -435,7 +435,7 @@ public final class QWSampler {
         return allowedBase[constrainedKeepScratch[selectedPos]]
     }
 
-    private func ensureConstrainedScratchCapacity(count: Int) {
+    func ensureConstrainedScratchCapacity(count: Int) {
         if penaltyScratch.count < count { penaltyScratch = [Float](repeating: 0, count: count) }
         if shiftedScratch.count < count { shiftedScratch = [Float](repeating: 0, count: count) }
         if eScratch.count < count { eScratch = [Float](repeating: 0, count: count) }
@@ -446,7 +446,7 @@ public final class QWSampler {
         if constrainedKeepScratch.count < k { constrainedKeepScratch = [Int](repeating: 0, count: k) }
     }
 
-    private func fillConstrainedTopIndices(count: Int, topK k: Int) {
+    func fillConstrainedTopIndices(count: Int, topK k: Int) {
         constrainedWeightsScratch.withUnsafeBufferPointer { weights in
             @inline(__always) func before(_ a: Int, _ b: Int) -> Bool {
                 weights[a] != weights[b] ? weights[a] > weights[b] : a < b

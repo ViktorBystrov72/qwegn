@@ -9,7 +9,7 @@ const CHAT_PARAM_INPUT_BINDINGS = [
 ];
 const chatState = {
   initialized: false, sessions: [], activeSessionId: null, customPresets: [],
-  sidebarCollapsed: false, openDrawer: null, pendingImages: [], editingMsgId: null,
+  sidebarCollapsed: false, openDrawer: null, pendingImages: [], pendingVideos: [], editingMsgId: null,
   clearAllArmedUntil: 0, isGenerating: false, activeAbortController: null, activeStatusLabel: "Ready",
   autoFollowScroll: true, lastTranscriptScrollTop: 0, ignoreScrollUntil: 0,
   transcriptListenersBound: false, reasoningOpenById: {},
@@ -94,7 +94,7 @@ function renderChatWorkspace() {
   renderChatSystemDrawer();
   renderChatParamsDrawer();
   renderChatTranscript();
-  renderChatAttachments();
+  if (typeof renderChatAttachments === "function") renderChatAttachments();
   renderChatComposerState();
 }
 function applyChatSidebarState() {
@@ -132,7 +132,7 @@ function renderChatSessionList() {
   }).join("");
 }
 function activateFreshSessionState(session) {
-  chatState.activeSessionId = session.id; chatState.pendingImages = []; chatState.editingMsgId = null;
+  chatState.activeSessionId = session.id; chatState.pendingImages = []; chatState.pendingVideos = []; chatState.editingMsgId = null;
   chatState.autoFollowScroll = true; chatState.lastTranscriptScrollTop = 0; commitChatWorkspace(null);
 }
 function createNewChatSession() {
@@ -202,7 +202,7 @@ function syncChatHeaderWithDashboard() {
     chatEl("chat-preset-badge").textContent = matched ? matched.name : "Custom";
   }
   if (typeof renderChatMemoryPackAndHarnessUI === "function") renderChatMemoryPackAndHarnessUI(session);
-  renderChatAttachments();
+  if (typeof renderChatAttachments === "function") renderChatAttachments();
 }
 function syncChatWithServerSettings(_) { if (typeof document !== "undefined") renderChatSystemDrawer(); }
 function renderChatSystemDrawer() {
@@ -416,10 +416,6 @@ function renderChatTranscript() {
   }
   updateChatScrollToBottomButton();
 }
-function safeChatImageDataUrl(rawUrl) {
-  const s = String(rawUrl ?? "").trim();
-  return /^data:image\/[a-z0-9.+-]+;base64,/i.test(s) ? s : "";
-}
 function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
   const session = getActiveChatSession();
   const isAssistant = msg.role === "assistant"; const isUser = msg.role === "user"; const isTool = msg.role === "tool";
@@ -451,8 +447,11 @@ function renderSingleChatTurnHtml(msg, idx, totalCount, answeredToolCallIds) {
     if (isAssistant && msg.reasoning) bodyHtml += buildChatThinkingHtml(msg);
     if (isAssistant) bodyHtml += `<div class="chat-turn-answer">${buildAssistantAnswerHtml(msg)}</div>`;
     else bodyHtml += `<div class="chat-user-text">${escapeHtml(msg.content || "")}</div>`;
-    if (Array.isArray(msg.images) && msg.images.length > 0) {
+    if (Array.isArray(msg.images) && msg.images.length > 0 && typeof safeChatImageDataUrl === "function") {
       bodyHtml += `<div class="chat-turn-images">${msg.images.map((img) => `<img class="chat-turn-thumb" src="${escapeHtml(safeChatImageDataUrl(img.dataUrl))}" alt="${escapeHtml(img.name || "Attached image")}" />`).join("")}</div>`;
+    }
+    if (Array.isArray(msg.videos) && msg.videos.length > 0 && typeof safeChatVideoDataUrl === "function") {
+      bodyHtml += `<div class="chat-turn-images">${msg.videos.map((vid) => `<video class="chat-turn-thumb" controls muted playsinline preload="metadata" src="${escapeHtml(safeChatVideoDataUrl(vid.dataUrl))}"></video>`).join("")}</div>`;
     }
     if (Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0) {
       bodyHtml += `<div class="chat-turn-tools">${msg.toolCalls.map((tc) => renderToolCallCardHtml(msg.id, tc, answeredToolCallIds)).join("")}</div>`;
@@ -575,47 +574,6 @@ function bindChatTranscriptListeners() {
 function applyChatStarterPrompt(text) { const i = chatEl("chat-input"); if (i) { i.value = text; autoResizeChatInput(i); i.focus(); } }
 function autoResizeChatInput(el) { if (el) { el.style.height = "auto"; el.style.height = `${Math.min(Math.max(el.scrollHeight, 68), 220)}px`; } }
 function handleChatInputKeyDown(e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!chatState.isGenerating) sendChatTurn(); } }
-function triggerChatImagePicker() { const f = chatEl("chat-file-input"); if (f) f.click(); }
-function handleChatFileInputChange(e) { if (e && e.target && e.target.files && e.target.files.length) queueChatImageFiles(e.target.files); if (e && e.target) e.target.value = ""; }
-function handleChatDragOver(e) { e.preventDefault(); if (chatEl("chat-composer")) chatEl("chat-composer").classList.add("is-dragover"); }
-function handleChatDragLeave(_) { if (chatEl("chat-composer")) chatEl("chat-composer").classList.remove("is-dragover"); }
-function handleChatDrop(e) { e.preventDefault(); handleChatDragLeave(e); if (e && e.dataTransfer && e.dataTransfer.files) queueChatImageFiles(e.dataTransfer.files); }
-function handleChatPaste(event) {
-  const items = event && event.clipboardData ? event.clipboardData.items : null;
-  if (!items) return;
-  const files = [];
-  for (let i = 0; i < items.length; i += 1) {
-    if (items[i] && items[i].kind === "file" && items[i].type && items[i].type.startsWith("image/")) { const f = items[i].getAsFile(); if (f) files.push(f); }
-  }
-  if (files.length > 0) queueChatImageFiles(files);
-}
-function queueChatImageFiles(fileList) {
-  Array.from(fileList).forEach((file) => {
-    if (!file || !file.type || !file.type.startsWith("image/")) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result !== "string") return;
-      chatState.pendingImages.push({ id: generateChatId("img"), name: file.name || "pasted-image.png", mimeType: file.type, dataUrl: reader.result });
-      renderChatAttachments();
-    };
-    reader.readAsDataURL(file);
-  });
-}
-function removePendingChatImage(imgId) { chatState.pendingImages = chatState.pendingImages.filter((img) => img.id !== imgId); renderChatAttachments(); }
-function renderChatAttachments() {
-  const strip = chatEl("chat-attachments-strip");
-  if (!strip) return;
-  if (!chatState.pendingImages.length) { strip.hidden = true; strip.innerHTML = ""; return; }
-  strip.hidden = false;
-  const modelObj = typeof publishedModel !== "undefined" ? publishedModel : null;
-  const connected = typeof isConnected !== "undefined" && isConnected;
-  const hasVision = connected && modelObj && Array.isArray(modelObj.capabilities) && modelObj.capabilities.includes("vision");
-  const warnHtml = connected && modelObj && !hasVision ? `<div class="chat-attachment-warn">Note: active model capabilities do not include vision; image parts may be rejected.</div>` : "";
-  strip.innerHTML = warnHtml + chatState.pendingImages.map((img) =>
-    `<div class="chat-attachment-chip"><img src="${escapeHtml(safeChatImageDataUrl(img.dataUrl))}" alt="${escapeHtml(img.name)}" /><span class="mono">${escapeHtml(img.name)}</span>
-      <button type="button" class="chat-session-del" data-chat-action="remove-image" data-img-id="${escapeHtml(img.id)}" aria-label="Remove image ${escapeHtml(img.name)}">×</button></div>`
-  ).join("");
-}
 function renderChatComposerState() {
   if (chatEl("chat-send-btn")) chatEl("chat-send-btn").disabled = chatState.isGenerating;
   if (chatEl("chat-stop-btn")) chatEl("chat-stop-btn").hidden = !chatState.isGenerating;
@@ -627,13 +585,14 @@ function stopActiveChatGeneration() {
 }
 async function sendChatTurn() {
   if (chatState.isGenerating) return;
-  const inputEl = chatEl("chat-input"); const text = inputEl ? inputEl.value.trim() : ""; const images = chatState.pendingImages.slice();
-  if (!text && images.length === 0) return;
+  const inputEl = chatEl("chat-input"); const text = inputEl ? inputEl.value.trim() : "";
+  const images = (chatState.pendingImages || []).slice(); const videos = (chatState.pendingVideos || []).slice();
+  if (!text && images.length === 0 && videos.length === 0) return;
   const session = getActiveChatSession();
   if (session.messages.length === 0 && (session.title === "New Chat" || session.title === "Untitled Chat") && text) session.title = text.replace(/\s+/g, " ").slice(0, 42);
-  session.messages.push({ id: generateChatId("msg"), role: "user", content: text, images, createdAt: Date.now() });
+  session.messages.push({ id: generateChatId("msg"), role: "user", content: text, images, videos, createdAt: Date.now() });
   if (inputEl) { inputEl.value = ""; autoResizeChatInput(inputEl); }
-  chatState.pendingImages = []; commitChatWorkspace(session); scrollChatTranscriptToBottom(true); await executeChatCompletion(session, {});
+  chatState.pendingImages = []; chatState.pendingVideos = []; commitChatWorkspace(session); scrollChatTranscriptToBottom(true); await executeChatCompletion(session, {});
 }
 function beginEditChatTurn(msgId) {
   if (chatState.isGenerating) return;
@@ -645,7 +604,8 @@ async function saveAndResendChatTurn(msgId) {
   const session = getActiveChatSession(); const idx = session.messages.findIndex((m) => m.id === msgId);
   if (idx === -1) return;
   const area = chatEl(`chat-edit-textarea-${msgId}`); const nextText = area ? area.value.trim() : "";
-  if (!nextText && (!session.messages[idx].images || !session.messages[idx].images.length)) { notifyChat("Message text cannot be empty.", true); return; }
+  const hasTurnMedia = (session.messages[idx].images && session.messages[idx].images.length) || (session.messages[idx].videos && session.messages[idx].videos.length);
+  if (!nextText && !hasTurnMedia) { notifyChat("Message text cannot be empty.", true); return; }
   session.messages[idx].content = nextText; session.messages = session.messages.slice(0, idx + 1); chatState.editingMsgId = null;
   commitChatWorkspace(session); scrollChatTranscriptToBottom(true); await executeChatCompletion(session, {});
 }
@@ -761,7 +721,7 @@ function handleChatActionClick(e) {
   const el = e.target && e.target.closest ? e.target.closest("[data-chat-action]") : null;
   if (!el) return;
   const action = el.getAttribute("data-chat-action");
-  const id = el.getAttribute("data-msg-id") || el.getAttribute("data-session-id") || el.getAttribute("data-img-id") || "";
+  const id = el.getAttribute("data-msg-id") || el.getAttribute("data-session-id") || el.getAttribute("data-img-id") || el.getAttribute("data-vid-id") || "";
   const map = {
     "select-session": () => selectChatSession(id),
     "delete-session": () => deleteChatSession(id),
@@ -774,7 +734,8 @@ function handleChatActionClick(e) {
     "delete-turn": () => deleteChatTurn(id),
     "save-edit-turn": () => saveAndResendChatTurn(id),
     "cancel-edit-turn": () => cancelEditChatTurn(),
-    "remove-image": () => removePendingChatImage(id),
+    "remove-image": () => { if (typeof removePendingChatImage === "function") removePendingChatImage(id); },
+    "remove-video": () => { if (typeof removePendingChatVideo === "function") removePendingChatVideo(id); },
     "submit-tool-result": () => submitToolResultForCall(id, el.getAttribute("data-call-id") || "", el.getAttribute("data-tool-name") || "tool", el.getAttribute("data-run-continue") === "true")
   };
   if (map[action]) map[action]();

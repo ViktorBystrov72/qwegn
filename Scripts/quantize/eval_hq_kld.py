@@ -25,7 +25,7 @@ from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hq_blocks import (
-    dequant_fp8_blockwise,
+    dequant_with_scale_inv,
     dequant_hq_blocks,
     hq_block_bytes,
     parse_quant_spec,
@@ -51,7 +51,7 @@ def load_tensor_f32(locator: dict[str, Path], name: str, device: torch.device) -
         ps = locator[scale_name]
         with safe_open(ps, framework="pt") as sf:
             s = sf.get_tensor(scale_name)
-        return dequant_fp8_blockwise(t, s, device=device)
+        return dequant_with_scale_inv(t, s, device=device)
     return t.to(torch.float32).to(device=device)
 
 

@@ -13,6 +13,12 @@ public struct QWModelCatalogEntry: Equatable, Sendable {
     public let hasLSASidecar: Bool
     /// Full path to `model.qlsa` when present in the model directory.
     public let lsaSidecarPath: String?
+    /// True when the pack carries native `.decision` metadata or a CoreAI `.aimodel` bundle.
+    public let isDecisionCapable: Bool
+    /// True when the pack contains a compiled CoreAI `.aimodel` ANE bundle.
+    public let isCoreAIBundle: Bool
+    /// Optional human-readable decision archetype summary (`verbalizer`, `optionMarkers`, `pooledClassifier`).
+    public let decisionArchetype: String?
     /// nil when the model is runnable; otherwise why it is not.
     public let reason: String?
 
@@ -21,7 +27,10 @@ public struct QWModelCatalogEntry: Equatable, Sendable {
                 capabilities: Set<QWModelDescriptor.Capability> = [],
                 maxSpeculativeDrafts: Int = 0,
                 hasLSASidecar: Bool = false,
-                lsaSidecarPath: String? = nil) {
+                lsaSidecarPath: String? = nil,
+                isDecisionCapable: Bool = false,
+                isCoreAIBundle: Bool = false,
+                decisionArchetype: String? = nil) {
         self.name = name
         self.path = path
         self.modelType = modelType
@@ -32,6 +41,9 @@ public struct QWModelCatalogEntry: Equatable, Sendable {
         self.maxSpeculativeDrafts = maxSpeculativeDrafts
         self.hasLSASidecar = hasLSASidecar
         self.lsaSidecarPath = lsaSidecarPath
+        self.isDecisionCapable = isDecisionCapable
+        self.isCoreAIBundle = isCoreAIBundle
+        self.decisionArchetype = decisionArchetype
     }
 
     public var supported: Bool { reason == nil }
@@ -127,9 +139,35 @@ public enum QWModelCatalog {
         return local + hub.filter { !localNames.contains($0.name) }
     }
 
-    /// Classifies one installed model folder or snapshot directory from its `config.json`.
+    /// Scans local `~/.qwg/models` and the Hugging Face hub cache for runnable decision sidecars.
+    public static func scanDecisionSidecars(
+        localDirectory: String = QWPaths.modelsDirectoryPath,
+        hfHubDirectory: String = QWPaths.hfHubCacheDirectoryURL.path,
+        createLocalDirectoryIfMissing: Bool = true
+    ) -> [QWModelCatalogEntry] {
+        scanInstalledPrimaryModels(
+            localDirectory: localDirectory,
+            hfHubDirectory: hfHubDirectory,
+            createLocalDirectoryIfMissing: createLocalDirectoryIfMissing
+        ).filter { $0.supported && ($0.isDecisionCapable || $0.isCoreAIBundle) }
+    }
+
+    /// Classifies one installed model folder or snapshot directory from its `config.json` or CoreAI bundle.
     public static func classify(name: String, path: String) -> QWModelCatalogEntry {
+        let rootURL = URL(fileURLWithPath: path)
+        let root = QWModelRoot(url: rootURL)
+        let isCoreAI = (root.kind == .coreAIModel)
         guard let data = readConfigData(at: path) else {
+            if isCoreAI {
+                let coreWindow = readCoreAIWindow(at: path)
+                return QWModelCatalogEntry(
+                    name: name, path: path, modelType: "coreai_decision",
+                    family: .lfm2Encoder, nativeWindow: coreWindow, reason: nil,
+                    capabilities: [.decision], maxSpeculativeDrafts: 0,
+                    isDecisionCapable: true, isCoreAIBundle: true,
+                    decisionArchetype: "optionMarkers+CoreAI"
+                )
+            }
             return QWModelCatalogEntry(name: name, path: path, modelType: nil, family: nil,
                                        nativeWindow: nil, reason: "no config.json")
         }
@@ -137,8 +175,8 @@ public enum QWModelCatalog {
         do {
             let desc = try QWModelDescriptor.decode(configJSON: data)
             let sidecarURL = QWLSAConfig.resolveSidecarURL(packPath: path)
-            // A model the engine does not officially serve is not runnable,
-            // and the entry must say so rather than advertise it.
+            let isDecision = (desc.decisionConfig != nil) || desc.capabilities.contains(.decision) || isCoreAI
+            let archetype = describeDecisionArchetype(desc.decisionConfig, isCoreAI: isCoreAI)
             guard QWModelFamilyRegistry.shared.isSupported(modelType: desc.modelType) else {
                 return QWModelCatalogEntry(name: name, path: path, modelType: desc.modelType,
                                            family: desc.family, nativeWindow: desc.maxPositionEmbeddings,
@@ -146,7 +184,10 @@ public enum QWModelCatalog {
                                            capabilities: desc.capabilities,
                                            maxSpeculativeDrafts: desc.maxSpeculativeDrafts,
                                            hasLSASidecar: sidecarURL != nil,
-                                           lsaSidecarPath: sidecarURL?.path)
+                                           lsaSidecarPath: sidecarURL?.path,
+                                           isDecisionCapable: isDecision,
+                                           isCoreAIBundle: isCoreAI,
+                                           decisionArchetype: archetype)
             }
             return QWModelCatalogEntry(name: name, path: path, modelType: desc.modelType,
                                        family: desc.family, nativeWindow: desc.maxPositionEmbeddings,
@@ -154,7 +195,10 @@ public enum QWModelCatalog {
                                        capabilities: desc.capabilities,
                                        maxSpeculativeDrafts: desc.maxSpeculativeDrafts,
                                        hasLSASidecar: sidecarURL != nil,
-                                       lsaSidecarPath: sidecarURL?.path)
+                                       lsaSidecarPath: sidecarURL?.path,
+                                       isDecisionCapable: isDecision,
+                                       isCoreAIBundle: isCoreAI,
+                                       decisionArchetype: archetype)
         } catch let error as QWModelDescriptor.DescriptorError {
             return QWModelCatalogEntry(name: name, path: path, modelType: modelType, family: nil,
                                        nativeWindow: nil, reason: error.description)
@@ -275,5 +319,28 @@ public enum QWModelCatalog {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         if let top = obj["model_type"] as? String { return top }
         return (obj["text_config"] as? [String: Any])?["model_type"] as? String
+    }
+
+    private static func readCoreAIWindow(at path: String) -> Int? {
+        let dir = URL(fileURLWithPath: path)
+        for name in ["combined_provenance.json", "rl_agent_config.json"] {
+            let url = dir.appendingPathComponent(name)
+            guard let data = try? Data(contentsOf: url),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if let len = obj["sequence_length"] as? Int ?? obj["max_length"] as? Int, len > 0 { return len }
+        }
+        return nil
+    }
+
+    private static func describeDecisionArchetype(
+        _ config: QWDecisionModelConfig?,
+        isCoreAI: Bool
+    ) -> String? {
+        guard let config else { return isCoreAI ? "coreai" : nil }
+        switch config.framing {
+        case .turnVerbalizer: return isCoreAI ? "verbalizer+CoreAI" : "verbalizer"
+        case .optionMarkers: return isCoreAI ? "optionMarkers+CoreAI" : "optionMarkers"
+        case .sequencePair: return isCoreAI ? "sequencePair+CoreAI" : "sequencePair"
+        }
     }
 }

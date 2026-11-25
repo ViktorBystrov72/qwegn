@@ -396,6 +396,8 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
         let qkvCols = w.qkvProj.n
         let attnYSlice = driver.prefixRows(sc.attnY16, rows: 1, cols: qkvCols, dt: .f16)
         try driver.gemvH16T4(enc, n: qkvCols, k: H, x: sc.ln1, gs: sc.gs, wQ4: w.qkvProj, y16: attnYSlice)
+        let ropePos = max(0, pos + context.session.roundRecord.mropeDelta)
+        let turnTable = context.session.mropeTurnTableSlice(pos: pos, count: 1, rotaryDims: geometry.rotaryDims)
         // C07 fused per-head norm + partial rope (position [pos]).
         if let qkvBias = w.qkvBias {
             try driver.ropeApply.encodeExtractQK(enc, hal: driver.hal,
@@ -403,13 +405,15 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                                                   qOut: sc.qR, kOut: sc.kR, vOut: sc.v16,
                                                   wq: w.wq, wk: w.wkTiled,
                                                   qkvBias: qkvBias,
-                                                  positionStart: pos, count: 1,
-                                                  inRowCols: qkvCols)
+                                                  positionStart: ropePos, count: 1,
+                                                  inRowCols: qkvCols,
+                                                  customTable: turnTable)
         } else {
             try driver.ropeApply.encodeQK(enc, hal: driver.hal, q: sc.q16, k: sc.k16,
                                           wq: w.wq, wk: w.wkTiled,
                                           qOut: sc.qR, kOut: sc.kR,
-                                          positionStart: pos, count: 1)
+                                          positionStart: ropePos, count: 1,
+                                          customTable: turnTable)
         }
         if let mbsa = driver.mbsaOperator, let mbsaW = w.mbsa, pos + 1 <= mbsa.maxContext {
             let idxCols = geometry.mbsaIdxCols
@@ -545,6 +549,8 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                        x: driver.prefixRows(psc.ln1, rows: T, cols: H, dt: .f16),
                        wQ4: w.qkvProj,
                        y16: attnYSlice)
+        let prefillRopePos = max(0, pos + context.session.roundRecord.mropeDelta)
+        let prefillTurnTable = context.session.mropeTurnTableSlice(pos: pos, count: T, rotaryDims: geometry.rotaryDims)
         try driver.ropeApply.encodeExtractQK(enc, hal: driver.hal,
                                               attnY: attnYSlice,
                                               qOut: driver.prefixRows(psc.attQR16, rows: T, cols: qOut, dt: .f16),
@@ -552,8 +558,9 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                                               vOut: driver.prefixRows(psc.attV16, rows: T, cols: kvC, dt: .f16),
                                               wq: w.wq, wk: w.wkTiled,
                                               qkvBias: w.qkvBias,
-                                              positionStart: pos, count: T,
-                                              inRowCols: qkvCols)
+                                              positionStart: prefillRopePos, count: T,
+                                              inRowCols: qkvCols,
+                                              customTable: prefillTurnTable)
         if let mbsa = driver.mbsaOperator, let mbsaW = w.mbsa, pos + T <= mbsa.maxContext {
             let idxCols = geometry.mbsaIdxCols
             if let idxProj = mbsaW.qkvIdxProj {
@@ -725,7 +732,7 @@ final class FullAttentionLayerKernel: DenseLayerKernel, QWLayerKernel, @unchecke
                 enc, hal: driver.hal,
                 attnY: yRow, qOut: qRow, kOut: kRow, vOut: vRow,
                 wq: w.wq, wk: w.wkTiled, qkvBias: w.qkvBias,
-                positionStart: pos, count: 1)
+                positionStart: max(0, pos + sess.roundRecord.mropeDelta), count: 1)
             enc.memoryBarrier(scope: .buffers)
             let activeKeys = layerSW > 0 ? min(pos + 1, layerSW) : (pos + 1)
             try attnDecode.encode(

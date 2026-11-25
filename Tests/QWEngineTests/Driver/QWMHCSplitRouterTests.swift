@@ -3,6 +3,9 @@ import Metal
 @testable import QWCore
 @testable import QWHAL
 @testable import QWEngine
+import QWAlloc
+import QWGEMM
+import QWQuant
 
 /// Split mHC router (partial + finalize) and the multi-row prefill router must match the fused
 /// qwg_mhc_router_norm_f16 kernel.
@@ -37,26 +40,30 @@ final class QWMHCSplitRouterTests: XCTestCase {
     private enum Kernel { case fused, split, rows }
 
     private func run(_ kernel: Kernel, merge: Bool, rows: Int = 3,
-                     streams: Int? = nil, geometry: QWModelGeometry? = nil) throws -> Outputs {
+                     streams: Int? = nil, hiddenOverride: Int? = nil,
+                     geometry: QWModelGeometry? = nil) throws -> Outputs {
         let activeC = streams ?? c
+        let activeHidden = hiddenOverride ?? hidden
         let geo = try geometry ?? QWWeightAllocationPlanTests.glm53FlashGeometry()
         let hal = try QWHal(geometry: geo)
         let numRows = 2 * activeC + activeC * activeC
         let numCtrl = activeC + activeC * activeC
-        let width = activeC * hidden
-        let stream = try buffer(hal, (0..<(rows * width)).map { sin(Float($0) * 0.0037) * 0.9 })
-        let w = try buffer(hal, (0..<(numRows * width)).map { cos(Float($0) * 0.013) * 0.05 })
+        let width = activeC * activeHidden
+        let streamArr = (0..<(rows * width)).map { Float(($0 % 997) - 498) * 0.0019 }
+        let wF32 = (0..<(numRows * width)).map { cos(Float($0 % 2048) * 0.013) * 0.05 }
+        let stream = try buffer(hal, streamArr)
+        let w = try buffer(hal, wF32)
         let b = try buffer(hal, (0..<numRows).map { sin(Float($0) * 0.3) * 0.2 })
-        let gamma = try buffer(hal, f16: (0..<hidden).map { sin(Float($0) * 0.01) * 0.1 })
-        let out = try buffer(hal, f16: [Float](repeating: 0, count: rows * hidden))
+        let gamma = try buffer(hal, f16: (0..<activeHidden).map { sin(Float($0) * 0.01) * 0.1 })
+        let out = try buffer(hal, f16: [Float](repeating: 0, count: rows * activeHidden))
         var prev = [Float](repeating: 0, count: rows * numCtrl)
         for t in 0..<rows {
             for i in 0..<activeC { prev[t * numCtrl + i] = 0.5 + 0.1 * Float(i) }
             for m in 0..<(activeC * activeC) { prev[t * numCtrl + activeC + m] = (m % (activeC + 1) == 0 ? 0.7 : 0.1) }
         }
         let ctrl = try buffer(hal, prev)
-        let branch = try buffer(hal, f16: (0..<(rows * hidden)).map { cos(Float($0) * 0.021) * 0.5 })
-        var uHidden = UInt32(hidden)
+        let branch = try buffer(hal, f16: (0..<(rows * activeHidden)).map { Float((($0 * 7) % 503) - 251) * 0.002 })
+        var uHidden = UInt32(activeHidden)
         var eps: Float = 1e-6
         var preScale: Float = 1.0
         var iters: UInt32 = 20 | (merge ? 0x8000_0000 : 0)
@@ -64,7 +71,7 @@ final class QWMHCSplitRouterTests: XCTestCase {
         let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
         let enc = try XCTUnwrap(cb.makeComputeCommandEncoder(dispatchType: .serial))
         if kernel == .split {
-            let parts = (hidden + 63) / 64
+            let parts = (activeHidden + 63) / 64
             let partials = try XCTUnwrap(hal.device.makeBuffer(length: rows * parts * (numRows + 1 + activeC * (activeC + 1) / 2) * 4))
             enc.setComputePipelineState(try hal.pipeline("qwg_mhc_router_partial_f32"))
             enc.setBuffer(stream, offset: 0, index: 0)
@@ -88,7 +95,7 @@ final class QWMHCSplitRouterTests: XCTestCase {
             enc.setBytes(&eps, length: 4, index: 7)
             enc.setBytes(&preScale, length: 4, index: 8)
             enc.setBytes(&iters, length: 4, index: 9)
-            enc.dispatchThreadgroups(MTLSize(width: (hidden + 255) / 256, height: rows, depth: 1),
+            enc.dispatchThreadgroups(MTLSize(width: (activeHidden + 255) / 256, height: rows, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         } else {
             enc.setComputePipelineState(try hal.pipeline(kernel == .rows ? "qwg_mhc_router_norm_rows_f16"
@@ -103,7 +110,7 @@ final class QWMHCSplitRouterTests: XCTestCase {
             enc.setBuffer(merge ? branch : out, offset: 0, index: 10)
             var uRows = UInt32(rows)
             enc.setBytes(&uRows, length: 4, index: 11)
-            let rpg = QWEngineDriver.mhcRouterRowsPerGroup
+            let rpg = QWEngineDriver.mhcRouterRowsPerGroup(streams: activeC)
             let groups = kernel == .rows ? (rows + rpg - 1) / rpg : rows
             enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
@@ -112,7 +119,7 @@ final class QWMHCSplitRouterTests: XCTestCase {
         cb.commit()
         cb.waitUntilCompleted()
         XCTAssertNil(cb.error)
-        return Outputs(stream: floats(stream, rows * width), norm: halves(out, rows * hidden),
+        return Outputs(stream: floats(stream, rows * width), norm: halves(out, rows * activeHidden),
                        ctrl: floats(ctrl, rows * numCtrl))
     }
 
@@ -203,6 +210,365 @@ final class QWMHCSplitRouterTests: XCTestCase {
             assertClose(split3.stream, fused3.stream, tol: 1e-6, "c2 split stream merge=\(merge)")
             assertClose(split3.ctrl, fused3.ctrl, tol: 1e-4, "c2 split ctrl merge=\(merge)")
             assertClose(split3.norm, fused3.norm, tol: 1e-3, "c2 split norm merge=\(merge)")
+        }
+    }
+
+    private func ernieAdditiveEpsGeometry() throws -> QWModelGeometry {
+        let json = """
+        {
+          "architectures": ["Ernie5_5_MoeForCausalLM"],
+          "model_type": "ernie5_5_moe",
+          "vocab_size": 1024,
+          "hidden_size": 4096,
+          "intermediate_size": 256,
+          "num_hidden_layers": 2,
+          "max_position_embeddings": 8192,
+          "rms_norm_eps": 1e-6,
+          "num_attention_heads": 64,
+          "num_key_value_heads": 1,
+          "head_dim": 128,
+          "partial_rotary_factor": 1.0,
+          "layer_types": ["full_attention", "full_attention"],
+          "enable_hyper_connections": true,
+          "hc_mult": 4,
+          "hc_sinkhorn_iters": 20,
+          "hc_eps": 1e-6,
+          "eos_token_id": 2
+        }
+        """.data(using: .utf8)!
+        return QWModelGeometry(descriptor: try QWModelDescriptor.decode(configJSON: json))
+    }
+
+    func testRowsKernelLargeAndSmallParity() throws {
+        let geoErnie = try ernieAdditiveEpsGeometry()
+        for merge in [false, true] {
+            let fused65 = try run(.fused, merge: merge, rows: 65, geometry: geoErnie)
+            let multi65 = try run(.rows, merge: merge, rows: 65, geometry: geoErnie)
+            assertZeroULP(multi65.stream, fused65.stream, "ernie rows stream T=65 merge=\(merge)")
+            assertClose(multi65.ctrl, fused65.ctrl, tol: 1e-5, "ernie rows ctrl T=65 merge=\(merge)")
+            assertClose(multi65.norm, fused65.norm, tol: 1e-3, "ernie rows norm T=65 merge=\(merge)")
+        }
+        let fusedSmall = try run(.fused, merge: true, rows: 17, hiddenOverride: 128, geometry: geoErnie)
+        let multiSmall = try run(.rows, merge: true, rows: 17, hiddenOverride: 128, geometry: geoErnie)
+        assertZeroULP(multiSmall.stream, fusedSmall.stream, "h128 rows stream")
+        assertClose(multiSmall.ctrl, fusedSmall.ctrl, tol: 1e-5, "h128 rows ctrl")
+        assertClose(multiSmall.norm, fusedSmall.norm, tol: 1e-3, "h128 rows norm")
+    }
+
+    func testRowsKernelInformationalLatencyVsFusedAt4087() throws {
+        let geo = try ernieAdditiveEpsGeometry()
+        let hal = try QWHal(geometry: geo)
+
+        let rows = 4087
+        let activeC = 4
+        let activeHidden = 4096
+        let width = activeC * activeHidden
+        let numRows = 2 * activeC + activeC * activeC
+        let numCtrl = activeC + activeC * activeC
+        let streamCount = rows * width
+        let ctrlCount = rows * numCtrl
+
+        let streamRef = try XCTUnwrap(hal.device.makeBuffer(length: streamCount * 4, options: .storageModeShared))
+        let streamRun = try XCTUnwrap(hal.device.makeBuffer(length: streamCount * 4, options: .storageModeShared))
+        let streamPtr = streamRef.contents().bindMemory(to: Float.self, capacity: streamCount)
+        for i in 0..<streamCount { streamPtr[i] = Float((i % 997) - 498) * 0.0019 }
+
+        let ctrlRef = try XCTUnwrap(hal.device.makeBuffer(length: ctrlCount * 4, options: .storageModeShared))
+        let ctrlRun = try XCTUnwrap(hal.device.makeBuffer(length: ctrlCount * 4, options: .storageModeShared))
+        let ctrlPtr = ctrlRef.contents().bindMemory(to: Float.self, capacity: ctrlCount)
+        for t in 0..<rows {
+            for i in 0..<activeC { ctrlPtr[t * numCtrl + i] = 0.5 + 0.1 * Float(i) }
+            for m in 0..<(activeC * activeC) {
+                ctrlPtr[t * numCtrl + activeC + m] = (m % (activeC + 1) == 0 ? 0.7 : 0.1)
+            }
+        }
+
+        let w = try buffer(hal, (0..<(numRows * width)).map { cos(Float($0 % 2048) * 0.013) * 0.05 })
+        let b = try buffer(hal, (0..<numRows).map { sin(Float($0) * 0.3) * 0.2 })
+        let gamma = try buffer(hal, f16: (0..<activeHidden).map { sin(Float($0) * 0.01) * 0.1 })
+        let branch = try buffer(hal, f16: (0..<(rows * activeHidden)).map { Float((($0 * 7) % 503) - 251) * 0.002 })
+        let outFused = try XCTUnwrap(hal.device.makeBuffer(length: rows * activeHidden * 2, options: .storageModeShared))
+        let outRows = try XCTUnwrap(hal.device.makeBuffer(length: rows * activeHidden * 2, options: .storageModeShared))
+
+        let psoFused = try hal.pipeline("qwg_mhc_router_norm_f16")
+        let psoRows = try hal.pipeline("qwg_mhc_router_norm_rows_f16")
+
+        func resetInputs() throws {
+            let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+            let blit = try XCTUnwrap(cb.makeBlitCommandEncoder())
+            blit.copy(from: streamRef, sourceOffset: 0, to: streamRun, destinationOffset: 0, size: streamCount * 4)
+            blit.copy(from: ctrlRef, sourceOffset: 0, to: ctrlRun, destinationOffset: 0, size: ctrlCount * 4)
+            blit.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            XCTAssertNil(cb.error)
+        }
+
+        func runOnce(isRows: Bool, outBuf: any MTLBuffer) throws -> Double {
+            try resetInputs()
+            var uHidden = UInt32(activeHidden)
+            var eps: Float = 1e-6
+            var preScale: Float = 1.0
+            var iters: UInt32 = 20 | 0x8000_0000
+            var uRows = UInt32(rows)
+            let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+            let enc = try XCTUnwrap(cb.makeComputeCommandEncoder(dispatchType: .serial))
+            enc.setComputePipelineState(isRows ? psoRows : psoFused)
+            for (i, buf) in [streamRun, w, b, gamma, outBuf, ctrlRun].enumerated() {
+                enc.setBuffer(buf, offset: 0, index: i)
+            }
+            enc.setBytes(&uHidden, length: 4, index: 6)
+            enc.setBytes(&eps, length: 4, index: 7)
+            enc.setBytes(&preScale, length: 4, index: 8)
+            enc.setBytes(&iters, length: 4, index: 9)
+            enc.setBuffer(branch, offset: 0, index: 10)
+            let groups: Int
+            if isRows {
+                enc.setBytes(&uRows, length: 4, index: 11)
+                let rpg = QWEngineDriver.mhcRouterRowsPerGroup(streams: activeC)
+                groups = (rows + rpg - 1) / rpg
+            } else {
+                groups = rows
+            }
+            enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            XCTAssertNil(cb.error)
+            return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+        }
+
+        _ = try runOnce(isRows: false, outBuf: outFused)
+        let fusedStream = floats(streamRun, streamCount)
+        let fusedCtrl = floats(ctrlRun, ctrlCount)
+        _ = try runOnce(isRows: true, outBuf: outRows)
+        assertZeroULP(floats(streamRun, streamCount), fusedStream, "T=4087 stream fused vs rows")
+        assertClose(floats(ctrlRun, ctrlCount), fusedCtrl, tol: 1e-5, "T=4087 ctrl fused vs rows")
+        assertClose(halves(outRows, rows * activeHidden), halves(outFused, rows * activeHidden),
+                    tol: 1e-3, "T=4087 norm fused vs rows")
+
+        var fusedBest = Double.greatestFiniteMagnitude
+        var rowsBest = Double.greatestFiniteMagnitude
+        for iter in 0..<7 {
+            let fMs = try runOnce(isRows: false, outBuf: outFused)
+            let rMs = try runOnce(isRows: true, outBuf: outRows)
+            if iter >= 2 {
+                fusedBest = min(fusedBest, fMs)
+                rowsBest = min(rowsBest, rMs)
+            }
+        }
+        print(String(format: "[QWMHCSplitRouterTests] T=%d H=%d C=%d merge=true minGPU: fused=%.3f ms vs rows=%.3f ms (%.2fx)",
+                     rows, activeHidden, activeC, fusedBest, rowsBest, fusedBest / max(rowsBest, 1e-6)))
+    }
+
+    private func runRouterKernel(hal: QWHal, pso: any MTLComputePipelineState, isNax: Bool,
+                                 wBuf: any MTLBuffer, xBuf: any MTLBuffer, outBuf: any MTLBuffer,
+                                 rows: Int, n: Int, k: Int,
+                                 weightMode: UInt32 = 0, flags: UInt32 = 0) throws -> Double {
+        var uM = UInt32(rows)
+        var uN = UInt32(n)
+        var uK = UInt32(k)
+        var wm = weightMode
+        var fl = flags
+        let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+        let enc = try XCTUnwrap(cb.makeComputeCommandEncoder(dispatchType: .serial))
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(wBuf, offset: 0, index: 0)
+        enc.setBuffer(xBuf, offset: 0, index: 1)
+        enc.setBuffer(outBuf, offset: 0, index: 2)
+        enc.setBytes(&uM, length: 4, index: 3)
+        enc.setBytes(&uN, length: 4, index: 4)
+        enc.setBytes(&uK, length: 4, index: 5)
+        if !isNax {
+            enc.setBytes(&wm, length: 4, index: 6)
+        }
+        enc.setBuffer(wBuf, offset: 0, index: 7)
+        enc.setBuffer(outBuf, offset: 0, index: 8)
+        enc.setBytes(&fl, length: 4, index: 9)
+        if isNax {
+            enc.dispatchThreadgroups(MTLSize(width: n / 64, height: (rows + 63) / 64, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        } else {
+            enc.dispatchThreadgroups(MTLSize(width: (n + 31) / 32, height: (rows + 31) / 32, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        XCTAssertNil(cb.error)
+        return (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+    }
+
+    func testRouterNaxF32InformationalLatencyVsGemmAt4087() throws {
+        let geo = try ernieAdditiveEpsGeometry()
+        let hal = try QWHal(geometry: geo)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable, "qwg_router_nax_f32 requires Metal 4")
+
+        let rows = 4087
+        let n = 1024
+        let k = 4096
+        let wBuf = try XCTUnwrap(hal.device.makeBuffer(length: n * k * 4, options: .storageModeShared))
+        let xBuf = try XCTUnwrap(hal.device.makeBuffer(length: rows * k * 4, options: .storageModeShared))
+        let outNax = try XCTUnwrap(hal.device.makeBuffer(length: rows * n * 4, options: .storageModeShared))
+        let outGemm = try XCTUnwrap(hal.device.makeBuffer(length: rows * n * 4, options: .storageModeShared))
+
+        let wPtr = wBuf.contents().bindMemory(to: Float.self, capacity: n * k)
+        for i in 0..<(n * k) { wPtr[i] = Float(((i * 13) % 997) - 498) * 0.0002 }
+        let xPtr = xBuf.contents().bindMemory(to: Float.self, capacity: rows * k)
+        for i in 0..<(rows * k) { xPtr[i] = Float(((i * 7) % 991) - 495) * 0.0005 }
+
+        let psoNax = try hal.pipeline("qwg_router_nax_f32")
+        let psoGemm = try hal.pipeline("qwg_router_gemm")
+
+        _ = try runRouterKernel(hal: hal, pso: psoGemm, isNax: false,
+                                wBuf: wBuf, xBuf: xBuf, outBuf: outGemm, rows: rows, n: n, k: k)
+        _ = try runRouterKernel(hal: hal, pso: psoNax, isNax: true,
+                                wBuf: wBuf, xBuf: xBuf, outBuf: outNax, rows: rows, n: n, k: k)
+        assertClose(floats(outNax, rows * n), floats(outGemm, rows * n),
+                    tol: 2e-3, "T=4087 N=1024 K=4096 router_nax_f32 vs gemm")
+
+        var gemmBest = Double.greatestFiniteMagnitude
+        var naxBest = Double.greatestFiniteMagnitude
+        for iter in 0..<7 {
+            let gMs = try runRouterKernel(hal: hal, pso: psoGemm, isNax: false,
+                                          wBuf: wBuf, xBuf: xBuf, outBuf: outGemm, rows: rows, n: n, k: k)
+            let nMs = try runRouterKernel(hal: hal, pso: psoNax, isNax: true,
+                                          wBuf: wBuf, xBuf: xBuf, outBuf: outNax, rows: rows, n: n, k: k)
+            if iter >= 2 {
+                gemmBest = min(gemmBest, gMs)
+                naxBest = min(naxBest, nMs)
+            }
+        }
+        print(String(format: "[QWMHCSplitRouterTests] T=%d N=%d K=%d minGPU: router_gemm=%.3f ms vs router_nax_f32=%.3f ms (%.2fx)",
+                     rows, n, k, gemmBest, naxBest, gemmBest / max(naxBest, 1e-6)))
+    }
+
+    func testRouterNaxF16InputParityAndLatencyAt4087() throws {
+        let geo = try ernieAdditiveEpsGeometry()
+        let hal = try QWHal(geometry: geo)
+        try XCTSkipUnless(hal.caps.isMetal4TensorCapable, "qwg_router_nax requires Metal 4")
+
+        let rows = 4087
+        let n = 1024
+        let k = 4096
+        let wF32Buf = try XCTUnwrap(hal.device.makeBuffer(length: n * k * 4, options: .storageModeShared))
+        let wBF16Buf = try XCTUnwrap(hal.device.makeBuffer(length: n * k * 2, options: .storageModeShared))
+        let xF32Buf = try XCTUnwrap(hal.device.makeBuffer(length: rows * k * 4, options: .storageModeShared))
+        let xF16Buf = try XCTUnwrap(hal.device.makeBuffer(length: rows * k * 2, options: .storageModeShared))
+        let outRefF32 = try XCTUnwrap(hal.device.makeBuffer(length: rows * n * 4, options: .storageModeShared))
+        let outRefBF16 = try XCTUnwrap(hal.device.makeBuffer(length: rows * n * 4, options: .storageModeShared))
+        let outNaxF32 = try XCTUnwrap(hal.device.makeBuffer(length: rows * n * 4, options: .storageModeShared))
+        let outNaxBF16 = try XCTUnwrap(hal.device.makeBuffer(length: rows * n * 4, options: .storageModeShared))
+
+        let wF32Ptr = wF32Buf.contents().bindMemory(to: Float.self, capacity: n * k)
+        let wBF16Ptr = wBF16Buf.contents().bindMemory(to: UInt16.self, capacity: n * k)
+        for i in 0..<(n * k) {
+            let v = Float(((i * 13) % 997) - 498) * 0.0002
+            wF32Ptr[i] = v
+            wBF16Ptr[i] = QWBF16.fromFloatRNE(v)
+        }
+        let xF32Ptr = xF32Buf.contents().bindMemory(to: Float.self, capacity: rows * k)
+        let xF16Ptr = xF16Buf.contents().bindMemory(to: Float16.self, capacity: rows * k)
+        for i in 0..<(rows * k) {
+            let h = Float16(Float(((i * 7) % 991) - 495) * 0.0005)
+            xF16Ptr[i] = h
+            xF32Ptr[i] = Float(h)
+        }
+
+        let psoGemm = try hal.pipeline("qwg_router_gemm")
+        let psoNaxF32 = try hal.pipeline("qwg_router_nax_f32")
+        let psoNaxBF16 = try hal.pipeline("qwg_router_nax")
+
+        _ = try runRouterKernel(hal: hal, pso: psoGemm, isNax: false,
+                                wBuf: wF32Buf, xBuf: xF32Buf, outBuf: outRefF32, rows: rows, n: n, k: k, weightMode: 0)
+        _ = try runRouterKernel(hal: hal, pso: psoGemm, isNax: false,
+                                wBuf: wBF16Buf, xBuf: xF32Buf, outBuf: outRefBF16, rows: rows, n: n, k: k, weightMode: 1)
+        _ = try runRouterKernel(hal: hal, pso: psoNaxF32, isNax: true,
+                                wBuf: wF32Buf, xBuf: xF16Buf, outBuf: outNaxF32, rows: rows, n: n, k: k, flags: 2)
+        _ = try runRouterKernel(hal: hal, pso: psoNaxBF16, isNax: true,
+                                wBuf: wBF16Buf, xBuf: xF16Buf, outBuf: outNaxBF16, rows: rows, n: n, k: k, flags: 2)
+
+        assertClose(floats(outNaxF32, rows * n), floats(outRefF32, rows * n),
+                    tol: 5e-4, "T=4087 N=1024 K=4096 router_nax_f32(f16 X) vs gemm")
+        assertClose(floats(outNaxBF16, rows * n), floats(outRefBF16, rows * n),
+                    tol: 2e-3, "T=4087 N=1024 K=4096 router_nax(bf16 W, f16 X) vs gemm")
+
+        var f32Best = Double.greatestFiniteMagnitude
+        var bf16Best = Double.greatestFiniteMagnitude
+        for iter in 0..<7 {
+            let fMs = try runRouterKernel(hal: hal, pso: psoNaxF32, isNax: true,
+                                          wBuf: wF32Buf, xBuf: xF16Buf, outBuf: outNaxF32, rows: rows, n: n, k: k, flags: 2)
+            let bMs = try runRouterKernel(hal: hal, pso: psoNaxBF16, isNax: true,
+                                          wBuf: wBF16Buf, xBuf: xF16Buf, outBuf: outNaxBF16, rows: rows, n: n, k: k, flags: 2)
+            if iter >= 2 {
+                f32Best = min(f32Best, fMs)
+                bf16Best = min(bf16Best, bMs)
+            }
+        }
+        print(String(format: "[QWMHCSplitRouterTests] T=%d N=%d K=%d F16-X minGPU: router_nax_f32=%.3f ms vs router_nax_bf16=%.3f ms",
+                     rows, n, k, f32Best, bf16Best))
+    }
+
+    func testMoEBridgePlainF16MatchesF32AndFeedsRouterNAX() throws {
+        let geo = try ernieAdditiveEpsGeometry()
+        let rows = 64, n = 128, k = 4096
+        for basis in [QWWeightBasis.rotated, QWWeightBasis.standard] {
+            let hal = try QWHal(geometry: geo, weightBasis: basis)
+            let xBuf = try buffer(hal, f16: (0..<(rows * k)).map { Float((($0 * 7) % 991) - 495) * 0.0005 })
+            let rotBuf = try buffer(hal, [Float](repeating: 0, count: rows * k))
+            let p32Buf = try buffer(hal, [Float](repeating: 0, count: rows * k))
+            let p16Buf = try buffer(hal, [Float](repeating: 0, count: (rows * k + 1) / 2))
+            let wF32Buf = try buffer(hal, (0..<(n * k)).map { Float((($0 * 13) % 997) - 498) * 0.0002 })
+            let wBF16Buf = try XCTUnwrap(hal.device.makeBuffer(length: n * k * 2, options: .storageModeShared))
+            let bfPtr = wBF16Buf.contents().bindMemory(to: UInt16.self, capacity: n * k)
+            let wfPtr = wF32Buf.contents().bindMemory(to: Float.self, capacity: n * k)
+            for i in 0..<(n * k) { bfPtr[i] = QWBF16.fromFloatRNE(wfPtr[i]) }
+            let yRefF32 = try buffer(hal, [Float](repeating: 0, count: rows * n))
+            let yRefBF16 = try buffer(hal, [Float](repeating: 0, count: rows * n))
+            let y16F32 = try buffer(hal, [Float](repeating: 0, count: rows * n))
+            let y16BF16 = try buffer(hal, [Float](repeating: 0, count: rows * n))
+
+            let xT = QWTensorValue(region: QWMRegion(buffer: xBuf, base: 0, length: rows * k * 2),
+                                   offset: 0, shape: QWTensorShape([rows * k], .f16))
+            let rotT = QWTensorValue(region: QWMRegion(buffer: rotBuf, base: 0, length: rows * k * 4),
+                                     offset: 0, shape: QWTensorShape([rows * k], .f32))
+            let p32T = QWTensorValue(region: QWMRegion(buffer: p32Buf, base: 0, length: rows * k * 4),
+                                     offset: 0, shape: QWTensorShape([rows * k], .f32))
+            let p16T = QWTensorValue(region: QWMRegion(buffer: p16Buf, base: 0, length: rows * k * 2),
+                                     offset: 0, shape: QWTensorShape([rows * k], .f16))
+
+            let cb = try XCTUnwrap(hal.queue.makeCommandBuffer())
+            let enc = try XCTUnwrap(cb.makeComputeCommandEncoder(dispatchType: .serial))
+            try QWGemm.encodeMoEBridgeF16ToF32(enc, hal: hal, x: xT, xRot32: rotT, xPlain32: p32T,
+                                               rows: rows, hidden: k, skipRot32: true, plainF16: false)
+            try QWGemm.encodeMoEBridgeF16ToF32(enc, hal: hal, x: xT, xRot32: rotT, xPlain32: p16T,
+                                               rows: rows, hidden: k, skipRot32: true, plainF16: true)
+            enc.memoryBarrier(scope: .buffers)
+            if hal.caps.isMetal4TensorCapable {
+                let wfT = QWTensorValue(region: QWMRegion(buffer: wF32Buf, base: 0, length: n * k * 4),
+                                        offset: 0, shape: QWTensorShape([n * k], .f32))
+                let wbT = QWTensorValue(region: QWMRegion(buffer: wBF16Buf, base: 0, length: n * k * 2),
+                                        offset: 0, shape: QWTensorShape([n * k], .bf16))
+                let yfT = QWTensorValue(region: QWMRegion(buffer: y16F32, base: 0, length: rows * n * 4),
+                                        offset: 0, shape: QWTensorShape([rows * n], .f32))
+                let ybT = QWTensorValue(region: QWMRegion(buffer: y16BF16, base: 0, length: rows * n * 4),
+                                        offset: 0, shape: QWTensorShape([rows * n], .f32))
+                try QWGemm.encodeFnRouterGemm(enc, hal: hal, weight: wfT, x: p16T, y: yfT, rows: rows, n: n, k: k)
+                try QWGemm.encodeFnRouterGemm(enc, hal: hal, weight: wbT, x: p16T, y: ybT, rows: rows, n: n, k: k)
+            }
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted(); XCTAssertNil(cb.error)
+            let p32AsF16 = floats(p32Buf, rows * k).map { Float(Float16($0)) }
+            assertClose(halves(p16Buf, rows * k), p32AsF16, tol: 1e-3, "plainF16 bridge basis=\(basis)")
+            if hal.caps.isMetal4TensorCapable {
+                let psoGemm = try hal.pipeline("qwg_router_gemm")
+                _ = try runRouterKernel(hal: hal, pso: psoGemm, isNax: false,
+                                        wBuf: wF32Buf, xBuf: p32Buf, outBuf: yRefF32, rows: rows, n: n, k: k, weightMode: 0)
+                _ = try runRouterKernel(hal: hal, pso: psoGemm, isNax: false,
+                                        wBuf: wBF16Buf, xBuf: p32Buf, outBuf: yRefBF16, rows: rows, n: n, k: k, weightMode: 1)
+                assertClose(floats(y16F32, rows * n), floats(yRefF32, rows * n), tol: 5e-4, "plain16 F32 router basis=\(basis)")
+                assertClose(floats(y16BF16, rows * n), floats(yRefBF16, rows * n), tol: 2e-3, "plain16 BF16 router basis=\(basis)")
+            }
         }
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce L0 capability-seam isolation across Operators, Subsystems, and Runtime."""
+"""Enforce L0 capability-seam isolation across Operators, Subsystems, Runtime, and Apps."""
 from pathlib import Path
 import re
 import sys
@@ -9,6 +9,7 @@ SCAN_DIRS = [
     ROOT / "Sources/Operators",
     ROOT / "Sources/Subsystems",
     ROOT / "Sources/Runtime",
+    ROOT / "Sources/Apps",
 ]
 ALLOWLIST = {
     (ROOT / "Sources/Runtime/QWEngine/Module/QWModuleRegistry.swift").resolve(),
@@ -17,7 +18,7 @@ ALLOWLIST = {
 GEMM_BUCKET_FAMILY = re.compile(r"\b(?:plan|shape)\s*\.\s*family\b")
 PATTERNS = [
     ("model family comparison", re.compile(r"(?:\b\w+\s*\.\s*)?\.?family\s*(?:==|!=)\s*\.(?!f[1-9]\w*)")),
-    ("family case equality", re.compile(r"\.(?:qwen38\w*|glm5Next|ernie55MoE|maxwellMoE|senseNovaLoop|inkling2Loop|bailingMoeV3|qwen3Dense|qwen3MoE|qwen2Dense|llamaDense|mistralDense)\s*(?:==|!=)")),
+    ("family case equality", re.compile(r"\.(?:qwen38\w*|glm5Next|ernie55MoE|maxwellMoE|senseNovaLoop|inkling2Loop|bailingMoeV3|qwen3Dense|qwen3MoE|qwen2Dense|llamaDense|mistralDense|lfm2|lfm3|lfm2Encoder|modernBert)\s*(?:==|!=)")),
     ("switch on model family", re.compile(r"\bswitch\s+[^\{\n]*\.family\b")),
     ("contains model family", re.compile(r"\.contains\s*\(\s*[^)]*\.family\b")),
     ("modelType comparison", re.compile(r"\.modelType\s*(?:==|!=)")),

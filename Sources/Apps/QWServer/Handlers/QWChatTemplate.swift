@@ -29,7 +29,12 @@ public struct QWChatTemplate: Sendable {
     private let tokenizerContext: [String: QWJson]
     public let rawSource: String
     public let isInkling2Template: Bool
+    private let usesGlobalSettingProtocol: Bool
+    public let toolCallEnvelope: QWToolCallEnvelope
+    public let thinkOpenTag: String?
+    public let thinkCloseTag: String?
     public let supportsThinkingTags: Bool
+    public var usesStandardToolCallHint: Bool { !isInkling2Template && toolCallEnvelope == .standard }
 
     public init(source: String, tokenizerContext: [String: QWJson] = [:]) throws {
         let normalizedSource = Self.normalizePythonJinjaSyntax(source)
@@ -37,9 +42,22 @@ public struct QWChatTemplate: Sendable {
         self.tokenizerContext = tokenizerContext
         self.rawSource = source
         self.isInkling2Template = source.contains("<|content_thinking|>") && source.contains("<|message_model|>")
-        self.supportsThinkingTags = normalizedSource.contains("<think>")
-            || normalizedSource.contains("<ernie:think>")
-            || self.isInkling2Template
+        self.usesGlobalSettingProtocol = source.contains("<|ernie:im_start|>") && source.contains("<ernie:global_setting>")
+        self.toolCallEnvelope = QWToolCallEnvelope.detect(in: normalizedSource)
+        let detectedThink = Self.detectThinkTags(in: normalizedSource)
+        self.thinkOpenTag = detectedThink?.open
+        self.thinkCloseTag = detectedThink?.close
+        self.supportsThinkingTags = detectedThink != nil || self.isInkling2Template
+    }
+
+    private static func detectThinkTags(in source: String) -> (open: String, close: String)? {
+        guard let regex = try? NSRegularExpression(pattern: #"</?((?:[A-Za-z0-9_]+:)?think)>"#),
+              let match = regex.firstMatch(in: source, range: NSRange(source.startIndex..<source.endIndex, in: source)),
+              let nameRange = Range(match.range(at: 1), in: source) else {
+            return nil
+        }
+        let tagName = String(source[nameRange])
+        return ("<\(tagName)>", "</\(tagName)>")
     }
 
     public func tokenizerTokenString(_ key: String) -> String? {
@@ -147,6 +165,9 @@ public struct QWChatTemplate: Sendable {
         if isInkling2Template {
             return try renderInkling2(messages: messages, options: options)
         }
+        if usesGlobalSettingProtocol {
+            return try renderErnie(messages: messages, options: options)
+        }
         var context = tokenizerContext.mapValues(Self.value(from:))
         context["messages"] = .array(messages.map(Self.value(from:)))
         context["add_generation_prompt"] = .boolean(options.addGenerationPrompt)
@@ -158,8 +179,10 @@ public struct QWChatTemplate: Sendable {
         var rendered = try template.render(context)
         if options.addGenerationPrompt,
            case .bool(false) = options.enableThinking,
-           rendered.hasSuffix("<think>") {
-            rendered += "</think>"
+           let openThink = thinkOpenTag,
+           let closeThink = thinkCloseTag,
+           rendered.hasSuffix(openThink) {
+            rendered += closeThink
         }
         return rendered
     }

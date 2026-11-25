@@ -8,6 +8,8 @@ public enum QWWeightSourceKind: String, Sendable, CaseIterable, Codable {
     case safetensorsSingle
     /// A sharded checkpoint described by `model.safetensors.index.json`.
     case safetensorsSharded
+    /// A compiled CoreAI bundle (`combined_provenance.json` + `*.aimodel`) for ANE execution.
+    case coreAIModel
 }
 
 /// Which weight container the caller wants.
@@ -77,6 +79,7 @@ public struct QWModelRoot: Sendable {
             "model.qwp",
             "model.safetensors",
             "model.safetensors.index.json",
+            "combined_provenance.json",
         ]
         for marker in directMarkers {
             if fm.fileExists(atPath: url.appendingPathComponent(marker).path) {
@@ -153,11 +156,11 @@ public struct QWModelRoot: Sendable {
             }
         }
         let last = url.lastPathComponent
-        let knownFileExtensions: Set<String> = ["qwp", "safetensors", "bin", "gguf", "json", "qlsa"]
+        let knownFileExtensions: Set<String> = ["qwp", "safetensors", "bin", "gguf", "json", "qlsa", "aimodel"]
         let ext = url.pathExtension.lowercased()
         if knownFileExtensions.contains(ext) {
             let stem = url.deletingPathExtension().lastPathComponent
-            let genericStems: Set<String> = ["model", "weights", "model.safetensors.index", "config"]
+            let genericStems: Set<String> = ["model", "weights", "model.safetensors.index", "config", "rl_agent"]
             if genericStems.contains(stem.lowercased()) {
                 let parentName = url.deletingLastPathComponent().lastPathComponent
                 if !parentName.isEmpty && parentName != "/" {
@@ -169,11 +172,29 @@ public struct QWModelRoot: Sendable {
         return last
     }
 
+    /// Resolves a CoreAI `.aimodel` package inside a model directory (preferring `rl_agent.aimodel`).
+    public static func resolveCoreAIModelURL(
+        in directory: URL,
+        fileManager fm: FileManager = .default
+    ) -> URL? {
+        let preferred = directory.appendingPathComponent("rl_agent.aimodel")
+        if fm.fileExists(atPath: preferred.path) { return preferred }
+        guard let items = try? fm.contentsOfDirectory(atPath: directory.path) else { return nil }
+        for name in items.sorted() where name.lowercased().hasSuffix(".aimodel") {
+            let candidate = directory.appendingPathComponent(name)
+            if fm.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return nil
+    }
+
     private static func resolveWeights(root: URL,
                                        isDirectory: Bool,
                                        url: URL,
                                        preference: QWWeightSourcePreference) -> (URL, QWWeightSourceKind?) {
         let fm = FileManager.default
+        if url.pathExtension.lowercased() == "aimodel", fm.fileExists(atPath: url.path) {
+            return (url, preference == .auto ? .coreAIModel : nil)
+        }
         // A file argument IS the weights.
         if !isDirectory {
             var isFileDir: ObjCBool = false
@@ -216,7 +237,11 @@ public struct QWModelRoot: Sendable {
             return pickSafetensors() ?? (single, nil)
         case .auto:
             if hasQWP { return (qwp, .qwp1) }
-            return pickSafetensors() ?? (qwp, nil)
+            if let st = pickSafetensors() { return st }
+            if let ai = resolveCoreAIModelURL(in: root, fileManager: fm) {
+                return (ai, .coreAIModel)
+            }
+            return (qwp, nil)
         }
     }
 

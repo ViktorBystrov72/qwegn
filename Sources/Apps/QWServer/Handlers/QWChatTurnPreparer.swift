@@ -6,6 +6,7 @@ import Foundation
 import QWCore
 import QWEngine
 import QWHead
+import QWMM
 import QWToken
 
 /// Immutable prepared chat turn produced by `QWChatTurnPreparer`.
@@ -24,6 +25,8 @@ public struct QWPreparedChatPrompt: @unchecked Sendable {
     public let stops: Set<Int>
     public let imEndTokenId: Int
     public let endThinkTokenId: Int
+    public let endThinkCloseTag: String
+    public let toolCallEnvelope: QWToolCallEnvelope
     public let userTextContainsImEnd: Bool
     public let customStopStrings: [String]
 }
@@ -52,7 +55,8 @@ public enum QWChatTurnPreparer {
             vocabularySize: descriptor.vocab,
             supportsTokenConstraints: supportsTokenConstraints,
             memoryManifest: memoryManifest,
-            effectiveMaxNewTokens: effectiveMaxNewTokens
+            effectiveMaxNewTokens: effectiveMaxNewTokens,
+            descriptor: descriptor
         )
     }
 
@@ -67,7 +71,8 @@ public enum QWChatTurnPreparer {
         vocabularySize: Int,
         supportsTokenConstraints: Bool,
         memoryManifest: QWMemoryManifest? = nil,
-        effectiveMaxNewTokens: Int? = nil
+        effectiveMaxNewTokens: Int? = nil,
+        descriptor: QWModelDescriptor? = nil
     ) throws -> QWPreparedChatPrompt {
         let fmtType = request.responseFormatType
         let isAssistantPrefill = request.isAssistantPrefill
@@ -105,16 +110,18 @@ public enum QWChatTurnPreparer {
             }
         }
         if hasActiveTools, let forcedTool = request.forcedToolChoiceName {
-            if chatTemplate.isInkling2Template {
+            if !chatTemplate.usesStandardToolCallHint {
                 if forcedTool.isEmpty {
                     extraSystemLines.append("You MUST call at least one of the provided tools in this response.")
                 } else {
                     extraSystemLines.append("You MUST call the tool '\(forcedTool)' in this response.")
                 }
-            } else if forcedTool.isEmpty {
-                extraSystemLines.append("You MUST call at least one of the provided tools in this response using <tool_call>.")
             } else {
-                extraSystemLines.append("You MUST call the tool '\(forcedTool)' in this response using <tool_call>.")
+                if forcedTool.isEmpty {
+                    extraSystemLines.append("You MUST call at least one of the provided tools in this response using <tool_call>.")
+                } else {
+                    extraSystemLines.append("You MUST call the tool '\(forcedTool)' in this response using <tool_call>.")
+                }
             }
             if request.parallelToolCalls == false {
                 extraSystemLines.append("Call at most ONE tool in this response; do not emit multiple tool calls.")
@@ -122,6 +129,36 @@ public enum QWChatTurnPreparer {
         }
 
         var msgs = request.toQWJsonMessages()
+        if let descriptor {
+            let videoInputs = request.extractVideoInputs()
+            let fallbackCounts = videoInputs.map { QWVideoDecoder.resolvedFallbackFrameCount(for: $0) }
+            var vidCursor = 0
+            for idx in msgs.indices {
+                guard case .object(var pairs) = msgs[idx],
+                      let contentIdx = pairs.firstIndex(where: { $0.0 == "content" }),
+                      case .string(let rawContent) = pairs[contentIdx].1,
+                      (rawContent.contains(QWMultimodalTagResolver.canonicalImageMarker)
+                       || rawContent.contains(QWMultimodalTagResolver.canonicalVideoMarker)) else {
+                    continue
+                }
+                let markerCount = max(0, rawContent.components(
+                    separatedBy: QWMultimodalTagResolver.canonicalVideoMarker
+                ).count - 1)
+                let sliceEnd = min(fallbackCounts.count, vidCursor + markerCount)
+                let msgCounts = vidCursor < sliceEnd ? Array(fallbackCounts[vidCursor..<sliceEnd]) : []
+                vidCursor += markerCount
+                let normalized = QWMultimodalTagResolver.normalizeMediaMarkers(
+                    in: rawContent,
+                    tokenizer: tok,
+                    descriptor: descriptor,
+                    videoFallbackFrameCounts: msgCounts
+                )
+                if normalized != rawContent {
+                    pairs[contentIdx].1 = .string(normalized)
+                    msgs[idx] = .object(pairs)
+                }
+            }
+        }
         if let manifest = memoryManifest {
             Self.applyMemoryVaultAndTailDelta(
                 to: &msgs,
@@ -159,7 +196,10 @@ public enum QWChatTurnPreparer {
         }
 
         let grammar = try QWStructuredOutput.grammar(for: request)
-        let toolCallTokenId = hasActiveTools ? tok.tokenId(for: "<tool_call>") : nil
+        let toolCallEnvelope = chatTemplate.toolCallEnvelope
+        let toolCallTokenId = hasActiveTools
+            ? (tok.tokenId(for: toolCallEnvelope.openTag) ?? tok.tokenId(for: QWToolCallEnvelope.standard.openTag))
+            : nil
         let enforceJson = grammar != nil && supportsTokenConstraints
             && (!hasActiveTools || toolCallTokenId != nil)
         if grammar != nil && !enforceJson && QWStructuredOutput.isStrict(request) {
@@ -189,7 +229,14 @@ public enum QWChatTurnPreparer {
         let specialTokens = tok.resolveSpecialTokens(fallback: specialTokensFallback)
         var stops: Set<Int> = specialTokens.defaultStopTokenIds
         let imEndTokenId = specialTokens.imEndTokenId
-        let endThinkTokenId = specialTokens.endThinkTokenId
+        let endThinkTokenId = chatTemplate.thinkCloseTag.flatMap { tok.tokenId(for: $0) }
+            ?? specialTokens.endThinkTokenId
+        let endThinkCloseTag: String = {
+            if let piece = tok.piece(endThinkTokenId), piece.hasPrefix("</"), piece.hasSuffix(">") {
+                return piece
+            }
+            return chatTemplate.thinkCloseTag ?? "</think>"
+        }()
         let imEndMarker = tok.piece(imEndTokenId) ?? "<|im_end|>"
         let userTextContainsImEnd = request.messages.contains { $0.extractTextContent().contains(imEndMarker) }
         if userTextContainsImEnd {
@@ -220,7 +267,12 @@ public enum QWChatTurnPreparer {
             builtToolConstraint = QWToolCallConstraint(
                 tools: tools, forcedToolName: request.forcedToolChoiceName,
                 table: table, toolCallToken: toolCallTokenId,
-                toolCallEndToken: tok.tokenId(for: "</tool_call>"))
+                toolCallEndToken: tok.tokenId(for: toolCallEnvelope.closeTag)
+                    ?? tok.tokenId(for: QWToolCallEnvelope.standard.closeTag),
+                toolCallCloseTag: toolCallEnvelope.closeTag,
+                requireToolCall: request.forcedToolChoiceName != nil,
+                startsInThinking: shouldThink, endThinkToken: endThinkTokenId,
+                endThinkCloseTag: endThinkCloseTag)
         }
         let innerConstraint: (any QWTokenConstraint)? = jsonConstraint ?? builtToolConstraint
         let activeConstraint: (any QWTokenConstraint)?
@@ -228,6 +280,7 @@ public enum QWChatTurnPreparer {
             activeConstraint = QWChatPolicyResolver.makeThinkingBudgetConstraint(
                 maxThinkingTokens: thinkingBudget,
                 endThinkTokenId: endThinkTokenId,
+                endThinkCloseTag: endThinkCloseTag,
                 vocabularySize: vocabularySize,
                 tokenizer: tok,
                 supportsTokenConstraints: supportsTokenConstraints,
@@ -255,6 +308,8 @@ public enum QWChatTurnPreparer {
             stops: stops,
             imEndTokenId: imEndTokenId,
             endThinkTokenId: endThinkTokenId,
+            endThinkCloseTag: endThinkCloseTag,
+            toolCallEnvelope: toolCallEnvelope,
             userTextContainsImEnd: userTextContainsImEnd,
             customStopStrings: customStopStrings
         )

@@ -7,6 +7,7 @@ public enum QWMTPBackend: String, CaseIterable, Sendable, Codable {
     case standard
     case variational
     case dflash2
+    case dspark
 
     /// Parse a CLI/API name. Case-sensitive: only the exact lowercase
     /// product names are accepted. Unknown names throw — never silently
@@ -16,6 +17,7 @@ public enum QWMTPBackend: String, CaseIterable, Sendable, Codable {
         case "standard", "mtp", "hybrid", "ngram": return .standard
         case "variational", "relaxed", "plm": return .variational
         case "dflash2", "dflash", "dspine": return .dflash2
+        case "dspark": return .dspark
         default: throw QWEngineError.badMTPBackend(name)
         }
     }
@@ -26,6 +28,7 @@ public enum QWMTPBackend: String, CaseIterable, Sendable, Codable {
         case .standard: return "standard"
         case .variational: return "variational:relaxed-argmax-quadratic-v1"
         case .dflash2: return "dflash2:block-diffusion-5L-w2048-conv2-top16"
+        case .dspark: return "dspark:mhc-tap-swa128-markov-conf-v1"
         }
     }
 
@@ -35,6 +38,7 @@ public enum QWMTPBackend: String, CaseIterable, Sendable, Codable {
         case .standard: return "standard-shipping"
         case .variational: return "variational-relaxed-acceptance"
         case .dflash2: return "dflash2-block-speculative"
+        case .dspark: return "dspark-block-speculative"
         }
     }
 

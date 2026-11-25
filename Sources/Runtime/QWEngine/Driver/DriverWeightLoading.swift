@@ -328,6 +328,22 @@ extension QWEngineDriver {
             }
             return t
         }
+        /// Raw verbatim `.bf16` tensor upload without widening to FP32.
+        mutating func bf16wRaw(_ name: String, _ elems: Int) throws -> QWTensorValue {
+            let resolved = resolveName(name)
+            guard let pk, let io else {
+                throw QWEngineDriverError.weightMissing(name, "bf16wRaw requires QWP pack")
+            }
+            let e = try pk.entry(resolved)
+            guard e.rawOff != nil, (e.kind == nil || e.kind == "bf16"),
+                  e.shape.reduce(1, *) == elems else {
+                throw QWEngineDriverError.weightMissing(name, "expected raw bf16[\(elems)]")
+            }
+            let t = try allocateWeight(QWTensorShape([elems], .bf16))
+            let dstPtr = t.region.buffer.contents().advanced(by: t.region.base + t.offset)
+            try io.load(resolved, layout: .raw, into: dstPtr)
+            return t
+        }
         mutating func f32wOrDequant(_ name: String, _ elems: Int) throws -> QWTensorValue {
             let resolved = resolveName(name)
             let src: [Float]

@@ -300,6 +300,81 @@ class TestErnie55Adapter(unittest.TestCase):
             )
             self.assertIn("User: Hi\n\nAssistant: Hello\n\nUser: Next\n\nAssistant: ", s_multi)
 
+    def test_preview_mxfp4_experts_bundled_dspark_and_ernie_chat_template(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "hf_preview"
+            src.mkdir()
+            build_mini_ernie55_hf_checkpoint(src)
+            cfg = json.loads((src / "config.json").read_text())
+            cfg["num_nextn_predict_layers"] = 0
+            cfg["compress_ratios"] = [4, -2]
+            cfg["quantization_config"] = {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "expert_dtype": "mxfp4",
+                "scale_fmt": "ue8m0",
+                "weight_block_size": [128, 128],
+            }
+            (src / "config.json").write_text(json.dumps(cfg, indent=2))
+            (src / "encoding_ernie.py").write_text("# ernie chat renderer\n")
+            (src / "tokenizer_config.json").write_text(json.dumps({
+                "tokenizer_class": "ErnieChatTokenizer",
+                "bos_token": "<|ERNIE_BEGIN|>",
+                "eos_token": "<|ernie:im_end|>",
+            }))
+
+            # Rebuild shards: drop layer 2, convert layer 1 experts to I8+F8_E8M0 MXFP4, add model.mtp.* bundled DSpark weights.
+            tensors: dict[str, torch.Tensor] = {}
+            from safetensors.torch import load_file
+            for sf in sorted(src.glob("*.safetensors")):
+                for k, v in load_file(sf).items():
+                    if k.startswith("model.layers.2."):
+                        continue
+                    tensors[k] = v
+                sf.unlink()
+            for e in range(4):
+                for wname in ("w1", "w2", "w3"):
+                    key = f"model.layers.1.block_sparse_moe.experts.{e}.{wname}.weight"
+                    orig = tensors[key]
+                    rows, cols = orig.shape
+                    tensors[key] = torch.randint(-128, 128, (rows, cols // 2), dtype=torch.int8)
+                    tensors[f"{key}_scale_inv"] = torch.full((rows, cols // 32), 125, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+            tensors["model.mtp.0.enorm.weight"] = torch.ones(128, dtype=torch.bfloat16)
+            tensors["model.mtp.feature_norm.weight"] = torch.ones(128, dtype=torch.bfloat16)
+            keys = sorted(tensors.keys())
+            mid = len(keys) // 2
+            s1, s2 = "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"
+            save_file({k: tensors[k] for k in keys[:mid]}, str(src / s1))
+            save_file({k: tensors[k] for k in keys[mid:]}, str(src / s2))
+            (src / "model.safetensors.index.json").write_text(
+                json.dumps({"metadata": {}, "weight_map": {k: (s1 if i < mid else s2) for i, k in enumerate(keys)}})
+            )
+
+            out = Path(tmp) / "out_preview_pack"
+            quantize_model(src, out)
+            info = audit_release(out)
+            self.assertTrue(info["ok"])
+            self.assertEqual(info["counts"]["shvq15_g64"], 8)
+            self.assertEqual(info["counts"]["shvq3_g64"], 4)
+
+            hdr, _ = read_header(out / "model.qwp")
+            self.assertNotIn("model.layers.2.e_proj.weight", hdr["tensors"])
+            self.assertNotIn("model.mtp.0.enorm.weight", hdr["tensors"])
+            self.assertNotIn("model.mtp.feature_norm.weight", hdr["tensors"])
+
+            tmpl_txt = (out / "assets" / "chat_template.jinja").read_text()
+            for marker in ("<|ernie:im_start|>", "<ernie:global_setting>", "<ernie:think>", "<ernie:tool_call>"):
+                self.assertIn(marker, tmpl_txt)
+            from jinja2 import Template
+            rendered = Template(tmpl_txt).render(
+                messages=[{"role": "user", "content": "Hello"}],
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            self.assertIn("<|ernie:im_start|>user\nHello<|ernie:im_end|>", rendered)
+            self.assertTrue(rendered.endswith("<|ernie:im_start|>assistant\n<ernie:think></ernie:think>"))
+
 
 if __name__ == "__main__":
     unittest.main()

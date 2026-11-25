@@ -113,6 +113,28 @@ public enum QWChatPolicyResolver {
         "high": 4096, "xhigh": 8192, "max": 8192, "maximum": 8192, "deep": 8192,
     ]
 
+    public static func isAutoReasoningEffort(_ raw: String?) -> Bool {
+        raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "auto"
+    }
+
+    public static func resolveAutoReasoningEffort(
+        tier: String,
+        confidence: Double,
+        confidenceThreshold: Double = 0.7
+    ) -> String? {
+        guard confidence >= confidenceThreshold else { return nil }
+        switch tier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "trivial":
+            return "off"
+        case "moderate":
+            return "low"
+        case "deep":
+            return "xhigh"
+        default:
+            return nil
+        }
+    }
+
     public static func normalizeReasoningEffort(_ raw: String?, fallback: String = "xhigh") -> String {
         guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               !trimmed.isEmpty else {
@@ -274,6 +296,7 @@ public enum QWChatPolicyResolver {
     public static func makeThinkingBudgetConstraint(
         maxThinkingTokens: Int,
         endThinkTokenId: Int,
+        endThinkCloseTag: String? = nil,
         vocabularySize: Int,
         tokenizer: QWTokenizer,
         supportsTokenConstraints: Bool,
@@ -282,8 +305,9 @@ public enum QWChatPolicyResolver {
         if tokenizer.tokenId(for: "<|content_thinking|>") != nil {
             return nil
         }
-        let hasKnownEndThink = tokenizer.tokenId(for: "</think>") != nil
-            || tokenizer.tokenId(for: "</ernie:think>") != nil
+        let resolvedPiece = tokenizer.piece(endThinkTokenId)
+        let hasKnownEndThink = (resolvedPiece.map { $0.hasPrefix("</") && $0.hasSuffix(">") } ?? false)
+            || (endThinkCloseTag.flatMap { tokenizer.tokenId(for: $0) } != nil)
         guard supportsTokenConstraints,
               endThinkTokenId >= 0,
               endThinkTokenId < vocabularySize,
@@ -294,6 +318,7 @@ public enum QWChatPolicyResolver {
         return QWThinkingBudgetConstraint(
             maxThinkingTokens: maxThinkingTokens,
             endThinkTokenId: endThinkTokenId,
+            endThinkCloseTag: endThinkCloseTag,
             vocabularySize: vocabularySize,
             tokenBytes: tokenBytes,
             inner: inner

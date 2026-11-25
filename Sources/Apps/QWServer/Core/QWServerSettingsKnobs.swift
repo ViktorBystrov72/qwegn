@@ -55,6 +55,7 @@ extension QWServerSettings {
         out["mtpEntropyThreshold"] = .double(mtpEntropyThreshold)
         out["dflashDraftPackPath"] = .string(dflashDraftPackPath)
         out["dflashSelectorTopK"] = .int(dflashSelectorTopK)
+        out["dsparkConfidenceSchedule"] = .bool(dsparkConfidenceSchedule)
         for id in QWEngineTuning.knobIds {
             out[id] = engineTuning[id] ?? QWKnobRegistry.descriptor(id)?.defaultValue
         }
@@ -69,7 +70,7 @@ extension QWServerSettings {
         "speculativeDecodingEnabled", "mtpDrafts", "mtpBackend",
         "mtpRelaxedMargin", "mtpRelaxedMinProb", "mtpDraftStrategy", "mtpQuadraticSeeding",
         "mtpAdaptiveDepth", "mtpEntropyThreshold",
-        "dflashDraftPackPath", "dflashSelectorTopK",
+        "dflashDraftPackPath", "dflashSelectorTopK", "dsparkConfidenceSchedule",
         "gdnPrefill", "evictPrefillScratch", "prefillChunkSize", "maxConcurrentSessions",
         "lsaMode", "lsaBudget", "lsaClusterBlock", "lsaSidecarPath", "lsaCrossLoopReuse", "engineTuning"
     ]
@@ -121,6 +122,7 @@ extension QWServerSettings {
             case "mtpEntropyThreshold": keys.insert("mtpEntropyThreshold")
             case "dflashDraftPackPath": keys.insert("dflashDraftPackPath")
             case "dflashSelectorTopK": keys.insert("dflashSelectorTopK")
+            case "dsparkConfidenceSchedule": keys.insert("dsparkConfidenceSchedule")
             case _ where QWEngineTuning.knobIds.contains(id): keys.insert("engineTuning")
             default: break
             }
@@ -196,6 +198,7 @@ extension QWServerSettings {
         if let v = values["mtpEntropyThreshold"]?.doubleValue { mtpEntropyThreshold = v }
         if let v = values["dflashDraftPackPath"]?.stringValue { dflashDraftPackPath = v }
         if let v = values["dflashSelectorTopK"]?.intValue { dflashSelectorTopK = v }
+        if let v = values["dsparkConfidenceSchedule"]?.boolValue { dsparkConfidenceSchedule = v }
         for id in QWEngineTuning.knobIds { if let v = values[id] { setEngineTuning(id, v) } }
     }
 
@@ -225,6 +228,22 @@ extension QWServerSettings {
         let genDefaults = assets?.generationDefaults
 
         speculativeParameters = QWSpeculativeParameters.topPerformanceDefaults(for: descriptor)
+        if let ds = descriptor?.dsparkConfig,
+           !expanded.isEmpty,
+           QWModelDescriptor.DSparkConfig.resolvePackURL(near: expanded) != nil,
+           descriptor?.supportsNativeMTP != true {
+            speculativeParameters = QWSpeculativeParameters(
+                enabled: true,
+                mtpDrafts: min(7, ds.maxDrafts),
+                mtpBackend: "dspark",
+                mtpRelaxedMargin: 0.0,
+                mtpDraftStrategy: "hybrid",
+                mtpQuadraticSeeding: false,
+                adaptiveDepth: false,
+                entropyThreshold: 0.7,
+                dsparkConfidenceSchedule: true
+            )
+        }
         maxContext = descriptor?.maxPositionEmbeddings ?? defaults.maxContext
         kvMode = defaults.kvMode
         ropeScalingType = defaults.ropeScalingType

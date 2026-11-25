@@ -360,7 +360,12 @@ extension QWHyperStreamRuntime {
             if !session.roundTokenCounts.isEmpty {
                 session.roundTokenCounts[session.roundTokenCounts.count - 1] += 1
             }
-            return session.pendingTokens.removeFirst()
+            let queued = session.pendingTokens.removeFirst()
+            if session.pendingConstraintAcceptCount > 0 {
+                session.pendingConstraintAcceptCount -= 1
+                try session.constraint?.accept(queued)
+            }
+            return queued
         }
         let activeCap = activeCapacity
         guard session.history.count + 1 < activeCap else {
@@ -369,8 +374,11 @@ extension QWHyperStreamRuntime {
             throw FNGPUError.contextDoesNotFit(requested: session.history.count + 1,
                                                 maxFitting: FNGPUDFlash.maxFittingContext(activeCapacity: activeCap))
         }
+        let canSpecConstraint = session.constraint.map {
+            $0.isUnconstrainedNow || (QWConstrainedSpeculationGate.isEnabled && $0.allowsSpeculation)
+        } ?? true
         if session.useSpec, let vStack = verifyStack,
-           (session.constraint?.isUnconstrainedNow ?? true),
+           canSpecConstraint,
            session.history.count + 8 < activeCap {
             if let mtp {
                 return try speculativeStep(&session, token: token, vStack: vStack, mtp: mtp)

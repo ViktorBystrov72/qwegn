@@ -147,14 +147,14 @@ extension QWGemm {
                                       rows: Int, rowsPerTG: Int, epi: UInt32, scale: Float,
                                       v4: Bool = false) throws {
         enc.setComputePipelineState(try hal.pipeline(kernel))
-        if rows > 4 && v4 {
+        if rows > 8 && v4 {
             let xBytes = x.shape.dtype == .f16 ? 2 : 4
             let yBytes = y.shape.dtype == .f16 ? 2 : 4
             weight.blocks.bind(enc, index: 0)
             enc.setPod(scale, index: 6)
             var r0 = 0
             while r0 < rows {
-                let r = min(4, rows - r0)
+                let r = min(8, rows - r0)
                 let fuse = r >= 2
                 let packedEpi = fuse ? (Int(epi) | (r << 8)) : Int(epi)
                 x.slice(byteOffset: r0 * weight.k * xBytes, count: r * weight.k, dtype: x.shape.dtype).bind(enc, index: 1)
@@ -168,7 +168,7 @@ extension QWGemm {
             return
         }
         enc.bindTensors(weight.blocks, x, y, startIndex: 0)
-        let fuseMultiRow = (rows >= 2 && rows <= 4 && v4)
+        let fuseMultiRow = (rows >= 2 && rows <= 8 && v4)
         let packedEpi = (fuseMultiRow ? (Int(epi) | (rows << 8)) : Int(epi))
         enc.setUInt32s(weight.n, weight.k, packedEpi, startIndex: 3)
         enc.setPod(scale, index: 6)
@@ -245,12 +245,12 @@ extension QWGemm {
             name = aqName
         }
         enc.setComputePipelineState(try hal.pipeline(name))
-        if rows > 4 {
+        if rows > 8 {
             weight.blocks.bind(enc, index: 0)
             enc.setPod(scale, index: 6)
             var r0 = 0
             while r0 < rows {
-                let r = min(4, rows - r0)
+                let r = min(8, rows - r0)
                 let fuse = r > 1
                 let packedEpi = fuse ? (Int(epi) | (r << 8)) : Int(epi)
                 x.slice(byteOffset: r0 * weight.k * 4, count: r * weight.k, dtype: .f32).bind(enc, index: 1)
@@ -267,7 +267,7 @@ extension QWGemm {
         enc.bindTensors(weight.blocks, x, y, startIndex: 0)
         keysHi.bind(enc, index: 7)   // the kernel's key slots sit past the scalar constants (3-6)
         keysLo.bind(enc, index: 8)
-        let fuseRows = rows > 1 && rows <= 4
+        let fuseRows = rows > 1 && rows <= 8
         let packedEpi = fuseRows ? (Int(epi) | (rows << 8)) : Int(epi)
         enc.setUInt32s(weight.n, weight.k, packedEpi, startIndex: 3)
         enc.setPod(scale, index: 6)

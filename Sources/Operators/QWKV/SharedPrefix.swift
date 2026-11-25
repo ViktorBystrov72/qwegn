@@ -139,6 +139,39 @@ extension QWKVCache {
         }
     }
 
+    /// Slices an immutable shared prefix to an earlier `pageTokens`-aligned boundary by retaining physical pages.
+    public func sliceSharedPrefix(_ prefix: QWKVSharedPrefix, toPageAlignedTokens targetTokens: Int) throws -> QWKVSharedPrefix? {
+        guard targetTokens > 0, targetTokens % Self.pageTokens == 0 else { return nil }
+        return try lock.withLock {
+            try validateSharedPrefixLocked(prefix)
+            guard targetTokens <= prefix.tokenCount else { return nil }
+            let targetPages = targetTokens / Self.pageTokens
+            var slicedPages = Array(repeating: [Int32](), count: layers.count * 2)
+            for li in layers.indices {
+                let targetStart = min(targetPages, liveStartPage(layerIndex: li, tokenCount: targetTokens))
+                for (ki, _) in QWKVKind.allCases.enumerated() {
+                    let srcIDs = prefix.pages[li * 2 + ki]
+                    guard srcIDs.count >= targetPages else { return nil }
+                    for pageIdx in targetStart..<targetPages where srcIDs[pageIdx] < 0 {
+                        return nil
+                    }
+                    let prefixIDs = (0..<targetPages).map { idx in idx < targetStart ? Int32(-1) : srcIDs[idx] }
+                    slicedPages[li * 2 + ki] = prefixIDs
+                }
+            }
+            for li in layers.indices {
+                let targetStart = min(targetPages, liveStartPage(layerIndex: li, tokenCount: targetTokens))
+                for (ki, kind) in QWKVKind.allCases.enumerated() {
+                    let ids = slicedPages[li * 2 + ki]
+                    for pageIdx in targetStart..<targetPages {
+                        retainSharedPage(li: li, kind: kind, page: ids[pageIdx])
+                    }
+                }
+            }
+            return QWKVSharedPrefix(tokenCount: targetTokens, cache: self, epoch: cacheEpoch, pages: slicedPages, mode: mode)
+        }
+    }
+
     public func withSharedPrefixPagePointers(
         _ prefix: QWKVSharedPrefix,
         _ body: (_ planeIndex: Int, _ pageIndex: Int, _ pointer: UnsafeRawPointer, _ byteCount: Int) throws -> Void

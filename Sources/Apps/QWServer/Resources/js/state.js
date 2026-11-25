@@ -55,7 +55,7 @@ function escapeHtml(raw) {
 }
 
 function switchTab(tabId, updateUrl = true) {
-  const validTabs = ["monitor", "chat", "models", "logs", "settings"];
+  const validTabs = ["monitor", "chat", "decisions", "models", "logs", "settings"];
   const resolved = validTabs.includes(tabId) ? tabId : "monitor";
   document.querySelectorAll(".tab-pane").forEach((el) => el.classList.add("hidden"));
   const target = document.getElementById(`view-${resolved}`);
@@ -77,6 +77,7 @@ function switchTab(tabId, updateUrl = true) {
   else closeLogStream();
   if (resolved === "settings") loadLiveSettings();
   if (resolved === "chat" && typeof onChatTabActivated === "function") onChatTabActivated();
+  if (resolved === "decisions" && typeof onDecisionsTabActivated === "function") onDecisionsTabActivated();
 }
 
 function updateSparkline(firstSeries, secondSeries) {

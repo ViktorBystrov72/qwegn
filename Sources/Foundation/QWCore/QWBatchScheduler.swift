@@ -197,10 +197,12 @@ public enum QWBatchPartitionSelection {
         hasLogprobsSampler: Bool,
         isUnconstrainedNow: Bool,
         hasConstraint: Bool,
-        hasConstraintSampler: Bool
+        hasConstraintSampler: Bool,
+        canSpeculateConstrained: Bool = false
     ) -> Bool {
         speculativeEnabled && remaining >= 2 && !hasLogprobsSampler
-            && isUnconstrainedNow && (!hasConstraint || hasConstraintSampler)
+            && (isUnconstrainedNow || canSpeculateConstrained)
+            && (!hasConstraint || hasConstraintSampler)
     }
 
     /// Plans which queued requests enter free partition slots in single-stream vs multi-slot mode.

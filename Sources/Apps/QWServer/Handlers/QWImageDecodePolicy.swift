@@ -4,11 +4,43 @@ import Darwin
 import Foundation
 import Network
 
+public struct QWVideoInputSpec: Codable, Sendable, Hashable {
+    public let url: String
+    public let fps: Double?
+    public let maxFrames: Int?
+    public let maxPixels: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case url
+        case fps
+        case maxFrames = "max_frames"
+        case maxPixels = "max_pixels"
+    }
+
+    public init(url: String, fps: Double? = nil, maxFrames: Int? = nil, maxPixels: Int? = nil) {
+        self.url = url
+        self.fps = fps
+        self.maxFrames = maxFrames
+        self.maxPixels = maxPixels
+    }
+}
+
 public struct QWImageDecodePolicy: Sendable, Equatable {
     public static let defaultMaxPixelArea = 16_777_216
     public static let defaultMaxImagesPerTurn = 16
+    public static let defaultMaxVideosPerTurn = 4
+    public static let defaultMaxVideoBytes = 64 * 1024 * 1024
+    public static let cliMaxVideoBytes = 512 * 1024 * 1024
+    public static let defaultMaxVideoDurationSeconds: Double = 300.0
+    public static let defaultMaxVideoFrames = 32
     public static let serverDefault = QWImageDecodePolicy()
-    public static let cliLocal = QWImageDecodePolicy(allowLocalImagePaths: true)
+    public static let cliLocal = QWImageDecodePolicy(
+        allowLocalImagePaths: true,
+        maxSourceBytes: 64 * 1024 * 1024,
+        maxVideoBytes: QWImageDecodePolicy.cliMaxVideoBytes,
+        maxVideoDurationSeconds: 3600.0,
+        maxVideoFrames: 64
+    )
 
     public let allowDataURLs: Bool
     public let allowLocalImagePaths: Bool
@@ -16,6 +48,9 @@ public struct QWImageDecodePolicy: Sendable, Equatable {
     public let maxSourceBytes: Int
     public let maxPixelDimension: Int
     public let maxPixelArea: Int
+    public let maxVideoBytes: Int
+    public let maxVideoDurationSeconds: Double
+    public let maxVideoFrames: Int
 
     public init(
         allowDataURLs: Bool = true,
@@ -23,7 +58,10 @@ public struct QWImageDecodePolicy: Sendable, Equatable {
         allowRemoteImageURLs: Bool = false,
         maxSourceBytes: Int = 20 * 1024 * 1024,
         maxPixelDimension: Int = 8192,
-        maxPixelArea: Int = QWImageDecodePolicy.defaultMaxPixelArea
+        maxPixelArea: Int = QWImageDecodePolicy.defaultMaxPixelArea,
+        maxVideoBytes: Int = QWImageDecodePolicy.defaultMaxVideoBytes,
+        maxVideoDurationSeconds: Double = QWImageDecodePolicy.defaultMaxVideoDurationSeconds,
+        maxVideoFrames: Int = QWImageDecodePolicy.defaultMaxVideoFrames
     ) {
         self.allowDataURLs = allowDataURLs
         self.allowLocalImagePaths = allowLocalImagePaths
@@ -31,6 +69,9 @@ public struct QWImageDecodePolicy: Sendable, Equatable {
         self.maxSourceBytes = maxSourceBytes
         self.maxPixelDimension = maxPixelDimension
         self.maxPixelArea = maxPixelArea
+        self.maxVideoBytes = maxVideoBytes
+        self.maxVideoDurationSeconds = maxVideoDurationSeconds
+        self.maxVideoFrames = maxVideoFrames
     }
 
     struct ResolvedRemoteTarget: Sendable, Equatable {

@@ -8,9 +8,10 @@ from pathlib import Path
 import numpy as np
 from hq4 import (BLOCK_BYTES, GROUP, INV_SQRT32, dequant_hq4_g32_m5,
                  dequant_hq4_g32_m5_rot, fwht32_ortho, quant_hq4_g32_m5)
-from hq_blocks import (VALID_GROUPS, dequant_fp8_blockwise, dequant_hq8_g32_m5,
-                       dequant_hq8_g32_m5_rot, dequant_hq_blocks, format_quant_spec,
-                       hq_block_bytes, parse_quant_spec, quant_hq8_g32_m5, quant_hq_blocks)
+from hq_blocks import (VALID_GROUPS, dequant_hq8_g32_m5, dequant_hq8_g32_m5_rot,
+                       dequant_hq_blocks, dequant_with_scale_inv, format_quant_spec,
+                       hq_block_bytes, parse_quant_spec, quant_hq8_g32_m5,
+                       quant_hq_blocks, unpacked_safetensors_shape, validate_source_quant_config)
 from pack_ngram import (HEAD_DIM, NGRAM_BIN_NAME, NGRAM_ROW_BYTES, PLE_LOCATION_NAME,
                         _NG_RPS, _NG_SECTOR, audit_ngram_bin, build_ngram_bin,
                         is_ple_ngram, scan_ple_and_router, write_ple_location_file)
@@ -426,20 +427,15 @@ def quantize_model(source: Path, destination: Path,
         **dict.fromkeys(("ernie5_5_moe", "ernie5_5_moe_text"), ("ernie55_adapter", "quantize_ernie55_model")),
         "maxwell_moe": ("maxwell_adapter", "quantize_maxwell_model"),
         **dict.fromkeys(("bailing_moe_v3", "bailing_moe_v3_vl", "bailing_moe_v3_text"), ("bailing_adapter", "quantize_bailing_model")),
+        **dict.fromkeys(("lfm2", "lfm3", "lfm3_vl"), ("lfm_adapter", "quantize_lfm_model")),
+        **dict.fromkeys(("lfm2_encoder", "d1_omni", "modernbert", "deberta_v2"), ("decision_adapter", "quantize_decision_model")),
     }
     if (adapter := _ADAPTERS.get(tc0.get("model_type") or config.get("model_type"))):
         fn = getattr(__import__(adapter[0]), adapter[1])
         return fn(source=source, destination=destination, flat_root=flat_root,
                   quant=quant, group_size=group_size, dense_quant=dense_quant,
                   expert_quant=expert_quant, expert_down_quant=expert_down_quant)
-    qcfg = config.get("quantization_config")
-    fp8_block_size = 128
-    if qcfg is not None:
-        if not isinstance(qcfg, dict) or qcfg.get("quant_method") != "fp8":
-            raise ValueError("REFUSED: source is already quantized; use the original checkpoint")
-        wbs = qcfg.get("weight_block_size")
-        if isinstance(wbs, list) and len(wbs) == 2 and wbs[0] == wbs[1]:
-            fp8_block_size = int(wbs[0])
+    fp8_block_size = validate_source_quant_config(config)
     if not (source / "tokenizer.json").is_file():
         raise FileNotFoundError(f"required asset missing: {source / 'tokenizer.json'}")
     embedded_chat_template = None
@@ -452,16 +448,20 @@ def quantize_model(source: Path, destination: Path,
         if not embedded_chat_template:
             embedded_chat_template = synthesize_base_chat_template(source)
 
-    shard_names, expected_shapes, raw_all_shapes = {}, {}, {}
+    shard_names, expected_shapes, raw_all_shapes, raw_dtypes, tensor_shard = {}, {}, {}, {}, {}
     for path in files:
         with safe_open(path, framework="pt") as sf:
             shard_names[path] = list(sf.keys())
             for name in shard_names[path]:
                 if name in raw_all_shapes:
                     raise ValueError(f"duplicate source tensor: {name}")
-                raw_all_shapes[name] = list(sf.get_slice(name).get_shape())
-                if not name.endswith("_scale_inv"):
-                    expected_shapes[name] = raw_all_shapes[name]
+                sl = sf.get_slice(name)
+                raw_all_shapes[name], raw_dtypes[name], tensor_shard[name] = list(sl.get_shape()), sl.get_dtype(), path
+    for name, shape in raw_all_shapes.items():
+        if not name.endswith("_scale_inv"):
+            sk = f"{name}_scale_inv"
+            expected_shapes[name] = unpacked_safetensors_shape(
+                shape, raw_dtypes[name], raw_all_shapes.get(sk), raw_dtypes.get(sk))
 
     index_path = source / "model.safetensors.index.json"
     if index_path.exists():
@@ -470,11 +470,8 @@ def quantize_model(source: Path, destination: Path,
         if actual_map != weight_map:
             raise ValueError("source shards do not match model.safetensors.index.json")
 
-    ple_shards, i64_constants = scan_ple_and_router(
-        files, shard_names, expected_shapes, source)
-
-    ref_tensors = None
-    ref_qwp = None
+    ple_shards, i64_constants = scan_ple_and_router(files, shard_names, expected_shapes, source)
+    ref_tensors, ref_qwp = None, None
     if hybrid_hq8_from is not None:
         ref_qwp = Path(hybrid_hq8_from) / "model.qwp"
         if not ref_qwp.is_file():
@@ -497,15 +494,13 @@ def quantize_model(source: Path, destination: Path,
                     f"HQ4 plane in the reference pack (fail-closed)")
 
     sha256_source_hex = None
-    if reuse_ngram_from is not None:
-        reuse_qwp = Path(reuse_ngram_from) / "model.qwp"
-        if reuse_qwp.is_file():
-            reuse_prov = read_header(reuse_qwp)[0].get("provenance", {})
-            if ((reuse_prov.get("source") == str(source)
-                 or (reuse_prov.get("source_revision") and reuse_prov.get("source_revision") == source.name))
-                    and reuse_prov.get("sha256_source")):
-                sha256_source_hex = reuse_prov["sha256_source"]
-                print(f"reusing sha256_source from {reuse_qwp}", flush=True)
+    if reuse_ngram_from is not None and (reuse_qwp := Path(reuse_ngram_from) / "model.qwp").is_file():
+        reuse_prov = read_header(reuse_qwp)[0].get("provenance", {})
+        if ((reuse_prov.get("source") == str(source)
+             or (reuse_prov.get("source_revision") and reuse_prov.get("source_revision") == source.name))
+                and reuse_prov.get("sha256_source")):
+            sha256_source_hex = reuse_prov["sha256_source"]
+            print(f"reusing sha256_source from {reuse_qwp}", flush=True)
     if sha256_source_hex is None and ref_qwp is not None:
         ref_prov = read_header(ref_qwp)[0].get("provenance", {})
         if (ref_prov.get("source") == str(source)
@@ -545,8 +540,12 @@ def quantize_model(source: Path, destination: Path,
             for name in active_names:
                 arr = tensors.pop(name)
                 sinv_key = f"{name}_scale_inv"
-                if sinv_key in tensors:
-                    arr = dequant_fp8_blockwise(arr, tensors.pop(sinv_key), block_size=fp8_block_size)
+                sinv = tensors.pop(sinv_key, None)
+                if sinv is None and sinv_key in tensor_shard:
+                    with safe_open(tensor_shard[sinv_key], framework="pt") as sf_s:
+                        sinv = sf_s.get_tensor(sinv_key)
+                if sinv is not None:
+                    arr = dequant_with_scale_inv(arr, sinv, fp8_block_size=fp8_block_size)
                 if arr.ndim == 3 and not expert_stack(name, arr.shape):
                     if not (name.endswith("conv1d.weight")
                             or ".hc_read." in name

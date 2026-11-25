@@ -651,6 +651,7 @@ function renderDashboard(model) {
   renderActions(model);
   renderRecentRequestsTable();
   if (typeof syncChatHeaderWithDashboard === "function") syncChatHeaderWithDashboard();
+  if (typeof updateDecisionSidecarPanel === "function") updateDecisionSidecarPanel(model);
 }
 
 function toggleRequestInspector(requestId) {

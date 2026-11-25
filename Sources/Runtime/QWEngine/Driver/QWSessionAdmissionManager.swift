@@ -12,6 +12,7 @@ final class QWSessionAdmissionManager: @unchecked Sendable {
     let generateLock = NSRecursiveLock()
     let requestGate = QWGenerationRequestGate()
     let slotLock = NSLock()
+    var totalSlots: Int = 0
     var freeSlots: [QWEngineDriver.GdnSlot] = []
 
     private let _commandBufferErrors = Atomic<Int>(0)
@@ -45,7 +46,7 @@ final class QWSessionAdmissionManager: @unchecked Sendable {
         try slotLock.withLock {
             guard !freeSlots.isEmpty else { throw QWEngineDriverError.busy }
             let slotIndex = dflashPreferred
-                ? (freeSlots.firstIndex(where: { $0.dflashSlot != nil }) ?? 0)
+                ? (freeSlots.firstIndex(where: { $0.dflashSlot != nil || $0.dsparkSlot != nil }) ?? 0)
                 : 0
             return freeSlots.remove(at: slotIndex)
         }

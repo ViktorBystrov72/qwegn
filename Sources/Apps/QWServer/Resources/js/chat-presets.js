@@ -643,9 +643,12 @@ const CHAT_NUMERIC_API_MAP = [
 
 function serializeChatTurnForApi(msg) {
   if (msg.role === "user") {
-    if (Array.isArray(msg.images) && msg.images.length > 0) {
+    const hasImgs = Array.isArray(msg.images) && msg.images.length > 0;
+    const hasVids = Array.isArray(msg.videos) && msg.videos.length > 0;
+    if (hasImgs || hasVids) {
       const parts = [{ type: "text", text: msg.content || "" }];
-      msg.images.forEach((img) => { if (img && img.dataUrl) parts.push({ type: "image_url", image_url: { url: img.dataUrl } }); });
+      if (hasImgs) msg.images.forEach((img) => { if (img && img.dataUrl) parts.push({ type: "image_url", image_url: { url: img.dataUrl } }); });
+      if (hasVids) msg.videos.forEach((vid) => { if (vid && vid.dataUrl) parts.push({ type: "video_url", video_url: { url: vid.dataUrl } }); });
       return { role: "user", content: parts };
     }
     return { role: "user", content: msg.content || "" };

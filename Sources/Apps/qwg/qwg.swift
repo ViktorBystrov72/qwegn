@@ -20,7 +20,7 @@ struct Qwg: AsyncParsableCommand {
         commandName: "qwg",
         abstract: "QWEngine — native Swift+Metal inference for Qwen3.8-27B and Qwen3.8-Flash-Next.",
         version: QWVersion.current,
-        subcommands: [Init.self, Inspect.self, Plan.self, Quantize.self, LsaConvert.self, Index.self, Pull.self, Run.self, Repl.self, Bench.self, Serve.self, Telemetry.self, FanHelper.self, Update.self])
+        subcommands: [Init.self, Inspect.self, Plan.self, Quantize.self, LsaConvert.self, Index.self, Pull.self, Run.self, Repl.self, Bench.self, Decide.self, Calibrate.self, Mcp.self, Serve.self, Telemetry.self, FanHelper.self, Update.self])
 }
 
 
@@ -65,6 +65,9 @@ struct Run: ParsableCommand {
     @Option(name: .customLong("prompt-file"), help: "Path to a file containing the user prompt text.") var promptFile: String?
     @Option(name: .customLong("image"), help: "Path to image input for multimodal vision prompt.") var image: String?
     @Option(name: .customLong("video"), help: "Path to video input for multimodal vision prompt.") var video: String?
+    @Option(name: .customLong("video-fps"), help: "Target frame sampling rate in FPS for --video (default: 2.0).") var videoFPS: Double?
+    @Option(name: .customLong("video-max-frames"), help: "Maximum sampled frames for --video (default: 12).") var videoMaxFrames: Int?
+    @Flag(name: .customLong("screen"), help: "Capture active macOS display via ScreenCaptureKit and attach as vision input.") var screen: Bool = false
     @Flag(name: .customLong("show-thinking"), inversion: .prefixedNo, help: "Show or hide thinking tokens in output.") var showThinking: Bool = true
     @Flag(name: .customLong("hide-thinking"), help: "Hide thinking tokens in output.") var hideThinking: Bool = false
     @Flag(name: .customLong("stream"), inversion: .prefixedNo, help: "Stream tokens to stdout as they are generated.") var stream: Bool = true
@@ -74,6 +77,7 @@ struct Run: ParsableCommand {
     @Flag(name: .customLong("color"), inversion: .prefixedNo, help: "Colorize thinking output and prompts (default: auto).") var color: Bool?
     @Flag(name: .customLong("verbose"), help: "Print a performance statistics block after the output (load, prefill/decode tok/s, TTFT, p50/p95 step latency, arena).") var verbose: Bool = false
     @Option(name: .customLong("dflash-window"), help: "DFlash 2 / DSpine window B in 2...16 (auto-detects dflash2 vs dspine from drafter pack and sets --mtp-drafts B-1).") var dflashWindow: Int? = nil
+    @Flag(name: .customLong("dspark-confidence-schedule"), inversion: .prefixedNo, help: "Enable adaptive confidence-head verification budget for DSpark.") var dsparkConfidenceSchedule: Bool?
     @Option(name: .customLong("repo"), help: "Repository or knowledge directory root containing .qwg/manifest.json to mount as LSA memory.") var repo: String? = nil
     @Flag(name: [.customLong("no-memory-pack"), .customLong("no-memory")], help: "Disable automatic mounting of .qwg/manifest.json memory pack.") var noMemory: Bool = false
     @Flag(name: .customLong("no-profile"), help: "Bypass ~/.qwg/settings.json and per-model knob profiles (hermetic benchmark mode).") var noProfile: Bool = false
@@ -179,13 +183,45 @@ struct Run: ParsableCommand {
             }
         }
         let allowVision = knobs.loadVision ?? true
-        let hasImageInput = image != nil
-        if hasImageInput && !allowVision {
-            FileHandle.standardError.write("qwg run: error: image input provided but vision loading disabled via --no-load-vision\n".data(using: .utf8)!)
+        let hasVisualInput = image != nil || video != nil || screen
+        if hasVisualInput && !allowVision {
+            let kind = video != nil ? "video" : (screen ? "screen capture" : "image")
+            FileHandle.standardError.write("qwg run: error: \(kind) input provided but vision loading disabled via --no-load-vision\n".data(using: .utf8)!)
             throw ExitCode(2)
         }
-        let formattedUserPrompt = (image != nil && !effectiveUserPrompt.contains("<|image_pad|>"))
-            ? "<|vision_start|><|image_pad|><|vision_end|>" + effectiveUserPrompt
+        var screenCleanupURL: URL? = nil
+        defer {
+            if let screenCleanupURL {
+                try? FileManager.default.removeItem(at: screenCleanupURL)
+            }
+        }
+        var turnImages: [String] = []
+        if let imgPath = image {
+            turnImages.append(imgPath)
+        }
+        if screen {
+            do {
+                let captured = try QWScreenCaptureHelper.captureActiveDisplayToTempFileSync(
+                    promptForPermissionIfNeeded: true
+                )
+                screenCleanupURL = captured.fileURL
+                turnImages.append(captured.fileURL.path)
+            } catch {
+                FileHandle.standardError.write("qwg run: error: \(error)\n".data(using: .utf8)!)
+                throw ExitCode(2)
+            }
+        }
+        let turnVideos: [QWVideoInputSpec] = video.map {
+            [QWVideoInputSpec(url: $0, fps: videoFPS, maxFrames: videoMaxFrames)]
+        } ?? []
+        let formattedUserPrompt = hasVisualInput
+            ? QWVideoDecoder.formatPromptWithMedia(
+                userPrompt: effectiveUserPrompt,
+                imageCount: turnImages.count,
+                videoInputs: turnVideos,
+                tokenizer: tok,
+                descriptor: runtimeAssets.descriptor
+            )
             : effectiveUserPrompt
         msgs.append(.object([("role", .string("user")), ("content", .string(formattedUserPrompt))]))
 
@@ -201,11 +237,16 @@ struct Run: ParsableCommand {
         let rawPromptIds = try tok.encode(wire)
         var promptIds: [Int]
         let visualSpans: [QWVisualSpan]
-        if let imgPath = image, allowVision {
-            let mm = try QWImageDecoder.prepareOneShotMultimodalTurn(
-                promptTokens: rawPromptIds, imagePath: imgPath,
-                modelPath: resolvedPack, hiddenDim: runtimeAssets.descriptor.hidden
+        if hasVisualInput && allowVision {
+            let controller = try QWCLIVisionController(modelPath: resolvedPack)
+            let mm = try controller.prepareTurn(
+                promptTokens: rawPromptIds,
+                imagePaths: turnImages,
+                videoInputs: turnVideos,
+                currentTurnHasImage: true,
+                hiddenDim: runtimeAssets.descriptor.hidden
             )
+            controller.unload()
             promptIds = mm.tokens
             visualSpans = mm.visualSpans
         } else {
@@ -328,7 +369,8 @@ struct Run: ParsableCommand {
                                 cacheDirectory: resolvedCacheDirURL, wipeOnStart: false)
                 : nil,
             prefillScratchEviction: resolvedEviction,
-            gdnPrefill: gdnPrefill
+            gdnPrefill: gdnPrefill,
+            dsparkConfidenceSchedule: dsparkConfidenceSchedule
         )
         do {
             try QWEngineInstanceLock.acquireEngineLock()

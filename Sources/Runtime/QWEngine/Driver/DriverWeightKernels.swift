@@ -108,8 +108,14 @@ extension QWEngineDriver {
             rawExists: rawExists
         )
         if let pack {
-            let isQ4g = (try? pack.entry(resolvedName).quantized) ?? false
-            return HeadWeightSpec(isQ4g: isQ4g, format: nil)
+            guard let entry = try? pack.entry(resolvedName), entry.quantized else {
+                return HeadWeightSpec(isQ4g: false, format: nil)
+            }
+            let headFmt: QWWeightFormat = entry.isIncumbentHQ4
+                ? .hq4G32
+                : .hqBlock(bits: entry.hqBits, groupSize: entry.hqGroup,
+                           denseIncumbent: false, denseSHVQ: entry.isSHVQ)
+            return HeadWeightSpec(isQ4g: true, format: headFmt)
         }
         guard let st else {
             return HeadWeightSpec(isQ4g: false, format: nil)
@@ -130,6 +136,56 @@ extension QWEngineDriver {
             }
         }
         return HeadWeightSpec(isQ4g: false, format: nil)
+    }
+
+    /// True when every MoE gate matrix in the QWP pack is stored verbatim as raw BF16.
+    static func resolveMoERouterIsBF16(
+        pack: QWQuant.Pack?,
+        geometry: QWModelGeometry,
+        mtpWeightDrafts: Int
+    ) -> Bool {
+        guard let pack, geometry.numExperts > 0 else { return false }
+        let routerRows = geometry.moeSplitFeatureRouting ? (2 * geometry.numExperts) : geometry.numExperts
+        let expectedElems = routerRows * geometry.hidden
+        func isRawBF16(_ rawName: String) -> Bool {
+            let resolved = QWCheckpointTensorLoader.resolveName(
+                rawName,
+                defaultPrefix: P,
+                tieWordEmbeddings: geometry.descriptor.tieWordEmbeddings,
+                rawExists: { (try? pack.entry($0)) != nil }
+            )
+            guard let entry = try? pack.entry(resolved),
+                  entry.rawOff != nil,
+                  entry.kind == nil || entry.kind == "bf16",
+                  entry.shape.reduce(1, *) == expectedElems else {
+                return false
+            }
+            return true
+        }
+        var sawMoE = false
+        for layer in 0..<geometry.numLayers where geometry.isMoELayer(layer) {
+            sawMoE = true
+            guard isRawBF16("model.layers.\(layer).mlp.gate.weight") else { return false }
+        }
+        guard sawMoE else { return false }
+        if mtpWeightDrafts > 0 && !geometry.mtpSharedLastLayer {
+            let prefixes = geometry.hasDedicatedMHCMTP
+                ? ["mtp_layers.0.decoder_layer.", P + "mtp_layers.0.decoder_layer."]
+                : [P + "layers.\(geometry.numLayers).", "model.layers.\(geometry.numLayers).", "mtp.layers.0."]
+            if let mtpPfx = prefixes.first(where: { pfx in
+                ["mlp.gate.weight", "block_sparse_moe.gate.weight"].contains { suffix in
+                    let resolved = QWCheckpointTensorLoader.resolveName(
+                        pfx + suffix, defaultPrefix: P,
+                        tieWordEmbeddings: geometry.descriptor.tieWordEmbeddings,
+                        rawExists: { (try? pack.entry($0)) != nil }
+                    )
+                    return (try? pack.entry(resolved)) != nil
+                }
+            }) {
+                guard isRawBF16(mtpPfx + "mlp.gate.weight") else { return false }
+            }
+        }
+        return true
     }
 
     /// The head's bank: the family's own container, or the incumbent's.

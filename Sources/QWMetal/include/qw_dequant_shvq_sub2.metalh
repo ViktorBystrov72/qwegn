@@ -4,9 +4,6 @@
 #pragma once
 #include <metal_stdlib>
 #include "qw_shvq_sub2_tables.metalh"
-#if defined(QW_SHVQ_ROUTED_DIRECT_LUT) || defined(QW_SHVQ_NEED_DIRECT15)
-#include "qw_shvq_sub2_routed_lut.metalh"
-#endif
 using namespace metal;
 
 METAL_FUNC constexpr uint qwg_shvq_slice_bytes(int bits) {
@@ -36,32 +33,22 @@ METAL_FUNC half4 qwg_shvq_unpack_quad4_1(device const uchar* p, uint quadIdx) {
     return as_type<half4>(((constant const ushort4*)kShvqLut1Bits)[vecIdx] ^ ushort4(sMask));
 }
 
+METAL_FUNC uint qwg_shvq15_u12(device const uchar* p, uint oct) {
+    const uint r = oct & 3u;
+    device const ushort* s = (device const ushort*)(p + 6u * (oct >> 2u) + (r & 2u));
+    const uint v32 = uint(s[0]) | (uint(s[1]) << 16u);
+    const uint shift = ((r & 1u) ? 12u : 0u) + ((r & 2u) << 2u);
+    return (v32 >> shift) & 0x0FFFu;
+}
+
 template <bool DIRECT15 = false>
 METAL_FUNC half4 qwg_shvq_unpack_quad4_15(device const uchar* p, uint quadIdx) {
-    const uint oct = quadIdx >> 1u;
-    device const uchar* t = p + 3u * (oct >> 1u);
-    const uint u12 = ((oct & 1u) == 0u)
-        ? (uint(t[0]) | ((uint(t[1]) & 0x0Fu) << 8u))
-        : ((uint(t[1]) >> 4u) | (uint(t[2]) << 4u));
+    (void)DIRECT15;
+    const uint u12 = qwg_shvq15_u12(p, quadIdx >> 1u);
     const uint vecIdx = ((u12 & 0x07FFu) << 1u) + (quadIdx & 1u);
     const ushort sMask = ushort((u12 & 0x0800u) << 4u);
-    ushort4 pos;
-#if defined(QW_SHVQ_ROUTED_DIRECT_LUT) || defined(QW_SHVQ_NEED_DIRECT15)
-    if constexpr (DIRECT15) {
-        pos = ((constant const ushort4*)kShvqLut15DirectBits)[vecIdx];
-    } else {
-#ifdef QW_SHVQ_ROUTED_DIRECT_LUT
-        pos = ((constant const ushort4*)kShvqLut15DirectBits)[vecIdx];
-#else
-        const char4 c = as_type<char4>(kShvqLut15PackedI8[vecIdx]);
-        pos = as_type<ushort4>(half4(float4(c) * kShvq15StepScaleF32));
-#endif
-    }
-#else
-    (void)DIRECT15;
     const char4 c = as_type<char4>(kShvqLut15PackedI8[vecIdx]);
-    pos = as_type<ushort4>(half4(float4(c) * kShvq15StepScaleF32));
-#endif
+    const ushort4 pos = as_type<ushort4>(half4(c) * half(kShvq15StepScaleF32));
     return as_type<half4>(pos ^ ushort4(sMask));
 }
 
@@ -80,23 +67,60 @@ METAL_FUNC void qwg_shvq_unpack_oct8_15(device const uchar* p,
                                         uint oct,
                                         thread half4 &uLo,
                                         thread half4 &uHi) {
-    device const uchar* t = p + 3u * (oct >> 1u);
-    const uint u12 = ((oct & 1u) == 0u)
-        ? (uint(t[0]) | ((uint(t[1]) & 0x0Fu) << 8u))
-        : ((uint(t[1]) >> 4u) | (uint(t[2]) << 4u));
+    const uint u12 = qwg_shvq15_u12(p, oct);
     const uint idx11 = u12 & 0x07FFu;
     const ushort4 s4 = ushort4(ushort((u12 & 0x0800u) << 4u));
-#ifdef QW_SHVQ_ROUTED_DIRECT_LUT
-    const uint4 raw128 = ((constant const uint4*)kShvqLut15DirectBits)[idx11];
-    const ushort4 pLo = as_type<ushort4>(raw128.xy);
-    const ushort4 pHi = as_type<ushort4>(raw128.zw);
-#else
     const uint2 raw64 = ((constant const uint2*)kShvqLut15PackedI8)[idx11];
-    const char4 c0 = as_type<char4>(raw64.x);
-    const char4 c1 = as_type<char4>(raw64.y);
-    const ushort4 pLo = as_type<ushort4>(half4(float4(c0) * kShvq15StepScaleF32));
-    const ushort4 pHi = as_type<ushort4>(half4(float4(c1) * kShvq15StepScaleF32));
-#endif
+    const half kStep = half(kShvq15StepScaleF32);
+    const ushort4 pLo = as_type<ushort4>(half4(as_type<char4>(raw64.x)) * kStep);
+    const ushort4 pHi = as_type<ushort4>(half4(as_type<char4>(raw64.y)) * kStep);
     uLo = as_type<half4>(pLo ^ s4);
     uHi = as_type<half4>(pHi ^ s4);
+}
+
+METAL_FUNC void qwg_shvq15_slice_u12x4(device const uchar* p, thread uint (&u)[4]) {
+    device const ushort* s = (device const ushort*)p;
+    const uint w0 = uint(s[0]), w1 = uint(s[1]), w2 = uint(s[2]);
+    u[0] = w0 & 0x0FFFu;
+    u[1] = ((w0 >> 12u) | (w1 << 4u)) & 0x0FFFu;
+    u[2] = ((w1 >> 8u) | (w2 << 8u)) & 0x0FFFu;
+    u[3] = (w2 >> 4u) & 0x0FFFu;
+}
+
+template <typename Vec4>
+METAL_FUNC float qwg_shvq15_unscaled_slice_dot(device const uchar* p,
+                                               thread const Vec4 (&lo)[4],
+                                               thread const Vec4 (&hi)[4]) {
+    uint u[4];
+    qwg_shvq15_slice_u12x4(p, u);
+    float acc = 0.0f;
+    #pragma unroll
+    for (uint w = 0u; w < 4u; ++w) {
+        const uint2 raw64 = ((constant const uint2*)kShvqLut15PackedI8)[u[w] & 0x07FFu];
+        const float d = dot(float4(as_type<char4>(raw64.x)), float4(lo[w]))
+                      + dot(float4(as_type<char4>(raw64.y)), float4(hi[w]));
+        acc += (u[w] & 0x0800u) ? -d : d;
+    }
+    return acc;
+}
+
+template <typename Vec4>
+METAL_FUNC float2 qwg_shvq15_unscaled_slice_dot2(device const uchar* p,
+                                                 thread const Vec4 (&lo0)[4], thread const Vec4 (&hi0)[4],
+                                                 thread const Vec4 (&lo1)[4], thread const Vec4 (&hi1)[4]) {
+    uint u[4];
+    qwg_shvq15_slice_u12x4(p, u);
+    float dm0 = 0.0f, dm1 = 0.0f;
+    #pragma unroll
+    for (uint w = 0u; w < 4u; ++w) {
+        const uint2 raw64 = ((constant const uint2*)kShvqLut15PackedI8)[u[w] & 0x07FFu];
+        const float4 fLo = float4(as_type<char4>(raw64.x));
+        const float4 fHi = float4(as_type<char4>(raw64.y));
+        const float d0 = dot(fLo, float4(lo0[w])) + dot(fHi, float4(hi0[w]));
+        const float d1 = dot(fLo, float4(lo1[w])) + dot(fHi, float4(hi1[w]));
+        const bool neg = (u[w] & 0x0800u) != 0u;
+        dm0 += neg ? -d0 : d0;
+        dm1 += neg ? -d1 : d1;
+    }
+    return float2(dm0, dm1);
 }
