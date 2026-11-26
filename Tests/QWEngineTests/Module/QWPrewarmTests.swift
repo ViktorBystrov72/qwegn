@@ -8,6 +8,9 @@ final class QWPrewarmTests: XCTestCase {
         let doors = [
             "qwg_lsa_ward_cluster_512",
             "qwg_lsa_select_blocks",
+            "qwg_lsa_select_score",
+            "qwg_lsa_select_hist2",
+            "qwg_lsa_select_expand",
             "qwg_lsa_select_finalize",
             "qwg_mla_indexer_select",
         ]

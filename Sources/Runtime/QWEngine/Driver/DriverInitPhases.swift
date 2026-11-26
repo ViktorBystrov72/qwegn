@@ -111,8 +111,16 @@ extension QWEngineDriver {
             )
     }
 
+    private static let lsaSelectorDoors: Set<String> = [
+        "qwg_lsa_select_blocks",
+        "qwg_lsa_select_score",
+        "qwg_lsa_select_hist2",
+        "qwg_lsa_select_expand",
+        "qwg_lsa_select_finalize",
+    ]
+
     static func prewarmDoors(_ doors: [String], hasLSAOperator: Bool) -> [String] {
-        hasLSAOperator ? doors : doors.filter { !$0.hasPrefix("qwg_lsa_select_") }
+        hasLSAOperator ? doors : doors.filter { !lsaSelectorDoors.contains($0) }
     }
 
     /// Creates every door the engine may dispatch, ONCE. The doors come
